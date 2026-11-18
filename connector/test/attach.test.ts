@@ -12,10 +12,11 @@ import os from "node:os";
 import path from "node:path";
 import test, { after, describe } from "node:test";
 import {
-  AttachSupport, MAX_REPORTED, SESSION_REF_RE, cleanTitle, fitResumable, localPidDomain, parseAgentsJson, processGroup, readRegistry,
-  TwinCheckError, type Resumable,
+  AttachSupport, MAX_REPORTED, SESSION_REF_RE, blindHolders, classifyAppended, isClaudeArgv, cleanTitle, ownTurnOf, fitResumable, liveActivity, localPidDomain, parseAgentsJson, processGroup, readRegistry,
+  TranscriptTail, TwinCheckError, transcriptUpdates, unwrapPasted, type Resumable,
 } from "../src/attach.js";
 import { ChildRegistry, processStart } from "../src/children.js";
+import { DEFAULT_SESSION_TIMING, SPECTATE_MS, entryTime } from "../src/session.js";
 import { memoryAudit } from "../src/audit.js";
 import { ConfigError, parseConfig } from "../src/config.js";
 import { terminalsDir, runHook } from "../src/terminals.js";
@@ -29,8 +30,8 @@ const REF3 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 // Every process a test starts is recorded here and stopped by pid (never by pattern).
 const children: ChildProcess[] = [];
 after(() => { for (const c of children) { try { if (c.pid && c.exitCode === null) process.kill(c.pid, "SIGKILL"); } catch { /* gone */ } } });
-const sleeper = (opts: { detached?: boolean } = {}): ChildProcess => {
-  const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: opts.detached ?? false });
+const sleeper = (opts: { detached?: boolean; cwd?: string } = {}): ChildProcess => {
+  const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: opts.detached ?? false, cwd: opts.cwd });
   children.push(c);
   return c;
 };
@@ -46,7 +47,7 @@ function configDir(): string {
 const registryRow = (dir: string, pid: number, extra: Record<string, unknown>) =>
   fs.writeFileSync(path.join(dir, "sessions", `${pid}.json`), JSON.stringify({ pid, sessionId: REF, status: "idle", kind: "interactive", ...extra }));
 
-function support(dir: string, o: { cli?: string; cliEnv?: Record<string, string>; recentWriteMs?: number; attached?: string[] } = {}): AttachSupport {
+function support(dir: string, o: { cli?: string; cliEnv?: Record<string, string>; recentWriteMs?: number; attached?: string[]; blindCheckMs?: number; screenName?: (pid: number) => Promise<string | null> } = {}): AttachSupport {
   const cfg = parseConfig(`
 [[agents]]
 id = "a"
@@ -60,12 +61,13 @@ ${Object.entries(o.cliEnv ?? {}).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).
   return new AttachSupport(cfg.agents[0]!, {
     registry: new ChildRegistry(path.join(tmpdir(), "children.json")), audit: memoryAudit(), log: silentLogger, logDir: tmpdir(), version: "test",
     env: process.env, catalogMs: 60_000, cliTimeoutMs: 1500, recentWriteMs: o.recentWriteMs ?? 10_000, attachedRefs: () => new Set(o.attached ?? []),
+    ...(o.blindCheckMs !== undefined ? { blindCheckMs: o.blindCheckMs } : {}), ...(o.screenName ? { screenName: o.screenName } : {}),
   });
 }
 
 /** A terminal that has the conversation open: a real process and the registry row Claude Code writes for it. `leave()` is `/exit`. */
-function openTerminal(dir: string, ref = REF): { pid: number; leave(): Promise<void> } {
-  const proc = sleeper();
+function openTerminal(dir: string, ref = REF, cwd?: string): { pid: number; leave(): Promise<void> } {
+  const proc = sleeper({ cwd });
   fs.mkdirSync(path.join(dir, "sessions"), { recursive: true });
   const row = path.join(dir, "sessions", `${proc.pid}.json`);
   fs.writeFileSync(row, JSON.stringify({ pid: proc.pid, sessionId: ref, status: "busy", kind: "interactive", procStart: processStart(proc.pid!), pidDomain: localPidDomain() }));
@@ -81,6 +83,58 @@ function fakeCli(mode: string, live: unknown[]): { cli: string; env: Record<stri
   fs.writeFileSync(cli, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_CLAUDE)} "$@"\n`, { mode: 0o755 });
   return { cli, env: { FAKE_CLAUDE_MODE: mode, FAKE_CLAUDE_LIVE: liveFile } };
 }
+
+describe("when a transcript entry happened, and which tool a step runs", () => {
+  test("each update of a line carries the time Claude Code wrote on it; a line without one carries none", () => {
+    const l = (o: Record<string, unknown>) => JSON.stringify({ sessionId: REF, isSidechain: false, uuid: "u-1", ...o });
+    // (the shape Claude Code 2.1.x writes: an ISO `timestamp` on every entry)
+    const at = "2026-11-17T14:12:40.123Z";
+    const ups = transcriptUpdates(l({ type: "assistant", timestamp: at, message: { role: "assistant", content: [
+      { type: "text", text: "Checking the tests." },
+      { type: "tool_use", id: "toolu_9", name: "Bash", input: { command: "npm test" } },
+    ] } }));
+    assert.deepEqual(ups.map((u) => [u.type, u.at]), [["agent_message_chunk", Date.parse(at)], ["tool_call", Date.parse(at)]]);
+    // (named where the Claude Code ACP adapter names it, so a phone counts the steps by tool for either)
+    assert.deepEqual(ups[1]!.update._meta, { claudeCode: { toolName: "Bash" } });
+    assert.equal(ups[1]!.update.title, "Bash: npm test");
+    const result = transcriptUpdates(l({ type: "user", timestamp: "2026-11-17T14:12:44.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_9", content: "ok" }] } }));
+    assert.equal(result[0]!.at, Date.parse("2026-11-17T14:12:44.000Z"));
+    assert.equal(transcriptUpdates(l({ type: "assistant", message: { role: "assistant", content: "no time" } }))[0]!.at, undefined);
+    assert.equal(transcriptUpdates(l({ type: "assistant", timestamp: "not a time", message: { role: "assistant", content: "x" } }))[0]!.at, undefined);
+  });
+
+  test("an entry's time is used unless it is missing or later than now", () => {
+    const now = Date.parse("2026-11-17T14:13:09.900Z");
+    assert.equal(entryTime(Date.parse("2026-11-17T14:12:40.123Z"), now), Date.parse("2026-11-17T14:12:40.123Z"));
+    assert.equal(entryTime(now, now), now);
+    assert.equal(entryTime(now + 1, now), undefined);
+    assert.equal(entryTime(undefined, now), undefined);
+    assert.equal(entryTime(Number.NaN, now), undefined);
+    assert.equal(entryTime(0, now), undefined);
+  });
+
+  test("a terminal's transcript is read at least four times a second", () => {
+    assert.ok(SPECTATE_MS <= 250, String(SPECTATE_MS));
+    assert.equal(DEFAULT_SESSION_TIMING.spectateMs, SPECTATE_MS);
+  });
+});
+
+describe("what a transcript says of a message Claude Code queued (submitted while a turn ran)", () => {
+  test("enqueue, taken into the running turn (queued_command), and handed back to the box (popAll); nothing else of the queue", () => {
+    const l = (o: Record<string, unknown>) => JSON.stringify({ sessionId: REF, isSidechain: false, ...o });
+    // (the shapes Claude Code 2.1.285 writes, measured 2026-11-10)
+    assert.deepEqual(transcriptUpdates(l({ type: "queue-operation", operation: "enqueue", content: "from the phone" })), [{ type: "queued", update: { text: "from the phone" } }]);
+    assert.deepEqual(transcriptUpdates(l({ type: "attachment", attachment: { type: "queued_command", prompt: "from the phone", commandMode: "prompt" } })),
+      [{ type: "queued_taken", update: { text: "from the phone" } }]);
+    assert.deepEqual(transcriptUpdates(l({ type: "queue-operation", operation: "popAll" })), [{ type: "queue_withdrawn", update: {} }]);
+    for (const other of [
+      l({ type: "queue-operation", operation: "dequeue" }),
+      l({ type: "queue-operation", operation: "remove", content: "from the phone", reason: "absorbed_mid_turn" }),
+      l({ type: "attachment", attachment: { type: "date" } }),
+      l({ type: "queue-operation", operation: "enqueue", content: "a background agent's", isSidechain: true }),
+    ]) assert.deepEqual(transcriptUpdates(other), [], other);
+  });
+});
 
 describe("reading who holds a session open", () => {
   test("claude agents --json: the rows that name a process and a session, and nothing else", () => {
@@ -244,6 +298,275 @@ function hookRow(dir: string, pid: number, extra: Record<string, unknown> = {}, 
   fs.writeFileSync(path.join(terminalsDir(dir), name), JSON.stringify({ v: 1, pid, procStart: processStart(pid), sessionId: REF, cwd: "/w", at: Date.now(), pidDomain: localPidDomain(), ...extra }));
 }
 
+// A Claude Code process whose registry row is unreadable (an empty sessions/<pid>.json, measured on a dev pod 2026-11-09: a
+// terminal session open for days was offered to be taken over, as "idle").
+const claudeNamed = (cwd: string, detached = false): ChildProcess => {
+  const c = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", cwd, argv0: "claude", detached });
+  children.push(c);
+  return c;
+};
+// (older than the grace an unreadable row gets while it may be being written: one written moments ago already refuses everything)
+const emptyRow = (dir: string, pid: number) => {
+  const file = path.join(dir, "sessions", `${pid}.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "");
+  const t = (Date.now() - 3_600_000) / 1000;
+  fs.utimesSync(file, t, t);
+};
+
+describe("a Claude Code process whose registry row cannot be read", () => {
+  test("is found by its pid, its program and its folder; a readable row, or a process that is not Claude Code, is not", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const work = fs.realpathSync(tmpdir("cc-blind-"));
+    const blind = claudeNamed(work);
+    const other = sleeper();
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, blind.pid!);
+    emptyRow(dir, other.pid!);   // (an unreadable row of a process that is not Claude Code says nothing about a conversation)
+    registryRow(dir, 4242, { procStart: "1" });
+    assert.deepEqual(await blindHolders(dir), [{ pid: blind.pid, pgid: processGroup(blind.pid!), cwd: work, sessionId: null }]);
+    assert.equal(isClaudeArgv(["claude"]), true);
+    assert.equal(isClaudeArgv(["/usr/bin/node", "/opt/x/node_modules/@anthropic-ai/claude-code/cli.js"]), true);
+    assert.equal(isClaudeArgv(["node", "/opt/claude-agent-acp/dist/index.js"]), false);
+  });
+
+  test("the conversation it has open is proven by the task folder it holds, only where nothing else of its folder may be it", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const work = fs.realpathSync(tmpdir("cc-blind-"));
+    const project = work.replace(/[^A-Za-z0-9]/g, "-");
+    const uid = process.getuid!();
+    const tasks = path.join(tmpdir("cc-tmp-"), `claude-${uid}`, project, REF, "tasks");
+    fs.mkdirSync(tasks, { recursive: true });
+    const blind = spawn(process.execPath, ["-e", "require('fs').openSync(process.argv[1], 'r'); setInterval(() => {}, 1000)", tasks], { stdio: "ignore", cwd: work, argv0: "claude" });
+    children.push(blind);
+    await new Promise((r) => setTimeout(r, 300));
+    emptyRow(dir, blind.pid!);
+    const transcripts = path.join(dir, "projects", project);
+    fs.mkdirSync(transcripts, { recursive: true });
+    const titled = (ref: string, title: string | null, ageMs = 0, entrypoint = "cli") => {
+      const f = path.join(transcripts, `${ref}.jsonl`);
+      fs.writeFileSync(f, `${JSON.stringify({ type: "user", sessionId: ref, entrypoint })}\n${title === null ? "" : `${JSON.stringify({ type: "custom-title", customTitle: title, sessionId: ref })}\n`}`);
+      const t = (Date.now() - ageMs) / 1000;
+      fs.utimesSync(f, t, t);
+    };
+    const T = "autopilot重构";
+    const proven = async (shown: string | null = T, u = uid) =>
+      (await blindHolders(dir, "/proc", u, async () => shown)).find((b) => b.pid === blind.pid)?.sessionId;
+    // Not written since the process started: nothing says it is this process's (it may have moved on with /clear).
+    titled(REF, T, 3_600_000);
+    assert.equal(await proven(), null, "not written since it started");
+    titled(REF, T);
+    // An old conversation, and a headless one since without a name: its screen names the held one, which no other shares.
+    titled(REF2, "blog", 3_600_000);
+    titled(REF3, null, 0, "sdk-cli");
+    assert.equal(await proven(), REF, "its screen names the held conversation");
+    assert.equal(await proven(null), null, "its screen names none");
+    assert.equal(await proven("blog"), null, "its screen names another one: it moved there");
+    assert.equal((await blindHolders(dir)).find((b) => b.pid === blind.pid)?.sessionId, null, "the task folder alone proves nothing (no pane here)");
+    // Another user's view of it proves nothing: the uid in the folder's name is not the caller's.
+    assert.equal(await proven(T, uid + 1), null, "another uid");
+    // Another conversation written since, named otherwise, held by another process's row or not: the screen still tells them apart.
+    titled(REF2, "blog");
+    assert.equal(await proven(), REF, "another one written since, named otherwise");
+    const other = claudeNamed(work);
+    await new Promise((r) => setTimeout(r, 100));
+    registryRow(dir, other.pid!, { sessionId: REF2, procStart: processStart(other.pid!) });
+    assert.equal(await proven(), REF, "another one a live row names, named otherwise");
+    // ... but one that may share the name: the same name, a name too far back to be seen, one that cannot be read (codex r5, Wei Lei).
+    titled(REF2, T);
+    assert.equal(await proven(), null, "another one with the same name");
+    titled(REF2, null);
+    // A candidate longer than the end that is read for a name, but not large, is read whole: one with no name is known to have none
+    // (autopilot-devpod: an interactive conversation of 1.09 MB without a name, written since its torn-row process started).
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "user", sessionId: REF2, toolUseResult: "x".repeat(1_200_000) })}\n`);
+    assert.equal(await proven(), REF, "another one of 1.2 MB without a name, read whole");
+    // Too large to read whole: a name further back than what is read is not known.
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "user", sessionId: REF2, toolUseResult: "x".repeat(8_000_000) })}\n`);
+    assert.equal(await proven(), null, "another one whose name may be further back than what is read");
+    // A readable one with a malformed line, or a name entry that is not a name: what it is named is not known (codex r9).
+    fs.writeFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "user", sessionId: REF2, entrypoint: "cli" })}\n{"type": "custom-title", "customTitle": "${T}\n`);
+    assert.equal(await proven(), null, "another one with a malformed line");
+    fs.writeFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "custom-title", customTitle: 7, sessionId: REF2 })}\n`);
+    assert.equal(await proven(), null, "another one whose name entry holds no name");
+    titled(REF2, "x".repeat(600));
+    assert.equal(await proven(), REF, "another one with a long name of its own");
+    // A name read, then something after it that may be a newer one: what it is named now is not known (codex r10).
+    titled(REF2, "blog");
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `{"type": "custom-title", "customTitle": "${T}\n`);
+    assert.equal(await proven(), null, "a malformed line after its name");
+    titled(REF2, "blog");
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `${JSON.stringify({ type: "custom-title", customTitle: null, sessionId: REF2 })}\n`);
+    assert.equal(await proven(), null, "a name entry with no name after its name");
+    titled(REF2, "blog");
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `{"type":"custom-ti`);
+    assert.equal(await proven(), null, "a name entry being written after its name");
+    // A last line still being written that cannot be a name entry (the agent's output, mid-write) says nothing about its name.
+    titled(REF2, "blog");
+    fs.appendFileSync(path.join(transcripts, `${REF2}.jsonl`), `{"type":"assistant","message":{"content":"half`);
+    assert.equal(await proven(), REF, "a line being written that is no name entry");
+    fs.rmSync(path.join(transcripts, `${REF2}.jsonl`));
+    fs.mkdirSync(path.join(transcripts, `${REF2}.jsonl`));   // (a "transcript" that cannot be read: open succeeds, the read fails)
+    assert.equal(await proven(), null, "another one that cannot be read");
+    fs.rmdirSync(path.join(transcripts, `${REF2}.jsonl`));
+    fs.symlinkSync(path.join(transcripts, "nowhere"), path.join(transcripts, `${REF2}.jsonl`));
+    assert.equal(await proven(), null, "another one that cannot even be looked at (codex r6)");
+    fs.rmSync(path.join(transcripts, `${REF2}.jsonl`));
+    // A headless writer since says nothing about this process not being on it too (codex r8): it is a candidate like any other.
+    titled(REF3, T, 0, "sdk-cli");
+    assert.equal(await proven(), null, "a headless one with the same name");
+    titled(REF3, null, 0, "sdk-cli");
+    // The held conversation has no name: nothing on its screen can show it.
+    titled(REF, null);
+    assert.equal(await proven(), null, "the held conversation has no name");
+    titled(REF, T);
+    assert.equal(await proven(), REF);
+    // A second task folder it holds that was deleted (or cannot be looked at) is a doubt about which one it is on: no proof.
+    const tasks2 = path.join(path.dirname(path.dirname(tasks)), REF2, "tasks");
+    fs.mkdirSync(tasks2, { recursive: true });
+    const two = spawn(process.execPath, ["-e", "const fs = require('fs'); fs.openSync(process.argv[1], 'r'); fs.openSync(process.argv[2], 'r'); setInterval(() => {}, 1000)", tasks, tasks2], { stdio: "ignore", cwd: work, argv0: "claude" });
+    children.push(two);
+    await new Promise((r) => setTimeout(r, 300));
+    registryRow(dir, blind.pid!, { sessionId: REF3, procStart: processStart(blind.pid!) });   // (the only process whose row is torn: this one)
+    emptyRow(dir, two.pid!);
+    titled(REF, T);
+    assert.equal((await blindHolders(dir, "/proc", uid, async () => T)).find((b) => b.pid === two.pid)?.sessionId, null, "two task folders");
+    fs.rmSync(path.dirname(tasks2), { recursive: true });
+    assert.equal((await blindHolders(dir, "/proc", uid, async () => T)).find((b) => b.pid === two.pid)?.sessionId, null, "a deleted second task folder");
+    await stop(two);
+    emptyRow(dir, blind.pid!);
+    // Two such processes in the folder: which one wrote what cannot be told.
+    const second = claudeNamed(work);
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, second.pid!);
+    assert.deepEqual((await blindHolders(dir)).map((b) => b.sessionId), [null, null]);
+    await stop(second);
+    await stop(other);
+    await stop(blind);
+  });
+
+  test("a scan of such processes that answers late never makes the conversation one holds look free (Wei Lei, #612)", { skip: process.platform !== "linux" }, async () => {
+    // A process proven (by its task folder and its screen) to hold REF, whose scan takes longer than a check waits for it.
+    const dir = configDir();
+    const work = fs.realpathSync(tmpdir("cc-late-"));
+    const project = work.replace(/[^A-Za-z0-9]/g, "-");
+    const uid = process.getuid!();
+    const tasks = path.join(tmpdir("cc-tmp-"), `claude-${uid}`, project, REF, "tasks");
+    fs.mkdirSync(tasks, { recursive: true });
+    const blind = spawn(process.execPath, ["-e", "require('fs').openSync(process.argv[1], 'r'); setInterval(() => {}, 1000)", tasks], { stdio: "ignore", cwd: work, argv0: "claude" });
+    children.push(blind);
+    await new Promise((r) => setTimeout(r, 300));
+    emptyRow(dir, blind.pid!);
+    const transcripts = path.join(dir, "projects", project);
+    fs.mkdirSync(transcripts, { recursive: true });
+    fs.writeFileSync(path.join(transcripts, `${REF}.jsonl`), `${JSON.stringify({ type: "user", sessionId: REF, entrypoint: "cli" })}\n${JSON.stringify({ type: "custom-title", customTitle: "late", sessionId: REF })}\n`);
+    const slowScreen = async () => { await new Promise((r) => setTimeout(r, 150)); return "late"; };
+    // The live list's wait gives up at 100 ms; the check's own wait on the same scan gets its answer (REF proven) at 150 ms.
+    const s = support(dir, { blindCheckMs: 100, screenName: slowScreen });
+    const v = await s.check(REF, { ownPgid: null, transcript: false });
+    assert.equal(v.ok, false, "a takeover or attach of REF is refused");
+    // And the listing: a live list made without the late scan, then the scan proving REF: never "idle".
+    const listing = support(dir, { blindCheckMs: 100, screenName: slowScreen });
+    const any = listing as unknown as { listed: unknown[]; waitedOnce: boolean; listedAt: number };
+    any.listed = [{ ref: REF, title: "late", cwd: work, updatedAt: Date.now() }];
+    any.waitedOnce = true;
+    any.listedAt = Date.now();
+    const [r] = await listing.resumable(1_000);
+    assert.notEqual(r!.state, "idle", "REF is not offered to take over");
+    // Its own session (an adapter of this connector) is not stopped by such a scan being late.
+    const own = await support(dir, { blindCheckMs: 100, screenName: slowScreen }).check(REF2, { ownPgid: 424242, transcript: false });
+    assert.equal(own.ok, true, "its own session goes on");
+    await stop(blind);
+  });
+
+  test("a registry that cannot be read is no answer: the scan throws, and a check refuses although the command lists nothing (codex r15)", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    fs.rmSync(path.join(dir, "sessions"), { recursive: true, force: true });
+    fs.writeFileSync(path.join(dir, "sessions"), "not a folder");   // (readdir: ENOTDIR)
+    await assert.rejects(blindHolders(dir));
+    const f = fakeCli("ok", []);
+    const v = await support(dir, { cli: f.cli, cliEnv: f.env }).check(REF, { ownPgid: null, transcript: false });
+    assert.equal(v.ok, false, "not taken for free");
+    fs.rmSync(path.join(dir, "sessions"));
+    assert.deepEqual(await blindHolders(dir), [], "no registry at all: nothing");
+  });
+
+  test("the twin check refuses: it cannot tell that the conversation is free, and a second writer is never started", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const blind = claudeNamed(os.tmpdir());
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, blind.pid!);
+    const v = await support(dir).check(REF, { ownPgid: null, transcript: false });
+    assert.equal(v.ok ? "ok" : v.reason, "twin_check_failed");
+    assert.match(v.ok ? "" : v.detail, new RegExp(`process ${blind.pid} .*sessions/${blind.pid}\\.json cannot be read`));
+    await stop(blind);
+    assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, true, "once that process is gone, the row says nothing");
+  });
+
+  test("this connector's own adapter (the process group it leads) is never taken for such a holder", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const mine = claudeNamed(os.tmpdir(), true);   // (detached: it leads its own group, as an adapter the connector starts does)
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, mine.pid!);
+    assert.equal((await support(dir).check(REF, { ownPgid: mine.pid!, transcript: false })).ok, true);
+    assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, false, "anyone else's: refused");
+  });
+
+  test("a conversation only this connector's own adapter holds is reported attached, never as a terminal that waits (guide re-check 2026-11-11)", { skip: process.platform !== "linux" }, async () => {
+    // Another agent of this connector (a session started from the phone) runs Claude Code in the same config directory: its row says
+    // it waits (a permission card on the phone). It is no terminal, so nothing may tell the owner a terminal waits for them.
+    const dir = configDir();
+    const mine = sleeper({ detached: true });   // (an adapter this connector started: it leads its own group)
+    const term = sleeper();                     // (a terminal: not in any group this connector leads)
+    await new Promise((r) => setTimeout(r, 100));
+    const registry = new ChildRegistry(path.join(tmpdir(), "children.json"));
+    registry.add({ pid: mine.pid!, pgid: mine.pid!, agent_id: "claude", session_id: "s-phone" });
+    const row = (pid: number, ref: string, status: string) => fs.writeFileSync(path.join(dir, "sessions", `${pid}.json`),
+      JSON.stringify({ pid, sessionId: ref, status, waitingFor: "permission prompt", kind: "interactive", procStart: processStart(pid), pidDomain: localPidDomain() }));
+    row(mine.pid!, REF, "waiting");
+    const cfg = parseConfig(`
+[[agents]]
+id = "a"
+preset = "claude-attach"
+roots = [${JSON.stringify(os.tmpdir())}]
+attach_cli = "/nonexistent/claude-for-tests"
+[agents.env]
+CLAUDE_CONFIG_DIR = ${JSON.stringify(dir)}
+`);
+    const s = new AttachSupport(cfg.agents[0]!, {
+      registry, audit: memoryAudit(), log: silentLogger, logDir: tmpdir(), version: "test", env: process.env, catalogMs: 60_000,
+      cliTimeoutMs: 1500, recentWriteMs: 10_000, attachedRefs: () => new Set(),
+    });
+    const any = s as unknown as { listed: unknown[]; waitedOnce: boolean; listedAt: number };
+    any.listed = [{ ref: REF, title: "phone", cwd: os.tmpdir(), updatedAt: Date.now() }, { ref: REF2, title: "both", cwd: os.tmpdir(), updatedAt: Date.now() }];
+    any.waitedOnce = true;
+    any.listedAt = Date.now();
+    let [phone] = await s.resumable(1_000);
+    assert.equal(phone!.state, "attached", "its own adapter's conversation is not open in a terminal");
+    assert.equal(phone!.activity, undefined, "and nothing says it waits");
+    // A terminal that holds a conversation too is a terminal, with what that terminal says (not what its own adapter says).
+    row(mine.pid!, REF2, "waiting");
+    row(term.pid!, REF2, "busy");
+    const listed = await s.resumable(1_000);
+    const both = listed.find((r) => r.ref === REF2)!;
+    assert.equal(both.state, "live");
+    assert.equal(both.activity, "working", "the terminal's own activity, not the adapter's wait");
+    [phone] = listed;
+    assert.equal(phone!.state, "idle", "the adapter's row moved to the other conversation: the first is held by nobody");
+    await stop(term);
+    await stop(mine);
+  });
+
+  test("a session this connector holds with its own adapter is not stopped by another process's unreadable row (each prompt checks)", { skip: process.platform !== "linux" }, async () => {
+    const dir = configDir();
+    const unrelated = claudeNamed(os.tmpdir());   // (an unrelated terminal in the same folder, its row empty)
+    const mine = sleeper({ detached: true });     // (this connector's adapter, leading its own group)
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(dir, unrelated.pid!);
+    assert.equal((await support(dir).check(REF, { ownPgid: mine.pid!, transcript: false })).ok, true, "the held session goes on");
+    assert.equal((await support(dir).check(REF, { ownPgid: null, transcript: false })).ok, false, "a new writer is still refused");
+  });
+});
+
 describe("the terminal hooks' rows in the twin check", () => {
   type Case = {
     name: string;
@@ -359,6 +682,13 @@ describe("what is reported to Claw", () => {
     assert.ok(new TextEncoder().encode(JSON.stringify(edge)).length <= 4096 && new TextEncoder().encode(JSON.stringify({ ...edge, resumable: [] })).length > 4096, "the case is the one that matters");
     assert.deepEqual(fitResumable(edge, items), edge);
     assert.deepEqual(fitResumable(base, []), { ...base, resumable: [] }, "nothing to offer, room to say so");
+    // The flag that says a conversation in a terminal can be watched never makes a valid heartbeat invalid.
+    const bare = new TextEncoder().encode(JSON.stringify({ ...base, roots: ["/"] })).length;
+    const near = { ...base, roots: ["/".concat("x".repeat(4090 - bare))] };
+    const flagged = { ...near, watch_live: true };
+    assert.ok(new TextEncoder().encode(JSON.stringify(near)).length <= 4096 && new TextEncoder().encode(JSON.stringify(flagged)).length > 4096, "the case is the one that matters");
+    assert.deepEqual(fitResumable(flagged, items), near);
+    assert.deepEqual(fitResumable({ ...base, watch_live: true }, []), { ...base, watch_live: true, resumable: [] }, "with room, it is said");
   });
 
   test("the preset: an opaque kind, the ask mode, a default command to list with, and nothing that applies to other agents", () => {
@@ -380,6 +710,176 @@ roots = ["${os.tmpdir()}"]
     assert.deepEqual(cfg.agents.map((a) => [a.kind, a.askMode, a.attach?.cli ?? null]), [["attach", "default", "claude"], ["attach", "default", "/opt/claude/bin/claude"], ["claude", "default", null]]);
     assert.throws(() => parseConfig(`[[agents]]\nid = "c"\npreset = "claude"\nattach_cli = "claude"\nroots = ["${os.tmpdir()}"]`), ConfigError);
     assert.throws(() => parseConfig(`[[agents]]\nid = "c"\npreset = "claude-attach"\nattach_cli = ""\nroots = ["${os.tmpdir()}"]`), ConfigError);
+  });
+});
+
+describe("which user turns of a terminal's transcript are a person's prompt (what a phone shows as typed in the terminal)", () => {
+  // The shapes Claude Code 2.1.285-2.1.319 writes (measured on real transcripts 2026-11-11; ids, paths and words replaced).
+  const base = { parentUuid: "00000000-0000-4000-8000-000000000001", isSidechain: false, userType: "external", entrypoint: "cli", version: "2.1.312", sessionId: REF, cwd: "/home/dev/repo", timestamp: "2026-11-11T08:00:00.000Z" };
+  const human = { promptId: "11111111-1111-4111-8111-111111111111", origin: { kind: "human" }, promptSource: "typed", turnOrigin: "human", permissionMode: "default" };
+  const line = (o: Record<string, unknown>) => JSON.stringify({ ...base, uuid: "22222222-2222-4222-8222-222222222222", ...o });
+  const user = (content: unknown, o: Record<string, unknown> = {}) => line({ type: "user", message: { role: "user", content }, ...o });
+  const shown = (l: string) => transcriptUpdates(l).map((u) => (u.type === "user_message_chunk" ? (u.update.content as { text: string }).text : u.type));
+  const NOTIFICATION = "<task-notification>\n<task-id>a0b1c2d3e4f5a6b7c</task-id>\n<tool-use-id>toolu_01AAAAAAAAAAAAAAAAAAAAAA</tool-use-id>\n"
+    + "<output-file>/tmp/claude-0/-home-dev-repo/33333333-3333-4333-8333-333333333333/tasks/a0b1c2d3e4f5a6b7c.output</output-file>\n"
+    + "<status>completed</status>\n<summary>Agent \"Fix the parser\" completed</summary>\n<result>done</result>\n</task-notification>";
+  const PEER = "Another Claude session sent a message:\n<cross-session-message from=\"uds:/tmp/cc-socks/1234.sock\" name=\"other\">\nplease rebase\n</cross-session-message>";
+
+  test("a typed prompt, an accepted suggestion, a queued one and one sent through the SDK are shown", () => {
+    assert.deepEqual(shown(user("fix the failing test in parser.ts", human)), ["fix the failing test in parser.ts"]);
+    assert.deepEqual(shown(user("yes", { ...human, promptSource: "suggestion_accepted" })), ["yes"]);
+    assert.deepEqual(shown(user("and the docs", { ...human, promptSource: "queued" })), ["and the docs"]);
+    assert.deepEqual(shown(user([{ type: "text", text: "from the SDK" }], { ...human, promptSource: "sdk" })), ["from the SDK"]);
+    assert.deepEqual(shown(user([{ type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } }, { type: "text", text: "[Image #1] what is this" }], human)),
+      ["[Image #1] what is this"]);
+  });
+
+  test("a prompt that mentions or even starts with a harness tag is still the person's when the entry says so", () => {
+    const prose = "why does the chat show <task-notification> blocks as typed in the terminal?";
+    assert.deepEqual(shown(user(prose, human)), [prose]);
+    assert.deepEqual(shown(user(prose)), [prose], "an entry that says nothing: only the start of its text is looked at");
+    assert.deepEqual(shown(user(`${NOTIFICATION}\nwhat does this mean?`, human)), [`${NOTIFICATION}\nwhat does this mean?`], "pasted at the terminal");
+    assert.deepEqual(shown(user("/compact")), ["/compact"], "a slash command as typed, from a Claude Code that does not say where it came from");
+  });
+
+  test("a background task's notification is nothing (the turn Claude Code takes on its own)", () => {
+    const notification = { promptId: "44444444-4444-4444-8444-444444444444", origin: { kind: "task-notification", producer: "session-task", runId: "0abc-def" },
+      promptSource: "system", turnOrigin: "task_notification", queueSkipAttachments: true, permissionMode: "bypassPermissions" };
+    assert.deepEqual(shown(user(NOTIFICATION, notification)), []);
+    assert.deepEqual(shown(user(NOTIFICATION, { origin: { kind: "task-notification" } })), [], "by origin alone");
+    assert.deepEqual(shown(user(NOTIFICATION, { promptSource: "system" })), [], "by promptSource alone");
+    assert.deepEqual(shown(user(NOTIFICATION)), [], "an entry that says nothing: by how it begins");
+    assert.deepEqual(shown(user(`\n${NOTIFICATION}`)), [], "(leading blank lines included)");
+  });
+
+  test("a message from another session or a sub-agent, a scheduled prompt and a reminder are nothing", () => {
+    const peer = { origin: { kind: "peer", from: "uds:/tmp/cc-socks/1234.sock", name: "other", body: "please rebase" }, promptSource: "system", turnOrigin: "peer", isMeta: true };
+    assert.deepEqual(shown(user(PEER, peer)), []);
+    assert.deepEqual(shown(user(PEER, { ...peer, isMeta: false })), [], "by origin, without isMeta");
+    assert.deepEqual(shown(user(PEER)), [], "an entry that says nothing: by how it begins");
+    assert.deepEqual(shown(user("<agent-message from=\"a0123456789abcdef\">\nI am done\n</agent-message>")), []);
+    assert.deepEqual(shown(user("check the deploy and report", { promptSource: "system", turnOrigin: "scheduled", isMeta: true })), [], "a scheduled prompt");
+    assert.deepEqual(shown(user("check the deploy and report", { promptSource: "system", turnOrigin: "scheduled" })), [], "... without isMeta");
+    assert.deepEqual(shown(user("<system-reminder>\nThe date changed.\n</system-reminder>")), []);
+  });
+
+  test("a tool's result is a step's end, never words; a slash command's and a `!` command's lines and a compacted summary are nothing", () => {
+    const result = user([{ tool_use_id: "toolu_01BBBBBBBBBBBBBBBBBBBBBB", type: "tool_result", content: "file contents", is_error: false }],
+      { toolUseResult: { stdout: "file contents", stderr: "", interrupted: false }, sourceToolAssistantUUID: "55555555-5555-4555-8555-555555555555" });
+    assert.deepEqual(transcriptUpdates(result).map((u) => u.type), ["tool_call_update"]);
+    assert.deepEqual(shown(user([{ type: "text", text: "the output of a tool, as text" }], { toolUseResult: "x" })), []);
+    assert.deepEqual(shown(user("<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>")), []);
+    assert.deepEqual(shown(user("<local-command-stdout>Compacted</local-command-stdout>", { turnOrigin: "human" })), []);
+    assert.deepEqual(shown(user("<bash-input>ls /tmp</bash-input>")), []);
+    assert.deepEqual(shown(user("This session is being continued from a previous conversation that ran out of context. The summary below ...",
+      { isCompactSummary: true, isVisibleInTranscriptOnly: true, turnOrigin: "human" })), []);
+  });
+
+  test("a pasted block is the text that was pasted: the phone's message of several lines matches what it typed, and shows as given", () => {
+    // (Claude Code 2.1.285, 2026-11-11: a 4-line message from the phone, pasted, recorded in place of `[Pasted text #1 +3 lines]`)
+    const phone = "Quoted your earlier reply:\n> the terminal said something\n\nis this expected?";
+    const recorded = `\n\n<pasted_content id="1fe5">\n${phone}\n</pasted_content id="1fe5">\n`;
+    assert.deepEqual(shown(user(recorded, human)), [phone]);
+    assert.equal(unwrapPasted(`look at this\n\n<pasted_content id="2a">\nline a\nline b\n</pasted_content id="2a">\n\nand fix it`), "look at this\nline a\nline b\nand fix it");
+    assert.equal(unwrapPasted(`<pasted_content id="1">\nx\n</pasted_content id="2">`), `<pasted_content id="1">\nx\n</pasted_content id="2">`, "ids that do not pair are left");
+    assert.equal(unwrapPasted("a prompt that names <pasted_content id=\"1\"> in prose"), "a prompt that names <pasted_content id=\"1\"> in prose");
+    const updates = (doc: Record<string, unknown>) => transcriptUpdates(line(doc)).map(({ type, update }) => ({ type, update }));
+    assert.deepEqual(updates({ type: "queue-operation", operation: "enqueue", content: recorded }), [{ type: "queued", update: { text: phone } }]);
+    assert.deepEqual(updates({ type: "attachment", attachment: { type: "queued_command", prompt: recorded, commandMode: "prompt", origin: { kind: "human" } } }),
+      [{ type: "queued_taken", update: { text: phone } }]);
+  });
+
+  test("Claude Code's interrupt note is never a prompt: it ends the terminal's turn (turn_interrupted, never sent on)", () => {
+    assert.deepEqual(shown(user([{ type: "text", text: "[Request interrupted by user for tool use]" }])), ["turn_interrupted"]);
+    assert.deepEqual(shown(user("[Request interrupted by user]")), ["turn_interrupted"]);
+    assert.deepEqual(shown(user("[Request interrupted by user] is what it printed", human)), ["[Request interrupted by user] is what it printed"]);
+  });
+});
+
+describe("reading a transcript another process writes", () => {
+  test("each line becomes what an adapter would have sent; what a phone has no use for is nothing", () => {
+    const j = (d: unknown) => JSON.stringify(d);
+    const rows: Array<[string, string, Array<[string, unknown]>]> = [
+      ["the user's words", j({ type: "user", message: { role: "user", content: "hi" } }), [["user_message_chunk", "hi"]]],
+      ["the agent's words", j({ type: "assistant", message: { content: [{ type: "text", text: "ok" }] } }), [["agent_message_chunk", "ok"]]],
+      ["a step it starts", j({ type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "/a/b.ts" } }] } }), [["tool_call", "Read: /a/b.ts"]]],
+      ["how a step ended", j({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: [{ type: "text", text: "boom" }] }] } }), [["tool_call_update", "failed"]]],
+      ["thinking", j({ type: "assistant", message: { content: [{ type: "thinking", thinking: "x" }] } }), []],
+      ["a sub-agent", j({ type: "assistant", isSidechain: true, message: { content: [{ type: "text", text: "x" }] } }), []],
+      ["Claude Code's own lines", j({ type: "user", isMeta: true, message: { content: "x" } }), []],
+      ["a summary", j({ type: "summary", summary: "x" }), []],
+      ["not JSON", "{ half", []],
+      ["empty text", j({ type: "assistant", message: { content: [{ type: "text", text: "  " }] } }), []],
+    ];
+    for (const [what, line, want] of rows) {
+      const got = transcriptUpdates(line).map((u) => [u.type, u.type === "tool_call" ? u.update.title : u.type === "tool_call_update" ? u.update.status : (u.update.content as { text: string }).text]);
+      assert.deepEqual(got, want, what);
+    }
+  });
+
+  test("the tail reads only what is new, waits for a line to be whole, survives a character split across reads and a rewrite", () => {
+    const file = path.join(tmpdir("cc-tail-"), "t.jsonl");
+    let where: string | null = null;
+    const tail = new TranscriptTail(() => where);
+    assert.deepEqual(tail.backlog(), [], "no file yet");
+    where = file;
+    const say = (t: string) => `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: t } ] } })}\n`;
+    fs.writeFileSync(file, Array.from({ length: 30 }, (_, i) => say(`old ${i}`)).join(""));
+    const texts = (us: ReturnType<TranscriptTail["poll"]>) => us.map((u) => (u.update.content as { text: string }).text);
+    assert.deepEqual(texts(new TranscriptTail(() => file).backlog()).length, 20, "the backlog is the last twenty");
+    // A backlog read that ends inside a character keeps its first bytes: the line completes on the next poll, whole.
+    const cutFile = path.join(path.dirname(file), "cut.jsonl");
+    const whole = Buffer.from(say("下一步"));
+    const mid = whole.indexOf(Buffer.from("下")) + 2;
+    fs.writeFileSync(cutFile, Buffer.concat([Buffer.from(say("before")), whole.subarray(0, mid)]));
+    const cutTail = new TranscriptTail(() => cutFile);
+    assert.deepEqual(texts(cutTail.backlog()), ["before"]);
+    fs.appendFileSync(cutFile, whole.subarray(mid));
+    assert.deepEqual(texts(cutTail.poll()), ["下一步"]);
+    tail.fromEnd();
+    assert.deepEqual(tail.poll(), []);
+    const line = Buffer.from(say("完成了"));
+    const cut = line.indexOf(Buffer.from("完")) + 1;   // inside the character
+    fs.appendFileSync(file, line.subarray(0, cut));
+    assert.deepEqual(tail.poll(), [], "half a line is held");
+    fs.appendFileSync(file, line.subarray(cut));
+    assert.deepEqual(texts(tail.poll()), ["完成了"]);
+    fs.writeFileSync(file, say("rewritten"));
+    assert.deepEqual(tail.poll(), [], "a rewritten file is followed from its new end");
+    fs.appendFileSync(file, say("after"));
+    assert.deepEqual(texts(tail.poll()), ["after"]);
+  });
+
+  test("a read that fails part way through a look keeps what the reads before it gave; the next look reads on (codex r1 on #674)", () => {
+    const file = path.join(tmpdir("cc-tail-"), "t.jsonl");
+    fs.writeFileSync(file, "");
+    const tail = new TranscriptTail(() => file);
+    tail.fromEnd();
+    const line = (o: Record<string, unknown>) => `${JSON.stringify({ sessionId: "s", isSidechain: false, ...o })}\n`;
+    const step = (id: string) => line({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: { command: "true" } }] } });
+    fs.appendFileSync(file, step("toolu_first") + line({ type: "attachment", attachment: { type: "prompt_snapshot", text: "x".repeat(600_000) } }) + step("toolu_after"));
+    const real = fs.readSync;
+    let reads = 0;
+    (fs as { readSync: unknown }).readSync = (...a: unknown[]) => { if (++reads === 2) throw new Error("EIO"); return (real as (...x: unknown[]) => number)(...a); };
+    let got: ReturnType<TranscriptTail["poll"]>;
+    try { got = tail.poll(); } finally { (fs as { readSync: unknown }).readSync = real; }
+    assert.deepEqual(got.filter((u) => u.type === "tool_call").map((u) => u.update.toolCallId), ["toolu_first"], "the first read's step is kept");
+    assert.deepEqual(tail.poll().filter((u) => u.type === "tool_call").map((u) => u.update.toolCallId), ["toolu_after"], "the next look reads on");
+  });
+
+  test("a step written after a large line (Claude Code's prompt_snapshot attachment) comes on the first look, not a look per 256 KB later (#505 acceptance)", () => {
+    const file = path.join(tmpdir("cc-tail-"), "t.jsonl");
+    fs.writeFileSync(file, "");
+    const tail = new TranscriptTail(() => file);
+    tail.fromEnd();
+    const line = (o: Record<string, unknown>) => `${JSON.stringify({ sessionId: "s", isSidechain: false, ...o })}\n`;
+    for (const size of [900_000, 1_500_000]) {   // (one Claude Code reads whole, one past the line limit it skips)
+      fs.appendFileSync(file, line({ type: "user", message: { role: "user", content: "run it" } })
+        + line({ type: "attachment", attachment: { type: "prompt_snapshot", text: "x".repeat(size) } })
+        + line({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: `toolu_${size}`, name: "Bash", input: { command: "sleep 3" } }] } }));
+      const got = tail.poll();
+      assert.deepEqual(got.filter((u) => u.type === "tool_call").map((u) => u.update.toolCallId), [`toolu_${size}`], `after ${size} bytes`);
+    }
   });
 });
 
@@ -405,8 +905,103 @@ async function attachHarness(o: { live?: Array<Record<string, unknown>>; cliMode
   return h;
 }
 
+/** What Claw sends with a takeover the person has just confirmed: the flag and until when the confirmation holds. */
+const fresh = () => ({ takeover: true, takeover_until: Date.now() + 5 * 60_000 });
 const closedReason = (h: Harness, sid: string) => h.claw.eventsOf(sid, "session_closed")[0]?.data.reason;
 const adapterMethods = (h: Harness) => h.adapterLog().map((l) => l.method).filter(Boolean);
+
+// The shapes Claude Code writes, as measured on 2.1.312 (claude-agent-acp 0.99.0) and 2.1.319 (a terminal), contents cut.
+const jl = (...entries: Array<Record<string, unknown>>) => entries.map((e) => JSON.stringify(e) + "\n").join("");
+const SDK = { entrypoint: "sdk-cli", userType: "external", isSidechain: false, sessionId: REF };
+const CLI = { ...SDK, entrypoint: "cli" };
+const agentTurn = (text: string) => [
+  { type: "queue-operation", operation: "enqueue", sessionId: REF },
+  { type: "queue-operation", operation: "dequeue", sessionId: REF },
+  { ...SDK, type: "user", message: { role: "user", content: text }, promptSource: "sdk", origin: { kind: "human" } },
+  { type: "api-request", sessionId: REF },
+  { ...SDK, type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } },
+];
+/** The agent's own turn that started a background task (`run_in_background`), which records the task's id. */
+const startedTask = (id: string) => [
+  ...agentTurn("run the tests in the background"),
+  { ...SDK, type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: `toolu_${id}`, name: "Bash", input: {} }] } },
+  { ...SDK, type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: `toolu_${id}`, content: "running" }] }, toolUseResult: { stdout: "", backgroundTaskId: id } },
+];
+/** A background task has finished: Claude Code writes the notification as its own prompt and answers it. */
+const notified = (id: string) => ({ ...SDK, type: "user", message: { role: "user", content: `<task-notification>\n<task-id>${id}</task-id>\n<tool-use-id>toolu_${id}</tool-use-id>\n<status>completed</status>\n</task-notification>` }, promptSource: "system", origin: { kind: "task-notification", producer: "session-task", runId: "r1" } });
+const selfTurn = [
+  { type: "queue-operation", operation: "enqueue", sessionId: REF },
+  { type: "queue-operation", operation: "dequeue", sessionId: REF },
+  notified("bktod8m08"),
+  { type: "api-request-blob", message: { role: "user", content: [{ type: "text", text: "…" }] } },
+  { type: "api-request", sessionId: REF },
+  { ...SDK, type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } },
+  { ...SDK, type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] }, toolUseResult: {} },
+  { ...SDK, type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "finished" }] } },
+  { ...SDK, type: "system", subtype: "turn_duration", isMeta: false },
+  { type: "last-prompt", sessionId: REF }, { type: "ai-title", sessionId: REF }, { type: "mode", sessionId: REF },
+];
+/** A person typed a prompt in a terminal: the same session, another program. */
+const typedTurn = [
+  { type: "file-history-snapshot", sessionId: REF },
+  { ...CLI, type: "user", message: { role: "user", content: "fix it" }, promptSource: "typed", origin: { kind: "human" } },
+  { ...CLI, type: "attachment" },
+  { ...CLI, type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "fixed" }] } },
+  { ...CLI, type: "system", subtype: "turn_duration", isMeta: false },
+];
+
+describe("who wrote what a transcript gained between two prompts", () => {
+  const OWN = { entrypoint: "sdk-cli", tasks: new Set(["bktod8m08"]) };
+  const classify = (text: string, own: { entrypoint: string | null; tasks: ReadonlySet<string> } = OWN) => classifyAppended(text, own, Buffer.byteLength(text));
+
+  test("the agent's own turn on a finished background task, and its own interruption note, are its own", () => {
+    assert.deepEqual(classify(jl(...selfTurn)), { by: "self", size: Buffer.byteLength(jl(...selfTurn)), tasks: [] });
+    const interrupted = jl({ ...SDK, type: "user", message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user for tool use]" }] } });
+    assert.equal(classify(interrupted).by, "self");
+    assert.equal(classify("").by, "self", "nothing written");
+  });
+
+  test("a person's prompt typed in a terminal is not, nor anything another program wrote", () => {
+    assert.equal(classify(jl(...typedTurn)).by, "other");
+    // Even one entry of a terminal among the agent's own.
+    assert.equal(classify(jl(...selfTurn, { ...CLI, type: "attachment" })).by, "other");
+    // A terminal's entries with no prompt in them (opened, a slash command, closed) are still a terminal's.
+    assert.equal(classify(jl({ ...CLI, type: "system", subtype: "local_command" })).by, "other");
+  });
+
+  test("a notification of a task this agent did not start is another process's turn, though it is the same program", () => {
+    // Another SDK process (a second adapter, a `claude -p`) that resumed the conversation, started a task and left.
+    assert.deepEqual(classify(jl(notified("bzzzzzzzz"))), { by: "other", why: "a notification of a task this agent did not start" });
+    assert.equal(classify(jl({ ...notified("bktod8m08"), message: { role: "user", content: "<task-notification>no id</task-notification>" } })).by, "other");
+    // A task the agent's own turn on a notification started is its own too, and so is that task's notification later.
+    const chained = jl(...selfTurn.slice(0, 6), { ...SDK, type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "" }] }, toolUseResult: { backgroundTaskId: "b2" } });
+    assert.deepEqual(classify(chained), { by: "self", size: Buffer.byteLength(chained), tasks: ["b2"] });
+    assert.equal(classify(jl(notified("b2"))).by, "other", "not before it is known");
+    assert.equal(classify(jl(notified("b2")), { entrypoint: "sdk-cli", tasks: new Set(["b2"]) }).by, "self");
+  });
+
+  test("a prompt the connector did not send is someone else's turn, even from the same kind of program (`claude -p`)", () => {
+    assert.equal(classify(jl(...agentTurn("hello"))).by, "other");
+    assert.equal(classify(jl({ ...SDK, type: "user", message: { role: "user", content: [{ type: "image" }] } })).by, "other", "an image is a prompt too");
+    assert.equal(classify(jl({ ...SDK, type: "user" })).by, "other", "a user entry that says nothing about what it is: not the agent's for certain");
+    assert.equal(classify(jl({ ...SDK, type: "user", message: { role: "user", content: "x" }, origin: { kind: "something-new" } })).by, "other", "an origin not known to be the agent's own");
+  });
+
+  test("while the agent's own program is not known, any entry that names one is not its own; what cannot be read is not either", () => {
+    assert.equal(classify(jl(...selfTurn), { entrypoint: null, tasks: OWN.tasks }).by, "other");
+    assert.equal(classify(jl({ type: "last-prompt" }), { entrypoint: null, tasks: new Set() }).by, "self", "an entry that names no program and is no prompt");
+    assert.equal(classify("{not json}\n").by, "other");
+    assert.equal(classify("[1]\n").by, "other");
+    assert.deepEqual(classify(jl(...selfTurn).slice(0, -5)), { by: "partial" }, "an entry still being written");
+  });
+
+  test("the program that wrote a turn, and the tasks it started, are read from the turn: one program, or none when two did", () => {
+    assert.deepEqual(ownTurnOf(jl(...agentTurn("hi"))), { entrypoint: "sdk-cli", tasks: [] });
+    assert.deepEqual(ownTurnOf(jl(...startedTask("bktod8m08"))), { entrypoint: "sdk-cli", tasks: ["bktod8m08"] });
+    assert.equal(ownTurnOf(jl(...agentTurn("hi"), ...typedTurn)).entrypoint, null);
+    assert.equal(ownTurnOf(jl({ type: "mode" })).entrypoint, null);
+  });
+});
 
 describe("attach end to end", () => {
   test("the heartbeat lists what can be taken over, newest first, inside the roots, with its state; the kind is opaque", async () => {
@@ -415,10 +1010,24 @@ describe("attach end to end", () => {
     const hb = await h.claw.until("a heartbeat with the list", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
     const a = hb.agents[0];
     assert.equal(a.kind, "attach");
+    assert.equal(a.capabilities.watch_live, true, "it says a conversation open in a terminal can be watched");
     assert.deepEqual(a.capabilities.resumable.map((r: any) => [r.ref, r.title, r.state]), [[REF, "Fix the flaky test", "idle"], [REF2, "Second", "live"]], "REF3 is outside the roots and is not offered");
     assert.equal(a.capabilities.resumable[0].updated_at, Date.parse("2026-10-29T10:00:00.000Z") / 1000);
     assert.equal(a.capabilities.resumable[0].cwd, fs.realpathSync(h.work));
     assert.ok(!JSON.stringify(a).includes("claude") && !JSON.stringify(a).includes("Claude"), "Claw is told nothing about the product");
+  });
+
+  test("a conversation in the folder of a Claude Code whose registry row cannot be read is reported unknown, not idle", { skip: process.platform !== "linux" }, async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF2, status: "idle" }] });
+    const blind = claudeNamed(fs.realpathSync(h.work));
+    await new Promise((r) => setTimeout(r, 100));
+    emptyRow(h.attachDir, blind.pid!);
+    await h.online();
+    // (the connector may have reported once before the row was written: the report after it is the one that counts)
+    const hb = await h.claw.until("a heartbeat that says REF is unknown", () => h.claw.heartbeats.find((b) =>
+      b.agents[0].capabilities.resumable?.some((r: any) => r.ref === REF && r.state === "unknown")));
+    // REF was "idle" (offered to take over); REF2 is still the live one its own row names
+    assert.deepEqual(hb.agents[0].capabilities.resumable.map((r: any) => [r.ref, r.state]), [[REF, "unknown"], [REF2, "live"]]);
   });
 
   test("a session is taken over in its own directory, in the ask mode, whatever mode it was left in; a write asks", async () => {
@@ -479,16 +1088,283 @@ describe("attach end to end", () => {
     assert.equal(h.claw.eventsOf(sid, "session_started").length, 0);
   });
 
-  test("a live twin refuses the takeover before an adapter is started", async () => {
-    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }] });
+  test("a conversation open in a terminal is watched read-only: its output arrives, nothing typed reaches it, and the watch ends with the terminal", async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing: { spectateMs: 20, spectateCheckMs: 100 } });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const line = (doc: Record<string, unknown>) => fs.appendFileSync(file, `${JSON.stringify({ sessionId: REF, isSidechain: false, ...doc })}\n`);
+    line({ type: "user", message: { role: "user", content: "run the tests" } });
+    line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Running them now." }] } });
     const sid = await h.attach(REF);
-    assert.equal(closedReason(h, sid), "session_live");
-    assert.deepEqual(adapterMethods(h).filter((m) => m !== "initialize" && m !== "session/list"), [], "nothing was resumed");
-    assert.ok(h.audit().some((a) => a.kind === "attach_refused" && a.reason === "session_live"));
-    // The terminal is closed: the same request now goes through.
+    const started = h.claw.eventsOf(sid, "session_started")[0]!.data;
+    assert.deepEqual([started.read_only, started.read_only_reason, started.attached, started.acp_session_id], [true, "session_live", true, REF]);
+    assert.equal(closedReason(h, sid), undefined, "not refused: watched");
+    assert.deepEqual(adapterMethods(h).filter((m) => m !== "initialize" && m !== "session/list"), [], "nothing was resumed or started");
+    assert.ok(h.audit().some((a) => a.kind === "session_spectating"));
+    // What was there before: sent once, marked as history, right after session_started. The connector posts events in
+    // batches as their lines reach its outbox on disk, so session_started can be posted (and `attach` return) one batch
+    // ahead of the history: it is waited for, not assumed to have come in the same request.
+    const history = () => h.claw.eventsOf(sid).filter((e) => e.data.replay === true)
+      .map((e) => [e.type, e.data.update.content.text, e.data.read_only]);
+    const shown: unknown[][] = [["user_message_chunk", "run the tests", true], ["agent_message_chunk", "Running them now.", true]];
+    await h.claw.until("the history", () => history().length >= shown.length);
+    assert.deepEqual(history(), shown);
+    assert.deepEqual(h.claw.eventsOf(sid).slice(0, 3).map((e) => e.type), ["session_started", "user_message_chunk", "agent_message_chunk"], "the history follows session_started, before anything new");
+    // The terminal goes on: each new line arrives, scrubbed, as the update an adapter would have sent.
+    line({ type: "assistant", message: { role: "assistant", content: [{ type: "thinking", thinking: "a private musing" }, { type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "npm test" } }] } });
+    line({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "12 passed, token ghp_abcdefghijklmnopqrstuvwxyz0123 seen" }] } });
+    line({ type: "assistant", isSidechain: true, message: { role: "assistant", content: [{ type: "text", text: "a sub-agent's aside" }] } });
+    fs.appendFileSync(file, JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "全部通过。" }] } }).slice(0, 40));
+    const call = await h.claw.until("the tool call", () => h.claw.eventsOf(sid, "tool_call")[0]);
+    assert.deepEqual([call.data.update.toolCallId, call.data.update.title, call.data.read_only, call.data.replay], ["toolu_1", "Bash: npm test", true, undefined]);
+    const result = await h.claw.until("its result", () => h.claw.eventsOf(sid, "tool_call_update")[0]);
+    assert.equal(result.data.update.status, "completed");
+    assert.ok(!JSON.stringify(result.data).includes("ghp_abcdef"), "a credential in the output is masked before it leaves");
+    assert.match(JSON.stringify(result.data), /12 passed/);
+    // A line written in two pieces is read once it is whole.
+    fs.appendFileSync(file, `${JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "全部通过。" }] } }).slice(40)}\n`);
+    await h.claw.until("the last line", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "全部通过。"));
+    assert.ok(!h.claw.eventsOf(sid).some((e) => JSON.stringify(e.data).includes("private musing") || JSON.stringify(e.data).includes("sub-agent")), "thinking and sub-agents are not shown");
+    assert.deepEqual(history(), shown, "the history was sent once, and nothing new is marked as history");
+
+    // Typing into it is refused, by name, and not one byte reaches the transcript.
+    const bytes = fs.readFileSync(file);
+    const seq = h.prompt(sid, "say do something else");
+    const rejected = await h.claw.until("the prompt to be refused", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.deepEqual([rejected.data.type, rejected.data.reason, rejected.data.cmd_seq], ["prompt", "read_only_live_session", seq]);
+    const end = await h.turnEnd(sid);
+    assert.deepEqual([end.data.stopReason, end.data.error, end.data.cmd_seq], ["error", "read_only_live_session", seq]);
+    h.claw.issue("set_mode", sid, { mode_id: "plan" });
+    await h.claw.until("the mode change to be refused", () => h.claw.eventsOf(sid, "command_rejected")[1]);
+    assert.equal(h.claw.eventsOf(sid, "command_rejected")[1]!.data.reason, "read_only_live_session");
+    h.claw.issue("resume", sid, {});
+    const resumed = await h.claw.until("the resume to answer", () => h.claw.eventsOf(sid, "session_resumed")[0]);
+    assert.equal(resumed.data.read_only, true);
+    assert.deepEqual(h.adapterLog().filter((l) => l.prompt), [], "no prompt reached any agent");
+    assert.ok(!adapterMethods(h).some((m) => m === "session/resume" || m === "session/prompt" || m === "session/set_mode"), "no agent was started");
+    assert.ok(fs.readFileSync(file).equals(bytes), "the transcript is exactly as the terminal left it");
+    // The list still says the terminal has it: watching is not holding.
+    await h.claw.until("a heartbeat that says live", () => [...h.claw.heartbeats].reverse().find((b) => b.agents[0].capabilities.resumable?.find((r: any) => r.ref === REF)?.state === "live"));
+
+    // The terminal is closed: the watch ends, and the conversation can now be taken over through the full check.
     h.setLive([]);
+    await h.claw.until("the watch to end", () => closedReason(h, sid) !== undefined);
+    assert.equal(closedReason(h, sid), "terminal_closed");
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
     const again = await h.attach(REF);
-    assert.equal(h.claw.eventsOf(again, "session_started").length, 1);
+    const taken = h.claw.eventsOf(again, "session_started")[0]!.data;
+    assert.equal(taken.read_only, undefined);
+    assert.equal(adapterMethods(h).filter((m) => m === "session/resume").length, 1);
+  });
+
+  test("a watched terminal's steps reach Claw dated when Claude Code wrote them, each its own, however many one read takes", async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const line = (doc: Record<string, unknown>) => `${JSON.stringify({ sessionId: REF, isSidechain: false, ...doc })}\n`;
+    fs.writeFileSync(file, line({ type: "user", timestamp: new Date(Date.now() - 600_000).toISOString(), message: { role: "user", content: "earlier" } }));
+    const sid = await h.attach(REF);
+    await h.claw.until("the history", () => h.claw.eventsOf(sid).some((e) => e.data.replay === true));
+    // Four steps of one turn, a few seconds apart as Claude Code wrote them, all reaching the file before the next read.
+    const t0 = Date.now() - 40_000;
+    const iso = (ms: number) => new Date(ms).toISOString();
+    fs.appendFileSync(file, [
+      line({ type: "assistant", timestamp: iso(t0), message: { role: "assistant", content: [{ type: "text", text: "Looking." }, { type: "tool_use", id: "toolu_a", name: "Read", input: { file_path: "/w/a.ts" } }] } }),
+      line({ type: "user", timestamp: iso(t0 + 3_000), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_a", content: "x" }] } }),
+      line({ type: "assistant", timestamp: iso(t0 + 9_000), message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_b", name: "Bash", input: { command: "npm test" } }] } }),
+      // (one with no time, and one dated ahead of this machine's clock: dated when sent)
+      line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "undated" }] } }),
+      line({ type: "assistant", timestamp: iso(Date.now() + 3_600_000), message: { role: "assistant", content: [{ type: "text", text: "ahead" }] } }),
+    ].join(""));
+    const sentFrom = Date.now();
+    await h.claw.until("the last step", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "ahead"));
+    const live = h.claw.eventsOf(sid).filter((e) => e.data.replay !== true && e.type !== "session_started");
+    const ts = (type: string, pick: (e: (typeof live)[number]) => boolean) => live.find((e) => e.type === type && pick(e))?.ts;
+    assert.equal(ts("agent_message_chunk", (e) => e.data.update.content.text === "Looking."), t0);
+    assert.equal(ts("tool_call", (e) => e.data.update.toolCallId === "toolu_a"), t0);
+    assert.equal(ts("tool_call_update", (e) => e.data.update.toolCallId === "toolu_a"), t0 + 3_000);
+    assert.equal(ts("tool_call", (e) => e.data.update.toolCallId === "toolu_b"), t0 + 9_000);
+    assert.deepEqual(live.find((e) => e.type === "tool_call" && e.data.update.toolCallId === "toolu_b")?.data.update._meta, { claudeCode: { toolName: "Bash" } });
+    for (const text of ["undated", "ahead"]) {
+      const at = ts("agent_message_chunk", (e) => e.data.update.content.text === text)!;
+      assert.ok(at >= sentFrom - 1_000 && at <= Date.now(), `${text}: ${at - sentFrom}`);
+    }
+  });
+
+  test("a takeover the person confirmed ends the terminal that has the conversation open, then resumes it; without it, the same request is only watched", async () => {
+    const h = await attachHarness({ timing: { spectateMs: 20, spectateCheckMs: 60_000, recentWriteMs: 300, takeoverWaitMs: 8_000 } });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({ type: "user", sessionId: REF, message: { role: "user", content: "hello" } })}\n`);
+    // The terminal: a real process that, like Claude Code on SIGTERM, writes the end of its transcript, drops its row and exits.
+    const liveFile = (h as unknown as { liveFile: string }).liveFile;
+    // (the paths reach it through its environment, never through the code it runs)
+    const script = 'process.on("SIGTERM", () => { const fs = require("fs"); fs.appendFileSync(process.env.T_FILE, JSON.stringify({ type: "system", subtype: "end" }) + "\\n"); fs.writeFileSync(process.env.T_LIVE, "[]"); process.exit(0); }); setInterval(() => {}, 1000);';
+    const term = spawn(process.execPath, ["-e", script], { stdio: "ignore", cwd: h.work, env: { ...process.env, T_FILE: file, T_LIVE: liveFile } });
+    children.push(term);
+    await new Promise((r) => setTimeout(r, 300));   // (its handler is in place)
+    h.setLive([{ pid: term.pid, sessionId: REF, status: "busy" }]);
+
+    const watched = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(watched, "session_started")[0]!.data.read_only, true, "no takeover asked for: watched");
+    assert.equal(term.exitCode, null, "the terminal is untouched by a request that did not ask to take it over");
+    h.claw.issue("close", watched, {});
+    await h.claw.until("the watch to close", () => closedReason(h, watched) !== undefined);
+
+    const exited = new Promise<number | null>((r) => term.once("exit", (code) => r(code)));
+    const sid = await h.attach(REF, h.work, fresh());
+    assert.equal(closedReason(h, sid), undefined, `taken over, not refused (${closedReason(h, sid)})`);
+    const started = h.claw.eventsOf(sid, "session_started")[0]!.data;
+    assert.deepEqual([started.read_only, started.took_over, started.acp_session_id], [undefined, true, REF]);
+    assert.equal(await Promise.race([exited, new Promise((r) => setTimeout(() => r("still running"), 5_000))]), 0, "the terminal was asked to end and ended by itself");
+    assert.equal(adapterMethods(h).filter((m) => m === "session/resume").length, 1, "resumed once, after the terminal was gone");
+    assert.match(fs.readFileSync(file, "utf8"), /"subtype":"end"/, "what the terminal wrote on its way out is kept");
+    const ended = h.audit().find((a) => a.kind === "terminal_ended");
+    assert.deepEqual(ended?.pids, [term.pid]);
+    await h.online();
+    const hb = await h.claw.until("a heartbeat", () => h.claw.heartbeats.at(-1));
+    assert.equal(hb.agents[0].capabilities.takeover, true, "the phone is told a takeover can be asked for");
+  });
+
+  test("a holder proven by its registry row (this machine's pid domain, the same process start) is ended too, without the command's word", async () => {
+    const h = await attachHarness({ live: [], cliMode: "fail", timing: { recentWriteMs: 100, takeoverWaitMs: 5_000, spectateMs: 20, spectateCheckMs: 60_000 } });
+    const term = openTerminal(h.attachDir, REF, h.work);
+    const sid = await h.attach(REF, h.work, fresh());
+    assert.equal(closedReason(h, sid), undefined, `taken over (${closedReason(h, sid)})`);
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.took_over, true);
+    assert.ok(!(await import("../src/children.js")).isAlive(term.pid), "the terminal's process was ended");
+  });
+
+  test("a takeover that reaches the machine after its confirmation lapsed, or names no deadline, ends nothing and resumes nothing", async () => {
+    for (const [label, extra] of [["late", { takeover: true, takeover_until: Date.now() - 1 }], ["no deadline", { takeover: true }]] as const) {
+      const h = await attachHarness({ timing: { recentWriteMs: 100, takeoverWaitMs: 2_000 } });
+      const term = sleeper({ cwd: h.work });
+      await new Promise((r) => setTimeout(r, 200));
+      h.setLive([{ pid: term.pid, sessionId: REF, status: "busy" }]);
+      const sid = await h.attach(REF, h.work, extra);
+      await h.claw.until("refused", () => closedReason(h, sid) !== undefined);
+      assert.equal(closedReason(h, sid), "takeover_expired", label);
+      await new Promise((r) => setTimeout(r, 200));
+      assert.deepEqual([term.exitCode, term.signalCode], [null, null], `${label}: the terminal is untouched`);
+      assert.ok(!adapterMethods(h).includes("session/resume"), label);
+      assert.equal(h.claw.eventsOf(sid, "session_started").length, 0, `${label}: not even watched`);
+    }
+  });
+
+  test("a takeover is refused, and nothing is resumed, when the terminal cannot be ended", async () => {
+    // Another host shares the config directory: its process cannot be ended from here.
+    const far = await attachHarness({ live: [], timing: { recentWriteMs: 100, takeoverWaitMs: 2_000 } });
+    fs.mkdirSync(path.join(far.attachDir, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(far.attachDir, "sessions", "424242.json"), JSON.stringify({ pid: 424242, sessionId: REF, status: "busy", kind: "interactive", pidDomain: "another-host:0" }));
+    const sid1 = await far.attach(REF, far.work, fresh());
+    await far.claw.until("refused", () => closedReason(far, sid1) !== undefined);
+    assert.equal(closedReason(far, sid1), "session_live_elsewhere");
+    assert.ok(!adapterMethods(far).includes("session/resume"));
+
+    // A row that names a live local pid but not this machine's pid domain proves nothing: that pid is not signalled.
+    const unproven = await attachHarness({ live: [], timing: { recentWriteMs: 100, takeoverWaitMs: 2_000 } });
+    const bystander = sleeper();
+    fs.mkdirSync(path.join(unproven.attachDir, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(unproven.attachDir, "sessions", `${bystander.pid}.json`), JSON.stringify({ pid: bystander.pid, sessionId: REF, status: "busy", kind: "interactive" }));
+    const sid0 = await unproven.attach(REF, unproven.work, fresh());
+    await unproven.claw.until("refused", () => closedReason(unproven, sid0) !== undefined);
+    assert.equal(closedReason(unproven, sid0), "takeover_failed");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(bystander.exitCode, null, "a process that is not proven to hold it is never signalled");
+    assert.equal(bystander.signalCode, null);
+    assert.ok(!adapterMethods(unproven).includes("session/resume"));
+
+    // A proven holder whose working directory is outside the agent's roots is not this agent's to end.
+    const outside = await attachHarness({ live: [], cliMode: "fail", timing: { recentWriteMs: 100, takeoverWaitMs: 2_000 } });
+    const far2 = openTerminal(outside.attachDir, REF, os.tmpdir());
+    const sid3 = await outside.attach(REF, outside.work, fresh());
+    await outside.claw.until("refused", () => closedReason(outside, sid3) !== undefined);
+    assert.equal(closedReason(outside, sid3), "takeover_failed");
+    assert.ok((await import("../src/children.js")).isAlive(far2.pid), "a process outside the roots is never signalled");
+    assert.ok(!adapterMethods(outside).includes("session/resume"));
+
+    // A terminal that does not exit when asked: refused once the wait is over; it is not killed harder.
+    const stubborn = await attachHarness({ timing: { recentWriteMs: 100, takeoverWaitMs: 1_000 } });
+    const term = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'], { stdio: "ignore", cwd: stubborn.work });
+    children.push(term);
+    await new Promise((r) => setTimeout(r, 300));
+    stubborn.setLive([{ pid: term.pid, sessionId: REF, status: "busy" }]);
+    const sid2 = await stubborn.attach(REF, stubborn.work, fresh());
+    await stubborn.claw.until("refused", () => closedReason(stubborn, sid2) !== undefined);
+    assert.equal(closedReason(stubborn, sid2), "terminal_did_not_exit");
+    assert.equal(term.exitCode, null, "still running: only asked, never killed");
+    assert.ok(!adapterMethods(stubborn).includes("session/resume"));
+    assert.ok(stubborn.audit().some((a) => a.kind === "takeover_refused" && a.reason === "terminal_did_not_exit"));
+  });
+
+  test("a read-only session stays read-only after the connector restarts", async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    const sid = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.read_only, true);
+    await h.stop();
+    h.connect({ timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    h.start();
+    await h.online();
+    h.setLive([]);   // even with the terminal gone, a prompt after the restart is not a takeover by surprise
+    h.prompt(sid, "say hi");
+    const rejected = await h.claw.until("the prompt to be refused", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.equal(rejected.data.reason, "read_only_live_session");
+    assert.ok(!adapterMethods(h).includes("session/resume"));
+  });
+
+  test("a read-only session stays read-only after a restart even when its agent can no longer attach", async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    const sid = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.read_only, true);
+    await h.stop();
+    // The machine's config dropped the agent's attach support before the restart.
+    (h.config.agents.find((a) => a.id === "fake") as { attach: unknown }).attach = null;
+    h.connect({ timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    h.start();
+    await h.online();
+    h.prompt(sid, "say hi");
+    const rejected = await h.claw.until("the prompt to be refused", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.equal(rejected.data.reason, "read_only_live_session");
+    assert.ok(!adapterMethods(h).includes("session/resume"), "no adapter was launched on the terminal's conversation");
+  });
+
+  test("after a restart a watch goes on by itself, a replayed request to open it stays read-only, and it ends with the terminal", async () => {
+    const timing = { spectateMs: 20, spectateCheckMs: 100 };
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "");
+    const sid = await h.attach(REF);
+    assert.equal(h.claw.eventsOf(sid, "session_started")[0]!.data.read_only, true);
+    await h.stop();
+    h.connect({ timing });
+    h.start();
+    await h.claw.until("the restarted connector to be up", () => h.audit().filter((a) => a.kind === "connector_online").length === 2);
+    // Followed again without any command: what the terminal writes now arrives.
+    fs.appendFileSync(file, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "after the restart" }] } })}\n`);
+    await h.claw.until("output after the restart", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "after the restart"));
+    // The terminal closes and the transcript is old: a replay of the very request that opened the watch is still not a takeover.
+    h.setLive([]);
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    h.claw.issue("session.new", sid, { agent_id: "fake", cwd: h.work, mode: null, resume_ref: REF });
+    await h.claw.until("the watch to end", () => closedReason(h, sid) !== undefined);
+    assert.equal(closedReason(h, sid), "terminal_closed");
+    assert.ok(h.claw.eventsOf(sid, "session_started").every((e) => e.data.read_only === true), "never opened as a takeover");
+    assert.ok(!adapterMethods(h).includes("session/resume"));
+  });
+
+  test("a transcript reached through a link that leaves the config directory is not read", () => {
+    const dir = configDir();
+    const outside = path.join(tmpdir("cc-outside-"), "secret.jsonl");
+    fs.writeFileSync(outside, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "not yours" }] } })}\n`);
+    fs.mkdirSync(path.join(dir, "projects", "-x"), { recursive: true });
+    fs.symlinkSync(outside, path.join(dir, "projects", "-x", `${REF}.jsonl`));
+    const s = support(dir);
+    assert.equal(s.transcriptPath(REF), null);
+    fs.writeFileSync(path.join(dir, "projects", "-x", `${REF2}.jsonl`), "");
+    assert.equal(s.transcriptPath(REF2), fs.realpathSync(path.join(dir, "projects", "-x", `${REF2}.jsonl`)));
   });
 
   test("the requests that must be refused, each with its own reason and none starting a resume", async () => {
@@ -630,6 +1506,72 @@ describe("attach end to end", () => {
     assert.equal(h.connector.registry.list().length, 1);
   });
 
+  test("what the agent writes on its own between turns (a background task it started finishing) neither refuses the next prompt nor discards the agent", async () => {
+    // A window far longer than the test: a check of the transcript's age would refuse every prompt below.
+    const h = await attachHarness({ env: { FAKE_TRANSCRIPT: "1" }, timing: { recentWriteMs: 600_000 } });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, jl(...typedTurn));
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    const sid = await h.attach(REF);
+    const resumes = () => adapterMethods(h).filter((m) => m === "session/resume").length;
+    // Each task finishes when the test says so, after its turn's end has reached Claw. The connector takes the transcript's
+    // size when a turn ends: a notification written before that (a timer that beat a slow connector) is part of the turn,
+    // and there is no growth between turns left to see.
+    const finished = (n: number) => path.join(h.attachDir, `task-${n}-finished`);
+    h.prompt(sid, `background ${finished(1)}`);
+    assert.equal((await h.turnEnd(sid, 1)).data.stopReason, "end_turn");
+    fs.writeFileSync(finished(1), "");
+    await h.claw.until("the agent to answer the finished task by itself", () => fs.readFileSync(file, "utf8").includes("task-notification"));
+    assert.ok(Date.now() - fs.statSync(file).mtimeMs < 600_000, "the transcript was written a moment ago");
+    h.prompt(sid, "say two");
+    assert.equal((await h.turnEnd(sid, 2)).data.stopReason, "end_turn");
+    assert.equal(h.claw.eventsOf(sid, "command_rejected").length, 0, "not refused as recently_written");
+    assert.deepEqual(h.messages(sid), ["started", "two"]);
+    assert.equal(resumes(), 1, "the same agent goes on: it wrote what was added, so it is in its memory");
+    assert.ok(h.audit().some((a) => a.kind === "transcript_grew_by_agent"));
+    assert.ok(!h.audit().some((a) => a.kind === "transcript_changed"));
+    // And again, once more on its own: the agent's program is known from each of its turns.
+    h.prompt(sid, `background ${finished(2)}`);
+    assert.equal((await h.turnEnd(sid, 3)).data.stopReason, "end_turn");
+    fs.writeFileSync(finished(2), "");
+    await h.claw.until("the second notification", () => fs.readFileSync(file, "utf8").split('"kind":"task-notification"').length === 3);
+    h.prompt(sid, "say four");
+    assert.equal((await h.turnEnd(sid, 4)).data.stopReason, "end_turn");
+    assert.equal(h.claw.eventsOf(sid, "command_rejected").length, 0);
+    assert.equal(resumes(), 1);
+  });
+
+  test("a person who typed in a terminal between two prompts still holds the next one back, though the agent wrote on its own too", async () => {
+    const h = await attachHarness({ env: { FAKE_TRANSCRIPT: "1" }, timing: { recentWriteMs: 5_000 } });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, jl(...typedTurn));
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    const sid = await h.attach(REF);
+    const finished = path.join(h.attachDir, "task-finished");
+    h.prompt(sid, `background ${finished}`);
+    assert.equal((await h.turnEnd(sid, 1)).data.stopReason, "end_turn");
+    fs.writeFileSync(finished, "");
+    await h.claw.until("the agent's own turn", () => fs.readFileSync(file, "utf8").includes("task-notification"));
+    // A terminal opened the conversation, the person typed a prompt, it was answered, and the terminal closed.
+    fs.appendFileSync(file, jl(...typedTurn));
+    h.prompt(sid, "say two");
+    const rejected = await h.claw.until("the prompt to be held back", () => h.claw.eventsOf(sid, "command_rejected")[0]);
+    assert.equal(rejected.data.reason, "recently_written");
+    const changed = h.audit().find((a) => a.kind === "transcript_changed");
+    assert.equal(changed?.why, "entries written by another program");
+    assert.ok(!h.audit().some((a) => a.kind === "transcript_grew_by_agent"));
+    assert.deepEqual(h.adapterLog().filter((l) => l.prompt).map((l) => l.prompt), [`background ${finished}`], "not sent to the agent that has not read the terminal's turn");
+    // Once it has settled, a fresh agent that reads the transcript takes it.
+    fs.utimesSync(file, old, old);
+    h.prompt(sid, "say three");
+    await h.turnEnd(sid, 3);
+    assert.equal(adapterMethods(h).filter((m) => m === "session/resume").length, 2);
+  });
+
   test("a terminal that opens the conversation during a turn, takes a turn of its own and exits is noticed: the next prompt does not go to the agent that was running", async () => {
     const h = await attachHarness({ timing: { twinWatchMs: 20 } });
     const sid = await h.attach(REF);
@@ -745,5 +1687,135 @@ describe("attach end to end", () => {
     await h.attach(REF);
     const runs = fs.readFileSync(h.cliLog, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
     assert.ok(runs.length > 0 && runs.every((r) => r.args === "agents --json" && r.config === h.attachDir));
+  });
+});
+
+describe("the conversations already on the machine show up by themselves", () => {
+  const root = os.tmpdir();
+  const ids = (toml: string) => parseConfig(toml).agents.map((a) => [a.id, a.kind, a.attach?.cli ?? null]);
+
+  test("a claude agent brings one that lists its existing conversations, unless told not to or one already does", () => {
+    const claude = (extra = "", id = "cc") => `[[agents]]\nid = "${id}"\npreset = "claude"\nroots = ["${root}"]\n${extra}`;
+    assert.deepEqual(ids(claude()), [["cc", "claude", null], ["cc-sessions", "attach", "claude"]]);
+    const got = parseConfig(claude(`approval = "never"\nname = "Claude on my box"\n[agents.env]\nCLAUDE_CONFIG_DIR = "/x/cfg"\n`)).agents;
+    const [src, derived] = [got[0]!, got[1]!];
+    assert.deepEqual([derived.roots, derived.env, derived.askMode, derived.unattended, derived.allowUnsafeModes, derived.command, derived.args],
+      [src.roots, src.env, src.askMode, src.unattended, src.allowUnsafeModes, src.command, src.args], "the same roots, environment, adapter and approval");
+    assert.equal(derived.name, "Claude on my box (existing sessions)");
+    assert.notEqual(derived.env, src.env, "not the same object: editing one does not change the other");
+    assert.deepEqual(ids(claude(`existing_sessions = false\n`)), [["cc", "claude", null]], "the owner can turn it off");
+    assert.deepEqual(ids(`${claude()}\n[[agents]]\nid = "mine"\npreset = "claude-attach"\nroots = ["${root}"]\n`), [["cc", "claude", null], ["mine", "attach", "claude"]],
+      "a claude-attach agent on the same config directory already lists them");
+    assert.deepEqual(ids(`${claude(`[agents.env]\nCLAUDE_CONFIG_DIR = "/other"\n`)}\n[[agents]]\nid = "mine"\npreset = "claude-attach"\nroots = ["${root}"]\n`).map((r) => r[0]),
+      ["cc", "mine", "cc-sessions"], "one on another config directory does not");
+    assert.deepEqual(ids(`${claude()}\n[[agents]]\nid = "cc-sessions"\npreset = "codex"\nroots = ["${root}"]\n`).map((r) => r[0]), ["cc", "cc-sessions"],
+      "an agent of the owner's with that id wins");
+    assert.deepEqual(ids(`[[agents]]\nid = "x"\npreset = "codex"\nroots = ["${root}"]\n`), [["x", "codex", null]], "only Claude");
+    assert.throws(() => parseConfig(`[[agents]]\nid = "x"\npreset = "codex"\nexisting_sessions = true\nroots = ["${root}"]\n`), /existing_sessions only applies/);
+    assert.throws(() => parseConfig(claude(`existing_sessions = "no"\n`)), /existing_sessions must be true or false/);
+    const same = path.join(os.homedir(), ".claude-same-test");
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = same;
+    try {
+      assert.deepEqual(ids(`${claude()}\n[[agents]]\nid = "mine"\npreset = "claude-attach"\nroots = ["${root}"]\n[agents.env]\nCLAUDE_CONFIG_DIR = "${same}/"\n`).map((r) => r[0]),
+        ["cc", "mine"], "the same directory spelled differently (the connector's default here, written out there) is the same directory");
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev;
+    }
+    assert.ok(parseConfig(claude("", "a".repeat(64))).agents[1]!.id.length <= 64);
+  });
+
+  test("what a terminal says it is doing: waiting for its person wins, then working, then idle", () => {
+    const rows = parseAgentsJson(JSON.stringify([
+      { pid: 1, sessionId: REF, status: "waiting", waitingFor: "input needed", cwd: "/w" }, { pid: 2, sessionId: REF, status: "busy" },
+    ]));
+    assert.deepEqual([rows[0]!.waitingFor, rows[0]!.cwd, rows[1]!.waitingFor], ["input needed", "/w", null]);
+    assert.deepEqual(liveActivity(rows), { activity: "waiting", waiting_for: "input needed" });
+    assert.deepEqual(liveActivity([rows[1]!]), { activity: "working" });
+    assert.deepEqual(liveActivity(parseAgentsJson(JSON.stringify([{ pid: 3, sessionId: REF, status: "idle" }]))), { activity: "idle" });
+    // `shell` (Claude Code 2.1.32x): idle at its prompt with background shells running; it was read as a status it does not know.
+    assert.deepEqual(liveActivity(parseAgentsJson(JSON.stringify([{ pid: 3, sessionId: REF, status: "shell" }]))), { activity: "idle" });
+    assert.deepEqual(liveActivity(parseAgentsJson(JSON.stringify([{ pid: 3, sessionId: REF, status: "compacting" }]))), {}, "a status it does not know says nothing");
+    assert.deepEqual(liveActivity([{ pid: 4, sessionId: REF, status: "waiting", waitingFor: `token sk-ant-api03-${"x".repeat(40)}\nnext`, foreign: false }]).waiting_for?.includes("sk-ant"), false, "scrubbed");
+  });
+
+  test("the heartbeat says a conversation open in a terminal is waiting for its person, and what for", async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF2, status: "waiting", waitingFor: "input needed" }, { pid: process.pid, sessionId: REF, status: "busy" }] });
+    await h.online();
+    const hb = await h.claw.until("a heartbeat with the list", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
+    assert.deepEqual(hb.agents[0].capabilities.resumable.map((r: any) => [r.ref, r.state, r.activity ?? null, r.waiting_for ?? null]),
+      [[REF, "live", "working", null], [REF2, "live", "waiting", "input needed"]]);
+  });
+
+  test("a conversation a terminal has just opened is reported within seconds, not at the next heartbeat", async () => {
+    const work = tmpdir("cc-work-");
+    const real = fs.realpathSync(work);
+    const listFile = path.join(tmpdir("cc-list-"), "sessions.json");
+    fs.writeFileSync(listFile, JSON.stringify([{ sessionId: REF, cwd: work, title: "Old one", updatedAt: "2026-10-29T10:00:00.000Z" }]));
+    const h = await Harness.create({
+      work, env: { FAKE_SESSIONS_FILE: listFile }, attach: { sessions: [] },
+      // The heartbeat is a minute away: only the watcher can bring the new conversation in time.
+      timing: { heartbeatMs: 60_000, sessionsWatchMs: 100, catalogMs: 600_000 },
+    });
+    hs.push(h);
+    await h.claw.until("the first heartbeat", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
+    const before = h.claw.heartbeats.length;
+    await new Promise((r) => setTimeout(r, 400));   // (the watcher has taken its first look)
+    // A terminal opens a new conversation in the roots: Claude Code writes its transcript and its registry row.
+    const project = path.join(h.attachDir, "projects", real.replace(/[^A-Za-z0-9]/g, "-"));
+    fs.mkdirSync(project, { recursive: true });
+    fs.writeFileSync(path.join(project, `${REF2}.jsonl`), "{}\n");
+    fs.writeFileSync(listFile, JSON.stringify([
+      { sessionId: REF2, cwd: work, title: "Just opened", updatedAt: "2026-10-29T11:00:00.000Z" },
+      { sessionId: REF, cwd: work, title: "Old one", updatedAt: "2026-10-29T10:00:00.000Z" },
+    ]));
+    const term = sleeper();
+    fs.mkdirSync(path.join(h.attachDir, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(h.attachDir, "sessions", `${term.pid}.json`), JSON.stringify({
+      pid: term.pid, sessionId: REF2, cwd: real, status: "waiting", waitingFor: "input needed", kind: "interactive",
+      procStart: processStart(term.pid!), pidDomain: localPidDomain(),
+    }));
+    const hb = await h.claw.until("a heartbeat with the new conversation", () => h.claw.heartbeats.slice(before)
+      .find((b) => b.agents[0].capabilities.resumable?.some((r: any) => r.ref === REF2)), 5_000);
+    const row = hb.agents[0].capabilities.resumable.find((r: any) => r.ref === REF2);
+    assert.deepEqual([row.title, row.state, row.activity, row.waiting_for], ["Just opened", "live", "waiting", "input needed"]);
+    await stop(term);
+  });
+
+  test("so is one a terminal ran and already ended (claude -p): a new transcript in a project folder inside the roots", async () => {
+    const work = tmpdir("cc-work-");
+    const real = fs.realpathSync(work);
+    const listFile = path.join(tmpdir("cc-list-"), "sessions.json");
+    const old = { sessionId: REF, cwd: work, title: "Old one", updatedAt: "2026-10-29T10:00:00.000Z" };
+    fs.writeFileSync(listFile, JSON.stringify([old]));
+    const h = await Harness.create({
+      work, env: { FAKE_SESSIONS_FILE: listFile }, attach: { sessions: [] }, start: false,
+      // Only the watcher may wake a heartbeat here: the timer is a minute away, and so is the stream's watchdog. With the
+      // tests' 700 ms watchdog a stalled event loop (a busy runner; this process is the stand-in Claw too) reopened the
+      // stream, and its `ready` frame woke a heartbeat the watcher was blamed for (CI 2026-11-07: 3 where 2 were taken).
+      timing: { heartbeatMs: 60_000, watchdogMs: 60_000, sessionsWatchMs: 100, catalogMs: 600_000 },
+    });
+    hs.push(h);
+    const project = path.join(h.attachDir, "projects", real.replace(/[^A-Za-z0-9]/g, "-"));
+    fs.mkdirSync(project, { recursive: true });
+    fs.writeFileSync(path.join(project, `${REF}.jsonl`), "{}\n");
+    h.start();
+    await h.claw.until("the first heartbeat", () => h.claw.heartbeats.find((b) => b.agents[0].capabilities.resumable?.length));
+    // The command stream's `ready` frame wakes one more heartbeat; on a slow runner the stream opens after any fixed wait, so
+    // the count is taken once that heartbeat is in (CI 2026-11-07: counted 2 where 1 was taken as the baseline).
+    await h.online();
+    await h.claw.until("the heartbeat the stream's ready frame wakes", () => h.claw.heartbeats.length >= 2);
+    await new Promise((r) => setTimeout(r, 400));
+    const before = h.claw.heartbeats.length;
+    // Appending to a transcript is no new conversation and lists nothing again.
+    fs.appendFileSync(path.join(project, `${REF}.jsonl`), "{}\n");
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(h.claw.streamHeaders.length, 1, "the stream was never reopened (its ready frame wakes a heartbeat too)");
+    assert.equal(h.claw.heartbeats.length, before, "nothing changed that the phone is shown");
+    fs.writeFileSync(listFile, JSON.stringify([{ sessionId: REF2, cwd: work, title: "Ran and ended", updatedAt: "2026-10-29T11:00:00.000Z" }, old]));
+    fs.writeFileSync(path.join(project, `${REF2}.jsonl`), "{}\n");
+    const hb = await h.claw.until("a heartbeat with the ended conversation", () => h.claw.heartbeats.slice(before)
+      .find((b) => b.agents[0].capabilities.resumable?.some((r: any) => r.ref === REF2)), 5_000);
+    assert.deepEqual(hb.agents[0].capabilities.resumable.map((r: any) => [r.title, r.state]), [["Ran and ended", "idle"], ["Old one", "idle"]]);
   });
 });

@@ -92,6 +92,8 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
     )`,
   // The acting user's review mode the call ran under (`high_risk_confirm` or `fully_auto`, their own setting in claw_github_review_settings).
   `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS review_mode TEXT`,
+  // GitHub's merge state a merge was refused on (`merge_state_not_clean`: DIRTY is a conflict only the author can resolve), else null.
+  `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS merge_state TEXT`,
   `CREATE INDEX IF NOT EXISTS idx_github_audit_actor ON claw_github_audit(actor_user_id, at DESC)`,
   // One approval or merge decision at a time per acting user and pull request, across replicas (see acquireWriteLock).
   `CREATE TABLE IF NOT EXISTS claw_github_write_locks (
@@ -109,6 +111,9 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
   // What a review that was posted said, for the review item it belongs to (assistant/review-items.ts reviewRecord): its event and each inline
   // finding with the thread GitHub made for it. Written only for a review item's session; null for every other call.
   `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS posted JSONB`,
+  // Whether the call was held to its session's request budget (see {@link sessionRequestCount}): false for the calls the server makes on
+  // its own or on a person's answer (`skipBudget`), null on rows written before the column existed.
+  `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS budgeted BOOLEAN`,
 ];
 
 export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<void> {
@@ -192,6 +197,8 @@ export interface AuditStart {
   tool: string;
   /** A short summary of the arguments, never their full text and never a credential. */
   args: Record<string, unknown>;
+  /** Whether the call is held to the session's request budget; false for one that is not (`skipBudget`). Unset: held. */
+  budgeted?: boolean;
 }
 
 export interface AuditFinish {
@@ -213,6 +220,8 @@ export interface AuditFinish {
   reviewMode?: string;
   /** A posted review's record (`PostedReview`), for a review item's session only. */
   posted?: PostedReview | null;
+  /** GitHub's merge state a merge was refused on (`merge_state_not_clean`), else unset. */
+  mergeState?: string | null;
 }
 
 /** One inline finding of a posted review: where it is, the thread GitHub opened for it (null when that could not be read) and its first words. */
@@ -222,9 +231,9 @@ export interface PostedReview { event: string; review_id: number | null; finding
 
 export async function auditStart(db: Queryable, a: AuditStart): Promise<number> {
   const r = await db.query(
-    `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, arguments)
-     VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id`,
-    [a.requesterUserId, a.actorUserId, a.sessionId, a.tool, JSON.stringify(a.args)],
+    `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, arguments, budgeted)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6) RETURNING id`,
+    [a.requesterUserId, a.actorUserId, a.sessionId, a.tool, JSON.stringify(a.args), a.budgeted ?? true],
   );
   return Number((r.rows[0] as { id: string | number }).id);
 }
@@ -236,20 +245,43 @@ export async function auditFinish(db: Queryable, id: number, f: AuditFinish): Pr
             github_requests = $5, github_request_ids = $6::jsonb, github_status = $7,
             risk_reasons = $8::jsonb, confirmation_id = $9, dry_run = $10, write = $11,
             result = $12, detail = $13, review_path = $14, review_path_reason = $15, review_mode = COALESCE($16, review_mode),
-            posted = COALESCE($17::jsonb, posted)
+            posted = COALESCE($17::jsonb, posted), merge_state = COALESCE($18, merge_state)
       WHERE id = $1`,
     [
       id, f.repo ?? null, f.pr ?? null, f.headSha ?? null, f.githubRequests, JSON.stringify(f.githubRequestIds.slice(-20)),
       f.githubStatus ?? null, JSON.stringify(f.riskReasons ?? []), f.confirmationId ?? null, f.dryRun, f.write,
       f.result, (f.detail ?? "").slice(0, 500), f.reviewPath ?? null, f.reviewPathReason ?? null, f.reviewMode ?? null,
-      f.posted ? JSON.stringify(f.posted) : null,
+      f.posted ? JSON.stringify(f.posted) : null, f.mergeState ? String(f.mergeState).slice(0, 40) : null,
     ],
   );
 }
 
-/** What this session has already asked of GitHub. */
+/**
+ * The GitHub tools (`github-mcp/`) write their calls made with a GitHub binding to this log too, under the tool name `github_mcp.<tool>`.
+ * Those rows are an owner's own reads and approved writes, never a review: every count of reviews, and a review session's request
+ * budget, leaves them out with this condition.
+ */
+export const GITHUB_MCP_AUDIT_TOOL_PREFIX = "github_mcp.";
+export const REVIEW_ROWS_ONLY = `tool NOT LIKE '${GITHUB_MCP_AUDIT_TOOL_PREFIX}%'`;
+
+/**
+ * The review tools that are never held to a session's request budget, whoever calls them: the server's own look at a review's pull request
+ * (`gh_pr_follow`, every 90 s for as long as the review item is open) and the pull request check made before a session's first turn
+ * (`gh_pr_check`). What tells an audit row apart is its `budgeted` column; this list reads the rows written before that column existed.
+ */
+export const UNBUDGETED_TOOLS: readonly string[] = ["gh_pr_follow", "gh_pr_check"];
+
+/**
+ * What this session has already asked of GitHub with the review tools: the requests of the calls held to its budget only. The calls the
+ * server makes without that budget (`skipBudget`: its follow-ups of the pull request, the check before the first turn, a person's answer to
+ * a held write) are not the session's spending, and never count against it (2026-11-15: a review item open for eight hours had its 400
+ * requests used up by its own follow-ups, and its re-run was refused at its first read).
+ */
 export async function sessionRequestCount(db: Queryable, sessionId: string): Promise<number> {
-  const r = await db.query("SELECT COALESCE(SUM(github_requests), 0)::int AS n FROM claw_github_audit WHERE session_id = $1", [sessionId]);
+  const r = await db.query(
+    `SELECT COALESCE(SUM(github_requests), 0)::int AS n FROM claw_github_audit
+      WHERE session_id = $1 AND ${REVIEW_ROWS_ONLY} AND COALESCE(budgeted, tool <> ALL($2::text[]))`, [sessionId, UNBUDGETED_TOOLS],
+  );
   return Number((r.rows[0] as { n: number }).n);
 }
 
@@ -281,7 +313,7 @@ export async function recentWrites(
     `SELECT COUNT(DISTINCT session_id || ':' || head_sha)::int AS n,
             COALESCE(BOOL_OR(session_id = $3 AND head_sha = $4 AND ($5::bigint IS NULL OR id <> $5)), FALSE) AS present
        FROM claw_github_audit
-      WHERE write AND NOT dry_run
+      WHERE write AND NOT dry_run AND ${REVIEW_ROWS_ONLY}
         AND at > NOW() - ($2::bigint * INTERVAL '1 millisecond')
         AND ($1::text IS NULL OR actor_user_id = $1)`,
     [actorUserId, sinceMs, pair?.sessionId ?? null, pair?.headSha ?? null, pair?.selfId ?? null],
@@ -567,6 +599,44 @@ export async function finishConfirmation(
       WHERE confirmation_id = $1 AND status IN ('pending', 'merging')`,
     [id, status, deciderUserId, JSON.stringify(result)],
   );
+}
+
+/**
+ * The merges a session holds for the acting user's answer on this head, taken for the requester's own merge (`GithubReview.followPullRequest`)
+ * in one statement, as a click takes one (`claimConfirmation`): a click after this finds them no longer pending. Null, with nothing taken,
+ * when one of the session's held writes is being decided right now: the acting user's answer goes first.
+ */
+export async function claimHeldMerges(db: Queryable, sessionId: string, headSha: string, requesterUserId: string): Promise<string[] | null> {
+  const busy = async (except: string[]): Promise<boolean> => (await db.query(
+    "SELECT 1 FROM claw_github_confirmations WHERE session_id = $1 AND status = 'merging' AND NOT (confirmation_id::text = ANY($2::text[])) LIMIT 1",
+    [sessionId, except],
+  )).rows.length > 0;
+  if (await busy([])) return null;
+  const taken = (await db.query(
+    `UPDATE claw_github_confirmations
+        SET status = 'merging', decided_at = NOW(), decided_by = $3, decided_via = '{"kind":"requester"}'::jsonb
+      WHERE session_id = $1 AND status = 'pending' AND kind = 'merge' AND head_sha = $2 AND expires_at > NOW()
+      RETURNING confirmation_id`,
+    [sessionId, headSha, requesterUserId],
+  )).rows.map((r) => String((r as { confirmation_id: string }).confirmation_id));
+  // A click that claimed one between the look and the update: theirs goes first, and what was taken here is given back.
+  if (await busy(taken)) {
+    for (const id of taken) await reopenConfirmation(db, id);
+    return null;
+  }
+  return taken;
+}
+
+/** The GitHub ids of the approvals this session posted of this head, newest first, from its own audit rows (`posted`). */
+export async function postedApprovalIds(db: Queryable, sessionId: string, repo: string, pr: number, headSha: string): Promise<number[]> {
+  const r = await db.query(
+    `SELECT (posted->>'review_id')::bigint AS id FROM claw_github_audit
+      WHERE session_id = $1 AND lower(repo) = lower($2) AND pr = $3 AND head_sha = $4 AND result = 'ok'
+        AND posted->>'event' = 'APPROVE' AND posted->>'review_id' ~ '^[0-9]{1,18}$'
+      ORDER BY at DESC LIMIT 5`,
+    [sessionId, repo, pr, headSha],
+  );
+  return r.rows.map((row) => Number((row as { id: string | number }).id));
 }
 
 /** Whether this session merged its pull request, or put it in the merge queue: by a confirmation a person allowed, or by a merge made at once. */

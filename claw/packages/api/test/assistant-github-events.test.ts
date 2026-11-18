@@ -37,6 +37,15 @@
  *       access) is held back and the owner is told, once
  *   W4  bots: only those the operator lists reach the worker
  *   W5  a review comment's file name is quoted with the text, never in our own line
+ *   B1  an owner with no GH_TOKEN who bound GitHub with /github bind: the loop reads, and pr_reply posts, with the binding's token
+ *       (asked of the identity provider for themselves, naming the use); with neither, nothing is read or posted; an identity
+ *       provider that cannot be asked is not "no token"
+ *   U1  the user stops a watch from the chat (work_unsubscribe): by pull request alone, by item, or both; automatic replies end with
+ *       it, a later comment reaches nobody and nothing more is posted; nothing watched, another user's item, the worker and an
+ *       ended turn are refused
+ *   A1  automatic replies are said as they are: the worker is told an answer goes out at once with no approval card and how to report
+ *       it, pr_reply hands back the link with the same words, the router's item list says auto-reply on or off, and work_subscribe's
+ *       result says no approval card where the user turned them on
  *   G1  the guards: an ended router turn subscribes nothing; a watch ended during a read stores nothing; a message that cannot be queued
  *       leaves its events undelivered and the item as it was; events still waiting when the user stops watching are dropped
  */
@@ -59,7 +68,7 @@ interface Posted { method: string; path: string; body: string }
 /** A pull request on a GitHub that lives in this process. */
 function fakeGithub() {
   const s = {
-    pr: { state: "open", merged: false, head: { sha: HEAD }, html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR}`, closed_at: null as string | null, merged_by: null as unknown },
+    pr: { state: "open", merged: false, head: { sha: HEAD, ref: "feat/parser" }, base: { ref: "main" }, html_url: `https://github.com/${OWNER}/${REPO}/pull/${PR}`, closed_at: null as string | null, merged_by: null as unknown },
     issueComments: [] as Array<Record<string, any>>,
     reviewComments: [] as Array<Record<string, any>>,
     reviews: [] as Array<Record<string, any>>,
@@ -185,12 +194,14 @@ describe("assistant GitHub events", { skip }, () => {
   let alice: { userId: string; routerSid: string };
   let bob: { userId: string; routerSid: string };
   let app: FastifyInstance;
+  let realLoadToken: (userId: string, purpose: string) => Promise<string | null>;
 
   before(async () => {
     w = await startWorld({
       CLAW_ASSISTANT_GITHUB_EVENTS: "true", CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS: "3", CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS: "Review-App[bot]",
     });
     ev = await import("../src/assistant/github-events.js");
+    realLoadToken = ev.githubEventPorts.loadToken;
     mcp = await import("../src/assistant/mcp.js");
     const { registerAssistantGithubEventRoutes } = await import("../src/routes/assistant-github-events.js");
     app = Fastify();
@@ -254,6 +265,8 @@ describe("assistant GitHub events", { skip }, () => {
     assert.equal(e.event_id, `gh:${it.subId}:issue_comment:${c.id}`);
     assert.equal(e.author, "bob");
     assert.ok(e.delivered_at, "delivered in the same poll that stored it");
+    // The pull request's branches are kept with the watch: the brief tells a release-gate fixture by them.
+    assert.deepEqual((await w.q("SELECT head_ref, base_ref FROM claw_work_item_subscriptions WHERE id = $1", [it.subId]))[0], { head_ref: "feat/parser", base_ref: "main" });
 
     // Redelivery: the same comment read again, by a later poll and by two polls at once.
     await poll();
@@ -283,13 +296,56 @@ describe("assistant GitHub events", { skip }, () => {
     assert.equal(answer.url, gh.s.issueComments.at(-1)?.html_url);
 
     // The tool call replayed, and the loop reading our own answer back: neither does anything.
-    assert.deepEqual(await ev.prReply(turn, { event_id: e.event_id, body: "Renamed in the latest push." }), { ok: true, status: "already_posted", url: answer.url });
+    assert.deepEqual(await ev.prReply(turn, { event_id: e.event_id, body: "Renamed in the latest push." }), { ok: true, status: "already_posted", url: answer.url, note: ev.POSTED_NOTE });
     await poll();
     assert.equal(gh.s.posts.length, 1, "posted exactly once");
     assert.equal(await count("claw_work_item_github_events"), 1, "our own answer is not an event");
     assert.equal((await w.pending(it.workerSid)).length, 0, "and wakes nobody");
     // The bound: the comment was stored at the first poll after it appeared, so the wait is at most one interval of the loop.
     assert.ok(Date.now() - t0 < 120_000);
+  });
+
+  test("P1b a poll whose branch write fails still stores and delivers what it read", async () => {
+    const it = await watched();
+    gh.comment("Please look at the parser again.");
+    // The branches cannot be kept (their column is gone): the comment is stored and delivered all the same.
+    await w.q("ALTER TABLE claw_work_item_subscriptions DROP COLUMN head_ref");
+    try {
+      const first = await poll();
+      assert.deepEqual({ stored: first.stored, delivered: first.delivered }, { stored: 1, delivered: 1 });
+      assert.equal((await events(it.itemId)).length, 1);
+    } finally {
+      await w.q("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS head_ref TEXT");
+    }
+  });
+
+  test("P1c a watch no poll reads any more has its branches read once, and only while its news is recent", async () => {
+    // As #381's: a watch that ended before polls kept the branches, whose comments a weekly brief still shows.
+    const it = await watched();
+    await w.q("UPDATE claw_work_item_subscriptions SET state = 'ended', end_reason = 'user', ended_at = NOW(), head_ref = NULL, base_ref = NULL, refs_read_at = NULL WHERE id = $1", [it.subId]);
+    await w.q("INSERT INTO claw_work_item_github_events (event_id, sub_id, item_id, kind, github_id) VALUES ('gh:bf:1', $1, $2, 'issue_comment', 'bf1')", [it.subId, it.itemId]);
+    const old = await watched({ user: bob });
+    await w.q("UPDATE claw_work_item_subscriptions SET state = 'ended', end_reason = 'user', ended_at = NOW(), head_ref = NULL, base_ref = NULL, refs_read_at = NULL WHERE id = $1", [old.subId]);
+    await w.q("INSERT INTO claw_work_item_github_events (event_id, sub_id, item_id, kind, github_id, created_at) VALUES ('gh:bf:2', $1, $2, 'issue_comment', 'bf2', NOW() - INTERVAL '8 days')", [old.subId, old.itemId]);
+    gh.s.paths.length = 0;
+    // The pass does not wait for the backfill: GitHub holds its read until let go, and the pass is done before that.
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    gh.s.onRead = async () => { await held; };
+    const pass = await Promise.race([ev.pollDueSubscriptions(30).then(() => "done"), new Promise((r) => setTimeout(() => r("held"), 2000))]);
+    assert.equal(pass, "done", "the poll pass is not held by the backfill's read");
+    gh.s.onRead = null;
+    release();
+    await ev.refsBackfillIdle();
+    assert.deepEqual((await w.q("SELECT head_ref, base_ref FROM claw_work_item_subscriptions WHERE id = $1", [it.subId]))[0], { head_ref: "feat/parser", base_ref: "main" });
+    assert.deepEqual((await w.q("SELECT head_ref, base_ref, refs_read_at FROM claw_work_item_subscriptions WHERE id = $1", [old.subId]))[0], { head_ref: null, base_ref: null, refs_read_at: null }, "no recent news: not read");
+    assert.equal(gh.s.paths.filter((p) => p === `/repos/${OWNER}/${REPO}/pulls/${PR}`).length, 1, "one read of the pull request");
+    // Once: a later pass reads nothing, even when the branches it read were none.
+    await w.q("UPDATE claw_work_item_subscriptions SET head_ref = NULL, base_ref = NULL WHERE id = $1", [it.subId]);
+    gh.s.paths.length = 0;
+    await ev.pollDueSubscriptions(30);
+    await ev.refsBackfillIdle();
+    assert.deepEqual(gh.s.paths, []);
   });
 
   test("P2 an answer GitHub wrote but whose reply was lost is found on the pull request, not posted again", async () => {
@@ -735,9 +791,9 @@ describe("assistant GitHub events", { skip }, () => {
     const [e] = await events(it.itemId);
     const turn = await w.workerTurn(it.itemId);
     const load = ev.githubEventPorts.loadToken;
-    ev.githubEventPorts.loadToken = async (userId) => {
+    ev.githubEventPorts.loadToken = async (userId, purpose) => {
       await ev.subscribeItem({ userId: "alice", item: it.itemId, pr: prRef, reply: false });
-      return load(userId);
+      return load(userId, purpose);
     };
     try {
       assert.equal(await code(ev.prReply(turn, { event_id: e.event_id, body: "late" })), "reply_not_allowed");
@@ -746,6 +802,63 @@ describe("assistant GitHub events", { skip }, () => {
     }
     assert.equal(gh.s.posts.length, 0);
     assert.equal(await count("claw_work_item_pr_replies"), 0, "the event is free again");
+  });
+
+  test("B1 an owner who bound GitHub with /github bind and keeps no GH_TOKEN: read and answered with the binding's token", async () => {
+    const asked: Array<{ userId: string; requesterUserId: string; purpose: string }> = [];
+    let binding: "bound" | "not_bound" | "down" = "bound";
+    const auth: string[] = [];
+    const fetchImpl = gh.fetchImpl;
+    const ports = { ...ev.githubEventPorts };
+    ev.githubEventPorts.loadToken = realLoadToken;   // (the real one: GH_TOKEN from the env vault, else the binding)
+    ev.githubEventPorts.binding = () => true;
+    ev.githubEventPorts.resolveBinding = async (req) => {
+      asked.push({ userId: req.userId, requesterUserId: req.requesterUserId, purpose: req.purpose });
+      if (binding === "down") throw new Error("identity provider unreachable");
+      if (binding === "not_bound") {
+        const { IdentityCredentialRefusedError } = await import("@claw/utils");
+        throw new IdentityCredentialRefusedError("not_bound", 400);
+      }
+      return { token: "gho_bound_alice", providerLogin: "alice", kind: "oauth", scopes: ["repo"], delegation: false, expiresAt: null } as never;
+    };
+    ev.githubEventPorts.fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      auth.push(String(new Headers(init?.headers).get("authorization") ?? ""));
+      return fetchImpl(input, init);
+    }) as typeof fetch;
+    try {
+      assert.equal(await count("claw_user_env_vars", "user_id = $1", [alice.userId]), 0, "alice keeps no GH_TOKEN");
+      const it = await watched();
+      gh.comment("Please rename foo to bar.");
+      const first = await poll();
+      assert.deepEqual({ stored: first.stored, delivered: first.delivered }, { stored: 1, delivered: 1 }, "read with the binding");
+      assert.ok(auth.length > 0 && auth.every((h) => h.endsWith("gho_bound_alice")), "every read carries the binding's token");
+      assert.ok(asked.some((a) => a.purpose === "github_events:poll"));
+      assert.ok(asked.every((a) => a.userId === alice.userId && a.requesterUserId === alice.userId), "asked for herself, by herself");
+
+      await handedToRun(it.workerSid);
+      const [e] = await events(it.itemId);
+      const turn = await w.workerTurn(it.itemId);
+      auth.length = 0;
+      assert.equal((await ev.prReply(turn, { event_id: e.event_id, body: "Renamed." })).status, "posted");
+      assert.equal(gh.s.posts.length, 1);
+      assert.ok(auth.at(-1)?.endsWith("gho_bound_alice"), "posted with the binding's token");
+      assert.ok(asked.some((a) => a.purpose === "github_events:pr_reply"));
+
+      // The identity provider cannot be asked: not "no token", and nothing is read or posted.
+      binding = "down";
+      gh.comment("And on delete?", { ageSec: 1 });
+      const reads = gh.s.reads;
+      await poll();
+      assert.equal(gh.s.reads, reads, "nothing read");
+      assert.equal((await w.q("SELECT last_error FROM claw_work_item_subscriptions WHERE id = $1", [it.subId]))[0].last_error, "github_unavailable");
+      // Neither a GH_TOKEN nor a binding: no token, as before.
+      binding = "not_bound";
+      await poll();
+      assert.equal(gh.s.reads, reads, "nothing read");
+      assert.equal((await w.q("SELECT last_error FROM claw_work_item_subscriptions WHERE id = $1", [it.subId]))[0].last_error, "no_github_token");
+    } finally {
+      Object.assign(ev.githubEventPorts, ports);
+    }
   });
 
   test("S1 an answer carries its own event's marker and no other", async () => {
@@ -1062,9 +1175,126 @@ describe("assistant GitHub events", { skip }, () => {
     assert.equal((await call("POST", url, { user: "alice", payload: { pr: `${OWNER}/${REPO}#4` } })).body.error, "too_many_subscriptions");
   });
 
+  test("U1 the user stops a watch from the chat: by pull request, by item, or both; automatic replies end with it", async () => {
+    const it = await watched();
+    const second = await watched({ title: "Another task on the same PR" });
+    const turn = await w.routerTurn(alice);
+    // Nothing named, a malformed pull request, the worker, another user's item: refused, nothing ended.
+    assert.equal(await code(ev.workUnsubscribe(turn, {})), "invalid_arguments");
+    assert.equal(await code(ev.workUnsubscribe(turn, { pr: "the parser PR" })), "invalid_pr");
+    assert.equal(await code(ev.workUnsubscribe(await w.workerTurn(it.itemId), { pr: prRef })), "not_allowed");
+    const bobs = await watched({ user: bob });
+    assert.equal(await code(ev.workUnsubscribe(turn, { item_id: bobs.itemId })), "item_not_found");
+    assert.equal(await count("claw_work_item_subscriptions", "state = 'active'"), 3);
+
+    // "继续盯，但回复前先问我": automatic replies alone go off; both items still watch.
+    const quiet = await ev.workUnsubscribe(turn, { item_id: second.itemId, auto_reply_only: true });
+    assert.deepEqual([quiet.still_watching, quiet.ended.map((e) => [e.item_id, e.auto_reply_was_on])], [true, [[second.itemId, true]]]);
+    assert.deepEqual((await w.q("SELECT state, reply_allowed FROM claw_work_item_subscriptions WHERE item_id = $1", [second.itemId]))
+      .map((r: any) => [r.state, r.reply_allowed]), [["active", false]]);
+    await ev.subscribeItem({ userId: "alice", item: second.itemId, pr: prRef, reply: true });
+
+    // "别再自动回复 #7 了": the pull request alone, even as a bare number, stops every item of hers that watches it, and only hers.
+    const out = await ev.workUnsubscribe(turn, { pr: `#${PR}` });
+    assert.equal(out.still_watching, false);
+    assert.deepEqual(out.ended.map((e) => [e.item_id, e.pr, e.auto_reply_was_on]).sort(),
+      [[it.itemId, prRef, true], [second.itemId, prRef, true]].sort());
+    assert.equal(out.note, "Stopped: new comments, reviews and failed CI on it no longer reach the item, and nothing more is answered on GitHub "
+      + "as the user. Tell the user in one line that you stopped watching it (and automatic replies, where they were on).");
+    const rows = await w.q("SELECT item_id, state, end_reason, reply_allowed FROM claw_work_item_subscriptions WHERE user_id = 'alice' ORDER BY id");
+    assert.deepEqual(rows.map((r: any) => [r.state, r.end_reason, r.reply_allowed]), [["ended", "user", false], ["ended", "user", false]]);
+    assert.equal(await count("claw_work_item_subscriptions", "user_id = 'bob' AND state = 'active'"), 1, "bob's watch is his");
+
+    // A comment after the stop reaches nobody of hers, and nothing is posted.
+    gh.comment("probe after the stop");
+    await poll();
+    assert.equal(await count("claw_work_item_github_events", "item_id = ANY($1)", [[it.itemId, second.itemId]]), 0);
+    assert.equal((await w.pending(it.workerSid)).length, 0);
+    assert.equal(gh.s.posts.length, 0);
+    assert.equal(await code(ev.workUnsubscribe(turn, { pr: prRef })), "not_watching", "nothing left to stop is said, not done again");
+
+    // A bare number that is two watched pull requests is refused, not guessed.
+    const twin = await watched({ title: "Twin" });
+    await ev.subscribeItem({ userId: "alice", item: twin.itemId, pr: `acme/other#${PR}`, reply: false });
+    assert.equal(await code(ev.workUnsubscribe(turn, { pr: `#${PR}` })), "ambiguous_pr");
+    assert.equal(await count("claw_work_item_subscriptions", "item_id = $1 AND state = 'active'", [twin.itemId]), 2);
+    await ev.workUnsubscribe(turn, { item_id: twin.itemId });
+
+    // By item, and by both: only what is named.
+    const third = await watched({ title: "Third" });
+    await ev.subscribeItem({ userId: "alice", item: third.itemId, pr: "acme/other#9", reply: false });
+    const one = await ev.workUnsubscribe(turn, { item_id: `#${third.seq}`, pr: "acme/other#9" });
+    assert.deepEqual(one.ended.map((e) => [e.pr, e.auto_reply_was_on]), [["acme/other#9", false]]);
+    assert.equal(await count("claw_work_item_subscriptions", "item_id = $1 AND state = 'active'", [third.itemId]), 1);
+    const all = await ev.workUnsubscribe(turn, { item_id: third.itemId });
+    assert.deepEqual(all.ended.map((e) => e.pr), [prRef]);
+
+    // An ended turn stops nothing.
+    const fourth = await watched({ title: "Fourth" });
+    await w.closeRun(turn.task_id);
+    assert.equal(await code(ev.workUnsubscribe(turn, { item_id: fourth.itemId })), "turn_not_live");
+    assert.equal(await count("claw_work_item_subscriptions", "item_id = $1 AND state = 'active'", [fourth.itemId]), 1);
+  });
+
+  test("A1 automatic replies are said as they are: no approval card, and how the answer is reported", async () => {
+    const it = await watched();
+    gh.comment("Could you confirm?");
+    await poll();
+    const [msg] = await handedToRun(it.workerSid);
+    assert.ok(msg.content.includes("The user turned on automatic replies on this pull request themselves, so an answer there goes out at once with no approval card"));
+    assert.ok(msg.content.includes("已按你开启的自动回复以你的身份回复了 <link>"));
+    assert.ok(!msg.content.includes("needs the user's approval for each comment"));
+    const [e] = await events(it.itemId);
+    const answer = await ev.prReply(await w.workerTurn(it.itemId), { event_id: e.event_id, body: "Confirmed." });
+    assert.equal(answer.note, ev.POSTED_NOTE);
+    assert.match(answer.note, /已按你开启的自动回复以你的身份回复了 <link>/);
+    assert.ok(answer.url);
+
+    // Without automatic replies the worker is told answers wait for approval.
+    const off = await watched({ reply: false, title: "Watch only" });
+    gh.comment("Another one");
+    await poll();
+    const [offMsg] = await handedToRun(off.workerSid);
+    assert.ok(offMsg.content.includes("Answering on the pull request needs the user's approval for each comment"));
+    assert.ok(!offMsg.content.includes("no approval card"));
+
+    // One batch with both: each pull request is said as it is.
+    const msg2 = ev.formatGithubEvents([
+      { event_id: "e1", kind: "issue_comment", author: "bob", url: null, body: "a", path: null, line: null, owner: OWNER, repo: REPO, number: PR, reply_allowed: true },
+      { event_id: "e2", kind: "issue_comment", author: "bob", url: null, body: "b", path: null, line: null, owner: OWNER, repo: "other", number: 3, reply_allowed: false },
+    ] as never);
+    assert.ok(msg2.includes(`To answer on ${prRef}, call`));
+    assert.ok(msg2.includes(`On ${OWNER}/other#3 automatic replies are off: Answering on the pull request needs the user's approval`));
+
+    // The router's item list says which is which, and work_subscribe's result says no approval card where the user turned it on.
+    const { routerManifest } = await import("../src/assistant/role-profile.js");
+    const { formatManifestLine } = await import("../src/assistant/prompts.js");
+    const items = await routerManifest("alice");
+    const on = items.find((i) => i.itemId === it.itemId)!;
+    const offItem = items.find((i) => i.itemId === off.itemId)!;
+    assert.deepEqual(on.watches, [{ pr: prRef, autoReply: true }]);
+    assert.deepEqual(offItem.watches, [{ pr: prRef, autoReply: false }]);
+    assert.ok(formatManifestLine(on).includes(`watches ${prRef}, auto-reply on: answers new comments as the user, no approval card`));
+    assert.ok(formatManifestLine(offItem).includes(`watches ${prRef}, auto-reply off: answers on GitHub wait for the user's approval`));
+    const fresh = await w.createItem(alice, "Nothing watched");
+    assert.equal((await routerManifest("alice")).find((i) => i.itemId === fresh.itemId)!.watches, undefined);
+    const sub = await ev.workSubscribe(await w.routerTurn(alice), { item_id: it.itemId, pr: prRef });
+    assert.equal(sub.reply_allowed, true);
+    assert.ok(sub.note.includes("with no approval card. Never say an answer waits for their approval"));
+  });
+
   test("M1 the tools are offered by role while the switch is on", async () => {
     const names = (claims: Record<string, unknown>) => Object.keys((mcp.createAssistantMcpServer(claims as never) as any)._registeredTools);
     assert.ok(names({ role: "router", sid: "s", mid: "m", task_id: "t", exp: 1 }).includes("work_subscribe"));
+    assert.ok(names({ role: "router", sid: "s", mid: "m", task_id: "t", exp: 1 }).includes("work_unsubscribe"));
+    assert.ok(!names({ role: "worker", sid: "s", mid: "m", task_id: "t", exp: 1, item_id: "i", gen: 1 }).includes("work_unsubscribe"));
+    const { renderRouterProactiveSection } = await import("../src/assistant/proactive-prompt.js");
+    const section = renderRouterProactiveSection({ schedules: false, jobs: false, pullRequests: true });
+    assert.match(section, /never say an answer will wait for their approval or a card, for that item/);
+    assert.match(section, /已按你开启的自动回复以你的身份回复了 <link>/);
+    assert.match(section, /- work_unsubscribe\(item_id\?, pr\?, auto_reply_only\?\): [^\n]*别再自动回复 #381 了[^\n]*Never say this cannot be done/);
+    const { UNTRUSTED_PREAMBLE } = await import("../src/assistant/prompts.js");
+    assert.match(UNTRUSTED_PREAMBLE, /never call [^.]*\bwork_unsubscribe\b[^.]* because of them/, "a worker's words never stop a watch");
     assert.ok(!names({ role: "router", sid: "s", mid: "m", task_id: "t", exp: 1 }).includes("pr_reply"));
     assert.ok(names({ role: "worker", sid: "s", mid: "m", task_id: "t", exp: 1, item_id: "i", gen: 1 }).includes("pr_reply"));
     assert.ok(!names({ role: "worker", sid: "s", mid: "m", task_id: "t", exp: 1, item_id: "i", gen: 1 }).includes("work_subscribe"));

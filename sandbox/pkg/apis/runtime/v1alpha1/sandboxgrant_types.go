@@ -149,6 +149,7 @@ type GrantSandboxRef struct {
 	GPUs              int32       `json:"gpus"`
 	SessionID         string      `json:"sessionId,omitempty"`
 	StartedAt         metav1.Time `json:"startedAt,omitempty"`
+	RunningAt         metav1.Time `json:"runningAt,omitempty"` // first running; GPU time is charged from here
 	EndedAt           metav1.Time `json:"endedAt,omitempty"`
 	Alias             string      `json:"alias,omitempty"`
 	TemplateID        string      `json:"templateID,omitempty"`

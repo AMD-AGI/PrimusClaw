@@ -38,6 +38,15 @@
  *    autoscaler's "pod didn't trigger scale-up" -- but that message says why it
  *    is stuck, not that anything is being done: only a scale-up that was
  *    triggered, or a message that keeps changing, is progress.
+ *
+ * An admitted pod the autoscaler will not add a node for *yet*, because of
+ * something that ends on its own (every account it buys nodes as is at the
+ * scheduler's per-user limit, a node is still being given back, the pool is at
+ * its running limit and an idle node will be released), is `queued` as well: that
+ * is a wait for capacity that can come, the normal state of a burst GPU pool, and
+ * it is marked `capacityWait` (see `capacityCanCome`). What the autoscaler says
+ * when no node will ever fit (no pool serves the workspace, the pod asks for more
+ * than a node has, a taint no pool tolerates) stays `unscheduled`.
  */
 export type WaitingKind = "queued" | "unscheduled";
 
@@ -60,6 +69,13 @@ export interface WaitingState {
    * nothing since has said it was withdrawn (see `readWaitingState`).
    */
   scalingUp?: true;
+  /**
+   * Set when the autoscaler says it is not adding a node now for a reason that
+   * ends on its own, so capacity can come (see `capacityCanCome`), or said so
+   * earlier in this stall and nothing since has taken it back. A wait for
+   * capacity, like `scalingUp`, and never ended by the unschedulable limit.
+   */
+  capacityWait?: true;
   /**
    * Set when the platform has said nothing about why the sandbox waits (no
    * message), so the state is one of our own sentences about the pod. It is also
@@ -126,10 +142,110 @@ function scaleUpWithdrawn(text: string): boolean {
   return /\bNotTriggerScaleUp\b/.test(text);
 }
 
+/**
+ * What an autoscaler writes when it is not adding a node for the pod now, but one
+ * can come without anyone changing anything: an account at its limit, a node being
+ * returned, a pool at its running limit that releases idle nodes, a purchase in
+ * backoff or not decided yet, purchases paused. Each is the autoscaler's own
+ * wording, matched as a phrase so that ordinary prose does not match it.
+ *
+ * A closed list rather than "any refusal": a refusal that no wait can settle (no
+ * pool serves the workspace, the pod does not fit any node of a pool, it needs
+ * more nodes at once than the pool may ever hold, its lease is longer than any
+ * node lives, a pool that keeps no node for it below its target) is what the
+ * unschedulable limit is for, and must keep failing fast. Text that matches none
+ * of these is read as that.
+ *
+ * Exported for its test.
+ */
+export const CAPACITY_WAIT_PHRASES: readonly RegExp[] = [
+  // Autopilot: why a pool bought no node for the pod's group this cycle.
+  /\bat the scheduler's per-user limit\b/,
+  /\bis still being given back\b/,
+  /\bthe pool is at its limit of running or submitted nodes\b/,
+  /\bthe scheduler refused the pool's last submission and the pool waits before the next\b/,
+  /\bnode purchases are paused\b/,
+  /\bcan take a job of this pool yet\b/,
+  /\bcould not be read yet\b/,
+  /\bbought no node for the Pod's group this cycle and recorded no reason\b/,
+  /\bthe pool has room for \d+ more\b/,
+  /\bthe pool may have \d+ more submitted\b/,
+  // Autopilot: a purchase of the pool that has not been decided yet holds it back.
+  /\bsubmit is not decided yet\b/,
+  /\bnothing more is bought in the pool until\b/,
+  // Autopilot: a pool at its budget whose nodes are released to make room for the pod.
+  /\bthe pod waits for a node of the pool to be given back\b/,
+  /\ban idle one is given back after\b/,
+  // cluster-autoscaler: a node group at its size limit, or one that just failed to grow.
+  /\bmax node group size reached\b/,
+  /\bin backoff after failed scale-up\b/,
+];
+
+/**
+ * Whether the platform's text says the pod waits for capacity that can come: the
+ * autoscaler's refusal names one of CAPACITY_WAIT_PHRASES, or the pod is held at a
+ * scheduling gate (`SchedulingGated`), which the autoscaler that buys the pod's node
+ * lifts once the node is there. Read from the whole message, like the scale-up.
+ */
+export function capacityCanCome(text: string): boolean {
+  if (/\bSchedulingGated\b/.test(text)) return true;
+  if (!/\bNotTriggerScaleUp\b|\bpod didn't trigger scale-up\b/i.test(text)) return false;
+  return CAPACITY_WAIT_PHRASES.some((re) => re.test(text));
+}
+
 const count = (text: string, re: RegExp): number => Number(re.exec(text)?.[1] ?? 0);
+
+/** Long enough for the autoscaler's reason, short enough to stay one line of progress. */
+const REFUSAL_LIMIT = 120;
+
+/**
+ * What the autoscaler said when it refused to add a node (`NotTriggerScaleUp`), in
+ * its own words but without its identifiers, or null when it said nothing more. It
+ * is the one part of the platform's text the user is given as written: "no new node
+ * is being added" alone does not say whether to wait, retry or change the request,
+ * and the autoscaler's reason does ("NoHeadroom: the pods need 1 new node(s)", "does
+ * not fit a new node of this pool"). Pool ids, pod names, job ids and taint
+ * contents are taken out, as everywhere else.
+ */
+export function scaleUpRefusal(text: string, limit = REFUSAL_LIMIT): string | null {
+  const at = text.search(/\bNotTriggerScaleUp\b/);
+  if (at < 0) return null;
+  const said = text.slice(at)
+    .replace(/\bNotTriggerScaleUp\b:?/g, " ")
+    .replace(/\bpod didn't trigger scale-up\b:?/gi, " ")
+    // "pool <id>: <why>" leads with the pool; "pool <id> would ..." names it in a sentence.
+    .replace(/\bpool [\w-]+:/gi, " ")
+    .replace(/\bpool [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "the pool")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "")
+    // A namespace/name (a pod, a PodGroup); not a resource such as amd.com/gpu.
+    .replace(/\b(pod|podgroup) [a-z0-9][-a-z0-9]*\/[a-z0-9][-a-z0-9.]*[a-z0-9]/gi, (_m, kind: string) => `the ${kind.toLowerCase()}`)
+    .replace(/(?<![\w.])[a-z0-9][-a-z0-9]*\/[a-z0-9][-a-z0-9.]*[a-z0-9]/g, "")
+    .replace(/\{[^}]*\}/g, "")
+    .replace(/\bjob \d+\b/gi, "a job")
+    .replace(/\s+([:;,.])/g, "$1")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s:;,.-]+|[\s:;,-]+$/g, "");
+  return said ? cleanPlatformText(said, limit) : null;
+}
+
+/** Long enough for the reason an account is held back, short enough for one line of progress. */
+const CAPACITY_REFUSAL_LIMIT = 200;
+
+/**
+ * Said while the sandbox waits for capacity that can come, with the autoscaler's
+ * reason (without its identifiers) when it gave one.
+ */
+function capacityWaitReason(text: string): string {
+  const said = scaleUpRefusal(text, CAPACITY_REFUSAL_LIMIT);
+  const why = said ? ` (the autoscaler says: ${said})` : "";
+  return `no node is free for the sandbox yet, and the platform will provide one when capacity frees up${why}`;
+}
 
 /** Said while a node is being added for the sandbox. */
 const ADDING_NODE = "the platform is adding a node for the sandbox";
+
+/** Said while a wait for capacity continues and the platform's newest text no longer gives its reason. */
+const CAPACITY_WAIT = "no node is free for the sandbox yet, and the platform will provide one when capacity frees up";
 
 /** Said when the platform's text is not one we can summarise, and the workload is admitted. */
 const UNPLACED = "the platform has not been able to place the sandbox on a node yet";
@@ -170,7 +286,11 @@ export function summarizeScheduling(text: string): string | null {
     causes.push(`${m[1]} short of ${m[2]}`);
   }
   const nodes = total ? ` (${total} nodes${causes.length ? `: ${causes.join(", ")}` : ", none available"})` : "";
-  return `no node can take the sandbox right now${nodes}${notAdded ? ", and no new node is being added" : ""}`;
+  const refusal = notAdded ? scaleUpRefusal(text) : null;
+  const notAddedClause = notAdded
+    ? `, and no new node is being added${refusal ? ` (the autoscaler says: ${refusal})` : ""}`
+    : "";
+  return `no node can take the sandbox right now${nodes}${notAddedClause}`;
 }
 
 /**
@@ -193,8 +313,16 @@ export function summarizeScheduling(text: string): string | null {
  * force through every message that does not take it back: until the autoscaler
  * says `NotTriggerScaleUp`, the platform withdraws its message, a pod is taken or
  * the workload goes back to the queue.
+ *
+ * `capacitySeen` is the same for a wait for capacity (`capacityWait`): truthy when
+ * the read before this one was one, and when it is a string, the reason that read
+ * was given, which a carried wait keeps.
  */
-export function readWaitingState(detail: Record<string, unknown>, scaleUpSeen = false): WaitingState | null {
+export function readWaitingState(
+  detail: Record<string, unknown>,
+  scaleUpSeen = false,
+  capacitySeen: boolean | string = false,
+): WaitingState | null {
   const phase = String(detail.phase ?? "").toLowerCase();
   if (phase !== "pending" && phase !== "notready") return null;
 
@@ -226,6 +354,19 @@ export function readWaitingState(detail: Record<string, unknown>, scaleUpSeen = 
   // repeated.
   if (text && (scaleUpTriggered(text) || (scaleUpSeen && !scaleUpWithdrawn(text)))) {
     return { kind: "queued", reason: ADDING_NODE, detail: text, scalingUp: true };
+  }
+  // The autoscaler is not adding a node now, for a reason that ends on its own: a
+  // wait for capacity, on the same terms as a node being added. It stays in force
+  // through the scheduler's account that follows it, as a scale-up does, until
+  // the autoscaler refuses for a reason that no wait settles, the platform
+  // withdraws its message or a pod is taken (`capacitySeen`).
+  if (text && (capacityCanCome(text) || (capacitySeen && !scaleUpWithdrawn(text)))) {
+    // Carried, the reason it was given stays the line, so the scheduler repeating
+    // its own account does not read as a change of what the sandbox waits for.
+    const reason = capacityCanCome(text)
+      ? capacityWaitReason(text)
+      : typeof capacitySeen === "string" && capacitySeen ? capacitySeen : CAPACITY_WAIT;
+    return { kind: "queued", reason, detail: text, capacityWait: true };
   }
   if (text) return { kind: "unscheduled", reason: summary ?? UNPLACED, detail: text };
 

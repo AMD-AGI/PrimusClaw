@@ -25,8 +25,13 @@ export const COMPONENT_LABEL = "primus-claw/component";
  * The labels every sandbox carries: session, component, the team label, plus
  * whatever the caller adds. `own` lands before `team` and `extra`, which is the
  * order the hands path has always applied them in; `extra` (the spec's own
- * labels) therefore wins over everything here, so a caller that must not let a
- * spec override the identity labels reasserts them afterwards.
+ * labels, which a DAG author writes) wins over `own` and `team`.
+ *
+ * The session and component labels always win, `extra` included: the sandbox
+ * NetworkPolicies select the Hands pods by `primus-claw/component=hands`
+ * (chart networkPolicy.sandboxEgress / sandboxIngress), and containment selects
+ * them by component and session. A spec that could set them would take its
+ * sandbox out of its own egress and ingress policies.
  */
 export function composeSandboxLabels(args: {
   sessionId: string;
@@ -35,11 +40,11 @@ export function composeSandboxLabels(args: {
   extra?: Record<string, string>;
 }): Record<string, string> {
   return {
-    [SESSION_ID_LABEL]: args.sessionId,
-    [COMPONENT_LABEL]: args.component,
     ...(args.own ?? {}),
     team: "primus-claw",
     ...(args.extra ?? {}),
+    [SESSION_ID_LABEL]: args.sessionId,
+    [COMPONENT_LABEL]: args.component,
   };
 }
 

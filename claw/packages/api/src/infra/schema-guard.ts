@@ -24,11 +24,10 @@
  *
  * The question it answers is only whether the column is there, never whether it
  * is the column the code thinks it is: types, nullability and defaults are not
- * compared. That boundary matters most on `claw_memory_entries`, which has two
- * independent migration owners -- this file's `initDb` and the Python
- * memory-service's `002_kb_extension.sql` -- both declaring their columns with
- * `ADD COLUMN IF NOT EXISTS`. Whichever runs first defines the type and the
- * other silently no-ops, and a divergence there passes this check.
+ * compared. That boundary matters most on `claw_memory_entries`, whose columns
+ * `initDb` declares with `ADD COLUMN IF NOT EXISTS`: a database where an older
+ * writer (the retired Python memory service) already added one with another
+ * type keeps that type, and the divergence passes this check.
  */
 
 export interface SchemaRequirement {
@@ -70,6 +69,8 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "effort",
       // Absent, every message to a session and every drain of its queue fails.
       "pending_drain_until",
+      // Absent, every completion fails to set the session idle, and every message and drain fails with it.
+      "workspace_save_id", "workspace_save_until", "workspace_save_task_id",
     ],
   },
   {
@@ -223,6 +224,34 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["id", "user_id", "entry_id", "op", "actor", "session_id", "reason", "title", "evidence_quote", "created_at"],
   },
   {
+    table: "claw_skills",
+    // Every skill save and every turn's skill selection names these (marketplace/skill-service.ts): absent, saving and
+    // using a personal skill fail.
+    columns: [
+      "id", "skill_name", "user_id", "version", "content", "description", "source", "status", "deleted_at",
+      "enabled", "origin", "content_sha", "last_used_at", "invocation",
+    ],
+  },
+  {
+    table: "claw_skill_events",
+    // Every personal-skill save records here in the same transaction: absent, each one fails.
+    columns: ["id", "user_id", "skill_name", "version", "op", "actor", "session_id", "detail", "created_at"],
+  },
+  {
+    table: "claw_skill_drafts",
+    columns: ["id", "user_id", "skill_name", "description", "content", "files", "replaces", "request_quote", "origin", "created_at"],
+  },
+  {
+    table: "claw_skill_changes",
+    // A save, delete or turn-off at the user's request records here what an undo takes back, in the same transaction.
+    columns: ["id", "user_id", "skill_name", "op", "version_after", "sha_after", "previous", "session_id", "created_at", "undone_at"],
+  },
+  {
+    table: "claw_memory_links",
+    // An entry's citations (memory/links.ts), kept with every memory write and read by the router's turn recall.
+    columns: ["user_id", "from_id", "rel", "name", "to_kind", "to_id", "created_by", "created_at"],
+  },
+  {
     table: "claw_assistants",
     // `POST /v1/assistant` and every work-item write start from this row.
     onlyWhenAssistant: true,
@@ -249,6 +278,12 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     table: "claw_assistant_says",
     onlyWhenAssistant: true,
     columns: ["say_id", "user_id", "item_id", "item_attention_seq", "text", "fallback", "created_at", "delivered_at"],
+  },
+  {
+    table: "claw_work_item_delivery_checks",
+    // What the delivery announcement records and its sweep reads: absent, every report's file announcement fails on the record.
+    onlyWhenAssistant: true,
+    columns: ["item_id", "event_id", "checked_at"],
   },
   {
     table: "claw_work_item_subscriptions",
@@ -282,6 +317,12 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     table: "claw_assistant_observations",
     onlyWhenAssistant: true,
     columns: ["id", "user_id", "scope", "session_id", "run_id", "tool", "args", "created_at"],
+  },
+  {
+    // Every plugin write names these columns, so a deployment whose ALTER
+    // failed would answer 500 to every plugin create, upsert and patch.
+    table: "plugins",
+    columns: ["images", "resource", "overridable", "expires_at"],
   },
 ];
 

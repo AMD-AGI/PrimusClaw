@@ -59,8 +59,7 @@ function fakeMsg(deliveryCount = 1) {
 }
 
 /** In-memory stand-in for the three KV methods task-runner actually calls. */
-function fakeKv() {
-  const store = new Map<string, Uint8Array>();
+function fakeKv(store = new Map<string, Uint8Array>()) {
   const enc = new TextEncoder();
   const kv = {
     async get(key: string) {
@@ -76,8 +75,7 @@ function fakeKv() {
   return { kv: kv as unknown as KV, store };
 }
 
-function fakeEmitter() {
-  const events: Array<Record<string, unknown>> = [];
+function fakeEmitter(events: Array<Record<string, unknown>> = []) {
   const emitter = {
     async emit(_sessionId: string, evt: Record<string, unknown>) { events.push(evt); },
   };
@@ -104,8 +102,7 @@ function result(over: Partial<ExecuteResult> = {}): ExecuteResult {
  * `makeHandsClient` returns a bare object: the stubbed workspace/S3 helpers
  * never dereference it, so no MCP transport is opened.
  */
-function stubSideEffects(over: Partial<TaskRunnerSideEffects> = {}) {
-  const calls: string[] = [];
+function stubSideEffects(over: Partial<TaskRunnerSideEffects> = {}, calls: string[] = []) {
   const transcripts: Array<Record<string, unknown>> = [];
   const transcriptLogs: Array<Array<Record<string, unknown>>> = [];
   const record = <T>(name: string, value: T) => (...args: unknown[]) => {
@@ -184,7 +181,9 @@ function captureAgentDone() {
  * resolves, which is the only input that selects a terminal state.
  */
 async function runScenario(opts: {
-  engineBehavior: (signal?: AbortSignal, extras?: ExecuteExtras) => Promise<ExecuteResult>;
+  engineBehavior: (
+    signal?: AbortSignal, extras?: ExecuteExtras, onEvent?: (evt: Record<string, unknown>) => Promise<void>,
+  ) => Promise<ExecuteResult>;
   deliveryCount?: number;
   sideEffects?: Partial<TaskRunnerSideEffects>;
   onStart?: (abortCtrl: AbortController) => void;
@@ -202,14 +201,36 @@ async function runScenario(opts: {
    */
   seedCheckpoint?: Partial<CheckpointState>;
   seedCallback?: Uint8Array;
+  /**
+   * The outbox key reads back as NATS's delete marker: an earlier execution of
+   * this task_id delivered its callback and `ackAndClearCallback` deleted it.
+   */
+  seedClearedCallback?: boolean;
+  /** Arrays the scenario's events and calls are mirrored into as they happen, for a stub to read mid-run. */
+  observe?: { events: Array<Record<string, unknown>>; calls: string[]; ckpt?: Map<string, Uint8Array> };
+  /** An earlier delivery of this run already published its completion (`turn-ended.<sid>.<mid>`). */
+  seedEndedTurn?: Record<string, unknown>;
 }) {
   const sessionId = opts.sessionId ?? SESSION;
   const { msg, verdicts } = fakeMsg(opts.deliveryCount ?? 1);
   const { kv } = fakeKv();
-  const { kv: kvCkpt, store: ckptStore } = fakeKv();
+  const { kv: kvCkpt, store: ckptStore } = fakeKv(opts.observe?.ckpt);
+  if (opts.seedEndedTurn) {
+    ckptStore.set(`turn-ended.${sessionId}.${MESSAGE}`, new TextEncoder().encode(JSON.stringify(opts.seedEndedTurn)));
+  }
   if (opts.seedCallback) {
     assert.ok(opts.taskId, "a persisted callback belongs to a task");
     ckptStore.set(`task-result.${opts.taskId}`, opts.seedCallback);
+  }
+  if (opts.seedClearedCallback) {
+    assert.ok(opts.taskId, "a cleared callback belongs to a task");
+    const outboxKey = `task-result.${opts.taskId}`;
+    const get = kvCkpt.get.bind(kvCkpt);
+    // NATS KV answers a deleted key with its delete marker, not null, until the bucket's TTL.
+    (kvCkpt as unknown as { get: (key: string) => Promise<unknown> }).get = async (key: string) =>
+      key === outboxKey && !ckptStore.has(key)
+        ? { key, value: new Uint8Array(0), operation: "DEL" }
+        : get(key);
   }
   if (opts.seedCheckpoint) {
     ckptStore.set(
@@ -235,17 +256,17 @@ async function runScenario(opts: {
       })),
     );
   }
-  const { emitter, events } = fakeEmitter();
-  const { sideEffects, calls, transcripts, transcriptLogs } = stubSideEffects(opts.sideEffects);
+  const { emitter, events } = fakeEmitter(opts.observe?.events);
+  const { sideEffects, calls, transcripts, transcriptLogs } = stubSideEffects(opts.sideEffects, opts.observe?.calls);
 
   // Snapshot of what the session had been told by the time the engine started,
   // for the assertions about what must be announced before any slow work.
   let typesAtEngineStart: string[] = [];
   const engine: Engine = {
-    async execute(_req, _onEvent, signal, _hands, extras) {
+    async execute(_req, onEvent, signal, _hands, extras) {
       calls.push("engine.execute");
       typesAtEngineStart = events.map((e) => String(e.type));
-      return opts.engineBehavior(signal, extras);
+      return opts.engineBehavior(signal, extras, onEvent);
     },
   };
 
@@ -356,6 +377,171 @@ test("a repository left out is reported beside a partial upload, not instead of 
   const statuses = r.events.filter((e) => e.type === "sandboxStatus").map((e) => e.status);
   assert.ok(statuses.includes("workspace_sync_partial"));
   assert.ok(statuses.includes("workspace_git_skipped"));
+});
+
+test("the turn ends on the session before the workspace is saved, and the task is reported done only after", async () => {
+  // Seen on 2026-11-11: a review that cloned a large repository spent 62 minutes
+  // uploading 79,353 files after its answer, and the session read `running` the
+  // whole time because `exec_complete` -- what the API sets the session idle on --
+  // waited for the upload. The turn's end does not depend on the upload; the
+  // Backend handoff and the ack still follow it.
+  let eventsAtSave: string[] = [];
+  let callsAtSave: string[] = [];
+  const events: Array<Record<string, unknown>> = [];
+  const calls: string[] = [];
+  const r = await runScenario({
+    taskId: "task-save-after-turn",
+    engineBehavior: withSandbox,
+    sideEffects: {
+      syncWorkspaceToS3: (async () => {
+        eventsAtSave = events.map((e) => String(e.type));
+        callsAtSave = [...calls];
+        return { ...SYNCED, exhausted: true, failedCount: 3, uploaded: 2, totalFiles: 5 };
+      }) as never,
+    },
+    observe: { events, calls },
+  });
+
+  assert.deepEqual(
+    eventsAtSave.slice(-2), ["executionStats", "exec_complete"],
+    `the session had been told the turn ended before the save began: ${eventsAtSave.join(", ")}`,
+  );
+  assert.equal(r.completion?.workspace_save, "pending", "the turn's end says a save follows it, for the file listing");
+  const saveId = r.completion?.workspace_save_id;
+  assert.equal(typeof saveId, "string", "and names the save, which a redelivered turn's message id cannot");
+  const saves = r.events.filter((e) => e.type === "workspaceSave");
+  assert.deepEqual(
+    saves.map((e) => [e.phase, e.outcome, e.save_id, e.message_id]),
+    [["finished", "partial", saveId, MESSAGE]],
+    "and the file listing is told when that save is over, and how it ended",
+  );
+  assert.ok(!callsAtSave.includes("postAgentDone"), "Backend is not told the task is done before its files are saved");
+  const types = r.events.map((e) => (e.type === "sandboxStatus" ? `sandboxStatus:${String(e.status)}` : String(e.type)));
+  assert.equal(types.filter((t) => t === "exec_complete").length, 1, "one completion");
+  assert.ok(
+    types.indexOf("exec_complete") < types.indexOf("sandboxStatus:workspace_sync_partial"),
+    `what the save reports follows the turn's end: ${types.join(", ")}`,
+  );
+  assert.ok(
+    types.indexOf("sandboxStatus:workspace_sync_partial") < types.lastIndexOf("workspaceSave"),
+    `the save is over only after what it reports: ${types.join(", ")}`,
+  );
+  assert.equal(r.completion?.failed, false);
+  assert.ok(r.calls.indexOf("syncWorkspaceToS3") < r.calls.indexOf("postAgentDone"), r.calls.join(", "));
+  assert.deepEqual(r.verdicts, ["ack"]);
+});
+
+test("a save that could not be done still says it is over", async () => {
+  // Otherwise the file listing reads "saving" until the event goes stale, for a
+  // save nobody is doing.
+  const r = await runScenario({
+    engineBehavior: withSandbox,
+    sideEffects: {
+      syncWorkspaceToS3: (async () => { throw new Error("sandbox gone"); }) as never,
+    },
+  });
+  assert.equal(r.completion?.workspace_save, "pending");
+  const saves = r.events.filter((e) => e.type === "workspaceSave").map((e) => [e.phase, e.outcome, e.save_id]);
+  assert.deepEqual(saves, [["finished", "failed", r.completion?.workspace_save_id]]);
+  assert.equal(r.completion?.failed, false, "the turn itself succeeded");
+  assert.deepEqual(r.verdicts, ["ack"]);
+});
+
+test("a run that declared its workspace throwaway has no save to announce", async () => {
+  const r = await runScenario({ engineBehavior: withSandbox, request: { workspace_throwaway: true } });
+  assert.ok(r.completion, "the turn ended");
+  assert.equal(r.completion.workspace_save, undefined, "no save follows it");
+  assert.equal(r.completion.workspace_save_id, undefined);
+  assert.equal(r.calls.includes("syncWorkspaceToS3"), false);
+  assert.deepEqual(r.events.filter((e) => e.type === "workspaceSave"), []);
+});
+
+test("a run with no sandbox has no save to announce", async () => {
+  const r = await runScenario({ engineBehavior: async () => result() });
+  assert.ok(r.completion, "the turn ended");
+  assert.equal(r.completion.workspace_save, undefined, "no save follows it");
+  assert.equal(r.completion.workspace_save_id, undefined);
+  assert.deepEqual(r.events.filter((e) => e.type === "workspaceSave"), []);
+});
+
+test("the turn's end is recorded before it is published, and the record goes with the ack", async () => {
+  const ckpt = new Map<string, Uint8Array>();
+  let recordAtCompletion: Record<string, unknown> | undefined;
+  const events: Array<Record<string, unknown>> = [];
+  const calls: string[] = [];
+  const r = await runScenario({
+    engineBehavior: withSandbox,
+    observe: { events, calls, ckpt },
+    sideEffects: {
+      syncWorkspaceToS3: (async () => {
+        const raw = ckpt.get(`turn-ended.${SESSION}.${MESSAGE}`);
+        recordAtCompletion = raw ? JSON.parse(new TextDecoder().decode(raw)) : undefined;
+        return SYNCED;
+      }) as never,
+    },
+  });
+  assert.ok(recordAtCompletion, "a delivery that came back during the save would find the turn ended");
+  assert.equal((recordAtCompletion.completion as Record<string, unknown>).type, "exec_complete");
+  assert.equal(recordAtCompletion.save_id, r.completion?.workspace_save_id);
+  assert.deepEqual(r.verdicts, ["ack"]);
+  assert.equal(ckpt.has(`turn-ended.${SESSION}.${MESSAGE}`), false, "nothing to finish once acked");
+});
+
+for (const [label, over] of [
+  ["the save throws", { syncWorkspaceToS3: (async () => { throw new Error("hands gone"); }) }],
+  ["the transcript throws", { flushTranscript: (async () => { throw new Error("s3 down"); }) }],
+  ["reaping the shells throws", {
+    makeHandsClient: (() => ({
+      close: async () => {},
+      reapShells: async () => { throw new Error("reap failed"); },
+    })),
+  }],
+] as const) {
+  test(`after the turn has ended, ${label}: the run is still acked, not naked for a rerun`, async () => {
+    let agentDone = 0;
+    const r = await runScenario({
+      taskId: `task-after-end-${label.length}`,
+      engineBehavior: withSandbox,
+      sideEffects: {
+        ...(over as unknown as Partial<TaskRunnerSideEffects>),
+        postAgentDone: (async () => { agentDone++; }) as never,
+      },
+    });
+    assert.deepEqual(r.verdicts, ["ack"], "a nak would run the ended turn again beside the next one");
+    assert.equal(r.types.filter((t) => t === "exec_complete").length, 1);
+    assert.equal(r.completion?.failed, false);
+    assert.equal(agentDone, 1, "the task is handed to Backend as done");
+    assert.equal(r.ckptStore.has(`turn-ended.${SESSION}.${MESSAGE}`), false);
+  });
+}
+
+test("a delivery of a turn that already ended finishes it without running it again", async () => {
+  // The earlier delivery published the completion and was stopped during its
+  // save (SIGTERM, pod lost) before its ack, so JetStream delivered it again.
+  const stored = result({ finalText: "already answered" });
+  const completion = { type: "exec_complete", message_id: MESSAGE, failed: false, final_text: "already answered",
+    workspace_save: "pending", workspace_save_id: "save-1" };
+  const handed: ExecuteResult[] = [];
+  const r = await runScenario({
+    taskId: "task-ended",
+    deliveryCount: 2,
+    seedEndedTurn: { completion, result: stored, save_id: "save-1" },
+    engineBehavior: async () => { throw new Error("the ended turn must not run again"); },
+    sideEffects: {
+      postAgentDone: (async (_req: unknown, res: ExecuteResult) => { handed.push(res); }) as never,
+    },
+  });
+  assert.ok(!r.calls.includes("engine.execute"), "the turn is not executed again");
+  assert.ok(!r.calls.includes("ensureHands"), "nor is a sandbox opened for it");
+  assert.deepEqual(r.events.map((e) => [e.type, e.phase, e.outcome, e.save_id]), [
+    ["exec_complete", undefined, undefined, undefined],
+    ["workspaceSave", "finished", "failed", "save-1"],
+  ], "the completion again (the API takes one per turn), then the save reported over so the next message is let through");
+  assert.equal(r.events[0].final_text, "already answered");
+  assert.deepEqual(handed, [stored]);
+  assert.deepEqual(r.verdicts, ["ack"]);
+  assert.equal(r.ckptStore.has(`turn-ended.${SESSION}.${MESSAGE}`), false);
+  assert.ok(r.calls.includes("releaseTaskLock"));
 });
 
 // ── fatal ────────────────────────────────────────────────────────────────
@@ -508,6 +694,62 @@ test("user interrupt vs fatal is decided by the abort signal, not the error", as
     String(r.completion?.final_text).includes("Interrupted by user"),
     "final_text must be non-empty so the assistant turn is persisted for future context",
   );
+});
+
+test("a turn stopped before the engine said anything ends on the session's stream with an interrupted ResultMessage", async () => {
+  // A /stop while the sandbox is still being prepared: the engine has emitted
+  // nothing of its own. `exec_complete` never reaches a stream's readers, so the
+  // ResultMessage is the only end a chat's status (or an A2A caller) can see.
+  let ctrl!: AbortController;
+  const r = await runScenario({
+    onStart: (c) => { ctrl = c; },
+    engineBehavior: async () => {
+      ctrl.abort();
+      throw new Error("stream closed");
+    },
+  });
+
+  assert.equal(r.completion?.interrupted, true);
+  const ends = r.events.filter((e) => e.type === "ResultMessage");
+  assert.equal(ends.length, 1, "exactly one end of the turn");
+  assert.deepEqual(ends[0]?.data, { subtype: "interrupted" });
+  assert.equal(ends[0]?.message_id, MESSAGE, "the end names the stopped turn's message");
+  assert.equal(ends[0]?.subagent_id, undefined, "a main-agent end, not a sub-agent's");
+  const types = r.types.filter((t) => t === "ResultMessage" || t === "exec_complete");
+  assert.deepEqual(types, ["ResultMessage", "exec_complete"], "the stream's end comes before the API's completion");
+});
+
+test("a turn stopped after the engine ended it does not end it twice", async () => {
+  let ctrl!: AbortController;
+  const r = await runScenario({
+    onStart: (c) => { ctrl = c; },
+    engineBehavior: async (_signal, _extras, onEvent) => {
+      // A sub-agent's end is not the turn's: it must not stand in for it.
+      await onEvent!({ type: "ResultMessage", subagent_id: "sub-1", data: { subtype: "success" } });
+      await onEvent!({ type: "ResultMessage", data: { subtype: "success" } });
+      ctrl.abort();
+      throw new Error("stream closed");
+    },
+  });
+
+  assert.equal(r.completion?.interrupted, true);
+  const mainEnds = r.events.filter((e) => e.type === "ResultMessage" && !e.subagent_id);
+  assert.deepEqual(mainEnds.map((e) => e.data), [{ subtype: "success" }], "the engine's own end stands alone");
+});
+
+test("a sub-agent's end does not stand in for the stopped turn's", async () => {
+  let ctrl!: AbortController;
+  const r = await runScenario({
+    onStart: (c) => { ctrl = c; },
+    engineBehavior: async (_signal, _extras, onEvent) => {
+      await onEvent!({ type: "ResultMessage", subagent_id: "sub-1", data: { subtype: "success" } });
+      ctrl.abort();
+      throw new Error("stream closed");
+    },
+  });
+
+  const mainEnds = r.events.filter((e) => e.type === "ResultMessage" && !e.subagent_id);
+  assert.deepEqual(mainEnds.map((e) => e.data), [{ subtype: "interrupted" }]);
 });
 
 test("DAG cancellation posts a cancelled terminal callback on clean engine return", async () => {
@@ -969,6 +1211,30 @@ test("redelivery replays a persisted callback without executing the task again",
   assert.ok(!r.calls.includes("engine.execute"), "replay must not repeat task side effects");
   assert.equal(r.ckptStore.has(`task-result.${taskId}`), false);
   assert.ok(r.calls.includes("releaseTaskLock"));
+});
+
+// A script task that returned wait_external delivered its callback and cleared its outbox. When
+// the external wait resolves, the API puts the same row back to queued and publishes it again
+// under the same task_id, to run from step 0. The outbox key now reads back as a delete marker;
+// that marker belongs to the earlier execution, so this delivery must run the script again.
+test("a task resumed after wait_external runs again although its outbox reads back as a delete marker", async () => {
+  const taskId = "task-wait-external-resume";
+  let replayed = 0;
+  const r = await runScenario({
+    taskId, seedClearedCallback: true,
+    request: { mode: "script" } as Partial<ExecuteRequest>,
+    engineBehavior: async () => result(),
+    sideEffects: {
+      postAgentDone: (async (_req: unknown, res: ExecuteResult) => {
+        if (res.finalText === undefined) replayed++;
+      }) as never,
+    },
+  });
+
+  assert.ok(r.calls.includes("runScript"), "the resumed script runs from step 0");
+  assert.equal(replayed, 0, "the cleared outbox is not replayed as a result");
+  assert.deepEqual(r.verdicts, ["ack"], "the fresh execution ends the delivery once");
+  assert.equal(r.completion?.failed, false, "and reports its own terminal state");
 });
 
 for (const outcome of ["success", "failure"] as const) {

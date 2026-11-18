@@ -26,6 +26,16 @@ export class BadGatewayError extends ServiceError {}
 // Marketplace upsert/duplicate outcomes. Same hierarchy so a caller that only
 // cares that something went wrong can still catch ServiceError.
 export class UpsertPermissionError extends ServiceError {}
+// The plugin name is already registered by another user. A subclass of
+// UpsertPermissionError so a caller that only asks "was the upsert refused?"
+// still sees a refusal, but the route reports it as a name collision rather
+// than a bare "forbidden": the caller is not missing a permission, it has
+// picked a name that someone else owns, and the fix is a different name.
+export class PluginNameTakenError extends UpsertPermissionError {
+  constructor(readonly pluginName: string) {
+    super(`plugin name '${pluginName}' belongs to another user; pick another name`);
+  }
+}
 export class UpsertConflictError extends ServiceError {}
 export class UpsertToolTypeChangeError extends ServiceError {}
 export class ToolDuplicateError extends ServiceError {}

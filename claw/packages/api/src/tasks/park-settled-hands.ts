@@ -16,6 +16,7 @@ import pino from "pino";
 import { parkHandsAfterRun, type RunEndedParkResult } from "@claw/protocol";
 
 import { db } from "../infra/db.js";
+import { workspaceSaveHeldSql } from "../sessions/save-hold.js";
 import { kv } from "../infra/nats.js";
 
 const logger = pino({ name: "park-settled-hands" });
@@ -92,7 +93,12 @@ export async function parkHandsOfSettledSessions(
             SELECT 1 FROM claw_tasks t
              WHERE t.session_id = s.session_id
                AND t.status IN ('queued','preparing','running','cancelling')
-          )`,
+          )
+          -- Nor a session whose last turn is still saving its workspace from the
+          -- sandbox: that run's row is closed but it is not done with the sandbox
+          -- (sessions/save-hold.ts). Parked once the save is over, by whichever
+          -- path settles the session next.
+          AND NOT ${workspaceSaveHeldSql("s")}`,
       [unique],
     );
     settled = r.rows.map((row) => (row as { session_id: string }).session_id);

@@ -42,10 +42,11 @@ import { canExecuteTaskDag, canReadTaskDag } from "../tasks/dags/authz.js";
 import { getTaskDag } from "../tasks/dags/db.js";
 import { withAdmissionTransaction, type AfterCommit } from "../tasks/admission.js";
 import {
-  expandDag, isCreateRefusal, isTopologyRefusal, type CreateRefusal,
+  expandDag, isCreateRefusal, isSandboxWorkspaceRefusal, isTopologyRefusal, type CreateRefusal,
 } from "../tasks/dag-expander.js";
 import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { WorkbenchCtx, WorkbenchDef, RunsListItem } from "./types.js";
+import { holdPluginForAdmission } from "../marketplace/plugin-expiry.js";
 
 const logger = pino({ name: "workbench-routes" });
 
@@ -132,6 +133,10 @@ async function ensureSession(
 
 /** The wording every gated creation surface uses, so one refusal reads the same everywhere. */
 async function sendRunRefusal(reply: FastifyReply, refusal: CreateRefusal): Promise<void> {
+  if (isSandboxWorkspaceRefusal(refusal)) {
+    await reply.status(400).send(refusal.sandboxWorkspace);
+    return;
+  }
   if (isTopologyRefusal(refusal)) {
     await reply.status(400).send({
       ok: false, error: "invalid_topology", errors: refusal.invalidTopology,
@@ -308,6 +313,12 @@ async function submitWorkbenchRun(
   afterCommit: AfterCommit,
 ): Promise<{ commit: boolean; value: unknown }> {
   const { reply } = run;
+  // Held until commit, so the expiry sweep cannot delete it under these tasks;
+  // a plugin that is gone (or past a temporary plugin's expiry) is refused.
+  if (!(await holdPluginForAdmission(client, run.plugin.id))) {
+    await reply.status(404).send({ ok: false, error: "plugin_not_found" });
+    return { commit: false, value: reply };
+  }
   let session: { sessionId: string; created: boolean };
   try {
     session = await ensureSession(run.workbench, run.user, run.body, client, run.req);

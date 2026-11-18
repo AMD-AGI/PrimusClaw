@@ -39,10 +39,12 @@ import type { EnvironmentTopology } from "@claw/protocol";
 import { db, type StatementRunner } from "../infra/db.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { RUN_DOORBELL_DISPATCH } from "../config.js";
+import { holdPluginReference, PluginGoneError } from "../marketplace/plugin-expiry.js";
 import { canAccessSession, isSystemAdmin, type UserInfo } from "../auth/models.js";
 import { loadUserEnvForSession } from "../github-review/session-tools.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import { queuedMessageId, releaseSessionGateForTurn, takeSessionGate } from "../tasks/chat-run.js";
+import { workspaceSaveHeldSql } from "./save-hold.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
 import { DRAIN_UNDER_WAY_SQL } from "./drain-claim.js";
 import { dispatchTaskToBrain, newChatMessageId } from "./dispatch.js";
@@ -118,7 +120,7 @@ export type SubmitSessionMessageInput = SubmitSessionMessageBase & (
 
 /** What became of the drain for a queued message. */
 export type QueuedDrain =
-  /** The session was running: the turn in front drains the queue when it ends. */
+  /** The session was running, or held for the last turn's workspace save: that turn or save drains the queue when it ends. */
   | "awaiting_turn"
   /** `enqueue` on an idle session, or a message queued behind a drain under way, and the drain returned. */
   | "drained"
@@ -284,7 +286,8 @@ export async function submitSessionMessage(
   try {
     await client.query("BEGIN");
     const lockResult = await client.query(
-      `SELECT agent_status, user_id, ${DRAIN_UNDER_WAY_SQL} AS drain_under_way FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE`,
+      `SELECT agent_status, user_id, ${DRAIN_UNDER_WAY_SQL} AS drain_under_way, ${workspaceSaveHeldSql()} AS save_held
+         FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE`,
       [sessionId],
     );
     if (!lockResult.rows.length) {
@@ -310,6 +313,9 @@ export async function submitSessionMessage(
     // A drain under way is dispatching a turn that has not taken the gate yet: this message is queued behind it
     // rather than taking the gate the drain is about to take over it.
     const drainUnderWay = lockResult.rows[0].drain_under_way === true;
+    // The last turn's workspace save is still running: this message waits for it here, in the queue, not on Brain's
+    // workspace lock, where its wait is bounded. The save's finish drains it (sessions/save-hold.ts).
+    const saveHeld = lockResult.rows[0].save_held === true;
     // Snapshot per-user env at message creation time. Decrypted once here,
     // frozen on the pending_messages row (queue path) or NATS task body
     // (immediate path) so Brain reads plaintext without touching the
@@ -321,13 +327,17 @@ export async function submitSessionMessage(
     // and blocking ALTER TABLE / reads cluster-wide.
     // None for a session that acts as a user: its sandbox is given none of its owner's stored variables (see `loadUserEnvForSession`).
     const userEnvSnapshot = await loadUserEnvForSession(client, userId, sessionId, logger);
-    if (status === "running" || mode === "enqueue" || drainUnderWay) {
+    if (status === "running" || mode === "enqueue" || drainUnderWay || saveHeld) {
       const secrets = pendingSecretColumns({
         llmKey: resolveUserLlmKey(user) || "",
         platformKey: user?.platformKey || "",
         userEnv: userEnvSnapshot,
         doorbell: RUN_DOORBELL_DISPATCH,
       });
+      // The queued row references the plugin: hold it so the expiry sweep cannot
+      // race the insert. The route refused a gone plugin already; one that went
+      // since is refused the same way rather than queued without its tools.
+      if (!(await holdPluginReference(client, pluginId))) throw new PluginGoneError();
       const inserted = await insertPendingMessage(client, {
         sessionId,
         content,
@@ -346,7 +356,7 @@ export async function submitSessionMessage(
       });
       if (inserted.id !== null) await input.accepted?.(client, queuedMessageId(inserted.id));
       await client.query("COMMIT");
-      queued = { pendingId: inserted.id, deduplicated: inserted.deduplicated, wasRunning: status === "running" };
+      queued = { pendingId: inserted.id, deduplicated: inserted.deduplicated, wasRunning: status === "running" || saveHeld };
     } else {
       // Stash the snapshot for the immediate-dispatch path below — building
       // `task` happens outside the transaction so we need it accessible.

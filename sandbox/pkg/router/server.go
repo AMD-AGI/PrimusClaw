@@ -23,6 +23,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
 	"sigs.k8s.io/agent-sandbox/pkg/cmdlog"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
@@ -37,7 +38,9 @@ type Config struct {
 	MaxConcurrentRequests int
 	EnableAuth            bool
 	// Identity validates caller credentials on /v1 when EnableAuth is set.
-	Identity           *identity.Client
+	Identity *identity.Client
+	// Authz resolves the caller's platform role. nil reads the role from the token.
+	Authz              authz.RoleSource
 	WorkloadManagerURL string
 	Namespace          string
 	// Namespaces decides which namespaces /v1/namespaces/:namespace serves.
@@ -230,6 +233,12 @@ func (s *Server) setupRoutes() {
 	v1.GET("/sandbox/sessions/:namespace/:name/policy", s.proxyToWM)
 	v1.PATCH("/sandbox/sessions/:namespace/:name/policy", s.proxyToWM)
 	v1.GET("/sandbox/sessions/:namespace/:name/logs", s.proxyToWM)
+
+	// Owner policy templates (system-admin only, checked by WM).
+	v1.GET("/admin/owner-policy/templates", s.proxyToWM)
+	v1.GET("/admin/owner-policy/templates/:name", s.proxyToWM)
+	v1.PUT("/admin/owner-policy/templates/:name", s.proxyToWM)
+	v1.DELETE("/admin/owner-policy/templates/:name", s.proxyToWM)
 
 	// WM health (proxied for unified /v1/health)
 	v1.GET("/health", s.proxyToWM)
@@ -638,15 +647,18 @@ func (s *Server) resolveInvokeSandbox(c *gin.Context, sessionID, namespace, name
 	//   2. WM recovery endpoint → Sandbox CR (fallback)
 	//   3. Error with actionable message
 	// Auto-creation (when sessionID is empty) only happens for POST requests (guarded above).
-	// A forwarded invocation's Authorization is the hop token, which is not a
-	// caller credential the Workload Manager can verify, so it is not passed on.
+	// A forwarded invocation carries a hop token and may still carry the
+	// caller's API key. Neither is a caller credential for the Workload Manager.
 	authorization := c.GetHeader("Authorization")
+	apiKey := c.GetHeader(identity.APIKeyHeader)
 	if forwarded {
 		authorization = ""
+		apiKey = ""
 	}
 	requestContext := withCallerCredentials(
 		c.Request.Context(),
 		authorization,
+		apiKey,
 		c.GetHeader("Cookie"),
 	)
 	info, err := local, error(nil)

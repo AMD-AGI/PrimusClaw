@@ -1,0 +1,325 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+// A connector's refusal codes are told as what happened and what to do, never as the bare code (`remote/connector/reasons.ts`).
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import {
+  OLD_CONNECTOR,
+  SANDBOX,
+  UPGRADE,
+  bareReason,
+  describe,
+  ended,
+  explain,
+  knownReasons,
+} from "../../src/remote/connector/reasons.js";
+import { setupFrom } from "../../src/remote/connector/setup.js";
+import { decode, unwrapPasted } from "../../src/remote/events.js";
+import { remoteLeads } from "../../src/locales/remote-leads.js";
+import { WORLD_ERRORS } from "../../../../test-support/remote-world.js";
+
+// The closed set, from connector/src: every `SessionRefusal("...")`, `refuse("...")`, `rejectCommand(..., "...")`, `close("...")` /
+// `killAll("...")`, the cwd verdicts of roots.ts, attach.ts's reasons, and the `error` a failed turn_end carries. A code the
+// connector gains must be added here and to `REASON_TEXTS`.
+const CONNECTOR_CODES = [
+  // session.ts
+  "mode_unavailable",
+  "mode_not_enforced",
+  "mode_not_confirmed",
+  "mode_mismatch",
+  "mode_not_allowed",
+  "adapter_gone",
+  "adapter_start_failed",
+  "adapter_protocol",
+  "adapter_cannot_resume",
+  "adapter_error",
+  "agent_auth_required",
+  "attach_unavailable",
+  "session_live",
+  "session_closed",
+  "set_mode_failed",
+  "too_many_queued_prompts",
+  "cancelled",
+  "adapter_unavailable",
+  // manager.ts
+  "unknown_session",
+  "unknown_agent",
+  "resume_not_supported",
+  "too_many_sessions",
+  "resume_ref_required",
+  "invalid_resume_ref",
+  "already_attached",
+  "cwd_mismatch",
+  "text_required",
+  "mode_id_required",
+  "action_and_option_required",
+  "closed",
+  // roots.ts
+  "invalid_cwd",
+  "cwd_not_absolute",
+  "cwd_not_found",
+  "cwd_not_directory",
+  "cwd_outside_roots",
+  // attach.ts
+  "recently_written",
+  "twin_check_failed",
+  "catalog_unavailable",
+  // attach.ts endHolders (a takeover the person confirmed)
+  "session_live_elsewhere",
+  "takeover_not_permitted",
+  "takeover_failed",
+  "terminal_did_not_exit",
+  // session.ts typing into a terminal that has the conversation open (terminal-input.ts)
+  "terminal_busy",
+  "terminal_gone",
+  "terminal_switched",
+  "terminal_input_failed",
+  "terminal_input_unseen",
+  "terminal_input_unconfirmed",
+  "terminal_input_unavailable",
+  "terminal_session",
+  "empty_prompt",
+  "terminal_mode_not_allowed",
+  "terminal_mode_unknown",
+  "terminal_command_refused",
+  "takeover_expired",
+  "terminal_screen_unknown",
+  "read_only_live_session",
+  // connector 0.1.19 (session.ts): a queued message pulled back into the box; a holder never proven
+  "terminal_input_withdrawn",
+  "terminal_state_unknown",
+  // roots.ts (a folder named by its base name; a root whose disk does not answer)
+  "cwd_ambiguous",
+  "root_unavailable",
+  // connector.ts (killAll)
+  "revoked",
+  "stopped",
+  "paused",
+  // permissions.ts (a decision refused)
+  "unknown_action",
+  "option_not_offered",
+];
+
+// The codes Claw itself writes (`data.by = "claw"`): a command never collected, and a session closed with its connector's row.
+const CLAW_CODES = ["not_delivered", "delivery_unconfirmed", "connector_revoked", "machine_reconnected"];
+
+const HAN = /[一-鿿]/u;
+const isAscii = (text: string): boolean => {
+  for (let i = 0; i < text.length; i += 1) if (text.charCodeAt(i) >= 0x80) return false;
+  return true;
+};
+const UPGRADE_LINE =
+  "npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install";
+
+test("the closed set is all known", () => {
+  const known = new Set(knownReasons());
+  assert.deepEqual(
+    CONNECTOR_CODES.filter((c) => !known.has(c)),
+    [],
+  );
+  assert.deepEqual(
+    CLAW_CODES.filter((c) => !known.has(c)),
+    [],
+  );
+});
+
+test("every code is said in words not as the code", () => {
+  for (const code of [...CONNECTOR_CODES, ...CLAW_CODES]) {
+    for (const lang of ["zh", "en", null] as const) {
+      const text = describe(code, lang);
+      assert.ok(text && text !== `${code}.` && text.length >= 6, `${code} ${String(lang)}: ${text}`);
+      // (a plain word such as "closed" may be part of the sentence; a code with an underscore never is)
+      if (code.includes("_")) assert.ok(!text.includes(code), text);
+      const [zh, en] = explain(code);
+      assert.ok(HAN.test(zh) && isAscii(en) && zh !== en, code);
+      if (lang === "zh") assert.equal(text, zh);
+      else if (lang === "en") assert.equal(text, en);
+      else assert.equal(text, `${zh}\n${en}`); // (no language known: both)
+    }
+  }
+});
+
+test("an old or unknown connector is told to upgrade and how to get by", () => {
+  for (const code of [...OLD_CONNECTOR].sort()) {
+    for (const version of [null, "", "0.1.3", "0.1.4", "v0.1.4", "garbage"]) {
+      for (const [lang, upgrade, sandbox] of [
+        ["zh", UPGRADE[0], SANDBOX[0]],
+        ["en", UPGRADE[1], SANDBOX[1]],
+      ] as const) {
+        const text = describe(code, lang, version);
+        assert.ok(text.includes(upgrade) && text.includes(sandbox), `${code} ${String(version)} ${lang}`);
+        assert.ok(text.includes(UPGRADE_LINE));
+        assert.ok(text.includes('env = { IS_SANDBOX = "1" }'));
+      }
+    }
+  }
+});
+
+test("a fixed connector is not told to upgrade", () => {
+  for (const version of ["0.1.5", "0.1.10", "0.2.0", "1.0.0", "0.1.5-rc.1"]) {
+    for (const code of OLD_CONNECTOR) {
+      const text = describe(code, "en", version);
+      assert.ok(
+        !text.includes("npm install") && !text.includes("IS_SANDBOX") && text.includes("claw-connector status"),
+        `${code} ${version}`,
+      );
+    }
+  }
+});
+
+test("an unknown code gets a generic sentence that names it and words stay as they are", () => {
+  assert.ok(describe("brand_new_reason", "en").includes("(brand_new_reason)"));
+  assert.ok(describe("brand_new_reason", "zh").includes("（brand_new_reason）"));
+  assert.equal(describe("the connector was revoked", "en"), "the connector was revoked.");
+  assert.equal(describe("", "en"), "");
+  assert.equal(describe(null, "zh"), "");
+});
+
+test("ended puts the lead first in the language", () => {
+  assert.ok(
+    ended(["会话没能启动", "The session could not start"], "too_many_sessions", "en").startsWith(
+      "The session could not start: Too many sessions",
+    ),
+  );
+  assert.ok(
+    ended(["会话没能启动", "The session could not start"], "too_many_sessions", "zh").startsWith("会话没能启动："),
+  );
+  assert.equal(ended(["会话已结束", "The session ended"], "", "en"), "The session ended.");
+  const both = ended(["会话已结束", "The session ended"], "adapter_gone", null);
+  assert.ok(both.startsWith("会话已结束：") && both.includes("\nThe session ended: "));
+});
+
+test("a revoked connector is given the whole login command", () => {
+  // (the address this worker reaches Claw at: what a deployment sets as CLAW_API_URL)
+  const setup = setupFrom(null, "https://claw.example.com/claw-api");
+  for (const lang of ["zh", "en"] as const) {
+    const text = describe("revoked", lang, null, setup);
+    assert.ok(
+      text.includes(
+        "claw-connector login --server https://claw.example.com/claw-api --identity-url https://claw.example.com",
+      ),
+      text,
+    );
+  }
+});
+
+// Names an object has of its own in JavaScript are reasons like any other (Python's dict.get finds nothing for them).
+test("a reason named like an object's own property is told as Python tells it", () => {
+  assert.equal(
+    describe("constructor", "en"),
+    "The connector gave a reason I do not know (constructor). Run `claw-connector status` on that machine, or upgrade the connector and try again.",
+  );
+  assert.equal(
+    describe("constructor", "zh"),
+    "连接器给出了一个我不认识的原因（constructor）。在那台机器上运行 `claw-connector status` 看看，或升级连接器后再试。",
+  );
+  for (const name of ["__proto__", "toString", "hasOwnProperty"]) {
+    for (const lang of ["en", "zh"] as const) assert.equal(describe(name, lang), `${name}.`);
+  }
+});
+
+// A reason is the connector's text: trimming its full stops must not take time quadratic in its length (a `/\.+$/` replace
+// retries the run of dots from every position when the text does not end in one). Python's `rstrip(".")` is linear.
+test("a long run of full stops that does not end the reason is trimmed in linear time", () => {
+  const reason = ".".repeat(50_000) + "x";
+  const started = performance.now();
+  assert.equal(bareReason(reason), reason); // (Python: the same text, nothing to strip at its end)
+  assert.equal(bareReason(`${reason}...`), reason);
+  assert.ok(performance.now() - started < 500, `${String(performance.now() - started)} ms`);
+});
+
+// The `turn_end` error codes a connector from 0.1.19 ends a message typed into a terminal with.
+const TERMINAL_TURN_ERRORS = [
+  "terminal_busy",
+  "terminal_input_withdrawn",
+  "terminal_input_failed",
+  "terminal_input_unseen",
+  "terminal_switched",
+  "terminal_gone",
+  "terminal_screen_unknown",
+  "terminal_state_unknown",
+  "read_only_live_session",
+];
+
+for (const code of TERMINAL_TURN_ERRORS) {
+  test(`a terminal turn error of connector 0.1.19 has its own words: ${code}`, () => {
+    assert.ok(knownReasons().includes(code), code);
+    const [zh, en] = explain(code);
+    assert.ok(!zh.includes("不认识") && !en.includes("do not know"), `${zh} | ${en}`);
+  });
+}
+
+test("a message the terminal never showed says it was not sent, why, and to send it again", () => {
+  const [zh, en] = explain("terminal_input_unseen");
+  assert.ok(zh.includes("没有发出去") && zh.includes("正忙") && zh.includes("再发"), zh);
+  assert.ok(en.includes("nothing was sent") && en.includes("busy") && en.includes("again"), en);
+});
+
+test("terminal busy no longer blames a running turn", () => {
+  // (0.1.19 types a message in while a turn runs, Claude Code queues it: only typing or a scrolled-back screen holds it)
+  const [zh, en] = explain("terminal_busy");
+  assert.ok(!zh.includes("在跑") && !en.toLowerCase().includes("running"), `${zh} | ${en}`);
+  assert.ok(zh.includes("输入") && zh.includes("回滚") && en.includes("typing") && en.includes("scrolled back"));
+});
+
+test("a withdrawn message says where it is and how to send it", () => {
+  const [zh, en] = explain("terminal_input_withdrawn");
+  assert.ok(zh.includes("没有") && zh.includes("输入框") && zh.includes("回车") && zh.includes("重发"), zh);
+  assert.ok(
+    en.includes("not sent") && en.includes("input box") && en.includes("Enter") && en.includes("again from the phone"),
+    en,
+  );
+});
+
+test("a message the terminal did not confirm is never said as not sent and only a connector before 0.1.22 is told to upgrade", () => {
+  for (const lang of ["zh", "en"] as const) {
+    for (const [version, upgrade] of [
+      ["0.1.21", true],
+      ["0.1.4", true],
+      ["0.1.22", false],
+      ["0.2.2", false],
+      [null, false],
+    ] as const) {
+      const text = describe("terminal_input_unconfirmed", lang, version);
+      assert.equal(text.includes(UPGRADE_LINE), upgrade, `${String(version)} ${lang}: ${text}`);
+      assert.ok(!/not sent|did not go|may not have gone in|没有发进去|没发出去/u.test(text), text);
+      assert.ok(text.includes(lang === "zh" ? "之后的回复仍会发到这里" : "still shows here"), text);
+    }
+  }
+  assert.equal(
+    ended(remoteLeads.inputUnconfirmed, "terminal_input_unconfirmed", "en").split(": ")[0],
+    "Not confirmed by the terminal yet",
+  );
+});
+
+test("a prompt typed at the terminal is shown as typed, not as the block Claude Code records a paste in", () => {
+  const step = decode(
+    {
+      name: "user_message_chunk",
+      id: "1",
+      data: {
+        data: {
+          update: {
+            sessionUpdate: "user_message_chunk",
+            content: {
+              type: "text",
+              text: '\n\n<pasted_content id="9a55">\nline one\n\nline two\n</pasted_content id="9a55">\n',
+            },
+          },
+        },
+      },
+    },
+    WORLD_ERRORS,
+  );
+  assert.equal(step.typed, "line one\n\nline two");
+  assert.equal(
+    unwrapPasted('look\n\n<pasted_content id="2a">\na\nb\n</pasted_content id="2a">\n\nand fix it'),
+    "look\na\nb\nand fix it",
+  );
+  assert.equal(
+    unwrapPasted('<pasted_content id="1">\nx\n</pasted_content id="2">'),
+    '<pasted_content id="1">\nx\n</pasted_content id="2">',
+  );
+});

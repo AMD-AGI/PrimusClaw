@@ -18,8 +18,8 @@ import { isAdmin, type UserInfo } from "../auth/models.js";
 import { stampSessionCredentials } from "../auth/session-credentials.js";
 import { buildMessages } from "./context-builder.js";
 import { memoryAccess } from "../memory/service.js";
-import { CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
-import { selectSkillsForTask } from "../marketplace/skill-service.js";
+import { CLAW_SKILL_AUTO_EVOLUTION_ENABLED } from "../config.js";
+import { applyTurnUserSkills, userSkillsForTurn } from "./user-skills.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
 import { eventSubject, taskSubject, type EnvironmentTopology } from "@claw/protocol";
 import {
@@ -35,9 +35,10 @@ import { stripRunSecrets } from "../tasks/run-spec.js";
 import { sessionEffortFromRow, sessionModelFromRow } from "./session-model.js";
 import { sessionRepoFromRow } from "./session-repo.js";
 import { applyAppMcpToTask } from "./app-mcp.js";
-import { applySessionRoleToTask, skipsSkillSelection } from "../assistant/role-profile.js";
+import { applySessionRoleToTask } from "../assistant/role-profile.js";
 import { applyTriggerToolsToTask } from "../triggers/mcp.js";
 import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/store.js";
+import { redactStoredValue } from "@claw/utils";
 import pino from "pino";
 
 const logger = pino({ name: "session-dispatch" });
@@ -253,35 +254,20 @@ export async function dispatchTaskToBrain(
     // includes it even if the consumer hasn't yet subscribed.
     // A sandbox-only run is not a conversation turn: nothing is added to the
     // transcript, and so nothing is handed to the model as history later.
+    // The stored copy is masked (`redactStoredValue`); this turn's prompt is
+    // `content`, which goes to Brain as the user wrote it.
     if (!sandboxOnly) {
       await db.query(
         "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id, session_id) DO NOTHING",
-        [messageId, sessionId, "UserMessage", userEvent],
+        [messageId, sessionId, "UserMessage", redactStoredValue(userEvent)],
       );
       sessionDispatchPorts.publishSse(sessionId, JSON.stringify(userEvent));
     }
 
     const history = sandboxOnly ? [] : await buildMessages(sessionId, content, userId);
 
-    let localSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> = {};
-    try {
-      // A router turn only classifies and calls tools; selecting skills costs it an LLM call it has no use for.
-      const activeSkills = sandboxOnly || await skipsSkillSelection(sessionId) ? {} : await selectSkillsForTask(userId, content);
-      for (const [name, bundle] of Object.entries(activeSkills)) {
-        localSkills[name] = {
-          content: bundle.content,
-          description: bundle.description,
-          enabled: true,
-          version: bundle.version,
-          files: bundle.files,
-        };
-      }
-    } catch (err: any) {
-      const code = err?.code || "";
-      if (code !== "42P01" && code !== "42703") {
-        logger.error({ err, userId }, "skill.load_failed");
-      }
-    }
+    // The user's personal skills, listed (not their text) to a turn of their own conversation. A sandbox-only run has no model.
+    const userSkills = sandboxOnly ? { enabled: false } : await userSkillsForTurn(sessionId, userId);
 
     const sandboxImageMatch = SANDBOX_IMAGE_RE.exec(content);
     const admin = user ? isAdmin(user) : false;
@@ -316,7 +302,7 @@ export async function dispatchTaskToBrain(
       prompt: content,
       history,
       memory_enabled: (await memoryAccess(sessionId, userId)).serves,
-      skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
+      skill_evolution_enabled: CLAW_SKILL_AUTO_EVOLUTION_ENABLED,
       user_id: userId,
       llm_api_key: resolveUserLlmKey(user),
       platform_key: user?.platformKey || "",
@@ -324,7 +310,6 @@ export async function dispatchTaskToBrain(
       plugin_id: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
       workspace_id: workspaceId,
       mcp_servers: mcpServers,
-      skills: Object.keys(localSkills).length ? localSkills : undefined,
       sandbox_image: finalSandboxImage,
       resources: finalResources,
       timeout: requestTimeout,
@@ -338,6 +323,7 @@ export async function dispatchTaskToBrain(
     if (pluginTools !== undefined) {
       task.plugin_tools = pluginTools;
     }
+    applyTurnUserSkills(task, userSkills);
     if (toolsAllowlist?.length) task.tools_allowlist = toolsAllowlist;
     if (sandboxOnly) {
       // Brain opens the sandbox up front for script mode and the empty script

@@ -24,11 +24,16 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
+	"sigs.k8s.io/agent-sandbox/pkg/usercr"
 )
 
 type fakeRunner struct {
@@ -45,6 +50,8 @@ type fakeRunner struct {
 	failure   string
 	node      string
 	adopted   []time.Duration
+	// onCancel runs when a held create is cancelled, before it returns.
+	onCancel func()
 }
 
 func (f *fakeRunner) Adopt(_ context.Context, _ string, _ CreateResult, timeout time.Duration) error {
@@ -61,6 +68,9 @@ func (f *fakeRunner) Create(ctx context.Context, req CreateRequest) (CreateResul
 		select {
 		case <-f.hold:
 		case <-ctx.Done():
+			if f.onCancel != nil {
+				f.onCancel()
+			}
 			return CreateResult{}, ctx.Err()
 		}
 	}
@@ -115,6 +125,59 @@ func testPlane(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32) (
 
 func testPlaneWithSpec(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string) (*Service, *fakeRunner, map[string]string) {
 	t.Helper()
+	return testPlaneInWorkspaces(t, maxSec, perGPU, maxSandboxes, spec, []string{"top-models"})
+}
+
+func testPlaneInWorkspaces(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string) (*Service, *fakeRunner, map[string]string) {
+	t.Helper()
+	return testPlaneReviewed(t, maxSec, perGPU, maxSandboxes, spec, workspaces, defaultAuthz())
+}
+
+// testPlaneInWorkspacesWith builds the default grant plane with the given permission reviews.
+func testPlaneInWorkspacesWith(t *testing.T, az *fakeAuthz) (*Service, *fakeRunner, map[string]string) {
+	t.Helper()
+	return testPlaneReviewed(t, 3600, []int32{1}, 2, `{"acceptedEnvs":["FOO"],"inputs":["/in"],"outputs":["/out"]}`, []string{"prod"}, az)
+}
+
+func testPlaneReviewed(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string, az *fakeAuthz) (*Service, *fakeRunner, map[string]string) {
+	t.Helper()
+	return testPlaneConfigured(t, maxSec, perGPU, maxSandboxes, spec, workspaces, func(o *grant.Options) {
+		if az != nil {
+			o.Authz = az
+			o.ReviewOwner = true
+		}
+	})
+}
+
+// testPlaneSAROff builds the default grant plane with the User authorizer and no workspace SAR.
+func testPlaneSAROff(t *testing.T, users staticUsers, attest bool, opts ...usercr.Option) (*Service, *fakeRunner, map[string]string) {
+	t.Helper()
+	return testPlaneConfigured(t, 3600, []int32{1}, 2, `{"acceptedEnvs":["FOO"],"inputs":["/in"],"outputs":["/out"]}`, []string{"lab"}, func(o *grant.Options) {
+		o.Authz = usercr.NewFromReader(users, opts...)
+		o.AttestWorkloads = attest
+	})
+}
+
+// testPlaneWithClient builds the default grant plane and also returns its fake cluster client.
+func testPlaneWithClient(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string) (*Service, *fakeRunner, map[string]string, client.Client) {
+	t.Helper()
+	az := defaultAuthz()
+	return testPlaneConfiguredClient(t, maxSec, perGPU, maxSandboxes, spec, workspaces, func(o *grant.Options) {
+		o.Authz = az
+		o.ReviewOwner = true
+	})
+}
+
+// testPlaneConfigured issues the default grant on a plane whose grant options configure adjusts.
+func testPlaneConfigured(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string, configure func(*grant.Options)) (*Service, *fakeRunner, map[string]string) {
+	t.Helper()
+	svc, runner, keys, _ := testPlaneConfiguredClient(t, maxSec, perGPU, maxSandboxes, spec, workspaces, configure)
+	return svc, runner, keys
+}
+
+// testPlaneConfiguredClient is testPlaneConfigured that also returns the fake cluster client.
+func testPlaneConfiguredClient(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes int32, spec string, workspaces []string, configure func(*grant.Options)) (*Service, *fakeRunner, map[string]string, client.Client) {
+	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	scheme := runtime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
@@ -129,14 +192,16 @@ func testPlaneWithSpec(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes 
 	if err != nil {
 		t.Fatal(err)
 	}
-	gs := grant.New(grant.Options{
+	opts := grant.Options{
 		Client: cl, Namespace: "agent-sandbox-system", DataKey: bytes32(),
-		Authn: allowAuth{}, Attest: checker, Identity: allowIdentity{}, Membership: allowMember{},
+		Authn: allowAuth{}, Attest: checker, Identity: allowIdentity{},
 		Now: func() time.Time { return now },
-	})
+	}
+	configure(&opts)
+	gs := grant.New(opts)
 	req := grant.IssueRequest{
 		GrantID:     "gr-01jb7m9k2x",
-		Owner:       grant.OwnerRequest{UserID: "u-123", Workspaces: []string{"top-models"}},
+		Owner:       grant.OwnerRequest{UserID: "u-123", Workspaces: workspaces},
 		PlatformKey: "ak-test",
 		Issuer:      grant.IssuerRequest{SessionID: "s-8f2a", AppRunID: "ar-01ja"},
 		Roles: map[string]grant.RoleRequest{
@@ -156,7 +221,7 @@ func testPlaneWithSpec(t *testing.T, maxSec int64, perGPU []int32, maxSandboxes 
 		t.Fatal(err)
 	}
 	runner := &fakeRunner{}
-	return New(Options{Grants: gs, Runner: runner, Namespace: "agent-sandbox-system"}), runner, issued.Keys
+	return New(Options{Grants: gs, Runner: runner, Namespace: "agent-sandbox-system"}), runner, issued.Keys, cl
 }
 
 func bytes32() []byte {
@@ -202,13 +267,96 @@ type allowAuth struct{}
 
 func (allowAuth) Authenticate(context.Context, string) error { return nil }
 
+// allowIdentity answers every platform key as the grant owner u-123.
 type allowIdentity struct{}
 
-func (allowIdentity) Check(context.Context, string, string) (string, error) { return "alice", nil }
+func (allowIdentity) Introspect(context.Context, string) (identity.Token, error) {
+	return identity.Token{Subject: "u-123", Username: "alice"}, nil
+}
 
-type allowMember struct{}
+// fakeAuthz answers permission reviews from per-user workspace lists and a set of
+// platform admins. A "*" workspace allows any workspace.
+type fakeAuthz struct {
+	workspaces map[string][]string
+	admins     map[string]bool
+	err        error
+}
 
-func (allowMember) Check(context.Context, string, []string) error { return nil }
+func (f *fakeAuthz) CanUseWorkspace(_ context.Context, tok identity.Token, ws string) (bool, error) {
+	if ws == "" {
+		return false, authz.ErrEmptyWorkspace
+	}
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.admins[tok.Subject] || contains(f.workspaces[tok.Subject], "*") || contains(f.workspaces[tok.Subject], ws), nil
+}
+
+func (f *fakeAuthz) CanUseAllWorkspaces(_ context.Context, tok identity.Token) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.admins[tok.Subject] || contains(f.workspaces[tok.Subject], "*"), nil
+}
+
+func (f *fakeAuthz) PlatformRole(_ context.Context, tok identity.Token) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	if f.admins[tok.Subject] {
+		return identity.RoleSystemAdmin, nil
+	}
+	return identity.RoleDefault, nil
+}
+
+// ChooseWorkspace is the test double of a permission review. One listed workspace is still inferred here.
+// The production SAR client does not infer a workspace.
+func (f *fakeAuthz) ChooseWorkspace(ctx context.Context, tok identity.Token, requested string) (string, error) {
+	all, err := f.CanUseAllWorkspaces(ctx, tok)
+	if err != nil {
+		return "", err
+	}
+	if all {
+		if requested == "" {
+			return "", authz.ErrWorkspaceRequired
+		}
+		return requested, nil
+	}
+	if requested != "" {
+		ok, err := f.CanUseWorkspace(ctx, tok, requested)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", authz.ErrNotInWorkspace
+		}
+		return requested, nil
+	}
+	names := f.workspaces[tok.Subject]
+	if len(names) == 1 && names[0] != "" && names[0] != "*" {
+		return names[0], nil
+	}
+	if len(names) == 0 {
+		return "", authz.ErrNotInWorkspace
+	}
+	return "", authz.ErrWorkspaceRequired
+}
+
+// defaultAuthz lets the grant owner use any workspace, u-1 use lab, u-2 use lab and prod,
+// and makes u-8 and u-9 platform admins.
+func defaultAuthz() *fakeAuthz {
+	return &fakeAuthz{
+		workspaces: map[string][]string{"u-123": {"*"}, "u-1": {"lab"}, "u-2": {"lab", "prod"}},
+		admins:     map[string]bool{"u-8": true, "u-9": true},
+	}
+}
+
+// staticUsers serves SaFE Users by id. A missing id is a User that does not exist.
+type staticUsers map[string]usercr.User
+
+func (u staticUsers) Read(_ context.Context, userID string) (usercr.User, error) {
+	return u[userID], nil
+}
 
 func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 	cases := []struct {
@@ -240,6 +388,69 @@ func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 				t.Fatalf("replay=%v", err)
 			}
 		})
+	}
+}
+
+// A replay that reads the Workload while the expired create deletes it reports
+// the pending timeout, not the deletion it observed.
+func TestPendingTimeoutReplayDuringDeleteReportsPendingTimeout(t *testing.T) {
+	svc, runner, keys := testPlaneWithSpec(t, 600, []int32{1}, 1, `{"pendingTimeoutSec":1}`)
+	runner.hold = make(chan struct{})
+	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"}}
+	var replayErr error
+	runner.onCancel = func() {
+		runner.observed = WorkloadFinished
+		runner.failure = "workload sbx-1 is being deleted: phase NotReady: In queue"
+		_, _, replayErr = svc.Create(context.Background(), keys["measurement"], body)
+	}
+	_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+	var oe *grant.OpError
+	if !errors.As(replayErr, &oe) || oe.Status != http.StatusGone || !strings.Contains(oe.Detail, ": pending_timeout") || strings.Contains(oe.Detail, "being deleted") {
+		t.Fatalf("replay=%v", replayErr)
+	}
+	if !errors.As(err, &oe) || oe.Reason != "pending_timeout" || !strings.Contains(oe.Detail, "pendingTimeoutSec=1") {
+		t.Fatalf("create=%v", err)
+	}
+}
+
+// A sandbox a replay adopted as running before the pending deadline is not
+// ended or deleted when the deadline passes.
+func TestPendingDeadlineKeepsAdoptedRunningSandbox(t *testing.T) {
+	svc, runner, keys := testPlaneWithSpec(t, 600, []int32{1}, 1, `{"pendingTimeoutSec":1}`)
+	runner.started = make(chan struct{})
+	runner.hold = make(chan struct{})
+	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"}}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+		done <- err
+	}()
+	awaitStarted(t, runner.started, done)
+	runner.observed = WorkloadRunning
+	if _, status, err := svc.Create(context.Background(), keys["measurement"], body); err != nil || status != http.StatusCreated {
+		t.Fatalf("replay status=%d err=%v", status, err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	refs, err := svc.grants.ListRoleSandboxes(context.Background(), "gr-01jb7m9k2x", "measurement")
+	if err != nil || len(refs) != 1 || refs[0].State != runtimev1alpha1.SandboxRunning {
+		t.Fatalf("refs=%+v err=%v", refs, err)
+	}
+	close(runner.hold)
+	if err := <-done; err != nil {
+		t.Fatalf("create=%v", err)
+	}
+}
+
+// endAt counts the sandbox timeout from the time it was first running.
+func TestDetailEndAtCountsFromRunning(t *testing.T) {
+	svc, _, _ := testPlane(t, 600, []int32{1}, 1)
+	created := time.Date(2026, 11, 9, 3, 14, 0, 0, time.UTC)
+	ref := runtimev1alpha1.GrantSandboxRef{
+		ID: "sbx-1", StartedAt: metav1.NewTime(created), RunningAt: metav1.NewTime(created.Add(20 * time.Minute)), TimeoutSec: 600,
+	}
+	got := svc.detail(context.Background(), "gr-01jb7m9k2x", ref)
+	if want := created.Add(30 * time.Minute).Format(time.RFC3339); got.EndAt != want || got.StartedAt != created.Add(20*time.Minute).Format(time.RFC3339) {
+		t.Fatalf("startedAt=%s endAt=%s want endAt %s", got.StartedAt, got.EndAt, want)
 	}
 }
 
@@ -518,7 +729,7 @@ func TestCreateReplayKillAndQuota(t *testing.T) {
 	if first.EnvdAccessToken == "" || first.ClientID != first.SandboxID || first.Domain != first.SandboxID || first.Alias != "runner" {
 		t.Fatalf("first=%+v", first)
 	}
-	if first.TemplateID != "ar-01ja-runner-g1" || first.EnvdVersion != "0.1.0" {
+	if first.TemplateID != "ar-01ja-runner-g1" || first.EnvdVersion != "0.5.2" {
 		t.Fatalf("first=%+v", first)
 	}
 	created := runner.created[0]
@@ -738,6 +949,69 @@ func TestQuotaMessageBody(t *testing.T) {
 	}
 }
 
+func TestSandboxCreateAcceptsBearerAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc, _, keys := testPlane(t, 600, []int32{1}, 2)
+	h := NewHandler(svc)
+	r := gin.New()
+	h.Mount(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"ar-01ja-runner-g1","timeout":30}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+keys["measurement"])
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("bearer create=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSandboxCreatePrefersAPIKeyOverBearer(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc, _, keys := testPlane(t, 600, []int32{1}, 2)
+	h := NewHandler(svc)
+	r := gin.New()
+	h.Mount(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"ar-01ja-runner-g1","timeout":30}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer not-a-platform-key")
+	req.Header.Set("X-API-KEY", keys["measurement"])
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("api key with bearer=%d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSandboxCreateAcceptsIdentityKeyAsBearer(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ids := &fakeIntrospector{tokens: map[string]identity.Token{"ak-alice": {Subject: "u-1", Email: "alice@example.com"}}}
+	plane, _, _ := ownerPlane(t, ids, samplePolicy())
+	r := gin.New()
+	NewHandler(plane).Mount(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"runner","timeout":30}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer ak-alice")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated || ids.calls != 1 {
+		t.Fatalf("identity bearer=%d calls=%d %s", w.Code, ids.calls, w.Body.String())
+	}
+}
+
+func TestMissingSandboxCredentialNamesBothHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc, _, _ := testPlane(t, 600, []int32{1}, 1)
+	h := NewHandler(svc)
+	r := gin.New()
+	h.Mount(r)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"ar-01ja-runner-g1","timeout":30}`))
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "X-API-KEY") || !strings.Contains(w.Body.String(), "Authorization") {
+		t.Fatalf("missing=%d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestV2RoutesReachHandlers(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	svc, _, keys := testPlane(t, 600, []int32{1}, 2)
@@ -877,5 +1151,42 @@ func TestKillWithoutRunner(t *testing.T) {
 	got, err := svc.Get(context.Background(), key, created.SandboxID)
 	if err != nil || got.State != runtimev1alpha1.SandboxRunning {
 		t.Fatalf("got=%+v err=%v", got, err)
+	}
+}
+
+// A grant that lists the app's workspace first must still place a template's
+// sandbox in the workspace that template names (hosting, 2026-11-07: measurement
+// sandboxes of a top-models template landed in crusoe-spur-vk).
+func TestGrantSandboxRunsInTheTemplateWorkspace(t *testing.T) {
+	svc, runner, keys := testPlaneInWorkspaces(t, 600, []int32{1}, 2, `{"workspace":"top-models"}`, []string{"crusoe-spur-vk", "top-models"})
+	if _, _, err := svc.Create(context.Background(), keys["measurement"], CreateBody{TemplateID: "runner", Timeout: 60}); err != nil {
+		t.Fatalf("create=%v", err)
+	}
+	if len(runner.created) != 1 || runner.created[0].Workspace != "top-models" {
+		t.Fatalf("created=%+v, want one sandbox in top-models", runner.created)
+	}
+}
+
+// A template that names no workspace keeps the grant's first one.
+func TestGrantSandboxWithoutTemplateWorkspaceUsesTheFirstListed(t *testing.T) {
+	svc, runner, keys := testPlaneInWorkspaces(t, 600, []int32{1}, 2, `{}`, []string{"top-models", "crusoe-spur-vk"})
+	if _, _, err := svc.Create(context.Background(), keys["measurement"], CreateBody{TemplateID: "runner", Timeout: 60}); err != nil {
+		t.Fatalf("create=%v", err)
+	}
+	if len(runner.created) != 1 || runner.created[0].Workspace != "top-models" {
+		t.Fatalf("created=%+v, want one sandbox in top-models", runner.created)
+	}
+}
+
+// A template workspace outside the grant's list was never attested: refused, nothing created.
+func TestGrantSandboxTemplateWorkspaceOutsideTheGrantIsRefused(t *testing.T) {
+	svc, runner, keys := testPlaneInWorkspaces(t, 600, []int32{1}, 2, `{"workspace":"other-ws"}`, []string{"crusoe-spur-vk", "top-models"})
+	_, _, err := svc.Create(context.Background(), keys["measurement"], CreateBody{TemplateID: "runner", Timeout: 60})
+	var oe *grant.OpError
+	if !errors.As(err, &oe) || oe.Status != http.StatusForbidden || oe.Reason != "workspace_not_allowed" {
+		t.Fatalf("create=%v, want 403 workspace_not_allowed", err)
+	}
+	if len(runner.created) != 0 {
+		t.Fatalf("created=%+v, want none", runner.created)
 	}
 }

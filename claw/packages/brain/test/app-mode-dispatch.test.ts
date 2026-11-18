@@ -14,8 +14,17 @@
  *   A1b a failed app run is reported as a failure with the runner's reason
  *   A1c a cancel finishes the run; a drain or a lost lease leaves it to its
  *       successor
+ *   A1d the same split decides whether a sandbox still being waited for is
+ *       stopped when the run's signal fires
  *   A2 llm, script, app and an omitted mode are not refused
  *   A3 a mode this Brain has never heard of is refused, the engine untouched
+ *   A4 a task whose result outbox was already cleared (NATS returns the delete
+ *      marker, an empty value) is not replayed: the delivery runs as a fresh
+ *      execution, so a finish-only dispatch finishes its run
+ *   A5 an outbox entry that does not parse is dropped and the delivery runs,
+ *      instead of being retried until it is poisoned
+ *   A6 a run whose lock a Stop force-released leaves, on its late exit, the
+ *      controller of the next run of its key in place
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -27,7 +36,8 @@ import type { TaskRunnerSideEffects } from "../src/tasks/runner.js";
 import type { AppRunner, AppRunResult, AppRunOutcome } from "../src/apps/app-runner.js";
 
 const { bindTaskRunnerDeps, runHandleTask, refuseUnsupportedMode } = await import("../src/tasks/runner.js");
-const { activeAbort, SIGTERM_ABORT_REASON, LEASE_LOST_ABORT_REASON, DEADLINE_EXCEEDED_ABORT_REASON } =
+const { interruptRunsAt } = await import("../src/tasks/interrupt.js");
+const { activeAbort, SIGTERM_ABORT_REASON, LEASE_LOST_ABORT_REASON, DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON } =
   await import("../src/tasks/abort-registry.js");
 
 interface FakeRunner {
@@ -41,10 +51,13 @@ interface FakeRunner {
   made: Array<{ platformKey: string; epoch: number }>;
   closed: string[];
   /** What run() answers. It may also fire the abort first, as a real cancel would. */
-  script: (signal: AbortSignal) => Promise<AppRunResult>;
+  script: (signal: AbortSignal, opts?: { reclaimOnAbort?: () => boolean }) => Promise<AppRunResult>;
 }
 
-function harness(runner?: FakeRunner) {
+/** A KV entry as NATS returns it: a key deleted with `kv.delete` comes back as its delete marker, not null. */
+type KvEntry = { key: string; value: Uint8Array; operation?: string };
+
+function harness(runner?: FakeRunner, outbox?: { entry: KvEntry | null; deleted: string[] }) {
   const done: ExecuteResult[] = [];
   let acked = 0;
   let released = 0;
@@ -57,7 +70,11 @@ function harness(runner?: FakeRunner) {
   const settles: unknown[][] = [];
   let handOvers = 0;
   const events: Array<{ type?: string }> = [];
-  const kv = { async get() { return null; }, async put() { return 1; }, async delete() {} } as unknown as KV;
+  const kv = {
+    async get(key: string) { return key === "task-result.t-app" ? outbox?.entry ?? null : null; },
+    async put() { return 1; },
+    async delete(key: string) { outbox?.deleted.push(key); },
+  } as unknown as KV;
   const engine: Engine = {
     async execute(): Promise<ExecuteResult> { engineCalls++; throw new Error("engine must not run"); },
   };
@@ -78,7 +95,7 @@ function harness(runner?: FakeRunner) {
       runner?.made.push({ platformKey, epoch });
       return {
         markEnded: async (why: string) => { runner?.closed.push(why); return true; },
-        run: async (signal: AbortSignal) => { runner!.runs++; return runner!.script(signal); },
+        run: async (signal: AbortSignal, opts?: { reclaimOnAbort?: () => boolean }) => { runner!.runs++; return runner!.script(signal, opts); },
         finishNow: async (cause: string): Promise<AppRunOutcome> => { runner!.finishes.push(cause); if (runner!.finishThrows) throw new Error("finish kept failing"); return runner!.finishOutcome ?? { success: false, reason: cause }; },
       } as unknown as AppRunner;
     }) as never,
@@ -222,6 +239,32 @@ test("A1c a user cancel finishes the run; a drain or a lost lease leaves it to t
   }
 });
 
+test("A1d a sandbox the run is waiting for is stopped when the run is finished here, and left when it is handed over", async () => {
+  // Asked as the AppRunner asks it: when the abort is seen, not when the run starts.
+  const cases: Array<[string, unknown, boolean]> = [
+    ["user cancel", undefined, true],
+    ["deadline", DEADLINE_EXCEEDED_ABORT_REASON, true],
+    ["terminal row", RUN_ROW_TERMINAL_ABORT_REASON, true],
+    ["drain", SIGTERM_ABORT_REASON, false],
+    ["lost lease", LEASE_LOST_ABORT_REASON, false],
+  ];
+  for (const [name, reason, reclaims] of cases) {
+    let answer: boolean | undefined;
+    const r = fakeRunner(async () => ({ kind: "aborted" }));
+    const h = harness(r);
+    const c = new AbortController();
+    activeAbort.set("lock.s-app", c);
+    r.script = async (_signal, opts) => {
+      assert.equal(typeof opts?.reclaimOnAbort, "function", `${name}: the run is told what its stop means`);
+      c.abort(reason);
+      answer = opts!.reclaimOnAbort!();
+      return { kind: "aborted" };
+    };
+    await runHandleTask(h.msg, request("app"), "s-app", "lock.s-app", "m1", "u1", c);
+    assert.equal(answer, reclaims, `${name}: ${reclaims ? "the workload is stopped" : "the workload is left for the successor"}`);
+  }
+});
+
 test("A1c2 a cancel whose application wrote a successful final in its grace is reported as that success, with its captures", async () => {
   for (const make of [
     () => { const c = new AbortController(); return { ctrl: c, fire: () => c.abort() }; },
@@ -325,4 +368,70 @@ test("A1i finish-only without a platform key: nothing is reported and the run ro
   assert.equal(h.done.length, 0);
   assert.equal(h.events.filter((e) => e.type === "statusUpdate").length, 0);
   assert.equal(h.acked(), 1);
+});
+
+// The live case (11-06): an app run cancelled while its sandbox was still being created was handed to a
+// new Brain to finish (`app_finish_only`). Its earlier delivery had cleared the result outbox, so the
+// key read back as a delete marker; replaying that empty value failed on every delivery until the
+// message was poisoned, and the run row stayed `finishing`.
+const DELETE_MARKER: KvEntry = { key: "task-result.t-app", value: new Uint8Array(0), operation: "DEL" };
+
+test("A4 finish-only with a cleared outbox: the run is finished, nothing is replayed", async () => {
+  for (const entry of [DELETE_MARKER, { ...DELETE_MARKER, operation: "PURGE" }, { key: "task-result.t-app", value: new Uint8Array(0) }]) {
+    const runner = fakeRunner(async () => ({ kind: "ended", outcome: { success: false, reason: "app run ended: cancelled" } }));
+    const outbox = { entry, deleted: [] as string[] };
+    const h = harness(runner, outbox);
+    const abortCtrl = new AbortController();
+    activeAbort.set("lock.s-app", abortCtrl);
+    await runHandleTask(h.msg, { ...request("app"), app_finish_only: true } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", abortCtrl);
+    assert.equal(runner.runs, 1, `${entry.operation ?? "empty"}: the AppRunner finishes the run`);
+    assert.equal(h.finishDone(), 1, "the task is handed back to its terminal state once");
+    assert.equal(h.done.length, 0, "an empty outbox is not replayed as a result");
+    assert.equal(h.acked(), 1);
+    assert.equal(h.released(), 1);
+    assert.equal(activeAbort.has("lock.s-app"), false);
+  }
+});
+
+test("A5 an outbox entry that does not parse is dropped and the delivery runs, not retried until poisoned", async () => {
+  const runner = fakeRunner(async () => ({ kind: "ended", outcome: { success: false, reason: "app run ended: cancelled" } }));
+  const outbox = { entry: { key: "task-result.t-app", value: new TextEncoder().encode("{\"finalText\": "), operation: "PUT" }, deleted: [] as string[] };
+  const h = harness(runner, outbox);
+  const abortCtrl = new AbortController();
+  activeAbort.set("lock.s-app", abortCtrl);
+  await runHandleTask(h.msg, { ...request("app"), app_finish_only: true } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", abortCtrl);
+  assert.deepEqual(outbox.deleted, ["task-result.t-app"], "the unreadable entry is removed");
+  assert.equal(runner.runs, 1, "the finish runs instead of a failing replay");
+  assert.equal(h.finishDone(), 1);
+  assert.equal(h.acked(), 1);
+  assert.equal(h.released(), 1);
+});
+
+test("A6 a run whose lock a Stop force-released leaves, on its late exit, the next run's controller in place", async (t) => {
+  // finishRun used to clear the key's controller whoever it belonged to. After
+  // a Stop force-released this run, the key's next run is filed there, and
+  // clearing it left that run unreachable by any interrupt.
+  const runB = new AbortController();
+  const runner = fakeRunner(async () => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      assert.deepEqual(interruptRunsAt("lock.s-app", 30_000), ["lock.s-app"]);
+      t.mock.timers.tick(30_000);
+    } finally {
+      t.mock.timers.reset();
+    }
+    assert.equal(activeAbort.has("lock.s-app"), false, "the force release dropped this run's controller");
+    activeAbort.set("lock.s-app", runB);
+    return { kind: "superseded" };
+  });
+  const h = harness(runner);
+  try {
+    const runA = await runApp(h);
+    assert.notEqual(runA, runB);
+    assert.equal(activeAbort.get("lock.s-app"), runB, "the late exit did not take the next run's controller");
+    assert.deepEqual(interruptRunsAt("lock.s-app", 3_600_000), ["lock.s-app"]);
+    assert.equal(runB.signal.aborted, true, "so a Stop still reaches it");
+  } finally {
+    activeAbort.delete("lock.s-app");
+  }
 });

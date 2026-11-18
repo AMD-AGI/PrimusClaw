@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: MIT
 
 import { agentLoop, type TurnPool } from "./agent-loop.js";
-import { ToolRouter, INHERIT_MODEL, type WebToolServices } from "../tools/router.js";
+import { fitShellSchemas, ToolRouter, INHERIT_MODEL, type WebToolServices } from "../tools/router.js";
 import type { HandsClient } from "../clients/hands.js";
 import type { HookRunner } from "./hooks.js";
 import type { Message, ReasoningEffort, ToolSchema, EventCallback } from "@claw/protocol";
 import type { RunIdentity } from "../tasks/run-identity.js";
 import { filterToolSchemas, type ToolAllowlist } from "../tools/allowlist.js";
+import type { CiteCheck } from "../tools/cite-check.js";
 import { MEMORY_TOOLS } from "../tools/memory-tools.js";
 import { SUB_AGENT_EXPLORE_MODEL, SUB_AGENT_MODELS } from "../config.js";
 import { modelRefusalStatus } from "./summary-completer.js";
@@ -141,6 +142,8 @@ export interface RunSubagentOptions {
    * sub-agent's own loop for the calls that loop handles itself.
    */
   toolAllowlist?: ToolAllowlist | null;
+  /** The parent run's `cite_check` (`tools/cite-check.ts`), forwarded so a sub-agent is no way around it. */
+  citeCheck?: CiteCheck | null;
   /** The parent run's shared turn budget (`LoopOptions.turnPool`), forwarded so the sub-agent's turns are taken from it. */
   turnPool?: TurnPool;
 }
@@ -163,14 +166,14 @@ export interface SubagentResult {
  * Pick the effective tool schemas for this sub-agent: the parent's, narrowed by
  * the run's tools_allowlist first so that nothing below can widen them again.
  */
-function filterSchemas(
+export function filterSchemas(
   parentSchemas: ToolSchema[],
   profile: SubagentType,
   explicitAllow?: string[],
   runAllowlist?: ToolAllowlist | null,
 ): ToolSchema[] {
   const profileAllow = PROFILE_ALLOW[profile];
-  return filterToolSchemas(parentSchemas, runAllowlist).filter((s) => {
+  return fitShellSchemas(filterToolSchemas(parentSchemas, runAllowlist).filter((s) => {
     const name = s.name;
     // Universal deny.
     if (DENY_LIST.has(name)) return false;
@@ -182,7 +185,7 @@ function filterSchemas(
     if (profileAllow === "all") return true;
     if (name.startsWith("mcp__")) return true;
     return profileAllow.includes(name);
-  });
+  }));
 }
 
 /**
@@ -232,6 +235,8 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
   // Fresh tool router scoped to the allowed schemas. Since filterSchemas
   // already enforces DENY_LIST, route() will also refuse any leaked call.
   const router = new ToolRouter(opts.hands, opts.platformMcpClients || new Map(), opts.webToolServices);
+  // A report a sub-agent delivers is checked as its parent's would be.
+  router.citeCheck = opts.citeCheck ?? null;
   // Monkey-patch route() to enforce the sub-agent's whitelist even if the
   // LLM tries to call a tool outside the declared schemas.
   const allowedSet = new Set(schemas.map((s) => s.name));

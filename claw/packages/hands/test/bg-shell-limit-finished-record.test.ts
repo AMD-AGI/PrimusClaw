@@ -19,17 +19,17 @@
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 import { isolatingSandbox } from "./support/sandbox-isolation.js";
 import { until } from "./support/group-settled.js";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 isolatingSandbox();
 
 process.env.WORKSPACE_PATH = tmpdir();
-const STATE_ROOT_FOR_CLEANUP = mkdtempSync(join(tmpdir(), "bg-shell-limit-finished-"));
+const STATE_ROOT_FOR_CLEANUP = tmpDir("bg-shell-limit-finished-");
 process.env.HANDS_STATE_DIR = STATE_ROOT_FOR_CLEANUP;
 process.env.BG_SHELL_ENABLED = "true";
 process.env.BG_SHELL_MAX_CONCURRENT = "1";

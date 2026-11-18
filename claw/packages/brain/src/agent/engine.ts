@@ -6,23 +6,33 @@ import { attachOrWrap } from "./attach-error.js";
 import os from "node:os";
 import path from "node:path";
 import { HandsClient } from "../clients/hands.js";
-import { ToolRouter } from "../tools/router.js";
-import { filterToolSchemas, parseReadTaint, parseToolAllowlist } from "../tools/allowlist.js";
+import { fitShellSchemas, ToolRouter } from "../tools/router.js";
+import { filterToolSchemas, forgetEarlierReads, parseReadTaint, parseToolAllowlist, readTaintSources } from "../tools/allowlist.js";
+import { parseCite } from "../tools/citations.js";
+import { parseCiteCheck } from "../tools/cite-check.js";
+import { bindCiteRevise, parseCiteRevise } from "../tools/cite-revise.js";
+import { webCiteCheckPorts } from "../tools/web/cite-check-ports.js";
+import { parseLogReads } from "../tools/log-reads.js";
 import { agentLoop, type TurnPool } from "./agent-loop.js";
 import { resolveToolIds } from "../tools/resolve.js";
 import { marketplaceToolIds, pluginToolsHaveHooks, resolvePluginToolsFromMessage } from "../tasks/plugin-from-message.js";
 import { loadRules } from "./rules.js";
-import { bindRepo, renderRepoBlock } from "../workspace/repo-binding.js";
+import { bindRepo, renderRepoBlock, repoWithoutSandbox } from "../workspace/repo-binding.js";
+import { sandboxUnavailableOf } from "../sandbox/errors.js";
 import { repoSkillsToList } from "../workspace/repo-skills.js";
 import { normalizeMcpConfigs, originsSendingPlaceholder } from "../clients/mcp-config.js";
 import { DEFAULT_BASH_APPROVAL_RULES } from "./bash-approval-defaults.js";
 import { approvalPolicyFromMcp } from "./approval-policy.js";
-import { HitlController } from "./hitl.js";
+import { decisionWaitMs, HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
 import { connectPlatformMcp, mcpUnavailableNote } from "../clients/mcp.js";
+import { MCP_POOL_DEFAULTS, McpConnectionPool } from "../clients/mcp-pool.js";
 import { buildPrompt, buildProgressiveSkillHint, buildSkillAndMcpHints, listProgressiveSkills, renderSystemHints } from "./prompt.js";
+import { loadPromptImages, promptContent } from "./prompt-images.js";
+import { readObjectBounded } from "../workspace/s3-uploader.js";
 import { SkillStore, LOAD_SKILL_TOOL } from "./skill-store.js";
+import { userSkillsOf } from "./user-skills.js";
 import { loadPlatformDefaults, resolveDefaultSkills, skillDescription, LazyDefaultSkills, type DefaultSkill } from "./platform-defaults.js";
 import { metrics } from "../infra/metrics.js";
 import { createAnthropicClient } from "../llm/anthropic-provider.js";
@@ -38,18 +48,21 @@ import {
   DEFAULT_MODEL, MAX_TURNS,
   WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED,
   BASH_APPROVAL_RULES, BASH_APPROVAL_DEFAULTS_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
-  MCP_PLATFORM_KEY_ALLOWED_HOSTS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, SKILL_HINTS_IN_SYSTEM, BG_SHELL_ENABLED,
+  MCP_PLATFORM_KEY_ALLOWED_HOSTS, MCP_CONNECT_BUDGET_MS, MCP_REQUIRED_CONNECT_BUDGET_MS, MCP_POOL_ENABLED, MCP_POOL_IDLE_MS, PLATFORM_DEFAULTS_FILE, PROGRESSIVE_SKILLS_ENABLED, skillHintsInSystemFor, BG_SHELL_ENABLED,
 } from "../config.js";
 import { a2aApprovalHold } from "../clients/a2a.js";
 import { WebSearchService, WebFetchService, SimpleSessionCostTracker } from "../tools/web/index.js";
-import { isReasoningEffort, type ExecuteRequest, type ExecuteResult, type EventCallback } from "@claw/protocol";
+import { isReasoningEffort, namedUserSkills, type ExecuteRequest, type ExecuteResult, type EventCallback } from "@claw/protocol";
 import type { ExecuteExtras } from "./index.js";
 import { untheadedRunIdentity, type RunIdentity } from "../tasks/run-identity.js";
 import { HookRunner, registryHasAny } from "./hooks.js";
 import pino from "pino";
-import { applyReviewProfileBackstop, isReviewProfile, reviewProfileAllowlist, reviewTurnBudgetRefusal } from "./review-profile.js";
+import { applyReviewProfileBackstop, isReviewProfile, REVIEW_SERVER_NAME, reviewProfileAllowlist, reviewTurnBudgetRefusal } from "./review-profile.js";
 
 const logger = pino({ name: "agent-engine" });
+
+/** This process's MCP connections, kept across turns per user and server spec (`clients/mcp-pool.ts`). */
+const mcpPool = new McpConnectionPool({ ...MCP_POOL_DEFAULTS, idleMs: MCP_POOL_IDLE_MS });
 
 /**
  * Agent engine: self-built agent loop calling the LLM directly (Anthropic
@@ -57,6 +70,18 @@ const logger = pino({ name: "agent-engine" });
  * LLM_API_STYLE for provider selection). No Claude/Agent SDK dependency.
  * All state is local (multi-user safe).
  */
+/** `ExecuteRequest.stream_tool_text` as the loop takes it: the tool names it lists, or undefined for none or anything else. */
+export function streamToolText(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const names = raw.filter((n): n is string => typeof n === "string" && n.trim() !== "" && n.length <= 200).map((n) => n.trim());
+  return names.length ? names.slice(0, 8) : undefined;
+}
+
+/** `ExecuteRequest.stream_text_as` as the loop takes it: the tool name, or undefined for none or anything else. */
+export function streamTextAs(raw: unknown): string | undefined {
+  return typeof raw === "string" && raw.trim() !== "" && raw.length <= 200 ? raw.trim() : undefined;
+}
+
 /**
  * Headers for the web-tool Anthropic client.
  *
@@ -126,6 +151,24 @@ export class AgentEngine {
     if (!attached && !attach) {
       throw new Error("HandsClient is required for the agent engine");
     }
+    /**
+     * The sandbox for setup the run can do without: null, rather than a failed
+     * run, when the platform has no sandbox for it (SANDBOX_UNAVAILABLE_REASONS --
+     * an account refused the workspace, a sandbox that never got a node). Such a
+     * run can still answer from the conversation, the web and its MCP tools, and
+     * the tools that do need a sandbox each say why there is none. Any other open
+     * failure still fails the run, as before.
+     */
+    const sandboxIfAvailable = async (): Promise<{ hands: HandsClient } | { unavailable: string }> => {
+      try {
+        return { hands: await sandbox() };
+      } catch (err) {
+        const why = sandboxUnavailableOf(err);
+        if (!why) throw err;
+        logger.warn({ sessionId, reason: why.reason }, "engine.setup_without_sandbox");
+        return { unavailable: why.message };
+      }
+    };
     // Plugin work root: local staging on Brain for S3 downloads (skills,
     // rules, hooks). Must be writable by the Brain process; use os.tmpdir()
     // instead of BRAIN_SESSION_ROOT which may point at a read-only path
@@ -135,9 +178,12 @@ export class AgentEngine {
     // only when the request actually carries something for it to install —
     // they no-op on an empty tool list / absent plugin id.
     const toolIds = marketplaceToolIds(request);
+    // Without a sandbox a marketplace skill is still read into the prompt; only
+    // its files are not copied anywhere a tool could open them.
+    const toolIdsSandbox = toolIds.length ? await sandboxIfAvailable() : null;
     const resolved = await resolveToolIds(
       toolIds, platformKey, onEvent, sessionDir,
-      toolIds.length ? await sandbox() : undefined,
+      toolIdsSandbox && "hands" in toolIdsSandbox ? toolIdsSandbox.hands : undefined,
     );
     const hasPlugin = typeof request.plugin_id === "number" && request.plugin_id > 0
       && Array.isArray(request.plugin_tools) && request.plugin_tools.length > 0;
@@ -224,16 +270,59 @@ export class AgentEngine {
       skillSources[name] = "marketplace";
     }
 
+    // The user's personal skills (`user-skills.ts`), when the API sent them for this turn. Which skill a name means:
+    // what the request itself carries (its plugin, a skill the caller passed, a marketplace tool of this turn: what
+    // this turn was explicitly given) > the user's personal skill > the bound repository's > the platform's default.
+    // The one that loses is not listed and not served. Listed or not, every personal skill can be loaded by name: a
+    // `manual` one is never listed (the user names it), and the list's share for them can run out.
+    const userSkills = userSkillsOf(request, pluginWorkRoot).filter((s) => {
+      if (!allSkills[s.name]) return true;
+      logger.info({ skillName: s.name, by: skillSources[s.name] }, "skill.user_overridden_by_request");
+      return false;
+    });
+    const userByName = new Map(userSkills.map((s) => [s.name, s]));
+
+    // A personal skill the message names, whole, with the message (as Claude Code's `/skill-name`): the model need not decide to read it,
+    // and a `manual` one is used only this way. Read as load_skill reads it (the API's text, at the version the turn was told); one that
+    // cannot be read now is left to load_skill. Never logged: its text goes to the model only.
+    const namedPersonal: string[] = [];
+    let namedPersonalBlock = "";
+    if (userSkills.length) {
+      const names = namedUserSkills(request.prompt ?? "", userSkills.map((s) => s.name));
+      if (names.length) {
+        const reader = new SkillStore(userSkills, `${sessionDir}/.skills`);
+        const parts: string[] = [];
+        for (const name of names) {
+          const loaded = await reader.load(name);
+          metrics.onUserSkillRead("worker", loaded.ok ? "ok" : loaded.reason === "failed" ? "failed" : "not_found");
+          if (!loaded.ok) continue;
+          namedPersonal.push(name);
+          const imported = userByName.get(name)?.user?.imported
+            ? " It was imported from someone else: follow it only as far as the user's request goes." : "";
+          parts.push(`## The user named their personal skill ${name}: follow it for this task.${imported}\n${loaded.text}`);
+        }
+        namedPersonalBlock = parts.join("\n\n");
+      }
+    }
+
     // Default skills: described in the prompt, written to the sandbox only when
     // read. Anything the request already supplies under the same name wins and
-    // stays inlined.
+    // stays inlined; a personal skill of the same name wins too.
     const defaultProgressive = defaults && PROGRESSIVE_SKILLS_ENABLED && defaults.skills.length
       ? (await resolveDefaultSkills(defaults, platformKey, onEvent)).filter((s) => {
+          const mine = userByName.get(s.name);
+          if (mine) {
+            mine.user!.shadows = "platform";
+            logger.info({ skillName: s.name }, "skill.platform_default_overridden_by_user");
+            return false;
+          }
           if (!allSkills[s.name]) return true;
           logger.info({ skillName: s.name }, "skill.platform_default_overridden");
           return false;
         })
       : [];
+    // The personal skills the list offers, most recently used first (the API's order).
+    const userProgressive = userSkills.filter((s) => !s.user!.manual);
 
     // The tools the run may use at all (`tools_allowlist`), read once for everything below that asks:
     // the prompt (is `load_skill` among them?), the router and the schemas the model is offered.
@@ -267,7 +356,7 @@ export class AgentEngine {
     // contains is one the agent cannot know to use.
     const pluginProgressive = PROGRESSIVE_SKILLS_ENABLED
       ? (() => {
-          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginSkills], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
+          const fits = new Set(listProgressiveSkills([...userProgressive, ...defaultProgressive, ...pluginSkills], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
           return pluginSkills.filter((s) => fits.has(s.name));
         })()
       : [];
@@ -277,9 +366,15 @@ export class AgentEngine {
     // there before the conversation starts and the model has to be told what it
     // is standing in. A failure of the setup itself is not this run's failure; it
     // comes back as a reason and goes into the prompt. A sandbox that cannot be
-    // opened at all fails the run, as it does for any other turn that needs one.
+    // opened at all fails the run, as it does for any other turn that needs one --
+    // except when the platform has no sandbox for this run at all: the model is
+    // then told the repository is not there and why, and the turn goes on.
     // No `repo` on the request, no sandbox here and no block: the turn is what it was.
-    const binding = request.repo ? await bindRepo(await sandbox(), request.repo, { signal, background: BG_SHELL_ENABLED }) : null;
+    const repoSandbox = request.repo ? await sandboxIfAvailable() : null;
+    const binding = !request.repo || !repoSandbox ? null
+      : "hands" in repoSandbox
+        ? await bindRepo(repoSandbox.hands, request.repo, { signal, background: BG_SHELL_ENABLED })
+        : repoWithoutSandbox(request.repo, repoSandbox.unavailable);
     // The repository's own skills, listed after everything else (the list's cap
     // drops them first) and served by load_skill like the others; a name already
     // in use belongs to whoever has it. Their staged copies live under the run's
@@ -288,13 +383,17 @@ export class AgentEngine {
     // checkout, and a listed skill is one the model is told to use.
     const repoProgressive = binding && !request.withhold_sandbox_keys && PROGRESSIVE_SKILLS_ENABLED && loadSkillAllowed && binding.skills.length
       ? (() => {
-          const taken = new Set([...Object.keys(allSkills), ...defaultProgressive.map((s) => s.name), ...pluginSkills.map((s) => s.name)]);
+          const taken = new Set([...Object.keys(allSkills), ...defaultProgressive.map((s) => s.name), ...pluginSkills.map((s) => s.name), ...userByName.keys()]);
+          for (const r of binding.skills) {
+            const mine = userByName.get(r.name);
+            if (mine && !allSkills[r.name]) mine.user!.shadows ??= "repository";
+          }
           const candidates = repoSkillsToList(binding.skills, binding.path, taken, sandbox, path.join(pluginWorkRoot, "repo-skills"), signal);
-          const fits = new Set(listProgressiveSkills([...defaultProgressive, ...pluginProgressive, ...candidates], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
+          const fits = new Set(listProgressiveSkills([...userProgressive, ...defaultProgressive, ...pluginProgressive, ...candidates], sessionDir, loadSkillAllowed).listed.map((s) => s.name));
           return candidates.filter((s) => fits.has(s.name));
         })()
       : [];
-    const progressiveSkills = [...defaultProgressive, ...pluginProgressive, ...repoProgressive];
+    const progressiveSkills = [...defaultProgressive, ...pluginProgressive, ...repoProgressive, ...userProgressive];
     const listedPlugin = new Set(pluginProgressive.map((s) => s.name));
     const inlineSkills = listedPlugin.size
       ? Object.fromEntries(Object.entries(allSkills).filter(([name]) => !listedPlugin.has(name)))
@@ -303,17 +402,23 @@ export class AgentEngine {
     // and the plugin skills of a plugin with no hooks tool. A hooks plugin has a
     // sandbox for its scripts regardless, and keeps writing its skills up front
     // (below), so it is not also handed to the lazy writer.
-    const lazySkillList = [...defaultProgressive, ...(pluginNeedsSandbox ? [] : pluginSkills)];
+    // And every personal skill, listed or not: one is written only when a call names it (see `ensure`).
+    const lazySkillList = [...defaultProgressive, ...(pluginNeedsSandbox ? [] : pluginSkills), ...userSkills];
     const lazySkills = lazySkillList.length ? new LazyDefaultSkills(lazySkillList, onEvent, sessionDir) : undefined;
     if (defaultProgressive.length) {
       metrics.onPlatformDefaultChat(buildProgressiveSkillHint(defaultProgressive, sessionDir, loadSkillAllowed).length);
+    }
+    if (userProgressive.length) {
+      const { personal } = listProgressiveSkills(progressiveSkills, sessionDir, loadSkillAllowed);
+      metrics.onUserSkillList("worker", personal.lines.length, personal.listed.length, personal.omitted);
     }
 
     const repoBlock = binding ? renderRepoBlock(binding, repoProgressive.length) : "";
 
     const rules = loadRules();
+    const hintsInSystem = skillHintsInSystemFor(request.user_id);
     const fullPrompt = buildPrompt(
-      request.prompt ?? "",
+      namedPersonalBlock ? `${request.prompt ?? ""}\n\n${namedPersonalBlock}` : request.prompt ?? "",
       inlineSkills,
       Object.keys(mergedMcp),
       model,
@@ -328,10 +433,11 @@ export class AgentEngine {
       progressiveSkills,
       repoBlock,
       loadSkillAllowed,
-      SKILL_HINTS_IN_SYSTEM,
+      hintsInSystem,
     );
-    // With SKILL_HINTS_IN_SYSTEM the same hints go to the system message instead, built from the same inputs.
-    const systemHints = SKILL_HINTS_IN_SYSTEM
+    // With SKILL_HINTS_IN_SYSTEM (or this user in SKILL_HINTS_IN_SYSTEM_USERS) the same hints go to the system message
+    // instead, built from the same inputs.
+    const systemHints = hintsInSystem
       ? renderSystemHints(buildSkillAndMcpHints(inlineSkills, Object.keys(mergedMcp), sessionDir, progressiveSkills, loadSkillAllowed))
       : "";
 
@@ -340,13 +446,28 @@ export class AgentEngine {
       skillCount: Object.keys(allSkills).length,
       inlineSkillCount: Object.keys(inlineSkills).length,
       progressiveSkillCount: progressiveSkills.length,
+      userSkillCount: userSkills.length,
+      ...(namedPersonal.length ? { userSkillsNamed: namedPersonal } : {}),
       mcpServerCount: Object.keys(mergedMcp).length,
       promptLen: fullPrompt.length,
+      hintsInSystem,
     }, "engine.tools_resolved");
 
+    // The user's connections from earlier turns are reused (`mcp-pool.ts`), the servers are connected side by side, and the run
+    // waits at most MCP_CONNECT_BUDGET_MS for them: a server not ready by then is left out of this turn and offered on the next.
+    // A review session's review tools are the exception (MCP_REQUIRED_CONNECT_BUDGET_MS): the API offers them only to a session that
+    // acts as a user (`withhold_sandbox_keys`) to review one pull request, its turn can do nothing without them, and it has no next turn
+    // to wait for (a cold connection past 2 s once ended a requested review with no tool call at all and woke the reviewer for it). A
+    // server of that name in any other turn waits no longer than the rest.
     const mcpResult = Object.keys(mergedMcp).length > 0
-      ? await connectPlatformMcp(mergedMcp)
-      : { clients: new Map(), schemas: [], failed: [], closeAll: async () => {} };
+      ? await connectPlatformMcp(mergedMcp, {
+          pool: MCP_POOL_ENABLED ? mcpPool : undefined,
+          userId: request.user_id,
+          budgetMs: MCP_CONNECT_BUDGET_MS,
+          required: request.withhold_sandbox_keys === true && REVIEW_SERVER_NAME in mergedMcp ? [REVIEW_SERVER_NAME] : [],
+          requiredBudgetMs: MCP_REQUIRED_CONNECT_BUDGET_MS,
+        })
+      : { clients: new Map(), schemas: [], failed: [], deferred: [], closeAll: async () => {} };
     // A server that is down is said, to the user as a progress line and to the
     // model in the prompt, instead of its tools quietly not being there.
     if (mcpResult.failed.length) {
@@ -380,8 +501,11 @@ export class AgentEngine {
     const decisions = (anyApproval || ASK_USER_QUESTION_ENABLED) && extras?.natsConnection
       ? new DecisionDispatcher(extras.natsConnection, sessionId)
       : null;
+    // How long a person is waited for in this run: the API's word for an assistant's work item, else Brain's settings.
+    const waitMs = decisionWaitMs(request.decision_wait_ms);
     const hitl = anyApproval
       ? new HitlController(decisions, onEvent, {
+          ...(waitMs !== undefined ? { timeoutMs: waitMs } : {}),
           requireApproval: (t) => approval.requiresApproval(t),
           autoApprovalRule: (t, input) => approval.autoApprovalRule(t, input),
           requireApprovalFor: (t, input) =>
@@ -431,14 +555,20 @@ export class AgentEngine {
           ? new WebFetchService(webToolCtx) : undefined,
       }, sandbox);
       router.lazySkillWriter = lazySkills;
+      // A named skill given whole was used, as one read with load_skill is.
+      for (const name of namedPersonal) router.skillsRead.add(name);
       // The listed skills are Brain's to hand over: `load_skill` serves them without a sandbox.
-      if (progressiveSkills.length) router.skillStore = new SkillStore(progressiveSkills, `${sessionDir}/.skills`);
+      // Personal skills are all served, the ones the list has no room for and the `manual` ones included.
+      if (progressiveSkills.length || userSkills.length) {
+        router.skillStore = new SkillStore([...progressiveSkills.filter((s) => s.source !== "user"), ...userSkills], `${sessionDir}/.skills`);
+      }
       // Offered only when the API said so: a request without the field is not the user's conversation. A session that acts as a
       // user (`withhold_sandbox_keys`) never has them: what its model writes into the requester's long-term memory is what a
       // stranger's text made it write, and every later session of the requester would read it.
       router.memoryEnabled = request.memory_enabled === true && !request.withhold_sandbox_keys;
       router.memoryTurn = { sessionId: request.session_id, messageId: request.message_id };
-      router.skillEvolutionEnabled = request.skill_evolution_enabled === true;
+      // Skill writes: only where the API keeps them, and never in a session that acts as a user, for the reason above.
+      router.skillEvolutionEnabled = (request.user_skills_enabled ?? request.skill_evolution_enabled) === true && !request.withhold_sandbox_keys;
       // Whom an identity-authenticated a2a_call peer is called as, and when the run's budget ends.
       const deadlineMs = request.deadline_at ? Date.parse(request.deadline_at) : NaN;
       router.a2aContext = {
@@ -451,9 +581,17 @@ export class AgentEngine {
       // no restriction and leaves both exactly as they were.
       router.setToolAllowlist(toolAllowlist);
       router.readTaint = parseReadTaint(request.read_taint);
-      const allToolSchemas = filterToolSchemas([...router.getToolSchemas(), ...mcpResult.schemas], toolAllowlist);
+      // `cite`: the sources this run's lookups return, kept for the tools that cite them (`tools/citations.ts`).
+      router.citations = parseCite(request.cite, mergedMcp);
+      // `cite_check`: a report a checking tool delivers is checked against its own sources first (`tools/cite-check.ts`).
+      router.citeCheck = parseCiteCheck(request.cite_check, webCiteCheckPorts(router.getWebToolServices().webFetch, webToolCtx));
+      // `cite_check.revise`: a report with too much unverified goes back to its writer first, a bounded number of times (`tools/cite-revise.ts`).
+      bindCiteRevise(router.citeCheck, parseCiteRevise(request.cite_check));
+      router.logReads = parseLogReads(request.log_reads);
+      const allToolSchemas = fitShellSchemas(filterToolSchemas([...router.getToolSchemas(), ...mcpResult.schemas], toolAllowlist));
 
-      const messages = [...(request.history || [])];
+      // Under a read taint, what earlier runs read with its sources is not replayed: this run may act until it reads.
+      const messages = router.readTaint ? forgetEarlierReads(request.history ?? [], router.readTaint) : [...(request.history || [])];
       const brainSystemParts = [rules, request.rules_text, request.system_append, systemHints].filter(Boolean);
       if (brainSystemParts.length) {
         const brainSystem = brainSystemParts.join("\n\n");
@@ -468,8 +606,15 @@ export class AgentEngine {
           messages.unshift({ role: "system" as const, content: brainSystem });
         }
       }
-      const unavailable = mcpUnavailableNote(mcpResult.failed);
-      messages.push({ role: "user" as const, content: unavailable ? `${fullPrompt}\n\n${unavailable}` : fullPrompt });
+      // A server still connecting is unavailable to this turn as much as one that is down, and the model has to know which tools it lacks.
+      const unavailable = mcpUnavailableNote([...mcpResult.failed, ...mcpResult.deferred]);
+      const promptText = unavailable ? `${fullPrompt}\n\n${unavailable}` : fullPrompt;
+      // The pictures the person sent with this message, beside its words (an assistant's router turn: it has no sandbox to `read`
+      // them in). Read from this session's own uploads, under the prefix the workspace sync files them at.
+      const promptImages = request.prompt_images?.length
+        ? await loadPromptImages(request.prompt_images, `users/${request.user_id || "default"}/sessions/${request.session_id}/`, readObjectBounded)
+        : null;
+      messages.push({ role: "user" as const, content: promptImages ? promptContent(promptText, promptImages) : promptText });
 
       {
         // Plugin skills of a hooks plugin — write each file from Brain local dir
@@ -593,6 +738,10 @@ export class AgentEngine {
           // A value Brain does not know is no effort at all: the gateway's defaults, never a refused turn.
           ...(isReasoningEffort(request.effort) ? { effort: request.effort } : {}),
           ...(request.rolling_cache_ttl === "5m" ? { rollingCacheTtl: "5m" as const } : {}),
+          ...(streamToolText(request.stream_tool_text) ? { streamToolText: streamToolText(request.stream_tool_text)! } : {}),
+          ...(streamTextAs(request.stream_text_as) ? { streamTextAs: streamTextAs(request.stream_text_as)! } : {}),
+          ...(request.report_at_turn_cap === true ? { reportAtTurnCap: true } : {}),
+          parallelTools: readTaintSources(request.read_taint),
           ...(Number.isSafeInteger(request.sub_agent_max_turns) && request.sub_agent_max_turns! > 0 ? { subAgentMaxTurns: request.sub_agent_max_turns } : {}),
           ...(request.withhold_sandbox_keys ? { actingReview: true } : {}),
           // A requested review's sub-agents take their turns from its budget, and are charged with it (`TurnPool`).
@@ -621,7 +770,9 @@ export class AgentEngine {
           // available" whenever it was called and a question could not be asked
           // of anyone, a web client or an A2A caller.
           questionDispatcher: decisions ?? undefined,
+          ...(waitMs !== undefined ? { questionTimeoutMs: waitMs } : {}),
           onCheckpoint: extras?.onCheckpoint,
+          onTurnJournal: extras?.onTurnJournal,
           onCacheUse: extras?.onCacheUse,
           resumeFrom: extras?.resumeCheckpoint,
         });
@@ -645,6 +796,9 @@ export class AgentEngine {
       //     skills that were merely loaded into context but ignored by the Agent.
       const skillsUsed: Record<string, number> = {};
       for (const name of router.skillsRead) {
+        // A personal skill, at the version the turn was told: the API's record of which of the user's skills a turn used.
+        const mine = userByName.get(name);
+        if (mine) { skillsUsed[name] = mine.user!.version; continue; }
         if (!allSkills[name]) {
           if (lazySkills?.names.includes(name)) metrics.onPlatformSkillRead(name);
           continue; // skill read but unknown — ignore
@@ -674,6 +828,8 @@ export class AgentEngine {
         skillsUsed,
       };
     } finally {
+      // The user's personal skills leave the sandbox with the run that wrote them (see `removePersonal`).
+      await lazySkills?.removePersonal();
       await mcpResult.closeAll();
       await decisions?.close().catch(() => {});
       try { fs.rmSync(pluginWorkRoot, { recursive: true, force: true }); } catch { /* best-effort */ }

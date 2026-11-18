@@ -22,6 +22,7 @@ import { drainSessionIfIdle, queueServerMessage } from "../assistant/messages.js
 import { insertSessionRow } from "../routes/sessions.js";
 import { dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { releaseSessionRefs } from "../workspace/store.js";
+import { fireBrief } from "../assistant/brief.js";
 
 const logger = pino({ name: "triggers-fire" });
 
@@ -64,6 +65,8 @@ export const triggerPorts = {
 export type FireOutcome =
   /** `messageId` is null for a firing queued to an item's worker: the turn it starts is named when it is drained. */
   | { status: "started"; sessionId: string; messageId: string | null }
+  /** A brief: said to the owner through their assistant, with no run behind it. */
+  | { status: "delivered" }
   | { status: "failed_start"; detail: string; credentialInvalid: boolean }
   /** The item is finished or stopped, so its watch is over; or it is waiting for its user, so this firing is not run. */
   | { status: "item_closed" }
@@ -176,6 +179,23 @@ export async function fireIntoItem(trigger: TriggerRow, plannedAt: Date): Promis
     return queued;
   } catch (err) {
     logger.error({ err, triggerId: trigger.trigger_id }, "trigger.fire_into_item_failed");
+    return { status: "failed_start", detail: "internal_error", credentialInvalid: false };
+  }
+}
+
+/**
+ * A firing of a brief trigger (`action` = `brief`): the owner's brief, put together by Claw and said through their assistant
+ * (`assistant/brief.ts`). No model runs. SaFE is read with the key the trigger keeps; a key that cannot be read leaves that one
+ * section unchecked rather than the brief unsent.
+ */
+export async function fireBriefTrigger(trigger: TriggerRow, plannedAt: Date): Promise<FireOutcome> {
+  try {
+    const user = triggerPorts.getCredentialsFor(trigger);
+    const said = await fireBrief(trigger, plannedAt, user?.platformKey || null);
+    if (said.status === "failed") return { status: "failed_start", detail: said.detail, credentialInvalid: false };
+    return { status: "delivered" };
+  } catch (err) {
+    logger.error({ err, triggerId: trigger.trigger_id }, "trigger.fire_brief_failed");
     return { status: "failed_start", detail: "internal_error", credentialInvalid: false };
   }
 }

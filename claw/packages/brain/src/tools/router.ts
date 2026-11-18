@@ -1,13 +1,23 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import pino from "pino";
 import { HandsClient, withHandsTimeout, type ShellClassProbe, type ToolImage } from "../clients/hands.js";
 import { isSandboxTool, toolTimeoutCeilingSec } from "./hands.js";
 import { handleA2ACall } from "../clients/a2a.js";
 import { LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON } from "../tasks/abort-registry.js";
 import { callBackendMcpTool } from "../clients/backend-mcp.js";
+import type { McpToolCaller } from "../clients/mcp.js";
 import { getPluginToolScope } from "./scope.js";
 import { toolNotAllowedMessage, type ReadTaint, type ToolAllowlist } from "./allowlist.js";
+import type { RunCitations } from "./citations.js";
+import {
+  CITED_FILE_MAX_BYTES, isCitedReport, CITED_FILE_PATTERNS, CITED_FILE_REFUSAL, CITED_FILE_TOO_LARGE, CITED_FILE_UNREADABLE, REPORT_FILE_EXTENSIONS, checkNote,
+  checkReport, type CiteCheck,
+} from "./cite-check.js";
+import type { LogReads } from "./log-reads.js";
+import { citeReviseFor } from "./cite-revise.js";
+import { callWithWorkspaceFanout, fansOut } from "./workspace-fanout.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import { MEMORY_TOOLS, MEMORY_TOOL_SCHEMAS, callMemoryTool } from "./memory-tools.js";
 import {
@@ -18,11 +28,14 @@ import {
   DELIVER_FILE_ENABLED, DELIVER_FILE_MAX_BYTES,
 } from "../config.js";
 import type { Delivery } from "@claw/protocol";
-import { DELIVER_FILE_TOOL, deliverFile, deliverFileSchema } from "./deliver-file.js";
+import { DELIVER_FILE_TOOL, deliverFile, deliverFileSchema, workspaceFile } from "./deliver-file.js";
 import type { WebSearchService } from "./web/search.js";
 import type { WebFetchService } from "./web/fetch.js";
 import { LOAD_SKILL_TOOL, type SkillStore } from "../agent/skill-store.js";
 import { TOOL_RESULTS_DIR } from "../workspace/excludes.js";
+import { metrics } from "../infra/metrics.js";
+
+const logger = pino({ name: "tool-router" });
 
 /**
  * The bash timeout ceiling the schema states.
@@ -36,6 +49,57 @@ const BASH_TIMEOUT_CEILING_SEC = toolTimeoutCeilingSec("bash");
 
 /** The same, for the tool whose whole purpose is to wait longer than bash may. */
 const WAIT_TIMEOUT_CEILING_SEC = toolTimeoutCeilingSec("wait");
+
+/**
+ * How a model that backgrounds a command gets back to it: `wait` (block until it ends) and `bash_output` (look at it), only one of
+ * them, or not at all.
+ *
+ * The bash schema names that tool, so it has to be one the run is offered: a run whose allow-list keeps `bash` but not `wait` (a
+ * requested review, a sub-agent profile, a list a request carries) was told "then call wait", called it, and was refused, a turn spent
+ * on nothing each time. `fitShellSchemas` picks the variant from what is actually offered after every filter.
+ */
+export type BackgroundFollow = "wait" | "wait_only" | "bash_output" | null;
+
+function bashSchema(follow: BackgroundFollow): ToolSchema {
+  const head = "Execute a shell command in the workspace directory. Blocks until the command exits; if it hits the timeout the whole process group is killed and only the output so far comes back";
+  const cap = `Timeout in seconds (default ${BASH_FOREGROUND_DEFAULT_SEC}, capped at ${BASH_TIMEOUT_CEILING_SEC}): a higher value is reduced to the cap`;
+  if (follow === null) {
+    return { name: "bash", description: `${head}, so give a long command a timeout to match rather than splitting it up. When you need to wait — for a job to finish, for a file to appear — wait once for the whole interval in a single call and raise \`timeout\` to cover it. Every call is a separate model request that re-sends the entire conversation, so three chained sleeps cost three times what one longer sleep costs and tell you nothing extra.`,
+      input_schema: {
+        type: "object", properties: {
+          command: { type: "string", description: "Shell command to execute" },
+          timeout: { type: "number", description: `${cap}. The default is a default, not a budget — there is no background mode in this session, so a command or a wait that needs longer should say so here, up to the cap, in one call.` },
+        }, required: ["command"],
+      }};
+  }
+  const then = follow !== "bash_output"
+    ? { tail: "then call wait to block until it finishes", timeout: "run_in_background plus wait",
+      start: follow === "wait" ? "Follow with wait to block until it finishes, or bash_output to look at it without waiting." : "Follow with wait to block until it finishes." }
+    : { tail: "then read what it printed, and its exit status once it ends, with bash_output", timeout: "run_in_background plus bash_output", start: "Follow with bash_output to read what it printed and, once it has finished, its exit status." };
+  return { name: "bash", description: `${head}. For anything that may outlast the timeout — servers, training runs, long builds, watchers — pass run_in_background=true instead of raising the timeout, ${then.tail}.`,
+    input_schema: {
+      type: "object", properties: {
+        command: { type: "string", description: "Shell command to execute" },
+        timeout: { type: "number", description: `${cap}, so use ${then.timeout} for anything longer instead of raising this.` },
+        run_in_background: { type: "boolean", description: `Return a shell_id immediately and keep the command running. ${then.start}` },
+        shell_id: { type: "string", description: "Name this shell instead of taking a generated id (advanced). Private to this conversation, so a plain name like 'server' is fine." },
+        background_kind: { type: "string", enum: ["background", "monitor"], description: "Only with run_in_background=true. monitor shells skip stall-prompt notifications." },
+      }, required: ["command"],
+    }};
+}
+
+/**
+ * The offered schemas with `bash` told only of the background tools that are among them: `wait` and `bash_output` as offered, and no
+ * background mode at all when neither is (a shell nothing offered can read is a shell the model cannot use). Apply it to the final
+ * list, after every allow-list, profile and deny-list filter.
+ */
+export function fitShellSchemas(schemas: ToolSchema[]): ToolSchema[] {
+  if (!BG_SHELL_ENABLED) return schemas;
+  const names = new Set(schemas.map((s) => s.name));
+  if (!names.has("bash") || (names.has("wait") && names.has("bash_output"))) return schemas;
+  const fitted = bashSchema(names.has("wait") ? "wait_only" : names.has("bash_output") ? "bash_output" : null);
+  return schemas.map((s) => (s.name === "bash" ? fitted : s));
+}
 
 /** Sub-file path validation (matches API skill-service.validateSubFilePath). */
 const ALLOWED_SUB_DIRS = ["references", "templates", "scripts", "assets"];
@@ -61,6 +125,9 @@ export const SPILL_MAX_CHARS = 4 * 1024 * 1024;
 
 /** The tools that write skills, which the API keeps only when skill self-evolution is on. */
 export const SKILL_WRITE_TOOLS = new Set(["save_skill", "add_skill_file", "update_skill_file", "remove_skill_file"]);
+/** The API's personal-skill limits (`api/src/marketplace/skill-service.ts`), so a write refused there is refused here first. */
+export const SKILL_MD_MAX_CHARS = 20_000;
+export const SKILL_FILE_MAX_BYTES = 64 * 1024;
 
 const BRAIN_NETWORK_TOOLS = new Set(["web_search", "web_fetch"]);
 
@@ -91,6 +158,16 @@ export type RouteOutcome = {
   images?: ToolImage[];
   /** A `deliver_file` that copied its file: what the terminal event tells the client. */
   delivery?: Delivery;
+  /**
+   * The sources the call returned, as its own code produced them (Brain's web tools, an MCP result's `_meta["claw/sources"]`):
+   * what `ExecuteRequest.cite` keeps, when it believes the tool (`RunCitations.producedBy`). Never read from the result's text.
+   */
+  sources?: unknown[];
+  /**
+   * The result's text is not to be repeated outside the conversation: the log line and the turn event carry this
+   * instead (a personal skill's text, `load_skill`). The model still gets the whole result.
+   */
+  withheld?: string;
 };
 
 /**
@@ -124,10 +201,12 @@ const LOOP_INTERCEPTED_TOOLS = new Set([
 export const INHERIT_MODEL = "inherit";
 
 /** The tool that hands the model a skill the prompt listed; offered only when one is listed. */
-function loadSkillSchema(): ToolSchema {
+function loadSkillSchema(personal = false): ToolSchema {
   return {
     name: LOAD_SKILL_TOOL,
-    description: "Load a skill listed under 'Platform Skills' in the prompt: with only `name` you get its SKILL.md (instructions, plus the list of its other files); with `file` you get one of those files. A long file comes in parts of up to ~16000 characters: the end of each part says the `offset` of the next, so keep calling with that offset until the end. Served without a sandbox, so use it, not read or bash, to read any part of a skill. Run a skill's scripts with bash.",
+    description: (personal
+      ? "Load a skill listed under 'Platform Skills' or 'Personal Skills' in the prompt, or a personal skill the user names: with only"
+      : "Load a skill listed under 'Platform Skills' in the prompt: with only") + " `name` you get its SKILL.md (instructions, plus the list of its other files); with `file` you get one of those files. A long file comes in parts of up to ~16000 characters: the end of each part says the `offset` of the next, so keep calling with that offset until the end. Served without a sandbox, so use it, not read or bash, to read any part of a skill. Run a skill's scripts with bash.",
     input_schema: {
       type: "object", properties: {
         name: { type: "string", description: "The skill's name, as listed in the prompt" },
@@ -197,7 +276,7 @@ export class ToolRouter {
   memoryTurn: { sessionId?: string; messageId?: string } = {};
 
   /**
-   * True only when the API said skill self-evolution is on. Off, the API drops
+   * True only when the API said it keeps the skills this turn saves (`user_skills_enabled`). Off, the API drops
    * every saved skill, so the skill-writing tools are withheld and refused.
    */
   skillEvolutionEnabled = false;
@@ -211,6 +290,12 @@ export class ToolRouter {
   private toolAllowlist: ToolAllowlist | null = null;
   /** The run's `read_taint` (`allowlist.ts`): set by the engine, null when the request has none. */
   readTaint: ReadTaint | null = null;
+  /** The run's `cite` (`citations.ts`): set by the engine on the top-level router, null when the request has none. */
+  citations: RunCitations | null = null;
+  /** The run's `cite_check` (`cite-check.ts`): set by the engine on the top-level router, null when the request has none. */
+  citeCheck: CiteCheck | null = null;
+  /** The run's `log_reads` (`log-reads.ts`): set by the engine, null when the request has none. */
+  logReads: LogReads | null = null;
 
   /**
    * Whom `a2a_call` acts for and how long the run has: the session's owner (an identity
@@ -256,7 +341,7 @@ export class ToolRouter {
 
   constructor(
     private hands: HandsClient | null,
-    private platformMcp: Map<string, { callTool: (name: string, args: Record<string, unknown>) => Promise<string> }> = new Map(),
+    private platformMcp: Map<string, McpToolCaller> = new Map(),
     webServices?: WebToolServices,
     attachHands?: () => Promise<HandsClient>,
   ) {
@@ -314,7 +399,9 @@ export class ToolRouter {
 
   /** Parse a file path for `.skills/{name}/SKILL.md` and record the skill name. */
   private trackSkillRead(path: string): void {
-    const m = path.match(/\.skills\/([a-z0-9][a-z0-9-]*)\/SKILL\.md/i);
+    // A personal skill's SKILL.md is one directory further down: `.skills/.personal-skills/<name>/SKILL.md`. Names as
+    // SKILL_NAME_RE allows them (a skill stored before the kebab-case rule can have `.` or `_`).
+    const m = path.match(/\.skills\/(?:\.personal-skills\/)?([a-z0-9][a-z0-9._-]*)\/SKILL\.md/i);
     if (m) this.skillsRead.add(m[1]);
   }
 
@@ -381,11 +468,11 @@ export class ToolRouter {
   ): Promise<string> {
     if (name === "web_search") {
       if (!this.webServices.webSearch) return refuse(outcome, "Error: web search disabled");
-      return this.webServices.webSearch.execute(input);
+      return this.webServices.webSearch.execute(input, outcome);
     }
     if (name === "web_fetch") {
       if (!this.webServices.webFetch) return refuse(outcome, "Error: web fetch disabled");
-      return this.webServices.webFetch.execute(input);
+      return this.webServices.webFetch.execute(input, outcome);
     }
     throw new Error(`Unknown network tool: ${name}`);
   }
@@ -411,9 +498,153 @@ export class ToolRouter {
     if (this.toolAllowlist && !this.toolAllowlist.allows(name)) {
       return refuse(outcome, toolNotAllowedMessage(name));
     }
-    const tainted = this.readTaint?.refusal(name);
-    if (tainted) return refuse(outcome, tainted);
+    // A research report is checked against its own sources before it is delivered, and only the checked text goes on
+    // (`cite-check.ts`); the model is told what the check found before what the tool answered.
+    const check = this.citeCheck;
+    // The same report copied out of the sandbox would reach the user unchecked: a file that is one is read and delivered as checked
+    // text instead (a report too long for one deliver_text call is written to a file, so this is how it is delivered).
+    // The file is the one deliver_file would copy (`workspaceFile`: under /workspace, links followed); one it would refuse is left
+    // to refuse.
+    if (check && name === DELIVER_FILE_TOOL && typeof input.path === "string") {
+      const found = await workspaceFile(await this.requireHands(), input.path, signal);
+      if (found.ok) {
+        // A file one text delivery can hold is read, and the check's own parsing decides whether it is a cited report. A larger one
+        // cannot be delivered checked: one that may be a report (the search finds a source line and a citation in it, whatever its
+        // type, or cannot search a text file) is refused; any other is copied as before.
+        if (found.size <= CITED_FILE_MAX_BYTES) {
+          const delivered = await this.deliverCitedFile(check, found, input, signal, outcome, ctx);
+          if (delivered !== null) return delivered;
+        } else if (await this.largeFileMayCite(found.real, REPORT_FILE_EXTENSIONS.test(found.real), signal)) {
+          return refuse(outcome, CITED_FILE_TOO_LARGE);
+        }
+      }
+    }
+    if (check?.checks(name) && typeof input.text === "string" && input.text.trim()) {
+      const result = await checkReport(input.text, check.ports, signal, check.verdicts);
+      if (result.checked) {
+        // Too much of it unverified: back to its writer before anything is delivered, a bounded number of times (`cite-revise.ts`).
+        const revise = citeReviseFor(check)?.review(result);
+        if (revise) {
+          logger.info({ tool: name, claims: result.claims, unverified: result.unverified }, "cite_check.revise");
+          return refuse(outcome, revise);
+        }
+        const answered: RouteOutcome = outcome ?? { isError: false };
+        const text = await this.routeListed(name, { ...input, text: result.text }, signal, answered, ctx);
+        return answered.isError ? text : `${checkNote(result)}\n\n${text}`;
+      }
+    }
+    return this.routeListed(name, input, signal, outcome, ctx);
+  }
 
+  /**
+   * Whether a file too large to be delivered checked may be a cited report, whatever its type: the sandbox's own `grep` (which reads
+   * the whole file) counts both a line of a list of sources and a line with a citation number (`CITED_FILE_PATTERNS`). Two clean
+   * answers, one of them without a match, rule it out. A search that failed, was cut short or could not search the file (over its
+   * 8 MB) rules it out only for a file that is not a text file (`textType` false).
+   */
+  private async largeFileMayCite(path: string, textType: boolean, signal?: AbortSignal): Promise<boolean> {
+    for (const pattern of CITED_FILE_PATTERNS) {
+      const found: RouteOutcome = { isError: false };
+      let text: string;
+      try {
+        text = await this.routeAllowed("grep", { pattern, path, output_mode: "count", case_sensitive: true }, signal, found);
+      } catch {
+        return textType;
+      }
+      // A search that did not answer, or did not read the whole file, rules nothing out for a text file; a file of another type
+      // (a large archive, a dataset) is not taken for a report on that alone.
+      if (found.isError || /^(Error|Invalid|Pattern)\b/.test(text.trim()) || /\bnot searched\b|\[scan aborted|\[grep aborted/.test(text)) return textType;
+      // A match is the file's count line, `<path>:<n>` with n > 0, whatever the path's name; no note ends that way.
+      if (!text.split("\n").some((l) => Number(l.trim().match(/.:(\d+)$/)?.[1] ?? 0) > 0)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Deliver the sandbox file `file` (resolved as deliver_file resolves it), a cited report, as `deliver_text` would deliver its text:
+   * read whole with the sandbox's own `read` at its resolved path, then handed to the run's checked `deliver_text` (`route`), so it is
+   * checked against its sources before it is stored. Its name is the file's, with `.md` added when it is not a text file's; the
+   * caption is the call's. Refused, with nothing delivered, when the file cannot be read, is larger than one text delivery, or the run
+   * has no checked `deliver_text`. Null when the text read is not a report the check reads: deliver_file then copies it as it is.
+   */
+  private async deliverCitedFile(
+    check: CiteCheck, file: { file: string; real: string }, input: Record<string, unknown>, signal?: AbortSignal, outcome?: RouteOutcome,
+    ctx?: { stepIdentity?: string },
+  ): Promise<string | null> {
+    const path = file.real;
+    const read: RouteOutcome = { isError: false };
+    let text: string;
+    // A text file that cannot be read back may be a report: refused. Any other (an image Hands cannot decode) is copied as before.
+    const unreadable = (): string | null => (REPORT_FILE_EXTENSIONS.test(path) ? refuse(outcome, CITED_FILE_UNREADABLE) : null);
+    try {
+      text = await this.routeAllowed("read", { path, line_numbers: false }, signal, read);
+    } catch {
+      return unreadable();
+    }
+    if (read.isError || /^Error\b/.test(text)) return unreadable();
+    // Not a report the check reads (a binary file, notes, citations only inside code blocks): deliver_file copies it as any other
+    // file, as deliver_text would have passed its text on unchanged. Asked first: the text read may be longer than the file's bytes.
+    if (!isCitedReport(text)) return null;
+    if (Buffer.byteLength(text, "utf8") > CITED_FILE_MAX_BYTES) return refuse(outcome, CITED_FILE_TOO_LARGE);
+    const tool = check.deliverTool();
+    if (!tool) return refuse(outcome, CITED_FILE_REFUSAL);
+    const base = file.file.split("/").filter(Boolean).pop() ?? "report.md";
+    const fileName = /\.(md|markdown|txt)$/i.test(base) ? base : `${base.replace(/\.[^.]*$/, "")}.md`;
+    const args: Record<string, unknown> = { name: fileName, text };
+    if (typeof input.caption === "string" && input.caption.trim()) args.caption = input.caption;
+    const answered: RouteOutcome = outcome ?? { isError: false };
+    const answer = await this.route(tool, args, signal, answered, ctx);
+    return answered.isError ? answer : `This file is a report with numbered citations: it was delivered as text (${fileName}), checked against its sources.\n\n${answer}`;
+  }
+
+  /** `route()` for a call the allow-list let through: the read taint and the citations, then the tool. */
+  private async routeListed(
+    name: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+    outcome?: RouteOutcome,
+    ctx?: { stepIdentity?: string },
+  ): Promise<string> {
+    const taint = this.readTaint;
+    const cite = this.citations;
+    if (!taint && !cite) return this.routeAllowed(name, input, signal, outcome, ctx);
+    const tainted = taint?.refusal(name);
+    if (tainted) return refuse(outcome, tainted);
+    // Whether the call failed can decide whether it read anything (`ReadTaint.ran`) and whether its sources are kept, so the bit
+    // is read here even when the caller passed no outcome. A call that threw failed.
+    const answered: RouteOutcome = outcome ?? { isError: false };
+    // A citing call's sources, as the run's lookups returned them; sent where the model's arguments cannot reach.
+    const meta = cite?.metaFor(name, input);
+    let failed = true;
+    try {
+      const text = await this.routeAllowed(name, input, signal, answered, ctx, meta);
+      failed = answered.isError;
+      if (!failed) {
+        cite?.keep(name, answered.sources, input.url);
+        cite?.keepLinks(name, text);
+      }
+      return text;
+    } catch (err) {
+      // A thrown message is not the source's own fixed words: it is whatever the transport or the server put in it (an HTTP
+      // body, a JSON-RPC error's message). A failure that leaves the turn unmarked must hold nothing anyone else wrote, so the
+      // model is told only that the call failed; the message goes to the log. An abort is the run ending, and is left as it is.
+      if (!taint?.failsClean(name) || signal?.aborted) throw err;
+      logger.warn({ tool: name, err: err instanceof Error ? err.message : String(err) }, "read_taint.clean_failure_threw");
+      throw new Error(`${name} failed before it answered (what went wrong is not shown in this conversation)`);
+    } finally {
+      taint?.ran(name, failed);
+    }
+  }
+
+  /** `route()` for a call the allow-list and the read taint let through. `meta`: an MCP call's request `_meta` (`citations.ts`). */
+  private async routeAllowed(
+    name: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+    outcome?: RouteOutcome,
+    ctx?: { stepIdentity?: string },
+    meta?: Record<string, unknown>,
+  ): Promise<string> {
     if (LOOP_INTERCEPTED_TOOLS.has(name)) {
       throw new Error(`${name} must be handled by engine loop, not router`);
     }
@@ -454,16 +685,23 @@ export class ToolRouter {
     if (name === "save_skill") {
       const content = input.content as string || "";
       const skillName = input.skill_name as string || "";
-      const blocked = scanContent(content, 5000);
+      const blocked = scanContent(content, SKILL_MD_MAX_CHARS);
       if (blocked) {
         return refuse(outcome, `Error: skill '${skillName}' not saved — blocked by safety check (${blocked}).`);
       }
+      const quote = typeof input.request_quote === "string" ? input.request_quote : "";
+      const invocation = input.invocation === "manual" || input.invocation === "auto" ? input.invocation : undefined;
       this.pendingSkills.push({
         skill_name: skillName,
         content,
         description: input.description as string,
+        ...(quote ? { request_quote: quote } : {}),
+        ...(invocation ? { invocation } : {}),
       });
-      return `Skill '${skillName}' saved. It will be used automatically in future tasks.`;
+      // Not "saved": the API decides when the turn ends. The user's own request, quoted, is saved then; anything else is a draft they confirm.
+      return quote
+        ? `Skill '${skillName}' will be saved when this turn ends if request_quote is the user's own request to save it; the user is then shown a card with Undo. If it is not, they are shown it as a draft to confirm. Do not tell them it is saved for certain: say it is on its way to them as a card.`
+        : `Skill '${skillName}' is a draft: when this turn ends the user is shown it with Save and Discard, and it is saved only if they press Save. Tell them so; do not say it is saved.`;
     }
     if (name === "add_skill_file") {
       const skillName = input.skill_name as string || "";
@@ -471,7 +709,7 @@ export class ToolRouter {
       const content = input.content as string || "";
       const pathErr = validateSubFilePath(filePath);
       if (pathErr) return refuse(outcome, `Error: invalid file_path — ${pathErr}.`);
-      const blocked = scanContent(content, 10 * 1024);
+      const blocked = scanContent(content, SKILL_FILE_MAX_BYTES);
       if (blocked) return refuse(outcome, `Error: file content blocked by safety check (${blocked}).`);
       this.pendingSkillFileMutations.push({
         action: "add", skill_name: skillName, file_path: filePath, content, is_binary: !!input.is_binary,
@@ -484,7 +722,7 @@ export class ToolRouter {
       const content = input.content as string || "";
       const pathErr = validateSubFilePath(filePath);
       if (pathErr) return refuse(outcome, `Error: invalid file_path — ${pathErr}.`);
-      const blocked = scanContent(content, 10 * 1024);
+      const blocked = scanContent(content, SKILL_FILE_MAX_BYTES);
       if (blocked) return refuse(outcome, `Error: file content blocked by safety check (${blocked}).`);
       this.pendingSkillFileMutations.push({
         action: "update", skill_name: skillName, file_path: filePath, content, is_binary: !!input.is_binary,
@@ -508,7 +746,16 @@ export class ToolRouter {
       const skillName = typeof input.name === "string" ? input.name : "";
       const file = typeof input.file === "string" ? input.file : undefined;
       const loaded = await this.skillStore.load(skillName, file, input.offset);
+      const wholeSkill = file === undefined || file === "" || file === "SKILL.md";
+      const personal = this.skillStore.get(skillName)?.source === "user";
+      if (wholeSkill && personal) {
+        // Whether a personal skill was really used: the signal that loading without being named happens at all.
+        if (loaded.ok) metrics.onUserSkillRead("worker", "ok");
+        else if (loaded.reason) metrics.onUserSkillRead("worker", loaded.reason === "failed" ? "failed" : "not_found");
+      }
       if (!loaded.ok) return refuse(outcome, loaded.error);
+      // A personal skill's text goes to the model and nowhere else: not into a log line, not into the turn's events.
+      if (personal && outcome) outcome.withheld = `[personal skill '${skillName}'${file && file !== "SKILL.md" ? `, file '${file}'` : ""}: ${loaded.text.length} chars loaded]`;
       // Same rule as a read of `.skills/<name>/SKILL.md`: the skill counts as used when its SKILL.md was.
       if (file === undefined || file === "" || file === "SKILL.md") this.skillsRead.add(skillName);
       return loaded.text;
@@ -583,7 +830,12 @@ export class ToolRouter {
       const [, server, ...rest] = name.split("__");
       const client = this.platformMcp.get(server);
       if (!client) throw new Error(`Unknown MCP server: ${server}`);
-      return client.callTool(rest.join("__"), input);
+      // A log read (`log_reads`): asked for no more than its bound, and its answer masked before anything reads it.
+      if (this.logReads?.has(name)) return this.logReads.filter(await client.callTool(rest.join("__"), this.logReads.bound(name, input), outcome, meta, signal));
+      // SaFE's workload or node list without a workspace, refused (or answered empty) to a member: read across the workspaces they
+      // may use (`workspace-fanout.ts`).
+      if (fansOut(name)) return callWithWorkspaceFanout(client, name, rest.join("__"), input, outcome, meta, signal);
+      return client.callTool(rest.join("__"), input, outcome, meta, signal);
     }
 
     throw new Error(`Unknown tool: ${name}`);
@@ -597,24 +849,26 @@ export class ToolRouter {
     const out = this.allToolSchemas().filter((t) =>
       (this.memoryEnabled || !MEMORY_TOOLS.has(t.name))
       && (this.skillEvolutionEnabled || !SKILL_WRITE_TOOLS.has(t.name)));
-    return this.skillStore ? [...out, loadSkillSchema()] : out;
+    return this.skillStore ? [...out, loadSkillSchema(this.skillStore.hasPersonal)] : out;
   }
 
   private allToolSchemas(): ToolSchema[] {
     return [
       ...MEMORY_TOOL_SCHEMAS,
-      { name: "save_skill", description: "Save the current approach as a reusable skill (the main SKILL.md). Use when: (1) user explicitly asks to save a workflow, (2) you completed a complex multi-step task with reusable value. To attach supporting scripts/templates/docs to this skill, follow up with add_skill_file. Write content and description in the user's language.", input_schema: {
+      { name: "save_skill", description: "Save the current approach as one of the user's personal skills (the main SKILL.md). Use when: (1) the user explicitly asks to save a workflow as a skill: pass their words as request_quote and it is saved, with a card they can undo; (2) you completed a complex multi-step task with reusable value: leave request_quote out and it becomes a draft the user confirms first. To attach supporting scripts/templates/docs to this skill, follow up with add_skill_file. Write content and description in the user's language.", input_schema: {
         type: "object", properties: {
           skill_name: { type: "string", description: "Short kebab-case English slug, e.g. 'react-scaffold' (name is always English for consistency, content/description follow user language)" },
           description: { type: "string", description: "2-4 sentences: what the skill does, when to use it, when NOT to use it" },
-          content: { type: "string", description: "Full SKILL.md text with ## Goal, ## Steps, ## Notes (max 5000 chars)" },
+          content: { type: "string", description: `Full SKILL.md text with ## Goal, ## Steps, ## Notes (max ${SKILL_MD_MAX_CHARS} chars)` },
+          request_quote: { type: "string", description: "Only when the user asked to save this as a skill: their sentence that asks for it, copied exactly from what they wrote. Never made up." },
+          invocation: { type: "string", enum: ["auto", "manual"], description: "manual: used only when the user names it. Only when the user says so." },
         }, required: ["skill_name", "content", "description"],
       }},
       { name: "add_skill_file", description: "Attach a supporting file to an existing skill (script, template, reference doc). Use after save_skill when the skill needs accompanying assets the Agent can later read or execute. file_path must start with one of: references/, templates/, scripts/, assets/", input_schema: {
         type: "object", properties: {
           skill_name: { type: "string", description: "Name of an existing skill" },
           file_path: { type: "string", description: "Relative path under the skill dir, e.g. 'scripts/deploy.sh' (whitelist: references/, templates/, scripts/, assets/)" },
-          content: { type: "string", description: "File contents (max 10 KB)" },
+          content: { type: "string", description: `File contents (max ${SKILL_FILE_MAX_BYTES / 1024} KB)` },
           is_binary: { type: "boolean", description: "Set true if content is base64-encoded binary; default false" },
         }, required: ["skill_name", "file_path", "content"],
       }},
@@ -622,7 +876,7 @@ export class ToolRouter {
         type: "object", properties: {
           skill_name: { type: "string" },
           file_path: { type: "string" },
-          content: { type: "string", description: "New file contents (max 10 KB)" },
+          content: { type: "string", description: `New file contents (max ${SKILL_FILE_MAX_BYTES / 1024} KB)` },
           is_binary: { type: "boolean" },
         }, required: ["skill_name", "file_path", "content"],
       }},
@@ -632,22 +886,7 @@ export class ToolRouter {
           file_path: { type: "string" },
         }, required: ["skill_name", "file_path"],
       }},
-      { name: "bash", description: BG_SHELL_ENABLED
-        ? "Execute a shell command in the workspace directory. Blocks until the command exits; if it hits the timeout the whole process group is killed and only the output so far comes back. For anything that may outlast the timeout — servers, training runs, long builds, watchers — pass run_in_background=true instead of raising the timeout, then call wait to block until it finishes."
-        : "Execute a shell command in the workspace directory. Blocks until the command exits; if it hits the timeout the whole process group is killed and only the output so far comes back, so give a long command a timeout to match rather than splitting it up. When you need to wait — for a job to finish, for a file to appear — wait once for the whole interval in a single call and raise `timeout` to cover it. Every call is a separate model request that re-sends the entire conversation, so three chained sleeps cost three times what one longer sleep costs and tell you nothing extra.",
-        input_schema: {
-        type: "object", properties: {
-          command: { type: "string", description: "Shell command to execute" },
-          timeout: { type: "number", description: BG_SHELL_ENABLED
-            ? `Timeout in seconds (default ${BASH_FOREGROUND_DEFAULT_SEC}, capped at ${BASH_TIMEOUT_CEILING_SEC}): a higher value is reduced to the cap, so use run_in_background plus wait for anything longer instead of raising this.`
-            : `Timeout in seconds (default ${BASH_FOREGROUND_DEFAULT_SEC}, capped at ${BASH_TIMEOUT_CEILING_SEC}): a higher value is reduced to the cap. The default is a default, not a budget — there is no background mode in this deployment, so a command or a wait that needs longer should say so here, up to the cap, in one call.` },
-          ...(BG_SHELL_ENABLED ? {
-            run_in_background: { type: "boolean", description: "Return a shell_id immediately and keep the command running. Follow with wait to block until it finishes, or bash_output to look at it without waiting." },
-            shell_id: { type: "string", description: "Name this shell instead of taking a generated id (advanced). Private to this conversation, so a plain name like 'server' is fine." },
-            background_kind: { type: "string", enum: ["background", "monitor"], description: "Only with run_in_background=true. monitor shells skip stall-prompt notifications." },
-          } : {}),
-        }, required: ["command"],
-      }},
+      bashSchema(BG_SHELL_ENABLED ? "wait" : null),
 
       ...(BG_SHELL_ENABLED ? [
         { name: "bash_output", description: "Read output from a background shell started with bash(run_in_background=true). Returns only what the shell printed since your previous poll, plus the exit status once it has finished. Shells stay readable across turns of this conversation until the sandbox goes away.", input_schema: {
@@ -758,9 +997,11 @@ export class ToolRouter {
       } as ToolSchema] : []),
 
       ...(WEB_FETCH_ENABLED ? [{
-        name: "web_fetch", description: "Fetch a URL and return its content. Use after web_search to read a specific page. Does not execute JavaScript. If `prompt` is set and summarization is enabled, content is condensed by a small fast model before returning.", input_schema: {
+        name: "web_fetch", description: "Fetch a URL and return its content. Use after web_search to read a specific page. Does not execute JavaScript. If `prompt` is set and summarization is enabled, content is condensed by a small fast model before returning. A page longer than one answer is read in parts: set find to a word of the part you need (a feature's or a product's name) to get the page around each place it appears, or offset to read on from where the last part ended.", input_schema: {
           type: "object", properties: {
             url: { type: "string", description: "Absolute http(s) URL" },
+            find: { type: "string", description: "Optional: return only the page around each place this text appears (case-insensitive), for a large page such as a reference table or a compatibility matrix." },
+            offset: { type: "number", description: "Optional: the character of the page to start from, as a previous answer's Part line gives it (default 0)." },
             prompt: { type: "string", description: "Optional task to apply to the fetched content (e.g. 'extract the API examples'). Triggers Haiku summarization when enabled." },
             max_bytes: { type: "number", description: "1024-10485760 (default 10 MiB). HTTP body cutoff." },
             raw: { type: "boolean", description: "true → bypass Markdown conversion AND summarization (default false)" },

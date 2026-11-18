@@ -27,6 +27,10 @@ describe("triggers flag off", { skip }, () => {
     assert.equal(cfg.CLAW_TRIGGERS_ENABLED, false);
     const index = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
     assert.match(index, /if \(CLAW_TRIGGERS_ENABLED\) await registerTriggerRoutes\(app\)/);
-    assert.match(index, /if \(CLAW_TRIGGERS_ENABLED\) startTriggerScheduler\(\)/);
+    // Started through startup/background.ts, whose `trigger_scheduler` is `when: flags.triggers`.
+    assert.match(index, /\n {4}trigger_scheduler: \(\) => startTriggerScheduler\(\),\n/);
+    assert.match(index, /\n {4}triggers: CLAW_TRIGGERS_ENABLED,\n/);
+    const background = readFileSync(new URL("../src/startup/background.ts", import.meta.url), "utf8");
+    assert.match(background, /trigger_scheduler: flags\.triggers,/);
   });
 });

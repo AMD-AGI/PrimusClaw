@@ -1,6 +1,14 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import {
+  SANDBOX_WORKSPACE_NOT_ALLOWED,
+  allowedSandboxWorkspaces,
+  sandboxWorkspaceAllowed,
+  sandboxWorkspaceNotAllowedText,
+} from "@claw/protocol";
+import { AGENT_SANDBOX_NAMESPACE, SANDBOX_CPU_NAMESPACE, SANDBOX_NAMESPACE, isKubernetesMode } from "../config.js";
+
 /**
  * A sandbox this deployment has no way to stop, ever.
  *
@@ -116,7 +124,58 @@ export const SANDBOX_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set([
   "sandbox_unschedulable",
   "sandbox_start_timeout",
   "sandbox_pending_timeout",
+  // Not a wait, but the same answer to "what does a second try buy": the
+  // platform refused the account, and it refuses it again a second later.
+  "sandbox_workspace_forbidden",
+  // Nor this one: the deployment does not let a sandbox run in that workspace,
+  // and a second try names the same workspace.
+  "sandbox_workspace_not_allowed",
 ]);
+
+/**
+ * The endings among SANDBOX_UNAVAILABLE_REASONS that say the platform had no
+ * capacity for the sandbox within the wait the run was given: no node took its
+ * pod, the wait for capacity ran out, or it never became ready once scheduled.
+ * A run that asked for a sandbox and ended on one of these did not do the work
+ * it needed the sandbox for, and is recorded as failed for it even when its
+ * agent went on to answer (see TaskRunner.provisionFailure). A refused account or
+ * workspace is not among them: that is the account's standing, and a turn that
+ * carries on without a sandbox there is the designed behaviour, not a failure.
+ */
+export const SANDBOX_CAPACITY_FAILURE_REASONS: ReadonlySet<string> = new Set([
+  "sandbox_unschedulable",
+  "sandbox_start_timeout",
+  "sandbox_pending_timeout",
+]);
+
+/**
+ * The platform refused to create the sandbox workload because the caller's
+ * account may not create workloads in that workspace (SaFE answers 403, in
+ * practice "not allowed to create workload, workspace: [<ws>]" for a user who
+ * is not a member of it).
+ */
+export const SANDBOX_WORKSPACE_FORBIDDEN = "sandbox_workspace_forbidden";
+
+export { SANDBOX_WORKSPACE_NOT_ALLOWED };
+
+/**
+ * What the user is told when the platform will not let their account start a
+ * sandbox in `workspace`.
+ *
+ * Written for the person, not the operator: SaFE's answer carries the account's
+ * internal user id and a platform error code, neither of which tells anyone what
+ * to do, and both of which end up verbatim in a chat or a Teams message when the
+ * raw body is passed through. The body is logged where it is received instead.
+ * `cpu` says the workspace is the deployment's CPU sandbox workspace, which is
+ * the one an assistant or Teams turn lands in without naming any.
+ */
+export function sandboxWorkspaceForbiddenText(workspace: string, cpu: boolean): string {
+  const which = cpu ? "CPU sandbox workspace" : "sandbox workspace";
+  const target = workspace ? `the ${workspace} workspace` : "the workspace sandboxes start in";
+  return `You do not have a ${which} yet: your account may not start sandboxes in ${target}.`
+    + ` Ask a SaFE administrator to add your account to ${target}, then try again.`
+    + " Anything that does not need a sandbox still works.";
+}
 
 /** The give-up behind `err` when it is one of SANDBOX_UNAVAILABLE_REASONS, else null. */
 export function sandboxUnavailableOf(err: unknown): SandboxProvisionTerminalError | null {
@@ -164,6 +223,53 @@ export function classifyWorkloadTerminalReason(info: Record<string, unknown>): s
     return "sandbox_envd_exited";
   }
   return "sandbox_workload_terminal";
+}
+
+/**
+ * What SaFE writes when the platform, not the container, ended a pod: the
+ * DisruptionTarget condition it records on the pod ("DisruptionTarget:
+ * <reason> ...", or "pod <name> was taken away by a disruption, ..." for a pod
+ * that then reported success), and the pod-level reasons Kubernetes gives a pod
+ * it killed from above the container (NodeLost, Evicted, Preempted, NodeShutdown).
+ * The CamelCase tokens are matched as written, so ordinary prose does not match.
+ */
+const WORKLOAD_DISRUPTION = new RegExp([
+  String.raw`\bDisruptionTarget\b`,
+  "taken away by a disruption",
+  String.raw`\b(?:NodeLost|Evicted|Preempted|NodeShutdown|PreemptionByScheduler|DeletionByTaintManager|DeletionByPodGC|TerminationByKubelet|EvictionByEvictionAPI)\b`,
+].join("|"));
+
+/**
+ * The kubelet's words for evicting a pod over what the pod itself used: past its
+ * own ephemeral-storage limit (the pod's, a container's, an emptyDir's), or the
+ * pod picked because one of its containers used more than it requested when the
+ * node ran short (the kubelet then says "Container c was using X, request is Y,
+ * has larger consumption of memory"). Those come as Evicted /
+ * TerminationByKubelet / EvictionByEvictionAPI too, and are the application's
+ * doing. A node-pressure eviction that names no such container ("The node was
+ * low on resource: memory." alone) is the node's, and stays a disruption.
+ */
+const RESOURCE_EVICTION = /exceeds? (?:the |its )?(?:total )?limit|exceeded its .{0,80}limit|has larger consumption of/i;
+
+/**
+ * Whether a terminal SaFE workload detail says the platform took its pod away
+ * (its node lost, a preemption, a drain) rather than its container failing or
+ * the pod being evicted for what it used itself (`RESOURCE_EVICTION`).
+ *
+ * Reads the terminal condition's message only, the one
+ * {@link classifyWorkloadTerminalReason} reads (it carries the failed pods'
+ * details): never the top-level message, which the scheduler writes and never
+ * clears, so an old "Preempted" there would make a later failure of the
+ * container look like a disruption. No terminal condition is false.
+ */
+export function workloadDisrupted(info: Record<string, unknown>): boolean {
+  const conds = Array.isArray(info.conditions) ? (info.conditions as Array<Record<string, unknown> | null>) : [];
+  const terminal = conds.find((c) => {
+    const t = String(c?.type ?? "").toLowerCase();
+    return t === "adminfailed" || t === "adminstopped";
+  });
+  const text = String(terminal?.message ?? "");
+  return WORKLOAD_DISRUPTION.test(text) && !RESOURCE_EVICTION.test(text);
 }
 
 /**
@@ -288,4 +394,36 @@ export class DagHandleScanTimeoutError extends Error {
     super(message);
     this.name = "DagHandleScanTimeoutError";
   }
+}
+
+/**
+ * Refuse to create a sandbox in a workspace the deployment does not isolate
+ * (SANDBOX_ALLOWED_NAMESPACES, see @claw/protocol sandbox-workspaces.ts).
+ *
+ * The API refuses a request naming such a workspace with 400; this is the
+ * line behind it, for whatever reached a provider without passing that check
+ * (a session pinned before the list was set, a namespace only a template
+ * rendered). Called by each provider before it asks the platform for anything.
+ */
+export function assertSandboxWorkspaceAllowed(
+  workspace: string,
+  env: Record<string, string | undefined> = process.env,
+  deploymentDefaults: readonly string[] = brainDefaultSandboxWorkspaces(),
+): void {
+  const listed = allowedSandboxWorkspaces(env);
+  // The workspaces this Brain itself falls back to are on the list whatever
+  // the environment spells: SANDBOX_NAMESPACE and AGENT_SANDBOX_NAMESPACE
+  // default to "default" when unset, and a request that names nothing lands
+  // there; refusing it would refuse every unpinned sandbox.
+  const allowed = listed === null ? null : new Set([...listed, ...deploymentDefaults.map((d) => d.trim()).filter((d) => d !== "")]);
+  if (sandboxWorkspaceAllowed(workspace, allowed)) return;
+  throw new SandboxProvisionTerminalError(
+    SANDBOX_WORKSPACE_NOT_ALLOWED,
+    sandboxWorkspaceNotAllowedText(workspace.trim(), allowed!),
+  );
+}
+
+/** Where this Brain puts a sandbox that names no workspace, in the deploy mode it runs in. */
+function brainDefaultSandboxWorkspaces(): string[] {
+  return isKubernetesMode() ? [AGENT_SANDBOX_NAMESPACE] : [SANDBOX_NAMESPACE, SANDBOX_CPU_NAMESPACE];
 }

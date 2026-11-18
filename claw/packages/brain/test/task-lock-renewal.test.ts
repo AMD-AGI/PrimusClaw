@@ -25,13 +25,18 @@
 //   R4 the stand-down deadline is derived from the TTL it has to beat
 //   R5 a lock this pod never took is reported, not silently skipped
 //   R6 a refresh interval too close to the TTL is a lock that lapses mid-run
+//   R7 a renewal that timed out but was stored is ours, not a takeover
+//   R8 after a conflict, a lock read back under another holder is still lost
+//   R9 a read-back that does not answer is an error, not a verdict
+//   R10 a renewal that outlives its run cannot take over the next run of the key
+//   R11 ...nor make this process forget the next run's lock while it reads back
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { KV } from "nats";
 
 import {
   acquireTaskLock, bindTaskLockKv, lockExpiresBetweenRenewals, lockProofDeadlineMs,
-  refreshTaskLock,
+  refreshTaskLock, releaseTaskLock,
 } from "../src/tasks/lock.js";
 import { BRAIN_REGISTRY_TTL_MS, LOCK_REFRESH_INTERVAL_MS } from "../src/config.js";
 
@@ -79,6 +84,11 @@ test("R1 a transport error keeps the claim, and the next tick renews it", async 
 
 test("R2 a revision conflict is still a loss, and is final", async () => {
   const { kv, revisions } = fakeKv(() => conflict());
+  // Read back after the conflict, as a renewal now does: somebody else holds it.
+  (kv as unknown as { get: () => Promise<unknown> }).get = async () => ({
+    key: "lock.sess-taken", revision: 40, operation: "PUT",
+    value: new TextEncoder().encode(JSON.stringify({ holderId: "another-pod", acquiredAt: 1, lastRenewedAt: 1 })),
+  });
   bindTaskLockKv(kv);
   await acquireTaskLock("sess-taken");
 
@@ -140,4 +150,178 @@ test("R6 a refresh interval too close to the TTL is a lock that lapses mid-run",
     "and at the TTL the deadline is no longer shorter than the claim it judges");
   assert.equal(lockExpiresBetweenRenewals(), false,
     "the shipped pair has to satisfy its own check");
+});
+
+/**
+ * A lock bucket with one entry, stored the way JetStream stores it: a revision
+ * that moves on every write, CAS on that revision, and -- the case that matters
+ * -- a write that is stored while its acknowledgement is lost.
+ */
+function storedKv() {
+  const enc = new TextEncoder();
+  let entry: { revision: number; value: Uint8Array } | null = null;
+  let seq = 100;
+  let loseNextAck = false;
+  let readFails = false;
+  const kv = {
+    async create(_key: string, value: Uint8Array) {
+      if (entry) throw new Error("wrong last sequence: key exists");
+      entry = { revision: ++seq, value };
+      return entry.revision;
+    },
+    async update(_key: string, value: Uint8Array, rev: number) {
+      if (!entry || entry.revision !== rev) throw new Error(`wrong last sequence: ${entry?.revision ?? 0}`);
+      entry = { revision: ++seq, value };
+      if (loseNextAck) {
+        loseNextAck = false;
+        throw Object.assign(new Error("TIMEOUT"), { name: "NatsError", code: "TIMEOUT" });
+      }
+      return entry.revision;
+    },
+    async get(key: string) {
+      if (readFails) throw Object.assign(new Error("TIMEOUT"), { name: "NatsError", code: "TIMEOUT" });
+      return entry ? { key, revision: entry.revision, value: entry.value, operation: "PUT" } : null;
+    },
+  } as unknown as KV;
+  return {
+    kv,
+    loseNextAck: () => { loseNextAck = true; },
+    readFails: (on: boolean) => { readFails = on; },
+    takeOver: () => {
+      entry = { revision: ++seq, value: enc.encode(JSON.stringify({ holderId: "successor", seq: 7, acquiredAt: 1, lastRenewedAt: 1 })) };
+    },
+  };
+}
+
+test("R7 a renewal that timed out but was stored is ours, not a takeover", async () => {
+  const store = storedKv();
+  bindTaskLockKv(store.kv);
+  assert.equal(await acquireTaskLock("sess-stall", 7), true);
+
+  // The JetStream stall: the write lands, its PubAck does not.
+  store.loseNextAck();
+  assert.equal(await refreshTaskLock("sess-stall"), "error");
+  // The next renewal's CAS quotes the revision before the stored write, so it
+  // conflicts. Nobody else is holding the lock; the entry is our own.
+  assert.equal(await refreshTaskLock("sess-stall"), "renewed",
+    "the 2026-11-06 stand-down: a healthy run read its own write as a takeover");
+  assert.equal(await refreshTaskLock("sess-stall"), "renewed", "and renewals carry on from the adopted revision");
+});
+
+test("R8 after a conflict, a lock read back under another holder is still lost", async () => {
+  const store = storedKv();
+  bindTaskLockKv(store.kv);
+  await acquireTaskLock("sess-taken-over", 7);
+  store.takeOver();
+  assert.equal(await refreshTaskLock("sess-taken-over"), "lost");
+  assert.equal(await refreshTaskLock("sess-taken-over"), "not_held");
+});
+
+test("R9 a read-back that does not answer is an error, not a verdict", async () => {
+  const store = storedKv();
+  bindTaskLockKv(store.kv);
+  await acquireTaskLock("sess-blind", 7);
+  store.loseNextAck();
+  assert.equal(await refreshTaskLock("sess-blind"), "error");
+  store.readFails(true);
+  assert.equal(await refreshTaskLock("sess-blind"), "error",
+    "ownership is unknown, which is the transport case, not the takeover case");
+  store.readFails(false);
+  assert.equal(await refreshTaskLock("sess-blind"), "renewed");
+});
+
+test("R10 a renewal that outlives its run cannot take over the next run of the key", async () => {
+  // Run A's renewal is slow; A finishes, releases, and run B of the same key
+  // acquires it in the same process (same holder id) before A's CAS answers.
+  const dec = new TextDecoder();
+  let entry: { revision: number; value: Uint8Array } | null = null;
+  let seq = 0;
+  const parked: Array<() => void> = [];
+  let parkNextUpdate = false;
+  const kv = {
+    async create(_k: string, value: Uint8Array) {
+      if (entry) throw new Error("wrong last sequence: key exists");
+      entry = { revision: ++seq, value };
+      return entry.revision;
+    },
+    async update(_k: string, value: Uint8Array, rev: number) {
+      if (parkNextUpdate) {
+        parkNextUpdate = false;
+        await new Promise<void>((r) => parked.push(r));
+      }
+      if (!entry || entry.revision !== rev) throw new Error(`wrong last sequence: ${entry?.revision ?? 0}`);
+      entry = { revision: ++seq, value };
+      return entry.revision;
+    },
+    async get(key: string) {
+      return entry ? { key, revision: entry.revision, value: entry.value, operation: "PUT" } : null;
+    },
+    async delete() { entry = null; },
+  } as unknown as KV;
+  bindTaskLockKv(kv);
+
+  assert.equal(await acquireTaskLock("sess-reused", 101), true);
+  parkNextUpdate = true;
+  const staleA = refreshTaskLock("sess-reused");
+  // A ends: its lock is released and B takes the key.
+  entry = null;
+  await releaseTaskLock("sess-reused");
+  assert.equal(await acquireTaskLock("sess-reused", 202), true);
+  const bAcq = JSON.parse(dec.decode(entry!.value)).acq;
+
+  parked.shift()!();
+  assert.equal(await staleA, "lost", "A's renewal is A's business only");
+  const stored = JSON.parse(dec.decode(entry!.value));
+  assert.equal(stored.seq, 202, "B's entry was not overwritten");
+  assert.equal(stored.acq, bAcq);
+  assert.equal(await refreshTaskLock("sess-reused"), "renewed", "and B renews as if nothing happened");
+});
+
+test("R11 a renewal whose read-back outlives its run does not forget the next run's lock", async () => {
+  const dec = new TextDecoder();
+  let entry: { revision: number; value: Uint8Array } | null = null;
+  let seq = 0;
+  let conflictNextUpdate = false;
+  let parkNextGet = false;
+  const parked: Array<() => void> = [];
+  const kv = {
+    async create(_k: string, value: Uint8Array) {
+      if (entry) throw new Error("wrong last sequence: key exists");
+      entry = { revision: ++seq, value };
+      return entry.revision;
+    },
+    async update(_k: string, value: Uint8Array, rev: number) {
+      if (conflictNextUpdate) { conflictNextUpdate = false; throw new Error("wrong last sequence: 999"); }
+      if (!entry || entry.revision !== rev) throw new Error(`wrong last sequence: ${entry?.revision ?? 0}`);
+      entry = { revision: ++seq, value };
+      return entry.revision;
+    },
+    async get(key: string) {
+      if (parkNextGet) {
+        parkNextGet = false;
+        await new Promise<void>((r) => parked.push(r));
+      }
+      return entry ? { key, revision: entry.revision, value: entry.value, operation: "PUT" } : null;
+    },
+    async delete() { entry = null; },
+  } as unknown as KV;
+  bindTaskLockKv(kv);
+
+  assert.equal(await acquireTaskLock("sess-readback", 101), true);
+  // A's renewal conflicts and its read-back is slow.
+  conflictNextUpdate = true;
+  parkNextGet = true;
+  const staleA = refreshTaskLock("sess-readback");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(parked.length, 1, "A is inside its read-back");
+  // Meanwhile A ends and B takes the key.
+  entry = null;
+  await releaseTaskLock("sess-readback");
+  assert.equal(await acquireTaskLock("sess-readback", 202), true);
+
+  parked.shift()!();
+  assert.equal(await staleA, "lost");
+  assert.equal(JSON.parse(dec.decode(entry!.value)).seq, 202);
+  assert.equal(await refreshTaskLock("sess-readback"), "renewed",
+    "B still renews: a late answer to A did not erase B's local record");
 });

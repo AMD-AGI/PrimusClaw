@@ -8,8 +8,9 @@ import { singleflightCreate, type FlightResult } from "../shared/singleflight.js
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { submitSessionMessage } from "../sessions/submit-message.js";
-import { CLAW_ASSISTANT_ENABLED, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_FIRST_ACK_USERS, SESSION_SANDBOX_HOLD_MS, SESSION_SANDBOX_START_ENABLED } from "../config.js";
 import { attendedViaOfRequest, parseChannelContext, preemptReportTurn, recordAssistantMessage } from "../assistant/inbound.js";
+import { armFirstAck } from "../assistant/lookup-ack.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { checkSessionCreate } from "../github-review/acting-session.js";
 import { REQUESTED_REVIEW_CONFIG_KEYS } from "../github-review/requested-by.js";
@@ -28,6 +29,8 @@ import {
   isAdmin,
   isSystemAdmin,
 } from "../auth/models.js";
+import { pluginLaunchable } from "../marketplace/plugins.js";
+import { PluginGoneError } from "../marketplace/plugin-expiry.js";
 import { getContextUsageSnapshot } from "../sessions/context-builder.js";
 import { publicSessionRow } from "../events/redaction.js";
 import { archiveSession, unarchiveSession } from "../sessions/archive.js";
@@ -42,12 +45,13 @@ import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
 import { metrics } from "../infra/metrics.js";
 import { sessionWorkspacePrefix } from "../workspace/prefix.js";
 import { releaseSessionRefs } from "../workspace/store.js";
+import { workspaceSaving } from "../workspace/save-state.js";
 import {
   acquireAdmissionLock, envAdmitLimits, sessionTreeShape, treeCeilingRefusal,
   type AdmissionAsk,
 } from "../tasks/admission.js";
 import { S3_BUCKET, UPLOAD_TTL_DAYS } from "../config.js";
-import { getS3Client } from "../infra/s3-client.js";
+import { getS3Client, S3_LIST_PAGE_KEYS } from "../infra/s3-client.js";
 import type { S3Client } from "@aws-sdk/client-s3";
 import { ListObjectsV2Command, GetObjectCommand, PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
@@ -57,6 +61,7 @@ import { Readable, PassThrough } from "node:stream";
 import pino from "pino"
 import { handsSessionKey, parseSessionRepo, putTerminalHold } from "@claw/protocol";
 import { toolsAllowlistProblem } from "../tasks/dags/admission.js";
+import { sandboxWorkspaceRefusal } from "../tasks/sandbox-workspaces.js";
 
 const logger = pino({ name: "sessions" });
 
@@ -510,7 +515,7 @@ async function listS3KeysUnderPrefix(
   let ct: string | undefined;
   do {
     const res = await s3.send(
-      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: ct }),
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: ct, MaxKeys: S3_LIST_PAGE_KEYS }),
     );
     for (const obj of res.Contents || []) {
       if (!obj.Key || obj.Size === undefined || obj.Size <= 0) continue;
@@ -1227,6 +1232,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         const n = typeof fmPluginRaw === "number" ? fmPluginRaw : parseInt(String(fmPluginRaw), 10);
         if (Number.isFinite(n)) fmPluginId = n;
       }
+      if (fmPluginId !== undefined && !(await pluginLaunchable(fmPluginId, user?.userId, user ? isAdmin(user) : false))) {
+        return reply.status(404).send({ ok: false, error: "plugin_not_found" });
+      }
       firstMessage = {
         content: fmContent,
         messageType: fmType,
@@ -1241,6 +1249,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       const vetted = await vetRequestMcpServers(fm.mcp_servers);
       if (!vetted.ok) return reply.status(400).send({ ok: false, error: `message.${vetted.error}` });
       firstMessage.mcpServers = vetted.servers;
+      // The workspace the first turn's sandbox lands in must be one the deployment isolates.
+      const refusedWorkspace = sandboxWorkspaceRefusal([fmWorkspaceId]);
+      if (refusedWorkspace) return reply.status(400).send(refusedWorkspace);
     }
 
     const sessionEnvResult = parseSessionEnv(body.env);
@@ -1753,6 +1764,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       const n = typeof pluginIdRaw === "number" ? pluginIdRaw : parseInt(String(pluginIdRaw), 10);
       if (Number.isFinite(n)) pluginId = n;
     }
+    // A new turn may not name a plugin that is gone, expired or not the caller's to use.
+    if (pluginId !== undefined && !(await pluginLaunchable(pluginId, user?.userId, user ? isAdmin(user) : false))) {
+      return reply.status(404).send({ ok: false, error: "plugin_not_found" });
+    }
     const imageRaw = body.image;
     const requestImage =
       typeof imageRaw === "string" && imageRaw.trim() !== "" ? imageRaw.trim() : undefined;
@@ -1781,6 +1796,10 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       typeof workspaceIdRaw === "string" && workspaceIdRaw.trim() !== ""
         ? workspaceIdRaw.trim()
         : undefined;
+    // Refused before anything is queued: the sandbox this message may open would
+    // land in a workspace the deployment does not isolate (SANDBOX_ALLOWED_NAMESPACES).
+    const refusedWorkspace = sandboxWorkspaceRefusal([workspaceId]);
+    if (refusedWorkspace) return reply.status(400).send(refusedWorkspace);
     const vettedMcp = await vetRequestMcpServers(body.mcp_servers);
     if (!vettedMcp.ok) return reply.status(400).send({ ok: false, error: vettedMcp.error });
     const mcpServers = vettedMcp.servers;
@@ -1890,7 +1909,9 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
 
     // Lock, gate, queue or dispatch: all of it is `submitSessionMessage`, which is
     // also what a caller that is not an HTTP request goes through.
-    const submitted = await submitSessionMessage({
+    let submitted: Awaited<ReturnType<typeof submitSessionMessage>>;
+    try {
+    submitted = await submitSessionMessage({
       sessionId, userId, user,
       content, messageType, toolIds, pluginId,
       requestImage, requestResource, requestTimeout, topology, toolsAllowlist,
@@ -1908,6 +1929,18 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
         }),
       } : {}),
     });
+    } catch (err) {
+      // The plugin went between the check above and the queue insert's hold.
+      if (err instanceof PluginGoneError) return reply.status(404).send({ ok: false, error: "plugin_not_found" });
+      throw err;
+    }
+    // A message to the person's assistant that has had no word CLAW_ASSISTANT_FIRST_ACK_MS from now is told "on it" by the server
+    // (`assistant/lookup-ack.ts`), counted from now: a message queued behind a worker's report waits from here, not from its run.
+    if (CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_FIRST_ACK_USERS) {
+      const firstAckId = submitted.kind === "dispatched" ? submitted.messageId
+        : submitted.kind === "queued" && submitted.pendingId !== null ? queuedMessageId(submitted.pendingId) : null;
+      if (firstAckId) armFirstAck(sessionId, firstAckId, undefined, {}, userId);
+    }
     if (CLAW_ASSISTANT_ENABLED && submitted.kind === "queued" && submitted.drain === "awaiting_turn") {
       // What the user says next goes before a worker's report the assistant is still reading.
       await preemptReportTurn(sessionId).catch((err) => logger.warn({ err, sessionId }, "assistant.report_turn_preempt_failed"));
@@ -2148,7 +2181,7 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
     let ct: string | undefined;
     do {
       const res = await s3.send(
-        new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: ct }),
+        new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: ct, MaxKeys: S3_LIST_PAGE_KEYS }),
       );
       for (const obj of res.Contents || []) {
         const rel = (obj.Key || "").slice(prefix.length);
@@ -2157,7 +2190,14 @@ export async function registerSessionRoutes(app: FastifyInstance): Promise<void>
       }
       ct = res.IsTruncated ? res.NextContinuationToken : undefined;
     } while (ct);
-    return { ok: true, data: files };
+    // The session's last turn may still be uploading these: a turn ends before
+    // its workspace is saved. Null when no save is running; left out when that
+    // could not be read, which is not the same answer.
+    const saving = await workspaceSaving(sessionId).catch((err: unknown) => {
+      logger.warn({ err, sessionId }, "session.files.saving_unreadable");
+      return undefined;
+    });
+    return { ok: true, data: files, ...(saving === undefined ? {} : { saving }) };
   });
 
   // --- Download/Stream File (V1/V2 split) ---

@@ -35,6 +35,9 @@ type BeginRequest struct {
 	Sealed            bool
 	Inputs            []string
 	Outputs           []string
+	// UserTemplate marks a template the caller verified as a usable user
+	// template; the grant template list is not consulted for it.
+	UserTemplate bool
 }
 
 // Replay is returned when the idempotency key already names a sandbox.
@@ -126,6 +129,9 @@ func (s *Service) MarkRunning(ctx context.Context, grantID, sandboxID string, up
 			return opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 		}
 		ref.State = runtimev1alpha1.SandboxRunning
+		if ref.RunningAt.IsZero() {
+			ref.RunningAt = metav1.NewTime(s.now())
+		}
 		if up.SandboxName != "" {
 			ref.SandboxName = up.SandboxName
 		}
@@ -191,27 +197,53 @@ const createFailedReason = "create_failed"
 // A ref already ended as a create failure takes reason, since the create call knows the cause.
 func (s *Service) FailSandbox(ctx context.Context, grantID, sandboxID, reason string) error {
 	return s.setStatus(ctx, grantID, func(g *runtimev1alpha1.SandboxGrant) error {
+		return s.failRef(g, sandboxID, reason)
+	})
+}
+
+// ExpirePending ends a sandbox that is not running yet, as FailSandbox does.
+// It reports false and leaves the ref unchanged when the sandbox is already running.
+func (s *Service) ExpirePending(ctx context.Context, grantID, sandboxID, reason string) (bool, error) {
+	expired := false
+	err := s.setStatus(ctx, grantID, func(g *runtimev1alpha1.SandboxGrant) error {
 		ref, idx := findSandbox(g, sandboxID)
-		if idx >= 0 && ref.State == runtimev1alpha1.SandboxEnded {
-			if isCreateFailure(ref.EndReason) {
-				g.Status.Sandboxes[idx].EndReason = capReason(reason)
-			}
+		expired = idx < 0 || ref.State != runtimev1alpha1.SandboxRunning
+		if !expired {
 			return nil
 		}
-		now := s.now()
-		if err := endOne(g, sandboxID, reason, now); err != nil {
-			return err
-		}
-		compactEndedRefs(g, now)
-		return nil
+		return s.failRef(g, sandboxID, reason)
 	})
+	return expired, err
+}
+
+// failRef ends sandboxID with reason. An ended create failure takes the new
+// reason, except that a pending_timeout is only replaced by another one.
+func (s *Service) failRef(g *runtimev1alpha1.SandboxGrant, sandboxID, reason string) error {
+	ref, idx := findSandbox(g, sandboxID)
+	if idx >= 0 && ref.State == runtimev1alpha1.SandboxEnded {
+		if isCreateFailure(ref.EndReason) && (!isPendingTimeout(ref.EndReason) || isPendingTimeout(reason)) {
+			g.Status.Sandboxes[idx].EndReason = capReason(reason)
+		}
+		return nil
+	}
+	now := s.now()
+	if err := endOne(g, sandboxID, reason, now); err != nil {
+		return err
+	}
+	compactEndedRefs(g, now)
+	return nil
+}
+
+// isPendingTimeout reports whether an end reason records a pending deadline.
+func isPendingTimeout(reason string) bool {
+	return strings.HasPrefix(reason, "pending_timeout")
 }
 
 // isCreateFailure reports whether an end reason records a failed create.
 func isCreateFailure(reason string) bool {
 	return reason == createFailedReason ||
 		strings.HasPrefix(reason, "sandbox_create_failed") ||
-		strings.HasPrefix(reason, "pending_timeout")
+		isPendingTimeout(reason)
 }
 
 // capReason cuts reason to endReasonLimit bytes without splitting a character.
@@ -275,7 +307,7 @@ func (s *Service) setSandboxTimeout(ctx context.Context, grantID, sandboxID stri
 			if ref.State == runtimev1alpha1.SandboxEnded {
 				return opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 			}
-			if maxSec > 0 && !timeoutWithinLifetime(ref.StartedAt.Time, s.now(), timeoutSec, maxSec) {
+			if maxSec > 0 && !timeoutWithinLifetime(lifetimeStart(ref), s.now(), timeoutSec, maxSec) {
 				return opErr(http.StatusForbidden, "timeout_not_allowed",
 					fmtDetail("%d > %d", timeoutSec, maxSec))
 			}
@@ -285,6 +317,15 @@ func (s *Service) setSandboxTimeout(ctx context.Context, grantID, sandboxID stri
 		}
 		return opErr(http.StatusNotFound, "sandbox_not_found", sandboxID)
 	})
+}
+
+// lifetimeStart is the time a sandbox lifetime counts from: first running,
+// else its create time.
+func lifetimeStart(ref runtimev1alpha1.GrantSandboxRef) time.Time {
+	if !ref.RunningAt.IsZero() {
+		return ref.RunningAt.Time
+	}
+	return ref.StartedAt.Time
 }
 
 // timeoutWithinLifetime reports whether now plus timeoutSec is still within
@@ -484,7 +525,7 @@ func beginOne(g *runtimev1alpha1.SandboxGrant, req BeginRequest, now time.Time) 
 	if !ok {
 		return opErr(http.StatusForbidden, "role_not_allowed", req.Role)
 	}
-	if !containsStr(limit.Templates, req.TemplateID) {
+	if !req.UserTemplate && !containsStr(limit.Templates, req.TemplateID) {
 		return opErr(http.StatusForbidden, "template_not_allowed", req.TemplateID)
 	}
 	if g.Spec.MaxSandboxSeconds > 0 && req.TimeoutSec > g.Spec.MaxSandboxSeconds {
@@ -531,13 +572,7 @@ func endOne(g *runtimev1alpha1.SandboxGrant, sandboxID, reason string, now time.
 	if ref.State == runtimev1alpha1.SandboxEnded {
 		return nil
 	}
-	seconds := int64(0)
-	if !ref.StartedAt.IsZero() {
-		d := now.Sub(ref.StartedAt.Time)
-		if d > 0 && ref.GPUs > 0 {
-			seconds = int64(d.Seconds()) * int64(ref.GPUs)
-		}
-	}
+	seconds := chargedGPUSeconds(ref, now)
 	ref.State = runtimev1alpha1.SandboxEnded
 	ref.EndReason = capReason(reason)
 	ref.EndedAt = metav1.NewTime(now)
@@ -566,6 +601,31 @@ func endOne(g *runtimev1alpha1.SandboxGrant, sandboxID, reason string, now time.
 		g.Status.GPUSeconds += seconds
 	}
 	return nil
+}
+
+// chargedGPUSeconds is the GPU time a sandbox ending at now spends from the grant budget.
+// Only running time counts: a sandbox that never left pending (queued, scheduling-gated,
+// pulling its image) charges nothing. A running ref without runningAt predates the field
+// and is charged from startedAt, as it was when it began.
+func chargedGPUSeconds(ref runtimev1alpha1.GrantSandboxRef, now time.Time) int64 {
+	if ref.GPUs <= 0 {
+		return 0
+	}
+	from := ref.RunningAt
+	if from.IsZero() {
+		if ref.State != runtimev1alpha1.SandboxRunning {
+			return 0
+		}
+		from = ref.StartedAt
+	}
+	if from.IsZero() {
+		return 0
+	}
+	d := now.Sub(from.Time)
+	if d <= 0 {
+		return 0
+	}
+	return int64(d.Seconds()) * int64(ref.GPUs)
 }
 
 const maxEndedSandboxRefs = 1000

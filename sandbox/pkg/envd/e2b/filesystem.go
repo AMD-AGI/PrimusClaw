@@ -5,6 +5,7 @@ package e2b
 
 import (
 	"io"
+	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
@@ -36,8 +37,54 @@ const (
 	fileTypeLink = 3
 )
 
+// newDirPerm and newFilePerm are what a directory or file created here asks
+// for, left for the process umask to narrow, as mkdir(1) and a shell
+// redirection do: under umask 022 that is 0755 and 0644, and under the umask
+// 002 a sandbox runs with it is 0775 and 0664, so a file written into a
+// directory operators share through a setgid group is writable by that group,
+// as one a command in the sandbox writes there is.
+const (
+	newDirPerm  os.FileMode = 0o777
+	newFilePerm os.FileMode = 0o666
+)
+
+// createTemp is os.CreateTemp with perm in place of its fixed 0600, so the
+// file an upload is renamed into place from has the mode any new file gets.
+func createTemp(dir, prefix string, perm os.FileMode) (*os.File, error) {
+	for range 10000 {
+		name := filepath.Join(dir, prefix+strconv.FormatUint(uint64(rand.Uint32()), 10))
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, perm)
+		if os.IsExist(err) {
+			continue
+		}
+		return f, err
+	}
+	return nil, &os.PathError{Op: "createtemp", Path: filepath.Join(dir, prefix+"*"), Err: os.ErrExist}
+}
+
+// files serves the E2B filesystem API for one request.
+//
+// An unsealed request has the reach of the commands the sandbox runs: envd's
+// file calls run under the uid its commands get, and a command can already
+// read or write any path that uid can. The one credential envd holds that its
+// commands do not is egress.EnvDProxyGID, an iptables marker group no file is
+// meant to carry; envd can only add it with CAP_SETGID, that is when it runs as
+// root, and its commands then run as root too, with the container's
+// CAP_DAC_OVERRIDE (envd drops only CAP_NET_ADMIN, CAP_NET_RAW and CAP_SETGID
+// from the bounding set), so the group opens nothing to the file API that a
+// command cannot open. So an unsealed request is served with E2B's semantics:
+// an absolute path is that path, and a relative one is taken from the
+// workspace, the directory commands start in. files.write("/tmp/x") then
+// writes the /tmp/x that commands.run("cat /tmp/x") reads.
+//
+// A sealed request (a granted sandbox whose Router token carries an allow-list)
+// may not run commands at all, and the allow-list is the only thing that
+// bounds it. Its paths name a tree rooted at the workspace: the grant's "/in"
+// is "<workspace>/in". A sealed path that leaves that tree is refused with an
+// error that says so; it is never quietly mapped somewhere else.
 type files struct {
 	workspace string
+	sealed    bool
 }
 
 func newFiles(workspace string) *files {
@@ -47,8 +94,13 @@ func newFiles(workspace string) *files {
 	return &files{workspace: workspace}
 }
 
-func (f *files) allow(sealed bool, inputs, outputs []string, method, userPath string) error {
-	if !sealed {
+// scoped is the view of the filesystem one request is served from.
+func (f *files) scoped(sealed bool) *files {
+	return &files{workspace: f.workspace, sealed: sealed}
+}
+
+func (f *files) allow(inputs, outputs []string, method, userPath string) error {
+	if !f.sealed {
 		return nil
 	}
 	if !e2bapi.SealedFileAllows(method, cleanUserPath(userPath), inputs, outputs) {
@@ -57,18 +109,45 @@ func (f *files) allow(sealed bool, inputs, outputs []string, method, userPath st
 	return nil
 }
 
-func (f *files) resolve(userPath string) (string, error) {
+// resolve gives the container path a user path names, and the path the
+// response reports for it: the user's own sandbox-rooted path when sealed,
+// the absolute container path otherwise.
+func (f *files) resolve(userPath string) (string, string, error) {
+	if !f.sealed {
+		full, err := CommandPath(f.workspace, userPath)
+		if err != nil {
+			return "", "", rpcErr("invalid_argument", "path cannot be resolved")
+		}
+		return full, full, nil
+	}
 	full, err := SandboxPath(f.workspace, userPath)
 	if err != nil {
-		return "", rpcErr("invalid_argument", err.Error())
+		return "", "", rpcErr("permission_denied", "path escapes the sandbox root")
 	}
-	return full, nil
+	return full, cleanUserPath(userPath), nil
 }
 
-// SandboxPath maps a user path onto the sandbox workspace.
-// Absolute paths already inside the workspace stay there. Any other absolute
-// path is sandbox-rooted, so "/out/a" is "<workspace>/out/a" and cannot name
-// a host path outside the workspace.
+// CommandPath resolves a path the way a command in the sandbox would: an
+// absolute path is itself, a relative one is taken from the workspace, and an
+// empty one is the workspace.
+func CommandPath(workspace, p string) (string, error) {
+	root, err := filepath.Abs(workspace)
+	if err != nil {
+		return "", err
+	}
+	if p == "" {
+		return root, nil
+	}
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p), nil
+	}
+	return filepath.Join(root, p), nil
+}
+
+// SandboxPath maps a sealed request's path onto the tree rooted at the
+// workspace. Absolute paths already inside the workspace stay there; any other
+// absolute path is read from the workspace, so "/out/a" is "<workspace>/out/a".
+// A path that would leave the workspace returns os.ErrPermission.
 func SandboxPath(root, rel string) (string, error) {
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
@@ -114,7 +193,7 @@ func cleanUserPath(p string) string {
 }
 
 func (f *files) stat(userPath string) (fileEntry, error) {
-	full, err := f.resolve(userPath)
+	full, shown, err := f.resolve(userPath)
 	if err != nil {
 		return fileEntry{}, err
 	}
@@ -122,22 +201,22 @@ func (f *files) stat(userPath string) (fileEntry, error) {
 	if err != nil {
 		return fileEntry{}, fsErr(err)
 	}
-	return entryFrom(cleanUserPath(userPath), info, full), nil
+	return entryFrom(shown, info, full), nil
 }
 
 func (f *files) makeDir(userPath string) (fileEntry, error) {
-	full, err := f.resolve(userPath)
+	full, _, err := f.resolve(userPath)
 	if err != nil {
 		return fileEntry{}, err
 	}
-	if err := os.MkdirAll(full, 0o755); err != nil {
+	if err := os.MkdirAll(full, newDirPerm); err != nil {
 		return fileEntry{}, fsErr(err)
 	}
 	return f.stat(userPath)
 }
 
 func (f *files) remove(userPath string) error {
-	full, err := f.resolve(userPath)
+	full, _, err := f.resolve(userPath)
 	if err != nil {
 		return err
 	}
@@ -151,15 +230,15 @@ func (f *files) remove(userPath string) error {
 }
 
 func (f *files) move(src, dst string) (fileEntry, error) {
-	from, err := f.resolve(src)
+	from, _, err := f.resolve(src)
 	if err != nil {
 		return fileEntry{}, err
 	}
-	to, err := f.resolve(dst)
+	to, _, err := f.resolve(dst)
 	if err != nil {
 		return fileEntry{}, err
 	}
-	if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(to), newDirPerm); err != nil {
 		return fileEntry{}, fsErr(err)
 	}
 	if err := os.Rename(from, to); err != nil {
@@ -172,7 +251,7 @@ func (f *files) list(userPath string, depth uint32) ([]fileEntry, error) {
 	if depth == 0 {
 		depth = 1
 	}
-	full, err := f.resolve(userPath)
+	full, shown, err := f.resolve(userPath)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +263,7 @@ func (f *files) list(userPath string, depth uint32) ([]fileEntry, error) {
 		return nil, rpcErr("invalid_argument", "path is not a directory")
 	}
 	var out []fileEntry
-	if err := walkDir(full, cleanUserPath(userPath), 1, depth, &out); err != nil {
+	if err := walkDir(full, shown, 1, depth, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -213,14 +292,14 @@ func walkDir(full, user string, level, depth uint32, out *[]fileEntry) error {
 }
 
 func (f *files) write(userPath string, r io.Reader) error {
-	full, err := f.resolve(userPath)
+	full, _, err := f.resolve(userPath)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(full), newDirPerm); err != nil {
 		return fsErr(err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(full), ".e2b-upload-*")
+	tmp, err := createTemp(filepath.Dir(full), ".e2b-upload-", newFilePerm)
 	if err != nil {
 		return fsErr(err)
 	}
@@ -242,9 +321,6 @@ func (f *files) write(userPath string, r io.Reader) error {
 	if err := tmp.Close(); err != nil {
 		return fsErr(err)
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return fsErr(err)
-	}
 	if err := os.Rename(tmpName, full); err != nil {
 		return fsErr(err)
 	}
@@ -253,7 +329,7 @@ func (f *files) write(userPath string, r io.Reader) error {
 }
 
 func (f *files) read(userPath string) (io.ReadCloser, error) {
-	full, err := f.resolve(userPath)
+	full, _, err := f.resolve(userPath)
 	if err != nil {
 		return nil, err
 	}

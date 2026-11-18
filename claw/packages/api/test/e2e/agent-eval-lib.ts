@@ -91,7 +91,8 @@ export function traceOf(rows: readonly EventRow[], messageId?: string): Omit<Tra
       } else if (d.status === "success" || d.status === "error") {
         const call = calls.get(id);
         if (!call) continue; // a result with no call: Brain's own bookkeeping (plugin loads), not a tool the model chose
-        call.ok = d.status === "success";
+        // A call that returned its tool's own error (Brain's `is_error`: a refused read, a tool that threw) did not succeed.
+        call.ok = d.status === "success" && d.is_error !== true;
         call.result = [d.result, d.description, d.brief].find((x) => typeof x === "string" && x) ?? "";
       }
     } else if (type === "permissionRequest") {

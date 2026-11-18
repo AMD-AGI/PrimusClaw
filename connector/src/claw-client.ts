@@ -19,7 +19,10 @@ export class HttpError extends Error {
   }
 }
 /** The network failed or the stream went silent. */
-export class TransportError extends Error {}
+export class TransportError extends Error {
+  /** `true`: Claw had answered (a command stream that broke or went silent after it opened), so Claw was up. */
+  constructor(message: string, readonly afterAnswer = false) { super(message); }
+}
 
 export interface ClawClientOptions {
   /** Base URL up to and including any gateway prefix, without a trailing slash. */
@@ -78,8 +81,8 @@ export class ClawClient {
     }
   }
 
-  private async json(method: string, path: string, body?: unknown): Promise<Record<string, unknown>> {
-    const res = await this.send(method, path, body);
+  private async json(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const res = await this.send(method, path, body, signal);
     if (!res.ok) throw new HttpError(res.status, await errorCode(res), path);
     const parsed: unknown = await res.json().catch(() => null);
     return isObject(parsed) && isObject(parsed.data) ? parsed.data : {};
@@ -98,6 +101,41 @@ export class ClawClient {
   async postEvents(cid: string, batchId: string, events: OutEvent[]): Promise<EventsAck> {
     const d = await this.json("POST", `/v1/remote-agents/connectors/${cid}/events`, { batch_id: batchId, events });
     return { acked: (isObject(d.acked) ? d.acked : {}) as Record<string, number>, rejected: (Array.isArray(d.rejected) ? d.rejected : []) as EventsAck["rejected"] };
+  }
+
+  /**
+   * Open (or find, by conversation id) the session that carries the approvals of one conversation open in a terminal
+   * (approvals.ts). Throws {@link HttpError}: 409 `approvals_off` when the owner turned them off, 404 from a Claw without the route.
+   */
+  async openTerminalSession(cid: string, p: { agent_id: string; ref: string; cwd: string; title: string }): Promise<string> {
+    const d = await this.json("POST", `/v1/remote-agents/connectors/${encodeURIComponent(cid)}/terminal-sessions`, p);
+    if (typeof d.session_id !== "string") throw new HttpError(500, "no_session_id", "/terminal-sessions");
+    return d.session_id;
+  }
+
+  /**
+   * Whether command `cmdId`, received late (after a stall, held in the network, or past the live TTL), may still be carried out:
+   * Claw's answer, `live` or why not (`session_closed`, `cancelled`, `expired`, `gone`). `received_late`: it was already older than
+   * the live TTL when it came (only then may Claw call it `expired`). Throws {@link RevokedError} when this connector was revoked,
+   * and {@link HttpError} 404 with a code other than `not_found` from a Claw that has no such route.
+   */
+  async confirmCommand(cid: string, cmdId: string, q: { why: string; received_late: boolean; session_id?: string }, signal?: AbortSignal): Promise<string> {
+    const timeout = AbortSignal.timeout(this.o.requestTimeoutMs ?? 20_000);
+    const d = await this.json("POST", `/v1/remote-agents/connectors/${encodeURIComponent(cid)}/commands/${encodeURIComponent(cmdId)}/confirm`, q,
+      signal ? AbortSignal.any([signal, timeout]) : timeout);
+    return typeof d.status === "string" ? d.status : "unknown";
+  }
+
+  /**
+   * Revoke connector `cid` at Claw, for `logout`: Claw sends it nothing more and closes its sessions. A key is a user's
+   * credential and uses the user-side DELETE; a device sign-in's access token is refused there, and uses the
+   * connector-side route made for this. Throws {@link HttpError} 404 `not_found` when Claw has no live row by that id
+   * for this sign-in (already revoked, or another account's).
+   */
+  async revoke(cid: string, kind: "key" | "device" | "grant"): Promise<void> {
+    const id = encodeURIComponent(cid);
+    if (kind === "key") await this.json("DELETE", `/v1/remote-agents/connectors/${id}`);
+    else await this.json("POST", `/v1/remote-agents/connectors/${id}/revoke`);
   }
 
   /**
@@ -137,9 +175,9 @@ export class ClawClient {
       try {
         for await (const frame of readSse(res.body, arm)) yield frame;
       } catch (e) {
-        throw new TransportError(timedOut ? `no byte for ${opts.watchdogMs} ms` : `command stream: ${errMessage(e)}`);
+        throw new TransportError(timedOut ? `no byte for ${opts.watchdogMs} ms` : `command stream: ${errMessage(e)}`, true);
       }
-      if (timedOut) throw new TransportError(`no byte for ${opts.watchdogMs} ms`);
+      if (timedOut) throw new TransportError(`no byte for ${opts.watchdogMs} ms`, true);
     } finally {
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onAbort);

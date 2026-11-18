@@ -392,7 +392,7 @@ describe("memory v2", { skip }, () => {
       ["undo", (id) => svc.undoMemory("alice", id, "model"), "not_found"],
     ];
     for (const [name, act, refused] of acts) {
-      await w.q("TRUNCATE claw_memory_entries, claw_memory_events");
+      await w.q("TRUNCATE claw_memory_entries, claw_memory_events CASCADE");
       const saved = await svc.writeMemory("alice", { type: "user", title: "uses neovim", body: "I use neovim" }, model);
       assert.equal(saved.ok, true);
       const id = (saved as { id: number }).id;
@@ -538,7 +538,7 @@ describe("memory v2", { skip }, () => {
       `forget memory #${id}`, `Forget Memory #${id}.`, `please forget memory #${id}!`, `forget memory #${id}。`, `  FORGET   memory   #${id}  `,
       `ｆｏｒｇｅｔ ｍｅｍｏｒｙ ＃${id}`, `忘掉记忆 #${id}`, `请忘掉记忆#${id}。`,
     ]) {
-      await w.q("TRUNCATE claw_memory_entries, claw_memory_events");
+      await w.q("TRUNCATE claw_memory_entries, claw_memory_events CASCADE");
       await w.q("SELECT setval(pg_get_serial_sequence('claw_memory_entries', 'id'), $1, false)", [id]);
       const s = await turn(sid, "remember I use vim");
       await tool("save_memory", sid, s.messageId, save("uses vim", "uses vim", "I use vim"));
@@ -553,7 +553,7 @@ describe("memory v2", { skip }, () => {
 
     // Undo: an edited entry goes back, a new one goes.
     for (const command of ["undo memory #", "撤销记忆 #"]) {
-      await w.q("TRUNCATE claw_memory_entries, claw_memory_events");
+      await w.q("TRUNCATE claw_memory_entries, claw_memory_events CASCADE");
       const s = await turn(sid, "remember I use vim. no, I use neovim now");
       await tool("save_memory", sid, s.messageId, save("uses vim", "uses vim", "I use vim"));
       const n = Number((await entries())[0].id);
@@ -592,7 +592,7 @@ describe("memory v2", { skip }, () => {
     assert.ok(lines.slice(0, firstProject).every((l) => /^- \[(user|feedback)\]/.test(l)), "user and feedback first");
     assert.match(lines[firstProject], /\(recorded \d{4}-\d{2}-\d{2}, review by \d{4}-\d{2}-\d{2}\)$/);
 
-    await w.q("TRUNCATE claw_memory_entries");
+    await w.q("TRUNCATE claw_memory_entries CASCADE");
     const cjk = "这是一条很长的中文记忆标题用来测试真实的令牌预算是否生效".repeat(3);
     await insert("alice", 39, (i) => ({ type: "user", title: `${i}${cjk}`.slice(0, 60) }));
     await insert("alice", 1, () => ({ type: "project", title: "pinned project fact", pinned: true }));

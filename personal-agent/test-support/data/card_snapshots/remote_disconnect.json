@@ -1,0 +1,84 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "confirm": true,
+       "connector_id": "c1",
+       "primusclaw": "remote_off"
+      },
+      "style": "destructive",
+      "title": "Disconnect",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_off"
+     },
+     {
+      "data": {
+       "confirm": false,
+       "connector_id": "c1",
+       "primusclaw": "remote_off"
+      },
+      "title": "Keep it",
+      "type": "Action.Execute",
+      "verb": "primusclaw.remote_off"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Attention",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "🔌 Disconnect robin-dev?",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "text": "Its agents stop within a minute and its sessions close. To connect it again, send `/agent pair` for a one-line command, or run this on that machine:",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "fontType": "Monospace",
+      "spacing": "Small",
+      "text": "claw-connector login --server https://claw.example.com/claw-api --identity-url https://claw.example.com",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

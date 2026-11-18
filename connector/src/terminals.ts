@@ -4,8 +4,8 @@
 /**
  * Which conversations are open in a terminal, as the terminal itself says so.
  *
- * Claude Code runs the user-level `SessionStart` and `SessionEnd` hooks of its settings file. `claw-connector init`
- * installs two (see hooks.ts); each runs `terminal-hook.js`, which keeps one small file per open terminal session,
+ * Claude Code runs the user-level `SessionStart` and `SessionEnd` hooks of its settings file. `claw-connector hooks install`
+ * (or `init`, once the user agrees) installs two (see hooks.ts); each runs `terminal-hook.js`, which keeps one small file per open terminal session,
  * `<config dir>/claw-connector-terminals/<pid>.json`: the session id, the process that holds it and that process's
  * start time. A taking-over connector reads those files first (attach.ts). The pid and the start time are what make a
  * crash safe: `kill -9` and a power cut run no `SessionEnd`, and the row they leave names a process that is gone or
@@ -20,6 +20,7 @@
  */
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { isAlive, processStart } from "./children.js";
 
@@ -118,12 +119,47 @@ export function readTerminals(configDir: string, localDomain: string | null, now
       if (age < UNREADABLE_GRACE_MS) throw new Error(`${file} is unreadable (${(e as Error).message.split("\n")[0]})`);
       continue;
     }
-    const row = parseRow(doc);
-    if (!row) continue;
-    const still = holdsStill(row, localDomain);
-    if (still.open) out.push({ pid: row.pid, sessionId: row.sessionId, status: null, foreign: still.foreign, via: "hook" });
+    const entry = terminalEntry(doc, localDomain);
+    if (entry) out.push(entry);
   }
   return out;
+}
+
+/** {@link readTerminals}, off the event loop: the Claude config directory may be on a network disk that stalls. */
+export async function readTerminalsAsync(configDir: string, localDomain: string | null, now = Date.now()): Promise<TerminalEntry[]> {
+  const dir = terminalsDir(configDir);
+  let names: string[];
+  try {
+    names = await fsp.readdir(dir);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw e;
+  }
+  const out: TerminalEntry[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const file = path.join(dir, name);
+    let doc: unknown;
+    try {
+      doc = JSON.parse(await fsp.readFile(file, "utf8"));
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;
+      let age = Infinity;
+      try { age = now - (await fsp.stat(file)).mtimeMs; } catch { /* gone meanwhile */ }
+      if (age < UNREADABLE_GRACE_MS) throw new Error(`${file} is unreadable (${(e as Error).message.split("\n")[0]})`);
+      continue;
+    }
+    const entry = terminalEntry(doc, localDomain);
+    if (entry) out.push(entry);
+  }
+  return out;
+}
+
+function terminalEntry(doc: unknown, localDomain: string | null): TerminalEntry | null {
+  const row = parseRow(doc);
+  if (!row) return null;
+  const still = holdsStill(row, localDomain);
+  return still.open ? { pid: row.pid, sessionId: row.sessionId, status: null, foreign: still.foreign, via: "hook" } : null;
 }
 
 // --- the hook ----------------------------------------------------------------------------------

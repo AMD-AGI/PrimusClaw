@@ -52,7 +52,10 @@ test("the schema and the routes are wired behind the flag, and nothing else star
   const routes = readFileSync(new URL("../src/routes/remote-agents.ts", import.meta.url), "utf8");
   assert.match(routes, /if \(!CLAW_REMOTE_AGENTS_ENABLED\) return;/);
   const index = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
-  assert.match(index, /await registerRemoteAgentRoutes\(app\)/);
+  // With the shutdown's `closing`, so a release tells the command streams to reconnect (routes/remote-agents.ts), and the wake
+  // relay, so a write through one replica wakes the streams held on the others (remote-agents/wake-relay.ts).
+  // `background`: CLAW_API_BACKGROUND=off starts neither the relay nor a sweep (startup/background.ts).
+  assert.match(index, /await registerRemoteAgentRoutes\(app, \{ closing: shutdown\.closing, crossReplicaWake: true, background \}\)/);
   const config = readFileSync(new URL("../src/config.ts", import.meta.url), "utf8");
   assert.match(config, /CLAW_REMOTE_AGENTS_ENABLED = envBool\("CLAW_REMOTE_AGENTS_ENABLED", false\)/);
 });

@@ -10,6 +10,8 @@ dist/
 .env
 .env.local
 *.log
+# The build tag deploy/build.sh writes into the image's context.
+packages/api/BUILD
 
 # Per-env deploy values (contain secrets — keep example template tracked)
 deploy/values.*.env

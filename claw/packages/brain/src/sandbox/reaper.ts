@@ -31,7 +31,7 @@ import { reclaimIdleSessionClusters as realReclaimIdleSessionClusters }
 let reclaimClusters = realReclaimIdleSessionClusters;
 
 export function bindClusterReclaimForTest(
-  fn: (sessionId: string, apiKey: string, messageId?: string) => Promise<number>,
+  fn: (sessionId: string, apiKey: string, messageId?: string, workspaces?: readonly (string | null | undefined)[]) => Promise<number>,
 ): () => void {
   const prev = reclaimClusters;
   reclaimClusters = fn;
@@ -457,7 +457,9 @@ export async function destroyHands(
         );
       } else if (platformKey && messageId) {
         await withCeiling(
-          reclaimClusters(sessionId, platformKey, messageId),
+          reclaimClusters(sessionId, platformKey, messageId, [
+            String((target as { namespace?: string }).namespace ?? (ownsRecorded ? recorded.identity?.namespace : "") ?? ""),
+          ]),
           CLUSTER_CASCADE_CEILING_MS,
           "mn cluster cascade",
         ).catch((e: unknown) => {
@@ -1262,7 +1264,7 @@ async function sweepIdleMultiNodeClustersPass(): Promise<void> {
 
       scanned += 1;
       try {
-        reclaimed += await reclaimClusters(sessionId, platformKey);
+        reclaimed += await reclaimClusters(sessionId, platformKey, undefined, [String(info.namespace ?? "")]);
       } catch (err) {
         logger.warn({ err, sessionId }, "mn_sweeper.session_failed");
       }
@@ -1324,9 +1326,11 @@ export async function parkForIdleReclaim(sessionId: string): Promise<void> {
       // further than parking would have got.
       return;
     case "superseded":
-      // Every replica runs this teardown, so all of them park and only one can
-      // win the conditional write. Losing is the expected outcome and the goal is
-      // still met, so this is not a failure. Reporting it as one would mean five
+      // One replica runs a session's teardown now (a queue group), but two can
+      // still park at once -- during a rollout, when a replica of a version that
+      // ran it everywhere is still up -- and only one can win the conditional
+      // write. Losing is the expected outcome and the goal is still met, so this
+      // is not a failure. Reporting it as one would mean five
       // misleading warnings per incomplete teardown, burying a real KV outage
       // among them.
       logger.info({ sessionId }, "hands.park_for_idle_reclaim_superseded");

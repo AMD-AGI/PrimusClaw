@@ -89,6 +89,8 @@ const pristineDrain = submitMessagePorts.drainOldestPendingMessage;
 before(async () => {
   h = await startHarness();
   await h.sql(QUEUE_COLUMNS);
+  // The plugins the queued messages below name: a queued row holds its plugin, and a gone one is refused.
+  await h.sql("INSERT INTO plugins (id, name, version, is_public) VALUES (3, 'p3', '1', true), (7, 'p7', '1', true)");
   // The migration's own statements, not a restatement of them.
   for (const sql of pendingMessageDedupeSchemaSql()) await h.sql(sql);
 });

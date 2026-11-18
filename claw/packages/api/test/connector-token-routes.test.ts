@@ -4,7 +4,7 @@
 /**
  * What a connector's access token reaches, asked of the whole router.
  *
- * The token is meant to authenticate on four routes. "Nowhere else" is a claim
+ * The token is meant to authenticate on five routes. "Nowhere else" is a claim
  * about every route the API has, so this does not sample: it registers every
  * route module the server registers (the list is checked against `index.ts`),
  * discovers each route with an `onRoute` hook, and sends the same valid token to
@@ -44,6 +44,7 @@ const REGISTRARS: Record<string, string> = {
   registerRemoteAgentRoutes: "routes/remote-agents.js",
   registerAssistantRoutes: "routes/assistant.js",
   registerAssistantGithubEventRoutes: "routes/assistant-github-events.js",
+  registerAssistantProactiveRoutes: "routes/assistant-proactive.js",
   registerAssistantMcpRoutes: "assistant/mcp.js",
   registerTriggerMcpRoutes: "triggers/mcp.js",
   registerGithubReviewRoutes: "github-review/mcp.js",
@@ -59,6 +60,7 @@ const REGISTRARS: Record<string, string> = {
   registerInternalAppRoutes: "routes/internal-apps.js",
   registerInternalWorkspaceRoutes: "routes/internal-workspaces.js",
   registerInternalMemoryRoutes: "routes/internal-memory.js",
+  registerInternalSkillRoutes: "routes/internal-skills.js",
   registerTaskDagRoutes: "routes/task-dags.js",
   registerTaskRoutes: "routes/tasks.js",
   registerRunRoutes: "runs/routes.js",
@@ -167,7 +169,7 @@ describe("a connector access token over the whole router", { skip }, () => {
     assert.deepEqual(failures, []);
     assert.ok(checked >= 100, `only ${checked} routes were checked`);
     // The anonymous ones judge no credential at all, so a token cannot add to them; they are the known, tested set.
-    assert.ok(skipped.every((s) => /\/health|\/metrics|\.well-known|\/v1\/internal\//.test(s)), skipped.join(", "));
+    assert.ok(skipped.every((s) => /\/health|\/metrics|\.well-known|\/v1\/internal\/|^POST \/v1\/remote-agents\/pairings\/claim$/.test(s)), skipped.join(", "));
   });
 
   test("the same request without a token gets the same refusal, so the token was judged and not ignored by luck", async () => {
@@ -176,13 +178,16 @@ describe("a connector access token over the whole router", { skip }, () => {
     assert.deepEqual([withToken.statusCode, withToken.json()], [without.statusCode, without.json()]);
   });
 
-  test("the four connector-side routes accept it, and nothing else is true of them", async () => {
+  test("the connector-side routes accept it, and nothing else is true of them", async () => {
     const cid = randomUUID();
     const expected: Record<string, number> = {
       [`POST ${connectorSide.register.url}`]: 400, // a bad body, which is after authentication
       [`POST ${connectorSide.heartbeat.url}`]: 404, // not this user's connector
       [`POST ${connectorSide.events.url}`]: 404,
       [`GET ${connectorSide.commands.url}`]: 404,
+      [`POST ${connectorSide.revoke.url}`]: 404, // not this user's connector
+      [`POST ${connectorSide.confirm.url}`]: 404, // not this user's connector
+      [`POST ${connectorSide.terminalSessions.url}`]: 404, // not this user's connector
     };
     for (const r of Object.values(connectorSide)) {
       const res = await app.inject({

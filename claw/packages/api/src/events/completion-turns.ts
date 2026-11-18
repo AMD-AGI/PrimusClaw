@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { redactStoredText } from "@claw/utils";
 import { db } from "../infra/db.js";
 import { estimateTokens } from "../shared/tokens.js";
 
@@ -25,8 +26,9 @@ async function readTurnTools(sessionId: string, messageId: string | null) {
   }
   const events = rows.map((row) => row.data);
   const toolCalls = events.filter((event) => event.type === "toolUsed" && event.status === "start");
+  // A call that failed or was refused ("error") answered the model too: its text is the tool_result the turn is rebuilt with.
   const toolResults = events
-    .filter((event) => event.type === "toolUsed" && event.status === "success")
+    .filter((event) => event.type === "toolUsed" && (event.status === "success" || event.status === "error"))
     .map(({ full_output: _fullOutput, ...event }) => event);
   return { toolCalls, toolResults };
 }
@@ -109,8 +111,10 @@ export async function recordCompletionTurns(
     "SELECT COALESCE(MAX(turn_index), 0) as max FROM claw_conversation_turns WHERE session_id = $1 AND deleted_at IS NULL",
     [sessionId],
   )).rows[0].max;
+  // What is stored is masked (`redactStoredText`): these rows are the history later turns are handed, never this turn's prompt. The
+  // tool calls and results are read from the session's stored events, which the consumer masked as it wrote them.
   if (prompt) {
-    const said = await userWords(sessionId, messageId, prompt);
+    const said = redactStoredText(await userWords(sessionId, messageId, prompt)).text;
     await db.query(
       "INSERT INTO claw_conversation_turns (session_id, turn_index, role, content, token_count, message_id) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
       [sessionId, lastIdx + 1, "user", said, estimateTokens(said), messageId],
@@ -118,9 +122,9 @@ export async function recordCompletionTurns(
   }
 
   const { toolCalls, toolResults } = await readTurnTools(sessionId, messageId);
-  const assistantContent = final_text
+  const assistantContent = redactStoredText(final_text
     || (interrupted ? "[Interrupted by user]" : "")
-    || (failed ? `[Task failed: ${failure_reason || "unknown"}]` : "");
+    || (failed ? `[Task failed: ${failure_reason || "unknown"}]` : "")).text;
   // Called under withCompletionLock; summary publication takes the same lock.
   await db.query(
     `WITH written AS (

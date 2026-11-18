@@ -52,9 +52,20 @@ import { newMcpToken, sealAppRunSecret } from "../crypto/app-run-secrets.js";
 import { sessionWithholdsSandboxKeys } from "../github-review/session-tools.js";
 import { db } from "../infra/db.js";
 import { canViewPlugin } from "../marketplace/plugins.js";
+import { holdPluginForAdmission, PLUGIN_NOT_EXPIRED_SQL } from "../marketplace/plugin-expiry.js";
+import {
+  applyAppOverrides,
+  checkOverrides,
+  hasOverrides,
+  overrideKeys,
+  overridesAudit,
+  storedOverridable,
+  type OverrideValues,
+} from "../marketplace/plugin-overrides.js";
 import pino from "pino";
 import { withAdmissionTransaction } from "./admission.js";
-import { createSingleTask, isCreateRefusal, isTopologyRefusal } from "./dag-expander.js";
+import { createSingleTask, isCreateRefusal, isSandboxWorkspaceRefusal, isTopologyRefusal } from "./dag-expander.js";
+import { sandboxWorkspaceRefusal, type SandboxWorkspaceRefusal } from "./sandbox-workspaces.js";
 import { newTaskId, ulid } from "./ids.js";
 
 const logger = pino({ name: "app-run" });
@@ -280,7 +291,7 @@ export interface AppRunRequest {
   sessionId: string;
   user: UserInfo;
   auth: CallerAuth;
-  body: { plugin_id?: unknown; input?: unknown; resources?: unknown };
+  body: { plugin_id?: unknown; input?: unknown; resources?: unknown; overrides?: unknown };
   idemKey: string | null;
   /** Hash of the request body, computed once by the route (see appRunRequestHash). */
   requestHash: string;
@@ -294,6 +305,9 @@ export interface AppRunOutcome {
 const refuse = (statusCode: number, error: string, extra: Record<string, unknown> = {}): AppRunOutcome => ({
   statusCode, response: { ok: false, error, ...extra },
 });
+
+/** A workspace the deployment does not isolate: 400, with the same body every other route answers. */
+const refuseWorkspace = (body: SandboxWorkspaceRefusal): AppRunOutcome => ({ statusCode: 400, response: { ...body } });
 
 /** What an Idempotency-Key already created in a session. */
 export interface AppRunByKey {
@@ -327,10 +341,16 @@ function canonical(v: unknown): string {
   return JSON.stringify(v) ?? "null";
 }
 
-/** What an Idempotency-Key is bound to: the request's plugin, input and resources. */
-export function appRunRequestHash(body: { plugin_id?: unknown; input?: unknown; resources?: unknown }): string {
+/**
+ * What an Idempotency-Key is bound to: the request's plugin, input, resources and
+ * overrides. `overrides` joins the hashed document only when the request has
+ * one, so a request without it hashes as it did before the field existed.
+ */
+export function appRunRequestHash(body: { plugin_id?: unknown; input?: unknown; resources?: unknown; overrides?: unknown }): string {
+  const doc: Record<string, unknown> = { plugin_id: body.plugin_id, input: body.input, resources: body.resources ?? null };
+  if (body.overrides !== undefined && body.overrides !== null) doc.overrides = body.overrides;
   return createHash("sha256")
-    .update(`claw.app-run-request/v1\n${canonical({ plugin_id: body.plugin_id, input: body.input, resources: body.resources ?? null })}`)
+    .update(`claw.app-run-request/v1\n${canonical(doc)}`)
     .digest("hex");
 }
 
@@ -354,6 +374,8 @@ export async function checkAppRunRequest(
 ): Promise<AppRunOutcome | {
   pluginId: number; manifest: AppManifestV1; input: Record<string, unknown>;
   resolved: ResolvedAppResources; plan: AppRunPlan;
+  /** The checked overrides and what is recorded about them; absent when the request had none. */
+  overrides?: { values: OverrideValues; audit: Record<string, unknown> };
 }> {
   if (!ports.enabled()) return refuse(501, "app_runs_disabled");
   // A session that acts as a user keeps its owner's keys out of every sandbox it is given, and an application's sandbox is made with
@@ -368,10 +390,13 @@ export async function checkAppRunRequest(
 
   // 1. The plugin, the caller's right to it, and its manifest.
   const row = (await db.query(
-    `SELECT id, resource, owner_user_id, is_public FROM plugins
-      WHERE id = $1 AND deleted_at IS NULL`,
+    `SELECT id, version, resource, images, overridable, owner_user_id, is_public FROM plugins
+      WHERE id = $1 AND deleted_at IS NULL AND ${PLUGIN_NOT_EXPIRED_SQL}`,
     [pluginId],
-  )).rows[0] as { id: string | number; resource: unknown; owner_user_id: string | null; is_public: boolean } | undefined;
+  )).rows[0] as {
+    id: string | number; version: string | null; resource: unknown; images: unknown; overridable: unknown;
+    owner_user_id: string | null; is_public: boolean;
+  } | undefined;
   if (!row) return refuse(404, "plugin_not_found");
   if (!canViewPlugin(row as never, req.user.userId, isAdmin(req.user))) {
     return refuse(403, "plugin_access_denied");
@@ -380,7 +405,39 @@ export async function checkAppRunRequest(
   const rawManifest = isPlainObject(app) ? app.manifest : undefined;
   const issues = validateAppManifest(rawManifest);
   if (issues.length > 0) return refuse(422, "app_manifest_invalid", { issues: issueText(issues) });
-  const manifest = rawManifest as AppManifestV1;
+  let manifest = rawManifest as AppManifestV1;
+
+  // 1b. Run-time overrides: only what the plugin declares, checked before any
+  // of them is applied, and the result is a manifest that must still be valid
+  // (an override cannot set a variable the platform reserves, for one).
+  const checkedOverrides = checkOverrides(req.body.overrides, row, "app");
+  if (!checkedOverrides.ok) return refuse(400, "plugin_overrides_invalid", { problems: checkedOverrides.problems });
+  // A plugin that declares its image overridable has said which images it runs
+  // on, and `resources.image` (which predates declarations and stays free for
+  // a plugin that declares nothing) is held to the same list.
+  const requestedImage = isPlainObject(req.body.resources) ? req.body.resources.image : undefined;
+  if (requestedImage !== undefined && storedOverridable(row.overridable).image !== undefined) {
+    const viaDeclaration = checkOverrides({ image: requestedImage }, row, "app");
+    if (!viaDeclaration.ok) {
+      return refuse(400, "plugin_overrides_invalid", {
+        problems: viaDeclaration.problems.map((p) => ({ ...p, field: p.field.replace(/^overrides\.image/, "resources.image") })),
+      });
+    }
+  }
+  let overrides: { values: OverrideValues; audit: Record<string, unknown> } | undefined;
+  if (hasOverrides(checkedOverrides.values)) {
+    const values = checkedOverrides.values;
+    if (values.image !== undefined && isPlainObject(req.body.resources) && req.body.resources.image !== undefined) {
+      return refuse(400, "plugin_overrides_invalid", {
+        problems: [{ field: "overrides.image", reason: "resources.image is also set; give the image once" }],
+      });
+    }
+    const effective = applyAppOverrides(manifest, values, storedOverridable(row.overridable));
+    const after = validateAppManifest(effective);
+    if (after.length > 0) return refuse(400, "plugin_overrides_invalid", { issues: issueText(after) });
+    manifest = effective;
+    overrides = { values, audit: overridesAudit(values, row) };
+  }
 
   // 2. The input.
   if (!isPlainObject(req.body.input)) return refuse(400, "input_must_be_object");
@@ -396,6 +453,18 @@ export async function checkAppRunRequest(
   }
   const resolved = resolvedOrIssues.resources;
   const plan = planAppRun(manifest, resolved);
+
+  // 4a. Every workspace a sandbox of this run may be created in -- the app
+  // container's, the one its child sandboxes use, and any a sandbox template
+  // names, which is where the grant lets the application start sandboxes --
+  // must be one the deployment isolates (SANDBOX_ALLOWED_NAMESPACES). Before
+  // the SaFE calls: the answer does not depend on them, and a refused run
+  // costs nobody a round trip.
+  const refusedWorkspace = sandboxWorkspaceRefusal([
+    ...plan.workspaceIds,
+    ...appGrantTemplates(manifest, resolved).map((t) => (typeof t.workspace === "string" ? t.workspace : undefined)),
+  ]);
+  if (refusedWorkspace) return refuseWorkspace(refusedWorkspace);
 
   // 4. Every workspace the resources name, asked at once (they are independent
   // SaFE calls); the answer is read in the order the workspaces were named so the
@@ -413,7 +482,7 @@ export async function checkAppRunRequest(
     if (v.value !== "ok") return refuse(403, "workspace_access_denied", { workspace: workspaceId });
   }
 
-  return { pluginId, manifest, input, resolved, plan };
+  return { pluginId, manifest, input, resolved, plan, ...(overrides ? { overrides } : {}) };
 }
 
 /**
@@ -426,7 +495,7 @@ export async function admitAppRun(
 ): Promise<AppRunOutcome> {
   const checked = await checkAppRunRequest(req, ports);
   if ("statusCode" in checked) return checked;
-  const { pluginId, manifest, input, resolved, plan } = checked;
+  const { pluginId, manifest, input, resolved, plan, overrides } = checked;
   const taskId = newTaskId();
   const grantId = newGrantId();
   const grantRun: AppGrantRun = { grantId, taskId, sessionId: req.sessionId, userId: req.user.userId, pluginId };
@@ -489,6 +558,11 @@ export async function admitAppRun(
         return { commit: false, value: refuse(409, "app_run_active", { task_id: active }) };
       }
 
+      // Held until commit, so the expiry sweep cannot delete it under this run.
+      if (!(await holdPluginForAdmission(client, pluginId))) {
+        return { commit: false, value: refuse(404, "plugin_not_found") };
+      }
+
       await stampSessionCredentials(req.sessionId, req.user, client);
 
       const created = await createSingleTask({
@@ -499,9 +573,12 @@ export async function admitAppRun(
         mode: "app",
         workspace_id: plan.workspaceId,
         sandbox_spec: plan.sandboxSpec,
+        ...(overrides ? { metadata: { plugin_overrides: overrides.audit } } : {}),
       }, client);
       if (isCreateRefusal(created)) {
-        const value = isTopologyRefusal(created)
+        const value = isSandboxWorkspaceRefusal(created)
+          ? refuseWorkspace(created.sandboxWorkspace)
+          : isTopologyRefusal(created)
           ? refuse(400, "invalid_topology", { errors: created.invalidTopology })
           : refuse(429, "admission_rejected", { reason: created.reason });
         return { commit: false, value };
@@ -526,6 +603,13 @@ export async function admitAppRun(
         ],
       );
       logger.info({ sessionId: req.sessionId, taskId, pluginId }, "app_run.created");
+      // Keys only: a value can be anything the plugin let the caller set.
+      if (overrides) {
+        logger.info(
+          { sessionId: req.sessionId, taskId, pluginId, userId: req.user.userId, keys: overrideKeys(overrides.values) },
+          "plugin_overrides.applied",
+        );
+      }
       return { commit: true, value: { statusCode: 200, response: { ok: true, task_id: taskId } } };
     });
   } catch (err) {

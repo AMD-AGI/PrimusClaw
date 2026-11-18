@@ -1,0 +1,203 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+import { switchCommand } from "../capabilities/sessions-words.js";
+import { isKnownCommand } from "../commands/names.js";
+import { exactCommand } from "../understanding/commands.js";
+import { commandArgs, menuCommand, parseLinkCode } from "../commands/parse.js";
+import type { JsonObject } from "../json.js";
+import { routingText } from "../locales/routing.js";
+import type { ClickHandler, MessageRoute } from "../ports/routing.js";
+import type { InboundAction, InboundMessage } from "../ports/surface.js";
+import { pyLower, pySplit } from "../text/py-text.js";
+import { learnLang, type Chat } from "./chat.js";
+import type { CommandSets } from "./command-table.js";
+import { CredentialUnavailable } from "./credentials.js";
+import { KeyedLock } from "./lock.js";
+import type { RouterContext } from "./context.js";
+import type { PersonalText } from "./personal-text.js";
+import { ShowHere } from "./show-here.js";
+import { StopPress } from "./stop-press.js";
+
+/** The router's own buttons in a 1:1 chat (its feature handlers' come from the assembly). */
+const OWN_VERBS = ["bind", "repo", "create_pr", "show", "turn_stop"] as const;
+
+/**
+ * A 1:1 chat (the Python `Agent._dispatch` from the personal-chat check on): what needs no account first (`/link`, the
+ * language, a review request, feedback, a click that answers as the person's identity), then the person's credential, then
+ * their commands, their buttons, and the message on its way.
+ */
+export class PersonalRouter {
+  private readonly stopPress: StopPress;
+  private readonly showHere: ShowHere;
+  /** A person's bound id is read and kept one message at a time, so a late lookup of an earlier token never wins. */
+  private readonly boundLock = new KeyedLock();
+
+  constructor(
+    private readonly ctx: RouterContext,
+    private readonly sets: CommandSets,
+    private readonly text: PersonalText,
+  ) {
+    this.stopPress = new StopPress(ctx);
+    this.showHere = new ShowHere(ctx);
+  }
+
+  async route(event: InboundMessage | InboundAction, chat: Chat): Promise<void> {
+    const { store, subscriptions } = this.ctx.deps;
+    const userId = chat.sender.id;
+    store.references.saveReference(userId, wireOf(event)); // (serviceUrl can change: refreshed every time)
+    if (event.type === "action" && event.invoke) store.members.notePersonalClick(userId); // (the app is installed for them)
+    if (store.links.getKey(userId) !== null) {
+      await this.backfill(userId);
+      if (subscriptions !== undefined) await subscriptions.ensure(userId);
+    } else {
+      await this.boundLock.run(userId, () => this.reachBound(userId));
+    }
+    if (event.type === "message") await this.message(event, chat);
+    else await this.click(event, chat);
+  }
+
+  /**
+   * A person with no link whose chats run on an exchanged token (bound at the identity service): their Claw user id is
+   * read with the token and their subscription made with it, as a link's are, so their 1:1 chat reaches the assistant
+   * from this message on (the assistant reaches only a person whose Claw user id and subscription it knows).
+   *
+   * The id is read again whenever the token is not the one it was read with (tokens last minutes, so at most once a token):
+   * a person who rebinds to another account is followed to it, and one no longer bound is forgotten, so the assistant
+   * never keeps answering for an account the person no longer holds (nor for one whose owner a new token cannot tell yet).
+   * A subscription is made or mended only with a token whose owner is the id kept.
+   */
+  private async reachBound(userId: string): Promise<void> {
+    const { credentials, owners } = this.ctx;
+    const { store, subscriptions } = this.ctx.deps;
+    if (!credentials.onExchange) return;
+    let token: string | undefined;
+    try {
+      token = await credentials.background(userId);
+    } catch (error) {
+      if (error instanceof CredentialUnavailable) return; // (the identity service is down: the message says so itself)
+      throw error;
+    }
+    if (token === undefined) {
+      store.links.forgetBound(userId); // (not bound: the message is answered with the card that binds them)
+      return;
+    }
+    const kept = store.links.boundClawUser(userId, token);
+    if (kept?.current !== true) {
+      const clawUserId = await owners.userIdOf(token);
+      if (clawUserId === undefined) {
+        // (unread: asked again with the next message. An id read with an earlier token may be another account's now: it and
+        // its subscription are forgotten rather than kept answering for it; the next read makes the subscription again)
+        if (kept !== null) store.links.forgetBound(userId);
+        return;
+      }
+      store.links.setBoundClawUser(userId, clawUserId, token);
+    }
+    if (subscriptions !== undefined) await subscriptions.ensure(userId, token);
+  }
+
+  /** Linked before the Claw user id was kept: it is read now. */
+  private async backfill(userId: string): Promise<void> {
+    const { links } = this.ctx.deps.store;
+    if (!links.needsClawUserId(userId)) return;
+    const key = links.getKey(userId);
+    const clawUserId = key === null ? undefined : await this.ctx.owners.userIdOf(key);
+    if (clawUserId !== undefined) links.setClawUserId(userId, clawUserId);
+  }
+
+  private async message(message: InboundMessage, chat: Chat): Promise<void> {
+    const { assistant, remote } = this.ctx.deps;
+    const userId = chat.sender.id;
+    // The assistant understands this person's messages: only an exact command is read here
+    const understood = assistant.understands(userId);
+    const choice = message.choice === true; // (a pick on the assistant's choice card: an answer, never a command)
+    const switching = understood && !choice && remote.enabled && switchCommand(message.text) !== null;
+    const forAssistant =
+      understood && (choice || !exactCommand(message.text, { menuCommand, isKnownCommand })) && !switching;
+    const text = understood && !choice ? menuCommand(message.text) : this.text.textOf(message);
+    learnLang(this.ctx.deps.store, userId, message.text);
+    if (!choice && (await this.beforeCredential(message, chat, text, forAssistant))) return;
+    const key = await this.ctx.credentials.credential(chat, true);
+    if (key === undefined) return;
+    if (forAssistant && !this.text.talksToAgent(message)) await this.text.understand(message, chat, key);
+    else await this.text.onText(message, chat, key);
+  }
+
+  /** What a 1:1 message can do with no account: true when it was taken. */
+  private async beforeCredential(
+    message: InboundMessage,
+    chat: Chat,
+    text: string,
+    forAssistant: boolean,
+  ): Promise<boolean> {
+    const [first] = pySplit(text);
+    if (first !== undefined && pyLower(first) === "/link") {
+      await this.sets.link.link(chat, parseLinkCode(text), message.id);
+      return true;
+    }
+    for (const handler of this.ctx.deps.handlers.commands) {
+      const args = handler.beforeCredential === true ? commandArgs(text, handler.name) : null;
+      const route = {
+        sender: chat.sender,
+        conversation: chat.conversation,
+        scope: "",
+        lang: () => chat.lang(),
+        credential: "",
+        message,
+      };
+      if (args !== null && (await handler.run(route, args))) return true;
+    }
+    const lang = commandArgs(text, "lang");
+    if (lang !== null) {
+      await this.sets.account.lang(chat, lang);
+      return true;
+    }
+    if (forAssistant) return false; // (the assistant reads it, once there is a credential)
+    const route: MessageRoute = {
+      sender: chat.sender,
+      conversation: chat.conversation,
+      scope: "",
+      lang: () => chat.lang(),
+      message,
+      text,
+    };
+    for (const interceptor of this.ctx.deps.handlers.personalInterceptors)
+      if (await interceptor.intercept(route)) return true;
+    return false;
+  }
+
+  private handlerOf(verb: string): ClickHandler | undefined {
+    return this.ctx.deps.handlers.clicks.find((handler) => handler.verbs.includes(verb));
+  }
+
+  private async click(action: InboundAction, chat: Chat): Promise<void> {
+    const handler = this.handlerOf(action.verb);
+    const route = this.ctx.clickRoute(action, chat);
+    if (action.verb === "bind" && this.ctx.deps.exchange.enabled) {
+      await this.sets.link.confirmBinding(action, chat);
+      return;
+    }
+    if (handler?.beforeCredential !== undefined && (await handler.beforeCredential(route))) return;
+    const key = await this.ctx.credentials.credential(chat, false);
+    if (key === undefined) {
+      await this.ctx.settle(action, chat, routingText.in(chat.lang()).notConnected); // (a button of an unconnected chat)
+      return;
+    }
+    if ((OWN_VERBS as readonly string[]).includes(action.verb)) await this.ownClick(action, chat, key);
+    else if (handler?.withCredential !== undefined) await handler.withCredential(route, key);
+  }
+
+  private async ownClick(action: InboundAction, chat: Chat, key: string): Promise<void> {
+    if (action.verb === "repo") await this.sets.sessions.repoClick(action, chat);
+    else if (action.verb === "create_pr") await this.sets.sessions.createPr(action, chat, key);
+    else if (action.verb === "show") await this.showHere.click(action, chat, key);
+    else if (action.verb === "turn_stop") await this.stopPress.press(action, chat);
+  }
+}
+
+/** What is stored for proactive messages: the channel's own reference, as it gave it. */
+export function wireOf(event: {
+  readonly conversation: { readonly wire: Readonly<Record<string, unknown>> };
+}): JsonObject {
+  return event.conversation.wire as JsonObject;
+}

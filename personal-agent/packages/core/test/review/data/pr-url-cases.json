@@ -1,0 +1,176 @@
+{
+  "about": "Claw's pr_url is shown only when the whole string is a github.com pull request address (the Python worker's strict pattern); otherwise the address of the pull request the request named. Shared with the Python worker's tests.",
+  "named": "https://github.com/AMD-AGI/Hyperloom/pull/12",
+  "cases": [
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12",
+      "shown": true,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/a/b/pull/1",
+      "shown": true,
+      "result": "https://github.com/a/b/pull/1"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Primus.Claw_x-1/pull/9999999",
+      "shown": true,
+      "result": "https://github.com/AMD-AGI/Primus.Claw_x-1/pull/9999999"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12\nhttps://evil.example/phish",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12\r\nhttps://evil.example/phish",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12\rhttps://evil.example",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12\thttps://evil.example",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12 https://evil.example",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12 https://evil.example",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12\u0000",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "\nhttps://github.com/AMD-AGI/Hyperloom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": " https://github.com/AMD-AGI/Hyperloom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "http://github.com/AMD-AGI/Hyperloom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "HTTPS://github.com/AMD-AGI/Hyperloom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://evil.github.com.example/AMD-AGI/Hyperloom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com.evil.example/AMD-AGI/Hyperloom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://evil.github.com/AMD-AGI/Hyperloom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com@evil.example/AMD-AGI/Hyperloom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://user@github.com/AMD-AGI/Hyperloom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com:443/AMD-AGI/Hyperloom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/issues/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12/files",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12/",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/abc",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/0",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12345678",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12?x=1",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12#discussion_r1",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyper loom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/-bad/Hyperloom/pull/12",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/AMD-AGI/Hyperloom/pull/12)[x](https://evil.example",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "https://github.com/",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    },
+    {
+      "pr_url": "",
+      "shown": false,
+      "result": "https://github.com/AMD-AGI/Hyperloom/pull/12"
+    }
+  ]
+}

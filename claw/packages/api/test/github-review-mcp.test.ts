@@ -348,7 +348,7 @@ describe("C confirmations over HTTP", () => {
       assert.equal(r.status, 200, who);
       assert.equal(r.body.items.length, 1, who);
       const item = r.body.items[0];
-      assert.deepEqual(Object.keys(item).sort(), ["actor_user_id", "author", "checks", "decided_by", "decided_via", "expires_at", "head_sha", "id", "kind", "pr", "reasons", "repo", "requester_user_id", "review", "session_id", "status", "title"]);
+      assert.deepEqual(Object.keys(item).sort(), ["actor_user_id", "author", "checks", "decided_by", "decided_via", "expires_at", "head_sha", "id", "kind", "pr", "pr_summary", "reasons", "repo", "requester_user_id", "review", "session_id", "status", "title"]);
       assert.equal(item.kind, "merge");
       assert.equal(item.review, null, "a merge holds no review");
       assert.equal(item.decided_by, null, "nobody has answered it yet");

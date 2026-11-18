@@ -14,52 +14,54 @@ import { HitlController } from "../src/agent/hitl.js";
 import type { NatsDecisionMessage } from "../src/delivery/decision-dispatcher.js";
 
 const base = { url: "https://mcp.example.invalid/mcp", type: "http", token: "t" };
+// The rules of a spec alone, on a server the tool catalog does not know (a catalogued one, such as `safe`, also has every write
+// the catalog lists held: mcp-approval-catalog.test.ts).
 
 test("no rule means no policy", () => {
-  const p = approvalPolicyFromMcp({ safe: { ...base } });
+  const p = approvalPolicyFromMcp({ ops: { ...base } });
   assert.equal(p.active, false);
-  assert.equal(p.requiresApproval("mcp__safe__workload_stop"), false);
+  assert.equal(p.requiresApproval("mcp__ops__workload_stop"), false);
 });
 
 test("a list holds exactly the named tools, of that server only", () => {
   const p = approvalPolicyFromMcp({
-    safe: { ...base, requires_approval: ["workload_stop", "node_*"] },
+    ops: { ...base, requires_approval: ["workload_stop", "node_*"] },
     other: { ...base },
   });
   assert.equal(p.active, true);
-  assert.equal(p.requiresApproval("mcp__safe__workload_stop"), true);
-  assert.equal(p.requiresApproval("mcp__safe__node_delete"), true);
-  assert.equal(p.requiresApproval("mcp__safe__workload_get"), false);
+  assert.equal(p.requiresApproval("mcp__ops__workload_stop"), true);
+  assert.equal(p.requiresApproval("mcp__ops__node_delete"), true);
+  assert.equal(p.requiresApproval("mcp__ops__workload_get"), false);
   assert.equal(p.requiresApproval("mcp__other__workload_stop"), false);
   assert.equal(p.requiresApproval("workload_stop"), false);
 });
 
 test("true holds every tool of the server; false and null are no rule", () => {
-  const all = approvalPolicyFromMcp({ safe: { ...base, requires_approval: true } });
-  assert.equal(all.requiresApproval("mcp__safe__anything"), true);
+  const all = approvalPolicyFromMcp({ ops: { ...base, requires_approval: true } });
+  assert.equal(all.requiresApproval("mcp__ops__anything"), true);
   for (const none of [false, null]) {
-    assert.equal(approvalPolicyFromMcp({ safe: { ...base, requires_approval: none } }).active, false);
+    assert.equal(approvalPolicyFromMcp({ ops: { ...base, requires_approval: none } }).active, false);
   }
 });
 
 test("a malformed value fails closed: every tool of that server is held", () => {
   for (const bad of ["workload_stop", "true", 1, {}, [], [""], [5], ["ok", 5]]) {
-    const p = approvalPolicyFromMcp({ safe: { ...base, requires_approval: bad }, other: { ...base } });
+    const p = approvalPolicyFromMcp({ ops: { ...base, requires_approval: bad }, other: { ...base } });
     assert.equal(p.active, true, JSON.stringify(bad));
-    assert.equal(p.requiresApproval("mcp__safe__workload_get"), true, JSON.stringify(bad));
+    assert.equal(p.requiresApproval("mcp__ops__workload_get"), true, JSON.stringify(bad));
     assert.equal(p.requiresApproval("mcp__other__workload_get"), false, JSON.stringify(bad));
   }
 });
 
 test("one spelling cannot hide the other", () => {
-  const p = approvalPolicyFromMcp({ safe: { ...base, requires_approval: false, requiresApproval: ["workload_stop"] } });
-  assert.equal(p.requiresApproval("mcp__safe__workload_stop"), true);
-  assert.equal(p.requiresApproval("mcp__safe__workload_get"), false);
+  const p = approvalPolicyFromMcp({ ops: { ...base, requires_approval: false, requiresApproval: ["workload_stop"] } });
+  assert.equal(p.requiresApproval("mcp__ops__workload_stop"), true);
+  assert.equal(p.requiresApproval("mcp__ops__workload_get"), false);
 });
 
 test("the field survives normalizeMcpConfigs", () => {
-  const out = normalizeMcpConfigs({ safe: { ...base, requires_approval: ["a"] } });
-  assert.deepEqual(out.safe.requires_approval, ["a"]);
+  const out = normalizeMcpConfigs({ ops: { ...base, requires_approval: ["a"] } });
+  assert.deepEqual(out.ops.requires_approval, ["a"]);
 });
 
 function fakeDispatcher(answer: Partial<NatsDecisionMessage> | Error) {

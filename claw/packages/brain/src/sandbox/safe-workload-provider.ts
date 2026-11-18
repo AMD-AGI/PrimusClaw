@@ -18,16 +18,24 @@ import {
   SANDBOX_DEFAULT_TIMEOUT_SECONDS,
   AGENT_SANDBOX_MAX_SESSION_SECONDS,
   SANDBOX_NAMESPACE,
+  SANDBOX_CPU_NAMESPACE,
   SANDBOX_WORKLOAD_PRIORITY,
   SANDBOX_UNSCHEDULABLE_TIMEOUT_MS,
+  SANDBOX_PENDING_TIMEOUT_MS,
+  SANDBOX_MIN_RUN_SECONDS,
   AUTH_INTERNAL_TOKEN,
 } from "../config.js";
 import {
   classifyWorkloadTerminalReason,
+  workloadDisrupted,
+  SANDBOX_WORKSPACE_FORBIDDEN,
   SandboxExecRouteUnavailableError,
+  SandboxProvisionTerminalError,
+  sandboxWorkspaceForbiddenText,
   SandboxGoneError,
   SandboxRuntimeTerminalError,
   SandboxStopUnavailable,
+  assertSandboxWorkspaceAllowed,
 } from "./errors.js";
 import { resourcesMapToWorkloadArray } from "./params.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
@@ -95,14 +103,51 @@ export function workloadTimeoutSeconds(
   return ceilingSec === null ? wanted : Math.min(wanted, ceilingSec);
 }
 
+/**
+ * How long the sandbox a run opens may wait for capacity, in ms: queued, a node
+ * being added for it, or an autoscaler that says capacity can come (an account at
+ * the scheduler's per-user limit, a node being given back). 0 means no ceiling.
+ *
+ * The deployment's ceiling (`pendingTimeoutMs`, SANDBOX_PENDING_TIMEOUT_SECONDS),
+ * bounded by what the request's own timeout leaves the run: a request that names
+ * `timeoutSec` waits at most that timeout less `minRunSec`
+ * (SANDBOX_MIN_RUN_SECONDS), and a timeout shorter than twice `minRunSec` keeps
+ * half of itself for the run. So a request for 25200s on the defaults (3h, 1h)
+ * waits up to 3h, and one for 1800s up to 15 minutes. A request with no timeout
+ * gets the deployment's ceiling.
+ *
+ * Why the request bounds it: SaFE starts a sandbox's lifetime when it admits the
+ * workload, so a wait after admission is spent out of the run's own time, and the
+ * caller that set the timeout stops waiting for the run once it has passed.
+ * Never the unschedulable limit (5 minutes): that is for a pod that waiting does
+ * not help.
+ *
+ * Arguments rather than the module constants, so every branch is reachable in one
+ * process.
+ */
+export function capacityWaitTimeoutMs(
+  timeoutSec: number | undefined,
+  pendingTimeoutMs: number,
+  minRunSec: number,
+): number {
+  if (timeoutSec === undefined || !Number.isFinite(timeoutSec) || timeoutSec <= 0) return pendingTimeoutMs;
+  const kept = Math.min(Math.max(0, minRunSec), Math.floor(timeoutSec / 2));
+  const fromRequestMs = Math.max(1, timeoutSec - kept) * 1000;
+  return pendingTimeoutMs > 0 ? Math.min(pendingTimeoutMs, fromRequestMs) : fromRequestMs;
+}
+
 export class SafeWorkloadProvider implements SandboxProvider {
   readonly kind = "safe-workload" as const;
 
   async create(params: SandboxCreateParams): Promise<SandboxInstance> {
     const ns = params.namespace || SANDBOX_NAMESPACE;
+    // Before the platform is asked for anything: a workspace the deployment does
+    // not isolate is refused by name (SANDBOX_ALLOWED_NAMESPACES).
+    assertSandboxWorkspaceAllowed(ns);
     const apiKey = params.platformKey ?? "";
 
     const timeout = workloadTimeoutSeconds(params.timeoutSec, AGENT_SANDBOX_MAX_SESSION_SECONDS);
+    const capacityWaitMs = capacityWaitTimeoutMs(params.timeoutSec, SANDBOX_PENDING_TIMEOUT_MS, SANDBOX_MIN_RUN_SECONDS);
 
     const workloadBody: Record<string, unknown> = {
       displayName: sandboxWorkloadName(),
@@ -127,12 +172,22 @@ export class SafeWorkloadProvider implements SandboxProvider {
     });
     if (!resp.ok) {
       const errBody = (await resp.text()).slice(0, 300);
+      if (resp.status === 403) {
+        // The account may not create workloads here. Retrying cannot change
+        // that, and SaFE's body names the user id and an internal error code,
+        // so the body stays in this log and the user is told what to do.
+        logger.warn({ status: resp.status, workspace: ns, body: errBody }, "safe-workload.create_forbidden");
+        throw new SandboxProvisionTerminalError(
+          SANDBOX_WORKSPACE_FORBIDDEN,
+          sandboxWorkspaceForbiddenText(ns, !!SANDBOX_CPU_NAMESPACE && ns === SANDBOX_CPU_NAMESPACE.trim()),
+        );
+      }
       throw new Error(`Create Hands failed: HTTP ${resp.status} ${errBody}`);
     }
     const result = (await resp.json()) as Record<string, unknown>;
     const workloadId = (result.workloadId as string) || "";
     if (!workloadId) throw new Error(`No workloadId returned: ${JSON.stringify(result)}`);
-    logger.info({ workloadId }, "safe-workload.created");
+    logger.info({ workloadId, capacityWaitSec: Math.round(capacityWaitMs / 1000) }, "safe-workload.created");
 
     // Two-phase pending hook: caller records a pending KV entry (+ rollback on
     // failure) before we start polling. If it throws, the workload create is
@@ -150,6 +205,12 @@ export class SafeWorkloadProvider implements SandboxProvider {
       // The sandbox a run opens gives up early on an admitted workload that no
       // node will run; see SANDBOX_UNSCHEDULABLE_TIMEOUT_MS.
       unschedulableTimeoutMs: SANDBOX_UNSCHEDULABLE_TIMEOUT_MS,
+      // A node being added for it, or capacity the autoscaler says can come, is a
+      // wait for capacity: the queue's ceiling, not the start one (see
+      // scaleUpTimeoutMs), and both are bounded by what the request's own timeout
+      // leaves the run (see capacityWaitTimeoutMs).
+      scaleUpTimeoutMs: capacityWaitMs,
+      pendingTimeoutMs: capacityWaitMs,
       // For a cancelled run, which the failure path does not reap, and for an
       // unschedulable one, which has nothing to wait for or learn from: no pod
       // ever ran, so the platform has no account of it that the failure path
@@ -200,6 +261,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
           healthy: false,
           state: "terminal",
           reason: classifyWorkloadTerminalReason(info),
+          ...(workloadDisrupted(info) ? { disrupted: true } : {}),
         };
       }
       return { running: false, healthy: false, state: "unknown" };
@@ -336,7 +398,7 @@ export async function pollWorkloadUntilRunning(
   /** Event-name prefix of the wait's logs (`<prefix>.poll_error`); `hands` unless another owner says so. */
   logPrefix = "hands",
   /** The run's cancel signal, and what to do with the workload when the wait is given up. */
-  wait?: Pick<WorkloadWaitOptions, "signal" | "onGiveUp" | "reclaimOnAbort" | "unschedulableTimeoutMs">,
+  wait?: Pick<WorkloadWaitOptions, "signal" | "onGiveUp" | "reclaimOnAbort" | "unschedulableTimeoutMs" | "scaleUpTimeoutMs" | "pendingTimeoutMs">,
 ): Promise<void> {
   await onEvent?.({ type: "sandboxStatus", event: "phase", phase: "Creating", status: "creating", log: "" });
 
@@ -373,6 +435,8 @@ export async function pollWorkloadUntilRunning(
     reclaimOnAbort: wait?.reclaimOnAbort,
     onGiveUp: wait?.onGiveUp,
     unschedulableTimeoutMs: wait?.unschedulableTimeoutMs,
+    scaleUpTimeoutMs: wait?.scaleUpTimeoutMs,
+    pendingTimeoutMs: wait?.pendingTimeoutMs,
     deps,
   });
 }

@@ -21,7 +21,7 @@ import test, { describe } from "node:test";
 
 import {
   accumulatedText, artifactsOf, closingEvents, inputRequiredMessage, isRunEnd, mapLiveEvent,
-  newStreamState, parseAnswer, pendingInputOf, stateOfRun, taskOf, TEXT_CHUNK_SEPARATOR,
+  newStreamState, parseAnswer, pendingInputOf, resultMessageState, stateOfRun, taskOf, TEXT_CHUNK_SEPARATOR,
   type PendingInput, type RunEvent, type RunRecord,
 } from "../src/routes/a2a-task-view.js";
 import { Role, TaskState, type Part } from "../src/routes/a2a-types.js";
@@ -275,6 +275,14 @@ describe("V4 live events as stream events", () => {
     assert.equal(isRunEnd({ type: "exec_complete" }, "m-1"), true);
     assert.equal(isRunEnd({ type: "exec_complete", message_id: "m-0" }, "m-1"), false);
     assert.equal(isRunEnd({ type: "ResultMessage" }, "m-1"), false);
+  });
+
+  test("a ResultMessage ends a stream completed on success, cancelled when the turn was stopped, failed otherwise", () => {
+    assert.equal(resultMessageState({ type: "ResultMessage", data: { subtype: "success" } }), TaskState.COMPLETED);
+    // Brain's end of a turn the user stopped: a cancel, not a failure (the task's CancelTask answer says CANCELED too).
+    assert.equal(resultMessageState({ type: "ResultMessage", data: { subtype: "interrupted" } }), TaskState.CANCELED);
+    assert.equal(resultMessageState({ type: "ResultMessage", data: { subtype: "error" } }), TaskState.FAILED);
+    assert.equal(resultMessageState({ type: "ResultMessage" }), TaskState.FAILED); // (the API's synthetic end of a lost run)
   });
 
   test("the closing events close what was opened, then say the state", () => {

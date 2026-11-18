@@ -10,6 +10,8 @@
 import { Registry, collectDefaultMetrics, Counter, Gauge, Histogram } from "prom-client";
 import type { RunFailClaimReason, RunUnclaimReason } from "@claw/protocol";
 import type { IdentityMetrics } from "@claw/utils";
+// A leaf too: config imports nothing of this package that emits a metric.
+import { CLAW_USER_SKILLS_ENABLED } from "../config.js";
 // Type-only, so this stays a leaf module: the emitting modules import it at runtime.
 import type { AdmissionAsk, AdmissionRejectReason } from "../tasks/admission.js";
 import type { ExhaustedClaim } from "../tasks/run-claim.js";
@@ -110,6 +112,92 @@ const workItemStaleRejectedTotal = new Counter({
   labelNames: ["source"] as const,
   registers: [registry],
 });
+
+// A message the assistant was not let say because its user had their cap (`sayMaxPerHour`) of them in the last
+// hour, by what the user was told: the notice that replies are paused (`sent`, the first refusal of a stretch at the
+// cap), nothing more because they had it already (`already_sent`), or nothing because storing it failed (`failed`).
+const assistantSayRateLimitedTotal = new Counter({
+  name: "claw_assistant_say_rate_limited_total",
+  help: "Assistant messages refused by the hourly say cap, by whether the user was sent the cap notice.",
+  labelNames: ["notice"] as const,
+  registers: [registry],
+});
+
+// The sources the assistant's `say` was sent (`assistant/citations.ts`), by what became of each: shown with the message (`cited`),
+// dropped because no lookup of the turn returned the address (`dropped_not_in_turn`, the number that says the model is writing
+// addresses of its own), malformed (`dropped_invalid`), past the per-message cap (`dropped_over_cap`), not cited in the text
+// (`unreferenced`), or cited in a text that can make a link of its own and so cites nothing (`suppressed_link_text`).
+const assistantSaySourcesTotal = new Counter({
+  name: "claw_assistant_say_sources_total",
+  help: "Sources an assistant say was sent, by outcome.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
+// An assistant message stored with no subscription to carry it (`assistant.say` or `work_item.needs_you`): the web
+// client can still show it, but no channel the user reads on was sent it. Counted every time; the log line it also
+// writes is limited to one per user an hour.
+const assistantSayUnreachableTotal = new Counter({
+  name: "claw_assistant_say_unreachable_total",
+  help: "Assistant messages stored with no notification subscription for their type, by type.",
+  labelNames: ["type"] as const,
+  registers: [registry],
+});
+
+// A router turn that answered the user and ended without its answer said (`assistant/router-turn-end.ts`), by what became of it: its
+// plain text said for it (`delivered`, a turn that said nothing; `replaced_early_line`, a turn whose only say came before its last
+// lookup, "查一下 Autopilot 的状态。"), the system's notice instead (`lost_notice` for a failed or stopped turn, `withheld` for text with
+// internal words in it), refused by the say cap (`refused`), or left unsaid after a say that answered (`after_say`). The parity run's
+// K2 (2026-11-06) was a turn of the second kind that nobody counted: the user got only the early line. `silent_notice`: a turn that looked
+// things up and ended with no word and no text at all, told so by the system (bczh-202). `report_answer`: a turn a worker's answer woke
+// that ended without saying it (stopped for the user's next message, failed, or plain text), the answer said by the system instead.
+// `redacted`: plain text whose only internal text was an id, said with the id left out.
+export type RouterUnsaidOutcome =
+  | "delivered" | "replaced_early_line" | "lost_notice" | "withheld" | "redacted" | "refused" | "after_say" | "silent_notice" | "report_answer";
+const assistantRouterUnsaidTotal = new Counter({
+  name: "claw_assistant_router_unsaid_total",
+  help: "Router turns answering the user that ended without their answer said, by what the turn end did about it.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
+// The user's personal skills as the assistant's router sees them (`assistant/skill-tools.ts`): the characters of the list a router turn
+// is given with its message, how many turns had to leave some out for its budget, and every `skill_read` by its outcome (`ok`, a
+// skill or file the user does not have `not_found`, or one refused because the conversation is not where their skills are `not_here`).
+// The reads are the signal that a skill was used without being named. With CLAW_USER_SKILLS_ENABLED off none of them is registered, so
+// /metrics reads as it did before them.
+const userSkillListedChars = new Histogram({
+  name: "claw_user_skill_listed_chars",
+  help: "Characters of the personal skill list given to a turn, by role.",
+  labelNames: ["role"] as const,
+  buckets: [0, 100, 250, 500, 1000, 1500, 2000, 3000],
+  registers: [registry],
+});
+const userSkillTruncatedTotal = new Counter({
+  name: "claw_user_skill_truncated_total",
+  help: "Turns whose personal skill list left skills out for its budget, by role.",
+  labelNames: ["role"] as const,
+  registers: [registry],
+});
+const userSkillReadTotal = new Counter({
+  name: "claw_user_skill_read_total",
+  help: "Reads of a personal skill, by role and outcome.",
+  labelNames: ["role", "outcome"] as const,
+  registers: [registry],
+});
+// Every write of a personal skill from a conversation (`assistant/skill-writes.ts`, a worker's save_skill): `op` the write (create,
+// update, draft, delete, disable, enable, undo), `outcome` ok, or why it was refused (secret, injection, full, invalid, duplicate, ...).
+const userSkillSaveTotal = new Counter({
+  name: "claw_user_skill_save_total",
+  help: "Writes of a personal skill from a conversation, by op and outcome.",
+  labelNames: ["op", "outcome"] as const,
+  registers: [registry],
+});
+if (!CLAW_USER_SKILLS_ENABLED) {
+  for (const name of ["claw_user_skill_listed_chars", "claw_user_skill_truncated_total", "claw_user_skill_read_total", "claw_user_skill_save_total"]) {
+    registry.removeSingleMetric(name);
+  }
+}
 
 // `error` keeps a throw out of loadUsage or queueLength in the denominator;
 // without it a partial outage makes every rollout ratio read healthier.
@@ -363,5 +451,29 @@ export const metrics = {
   },
   onWorkItemStaleRejected(source: "worker" | "turn_end" | "sweep" | "watchdog"): void {
     workItemStaleRejectedTotal.inc({ source });
+  },
+  onAssistantSayRateLimited(notice: "sent" | "already_sent" | "failed"): void {
+    assistantSayRateLimitedTotal.inc({ notice });
+  },
+  onAssistantSaySources(
+    outcome: "cited" | "dropped_not_in_turn" | "dropped_invalid" | "dropped_over_cap" | "unreferenced" | "suppressed_link_text", n: number,
+  ): void {
+    if (n > 0) assistantSaySourcesTotal.inc({ outcome }, n);
+  },
+  onAssistantSayUnreachable(type: string): void {
+    assistantSayUnreachableTotal.inc({ type });
+  },
+  onAssistantRouterUnsaid(outcome: RouterUnsaidOutcome): void {
+    assistantRouterUnsaidTotal.inc({ outcome });
+  },
+  onUserSkillListed(role: "router", chars: number, truncated: boolean): void {
+    userSkillListedChars.observe({ role }, chars);
+    if (truncated) userSkillTruncatedTotal.inc({ role });
+  },
+  onUserSkillRead(role: "router", outcome: "ok" | "not_found" | "not_here"): void {
+    userSkillReadTotal.inc({ role, outcome });
+  },
+  onUserSkillSave(op: "create" | "update" | "draft" | "delete" | "disable" | "enable" | "undo", outcome: string): void {
+    userSkillSaveTotal.inc({ op, outcome });
   },
 };

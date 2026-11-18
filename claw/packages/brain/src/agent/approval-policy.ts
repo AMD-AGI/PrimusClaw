@@ -40,9 +40,21 @@
  * call: any other argument the call carries is not checked, so a `when` on
  * `status` releases `{ status: "paused", cascade: true }` as well. Name every
  * argument that matters, or leave the tool unlisted.
+ *
+ * Over every spec stands the catalog of MCP tools (`@claw/protocol`'s
+ * mcp-tool-catalog.ts): for a server it knows by name, every write it lists and
+ * every tool it does not list (one the server added since the catalog was
+ * reviewed) is held whatever the spec says (`false`, a list that misses it, no
+ * field at all), and `auto_approve` releases such a tool only when the catalog
+ * calls it a releasable write. A spec is a hand-kept list and falls
+ * behind its server (SaFE's workload_resume ran unheld that way); the catalog
+ * is checked against the server's own tools/list every night, and a tool it
+ * has not classified yet waits for a person meanwhile. The hold it adds for a
+ * server whose spec has no rule of its own counts as the platform's: it holds
+ * those tools and turns nothing else on (`operatorActive`).
  */
 import pino from "pino";
-import { isPlatformMcpServer } from "@claw/protocol";
+import { TOOL_CATALOG, catalogClassOf, isCataloguedServer, isPlatformMcpServer, isReleasableWrite, type ToolCatalog } from "@claw/protocol";
 
 const logger = pino({ name: "approval-policy" });
 
@@ -152,10 +164,22 @@ interface ServerRule {
   autos: Array<AutoMatcher | null>;
   /** False for a server the API adds itself, whose rule holds its own tools and turns nothing else on. */
   operator: boolean;
+  /** The catalogued server whose writes this rule holds and releases only as the catalog says; null for one it does not know. */
+  catalog: string | null;
+}
+
+/**
+ * `catalog`: the tool catalog that stands over the specs (default the platform's). `null` reads the specs alone, which is what an
+ * audit of a spec needs (`api/src/assistant/tool-classes.ts`), never what a turn runs with.
+ */
+/** Whether the catalog itself holds this tool of a catalogued server: anything but a read it lists. */
+function heldByCatalog(server: string, bare: string, tools: ToolCatalog): boolean {
+  return catalogClassOf(server, bare, tools) !== "read";
 }
 
 export function approvalPolicyFromMcp(
   servers: Record<string, Record<string, unknown>>,
+  { catalog: tools = TOOL_CATALOG }: { catalog?: ToolCatalog | null } = {},
 ): ApprovalPolicy {
   const rules: ServerRule[] = [];
   for (const [name, spec] of Object.entries(servers)) {
@@ -188,8 +212,18 @@ export function approvalPolicyFromMcp(
       }
       autos.push(match);
     }
+    const ownRule = holds.length > 0;
+    // Whatever the spec says, a write the catalog lists for this server waits for a person, and so does a tool it does not list
+    // (one the server added since the catalog was reviewed: it is not known to read). By name only: a server that takes a
+    // catalogued name gets the catalog whatever its URL says, the API's own trigger server included.
+    const catalog = tools !== null && isCataloguedServer(name, tools) ? name : null;
+    if (catalog !== null) holds.push((bare) => heldByCatalog(catalog, bare, tools!));
     if (holds.length === 0) continue;
-    rules.push({ prefix, holds: (bare) => holds.some((h) => h(bare)), autos, operator: !isPlatformMcpServer(name, spec) });
+    rules.push({
+      prefix, holds: (bare) => holds.some((h) => h(bare)), autos, catalog,
+      // A hold only the catalog adds is the platform's, like the API's own servers': it turns nothing else on.
+      operator: ownRule && !isPlatformMcpServer(name, spec),
+    });
   }
   const held = (r: ServerRule, toolName: string): boolean =>
     toolName.startsWith(r.prefix) && r.holds!(toolName.slice(r.prefix.length));
@@ -201,6 +235,9 @@ export function approvalPolicyFromMcp(
     let first: string | null = null;
     for (const r of holding) {
       if (r.autos.length === 0) return null;
+      // What the catalog holds is released only when it calls it a releasable write, whatever auto_approve lists.
+      const bare = toolName.slice(r.prefix.length);
+      if (r.catalog !== null && heldByCatalog(r.catalog, bare, tools!) && !isReleasableWrite(r.catalog, bare, tools!)) return null;
       for (const a of r.autos) {
         const entry = a === null ? null : a(toolName.slice(r.prefix.length), input ?? {});
         if (entry === null) return null;

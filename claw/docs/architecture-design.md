@@ -260,7 +260,17 @@ stream.
 ### 5.3 Serving history and live events together
 
 `GET /v1/chat/sessions/:id/messages` serves conversation history followed by live events;
-a replay mode returns the history as JSON instead. The subscription is established
+a replay mode returns the history as JSON instead: all of it, or one window read from the
+table alone (`?mode=replay&tail=N` for the last N events, `&after=<event_id>&limit=N` to page
+forward), which is what a long-lived session's reader should ask for. The stream's history is
+read a page at a time and, when the client does not say where it resumes (`?after=` or
+`Last-Event-ID`), is the session's last `SSE_HISTORY_TAIL` events (2000 by default; the
+`historyComplete` marker's `has_more` says older ones exist; `?history=all` sends all of them).
+`after=claw-<seq>` is followed by every stream event of a higher sequence (whatever order the
+replicas stored them in) and by the other rows stored after it, so `claw-10` follows `claw-9`. An `after`
+later than every id a session holds (`claw-` and more digits than a stream sequence has, such as
+`claw-99999999999999`) sends no history: the stream starts at its tail, for a client that wants only
+what happens from now on. The subscription is established
 *before* the history query runs, which closes the window in which an event published
 between the two would be lost.
 
@@ -564,8 +574,14 @@ Two different clocks bound a sandbox, and they must not be confused:
   writes when the workload **leaves the Pending queue and starts running** (not at dispatch —
   a workload is still Pending when marked dispatched). So it does **not** include time the
   workload spends **Pending** waiting for resources.
+  That holds for the queue only. A workload the platform has admitted (NotReady) already
+  has its `StartTime`, and a sandbox's `shutdownTime` is set when it is dispatched, so a wait
+  for capacity after admission (a node being added, an account at the scheduler's per-user
+  limit) is spent out of the sandbox's lifetime. Brain bounds that wait by the request:
+  `timeout` less `SANDBOX_MIN_RUN_SECONDS` (default 1h), so a run that had to queue keeps at
+  least that much of its own time.
 - **`SANDBOX_PENDING_TIMEOUT_SECONDS` (Brain config, default 3h)** — the ceiling on the
-  **Pending/queue wait**. A readable Pending status (SaFE answering HTTP 2xx with a phase)
+  **Pending/queue wait**, and on a wait for capacity after admission. A readable Pending status (SaFE answering HTTP 2xx with a phase)
   is polled and waited on; if the workload has not reached Running within this window the
   whole message fails terminally with reason `sandbox_pending_timeout` (never retried).
   Set to `0` to wait forever.

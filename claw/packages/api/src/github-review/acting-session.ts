@@ -125,3 +125,134 @@ export async function proofForFirstMessageAgain(
   if (row.status !== "failed" || row.words !== content) return null;
   return { via: null } as AttendedProof;
 }
+
+/**
+ * The proof for running a review once more when CI turned green (`assistant/review-items.ts`, `followReviewItems`): the person asked for this
+ * review of their own account, its one turn ended with a comment-only review because CI was not green on the head (its approval was refused
+ * `ci_not_green`), and that head is green now. It is the same words in the same session, given once more, as a person who said "review and
+ * merge it" means "once CI lets it". Made only when the database shows exactly that: the session acts as a user, has had one turn and no
+ * other, that turn completed and its words are `content`, nothing is queued, its approval was refused `ci_not_green`, and it is the session of
+ * an open review item of the owner's own (nobody else asked for it) whose wait for CI has not ended. Null otherwise: never twice, since the
+ * turn it lets through is the session's second.
+ *
+ * Or, for a review asked of anyone (2026-11-11, N25): its one completed turn read a head the same acting account had already reviewed in
+ * another session and tried no review or merge call at all (a refused or failed one is not this), as a re-review of a pull request with no
+ * new commits does, and the head is green now.
+ * The same words, once more; a review someone asked of the owner still passes every gate a queued turn does (`gateRequestedReviewTurn`:
+ * the reviewer's say asked again, and the turn budget).
+ */
+export async function proofForReviewAfterGreenCi(
+  q: { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }> }, sessionId: string, content: string,
+): Promise<AttendedProof | null> {
+  const row = (await q.query(
+    `SELECT s.config->'acting_as' AS acting_as,
+            (SELECT COUNT(*)::int FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat') AS turns,
+            (SELECT COUNT(*)::int FROM claw_pending_messages p WHERE p.session_id = s.session_id) AS queued,
+            (SELECT t.status FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS status,
+            (SELECT COALESCE(t.prompt, t.input->>'prompt', '') FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS words,
+            EXISTS (SELECT 1 FROM claw_work_items w WHERE w.worker_session_id = s.session_id AND w.kind = 'review' AND w.board_state <> 'done'
+                     AND NOT (w.params ? 'ci_wait_ended')
+                     AND ((NOT (w.params ? 'requested_by')
+                           AND EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = s.session_id AND a.tool = 'gh_review_submit'
+                                        AND a.result = 'refused' AND a.detail = 'ci_not_green'))
+                       OR (NOT EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = s.session_id
+                                        AND a.tool IN ('gh_review_submit', 'gh_pr_merge'))
+                           AND NOT EXISTS (SELECT 1 FROM claw_github_confirmations c WHERE c.session_id = s.session_id)
+                           AND EXISTS (SELECT 1 FROM (SELECT g.repo, g.pr, g.head_sha FROM claw_github_audit g
+                                                       WHERE g.session_id = s.session_id AND g.tool = 'gh_pr_get' AND g.result = 'ok'
+                                                         AND g.head_sha <> '' AND g.pr IS NOT NULL
+                                                       ORDER BY g.at DESC, g.id DESC LIMIT 1) g
+                                        WHERE EXISTS (SELECT 1 FROM claw_github_audit a
+                                                       WHERE a.actor_user_id = s.config->>'acting_as' AND a.session_id <> s.session_id
+                                                         AND a.tool = 'gh_review_submit' AND a.result = 'ok'
+                                                         AND a.detail IN ('submitted', 'already_submitted') AND lower(a.repo) = lower(g.repo)
+                                                         AND a.pr = g.pr AND lower(a.head_sha) = lower(g.head_sha)))))) AS waiting
+       FROM claw_sessions s WHERE s.session_id = $1 AND s.deleted_at IS NULL`,
+    [sessionId],
+  )).rows[0] as { acting_as: unknown; turns: number; queued: number; status: string | null; words: string | null; waiting: boolean } | undefined;
+  if (!row || typeof row.acting_as !== "string" || Number(row.turns) !== 1 || Number(row.queued) !== 0) return null;
+  if (row.status !== "completed" || row.words !== content || !row.waiting) return null;
+  return { via: null } as AttendedProof;
+}
+
+/**
+ * The proof for running a review someone asked of the owner once more after its merge waited for the pull request's author
+ * (`assistant/review-items.ts`, `AuthorWait`: GitHub refused the merge on a conflict, the branch rules or the missing `workflow` scope) and
+ * the pull request got new commits. It is the same words in the same session, given once more, as "review and merge it" means once the
+ * author has cleared what only they could: the new head is reviewed afresh, and the reviewer's say is asked again (`gateRequestedReviewTurn`).
+ * Made only when the database shows exactly that: the session acts as a user, has had one turn and no other, that turn completed and its
+ * words are `content`, nothing is queued, and it is the session of an open review item someone asked for that is marked as waiting for the
+ * author. Null otherwise: never twice, since the turn it lets through is the session's second.
+ */
+export async function proofForReviewAfterAuthor(
+  q: { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }> }, sessionId: string, content: string,
+): Promise<AttendedProof | null> {
+  const row = (await q.query(
+    `SELECT s.config->'acting_as' AS acting_as,
+            (SELECT COUNT(*)::int FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat') AS turns,
+            (SELECT COUNT(*)::int FROM claw_pending_messages p WHERE p.session_id = s.session_id) AS queued,
+            (SELECT t.status FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS status,
+            (SELECT COALESCE(t.prompt, t.input->>'prompt', '') FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS words,
+            EXISTS (SELECT 1 FROM claw_work_items w WHERE w.worker_session_id = s.session_id AND w.kind = 'review' AND w.board_state = 'in_progress'
+                     AND w.params ? 'requested_by' AND w.params ? 'author_waiting') AS waiting
+       FROM claw_sessions s WHERE s.session_id = $1 AND s.deleted_at IS NULL`,
+    [sessionId],
+  )).rows[0] as { acting_as: unknown; turns: number; queued: number; status: string | null; words: string | null; waiting: boolean } | undefined;
+  if (!row || typeof row.acting_as !== "string" || Number(row.turns) !== 1 || Number(row.queued) !== 0) return null;
+  if (row.status !== "completed" || row.words !== content || !row.waiting) return null;
+  return { via: null } as AttendedProof;
+}
+
+/**
+ * The proof for running a review once more whose one turn called no review tool at all (`assistant/review-items.ts`, `syncReviewItem`;
+ * 2026-11-13, N31: the review tools did not connect in time, the turn ended in seconds having read and posted nothing, and the reviewer was
+ * woken for it). It is the same words in the same session, given once more, as the turn did nothing of what they asked. Made only when the
+ * database shows exactly that: the session acts as a user, has had one turn and no other, that turn completed and its words are `content`,
+ * nothing is queued, the session has no review tool call since its turn began (the pull request check the server audits in it before then,
+ * and the server's own follow-ups, `gh_pr_follow`, aside) and no confirmation, and it
+ * is the session of an open review item that was not run again this way before (`empty_rerun`). Null otherwise: never twice, since the
+ * turn it lets through is the session's second. A review someone asked of the owner still passes every gate a queued turn does.
+ */
+export async function proofForReviewAfterNoCall(
+  q: { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }> }, sessionId: string, content: string,
+): Promise<AttendedProof | null> {
+  const row = (await q.query(
+    `SELECT s.config->'acting_as' AS acting_as,
+            (SELECT COUNT(*)::int FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat') AS turns,
+            (SELECT COUNT(*)::int FROM claw_pending_messages p WHERE p.session_id = s.session_id) AS queued,
+            (SELECT t.status FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS status,
+            (SELECT COALESCE(t.prompt, t.input->>'prompt', '') FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat' ORDER BY t.created_at DESC, t.task_id DESC LIMIT 1) AS words,
+            (EXISTS (SELECT 1 FROM claw_work_items w WHERE w.worker_session_id = s.session_id AND w.kind = 'review' AND w.board_state <> 'done'
+                      AND NOT (w.params ? 'empty_rerun'))
+             AND NOT EXISTS (SELECT 1 FROM claw_github_audit a WHERE a.session_id = s.session_id AND a.tool <> 'gh_pr_follow'
+                              AND a.at > (SELECT MIN(t.created_at) FROM claw_tasks t WHERE t.session_id = s.session_id AND t.origin = 'chat'))
+             AND NOT EXISTS (SELECT 1 FROM claw_github_confirmations c WHERE c.session_id = s.session_id)) AS waiting
+       FROM claw_sessions s WHERE s.session_id = $1 AND s.deleted_at IS NULL`,
+    [sessionId],
+  )).rows[0] as { acting_as: unknown; turns: number; queued: number; status: string | null; words: string | null; waiting: boolean } | undefined;
+  if (!row || typeof row.acting_as !== "string" || Number(row.turns) !== 1 || Number(row.queued) !== 0) return null;
+  if (row.status !== "completed" || row.words !== content || !row.waiting) return null;
+  return { via: null } as AttendedProof;
+}
+
+/**
+ * The proof for the first message of a review that waited for a slot (`params.queued`, `assistant/review-items.ts`): the request that made
+ * it was checked as `checkSessionCreate` checks any, and its item and session were made then, with the person's say, but its first message
+ * was held back so that nothing of it could run before a slot was free. Made only when the database shows exactly that: the session acts
+ * as a user, is a queued review item's, and has had no turn and has no message queued. Null otherwise.
+ */
+export async function proofForQueuedFirstMessage(
+  q: { query(text: string, params?: unknown[]): Promise<{ rows: unknown[] }> }, sessionId: string,
+): Promise<AttendedProof | null> {
+  const row = (await q.query(
+    `SELECT s.config->'acting_as' AS acting_as,
+            (SELECT COUNT(*)::int FROM claw_tasks t WHERE t.session_id = s.session_id) AS turns,
+            (SELECT COUNT(*)::int FROM claw_pending_messages p WHERE p.session_id = s.session_id) AS queued,
+            EXISTS (SELECT 1 FROM claw_work_items w WHERE w.worker_session_id = s.session_id AND w.kind = 'review'
+                     AND w.board_state <> 'done' AND w.params ? 'queued') AS waiting
+       FROM claw_sessions s WHERE s.session_id = $1 AND s.deleted_at IS NULL`,
+    [sessionId],
+  )).rows[0] as { acting_as: unknown; turns: number; queued: number; waiting: boolean } | undefined;
+  if (!row || typeof row.acting_as !== "string" || Number(row.turns) !== 0 || Number(row.queued) !== 0 || !row.waiting) return null;
+  return { via: null } as AttendedProof;
+}

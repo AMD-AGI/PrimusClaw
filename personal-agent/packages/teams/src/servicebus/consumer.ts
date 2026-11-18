@@ -1,0 +1,239 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * The inbound queue: several receivers, each taking the next conversation session that has messages and handling them in
+ * order until the session has been quiet for IDLE_MS. A body that is not a JSON object is dead-lettered at once (it can never
+ * succeed); a handler failure abandons the message, so the broker redelivers it and, after its maximum delivery count,
+ * dead-letters it. Either way the session moves on: one poison message never blocks a conversation. Every message taken
+ * gets one line (`inbound message`): its id, what came of it (completed, abandoned, dead_lettered), how long it waited in
+ * the queue and how long it took; never its body. For an activity that decodes, the line also says when the client sent it
+ * (`clientTiming`), so a message that reached Teams late can be told apart from one the person sent late.
+ */
+import type { Clock, Logger } from "@primusclaw/personal-agent";
+import { errorName, silentLogger } from "@primusclaw/personal-agent";
+
+import { isObject, type JsonObject } from "../cards/json.js";
+import type { BusClient, Received, SessionReceiver } from "./client.js";
+
+/** A session that has had no message for this long is released for the next one. */
+export const IDLE_MS = 20_000;
+/** After an error of the broker (not the idle timeout), wait this long before trying again. */
+export const BACKOFF_MS = 3_000;
+/** After finding no session with messages, wait this long before asking again. */
+export const NO_SESSION_PAUSE_MS = 1_000;
+
+/** What the handled messages are counted in: how long each waited in the queue and took to handle. */
+export interface InboundStats {
+  processed(queueLagMs: number | undefined, handleMs: number, ok: boolean): void;
+}
+
+/** Whether a broker error is the documented "no session has messages" timeout of acceptNextSession. */
+export function isIdleTimeout(error: unknown): boolean {
+  const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+  return code === "ServiceTimeout" || code === "SessionCannotBeLocked";
+}
+
+/**
+ * How long `message` waited in the queue before the worker took it: from the broker's enqueue time to the start of
+ * handling (now, less `handleMs`). undefined when the broker gave no enqueue time. A growing lag is the queue backing up.
+ */
+export function queueLagMs(message: Received, nowEpochMs: number, handleMs = 0): number | undefined {
+  if (!message.enqueuedAt) return undefined;
+  return Math.max(Math.trunc(nowEpochMs - message.enqueuedAt.getTime()) - handleMs, 0);
+}
+
+/** A client lag beyond this is a wrong clock, not a held message: it is logged raw and not as `client_lag_ms`. */
+export const MAX_CLIENT_LAG_MS = 24 * 60 * 60_000;
+
+// An ISO 8601 date-time with an explicit zone, as Teams writes `timestamp` ("...T07:00:16.1234567Z") and
+// `localTimestamp` ("...T15:00:00.123+08:00"). Only a value of this shape is logged, so no other text reaches the line.
+const ISO_TIME = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
+// The client's own id of the message, as a client may set it in channelData; only an id of these characters is logged.
+const CLIENT_ID = /^[A-Za-z0-9._:-]{1,64}$/;
+const CLIENT_ID_KEYS = ["clientActivityID", "clientActivityId", "clientmessageid", "clientMessageId"] as const;
+// A Teams message id in a 1:1 chat ("1794985216123") is the epoch milliseconds at which the service took the message.
+const EPOCH_MS_ID = /^\d{13}$/;
+
+/** When the client sent an activity and when the service took it, as the activity says; every field may be absent. */
+export interface ClientTiming {
+  /** The activity's `localTimestamp`: the client's own clock when it sent the message, with its zone offset. */
+  readonly client_ts?: string;
+  /** The client's id of the message from `channelData`, when the client gave one. */
+  readonly client_msg_id?: string;
+  /** When the service took the message: the activity's `timestamp`, else the epoch milliseconds of a 1:1 message id. */
+  readonly server_ts?: string;
+  /** `server_ts` less `client_ts`, signed, as measured: negative when the client's clock runs ahead. */
+  readonly client_lag_raw_ms?: number;
+  /** The same lag when it can be one (0 to MAX_CLIENT_LAG_MS); absent when the clocks disagree beyond that. */
+  readonly client_lag_ms?: number;
+}
+
+/** Epoch milliseconds of an ISO_TIME value; fractions past the millisecond are dropped. */
+function isoEpochMs(value: unknown): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const match = ISO_TIME.exec(value);
+  if (!match) return undefined;
+  const [, base, fraction = "", zone] = match;
+  const ms = Date.parse(`${base}.${fraction.padEnd(3, "0").slice(0, 3)}${zone}`);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
+ * When `activity` was sent by the client and taken by the service, for the `inbound message` line. Teams sets
+ * `timestamp` (the service's clock) and `localTimestamp` (the client's clock) on every message; the difference is how long
+ * the client held the message, plus the skew between the two clocks. A difference below zero or above
+ * MAX_CLIENT_LAG_MS is skew, so it is kept only as `client_lag_raw_ms`. Never reads the text or who sent it.
+ */
+export function clientTiming(activity: JsonObject): ClientTiming {
+  const timing: { -readonly [K in keyof ClientTiming]: ClientTiming[K] } = {};
+  const local = activity["localTimestamp"];
+  const clientMs = isoEpochMs(local);
+  if (clientMs !== undefined) timing.client_ts = local as string;
+  const channelData = activity["channelData"];
+  if (isObject(channelData)) {
+    for (const key of CLIENT_ID_KEYS) {
+      const id = channelData[key];
+      if (typeof id === "string" && CLIENT_ID.test(id)) {
+        timing.client_msg_id = id;
+        break;
+      }
+    }
+  }
+  const stamp = activity["timestamp"];
+  const id = activity["id"];
+  let serverMs = isoEpochMs(stamp);
+  if (serverMs !== undefined) timing.server_ts = stamp as string;
+  else if (typeof id === "string" && EPOCH_MS_ID.test(id)) {
+    serverMs = Number(id);
+    timing.server_ts = new Date(serverMs).toISOString();
+  }
+  if (clientMs !== undefined && serverMs !== undefined) {
+    const lag = serverMs - clientMs;
+    timing.client_lag_raw_ms = lag;
+    if (lag >= 0 && lag <= MAX_CLIENT_LAG_MS) timing.client_lag_ms = lag;
+  }
+  return timing;
+}
+
+export interface ConsumerParts {
+  readonly client: BusClient;
+  readonly queue: string;
+  readonly handle: (activity: JsonObject) => Promise<void>;
+  readonly receivers: number;
+  readonly clock: Clock;
+  readonly stats?: InboundStats;
+  readonly logger?: Logger;
+}
+
+function decode(body: Uint8Array): JsonObject {
+  const parsed: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+  if (!isObject(parsed)) throw new SyntaxError("body is not a JSON object");
+  return parsed;
+}
+
+export class InboundConsumer {
+  private stopped = false;
+  private readonly logger: Logger;
+
+  constructor(private readonly parts: ConsumerParts) {
+    this.logger = parts.logger ?? silentLogger;
+  }
+
+  /** Run the receivers until `stop`. */
+  async run(): Promise<void> {
+    await Promise.all(Array.from({ length: this.parts.receivers }, () => this.loop()));
+  }
+
+  stop(): void {
+    this.stopped = true;
+  }
+
+  private async loop(): Promise<void> {
+    while (!this.stopped) {
+      let receiver: SessionReceiver;
+      try {
+        receiver = await this.parts.client.acceptNextSession(this.parts.queue);
+      } catch (error) {
+        await this.pause(error);
+        continue;
+      }
+      try {
+        await this.drain(receiver);
+      } catch (error) {
+        await this.pause(error);
+      } finally {
+        await receiver.close().catch((error: unknown) => {
+          this.logger.info("closing a session receiver failed", { error: errorName(error) });
+        });
+      }
+    }
+  }
+
+  private async pause(error: unknown): Promise<void> {
+    if (isIdleTimeout(error)) {
+      // (documented: accepting the next session times out when no session has messages)
+      await this.parts.clock.sleep(NO_SESSION_PAUSE_MS);
+      return;
+    }
+    this.logger.warn("inbound receiver error", { error: errorName(error) });
+    await this.parts.clock.sleep(BACKOFF_MS);
+  }
+
+  private async drain(receiver: SessionReceiver): Promise<void> {
+    for (;;) {
+      const messages = await receiver.receive(1, IDLE_MS);
+      if (messages.length === 0 || this.stopped) return;
+      for (const message of messages) await this.dispatch(receiver, message);
+    }
+  }
+
+  private async dispatch(receiver: SessionReceiver, message: Received): Promise<void> {
+    let body: JsonObject;
+    try {
+      body = decode(message.body);
+    } catch (error) {
+      const why = error instanceof Error ? error.message : "undecodable";
+      this.logLine(message, "dead_lettered", queueLagMs(message, this.parts.clock.epochMs()), 0);
+      await receiver.deadLetter(message, "malformed", Array.from(why).slice(0, 200).join(""));
+      return;
+    }
+    const timing = clientTiming(body); // (read before the handler, which may change the activity)
+    const started = this.parts.clock.monotonicMs();
+    try {
+      await this.parts.handle(body);
+    } catch (error) {
+      this.logger.error("handler failed; abandoning for redelivery", { error: errorName(error) });
+      this.record(message, timing, started, false);
+      await receiver.abandon(message);
+      return;
+    }
+    this.record(message, timing, started, true);
+    await receiver.complete(message);
+  }
+
+  private record(message: Received, timing: ClientTiming, started: number, ok: boolean): void {
+    const handleMs = Math.trunc(this.parts.clock.monotonicMs() - started);
+    const lag = queueLagMs(message, this.parts.clock.epochMs(), handleMs);
+    this.logLine(message, ok ? "completed" : "abandoned", lag, handleMs, timing);
+    this.parts.stats?.processed(lag, handleMs, ok);
+  }
+
+  /** The one line for a message taken: ids, outcome and times only. */
+  private logLine(
+    message: Received,
+    outcome: string,
+    lagMs: number | undefined,
+    handleMs: number,
+    timing: ClientTiming = {},
+  ): void {
+    this.logger.info("inbound message", {
+      id: message.messageId,
+      delivery: message.deliveryCount,
+      outcome,
+      lag_ms: lagMs,
+      ms: handleMs,
+      ...timing,
+    });
+  }
+}

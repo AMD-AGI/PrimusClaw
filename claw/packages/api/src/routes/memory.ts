@@ -61,7 +61,8 @@ export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> 
     return userId;
   }
 
-  // Opt-in preference. Off by default; `available` says whether the deployment
+  // The user's preference: their own choice once they made one, the deployment's default
+  // (`CLAW_MEMORY_DEFAULT_ON`, off unless set) before; `available` says whether the deployment
   // has memory at all, so a UI can explain a dead toggle.
   app.get<{ Params: { userId: string } }>("/v1/users/:userId/memory-settings", async (req, reply) => {
     const userId = resolveUserId(req, reply);
@@ -93,7 +94,8 @@ export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> 
   app.post<{ Params: { userId: string } }>("/v1/users/:userId/memories", async (req, reply) => {
     const userId = resolveUserId(req, reply);
     if (!userId) return;
-    if (!(await getMemoryPreference(userId))) {
+    // The deployment's switch first: a user's own "on" writes nothing where the deployment has no memory.
+    if (!memoryAvailable() || !(await getMemoryPreference(userId))) {
       return reply.status(409).send({ ok: false, error: "memory_disabled", message: "turn memory on before adding memories" });
     }
     const r = await writeMemory(userId, draftOf((req.body ?? {}) as Record<string, unknown>), { kind: "api", attended: attended(req) });
@@ -107,7 +109,7 @@ export async function registerMemoryRoutes(app: FastifyInstance): Promise<void> 
     if (!userId) return;
     // Editing writes memory content, so it needs the opt-in like any other write.
     // Deleting stays allowed whatever the preference.
-    if (!(await getMemoryPreference(userId))) {
+    if (!memoryAvailable() || !(await getMemoryPreference(userId))) {
       return reply.status(409).send({ ok: false, error: "memory_disabled", message: "turn memory on before editing memories" });
     }
     const id = entryId(req.params.id);

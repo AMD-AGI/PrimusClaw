@@ -10,6 +10,7 @@
  * `last_user` sandbox destruction. Per-DAG aggregation and cascade failure
  * are handled by the scheduler tick (`tasks/scheduler.ts`).
  */
+import { workspaceSaveHoldsSession } from "../sessions/save-hold.js";
 import { db, inTransaction } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import type { PoolClient } from "pg";
@@ -26,6 +27,7 @@ import { newTaskId } from "./ids.js";
 import { decodeRunTimeReport } from "@claw/protocol";
 import { settleRunTime } from "./run-time-ledger.js";
 import type { ClawTaskRow, TaskStatus } from "./types.js";
+import { holdPluginForAdmission } from "../marketplace/plugin-expiry.js";
 
 const logger = pino({ name: "task-lifecycle" });
 
@@ -40,6 +42,8 @@ export interface AgentDonePayload {
   error_count?: number;
   abort_reason?: string;
   failure_reason?: string;
+  /** What happened, for a person, when `failure_reason` is a code. Stored as `error_message`. */
+  failure_message?: string;
   /** Only set when abort_reason='wait_external'. */
   metadata?: Record<string, unknown>;
   /** The attempt's final per-state totals, merged with the transition. */
@@ -145,7 +149,9 @@ export async function applyAgentDone(taskId: string, payload: AgentDonePayload):
     token_usage: payload.token_usage ? JSON.stringify(payload.token_usage) : null,
     turns: payload.turns ?? null,
     failure_reason: payload.failure_reason ?? null,
-    error_message: payload.failure_reason ?? null,
+    error_message: (typeof payload.failure_message === "string" && payload.failure_message
+      ? payload.failure_message.slice(0, 2000)
+      : null) ?? payload.failure_reason ?? null,
   };
 
   // Only written when the callback carried them. A run that ended for its own
@@ -267,6 +273,12 @@ async function maybeStopHandlesForLastUser(
       { dagRootTaskId, dagNodeId, sessionId, hold: termHold.state, handles: owned.map(([h]) => h) },
       "sandbox.last_user_stop_deferred_terminal_hold",
     );
+    return;
+  }
+  // Nor while the session's last turn is still saving its workspace from this
+  // sandbox: the orphan sweep reaps it once the save is over (sessions/save-hold.ts).
+  if (await workspaceSaveHoldsSession(sessionId)) {
+    logger.info({ dagRootTaskId, dagNodeId, sessionId }, "sandbox.last_user_stop_deferred_workspace_save");
     return;
   }
 
@@ -547,6 +559,13 @@ export async function retryTask(taskId: string, client?: PoolClient): Promise<Re
   // The clone copies a persisted value no boundary re-checks, so a row written
   // before the `int4` bound would otherwise re-enter the fleet through retry.
   if (topologyErrors(task.input as Record<string, unknown> | null)) return { ok: false };
+  // The clone references the task's plugin: it must still be there (not
+  // deleted, not past a temporary plugin's expiry), and held against the
+  // expiry sweep until this commits.
+  if (task.plugin_id !== null && task.plugin_id !== undefined) {
+    if (!client) return await withOwnedAdmissionLock((ownedClient) => retryTask(taskId, ownedClient));
+    if (!(await holdPluginForAdmission(client, task.plugin_id))) return { ok: false };
+  }
 
   await acquireAdmissionLock(client);
   const decision = await decideAdmission(askFromRow(task, new Set()), client ?? db);

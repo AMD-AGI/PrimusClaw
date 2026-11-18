@@ -20,9 +20,12 @@ permissions:
   contents: read
 
 # Cancel superseded runs for the same ref.
+# One run per pull request: a new head cancels the previous head's run.
+# Every other event (push to main or deploy/**, tags, schedules, manual runs)
+# gets a group of its own, so it is never cancelled or replaced.
 concurrency:
-  group: connector-packaging-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   tarball-contents:
@@ -32,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: claw/.nvmrc
           cache: npm
@@ -59,7 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - run: python3 -c 'import yaml' || sudo apt-get install -y python3-yaml
+      - run: python3 -c 'import yaml' || sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y python3-yaml
 
       # connector-release.yml publishes to a public registry with an OIDC identity, and the file a
       # release runs is the one at the release's tag, so what keeps a publish behind the

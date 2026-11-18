@@ -334,7 +334,15 @@ describe("trigger tools", { skip }, () => {
     );
 
     const alice = await w.user("alice");
-    assert.equal(await offered(alice.routerSid, await w.routerTurn(alice)), undefined, "a router keeps to its own tools");
+    // A router keeps the turn's own server, to list the user's scheduled tasks with and nothing else (`read-tools.ts`).
+    const rt = await w.routerTurn(alice);
+    const routerTask: Record<string, unknown> = { task_id: rt.task_id, message_id: rt.mid };
+    await mcpMod.applyTriggerToolsToTask(routerTask, alice.routerSid);
+    await w.mod.role.applySessionRoleToTask(routerTask, alice.routerSid);
+    assert.ok((routerTask.mcp_servers as Record<string, unknown>)[mcpMod.TRIGGER_MCP_SERVER], "a router lists with the turn's own server");
+    const routerAllows = routerTask.tools_allowlist as string[];
+    assert.ok(routerAllows.includes("mcp__schedules__trigger_list"));
+    assert.ok(!routerAllows.some((p) => p.startsWith("mcp__schedules__trigger_c") || p === "mcp__schedules__*"), "and creates and cancels nothing");
     const item = await w.createItem(alice, "Fix the build");
     const wt = await w.workerTurn(item.itemId);
     assert.ok(await offered(item.workerSid, wt), "an item's worker is offered them");

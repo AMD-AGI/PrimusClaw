@@ -138,3 +138,54 @@ test("redactPublicJson masks a Vault secret_id and a map of passwords keyed by n
   assert.ok(!encoded.includes("XkjQmzPl"), encoded);
   for (const key of Object.keys(safe.input)) assert.equal(safe.input[key], "[REDACTED]", key);
 });
+
+// node-postgres hands a timestamptz back as a Date. `redactPublicJson` used to walk it like a
+// plain object and answer `{}`, so every task and session time in a public answer came back
+// empty (seen on `GET /v1/tasks/:id` of a deleted session's run). A Date keeps the JSON a
+// client would have got without redaction: its ISO string, or null when it is invalid.
+test("redactPublicJson keeps a Date as the ISO string JSON would carry", () => {
+  const at = new Date("2026-11-07T16:08:57.677Z");
+  const safe = redactPublicJson({ at, list: [at], nested: { at }, bad: new Date(Number.NaN) });
+  assert.deepEqual(safe, {
+    at: "2026-11-07T16:08:57.677Z",
+    list: ["2026-11-07T16:08:57.677Z"],
+    nested: { at: "2026-11-07T16:08:57.677Z" },
+    bad: null,
+  });
+  assert.equal(redactPublicJson(at), "2026-11-07T16:08:57.677Z");
+});
+
+test("publicTaskRow and publicSessionRow keep the row's times", () => {
+  const created = new Date("2026-11-07T16:06:07.000Z");
+  const task = publicTaskRow({
+    task_id: "ktsk_1",
+    created_at: created,
+    started_at: created,
+    completed_at: null,
+  } as unknown as ClawTaskRow) as unknown as Record<string, unknown>;
+  assert.equal(task.created_at, "2026-11-07T16:06:07.000Z");
+  assert.equal(task.started_at, "2026-11-07T16:06:07.000Z");
+  assert.equal(task.completed_at, null);
+  const session = publicSessionRow({ session_id: "s1", created_at: created, updated_at: created });
+  assert.equal(session.created_at, "2026-11-07T16:06:07.000Z");
+  assert.equal(session.updated_at, "2026-11-07T16:06:07.000Z");
+});
+
+test("a deleted session's task answers its times, not empty objects", async () => {
+  const { deletedSessionTaskView } = await import("../src/routes/tasks.js");
+  const view = deletedSessionTaskView({
+    task_id: "ktsk_1",
+    session_id: "845d5367-f159-4e03-b2cc-669fea227916",
+    status: "cancelled",
+    failure_reason: "session_deleted",
+    error_message: null,
+    created_at: new Date("2026-11-07T16:06:07.000Z"),
+    started_at: new Date("2026-11-07T16:06:21.000Z"),
+    completed_at: new Date("2026-11-07T16:08:57.677Z"),
+  } as unknown as ClawTaskRow);
+  assert.equal(view.created_at, "2026-11-07T16:06:07.000Z");
+  assert.equal(view.started_at, "2026-11-07T16:06:21.000Z");
+  assert.equal(view.completed_at, "2026-11-07T16:08:57.677Z");
+  assert.equal(view.status, "cancelled");
+  assert.equal(view.session_deleted, true);
+});

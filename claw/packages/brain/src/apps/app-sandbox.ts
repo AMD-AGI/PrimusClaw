@@ -35,10 +35,13 @@ import { fetchPlatformFacts } from "../sandbox/platform-facts-read.js";
 import { parseWorkloadListPage } from "../sandbox/multi-node/workload-parse.js";
 import { getSafeWorkloadProvider } from "../sandbox/factory.js";
 import { SESSION_ENV } from "../sandbox/multi-node/safe-body.js";
+import { usableUserDataRoot } from "./app-env.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES } from "../sandbox/workload-wait.js";
 import { pollWorkloadUntilRunning, SHUTDOWN_BUFFER_SECONDS } from "../sandbox/safe-workload-provider.js";
 import type { SandboxInstance } from "../sandbox/provider.js";
 import { applyModelKeyEnv } from "../sandbox/params.js";
+import { PLATFORM_CREDENTIAL_ENV, workloadSpecEnv } from "../sandbox/workload-env.js";
+import { SandboxProvisionTerminalError, provisionTerminalOf } from "../sandbox/errors.js";
 
 const logger = pino({ name: "app-sandbox" });
 
@@ -65,12 +68,29 @@ export interface AppSandboxRun {
   platformKey: string;
 }
 
+/**
+ * What an `ensure` is told about the run being stopped while it waits.
+ *
+ * `signal` is the run's: once it has fired no create is sent, and the wait for a
+ * workload that exists -- one whose create was already under way included -- ends
+ * at once (`sandbox_wait_interrupted`). `reclaimOnAbort`,
+ * read when the abort is seen, says whether that stop ends the run -- a cancel,
+ * the deadline, a terminal row: the workload is stopped, since nothing else will
+ * stop a sandbox that no run is going to use -- or hands it over -- a drain, a
+ * lost lease: the workload is left as it is for the Brain that takes the run
+ * over, which adopts it by `CLAW_APP_RUN_ID`. Absent means every stop ends the run.
+ */
+export interface AppSandboxEnsureOptions {
+  signal?: AbortSignal;
+  reclaimOnAbort?: () => boolean;
+}
+
 export interface AppSandboxDeps {
   /** Persist `claw_app_runs.sandbox_workload_id`. Called as soon as an id exists. */
   recordWorkloadId(runId: string, workloadId: string): Promise<void>;
   fetch?: typeof globalThis.fetch;
   /** Wait for a workload to be Running; defaults to the shared poll. */
-  waitRunning?: (workloadId: string, apiKey: string) => Promise<void>;
+  waitRunning?: (workloadId: string, apiKey: string, abort?: AppSandboxEnsureOptions) => Promise<void>;
   /** Create through the shared path; defaults to the real provider. */
   create?: typeof createSafeWorkloadSandbox;
   /** Stop a workload this call created or found surplus; defaults to the SaFE provider. */
@@ -109,12 +129,16 @@ export function appSandboxLabels(run: Pick<AppSandboxRun, "runId" | "sessionId" 
 export async function findLiveAppSandboxes(
   runId: string,
   apiKey: string,
+  workspaceId: string,
   fetchImpl: typeof globalThis.fetch = globalThis.fetch,
 ): Promise<Array<{ id: string; phase: string }>> {
   const found: Array<{ id: string; phase: string }> = [];
   let seen = 0;
   for (let page = 0; page < LIST_MAX_PAGES; page++) {
     const query = new URLSearchParams({
+      // SaFE authorizes a list against its workspace: without one only a
+      // system-admin may list, and every other user's run is refused with a 403.
+      workspaceId,
       envKey: APP_RUN_ID_ENV,
       envValue: runId,
       phase: ACTIVE_PHASES,
@@ -151,36 +175,124 @@ export async function findLiveAppSandboxes(
   throw new Error("app sandbox lookup failed: more workloads than one run can own");
 }
 
+/**
+ * The mount paths of a workspace's hostpath volumes, in the workspace's order,
+ * from SaFE's workspace detail (`volumes`, omitted when there are none). Only
+ * paths a shell can carry plainly are kept (see `usableUserDataRoot`).
+ */
+export function hostpathMountPaths(body: unknown): string[] {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new Error("workspace lookup failed: unrecognised workspace");
+  }
+  const volumes = (body as { volumes?: unknown }).volumes;
+  if (volumes === undefined || volumes === null) return [];
+  if (!Array.isArray(volumes)) throw new Error("workspace lookup failed: unrecognised volumes");
+  const out: string[] = [];
+  for (const v of volumes) {
+    if (typeof v !== "object" || v === null) continue;
+    const { type, mountPath } = v as { type?: unknown; mountPath?: unknown };
+    if (type !== "hostpath" || typeof mountPath !== "string" || !usableUserDataRoot(mountPath)) continue;
+    if (!out.includes(mountPath)) out.push(mountPath);
+  }
+  return out;
+}
+
+/**
+ * Where an app sandbox's `USER_DATA_PATH` is derived from when SaFE set none:
+ * the mount paths of its workspace's hostpath volumes. A workspace that is not
+ * there or not readable with the run owner's key has nothing to derive from, and
+ * says why (`unreadable`); any other failure throws, and the caller asks again.
+ */
+export async function workspaceUserDataRoots(
+  workspaceId: string,
+  apiKey: string,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): Promise<{ roots: string[]; unreadable?: string }> {
+  if (!SAFE_API_URL) throw new Error("workspace lookup failed: SAFE_API_URL is not configured");
+  const resp = await fetchImpl(`${SAFE_API_URL}/api/v1/workspaces/${encodeURIComponent(workspaceId)}`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
+  });
+  if (resp.status === 401 || resp.status === 403 || resp.status === 404) {
+    await resp.body?.cancel().catch(() => {});
+    logger.warn({ workspaceId, status: resp.status }, "app_sandbox.workspace_unreadable_for_user_data_path");
+    return { roots: [], unreadable: `HTTP ${resp.status}` };
+  }
+  if (resp.status !== 200) {
+    await resp.body?.cancel().catch(() => {});
+    throw new Error(`workspace lookup failed: HTTP ${resp.status}`);
+  }
+  return { roots: hostpathMountPaths(await resp.json().catch(() => null)) };
+}
+
 /** The spec's env without the session correlation variable, which a manifest must not set either. */
 function withoutSessionEnv(env: Record<string, string> | undefined): Record<string, string> {
   const { [SESSION_ENV]: _dropped, ...rest } = env ?? {};
   return rest;
 }
 
+/** The spec's env as an app sandbox may use it: no session correlation, no platform credential a spec could plant. */
+function appSpecEnv(spec: Pick<SandboxSpecCreate, "env"> | null | undefined): Record<string, string> {
+  const env = withoutSessionEnv(spec?.env);
+  for (const name of PLATFORM_CREDENTIAL_ENV) delete env[name];
+  return env;
+}
+
 /**
- * The env the sandbox is created with: the spec's, the run's identity, and the
- * model credential Hands sandboxes get: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
- * (applyModelKeyEnv; platform-owned, so it wins over the spec).
+ * The env the sandbox is created with: the spec's boot-time settings and the
+ * run's identity, which is how a run finds its sandbox again (SaFE's list
+ * endpoint filters on `envKey`).
+ *
+ * Everything here is stored by SaFE in the workload and returned to every
+ * caller allowed to read it. So the model credential is not set here, a
+ * platform credential a spec supplies (`SAFE_API_KEY`, ...) is dropped, and a
+ * spec variable that looks like a credential is left out (workloadSpecEnv);
+ * the spec's whole env, and the model credential, travel with the
+ * application's start command (appStartEnv).
+ */
+export function appSandboxEnv(run: Pick<AppSandboxRun, "runId" | "sandboxSpec">): Record<string, string> {
+  const spec = appSpecEnv(run.sandboxSpec);
+  return { ...workloadSpecEnv(spec, spec, [], new Set()), [APP_RUN_ID_ENV]: run.runId };
+}
+
+/**
+ * The execute env of the application's start command: the spec's env, then the
+ * application's own env (as the start command's env always overlaid the
+ * pod's), then the model credential, which is platform-owned and so laid last.
+ */
+export function appStartEnv(
+  spec: Pick<SandboxSpecCreate, "env"> | null | undefined,
+  appEnv: Record<string, string>,
+  platformKey: string | undefined,
+): Record<string, string> {
+  return { ...appSpecEnv(spec), ...appEnv, ...appModelKeyEnv(platformKey) };
+}
+
+/**
+ * The model credential Hands sandboxes get, `ANTHROPIC_API_KEY` /
+ * `OPENAI_API_KEY` (applyModelKeyEnv), for the application's start command.
  *
  * In SaFE mode that key is the session owner's SaFE platform key. Code in the
  * sandbox can use it to call the SaFE API as the session owner, exactly as it can
  * in a Hands sandbox. The run's AppRunner scrubs it from forwarded output and it
- * is never stored in `claw_app_runs`.
- *
- * Only those two variables carry it: `SAFE_API_KEY` is not set (and one a spec
- * supplies is dropped), and no gateway URL is injected (the SaFE path leaves URLs
- * to the image / the manifest's env, so a manifest can point its agent elsewhere;
- * see ensureHands).
+ * is never stored in `claw_app_runs`. It travels in the execute request's env,
+ * never in the workload (see appSandboxEnv) or the logged command.
  */
-export function appSandboxEnv(run: Pick<AppSandboxRun, "runId" | "sandboxSpec" | "platformKey">): Record<string, string> {
-  const env: Record<string, string> = { ...withoutSessionEnv(run.sandboxSpec.env), [APP_RUN_ID_ENV]: run.runId };
-  delete env.SAFE_API_KEY;
-  applyModelKeyEnv(env, run.platformKey);
+export function appModelKeyEnv(platformKey: string | undefined): Record<string, string> {
+  const env: Record<string, string> = {};
+  applyModelKeyEnv(env, platformKey);
   return env;
 }
 
-const appSandboxNamespace = (run: Pick<AppSandboxRun, "workspaceId" | "sandboxSpec">): string =>
-  sandboxNamespaceForResources(run.workspaceId, run.sandboxSpec?.resources);
+/**
+ * The workspace the app container runs in: the run's `resources.workspace`, which
+ * admission checked the caller may use. The CPU/GPU rule of chat sandboxes does not
+ * move it, or the app would land in a workspace the caller never named. A run with
+ * no workspace (none is admitted that way today) falls back to that rule.
+ */
+export function appSandboxNamespace(run: Pick<AppSandboxRun, "workspaceId" | "sandboxSpec">): string {
+  return run.workspaceId?.trim() || sandboxNamespaceForResources(undefined, run.sandboxSpec?.resources);
+}
 
 /**
  * The handle of an app sandbox whose workload id is already known: a run being
@@ -206,15 +318,35 @@ export function appSandboxInstance(
 /**
  * The run's sandbox: an existing live one, or a fresh one. Returns once the
  * sandbox is Running.
+ *
+ * `abort` is the run's signal (see {@link AppSandboxEnsureOptions}). A run that is
+ * stopped while this waits -- a session deleted seconds after the run was
+ * submitted, with the workload still queued -- must not be left holding a
+ * sandbox it will never use: the workload is stopped here, at once, rather than
+ * waited on until it is Running and stopped (or not) by a finish whose lease has
+ * long run out by then.
  */
-export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps): Promise<AppSandbox> {
+export async function ensureAppSandbox(
+  run: AppSandboxRun,
+  deps: AppSandboxDeps,
+  abort: AppSandboxEnsureOptions = {},
+): Promise<AppSandbox> {
   if (isKubernetesMode()) {
     throw new Error("app sandboxes are created through SaFE; kubernetes mode is not supported");
   }
   if (!run.platformKey) throw new Error("ensureAppSandbox: platformKey is required");
   if (!run.sandboxSpec?.image?.trim()) throw new Error("ensureAppSandbox: sandbox_spec has no image");
   const ns = appSandboxNamespace(run);
-  const wait = deps.waitRunning ?? ((id, key) => pollWorkloadUntilRunning(id, key, undefined, undefined, "app"));
+  const wait = deps.waitRunning ?? ((id, key, s) => pollWorkloadUntilRunning(id, key, undefined, undefined, "app", {
+    signal: s?.signal, reclaimOnAbort: s?.reclaimOnAbort,
+  }));
+  /**
+   * The wait was cut short by a stop that hands the run over: the workload is
+   * the next holder's to adopt, and stopping it would leave that holder nothing.
+   */
+  const handedOver = (err: unknown): boolean =>
+    provisionTerminalOf(err)?.reason === "sandbox_wait_interrupted"
+    && abort.reclaimOnAbort !== undefined && !abort.reclaimOnAbort();
   // An app sandbox has no Hands in it, so there is no Hands URL to give.
   const instanceFor = (id: string): SandboxInstance => appSandboxInstance(run, id);
   const stop = deps.stop ?? ((id: string) => getSafeWorkloadProvider().stop(instanceFor(id)));
@@ -228,7 +360,7 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
     }
   };
 
-  const live = await findLiveAppSandboxes(run.runId, run.platformKey, deps.fetch);
+  const live = await findLiveAppSandboxes(run.runId, run.platformKey, ns, deps.fetch);
   if (live.length > 0) {
     // `live` is newest first. More than one means an earlier create was never seen
     // by the run (so it was never recorded or stopped). Which one is the run's:
@@ -244,14 +376,15 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
     if (run.sandboxWorkloadId !== adopted.id) await deps.recordWorkloadId(run.runId, adopted.id);
     if (adopted.phase !== "running") {
       try {
-        await wait(adopted.id, run.platformKey);
+        await wait(adopted.id, run.platformKey, abort);
       } catch (err) {
         // A workload that cannot be brought to Running (queued past the ceiling, or
-        // gone terminal) is stopped, as on the create path: left live, the next
-        // attempt would find and adopt it again, for ever. The surplus is left for
-        // that next attempt: it is not known to be bad, and stopping it too would
-        // leave the run with nothing.
-        await reclaim(adopted.id, "adopted_wait_failed");
+        // gone terminal), or whose run was cancelled while it waited, is stopped, as
+        // on the create path: left live, the next attempt would find and adopt it
+        // again, for ever. The surplus is left for that next attempt: it is not known
+        // to be bad, and stopping it too would leave the run with nothing. A run
+        // being handed over leaves it to the next holder.
+        if (!handedOver(err)) await reclaim(adopted.id, "adopted_wait_failed");
         throw err;
       }
     }
@@ -268,6 +401,15 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
   const resources = spec.resources;
   if (!resources || Object.keys(resources).length === 0) {
     throw new Error("ensureAppSandbox: sandbox_spec has no resources");
+  }
+  // Last look before the create: a run stopped while the lookup above was in
+  // flight gets no workload at all. After this the create itself is not cut short
+  // (SaFE may accept a create whose answer was dropped, and that workload would
+  // have no recorded id); the wait that follows it is.
+  if (abort.signal?.aborted) {
+    throw new SandboxProvisionTerminalError(
+      "sandbox_wait_interrupted", `app run ${run.runId} was stopped before its sandbox was created`,
+    );
   }
   const create = deps.create ?? createSafeWorkloadSandbox;
   let createdId: string | undefined;
@@ -296,13 +438,101 @@ export async function ensureAppSandbox(run: AppSandboxRun, deps: AppSandboxDeps)
         createdId = id;
         await deps.recordWorkloadId(run.runId, id);
       },
+      // The run's stop ends the wait for Running. The provider stops the workload
+      // itself (its onGiveUp) when `reclaimOnAbort` says the stop ends the run, and
+      // leaves it when it hands the run over.
+      ...(abort.signal ? { signal: abort.signal } : {}),
+      ...(abort.reclaimOnAbort ? { reclaimOnAbort: abort.reclaimOnAbort } : {}),
     });
     logger.info({ runId: run.runId, workloadId: inst.id }, "app_sandbox.created");
     // The handle is built here, as on the adopt path: the provider's carries a Hands
     // URL, and the same run must not get one when created and none when adopted.
     return { instance: instanceFor(inst.id), workloadId: inst.id, created: true };
   } catch (err) {
-    if (createdId !== undefined) await reclaim(createdId, "create_failed");
+    // After a cancel too, although the provider has already stopped the workload
+    // then: a stop that failed there is only logged, and a second one costs nothing.
+    // Never after a hand-over (see handedOver). A create whose id could not be
+    // recorded because the lease had moved on (`not_holder`) is still stopped: the
+    // new holder may have adopted it, and then counts it a lost sandbox and makes
+    // another, but left running it can be left to nobody, when the new holder had
+    // already finished the run before this create landed.
+    if (createdId !== undefined && !handedOver(err)) await reclaim(createdId, "create_failed");
+    throw err;
+  }
+}
+
+/** Component label of a reader sandbox: made only to read a run's state directory, never to run it. */
+export const APP_READER_COMPONENT = "app-reader";
+/**
+ * Env a reader sandbox carries its run's id under. Not {@link APP_RUN_ID_ENV}: the run's own
+ * lookup (`findLiveAppSandboxes`) matches on that, and a reader it found would be adopted as the
+ * run's sandbox and the application started in it.
+ */
+export const APP_READER_ENV = "CLAW_APP_READER_OF";
+/**
+ * What a reader is given: enough to `cat` one file from shared storage, and no accelerator. Not
+ * the run's resources: those are sized for the application, and a reader made with them took a
+ * second application's worth of capacity only to read `exit.json`.
+ */
+export const APP_READER_RESOURCES: Readonly<Record<string, string>> = Object.freeze({
+  cpu: "1", memory: "2Gi", "ephemeral-storage": "1Gi",
+});
+/** A reader is stopped as soon as it has been read from; this bounds one whose Brain died first. */
+export const APP_READER_TIMEOUT_SEC = 600;
+
+/**
+ * A small sandbox in the run's workspace, made only to read the run's state directory -- which
+ * is shared storage, so it outlives the run's own sandbox -- once that sandbox is gone. The run's
+ * image (it has the shell the read needs), {@link APP_READER_RESOURCES}, no spec env and no
+ * credentials. Returns once it is Running. The caller stops it when the read is done.
+ */
+export async function createAppReaderSandbox(
+  run: AppSandboxRun,
+  deps: Pick<AppSandboxDeps, "create" | "stop"> = {},
+  abort: AppSandboxEnsureOptions = {},
+): Promise<AppSandbox> {
+  if (isKubernetesMode()) {
+    throw new Error("app sandboxes are created through SaFE; kubernetes mode is not supported");
+  }
+  if (!run.platformKey) throw new Error("createAppReaderSandbox: platformKey is required");
+  if (!run.sandboxSpec?.image?.trim()) throw new Error("createAppReaderSandbox: sandbox_spec has no image");
+  if (abort.signal?.aborted) {
+    throw new SandboxProvisionTerminalError(
+      "sandbox_wait_interrupted", `app run ${run.runId} was stopped before its reader was created`,
+    );
+  }
+  const create = deps.create ?? createSafeWorkloadSandbox;
+  const stop = deps.stop ?? ((id: string) => getSafeWorkloadProvider().stop(appSandboxInstance(run, id)));
+  let createdId: string | undefined;
+  try {
+    const inst = await create({
+      sessionId: run.sessionId,
+      namespace: appSandboxNamespace(run),
+      image: run.sandboxSpec.image,
+      resources: { ...APP_READER_RESOURCES },
+      env: { [APP_READER_ENV]: run.runId },
+      labels: {
+        ...composeSandboxLabels({ sessionId: run.sessionId, component: APP_READER_COMPONENT, own: { [APP_RUN_ID_LABEL]: run.runId } }),
+        [COMPONENT_LABEL]: APP_READER_COMPONENT,
+      },
+      timeoutSec: APP_READER_TIMEOUT_SEC,
+      ttlSec: DEFAULT_SANDBOX_TTL_SEC,
+      platformKey: run.platformKey,
+      onProvisioned: async (id) => { createdId = id; },
+      ...(abort.signal ? { signal: abort.signal } : {}),
+      // A reader is nobody's to adopt: whatever cut its wait short, it is stopped.
+      reclaimOnAbort: () => true,
+    });
+    logger.info({ runId: run.runId, workloadId: inst.id }, "app_sandbox.reader_created");
+    return { instance: appSandboxInstance(run, inst.id), workloadId: inst.id, created: true };
+  } catch (err) {
+    if (createdId !== undefined) {
+      try {
+        await stop(createdId);
+      } catch (e) {
+        logger.error({ runId: run.runId, workloadId: createdId, err: e instanceof Error ? e.message : String(e) }, "app_sandbox.reader_reclaim_failed");
+      }
+    }
     throw err;
   }
 }

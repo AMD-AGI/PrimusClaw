@@ -55,17 +55,20 @@
 import type { KV } from "nats";
 import type { S3Client } from "@aws-sdk/client-s3";
 import { ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
-import { cleanupSubject, encodeCleanupPayload, parkHandsHandle, type ParkOutcome } from "@claw/protocol";
+import {
+  GRANT_CALL_TIMEOUT_MS, cleanupSubject, encodeCleanupPayload, parkHandsHandle, type ParkOutcome,
+} from "@claw/protocol";
 import pino from "pino";
 
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { sessionWorkspacePrefix, workspaceOwnerId } from "../workspace/prefix.js";
-import { getS3Client } from "../infra/s3-client.js";
+import { getS3Client, S3_LIST_PAGE_KEYS } from "../infra/s3-client.js";
 import { metrics } from "../infra/metrics.js";
 import { releaseSessionRefs, workspaceForSession } from "../workspace/store.js";
 import { sc, nc, kv, kvTombstones, jsm, EVENT_STREAM } from "../infra/nats.js";
 import { rememberSessionDeleted } from "./deleted-cache.js";
+import { appGrantSigner } from "../grants/app-grant.js";
 import { S3_BUCKET, envInt } from "../config.js";
 
 const logger = pino({ name: "session-teardown" });
@@ -223,21 +226,41 @@ function pastDeadline(deadline?: number): boolean {
 }
 
 /**
- * Delete everything under one prefix, a page at a time.
+ * Delete everything under one prefix, a directory at a time.
  *
- * Each page is deleted before the next is listed, rather than collecting every
- * key first. A workspace archive is written per turn, so a long session reaches
- * six figures of objects, and holding all of them costs memory in a request
- * handler for no benefit -- they are deleted one page later anyway. Safe to
- * interleave: a continuation token resumes after the last key returned, so
- * removing keys already listed does not disturb the walk.
+ * Walked with a delimiter, depth first, rather than as one flat listing. The
+ * reason is the store's and not the API's: MinIO answers a listing out of a
+ * metadata cache it fills by walking the drives, and the first page of a
+ * recursive listing waits for that cache's first block -- thousands of entries,
+ * so for any workspace smaller than that the whole subtree is read before a
+ * single key comes back, whatever `MaxKeys` asked for. Measured on production
+ * for a deleted session that never finished deleting: 4,470 objects in 978
+ * directories, a first hundred-key page of 161 s against a thirty-second
+ * request timeout, so every attempt failed on its first listing having deleted
+ * nothing, and failed the same way on every retry. A listing with a delimiter
+ * reads one directory; the same prefix walked that way took 979 listings, the
+ * slowest 7.5 s. What bounds a request is then the widest directory and not the
+ * whole workspace, which is a bound a session can only exceed by putting
+ * thousands of files side by side.
  *
- * The page boundary is where a deadline is honoured between listings. Inside a
- * page the delete batches honour it too: finishing a thousand-key page after
- * the clock has stopped is how an inline delete spends minutes in a request
- * handler, and how it overlaps a sweeper pass that thought it had the rest.
- * Stopping mid-page is still resumable -- the next attempt lists from the
- * start and the keys already gone are simply not returned.
+ * Each page's keys are deleted, and the subdirectories that page named are
+ * walked, before the next page of the same directory is asked for. Holding a
+ * directory's subdirectories until all of its pages were listed would let a
+ * pass spend its whole budget listing a level that holds only directories and
+ * stop having deleted nothing -- which the cleanup records as no progress and
+ * backs off, the stuck row again by another route. Walked this way, a pass
+ * reaches a file after one listing per level, and one cut short by the
+ * deadline has removed whole subtrees, so the next pass -- which lists from the
+ * top again -- finds less than this one did. MinIO drops a directory once its
+ * last object goes, so emptied subtrees are not even listed again. Safe to
+ * interleave for the same reason a flat walk was: a continuation token resumes
+ * after the last entry returned, so deleting entries already listed does not
+ * disturb it.
+ *
+ * Every directory followed is a common prefix the store returned for a listing
+ * under `prefix`, so it extends `prefix`; one that does not, or that does not
+ * grow, is refused rather than followed. The prefix is the whole safety argument
+ * for this delete, and it is checked here rather than trusted.
  */
 async function deletePrefix(
   s3: S3Client,
@@ -247,21 +270,44 @@ async function deletePrefix(
 ): Promise<{ deleted: number; failed: number; complete: boolean }> {
   let deleted = 0;
   let failed = 0;
-  let token: string | undefined;
-  do {
+  /** A directory being walked: where its listing is, and the subdirectories its last page named. */
+  interface Frame { dir: string; token?: string; listed: boolean; below: string[] }
+  const stack: Frame[] = [{ dir: prefix, listed: false, below: [] }];
+  while (stack.length) {
+    const frame = stack[stack.length - 1];
+    const next = frame.below.shift();
+    if (next !== undefined) {
+      stack.push({ dir: next, listed: false, below: [] });
+      continue;
+    }
+    if (frame.listed && frame.token === undefined) {
+      stack.pop();
+      continue;
+    }
     if (pastDeadline(deadline)) return { deleted, failed, complete: false };
     const page = await s3.send(
-      new ListObjectsV2Command({ Bucket: S3_BUCKET, Prefix: prefix, ContinuationToken: token }),
+      new ListObjectsV2Command({
+        Bucket: S3_BUCKET,
+        Prefix: frame.dir,
+        Delimiter: "/",
+        ContinuationToken: frame.token,
+        MaxKeys: S3_LIST_PAGE_KEYS,
+      }),
     );
+    frame.listed = true;
+    frame.token = page.IsTruncated ? page.NextContinuationToken : undefined;
+    for (const common of page.CommonPrefixes ?? []) {
+      const sub = common.Prefix;
+      if (sub && sub.startsWith(frame.dir) && sub.length > frame.dir.length) frame.below.push(sub);
+    }
     const keys = (page.Contents ?? [])
       .map((obj) => obj.Key)
-      .filter((key): key is string => Boolean(key));
+      .filter((key): key is string => typeof key === "string" && key.startsWith(prefix));
     const outcome = await deleteObjects(s3, keys, sessionId, deadline);
     deleted += outcome.deleted;
     failed += outcome.failed;
     if (!outcome.complete) return { deleted, failed, complete: false };
-    token = page.IsTruncated ? page.NextContinuationToken : undefined;
-  } while (token);
+  }
   return { deleted, failed, complete: true };
 }
 
@@ -475,6 +521,64 @@ async function deleteGateLocks(sessionId: string): Promise<boolean> {
 }
 
 /**
+ * Revoke the sandbox grants of the session's hosted application runs.
+ *
+ * A grant is what the application creates its own sandboxes with -- GPU ones,
+ * typically -- and revoking it is what reclaims them: Agent Sandbox marks the
+ * grant revoked (its keys fail at once) and deletes every sandbox made under it.
+ * Brain revokes it too, as a step of finishing the run, but that step used to
+ * wait for the application's SIGTERM grace, fifteen minutes by default, during
+ * which a deleted session held its GPUs. Nothing about a deleted session needs
+ * those sandboxes, so the grant goes here, with the rest of the session.
+ *
+ * The row is stamped first, so a Brain still running the application does not
+ * extend or re-sign a grant that is being revoked; a revoke that then fails
+ * leaves the step unfinished and the sweeper repeats it. Repeating is safe: the
+ * service answers a revoked or unknown grant with success. A run already `ended`
+ * had its grant revoked by the Brain that ended it, and is not asked about again.
+ *
+ * Without a signing key this process cannot reach the grant service, and there is
+ * then nothing here to do: the Brain's finishing step is the only revoke.
+ *
+ * @returns whether every grant was confirmed revoked.
+ */
+export async function revokeSessionAppGrants(sessionId: string, deadline?: number): Promise<boolean> {
+  const signer = teardownGrantSigner.current();
+  if (!signer) return true;
+  const rows = (await db.query(
+    `UPDATE claw_app_runs SET grant_revoked_at = COALESCE(grant_revoked_at, NOW()), updated_at = NOW()
+      WHERE session_id = $1 AND grant_id IS NOT NULL AND state <> 'ended'
+      RETURNING task_id, grant_id`,
+    [sessionId],
+  )).rows as Array<{ task_id: string; grant_id: string }>;
+  if (rows.length === 0) return true;
+  // All at once, under one bound: the caller's budget, and never below a second.
+  // A revoke cut short has still marked the grant revoked on the service, whose
+  // reaper finishes reclaiming its sandboxes; the retry only confirms it.
+  const timeoutMs = deadline === undefined
+    ? GRANT_CALL_TIMEOUT_MS
+    : Math.max(1_000, Math.min(GRANT_CALL_TIMEOUT_MS, deadline - Date.now()));
+  const signal = AbortSignal.timeout(timeoutMs);
+  const results = await Promise.allSettled(rows.map((row) => signer.revoke(row.grant_id, signal)));
+  let complete = true;
+  results.forEach((result, i) => {
+    const { task_id: taskId, grant_id: grantId } = rows[i]!;
+    if (result.status === "fulfilled") {
+      logger.info({ sessionId, taskId, grantId }, "session.app_grant_revoked");
+      return;
+    }
+    complete = false;
+    logger.warn({ sessionId, taskId, grantId, err: errorText(result.reason) }, "session.app_grant_revoke_failed");
+  });
+  return complete;
+}
+
+/** Where the cleanup gets its grant client; a seam so a test can stand in for the service. */
+export const teardownGrantSigner = {
+  current: (): Pick<NonNullable<ReturnType<typeof appGrantSigner>>, "revoke"> | null => appGrantSigner(),
+};
+
+/**
  * The steps of the cleanup that leave this process, in one object.
  *
  * A seam, because the order is the part that was wrong and the part no test
@@ -497,6 +601,7 @@ export const teardownPorts = {
     await jsm.streams.purge(EVENT_STREAM, { filter: `events.${sessionId}` } as never);
   },
   deleteGateLocks,
+  revokeAppGrants: revokeSessionAppGrants,
   deleteWorkspaceObjects: deleteSessionWorkspaceObjects,
   releaseWorkspaceRefs: releaseSessionRefs,
   parkHands: (sessionId: string): Promise<ParkOutcome> =>
@@ -575,10 +680,28 @@ export interface TeardownInput {
  * that row. Rows of other sessions it reads (a team member's) it locks itself. When it
  * answers false nothing is written and this returns false.
  *
+ * Every deletion -- a user's own or retention's -- takes
+ * {@link ARCHIVED_DELETION_LOCK_ID} first, for its transaction: retention's daily
+ * limit counts every archived session deleted in the last 24 hours (nothing on
+ * the row says who deleted it), and asks that count again under this lock, in
+ * `onlyIf`, so a user's delete committed while retention was deciding is in it.
+ * Every deletion and not only an archived one, because a session can be
+ * archived between a check and the deletion that follows it. The hold is one
+ * short transaction.
+ * Taken before the session row, by every holder, so the two cannot wait on each
+ * other in the opposite order.
+ *
  * @returns true when the deletion committed, false when `onlyIf` declined it.
  * @throws {TeardownRefused} when the transaction did not commit, in which case
  *         the session and every row it has are exactly as they were.
  */
+/**
+ * Serialises session deletions, for retention's daily count of archived ones; see
+ * {@link commitSessionDeletion}. Shares one namespace with every advisory lock in
+ * this database (`LEADER_LOCK_IDS`, `SCHEMA_MIGRATION_LOCK_ID`).
+ */
+export const ARCHIVED_DELETION_LOCK_ID = 8_264_179_233_105;
+
 export async function commitSessionDeletion(
   sessionId: string,
   opts: { onlyIf?: (query: Querier) => Promise<boolean> } = {},
@@ -591,6 +714,7 @@ export async function commitSessionDeletion(
   }>;
   try {
     queueExits = await inTransaction(async (query: Querier) => {
+      await query("SELECT pg_advisory_xact_lock($1)", [ARCHIVED_DELETION_LOCK_ID]);
       // Before anything is written, so that what it checks -- the queue among
       // it -- is still there to be seen. Under the session lock, taken here
       // first for that reason; the lock taken again below is then a no-op.
@@ -820,6 +944,9 @@ function cleanupSteps(input: TeardownInput, deadline?: number): CleanupStep[] {
     // themselves. Every reader treats a lock as a live run on those files,
     // including the collector that would otherwise never reclaim the directory.
     { label: "lock_release", run: () => teardownPorts.deleteGateLocks(sessionId) },
+    // The hosted application runs' grants, and the sandboxes made under them.
+    // Before the slow steps, because what it frees is GPUs; see revokeSessionAppGrants.
+    { label: "app_grants", run: () => teardownPorts.revokeAppGrants(sessionId, deadline) },
     {
       label: "events_purge",
       run: async () => {

@@ -33,7 +33,7 @@ Browser / MCP Client
 | Helm         | 3.x (`helm repo add nats https://nats-io.github.io/k8s/helm/charts/`) |
 | PostgreSQL   | PGO-managed cluster in `primus-claw` with Secret `primus-claw-pguser-postgres` |
 | MinIO        | Running in `minio` namespace, accessible at `minio.minio.svc.cluster.local:9000`, with the `S3_BUCKET` bucket (default `claw`) already created — no script creates it |
-| Container image | `<REGISTRY>/claw:<TAG>` built and pushed      |
+| Container image | A release, `docker.io/rocm/primusclaw:claw-<version>` (the default), or `<REGISTRY>/claw:<TAG>` of your own, built and pushed |
 | Ingress      | Higress ingress controller installed                     |
 | Sandbox namespace | The namespace named by `secret.sandboxNamespace` must already exist. Sandboxes without a request-supplied `workspace_id` are created there by the agent-sandbox router; the chart does not create it, and install fails early if it is missing. Defaults to `default`. |
 
@@ -43,8 +43,10 @@ Browser / MCP Client
 # 1. Copy/fill per-env values (contains secrets; do not commit)
 cp deploy/values.example.env deploy/values.primus-claw.env
 
-# 2. Deploy everything
-REGISTRY=myregistry.com/claw TAG=v1.0.0 bash deploy/deploy.sh
+# 2. Deploy everything: the release docker.io/rocm/primusclaw:claw-0.4.4
+TAG=claw-0.4.4 bash deploy/deploy.sh
+#    or an image of your own, myregistry.com/team/claw:v1.0.0
+REGISTRY=myregistry.com/team TAG=v1.0.0 bash deploy/deploy.sh
 ```
 
 ### Upgrade Note: BYOK Verification Protocol
@@ -119,7 +121,8 @@ exist before the first session runs, or workspace sync has nowhere to write.
 | `POSTGRES_SSLMODE`             | PG SSL mode                              | `require`                                            |
 | `SAFE_API_URL`                 | SaFE platform base URL                   | `https://cluster.example.com`                |
 | `SANDBOX_NAMESPACE`            | SaFE sandbox namespace; the default workspace of a sandbox, also the one `GET /v1/me` names as `sandbox.defaultWorkspaceId` when the caller has it | `example-sandbox`                                     |
-| `SANDBOX_CPU_NAMESPACE`        | Optional. A separate SaFE workspace for sandboxes that ask for no GPU (`gpu` absent or 0); `SANDBOX_NAMESPACE` is then the GPU workspace. A sandbox that asks for a GPU never goes here, even when a request names this workspace, and neither does a multi-node cluster; the Hands sandbox of a multi-node run goes next to its cluster, whatever it asks for. A workspace a request names still wins otherwise. `GET /v1/me` names this one as the default, and the API stamps no default workspace on tasks (Brain picks per sandbox). Set it on api and brain (`EXTRA_ENV_API_` / `EXTRA_ENV_BRAIN_`) | unset: one workspace for every sandbox |
+| `SANDBOX_CPU_NAMESPACE`        | Optional. A separate SaFE workspace for sandboxes that ask for no GPU (`gpu` absent or 0); `SANDBOX_NAMESPACE` is then the GPU workspace. A sandbox that asks for a GPU never goes here, even when a request names this workspace, and neither does a multi-node cluster; the Hands sandbox of a multi-node run goes next to its cluster, whatever it asks for. A workspace a request names still wins otherwise. `GET /v1/me` names this one as the default, reports in `sandbox.cpu` whether the caller can have a sandbox in it, and the API stamps no default workspace on tasks (Brain picks per sandbox). Set it on api and brain (`EXTRA_ENV_API_` / `EXTRA_ENV_BRAIN_`) | unset: one workspace for every sandbox |
+| `SANDBOX_ALLOWED_NAMESPACES`   | Optional. The SaFE workspaces a sandbox may be created in, comma or space separated: those whose network policies isolate a sandbox. `SANDBOX_NAMESPACE`, `SANDBOX_CPU_NAMESPACE` and `AGENT_SANDBOX_NAMESPACE` are always included. A request naming another workspace (a message, a session, a DAG node sandbox, an application run or its grant, an A2A send) is refused with 400 `sandbox_workspace_not_allowed`, and Brain refuses to create a sandbox or multi-node cluster there; the workspace Brain falls back to on its own (`default` when `SANDBOX_NAMESPACE` is unset) is always allowed. Set it on api and brain (`EXTRA_ENV_API_` / `EXTRA_ENV_BRAIN_`) | unset: every workspace |
 | `ANTHROPIC_BASE_URL`           | LLM gateway URL                          | `https://cluster.example.com/llm-gateway`   |
 | `S3_ENDPOINT`                  | MinIO / S3 endpoint                      | `http://minio.minio.svc.cluster.local:9000`          |
 | `S3_SANDBOX_ENDPOINT`          | S3 endpoint as sandboxes reach it, for presigned URLs (default: `S3_API_ENDPOINT`) | `https://cluster.example.com` |
@@ -164,13 +167,16 @@ kube-router, ...), `networkPolicy` in `charts/claw/values.yaml` renders:
 | `default-deny` | release | Nothing in or out of any pod unless allowed below. |
 | `allow-ingress-pod-network` | release | Ingress from `networkPolicy.ingressCIDRs` (typically the pod network). |
 | `allow-egress` | release | Own namespace; `egressNamespaces` (any port); `egressNamespacePorts`; DNS (kube-dns and `dnsIPs`); `egressCIDRs`; public addresses (outside `privateCIDRs`, so no cloud metadata) on `publicEgressPorts`. |
-| `claw-sandbox-egress` | each of `sandboxEgress.namespaces` | Egress of the Hands pods only: DNS, `sandboxEgress.egressPods` (the agent-sandbox control plane), `sandboxEgress.egressCIDRs`, public addresses on `sandboxEgress.publicEgressPorts`. The Kubernetes API, in-cluster databases and cloud metadata are not reachable. |
+| `claw-sandbox-egress` | each of `sandboxEgress.namespaces` | Egress of the Hands pods only: DNS, `sandboxEgress.egressPods` (the agent-sandbox control plane), `sandboxEgress.egressCIDRs`, public addresses on `sandboxEgress.publicEgressPorts`. The Kubernetes API, in-cluster databases, cloud metadata and Azure's host endpoint (168.63.129.16, in the default `privateCIDRs`) are not reachable. |
+| `claw-sandbox-ingress` | each of `sandboxEgress.namespaces` | With `sandboxIngress.enabled`: ingress of the Hands pods only from `sandboxIngress.fromPods` (default: the agent-sandbox control plane), `sandboxIngress.fromCIDRs`, and this release's Brain and API pods when they reach Hands directly (`admitClaw: auto`: kubernetes mode, or safe mode without `secret.sandboxHandsViaRouter`), on any port. Kubelet probes come from the node, which kube-router, Calico and Cilium let through. Without it any pod of the cluster can connect to a sandbox's envd. In kubernetes mode the Hands pods do not carry `podLabels` yet (agent-sandbox puts a request's labels on the Sandbox object only), so neither sandbox policy selects them there. |
 
 Ingress is by CIDR on purpose: a gateway on the host network has no pod
 identity (it arrives from the node address, or from the node's overlay address
 on another node), and an engine that learns a new pod's address a second or two
 after it starts (kube-router) refuses a selector-matched client's first
-connection. `deploy.sh` reads the lists from the values file named by
+connection. The sandbox ingress policy is the exception: its client is the
+long-lived agent-sandbox control plane, refused only for that moment after it
+rolls; use `sandboxIngress.fromCIDRs` instead where that matters. `deploy.sh` reads the lists from the values file named by
 `NETWORK_POLICY_VALUES_FILE`; `upgrade.sh` does not touch NetworkPolicies.
 
 ```yaml
@@ -189,6 +195,8 @@ networkPolicy:
     egressPods:
       - {namespace: agent-sandbox-system, podLabels: {app: agent-sandbox-controlplane}, ports: [8080, 8081]}
     egressCIDRs: [{cidr: 192.0.2.0/24, ports: [80, 443]}]
+  sandboxIngress:
+    enabled: true
 ```
 
 ### PostgreSQL Connection

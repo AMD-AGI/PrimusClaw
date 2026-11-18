@@ -96,6 +96,7 @@ describe("A2A push notifications", { skip }, () => {
     process.env.CLAW_A2A_CONTEXT_TASKS = "1";
     process.env.CLAW_A2A_PUSH_ENABLED = "1";
     process.env.CLAW_A2A_PUSH_ALLOWED_HOSTS = "127.0.0.1,hooks.internal";
+    delete process.env.CLAW_A2A_PUSH_ALLOWED_HOSTS_ONLY;
     await query("DELETE FROM claw_a2a_push_outbox");
     await query("DELETE FROM claw_a2a_push_configs");
   });
@@ -592,6 +593,31 @@ describe("A2A push notifications", { skip }, () => {
       });
       assert.deepEqual(r, { delivered: 0, failed: 1 });
       assert.equal(s.n, 0, "taken off the list, it is refused at delivery");
+    });
+
+    test("with the list made the whole of it, a public host not named is refused when the config is created", async () => {
+      process.env.CLAW_A2A_PUSH_ALLOWED_HOSTS_ONLY = "true";
+      const t = await liveTask();
+      const r = await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: HOOK });
+      assert.equal(r.error?.code, -32602, JSON.stringify(r));
+      assert.equal(r.error.message, "push notification url refused: host_not_allowed");
+      const named = await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: "http://127.0.0.1:18911/hook" });
+      assert.ok(named.result, JSON.stringify(named));
+      assert.equal(await configCount(), 1, "only the named host was stored");
+    });
+
+    test("with the list made the whole of it, a stored config to a host not named is refused at delivery, and nothing connects", async () => {
+      const t = await liveTask();
+      await storeConfig(t, HOOK);
+      await push.recordSessionEvent(t.sessionId, { type: "statusUpdate", agentStatus: "running" }, 83);
+      process.env.CLAW_A2A_PUSH_ALLOWED_HOSTS_ONLY = "true";
+      let called = 0;
+      const r = await push.deliverDue({ transport: (async () => { called += 1; return 200; }) as never });
+      assert.deepEqual(r, { delivered: 0, failed: 1 });
+      assert.equal(called, 0, "no connection was made");
+      const [row] = await outbox();
+      assert.equal(row.last_status, "refused:host_not_allowed");
+      assert.ok(row.dropped_at, "a refusal is not retried");
     });
   });
 

@@ -19,13 +19,13 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, existsSync, chmodSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync, existsSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 
 import { applyEnvFile } from "../src/runtime/env-file.js";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
-const dir = mkdtempSync(join(tmpdir(), "hands-env-"));
+const dir = tmpDir("hands-env-");
 let seq = 0;
 
 /** Write a handover file the way Brain's bootstrap does. */

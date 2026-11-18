@@ -3,8 +3,12 @@
 
 name: CodeQL
 
-# PR/push on all branches: skip when all changes match paths-ignore (doc-only).
-# Weekly schedule still runs on the default branch for full analysis.
+# Pull requests always run, documentation-only ones included: the main
+# ruleset's "Require code scanning results" rule (tool CodeQL) blocks a pull
+# request until CodeQL has reported an analysis for it, and a workflow skipped
+# by a paths filter reports nothing, so a doc-only pull request could never
+# merge. Pushes to main/deploy/** still skip doc-only commits; the weekly
+# schedule runs a full analysis on the default branch.
 on:
   push:
     # main and the deploy/* branches only: every other branch reaches CI as a
@@ -21,14 +25,8 @@ on:
       - "COPYRIGHT"
       - "CODEOWNERS"
       - ".gitattributes"
+  # No paths filter here: see the comment at the top of the file.
   pull_request:
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "LICENSE*"
-      - "COPYRIGHT"
-      - "CODEOWNERS"
-      - ".gitattributes"
   schedule:
     - cron: '0 6 * * 1'
 
@@ -41,9 +39,12 @@ permissions:
   # both calls fail with ``Resource not accessible by integration``.
   actions: read
 
+# One run per pull request: a new head cancels the previous head's run.
+# Every other event (push to main or deploy/**, tags, schedules, manual runs)
+# gets a group of its own, so it is never cancelled or replaced.
 concurrency:
-  group: codeql-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   analyze:
@@ -73,7 +74,7 @@ jobs:
           go-version-file: sandbox/go.mod
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -87,6 +88,6 @@ jobs:
         run: go build ./...
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
           category: "/language:${{ matrix.language }}"

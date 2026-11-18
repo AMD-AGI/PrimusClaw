@@ -20,7 +20,6 @@
 
 - [ ] Claw (api / brain / hands / protocol / utils)
 - [ ] Sandbox (Go / sdk-python)
-- [ ] memory (memory-service / knowledge-worker)
 - [ ] other
 
 ## Testing

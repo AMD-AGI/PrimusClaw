@@ -1,0 +1,123 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * A phone session against the REAL claude-agent-acp adapter, through `run`, as whoever runs the test: CI runs this
+ * file once as the runner's own user and once as root (tests.yml, "Connector real adapter"), so it covers
+ * {root, non-root} x {approval = "never", approval = "ask"}. Opening a session needs no model (no prompt is sent), and
+ * also with the user's own Claude settings defaulting to bypassPermissions. It does need a sign-in the adapter can see:
+ * one it reports as none is refused before the session is announced (agent_auth_required), so the agent gets an API key
+ * variable that is never used, and one more test checks that refusal without it. Skipped unless CLAW_REAL_CLAUDE_ACP names the adapter's dist/index.js
+ * (npm i @agentclientprotocol/claude-agent-acp@0.99.0).
+ */
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import test, { after, before, describe } from "node:test";
+import { EXIT, main, type Ctx } from "../src/commands.js";
+import { resolveDirs } from "../src/paths.js";
+import { FakeClaw } from "./support/fake-claw.js";
+import { tmpdir } from "./support/harness.js";
+
+const ADAPTER = process.env.CLAW_REAL_CLAUDE_ACP;
+const skip = ADAPTER ? false : "set CLAW_REAL_CLAUDE_ACP to run against the real Claude adapter";
+const euid = process.geteuid?.() ?? null;
+const who = euid === 0 ? "root" : `uid ${euid}`;
+
+// What the connector itself inherits reaches the adapter: an IS_SANDBOX here would hide the root case, and a sign-in of
+// the machine running the tests would hide the signed-out one.
+const INHERITED = ["IS_SANDBOX", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"];
+const saved = Object.fromEntries(INHERITED.map((k) => [k, process.env[k]]));
+before(() => { for (const k of INHERITED) delete process.env[k]; });
+after(() => { for (const [k, v] of Object.entries(saved)) if (v !== undefined) process.env[k] = v; });
+
+/**
+ * `userBypass`: the user's own Claude settings default to bypassPermissions; `sandbox`: the connector itself runs with
+ * IS_SANDBOX=1 (a container that sets it for everything), so root may use bypass too.
+ */
+async function openSession(approval: "never" | "ask", o: { userBypass?: boolean; sandbox?: boolean; signedOut?: boolean } = {}) {
+  const base = tmpdir("rm-");
+  const home = path.join(base, "home");
+  const work = path.join(base, "work");
+  const claude = path.join(base, "claude");
+  for (const d of [path.join(home, "config"), work, claude]) fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(claude, ".claude.json"), JSON.stringify({ hasCompletedOnboarding: true }));
+  if (o.userBypass) fs.writeFileSync(path.join(claude, "settings.json"), JSON.stringify({ permissions: { defaultMode: "bypassPermissions" } }));
+  if (o.sandbox) process.env.IS_SANDBOX = "1";
+  fs.writeFileSync(path.join(home, "config", "agents.toml"), `
+[[agents]]
+id = "cc"
+preset = "claude"
+command = ${JSON.stringify(process.execPath)}
+args = [${JSON.stringify(ADAPTER)}]
+roots = [${JSON.stringify(work)}]
+approval = "${approval}"
+[agents.env]
+CLAUDE_CONFIG_DIR = ${JSON.stringify(claude)}
+HOME = ${JSON.stringify(base)}
+${o.signedOut ? "" : `ANTHROPIC_API_KEY = "sk-ant-api03-unused-by-a-test-that-sends-no-prompt"`}
+`);
+  const out: string[] = [];
+  const c: Ctx = {
+    dirs: resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv), env: { HOME: base, CLAUDE_CONFIG_DIR: claude },
+    out: (s) => out.push(s), err: (s) => out.push(s), hostname: "ci", claudeManagedSettings: path.join(base, "managed.json"),
+  };
+  const claw = await FakeClaw.start();
+  let connector: any;
+  let running: Promise<number> | undefined;
+  try {
+    claw.tokens.add("good-token");
+    assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], { ...c, out: () => {}, err: () => {} }), EXIT.ok);
+    running = main(["run"], { ...c, onConnector: (cn) => { connector = cn; } });
+    await claw.until("online", () => claw.online, 30_000);
+    const sid = claw.newSession("cc", work);
+    const ev = await claw.until("session_started or session_closed", () => claw.eventsOf(sid).find((e) => e.type === "session_started" || e.type === "session_closed"), 120_000);
+    const doctor: string[] = [];
+    const code = await main(["doctor", "--json"], { ...c, out: (s) => doctor.push(s), err: (s) => doctor.push(s) });
+    return { ev, out, doctor: { code, doc: JSON.parse(doctor.join("\n")) } };
+  } finally {
+    connector?.stop();
+    await running;
+    await claw.close();
+    delete process.env.IS_SANDBOX;
+  }
+}
+
+describe(`the real Claude adapter as ${who}`, { skip }, () => {
+  test(`approval = "never": the session opens in bypassPermissions, and doctor agrees`, { timeout: 300_000 }, async () => {
+    const r = await openSession("never");
+    assert.equal(r.ev.type, "session_started", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
+    assert.equal(r.ev.data.currentMode, "bypassPermissions");
+    assert.equal(r.doctor.doc.ok, true, JSON.stringify(r.doctor.doc));   // (the adapter's verdict: the machine checks may fail here, e.g. Claude is not signed in on CI)
+    assert.ok(r.doctor.doc.agents[0].modes.includes("bypassPermissions"));
+  });
+
+  test(`approval = "ask": the session opens in default, and doctor agrees`, { timeout: 300_000 }, async () => {
+    const r = await openSession("ask");
+    assert.equal(r.ev.type, "session_started", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
+    assert.equal(r.ev.data.currentMode, "default");
+    assert.equal(r.doctor.doc.ok, true, JSON.stringify(r.doctor.doc));   // (the adapter's verdict: the machine checks may fail here, e.g. Claude is not signed in on CI)
+  });
+
+  test(`approval = "ask" while the user's own settings default to bypassPermissions (and IS_SANDBOX is set): opens in default`, { timeout: 300_000 }, async () => {
+    const r = await openSession("ask", { userBypass: true, sandbox: true });
+    assert.equal(r.ev.type, "session_started", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
+    assert.equal(r.ev.data.currentMode, "default");
+    assert.equal(r.ev.data.unattended, false);
+    assert.equal(r.doctor.doc.ok, true, JSON.stringify(r.doctor.doc));   // (the adapter's verdict: the machine checks may fail here, e.g. Claude is not signed in on CI)
+    assert.ok(!r.doctor.doc.agents[0].modes.includes("bypassPermissions"), "the adapter leaves bypass out for an agent that asks");
+  });
+
+  test(`approval = "never" while the user's own settings default to bypassPermissions: opens in bypassPermissions`, { timeout: 300_000 }, async () => {
+    const r = await openSession("never", { userBypass: true });
+    assert.equal(r.ev.type, "session_started", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
+    assert.equal(r.ev.data.currentMode, "bypassPermissions");
+  });
+
+  test("not signed in at all: refused before it is announced, agent_auth_required, with the Claude sign-in command", { timeout: 300_000 }, async () => {
+    const r = await openSession("ask", { signedOut: true });
+    assert.equal(r.ev.type, "session_closed", `${JSON.stringify(r.ev.data)}\n${r.out.join("\n")}`);
+    assert.equal(r.ev.data.reason, "agent_auth_required");
+    assert.match(r.ev.data.hint, /\/login/);
+  });
+});

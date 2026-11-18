@@ -45,8 +45,9 @@ try {
 
   // What ships: every file of the tarball (npm puts all of them under package/). dist/terminal-hook.js is the
   // program the Claude Code session hooks run (`claw-connector hooks install` resolves it next to dist/cli.js, see
-  // hookScript in src/commands.ts), so an installed package without it would write hooks that point at nothing.
-  const allowed = new Set(["LICENSE", "README.md", "dist/cli.js", "dist/terminal-hook.js", "package.json"]);
+  // hookScript in src/commands.ts), so an installed package without it would write hooks that point at nothing; the same
+  // holds for dist/approval-hook.js and `hooks install --approvals` (approvalScript).
+  const allowed = new Set(["LICENSE", "README.md", "dist/approval-hook.js", "dist/cli.js", "dist/terminal-hook.js", "package.json"]);
   const packed = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8" })
     .split("\n")
     .filter((line) => line !== "" && !line.endsWith("/"))

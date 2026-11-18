@@ -38,7 +38,7 @@ import { createHash, randomBytes } from "node:crypto";
 import pino from "pino";
 import { DOORBELL_SEMANTICS_VERSION, interruptSubject } from "@claw/protocol";
 import type { RunLease } from "@claw/protocol";
-import { RUN_FAT_PREPARING_RECONCILE } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_FIRST_ACK_USERS, RUN_FAT_PREPARING_RECONCILE } from "../config.js";
 import type { PoolClient } from "pg";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { nc } from "../infra/nats.js";
@@ -49,6 +49,7 @@ import type { RunOrigin } from "./run-budget.js";
 import type { TaskStatus } from "./types.js";
 import { recordRunUse, releaseRunUse, releaseRunUseStrict } from "../workspace/store.js";
 import { publishEvent } from "../events/store.js";
+import { holdPluginReference } from "../marketplace/plugin-expiry.js";
 
 const logger = pino({ name: "chat-run" });
 
@@ -627,6 +628,13 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
   const reconcileToken = input.reconcileAction ? randomBytes(16).toString("hex") : undefined;
   const status = input.status ?? "preparing";
   try {
+    // In a caller's transaction the row's plugin reference is written under a
+    // hold, like every other reference, so the expiry sweep cannot race it. The
+    // turn's tools were resolved before this (sessions/dispatch.ts), so a plugin
+    // gone by now changes nothing the turn runs with.
+    if (input.client && input.pluginId !== undefined && input.pluginId !== null) {
+      await holdPluginReference(input.client, input.pluginId);
+    }
     const row = await insertTask({
       task_id: taskId,
       session_id: input.sessionId,
@@ -665,6 +673,13 @@ export async function openChatRun(input: OpenChatRunInput): Promise<OpenChatRunR
     // reference nothing releases.
     if (!row) return null;
     if (status === "queued") metrics.onQueueEntered(input.queueEntryCause ?? "direct");
+    // A router turn that has said nothing a few seconds from now is told on it by the server (`assistant/lookup-ack.ts`). Imported when
+    // first needed: the assistant's modules import this one.
+    if (CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_FIRST_ACK_USERS && (input.origin ?? "chat") === "chat") {
+      void import("../assistant/lookup-ack.js")
+        .then((ack) => ack.armFirstAck(input.sessionId, input.messageId, undefined, {}, input.userId))
+        .catch((err) => logger.warn({ err, sessionId: input.sessionId }, "chat_run.first_ack_arm_failed"));
+    }
     // On the insert's own transaction when there is one: a reference committed
     // beside a row that rolls back is one nothing can ever reclaim.
     const workspaceId = input.recordWorkspaceUse === false
@@ -741,6 +756,12 @@ export interface CloseChatRunTarget {
   taskId?: string;
   /** The generation that reporter was issued. Absent when its acceptance returned none. */
   runClaim?: number;
+  /**
+   * What happened, for a person, when `failureReason` is a code (a run whose
+   * sandbox the platform could not provide). Stored as `error_message`, which is
+   * otherwise the reason itself.
+   */
+  failureMessage?: string;
 }
 
 interface ClosedRow {
@@ -896,7 +917,7 @@ export async function closeChatRun(
   target: CloseChatRunTarget = {},
 ): Promise<string[]> {
   const reason = outcome === "completed" ? null : (failureReason ?? outcome);
-  const message = outcome === "completed" ? null : (failureReason ?? "").slice(0, 2000) || null;
+  const message = outcome === "completed" ? null : (target.failureMessage || failureReason || "").slice(0, 2000) || null;
   try {
     const closed = target.taskId
       ? await closeNamedChatRun(sessionId, target, outcome, reason, message)

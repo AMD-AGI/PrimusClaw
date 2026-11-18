@@ -384,3 +384,190 @@ description: One-line summary used in marketplace previews.
 
 Body content...
 ```
+
+---
+
+## 4. Plugin Run-Time Overrides
+
+A launch of a plugin can change a few declared settings without registering a
+new plugin. The plugin's author declares what may change in `overridable`;
+a launch names its values in `overrides`. Nothing is overridable unless
+declared: a plugin without `overridable` (every plugin registered before the
+field existed) refuses every override and launches exactly as before.
+
+### Declaring (`overridable` on the plugin)
+
+`overridable` is accepted by `POST /v1/plugins`, `POST /v1/plugins/upsert`,
+`PUT`/`PATCH /v1/plugins/:id` and `POST /v1/plugins/:id/new-version` (a new
+version keeps the source version's declaration unless the request sets one),
+and is returned by every plugin read. An invalid declaration is
+`400 bad_request` naming every problem, and nothing is written.
+
+```json
+{
+  "image": { "enum": ["harbor.example/app:rc"] },
+  "model": { "enum": ["model-a", "model-b"], "env": ["APP_MODEL", "APP_REPORT_MODEL"] },
+  "args":  { "items": { "pattern": "^--[a-z-]+(=[A-Za-z0-9._-]+)?$" }, "maxItems": 4 },
+  "env": {
+    "SOURCE_SHA": { "pattern": "^[0-9a-f]{40}$", "description": "Commit to build from" },
+    "MODE": { "enum": ["fast", "full"] }
+  }
+}
+```
+
+| Key     | Value a launch gives | Rule |
+| ------- | -------------------- | ---- |
+| `image` | a string | Must be one of the plugin's `images[].repo`, or of the declaration's own `enum`. |
+| `model` | a string | String rule (below). A task runs on it; an app run gets it in every env name listed in `env` (an app run cannot override `model` when `env` is empty). |
+| `args`  | a list of strings | Appended to the app manifest's `command`. `items` is a string rule for each; `maxItems` 1-64 (default 16). |
+| `env`   | an object of name to string | One string rule per variable name the launch may set. At most 64 names. |
+
+A string rule is a small JSON Schema subset: `type` (`"string"`), `enum`
+(1-256 strings), `pattern` (an ECMAScript regular expression, at most 512
+characters; anchor it with `^...$`), `maxLength` (1-4096, default 4096) and
+`description`. Unknown keys are refused. Values and `enum` entries may not
+have leading or trailing whitespace. All pattern tests of one launch share a
+50 ms budget and run interruptibly, so a pattern that backtracks badly cannot
+stall the API: a value whose test does not finish in time is refused.
+
+### Launching with `overrides`
+
+`POST /v1/sessions/:sessionId/tasks` takes `overrides`:
+
+| Launch | Applicable keys |
+| ------ | --------------- |
+| App run (`mode: "app"`) | `image`, `model`, `args`, `env` |
+| Single task (`plugin_id`, no DAG) | `image`, `model` |
+
+```json
+{
+  "mode": "app",
+  "plugin_id": 42,
+  "input": { "...": "..." },
+  "resources": { "gpus": 8, "workspace": "ws-a" },
+  "overrides": { "model": "model-b", "env": { "SOURCE_SHA": "0123...cdef" } }
+}
+```
+
+Every key must be declared, apply to the launch, and hold a value its rule
+accepts; otherwise the answer is `400 plugin_overrides_invalid` with a
+`problems` list (`field`, `reason`), and nothing is created. A task with
+`overrides` but no `plugin_id`, or with a DAG, is refused the same way. For an
+app run the overrides are applied to a copy of the plugin's manifest, which must
+still validate (a platform-reserved variable such as `LD_PRELOAD` stays
+refused, reported as `issues`); `overrides.image` together with
+`resources.image` is refused (give the image once), and a plugin that declares
+`image` holds `resources.image` to the same list (a plugin that declares nothing
+keeps accepting any `resources.image`, as before). The plugin row itself is
+never changed by a launch.
+
+### Audit
+
+The checked values are recorded on the task, in
+`metadata.plugin_overrides = { plugin_id, plugin_version, values }`; an app run
+also stores the manifest it actually ran with. The API logs
+`plugin_overrides.applied` with the task, plugin, user and the overridden keys,
+never the values. For an app run, `overrides` is part of what an
+`Idempotency-Key` is bound to; a request without it hashes as before.
+
+---
+
+## 5. Listing Plugins and Their Versions
+
+`GET /v1/plugins` lists **one entry per plugin**, where a plugin is an owner's
+name: the latest active version of that (owner, name) the caller may see.
+Names are not owned, so two users' plugins called `alpha` are two entries, and
+one user's versions never replace or count towards another's. "Latest" is the
+version order an upsert uses (the first three dot-separated parts compared by
+their leading digits, so `1.10.0` is newer than `1.9.0`; ties go to the most
+recently updated row, then the highest id), not the row touched last. A
+collapsed entry carries `version_count`: the number of versions of that
+(owner, name) the listing covers, which is the active ones unless `status`
+says otherwise.
+
+| Query parameter | Effect |
+| --------------- | ------ |
+| `latest_per_name` | Defaults to `true`. `false` (also `0`, `no`) lists every row (every version), as before this default; `true`, `1`, `yes` collapse; anything else is `400`. |
+| `status` | With collapsing, only `active` rows compete unless a status is given; `status=disabled` collapses over disabled rows instead. |
+| `include_deleted` | Admins only. Adds deleted rows within the `scope`: with the default `visible` that is deleted public plugins and the admin's own; another user's deleted private plugins need `scope=all` as well. Among the rows that compete (the active ones, unless `status` is given), a deleted version never wins over an undeleted one; it is the entry only when none of the competing versions is undeleted, for example when the plugin's only undeleted versions are disabled. `include_deleted` is honoured only as the exact value `true`. |
+| `scope` | Which plugins: `visible` (default) is the public ones plus the caller's own, for admins too; `mine` only the caller's own; `public` only public ones; `all` every plugin, admins only (`403` otherwise). An absent or empty `scope` is `visible`; any other value is `400`. |
+| `owner` | Narrows the listing to one owner's plugins (`me` is the caller), inside the `scope`. For an admin this changed with `scope`: `owner=<another user>` alone returns only that user's public plugins; add `scope=all` to include their private ones (as `owner` alone did before `scope` existed). |
+| `name_exact`, `name`, `limit`, `offset` | Unchanged. |
+
+The other versions are listed on demand:
+
+```
+GET /v1/plugins/:id/versions
+```
+
+```json
+{
+  "ok": true,
+  "data": {
+    "name": "my-plugin",
+    "versions": [
+      { "id": 12, "name": "my-plugin", "version": "1.10.0", "status": "active", "is_public": true,
+        "owner_user_id": "...", "author": "...", "created_at": "...", "updated_at": "...", "deleted_at": null }
+    ]
+  }
+}
+```
+
+Versions are those of the same owner and name as `:id`, newest first, and only
+those the caller may see; deleted versions are left out (an admin may pass
+`include_deleted=true`). The route answers `404`
+or `403` exactly as `GET /v1/plugins/:id` does for the same id. Every version
+keeps its own id, and every other route (`GET`, `PATCH`, `DELETE`, launches)
+still addresses a plugin by id.
+
+---
+
+## 6. Temporary Plugins
+
+A plugin registered for one run (an eval, a probe, a smoke test) can expire on
+its own instead of staying in every listing until someone deletes it.
+
+Plugin writes (`POST /v1/plugins`, `POST /v1/plugins/upsert`,
+`PUT`/`PATCH /v1/plugins/:id`, `POST /v1/plugins/:id/new-version`) accept one of:
+
+| Field | Meaning |
+| ----- | ------- |
+| `ttl_seconds` | Expire this many seconds from now. |
+| `expires_at` | Expire at this ISO 8601 instant. |
+
+Either must land from 60 seconds to `PLUGIN_TTL_MAX_DAYS` (default 30) days
+from now; giving both is refused. `null` for either clears the expiry and makes
+the plugin permanent. Every plugin read returns `expires_at` (`null` when
+permanent).
+
+- **Never public.** A temporary plugin is private by default; asking for
+  `is_public: true` together with an expiry, making a temporary plugin public, or
+  giving a public plugin an expiry is `400`. Clear the expiry first to publish.
+- **New versions** inherit the source version's `expires_at` unless the request
+  names its own (or `null`).
+- **Past `expires_at`** a new task, batch, app run, retry, session message
+  (including a session's first message and a message to an Anthropic-compatible
+  session) or DAG template naming the plugin is refused: `404 plugin_not_found`,
+  the same answer as for a plugin that does not exist or is another user's
+  private one (a DAG template write is `400`, a retry `409 not_retryable`; an
+  app run naming another user's private plugin keeps its existing `403
+  plugin_access_denied`). Workbench runs refuse a gone plugin the same way. An A2A request naming it runs as
+  if the plugin were deleted (no tools), as A2A already treats a plugin the
+  caller cannot see. Work admitted before the expiry keeps running.
+- **The sweep.** Every `PLUGIN_EXPIRY_SWEEP_INTERVAL_MIN` (default 5) minutes
+  the API soft-deletes (`deleted_at`) every private plugin whose `expires_at` is
+  more than 10 minutes past, except one that is still in use: an unfinished
+  task, a live app run, a queued message or a live DAG template that names it.
+  That one expires on a later pass, once the use is over. An admission in
+  flight holds the plugin row until it commits, and the sweep skips a held row,
+  so a plugin is never deleted under a run being created. The API logs
+  `plugin.expired` for each.
+
+Eval and probe tooling that registers plugins should set `ttl_seconds`, for
+example a day for a nightly run:
+
+```bash
+curl -X POST "$CLAW/v1/plugins/upsert" -H "Authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"name":"probe-2026-11-11","version":"0.1.0","ttl_seconds":86400}'
+```

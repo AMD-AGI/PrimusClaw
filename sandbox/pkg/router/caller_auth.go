@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Caller authentication middleware for the Router (default on; --enable-auth=false to disable).
-// A caller presents "Authorization: Bearer <credential>": a platform API key (ak-...) or an
-// access token issued by the identity provider for this service. The credential is
-// validated through identity provider token introspection (RFC 7662).
+// A caller presents "Authorization: Bearer <credential>" or "X-API-KEY": a platform API key
+// or an access token issued by the identity provider for this service. The credential
+// is validated through identity provider token introspection (RFC 7662).
 package router
 
 import (
@@ -12,6 +12,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
+	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/identity"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 )
@@ -40,7 +42,7 @@ func stripUntrustedIdentityHeaders() gin.HandlerFunc {
 }
 
 // setUserContext sets userId, userName, and userRole in both Gin context and request headers.
-func setUserContext(c *gin.Context, tok identity.Token) {
+func setUserContext(c *gin.Context, tok identity.Token, role string) {
 	c.Request.Header.Set(UserIDHeader, tok.Subject)
 	if tok.Email != "" {
 		c.Request.Header.Set(UserNameHeader, tok.Email)
@@ -48,7 +50,6 @@ func setUserContext(c *gin.Context, tok identity.Token) {
 	c.Set("userId", tok.Subject)
 	c.Set("userName", tok.Email)
 
-	role := identity.PlatformRole(tok.Roles)
 	c.Set("userRole", role)
 	c.Request.Header.Set(UserRoleHeader, role)
 }
@@ -58,13 +59,18 @@ func bearerCredential(c *gin.Context) string {
 	return identity.BearerCredential(c.GetHeader("Authorization"))
 }
 
+// callerCredential returns the bearer token, or the X-API-KEY when no bearer is present.
+func callerCredential(c *gin.Context) string {
+	return identity.CallerCredential(c.Request.Header)
+}
+
 // abortCaller records the rejection and answers it.
 func abortCaller(c *gin.Context, r identity.Rejection) {
 	recordCallerAuthRejection(c, r.Status)
 	c.AbortWithStatusJSON(r.Status, gin.H{"error": r.Message, "code": r.Code})
 }
 
-// callerAuthMiddleware verifies the caller's bearer credential through identity introspection.
+// callerAuthMiddleware verifies the caller's credential through identity introspection.
 // A missing or inactive credential is 401; an identity provider that cannot answer is 503.
 func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -72,9 +78,14 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		credential := bearerCredential(c)
+		credential := callerCredential(c)
 		if credential == "" {
 			abortCaller(c, identity.MissingCredential)
+			return
+		}
+		// A grant key is valid only on the E2B routes and must not leave the cluster.
+		if e2b.IsGrantKey(credential) {
+			abortCaller(c, identity.RejectionFor(identity.ErrInactive))
 			return
 		}
 
@@ -87,9 +98,15 @@ func (s *Server) callerAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		setUserContext(c, tok)
+		role, err := authz.ResolveRole(s.cfg.Authz, c.Request.Context(), tok)
+		if err != nil {
+			log.Warn("caller platform role unreadable", "userId", tok.Subject, "error", err)
+			abortCaller(c, authz.Unavailable)
+			return
+		}
+		setUserContext(c, tok, role)
 		log.Debug("auth OK", "userId", tok.Subject,
-			"role", identity.PlatformRole(tok.Roles), "path", c.Request.URL.Path)
+			"role", role, "path", c.Request.URL.Path)
 		c.Next()
 	}
 }

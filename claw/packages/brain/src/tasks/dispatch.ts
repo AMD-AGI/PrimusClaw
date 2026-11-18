@@ -32,7 +32,7 @@ import {
 import { activeAbort, forgetRunAddresses, registerRunAddressesFor } from "./abort-registry.js";
 import { markSessionDeleted } from "../infra/deleted-sessions.js";
 import {
-  pickLockKey, acquireTaskLock, gateBindingError, lockContentionNakMs, readTaskLock,
+  pickLockKey, acquireTaskLock, bindLockRun, gateBindingError, lockContentionNakMs, readTaskLock,
 } from "./lock.js";
 import { releasePreGateLease, runHandleTask, resolvePoisonedTask } from "./runner.js";
 import { claimRun, failClaimedRun, type ClaimedRun } from "../clients/run-claim.js";
@@ -104,7 +104,7 @@ async function deferForLockContention(
  * during a rolling upgrade. Either one present is an answer, and finding neither
  * is only ever read as "not deleted", which is what it meant before as well.
  */
-async function sessionWasDeleted(sessionId: string): Promise<boolean> {
+export async function sessionWasDeleted(sessionId: string): Promise<boolean> {
   const buckets = [_kvTombstones, _kv].filter((b): b is KV => b !== null);
   for (const bucket of buckets) {
     try {
@@ -629,7 +629,14 @@ async function handleResolvedRequest(
 
   // 1. Distributed lock (NATS KV) on the same lockKey so cross-pod
   //    handlers don't race either.
-  const locked = await acquireTaskLock(lockKey, msg.seq);
+  // A claimed doorbell is a run the API has fenced: the claim bumped its
+  // claim_count, so whoever ran it before can no longer renew or settle it.
+  // That is what allows a lock its previous holder left behind -- a brain lost
+  // with its node -- to be taken over rather than waited out.
+  const locked = await acquireTaskLock(lockKey, msg.seq, {
+    taskId: request.task_id || undefined,
+    takeOverDeadHolder: claimedDoorbell,
+  });
   if (!locked) {
     await deferForLockContention(msg, request, {
       sessionId, lockKey, claimedDoorbell, taskId: request.task_id,
@@ -637,29 +644,61 @@ async function handleResolvedRequest(
     });
     return;
   }
+  // Before any await: the release of this run has to name this acquisition, not
+  // whichever one holds the key by the time it runs.
+  const abortCtrl = new AbortController();
+  bindLockRun(lockKey, abortCtrl);
   logger.info({ sessionId, lockKey, messageId }, "task.lock_acquired");
   await clearRetryPending(kv, sessionId, lockKey).catch((err) =>
     logger.warn({ err, sessionId, messageId }, "retry_pending.clear_failed"),
   );
 
-  const abortCtrl = new AbortController();
   activeAbort.set(lockKey, abortCtrl);
   // The names this run can be interrupted by, taken from the same request the
   // gate key was computed from. Nobody publishes to a gate key: the stop
   // button, cancelTask and the sweeper all address a session or a DAG root.
-  registerRunAddressesFor(lockKey, request);
+  registerRunAddressesFor(lockKey, request, abortCtrl);
   // Track promise for graceful drain.
   const taskPromise = runHandleTask(
     msg, request, sessionId, lockKey, messageId, userId, abortCtrl,
     claimedDoorbell ? { claimCount: claimGeneration ?? 0 } : null,
   );
-  inflightHandleTasks.add(taskPromise);
-  taskPromise.finally(() => {
-    inflightHandleTasks.delete(taskPromise);
+  trackInflight(taskPromise, () => {
     // The one place every dispatched run passes through on its way out. The
     // controller itself is cleared on several paths inside the run, and
-    // spreading this over those is how the two got out of step before.
-    forgetRunAddresses(lockKey);
+    // spreading this over those is how the two got out of step before. Only
+    // this run's: a Stop may have force-released it and a later run of the key
+    // registered its own names since.
+    forgetRunAddresses(lockKey, abortCtrl);
   });
   await taskPromise;
+}
+
+/**
+ * Hold a run in the drain set until it settles, then run `onSettled`.
+ *
+ * The run's own rejection is not this function's to report -- the caller
+ * awaits the same promise and its delivery handler logs it -- but whatever
+ * this attaches has to be handled here. It used to be
+ * `taskPromise.finally(cleanup)` as a bare statement: `finally` returns a new
+ * promise that rejects with the run's error, and nothing awaited that one. So
+ * every run that failed by throwing was reported twice, once as `task.unhandled`
+ * by the delivery handler and once as an unhandled rejection, and Node's
+ * default for the second is to kill the process. On 2026-11-06 a single
+ * JetStream publish timing out inside a failing run's terminal path took a
+ * brain pod down that way, with every other run on it.
+ *
+ * Exported for the test that pins it; production calls it only from handleTask.
+ */
+export function trackInflight(task: Promise<void>, onSettled: () => void): void {
+  inflightHandleTasks.add(task);
+  const settle = () => {
+    inflightHandleTasks.delete(task);
+    try {
+      onSettled();
+    } catch (err) {
+      logger.error({ err }, "task.inflight_cleanup_failed");
+    }
+  };
+  void task.then(settle, settle);
 }

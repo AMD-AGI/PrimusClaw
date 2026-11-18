@@ -162,6 +162,16 @@
         },
         "admitTreeMaxDepth": {
           "$ref": "#/definitions/admitCeiling"
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Grace period of an api pod: preStopSleepSeconds plus the in-process drain (SHUTDOWN_DEADLINE_MS) must fit inside it."
+        },
+        "preStopSleepSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Seconds an api pod keeps serving in preStop while it leaves the Service endpoints, before SIGTERM."
         }
       }
     },

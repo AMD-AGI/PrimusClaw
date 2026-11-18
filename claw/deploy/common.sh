@@ -13,7 +13,9 @@
 
 # ── Environment defaults ─────────────────────────────────────────────────
 NAMESPACE="${NAMESPACE:-primus-claw}"
-REGISTRY="${REGISTRY:-docker.io/primussafe}"
+# REGISTRY and REPOSITORY name the image, $REGISTRY/$REPOSITORY:$TAG; both are settled after the values file is read (below).
+REGISTRY="${REGISTRY:-}"
+REPOSITORY="${REPOSITORY:-}"
 TAG="${TAG:-}"
 STORAGE_CLASS="${STORAGE_CLASS:-}"
 DOMAIN="${DOMAIN:-}"
@@ -276,6 +278,15 @@ done
 set -a
 # shellcheck disable=SC1090
 source "$_VALUES_FILE"
+
+# The image. Unset, it is a release: docker.io/rocm/primusclaw:<TAG>, TAG claw-<version> (claw-latest the newest). A
+# REGISTRY of your own, or a build of main (REGISTRY=docker.io/primussafe TAG=<build>), keeps one repository per image:
+# $REGISTRY/claw:<TAG>, unless REPOSITORY names another.
+if [ -z "$REGISTRY" ]; then
+  REGISTRY=docker.io/rocm
+  REPOSITORY="${REPOSITORY:-primusclaw}"
+fi
+REPOSITORY="${REPOSITORY:-claw}"
 set +a
 
 # Backfill BRAIN_CHECKPOINT_KEY.
@@ -899,7 +910,7 @@ render_chart() {
     --set ingress.enabled=false \
     --set postgres.enabled=false \
     --set-string image.registry="$REGISTRY" \
-    --set-string image.repository=claw \
+    --set-string image.repository="$REPOSITORY" \
     --set-string image.tag="$TAG" \
     ${AGENT_SANDBOX_SESSION_TIMEOUT:+--set-string brain.sessionTimeout="$AGENT_SANDBOX_SESSION_TIMEOUT"} \
     ${AGENT_SANDBOX_MAX_SESSION_DURATION:+--set-string brain.maxSessionDuration="$AGENT_SANDBOX_MAX_SESSION_DURATION"} \
@@ -1023,8 +1034,8 @@ deploy_shared_assets() {
 
   log "Deploying hands-binary to $bin_dst ..."
 
-  # IMG is exported by build.sh; fall back to REGISTRY:TAG when build was skipped.
-  local img="${IMG:-${REGISTRY}/claw:${TAG}}"
+  # IMG is exported by build.sh; fall back to REGISTRY/REPOSITORY:TAG when build was skipped.
+  local img="${IMG:-${REGISTRY}/${REPOSITORY}:${TAG}}"
   if $DRY_RUN; then
     log "[dry-run] extract hands-binary from $img → $bin_dst"
     return 0
@@ -1063,7 +1074,7 @@ deploy_hands_from_image() {
 
   local bin_dir="$CLAW_DEPLOY_ROOT/$NAMESPACE"
   local bin_dst="$bin_dir/hands-binary"
-  local img="${IMG:-${REGISTRY}/claw:${TAG}}"
+  local img="${IMG:-${REGISTRY}/${REPOSITORY}:${TAG}}"
 
   log "Deploying hands-binary from image $img → $bin_dst ..."
   if $DRY_RUN; then

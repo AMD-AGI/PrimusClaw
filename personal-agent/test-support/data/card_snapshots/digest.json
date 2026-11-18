@@ -1,0 +1,89 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "primusclaw": "show",
+       "session_id": "s2"
+      },
+      "title": "Show here: 给 fleetpilot 加超时告警",
+      "type": "Action.Execute",
+      "verb": "primusclaw.show"
+     },
+     {
+      "data": {
+       "primusclaw": "show",
+       "session_id": "3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77"
+      },
+      "title": "Show here: 整理本周 SaFE 节点故障",
+      "type": "Action.Execute",
+      "verb": "primusclaw.show"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Attention",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "🔔 While you were away",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         },
+         {
+          "isSubtle": true,
+          "size": "Small",
+          "spacing": "None",
+          "text": "1 finished, 1 failed, 1 approval expired and refused",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "maxLines": 2,
+      "text": "Failed: [给 fleetpilot 加超时告警](https://claw.example.com/primus-claw/s2)",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "maxLines": 2,
+      "text": "Done: [整理本周 SaFE 节点故障](https://claw.example.com/primus-claw/3f2a9c1e-5b7d-4e21-9a0c-8d6f4b2e1a77)",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

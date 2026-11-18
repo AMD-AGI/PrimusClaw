@@ -1,11 +1,47 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { createInterface } from "node:readline/promises";
+import { fileURLToPath } from "node:url";
 import { main } from "./commands.js";
 import { resolveDirs } from "./paths.js";
 import type { Connector } from "./connector.js";
+import { probeAgents } from "./probe.js";
+import { inheritSystemCa, trustSystemCAs } from "./system-ca.js";
+import { lineSink } from "./logsink.js";
+import { setLogLine } from "./util.js";
+
+// Before any connection: trust the CAs this machine trusts as well as Node's own list (system-ca.ts), and hand the same
+// trust to the processes the connector starts.
+inheritSystemCa(process.env, trustSystemCAs(process.env));
+
+// Every line the connector prints goes through these: a log file that cannot be written (a quota used up, a full disk)
+// holds its lines in memory until it can be written again, instead of ending the process (logsink.ts).
+const out = lineSink({ fd: 1, stream: process.stdout });
+const err = lineSink({ fd: 2, stream: process.stderr });
+setLogLine(err);
 
 let connector: Connector | null = null;
+
+/**
+ * A yes/no question at the terminal; only offered when both ends are one (a script or a pipe is never asked). An empty answer
+ * (just Enter) is the question's default, `dflt`; anything but a yes or that default is a no.
+ */
+const ask = process.stdin.isTTY && process.stdout.isTTY
+  ? async (question: string, dflt = false): Promise<boolean> => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    // Ctrl-D or Ctrl-C at the question is a no, not a crash. readline takes Ctrl-C as a keystroke (SIGINT on the
+    // interface, not the process): without this the question would never settle and init would end silently.
+    const ac = new AbortController();
+    rl.on("SIGINT", () => { process.stdout.write("\n"); ac.abort(); });
+    // Ctrl-D (or stdin ending) closes the interface without settling the question, which would end init silently.
+    rl.on("close", () => ac.abort());
+    try {
+      const a = await rl.question(question, { signal: ac.signal });
+      return a.trim() === "" ? dflt : /^\s*y(es)?\s*$/i.test(a);
+    } catch { return false; } finally { rl.close(); }
+  }
+  : undefined;
 let stopping = false;
 
 /**
@@ -21,11 +57,18 @@ const onSignal = () => {
 
 main(process.argv.slice(2), {
   dirs: resolveDirs(),
+  cli: fileURLToPath(import.meta.url),
   env: process.env,
-  out: (l) => process.stdout.write(l + "\n"),
-  err: (l) => process.stderr.write(l + "\n"),
+  out,
+  err,
+  ask,
+  probe: probeAgents,
+  installAdapters: true,
   onConnector: (c) => {
     connector = c;
     for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(sig, onSignal);
+    // `claw-connector doctor` asks a running connector to check the machine again. SIGWINCH, whose default is to do nothing,
+    // so the same ask sent to an older connector that does not listen is harmless.
+    process.on("SIGWINCH", () => c.recheckHealth());
   },
-}).then((code) => process.exit(code), (e) => { process.stderr.write(`fatal: ${e instanceof Error ? e.stack : String(e)}\n`); process.exit(1); });
+}).then((code) => process.exit(code), (e) => { err(`fatal: ${e instanceof Error ? e.stack : String(e)}`, true); process.exit(1); });

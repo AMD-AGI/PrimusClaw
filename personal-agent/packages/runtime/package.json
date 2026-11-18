@@ -1,0 +1,40 @@
+{
+  "name": "@primusclaw/personal-agent-runtime",
+  "version": "0.10.3",
+  "description": "Node adapters for the personal agent's ports (clock, randomness, logging, storage, Claw, metrics, HTTP), and, at @primusclaw/personal-agent-runtime/worker, the worker process on any chat surface.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AMD-AGI/PrimusClaw.git",
+    "directory": "personal-agent/packages/runtime"
+  },
+  "homepage": "https://github.com/AMD-AGI/PrimusClaw/tree/main/personal-agent#readme",
+  "bugs": {
+    "url": "https://github.com/AMD-AGI/PrimusClaw/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/types/worker.d.ts",
+      "default": "./dist/worker.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=26"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@primusclaw/personal-agent": "0.10.3",
+    "fastify": "^5.12.8",
+    "zod": "^4.6.7"
+  }
+}

@@ -10,8 +10,10 @@ import assert from "node:assert/strict";
 import { createVerify, generateKeyPairSync } from "node:crypto";
 import {
   GRANT_AUDIENCE, GRANT_ISSUER, GRANT_KID, GRANT_KINDS, GrantCapsMissingError, GrantHttpError, GrantKeysMissingError, GrantSigner,
-  SandboxGrantClient, buildSandboxGrant, loadGrantSigner, type SandboxGrantMaterial,
+  SandboxGrantClient, buildSandboxGrant, grantWorkspaces, loadGrantSigner, type SandboxGrantMaterial,
 } from "../src/sandbox-grant.js";
+import { appGrantTemplates } from "../src/app-resources.js";
+import { APP_MANIFEST_SCHEMA, type AppManifestV1 } from "../src/app-manifest.js";
 
 const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
 const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
@@ -58,7 +60,8 @@ test("the attestation is ES256 and matches the issue body", () => {
   assert.equal(payload.aud, GRANT_AUDIENCE);
   assert.equal(payload.jti, material().grantId);
   assert.equal(payload.sub, "user-1");
-  assert.deepEqual(payload.workspaces, ["ws-a", "ws-b"]);
+  // Kept in the order given: the first is where a grant sandbox goes by default.
+  assert.deepEqual(payload.workspaces, ["ws-b", "ws-a"]);
   assert.deepEqual(payload.kinds, [...GRANT_KINDS]);
   assert.equal(payload.maxGpusPerSandbox, 8);
   assert.equal(payload.exp, NOW.getTime() / 1000 + 3600);
@@ -247,4 +250,34 @@ test("issue returns the template names the response carries, and none when it ca
   assert.deepEqual((await withNames.issue(material())).templates, { measurement: ["r-runner-g1", "r-runner-g8"] });
   const without = client(() => ({ status: 200, json: { keys: { measurement: "k" }, ...CAPS } }));
   assert.equal((await without.issue(material())).templates, undefined);
+});
+
+// hosting, 2026-11-07: app in crusoe-spur-vk, sandbox_workspace and the template in
+// top-models. The grant listed ["crusoe-spur-vk", "top-models"] (sorted) and Agent
+// Sandbox put both measurement sandboxes in the first one.
+const hostedManifest = (templateWorkspace?: string): AppManifestV1 => ({
+  schema: APP_MANIFEST_SCHEMA, name: "hosted", version: "1.0.0",
+  container: {}, state_dir: "/state", command: ["run"],
+  sandbox_templates: [{ name: "measurement", per_gpu_count: [1, 8], ...(templateWorkspace ? { workspace: templateWorkspace } : {}) }],
+  sandbox_roles: { measurement: ["measurement"] },
+});
+
+test("the grant lists the sandbox workspace first, never the alphabetically first", () => {
+  for (const templateWorkspace of ["top-models", undefined]) {
+    const templates = appGrantTemplates(hostedManifest(templateWorkspace), { image: "img:1", sandboxWorkspace: "top-models" });
+    assert.equal(templates[0]!.workspace, "top-models");
+    const workspaces = grantWorkspaces("crusoe-spur-vk", "top-models", templates);
+    assert.deepEqual(workspaces, ["top-models", "crusoe-spur-vk"]);
+    const built = buildSandboxGrant({ ...material(), workspaces, templates, roles: { measurement: ["measurement"] } }, NOW);
+    assert.deepEqual((built.body.owner as { workspaces: string[] }).workspaces, ["top-models", "crusoe-spur-vk"]);
+    assert.deepEqual(built.claims.workspaces, ["top-models", "crusoe-spur-vk"]);
+  }
+});
+
+test("without a sandbox workspace the app workspace comes first; a template's own follows", () => {
+  const templates = appGrantTemplates(hostedManifest("top-models"), { image: "img:1", sandboxWorkspace: "crusoe-spur-vk" });
+  assert.deepEqual(grantWorkspaces("crusoe-spur-vk", "crusoe-spur-vk", templates), ["crusoe-spur-vk", "top-models"]);
+  assert.deepEqual(grantWorkspaces("crusoe-spur-vk", null, []), ["crusoe-spur-vk"]);
+  // A template's workspace is listed even when it sorts before both.
+  assert.deepEqual(grantWorkspaces("zz-app", "yy-sbx", [{ name: "t", workspace: "aa-tpl" }]), ["yy-sbx", "aa-tpl", "zz-app"]);
 });

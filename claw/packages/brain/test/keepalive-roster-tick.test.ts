@@ -609,6 +609,43 @@ test("a KV read that rejects makes the census incomplete, not the key absent", a
   assert.equal(await isRosterStale(), false);
 });
 
+test("a record another replica deletes mid-walk is absent, not unreadable", async () => {
+  // Production, 2026-11-07: two replicas booted 170ms apart sweep in phase.
+  // One tore a sandbox down and deleted its handle record after the other had
+  // listed the bucket but before it read that key, so the read returned NATS's
+  // DEL marker -- an entry with an empty payload, not a miss. Parsed as a
+  // record, it marked the census incomplete and the shared roster stale, and
+  // every replica refused every new sandbox until a later sweep read clean.
+  const { bindAdmission, admitSandbox, isRosterStale } =
+    await import("../src/sandbox/admission.js");
+  await bindAdmission(kv, {
+    ceiling: CONFIG.ceiling, reconciliationReserve: CONFIG.reconciliationReserve,
+  });
+  kv.seed("hands.sess-a", entry("wl-a"));
+  kv.seed("hands.sess-torn-down", entry("wl-torn-down"));
+  const realGet = kv.get.bind(kv);
+  (kv as unknown as { get: unknown }).get = async (key: string) => {
+    if (key === "hands.sess-torn-down") {
+      return { value: new Uint8Array(0), revision: 2, operation: "DEL" };
+    }
+    return realGet(key);
+  };
+
+  await runKeepaliveTickForTest({
+    // Unbound DAG-handle KV in this file; the release is not what is under test
+    // here, and one that always throws means nothing is ever released.
+    releaseDagHandles: async () => {},
+    kv, countActiveShells: async () => 0, roster: { store: rosterStore(kv), config: CONFIG },
+  });
+
+  assert.equal(await isRosterStale(), false,
+    "a deleted record names no sandbox; the fleet was read whole");
+  assert.ok(!pinged.includes("wl-torn-down"));
+  assert.ok(pinged.includes("wl-a"));
+  const hold = await admitSandbox("sess-new");
+  await hold.release();
+});
+
 test("a DAG sandbox surviving a restart is admitted and pinged", async () => {
   // Its session key may name nothing, or a stale sibling: every node of a DAG
   // shares one session id. Walked from session keys alone it holds no slot and

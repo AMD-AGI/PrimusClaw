@@ -46,7 +46,8 @@ release="prometheus-${version}.linux-amd64"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-curl -fsSLo "$work/$release.tar.gz" \
+# --retry: GitHub's release downloads answer 504 for minutes during GitHub incidents (2026-11-09); curl --retry retries 5xx/timeouts.
+curl -fsSL --retry 6 --retry-delay 20 -o "$work/$release.tar.gz" \
   "https://github.com/prometheus/prometheus/releases/download/v${version}/${release}.tar.gz"
 echo "$tarball_sha256  $work/$release.tar.gz" | sha256sum -c - >/dev/null
 tar -xzf "$work/$release.tar.gz" -C "$work" "$release/promtool"

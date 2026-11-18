@@ -14,7 +14,9 @@
  *   provisioning -> starting -> running -> finishing -> ended
  *                       ^           |
  *                       +-restarting+      (process exited without `final`)
- *   a lost sandbox, in any state, goes back to provisioning and counts as a restart
+ *   a lost sandbox, in any state, goes back to provisioning, unless `exit.json` (read
+ *   through a small reader sandbox) says the app already ended; it counts as a restart
+ *   only when the application's own container failed ({@link platformLoss})
  *
  * Three rules carry the safety of it, each of them in one place:
  *
@@ -25,7 +27,11 @@
  *    could not be made is not "no `final`": the tick ends and tries again.
  *  - A restart is always counted before it is acted on, and the count is bounded
  *    by `max_restarts` on every road into provisioning or restarting
- *    ({@link AppRunner.countedRestart}).
+ *    ({@link AppRunner.countedRestart}). A sandbox the platform took away (its node
+ *    lost, the site out of nodes) is not the application failing and does not spend
+ *    `max_restarts` (a manifest with `max_restarts` 0 is still never started again);
+ *    those losses have their own, larger bound
+ *    ({@link PLATFORM_LOSSES_MAX}), so a site that never comes back still ends the run.
  *  - A second process is never started beside a live one: ticks do not overlap,
  *    the probe runs before every start, and the start command checks again inside
  *    the sandbox ({@link startCommand}).
@@ -47,15 +53,18 @@ import type {
   SandboxExecOptions, SandboxExecResult, SandboxInstance, SandboxStatus,
 } from "../sandbox/provider.js";
 import { provisionTerminalOf } from "../sandbox/errors.js";
-import type { AppSandbox, AppSandboxRun } from "./app-sandbox.js";
+import type { AppSandbox, AppSandboxEnsureOptions, AppSandboxRun } from "./app-sandbox.js";
+import { appStartEnv } from "./app-sandbox.js";
 import {
-  AppRunWriteRefused,
+  AppRunWriteRefused, runClosedForUser,
   type AppLastExit, type AppRunPatch, type AppRunRecord, type AppRunState, type AppRunStore,
 } from "./app-run-store.js";
 import {
-  EXIT_ABSENT, INPUT_FILE, buildAppEnv, expandStateDirCommand, generationTag, isUsableStateDir,
-  killCommand, parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand, stopCommand, writeFileCommand,
-  type ProbeVerdict,
+  BOOTSTRAP_FILE_MODES, EXIT_ABSENT, INPUT_FILE, INPUT_FILE_MODES, STATE_DIR_NO_USER_DATA, USER_DATA_DIR_NOT_CREATED, buildAppEnv,
+  needsUserDataPath, USER_ID_CARRIER,
+  expandStateDirCommand, generationTag, isUsableStateDir, killCommand, parseProbe, probeCommand, readExitCommand, scrub, secretValuesOf, startCommand,
+  stopCommand, writeFileCommand,
+  type FileModes, type ProbeVerdict,
 } from "./app-env.js";
 
 const logger = pino({ name: "app-runner" });
@@ -70,6 +79,49 @@ const EXEC_TIMEOUT = "30s";
 const START_FAILURES_BEFORE_RESTART = 3;
 /** Consecutive unreadable `exit.json` reads before it is taken as having no `final`. */
 const UNPARSEABLE_EXIT_READS = 3;
+/** Consecutive failed looks at shared storage after a lost sandbox before the loss is counted without one. */
+const LOST_SANDBOX_LOOKS = 3;
+/**
+ * Sandboxes the platform may take from one run before the run gives up on it.
+ *
+ * Losses the platform causes are not the application's restarts: a site outage
+ * that downs node after node (2026-11-09: 134 of 219 nodes down, then none usable)
+ * moved one app about six times in an hour and spent its whole `max_restarts`
+ * without the application ever failing. This bound is only there so a run whose
+ * sandbox can never be kept (a site that does not come back, no deadline set) still
+ * ends. A wait for a node that runs out is one loss, and that wait is long (the
+ * start ceiling, 15 minutes, or the queue ceiling), so 24 covers hours of outage.
+ */
+export const PLATFORM_LOSSES_MAX = 24;
+
+/**
+ * The provisioning and sandbox endings that say the platform could not give the
+ * run a sandbox or keep it: no node took it, the queue or start ceiling ran out,
+ * SaFE could not be read, the workload vanished or ended with no failure of its
+ * container named. Everything else (a container that failed, envd exiting, the
+ * sandbox's own TTL, a container that exited before ready) may be the
+ * application or its image, and still counts against `max_restarts`.
+ */
+const PLATFORM_LOSS_REASONS: ReadonlySet<string> = new Set([
+  "sandbox_unschedulable",
+  "sandbox_pending_timeout",
+  "sandbox_start_timeout",
+  "sandbox_status_unreadable",
+  "sandbox_gone",
+  "sandbox_workload_terminal",
+]);
+
+/**
+ * Whether a lost sandbox was the platform's doing rather than the application's.
+ * `reason` is the stable sandbox reason (absent from SaFE reads as `sandbox_gone`, a
+ * terminal workload with no reason as `sandbox_workload_terminal`); `disrupted` is
+ * SaFE saying a disruption (node lost, eviction, preemption) took the pod away,
+ * which wins over whatever the container's exit looked like.
+ */
+export function platformLoss(reason: string | undefined, disrupted = false): boolean {
+  if (disrupted) return true;
+  return PLATFORM_LOSS_REASONS.has(reason ?? "sandbox_workload_terminal");
+}
 /** Attempts at each finishing step before it is given up on, so a run is never held open for ever. */
 const FINISH_STEP_ATTEMPTS = 5;
 /** Consecutive failed ticks, with the store or SaFE unreachable, before finishNow gives up. */
@@ -81,6 +133,19 @@ const TEXT_MAX = 300;
  * count of its own.
  */
 export const MAX_STOP_GRACE_SEC = 3600;
+/**
+ * The SIGTERM grace of a run whose session was deleted, whatever the manifest asks for.
+ *
+ * The grace is there so an application can write its own `final` result, and a
+ * deleted session has nobody left to read one: its task is closed and hidden the
+ * moment the delete commits. What the full grace (900 s by default) bought instead
+ * was fifteen minutes of a live grant and its GPU sandboxes after the delete,
+ * measured on 2026-11-07. Short enough that the holder finishes inside the lease it
+ * still has -- the API renews no lease on a task the delete has closed, and the
+ * last renewal can be one heartbeat old -- so the finish does not wait for the
+ * sweeper to hand it to another Brain.
+ */
+export const SESSION_DELETED_STOP_GRACE_SEC = 15;
 
 // ---------------------------------------------------------------------------
 // Ports
@@ -179,14 +244,35 @@ export interface AppRunnerSeams {
 /** The sandbox, as the runner uses it. The real one is {@link realAppSandbox}. */
 export interface AppSandboxOps {
   /** An existing live sandbox of the run, or a new one, Running; records its id. */
-  ensure(run: AppSandboxRun): Promise<AppSandbox>;
+  ensure(run: AppSandboxRun, opts?: AppSandboxEnsureOptions): Promise<AppSandbox>;
+  /**
+   * A new small sandbox with no accelerator, in the run's workspace, made only to read the run's
+   * state directory (shared storage) after the run's own sandbox is gone. Never adopted as the
+   * run's sandbox; the caller stops it.
+   */
+  reader(run: AppSandboxRun, opts?: AppSandboxEnsureOptions): Promise<AppSandbox>;
   instance(run: Pick<AppSandboxRun, "workspaceId" | "platformKey" | "sandboxSpec">, workloadId: string): SandboxInstance;
   status(inst: SandboxInstance): Promise<SandboxStatus>;
   exec(inst: SandboxInstance, command: string, timeout: string, opts?: SandboxExecOptions): Promise<SandboxExecResult>;
   stop(inst: SandboxInstance): Promise<void>;
-  /** Ids of the run's live sandboxes by label, including one never recorded on the row. */
-  liveIds(runId: string, platformKey: string): Promise<string[]>;
+  /** Ids of the run's live sandboxes by label, in the run's workspace, including one never recorded on the row. */
+  liveIds(run: Pick<AppSandboxRun, "runId" | "workspaceId" | "sandboxSpec">, platformKey: string): Promise<string[]>;
   nodeName(workloadId: string, platformKey: string): Promise<string | null>;
+  /**
+   * The mount paths of the run's workspace's hostpath volumes, in the workspace's
+   * order: where a `USER_DATA_PATH` SaFE did not set is derived from (see
+   * `userDataPathPrelude`). Throws when the workspace could not be read for a
+   * reason that may pass, which is retried; no roots, with `unreadable` saying why,
+   * when the run owner's key is refused it. Absent means nothing is ever derived.
+   */
+  userDataRoots?(run: Pick<AppSandboxRun, "workspaceId" | "sandboxSpec">, platformKey: string): Promise<UserDataRoots>;
+}
+
+/** What {@link AppSandboxOps.userDataRoots} answers. */
+export interface UserDataRoots {
+  roots: string[];
+  /** Why the workspace's volumes are not known, e.g. "HTTP 403"; absent when they were read. */
+  unreadable?: string;
 }
 
 export interface AppRunnerDeps {
@@ -200,6 +286,12 @@ export interface AppRunnerDeps {
   statusTimeoutMs?: number;
   /** Epoch quoted to the API when it signs an extend or a reissue. */
   claimCount?: number;
+  /**
+   * Whether the run's session was deleted. Read only while finishing a run that
+   * was ended from outside; a check that cannot answer says false, which is the
+   * ordinary cancel. Absent means never deleted.
+   */
+  sessionDeleted?: (sessionId: string) => Promise<boolean>;
 }
 
 export interface AppRunOutcome {
@@ -220,6 +312,28 @@ export class AppRunFailedError extends Error {
 
 /** The state directory could not be expanded in the sandbox: a configuration fault, not a transient one. */
 class StateDirError extends Error {}
+
+/**
+ * The run's failure reason when the sandbox has no user data directory and none
+ * can be derived. Shown to the user, so it says what is missing.
+ */
+export const NO_USER_DATA_DIR_REASON =
+  "the sandbox has no user data directory: USER_DATA_PATH is unset, and no hostpath volume of the workspace "
+  + "is mounted in it to derive {mountPath}/users/{USER_ID} from";
+/** The run's failure reason when the workspace's volumes could not be read to derive one from. */
+export function workspaceUnreadableReason(why: string): string {
+  return `the sandbox has no user data directory: USER_DATA_PATH is unset, and the workspace's volumes could not be read (${why}) `
+    + "to derive {mountPath}/users/{USER_ID} from";
+}
+/** The run's failure reason when the derived user data directory could not be created. */
+export const USER_DATA_DIR_NOT_CREATED_REASON =
+  "the sandbox has no user data directory: USER_DATA_PATH is unset, and {mountPath}/users/{USER_ID} could not be created";
+
+/**
+ * The state directory needs `$USER_DATA_PATH` and the sandbox has none it can
+ * use. Every sandbox of the same workspace answers the same, so no restart can help.
+ */
+class NoUserDataDirError extends StateDirError {}
 
 export type TickResult = { done: false } | { done: true; outcome: AppRunOutcome };
 
@@ -286,10 +400,20 @@ export class AppRunner {
   private inflight: Promise<TickResult> | null = null;
   private startFailures = 0;
   private unparseableExits = 0;
+  private failedLossLooks = 0;
+  /** See {@link AppRunner.userDataRoots}; null until read. */
+  private roots: UserDataRoots | null = null;
   private readonly finishAttempts = new Map<string, number>();
   private readonly finishDone = new Set<string>();
   /** Set when the signal given to `run` fires; cleared by `finishNow`, which ends the run on purpose. */
   private halted = false;
+  /**
+   * The signal given to `run`, and whether its abort ends the run; what a sandbox
+   * `ensure` is interrupted by. Cleared by `finishNow`, whose own `ensure` (the
+   * one that reads `final` from shared storage) must not be cut short by the
+   * stop it is carrying out.
+   */
+  private ensureStop: AppSandboxEnsureOptions = {};
   /**
    * Seeded with the platform key, which is a constructor argument and needs no
    * read: it is in the set from the first moment, whatever the store does.
@@ -304,6 +428,8 @@ export class AppRunner {
   private readonly claimCount: number;
   /** Fake-clock time before which a grant that was already seen is not looked up again. */
   private grantInspectAfter = 0;
+  /** Latched once the session is seen deleted: a deletion is never undone. */
+  private sessionGone = false;
 
   constructor(
     private readonly runId: string,
@@ -327,9 +453,20 @@ export class AppRunner {
    * draining) the runner stops for good: a tick still in flight may finish the
    * call it is in, but it writes nothing to the row and starts nothing, so the
    * Brain that takes the run over is the only one moving it.
+   *
+   * A tick waiting for its sandbox is not left to finish that wait: the signal
+   * reaches the sandbox `ensure`, which sends no create once it has fired and
+   * stops waiting at once. `reclaimOnAbort` is read when the abort is seen and
+   * says what happens to a workload whose wait was cut short: true (a cancel, the
+   * deadline, a terminal row) stops it; false (a drain, a lost lease) leaves it
+   * for the Brain that takes the run over. Absent means true. Without this the
+   * wait ran on until the workload was Running -- minutes for a queued one --
+   * while the run's lease ran out under `finishNow`, which waits for the tick,
+   * and the stop that followed was refused and never made.
    */
-  async run(signal: AbortSignal): Promise<AppRunResult> {
+  async run(signal: AbortSignal, opts: { reclaimOnAbort?: () => boolean } = {}): Promise<AppRunResult> {
     this.halted = signal.aborted;
+    this.ensureStop = { signal, ...(opts.reclaimOnAbort ? { reclaimOnAbort: opts.reclaimOnAbort } : {}) };
     const halt = (): void => { this.halted = true; };
     signal.addEventListener("abort", halt, { once: true });
     try {
@@ -424,6 +561,7 @@ export class AppRunner {
     // first, or its write could land on top of the one below.
     await this.inflight?.catch(() => undefined);
     this.halted = false;
+    this.ensureStop = {};
     this.rec = await this.deps.store.load(this.runId);
     if (this.rec.state !== "finishing" && this.rec.state !== "ended") {
       await this.commit({ state: "finishing", last_exit: { at: this.iso(), cause, final: false } });
@@ -624,14 +762,23 @@ export class AppRunner {
   }
 
   private async inProvisioning(): Promise<TickResult> {
+    // A run its user has cancelled, or whose session is gone, gets no sandbox:
+    // whatever stopped it is about to finish it, and a sandbox made now would be
+    // one more thing to stop -- or, on a Brain that took the run over, the only
+    // thing left running.
+    if (await this.closedBeforeCreate()) return { done: false };
     let sandbox: AppSandbox;
     try {
-      sandbox = await this.deps.sandbox.ensure(this.sandboxRun());
+      sandbox = await this.deps.sandbox.ensure(this.sandboxRun(), this.ensureStop);
     } catch (err) {
       // A workload that ended while it was being created is a lost sandbox; any
       // other failure (SaFE unreachable) is transient and the next tick retries,
       // which cannot duplicate a sandbox because ensure adopts a live one.
-      if (provisionTerminalOf(err)) return this.countedRestart("sandbox_lost");
+      const terminal = provisionTerminalOf(err);
+      if (terminal) {
+        logger.warn({ runId: this.runId, reason: terminal.reason }, "app_run.sandbox_not_provisioned");
+        return this.countedRestart("sandbox_lost", undefined, platformLoss(terminal.reason));
+      }
       throw err;
     }
     await this.move({ state: "starting", sandbox_workload_id: sandbox.workloadId }, "provisioning");
@@ -646,10 +793,15 @@ export class AppRunner {
     try {
       stateDir = await this.ensureStateDir(inst);
     } catch (err) {
-      // A directory that cannot be expanded is the same on every tick: counted like
-      // a launch that keeps failing, so the run reaches the restart bound and ends
-      // instead of sitting in starting for ever. A transport failure (the exec
-      // itself) is not this, and is retried.
+      // No user data directory is a property of the workspace, not of this attempt:
+      // the run ends now, saying so, rather than spend its restarts and their backoff
+      // on asking again (measured 2026-11-17: nine refusals, then a backoff that held
+      // the task in executing, with no error, until it was cancelled).
+      if (err instanceof NoUserDataDirError) return this.endWithoutUserDataDir(err.message);
+      // Any other directory that cannot be expanded is counted like a launch that
+      // keeps failing, so the run reaches the restart bound and ends instead of
+      // sitting in starting for ever. A transport failure (the exec itself) is not
+      // this, and is retried.
       if (err instanceof StateDirError) return this.onStartFailure(err);
       throw err;
     }
@@ -700,9 +852,14 @@ export class AppRunner {
   /** Expand `state_dir` inside the sandbox once and keep the result on the row. */
   private async ensureStateDir(inst: SandboxInstance): Promise<string> {
     if (this.rec.state_dir) return this.rec.state_dir;
+    const { roots, unreadable } = await this.userDataRoots();
     const r = await this.deps.sandbox.exec(
-      inst, expandStateDirCommand(this.rec.manifest.state_dir, this.runId), EXEC_TIMEOUT, { untracked: true },
+      inst, expandStateDirCommand(this.rec.manifest.state_dir, this.runId, roots), EXEC_TIMEOUT, { untracked: true },
     );
+    if (r.exitCode === STATE_DIR_NO_USER_DATA) {
+      throw new NoUserDataDirError(unreadable ? workspaceUnreadableReason(unreadable) : NO_USER_DATA_DIR_REASON);
+    }
+    if (r.exitCode === USER_DATA_DIR_NOT_CREATED) throw new NoUserDataDirError(USER_DATA_DIR_NOT_CREATED_REASON);
     const dir = r.stdout.trim();
     if (r.exitCode !== 0 || !isUsableStateDir(dir)) {
       throw new StateDirError(`state_dir could not be expanded in the sandbox (exit ${r.exitCode})`);
@@ -746,17 +903,19 @@ export class AppRunner {
     // is thrown, so the tick fails and the next one tries again, and it never
     // counts toward the restart budget.
     const env = await this.applicationEnv(stateDir);
+    const { roots } = await this.userDataRoots();
     try {
       this.assertActive();
-      await this.writeFiles(inst, stateDir);
+      await this.writeFiles(inst, stateDir, roots);
       this.assertActive();
-      await this.startApplication(inst, stateDir, env);
+      await this.startApplication(inst, stateDir, env, roots);
     } catch (err) {
       if (err instanceof RunnerHalted) throw err;
       if (opts?.replace) {
         logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.grant_restart_failed");
         return { done: false };
       }
+      if (err instanceof NoUserDataDirError) return this.endWithoutUserDataDir(err.message);
       return this.onStartFailure(err);
     }
     this.startFailures = 0;
@@ -766,26 +925,42 @@ export class AppRunner {
   }
 
   /** `input.json`, the bootstrap file, and (in the start command) the events directory. */
-  private async writeFiles(inst: SandboxInstance, stateDir: string): Promise<void> {
-    const put = async (rel: string, content: Buffer, mode: string): Promise<void> => {
+  private async writeFiles(inst: SandboxInstance, stateDir: string, roots: readonly string[]): Promise<void> {
+    const put = async (rel: string, content: Buffer, modes: FileModes): Promise<void> => {
       this.assertActive();
       const r = await this.deps.sandbox.exec(
-        inst, writeFileCommand(`${stateDir}/${rel}`, mode), EXEC_TIMEOUT,
+        inst, writeFileCommand(`${stateDir}/${rel}`, modes, roots), EXEC_TIMEOUT,
         { untracked: true, env: { CLAW_FILE_B64: content.toString("base64") } },
       );
+      // Exit 5 comes only from the derivation, which is there only when roots are.
+      if (r.exitCode === USER_DATA_DIR_NOT_CREATED && roots.length > 0) throw new NoUserDataDirError(USER_DATA_DIR_NOT_CREATED_REASON);
       if (r.exitCode !== 0) throw new Error(`writing ${rel} failed (exit ${r.exitCode})`);
     };
-    await put(INPUT_FILE, Buffer.from(JSON.stringify(this.rec.input), "utf8"), "600");
+    await put(INPUT_FILE, Buffer.from(JSON.stringify(this.rec.input), "utf8"), INPUT_FILE_MODES);
     const bootstrap = this.rec.manifest.bootstrap;
-    if (bootstrap) await put(bootstrap.file, Buffer.from(bootstrap.content_b64, "base64"), "700");
+    if (bootstrap) await put(bootstrap.file, Buffer.from(bootstrap.content_b64, "base64"), BOOTSTRAP_FILE_MODES);
   }
 
-  private async startApplication(inst: SandboxInstance, stateDir: string, env: Record<string, string>): Promise<void> {
+  private async startApplication(
+    inst: SandboxInstance, stateDir: string, env: Record<string, string>, roots: readonly string[],
+  ): Promise<void> {
     // The lookups above can outlast the signal; a runner told to let go starts nothing.
     this.assertActive();
+    // Credentials ride with the start command, never in the workload (see
+    // appSandboxEnv): the spec's own, and the model credential laid last.
+    const startEnv = appStartEnv(this.rec.sandbox_spec, env, this.platformKey);
+    // The derivation reads USER_ID, which must be the sandbox's own (SaFE's, as the state
+    // directory was expanded with), never one the manifest's env lays over it: that would
+    // point the application at another user's directory. The application's own USER_ID
+    // rides under another name and is restored after the derivation (startCommand).
+    if (roots.length > 0 && startEnv.USER_ID !== undefined) {
+      startEnv[USER_ID_CARRIER] = startEnv.USER_ID;
+      delete startEnv.USER_ID;
+    }
     const r = await this.deps.sandbox.exec(
-      inst, startCommand(this.rec.manifest, stateDir, this.tag()), EXEC_TIMEOUT, { env },
+      inst, startCommand(this.rec.manifest, stateDir, this.tag(), roots), EXEC_TIMEOUT, { env: startEnv },
     );
+    if (r.exitCode === USER_DATA_DIR_NOT_CREATED && roots.length > 0) throw new NoUserDataDirError(USER_DATA_DIR_NOT_CREATED_REASON);
     if (r.exitCode !== 0) throw new Error(`start command failed (exit ${r.exitCode}): ${clip(this.scrubbed(r.stderr))}`);
   }
 
@@ -815,6 +990,34 @@ export class AppRunner {
     this.secretsLoaded = true;
     if (!nodeName) logger.warn({ runId: this.runId }, "app_run.node_name_unavailable");
     return buildAppEnv(sources);
+  }
+
+  /**
+   * The sandbox has no user data directory: the run is finishing, as failed, with
+   * the reason the user is shown. Nothing was started, so nothing is signalled;
+   * finishing stops the sandbox and revokes the grant as for any other end.
+   */
+  private async endWithoutUserDataDir(reason: string): Promise<TickResult> {
+    logger.warn({ runId: this.runId, workloadId: this.rec.sandbox_workload_id, reason }, "app_run.no_user_data_dir");
+    await this.move({
+      state: "finishing",
+      last_exit: { at: this.iso(), cause: "start_failed", final: false, stop_reason: reason },
+    }, "starting");
+    return { done: false };
+  }
+
+  /**
+   * Where a `USER_DATA_PATH` SaFE did not set is derived from, read once per
+   * worker, and only for an application that uses the variable: any other gets no
+   * roots, so its commands are exactly what they were, and SaFE is not asked. A
+   * read that fails throws, so the tick fails and the next one asks again:
+   * "could not read the workspace" is not "it has no volume".
+   */
+  private async userDataRoots(): Promise<UserDataRoots> {
+    if (this.roots) return this.roots;
+    const read = this.deps.sandbox.userDataRoots;
+    this.roots = read && needsUserDataPath(this.rec.manifest) ? await read(this.sandboxRun(), this.platformKey) : { roots: [] };
+    return this.roots;
   }
 
   /** A launch that keeps failing is the application failing: it takes the restart road. */
@@ -870,22 +1073,44 @@ export class AppRunner {
    * The one road to `restarting` or back to `provisioning`: counted, and bounded
    * by `max_restarts`. At the bound the run is finishing, as failed -- after one
    * look for a `final` that a lost sandbox may have hidden.
+   *
+   * `platform` (a sandbox the platform took away, see {@link platformLoss}) goes
+   * back to provisioning without spending `max_restarts`, for a manifest that
+   * allows restarts at all (one with `max_restarts` 0 ends, as before): it is counted in
+   * `last_exit.platform_losses` instead, bounded by {@link PLATFORM_LOSSES_MAX}. The
+   * count is carried on every later `last_exit` this road writes, so a takeover
+   * keeps it.
    */
   private async countedRestart(
     cause: "exit" | "sandbox_lost" | "start_failed",
     last?: AppLastExit,
+    platform = false,
   ): Promise<TickResult> {
     const rec = this.rec;
-    const lastExit: AppLastExit = last ?? { at: this.iso(), cause, final: false };
-    if (rec.restarts >= maxRestarts(rec.manifest)) {
-      // A sandbox lost with the budget spent may have taken a finished run with
-      // it: `final` is on shared storage and cannot be read without a sandbox.
-      // Failing the run here would report a success as a failure, so one more
-      // sandbox is made, once, to look (`launch` reads it and starts nothing).
-      if (cause === "sandbox_lost" && rec.state_dir && rec.last_exit?.recovery !== true) {
-        await this.move({ state: "provisioning", sandbox_workload_id: null, last_exit: { ...lastExit, recovery: true } });
+    const losses = rec.last_exit?.platform_losses ?? 0;
+    const lastExit: AppLastExit = {
+      ...(last ?? { at: this.iso(), cause, final: false }),
+      ...(losses > 0 ? { platform_losses: losses } : {}),
+    };
+    // A manifest that allows no restart (max_restarts 0, or no restart block) is never started a second time, whoever lost its
+    // sandbox: it ends here as it always did. Only a run that may restart at all is spared spending one on the platform.
+    if (platform && maxRestarts(rec.manifest) > 0) {
+      if (losses >= PLATFORM_LOSSES_MAX) {
+        await this.move({
+          state: "finishing",
+          last_exit: { ...lastExit, cause: "restarts_exhausted", stop_reason: `the platform lost the app's sandbox ${losses} times` },
+        });
         return { done: false };
       }
+      logger.warn({ runId: this.runId, platformLosses: losses + 1, restarts: rec.restarts }, "app_run.platform_loss_not_counted");
+      await this.move({
+        state: "provisioning", sandbox_workload_id: null, last_exit: { ...lastExit, platform_losses: losses + 1 },
+      });
+      return { done: false };
+    }
+    if (rec.restarts >= maxRestarts(rec.manifest)) {
+      // A lost sandbox has already been looked behind (`finalAfterLoss`, through a small
+      // reader sandbox): no application-sized sandbox is made only to read `exit.json`.
       await this.move({ state: "finishing", last_exit: { ...lastExit, cause: "restarts_exhausted" } });
       return { done: false };
     }
@@ -918,8 +1143,52 @@ export class AppRunner {
       return null;
     }
     if (status.state !== "terminal" && status.state !== "absent") return null;
-    logger.warn({ runId: this.runId, workloadId: inst.id, state: status.state, reason: status.reason }, "app_run.sandbox_lost");
-    return this.countedRestart("sandbox_lost");
+    logger.warn({ runId: this.runId, workloadId: inst.id, state: status.state, reason: status.reason, disrupted: status.disrupted }, "app_run.sandbox_lost");
+    // A sandbox can be lost after the application finished (its node preempted, its pod gone
+    // with no exit status): `final` is on shared storage and decides, as it does for an exit.
+    const exit = await this.finalAfterLoss();
+    if (exit) return this.finishFromExit(exit);
+    const reason = status.state === "absent" ? "sandbox_gone" : status.reason;
+    return this.countedRestart("sandbox_lost", undefined, platformLoss(reason, status.disrupted === true));
+  }
+
+  /**
+   * The run's sandbox is gone. Before that is counted as a restart (or, with the budget spent, as
+   * the run failing), look in the state directory for a `final` exit through a reader sandbox.
+   * Null when there is none, when the application never got a state directory, or when the run is
+   * closed for its user (a cancel keeps the cancel). A look that fails throws, so the tick ends and
+   * the next one looks again; after {@link LOST_SANDBOX_LOOKS} failed looks the loss is counted
+   * without one, so a reader that cannot be made does not hold the run for ever.
+   */
+  private async finalAfterLoss(): Promise<Extract<ExitRead, { kind: "exit" }> | null> {
+    const stateDir = this.rec.state_dir;
+    if (!stateDir) return null;
+    try {
+      if (await this.closedBeforeCreate()) return null;
+      const exit = await this.readThroughReader(stateDir);
+      if (exit.kind === "unreadable") throw new Error("exit.json could not be read");
+      this.failedLossLooks = 0;
+      return exit.kind === "exit" && exit.final ? exit : null;
+    } catch (err) {
+      if (err instanceof RunnerHalted || err instanceof AppRunWriteRefused) throw err;
+      if (++this.failedLossLooks < LOST_SANDBOX_LOOKS) throw err;
+      this.failedLossLooks = 0;
+      logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.lost_sandbox_final_unread");
+      return null;
+    }
+  }
+
+  /** Read `exit.json` through a new reader sandbox, which is stopped whatever the read answered. */
+  private async readThroughReader(stateDir: string): Promise<ExitRead> {
+    this.assertActive();
+    const reader = await this.deps.sandbox.reader(this.sandboxRun(), this.ensureStop);
+    try {
+      return await this.readExit(reader.instance, stateDir);
+    } finally {
+      await this.deps.sandbox.stop(reader.instance).catch((err) => {
+        logger.warn({ runId: this.runId, workloadId: reader.workloadId, err: this.safeText(err) }, "app_run.reader_stop_failed");
+      });
+    }
   }
 
   /** False only when SaFE says the workload is terminal or absent; a status that cannot be read throws, and the step retries. */
@@ -977,8 +1246,20 @@ export class AppRunner {
     const run: AppGrantRun = this.grantRun(rec);
     const cause = rec.last_exit?.cause ?? "exit";
     const cancelled = cause === "cancelled" || cause === "deadline" || cause === "row_terminal";
+    const sessionGone = cancelled && await this.sessionDeleted(rec);
+    const revokeGrant = async (): Promise<void> => {
+      await this.grant.revoke(run);
+      // Recorded on the row as well, so extendGrant refuses it from here on (and
+      // from any Brain that takes the run over). Only for a run that had a grant.
+      if (rec.grant_id && !this.rec.grant_revoked_at) await this.move({ grant_revoked: true });
+    };
 
-    if (cancelled && !(await this.step("stop_application", () => this.stopApplication(inst)))) return { done: false };
+    // A deleted session ends its run as a cancel with nobody waiting for the result:
+    // the grant goes first, which takes the sandboxes made under it with it, and the
+    // application gets the short grace rather than its own. A step already done is
+    // not repeated, so the order can differ from a takeover's without running twice.
+    if (sessionGone) await this.step("revoke_grant", revokeGrant);
+    if (cancelled && !(await this.step("stop_application", () => this.stopApplication(inst, sessionGone)))) return { done: false };
     await this.step("drain_events", async () => {
       if (!this.seams.drainEvents) return;
       // A sandbox that is gone cannot be read: say what was left, do not spend the step's attempts on it.
@@ -988,12 +1269,7 @@ export class AppRunner {
       }
       await this.seams.drainEvents(ctx);
     });
-    await this.step("revoke_grant", async () => {
-      await this.grant.revoke(run);
-      // Recorded on the row as well, so extendGrant refuses it from here on (and
-      // from any Brain that takes the run over). Only for a run that had a grant.
-      if (rec.grant_id && !this.rec.grant_revoked_at) await this.move({ grant_revoked: true });
-    });
+    await this.step("revoke_grant", revokeGrant);
     await this.step("unregister_mcp", () => this.seams.unregisterMcp?.(ctx));
     await this.step("stop_sandbox", () => this.stopSandboxes(inst));
 
@@ -1009,12 +1285,13 @@ export class AppRunner {
    * a tick open. After the grace, or once the process is gone, the run goes on
    * and step 5 stops the sandbox. Returns {@link STEP_PENDING} while waiting.
    */
-  private async stopApplication(inst: SandboxInstance | null): Promise<typeof STEP_PENDING | undefined> {
+  private async stopApplication(inst: SandboxInstance | null, sessionGone = false): Promise<typeof STEP_PENDING | undefined> {
     const stateDir = this.rec.state_dir;
     // Never got as far as a sandbox and a state directory: nothing to signal.
     if (!inst || !stateDir) return undefined;
     const graceMs = Math.min(
       this.rec.manifest.stop_grace_sec ?? APP_MANIFEST_DEFAULTS.stop_grace_sec, MAX_STOP_GRACE_SEC,
+      sessionGone ? SESSION_DELETED_STOP_GRACE_SEC : MAX_STOP_GRACE_SEC,
     ) * 1000;
     const sentAt = Date.parse(this.rec.last_exit?.stop_at ?? "");
     const signalled = Number.isFinite(sentAt);
@@ -1039,24 +1316,65 @@ export class AppRunner {
         return STEP_PENDING;
       }
     }
+    // A deleted session has nobody to read a result for, so a sandbox that is gone
+    // is not brought back to read one from shared storage.
+    if (sandboxGone && sessionGone) return undefined;
     // The process exited, never ran, or the grace is over: an application that
     // wrote `final` keeps its own return code and stop reason.
     return this.adoptFinalExit(inst, stateDir, sandboxGone);
   }
 
   /**
+   * Whether the run is closed for its user, read again from the database (through
+   * the API) right before a sandbox could be created rather than taken from the
+   * start of the tick; the Brain's own tombstone is asked as well. A read that
+   * fails throws, so the tick ends and nothing is created on a guess.
+   */
+  private async closedBeforeCreate(): Promise<boolean> {
+    const fresh = await this.deps.store.load(this.runId);
+    const closed = runClosedForUser(fresh) || await this.sessionDeleted(fresh);
+    if (closed) {
+      logger.info(
+        { runId: this.runId, state: fresh.state, taskStatus: fresh.task_status, sessionDeleted: fresh.session_deleted === true },
+        "app_run.sandbox_not_created_run_closed",
+      );
+    }
+    return closed;
+  }
+
+  /**
+   * Whether the run's session was deleted: the row says so (the database), or the
+   * Brain's tombstone does. Latched; false only when neither can tell.
+   */
+  private async sessionDeleted(rec: Pick<AppRunRecord, "session_id" | "session_deleted">): Promise<boolean> {
+    if (this.sessionGone) return true;
+    if (rec.session_deleted === true) return (this.sessionGone = true);
+    if (!this.deps.sessionDeleted || !rec.session_id) return false;
+    try {
+      this.sessionGone = await this.deps.sessionDeleted(rec.session_id);
+    } catch (err) {
+      logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.session_deleted_check_failed");
+    }
+    return this.sessionGone;
+  }
+
+  /**
    * The sandbox is gone but the state directory is not: it is shared storage. The
-   * only way to read `exit.json` from it is a sandbox, so one is made, once (the
-   * `recovery` mark on the row says it was done, across takeovers), as the restart
-   * path does for a lost sandbox: the application may have written `final` in its
-   * grace just before the sandbox went, and not reading it would report a finished
-   * run as the cancel it was. The sandbox is stopped by the finishing step that
-   * stops every sandbox of the run.
+   * only way to read `exit.json` from it is a sandbox, so a small reader is made, once
+   * (the `recovery` mark on the row says it was done, across takeovers), as the
+   * restart path does for a lost sandbox: the application may have written `final` in
+   * its grace just before the sandbox went, and not reading it would report a finished
+   * run as the cancel it was. The reader has no accelerator and is stopped as soon as
+   * it has been read from.
    */
   private async readFinalFromSharedStorage(stateDir: string): Promise<Extract<ExitRead, { kind: "exit" }> | null> {
     if (this.rec.last_exit?.recovery === true) return null;
-    const reader = await this.deps.sandbox.ensure(this.sandboxRun());
-    const exit = await this.readExit(reader.instance, stateDir);
+    // A cancel keeps the cancel whatever the application wrote, and a deleted
+    // session has nobody to read for: neither is worth a sandbox the size of the
+    // application's. Measured on 2026-11-07, a finish-only takeover of a deleted
+    // session's run made one, as the run's last act.
+    if (await this.closedBeforeCreate()) return null;
+    const exit = await this.readThroughReader(stateDir);
     // A read that failed (the sandbox could not be made, the file could not be
     // read) is retried by the finishing step and is NOT marked done: the mark says
     // "the shared storage was looked at", and only a look that happened earns it.
@@ -1110,7 +1428,7 @@ export class AppRunner {
    * time limit.
    */
   private async stopSandboxes(recorded: SandboxInstance | null): Promise<void> {
-    const ids = new Set(await this.deps.sandbox.liveIds(this.runId, this.platformKey));
+    const ids = new Set(await this.deps.sandbox.liveIds(this.sandboxRun(), this.platformKey));
     if (recorded) ids.add(recorded.id);
     const failures: unknown[] = [];
     for (const id of ids) {

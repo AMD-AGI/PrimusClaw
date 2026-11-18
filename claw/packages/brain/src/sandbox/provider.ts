@@ -72,6 +72,12 @@ export interface SandboxStatus {
   state?: "running" | "terminal" | "absent" | "unknown";
   /** Stable reason when state is terminal. */
   reason?: string;
+  /**
+   * Terminal because the platform took the pod away (a disruption: its node lost,
+   * an eviction, a preemption), not because its container failed. Only set when
+   * the provider can tell; absent means it could not or it was not.
+   */
+  disrupted?: boolean;
 }
 
 export interface SandboxExecResult {

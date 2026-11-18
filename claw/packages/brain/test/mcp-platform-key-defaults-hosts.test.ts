@@ -47,6 +47,9 @@ async function run(over: Record<string, unknown> = {}) {
   await new AgentEngine().execute(
     baseRequest({
       session_id: uniqueSession(),
+      // A user of its own per run: a user's later turn reuses the MCP connections of an earlier one (`clients/mcp-pool.ts`)
+      // and contacts nothing, and what each run sent is read here from what the servers received.
+      user_id: `u-${uniqueSession()}`,
       plugin_id: 5,
       plugin_tools: [{
         id: 17, type: "mcp", name: "plg",

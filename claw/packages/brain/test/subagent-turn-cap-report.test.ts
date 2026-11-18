@@ -7,7 +7,8 @@
  * Its caller reads only its final text. A review's second pass that spent its 20 turns reading
  * and running checks ended on a tool call and returned nothing, and the main loop approved on the
  * empty answer. Such a sub-agent is now asked once more, for its findings in text, and nothing it
- * calls in that reply is run. A sub-agent that finished on its own, and a top-level run, are not.
+ * calls in that reply is run. A sub-agent that finished on its own, and a top-level run, are not, unless the run asked for it
+ * (`report_at_turn_cap`: an assistant router's turn, whose text the API delivers as the person's answer).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -37,13 +38,13 @@ function scripted(turns: Array<{ content: unknown[]; stopReason: string }>) {
   return { session, sent };
 }
 
-function run(turns: Array<{ content: unknown[]; stopReason: string }>, depth: number) {
+function run(turns: Array<{ content: unknown[]; stopReason: string }>, depth: number, extra: Partial<LoopOptions> = {}) {
   const { session, sent } = scripted(turns);
   const routed: string[] = [];
   const opts: LoopOptions = {
     model: "m", apiUrl: "http://localhost:0", apiKey: "k", maxTurns: 2, depth,
     router: ({ route: async (name: string) => { routed.push(name); return "tool ok"; }, setHands: () => {} }) as unknown as ToolRouter,
-    sessionId: "s-cap", userId: "u", llmSession: session, onEvent: async () => {},
+    sessionId: "s-cap", userId: "u", llmSession: session, onEvent: async () => {}, ...extra,
   };
   return { sent, routed, result: agentLoop([{ role: "user", content: "review it" } as Message], [] as ToolSchema[], opts) };
 }
@@ -70,6 +71,22 @@ test("a sub-agent that finished within its turns is not asked again", async () =
 test("a top-level run that reaches its cap is not asked for a report", async () => {
   const { sent, result } = run([call("t1"), call("t2")], 0);
   await result;
+  assert.equal(sent.length, 2);
+  assert.ok(!sent.flat().some(isCapNotice));
+});
+
+test("a top-level run that asked for it (an assistant router's turn, report_at_turn_cap) answers in text at its cap", async () => {
+  const { sent, routed, result } = run([call("t1"), call("t2"), call("t3", "MI355X 的新闻我查到两条：……")], 0, { reportAtTurnCap: true });
+  const r = await result;
+  assert.equal(sent.length, 3, "one reply asked for past the cap");
+  assert.ok(isCapNotice(sent[2].at(-1)!), "the last request tells it the turns are used up");
+  assert.equal(routed.length, 2, "the tool call in that reply was not run");
+  assert.equal(r.finalText, "MI355X 的新闻我查到两条：……");
+});
+
+test("a top-level run that asked for it but finished within its turns is not asked again", async () => {
+  const { sent, result } = run([call("t1"), say("Done.")], 0, { reportAtTurnCap: true });
+  assert.equal((await result).finalText, "Done.");
   assert.equal(sent.length, 2);
   assert.ok(!sent.flat().some(isCapNotice));
 });

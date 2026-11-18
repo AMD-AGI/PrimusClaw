@@ -43,59 +43,13 @@ var ErrUnavailable = errors.New("identity is unavailable")
 
 // Token is the introspection result of an active key.
 type Token struct {
-	Subject string
-	Email   string
-	Roles   []string
+	Subject  string
+	Username string
+	Email    string
+	Roles    []string
+	// Groups are the platform groups of the subject.
+	Groups  []string
 	expires time.Time
-}
-
-// HasRole reports whether the token carries role.
-func (t Token) HasRole(role string) bool {
-	for _, r := range t.Roles {
-		if r == role {
-			return true
-		}
-	}
-	return false
-}
-
-type cacheEntry struct {
-	token   Token
-	expires time.Time
-}
-
-// boundedCache is a TTL map that evicts expired entries, then one entry, when full.
-type boundedCache struct {
-	entries map[string]cacheEntry
-}
-
-func (b *boundedCache) get(key string, now time.Time) (cacheEntry, bool) {
-	e, ok := b.entries[key]
-	if !ok {
-		return cacheEntry{}, false
-	}
-	if !now.Before(e.expires) {
-		delete(b.entries, key)
-		return cacheEntry{}, false
-	}
-	return e, true
-}
-
-func (b *boundedCache) put(key string, e cacheEntry, now time.Time) {
-	if _, ok := b.entries[key]; !ok && len(b.entries) >= maxCacheSize {
-		for k, old := range b.entries {
-			if !now.Before(old.expires) {
-				delete(b.entries, k)
-			}
-		}
-		if len(b.entries) >= maxCacheSize {
-			for k := range b.entries {
-				delete(b.entries, k)
-				break
-			}
-		}
-	}
-	b.entries[key] = e
 }
 
 // Client calls the identity introspection endpoint with HTTP Basic client credentials.
@@ -112,8 +66,8 @@ type Client struct {
 	group        singleflight.Group
 
 	mu       sync.Mutex
-	positive boundedCache
-	negative boundedCache
+	positive TTL[Token]
+	negative TTL[Token]
 	logged   map[string]time.Time
 }
 
@@ -132,8 +86,6 @@ func NewClient(endpoint, clientID, clientSecret, audience string) *Client {
 		http:         &http.Client{Timeout: callTimeout},
 		now:          time.Now,
 		cacheKey:     key,
-		positive:     boundedCache{entries: map[string]cacheEntry{}},
-		negative:     boundedCache{entries: map[string]cacheEntry{}},
 		logged:       map[string]time.Time{},
 	}
 }
@@ -188,8 +140,10 @@ func (c *Client) Introspect(ctx context.Context, key string) (Token, error) {
 type introspection struct {
 	Active   *bool           `json:"active"`
 	Sub      string          `json:"sub"`
+	Username string          `json:"username"`
 	Email    string          `json:"email"`
 	Roles    []string        `json:"roles"`
+	Groups   []string        `json:"groups"`
 	Audience json.RawMessage `json:"aud"`
 	ClientID string          `json:"client_id"`
 	Exp      json.Number     `json:"exp"`
@@ -238,7 +192,7 @@ func (c *Client) call(ctx context.Context, key string) (Token, bool, error) {
 		c.refuse(reason)
 		return Token{}, false, nil
 	}
-	tok := Token{Subject: out.Sub, Email: out.Email, Roles: out.Roles}
+	tok := Token{Subject: out.Sub, Username: out.Username, Email: out.Email, Roles: out.Roles, Groups: out.Groups}
 	if out.Exp != "" {
 		if f, err := out.Exp.Float64(); err == nil && f > 0 {
 			tok.expires = time.Unix(int64(f), 0)
@@ -325,10 +279,10 @@ func (c *Client) cached(key string) (Token, error, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
-	if e, ok := c.positive.get(key, now); ok {
-		return e.token, nil, true
+	if tok, ok := c.positive.Get(key, now); ok {
+		return tok, nil, true
 	}
-	if _, ok := c.negative.get(key, now); ok {
+	if _, ok := c.negative.Get(key, now); ok {
 		return Token{}, ErrInactive, true
 	}
 	return Token{}, nil, false
@@ -340,12 +294,12 @@ func (c *Client) store(key string, tok Token, active bool) {
 	defer c.mu.Unlock()
 	now := c.now()
 	if !active {
-		c.negative.put(key, cacheEntry{expires: now.Add(negativeTTL)}, now)
+		c.negative.Put(key, Token{}, now.Add(negativeTTL), now, maxCacheSize)
 		return
 	}
 	expires := now.Add(positiveTTL)
 	if !tok.expires.IsZero() && tok.expires.Before(expires) {
 		expires = tok.expires
 	}
-	c.positive.put(key, cacheEntry{token: tok, expires: expires}, now)
+	c.positive.Put(key, tok, expires, now, maxCacheSize)
 }

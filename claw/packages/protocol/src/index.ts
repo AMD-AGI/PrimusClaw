@@ -13,6 +13,7 @@ export * from "./topology-handoff.js";
 export * from "./app-run.js";
 export * from "./run-doorbell.js";
 export * from "./remote-agents.js";
+export * from "./claw-api/index.js";
 export * from "./sandbox/base32.js";
 export * from "./sandbox/hands-key.js";
 export * from "./sandbox/shell-record.js";
@@ -20,6 +21,7 @@ export * from "./sandbox/shell-classify.js";
 export * from "./sandbox/hands-route.js";
 export * from "./sandbox/terminal-hold.js";
 export * from "./workspace-excludes.js";
+export * from "./mcp-tool-catalog.js";
 // The one definition of what a published background-work verdict is and when
 // it may still be believed. Exported from the package because the writer lives
 // in Brain and one of the readers lives in the API, and a second copy of these
@@ -61,3 +63,9 @@ export * from "./sandbox-grant.js";
 export * from "./app-sandbox-templates.js";
 export * from "./session-repo.js";
 export * from "./deliveries.js";
+export * from "./citations.js";
+export * from "./user-skill-names.js";
+export * from "./images.js";
+export * from "./sandbox-workspaces.js";
+export * from "./workspace-save.js";
+export * from "./run-failure.js";

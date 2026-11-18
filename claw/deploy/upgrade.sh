@@ -20,7 +20,8 @@
 #
 # Environment variables:
 #   TAG              - image tag to deploy (REQUIRED; image building was removed)
-#   REGISTRY         - image registry (default: docker.io/primussafe)
+#   REGISTRY         - image registry (default: the release, docker.io/rocm/primusclaw:<TAG>, TAG claw-<version>)
+#   REPOSITORY       - image repository under REGISTRY (default: claw for a REGISTRY of your own)
 #   DOMAIN           - cluster ingress host (required for a full deploy; set in
 #                       values.<NAMESPACE>.env or via DOMAIN=...)
 #
@@ -60,14 +61,15 @@ Usage: TAG=<tag> bash deploy/upgrade.sh -n <ns> [flags]
 
 Required:
   -n <ns>                K8s namespace to upgrade (e.g. primus-claw, primus-claw-dev)
-  TAG=<tag>              Pre-built image tag to deploy (image building was removed;
-                         build & push docker.io/primussafe/claw:<tag> out-of-band first)
+  TAG=<tag>              Image tag to deploy: claw-<version> for a release
+                         (docker.io/rocm/primusclaw), or, with REGISTRY set, a tag
+                         built & pushed out-of-band (e.g. docker.io/primussafe/claw:<build>)
 
 Flags:
   --only-api             Upgrade only the API deployment
   --only-brain           Upgrade only the Brain deployment
   --only-hands           Only refresh hands-binary on shared storage: pulls
-                         $REGISTRY/claw:$TAG, streams /app/hands-binary out of it
+                         $REGISTRY/$REPOSITORY:$TAG, streams /app/hands-binary out of it
                          and writes it to CLAW_DEPLOY_ROOT — no API/Brain rollout.
   --skip-health          Skip post-upgrade health probes
   --skip-shared-assets   Skip copying hands-binary to CLAW_DEPLOY_ROOT
@@ -105,16 +107,16 @@ export NAMESPACE="$NAMESPACE_EXPLICIT"
 source "$SCRIPT_DIR/common.sh"
 
 # TAG is required: image building was removed from the upgrade path. Build &
-# push $REGISTRY/claw:<tag> out-of-band (e.g. deploy/build.sh) first. IMG is
+# push $REGISTRY/$REPOSITORY:<tag> out-of-band (e.g. deploy/build.sh) first. IMG is
 # consumed by health checks and deploy_hands_from_image / deploy_shared_assets.
 if [[ -z "$TAG" ]] && ! $ROLLBACK; then
-  fail "TAG is required (image building was removed). Build & push $REGISTRY/claw:<tag> out-of-band (e.g. deploy/build.sh), then pass TAG=<tag>."
+  fail "TAG is required (image building was removed). Pass TAG=claw-<version> for a release (docker.io/rocm/primusclaw), or build & push $REGISTRY/$REPOSITORY:<tag> out-of-band (e.g. deploy/build.sh) and pass TAG=<tag>."
 fi
 # On --rollback the tag is whatever the cluster reverts to, so it is read back
 # after the undo rather than taken from the environment. Anything TAG-derived is
 # filled in there.
 if ! $ROLLBACK; then
-  IMG="${IMG:-$REGISTRY/claw:$TAG}"
+  IMG="${IMG:-$REGISTRY/$REPOSITORY:$TAG}"
 fi
 export TAG IMG
 
@@ -151,7 +153,7 @@ if $ROLLBACK; then
   log "Rollback → namespace=$NAMESPACE  (Brain only; target tag is read from the cluster)"
   log "  dry-run=$DRY_RUN"
 else
-  IMAGE="$REGISTRY/claw:$TAG"
+  IMAGE="$REGISTRY/$REPOSITORY:$TAG"
   log "Upgrade → namespace=$NAMESPACE  image=$IMAGE"
   log "  API=$UPGRADE_API  Brain=$UPGRADE_BRAIN  hands-only=$ONLY_HANDS  dry-run=$DRY_RUN"
 fi

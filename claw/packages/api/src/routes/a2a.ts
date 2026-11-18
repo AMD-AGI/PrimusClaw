@@ -10,23 +10,26 @@ import { authErrorPayload, getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { canWriteSessionAsOperator, isAdmin, type UserInfo } from "../auth/models.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
-import { getViewablePlugin, resolveTaskPlugin } from "../marketplace/plugins.js";
+import { getViewablePlugin, pluginLaunchable, resolveTaskPlugin } from "../marketplace/plugins.js";
 import {
   decideAdmission, envAdmitLimits, sessionTreeShape, withOwnedAdmissionLock,
   type AdmissionAsk,
 } from "../tasks/admission.js";
 import { applySessionGateTransition, openChatRun } from "../tasks/chat-run.js";
 import { createA2aV2, type A2aV2, type ContextEntry, type OpenRunInput } from "./a2a-v2.js";
+import { resultMessageState } from "./a2a-task-view.js";
 import { a2aContextTasksEnabled, identityCallerMayUseA2a } from "./a2a-flags.js";
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { gpuNodesFromSpec, topologyErrors } from "../tasks/run-spec.js";
 import type { EnvironmentTopology } from "@claw/protocol";
-import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
+import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_SKILL_AUTO_EVOLUTION_ENABLED } from "../config.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import type { PoolClient } from "pg";
 import { ErrorCode, NatsError } from "nats";
 import pino from "pino";
+import { sandboxWorkspaceRefusal } from "../tasks/sandbox-workspaces.js";
 import { randomUUID } from "node:crypto";
+import { redactStoredText } from "@claw/utils";
 import {
   type Task, type Message,
   type Part, type StreamResponse,
@@ -128,6 +131,27 @@ function extractTextFromParts(parts: Part[]): string {
     .join("\n");
 }
 
+/** The most turn results (`ResultMessage` events) a task's `artifacts` carries: the latest ones. */
+export const A2A_MAX_ARTIFACTS = 100;
+
+/**
+ * The session's latest `max` turn results, oldest first. Not all of them: a context reused for months has one per turn,
+ * and every send builds the task (twice), so reading them all grew with the context's age.
+ */
+export async function latestResults(
+  sessionId: string, max: number = A2A_MAX_ARTIFACTS,
+): Promise<Array<Record<string, unknown>>> {
+  const r = await db.query(
+    `SELECT event_id, data FROM (
+       SELECT id, event_id, data FROM claw_session_events
+        WHERE session_id = $1 AND event = 'ResultMessage' AND deleted_at IS NULL
+        ORDER BY id DESC LIMIT $2
+     ) w ORDER BY id`,
+    [sessionId, max],
+  );
+  return (r.rows ?? []) as Array<Record<string, unknown>>;
+}
+
 async function buildTaskFromDb(
   sessionId: string,
   historyLength?: number,
@@ -174,14 +198,9 @@ async function buildTaskFromDb(
   }
 
   if (includeArtifacts) {
-    const eventsResult = await db.query(
-      `SELECT event_id, data FROM claw_session_events
-       WHERE session_id = $1 AND event = 'ResultMessage' AND deleted_at IS NULL
-       ORDER BY id`,
-      [sessionId],
-    );
-    if (eventsResult.rows?.length) {
-      task.artifacts = (eventsResult.rows as Array<Record<string, unknown>>).map((e, i) => {
+    const results = await latestResults(sessionId);
+    if (results.length) {
+      task.artifacts = results.map((e, i) => {
         // A result message repeats whatever the agent produced, so it is masked
         // like every other event that leaves the API.
         const data = e.data
@@ -370,13 +389,30 @@ interface A2ARunSpec {
   teamRole?: string;
 }
 
+/** Why a peer's request is refused as invalid params, before anything is opened. */
+type A2AInvalidRequest = { invalidTopology: string[] } | { invalidParams: string };
+
+function isA2AInvalidRequest(r: { spec: A2ARunSpec } | A2AInvalidRequest): r is A2AInvalidRequest {
+  return "invalidTopology" in r || "invalidParams" in r;
+}
+
+function a2aInvalidText(r: A2AInvalidRequest): string {
+  return "invalidTopology" in r ? r.invalidTopology.join("; ") : r.invalidParams;
+}
+
 async function resolveA2ARunSpec(
   messageId: string,
   metadata: Record<string, unknown> | undefined,
   auth: A2AAuthContext,
-): Promise<{ spec: A2ARunSpec } | { invalidTopology: string[] }> {
+): Promise<{ spec: A2ARunSpec } | A2AInvalidRequest> {
   const invalid = topologyErrors(metadata);
   if (invalid) return { invalidTopology: invalid };
+  // The workspace a peer names for this run's sandbox (and its multi-node
+  // cluster) must be one the deployment isolates (SANDBOX_ALLOWED_NAMESPACES).
+  const refusedWorkspace = sandboxWorkspaceRefusal([
+    typeof metadata?.workspace_id === "string" ? metadata.workspace_id : undefined,
+  ]);
+  if (refusedWorkspace) return { invalidParams: refusedWorkspace.message };
 
   const rawPluginId = metadata?.plugin_id !== undefined ? Number(metadata.plugin_id) : undefined;
   const pluginId = rawPluginId !== undefined && Number.isFinite(rawPluginId) ? rawPluginId : undefined;
@@ -387,9 +423,11 @@ async function resolveA2ARunSpec(
     // `metadata.plugin_id` is the caller's to name, so the plugin is read as the
     // caller sees it, exactly as a chat message does: a plugin they may not view
     // resolves to null here, never to its tools, skills and rules.
-    const plugin = await resolveTaskPlugin(
-      pluginId, auth.userId, isAdmin({ ...auth, userName: auth.userId }),
-    );
+    // A temporary plugin past its expiry reads as gone, exactly like a deleted one.
+    const admin = isAdmin({ ...auth, userName: auth.userId });
+    const plugin = await pluginLaunchable(pluginId, auth.userId, admin)
+      ? await resolveTaskPlugin(pluginId, auth.userId, admin)
+      : { tools: null, image: undefined, resource: undefined };
     pluginTools = plugin.tools;
     pluginImage = plugin.image;
     pluginResource = plugin.resource;
@@ -514,6 +552,9 @@ async function openA2ARun(
     sandboxSpec: spec.sandboxImage ? "default" : undefined,
     sandboxImage: spec.sandboxImage,
     workspaceId: spec.workspaceId,
+    // On the row, held by openChatRun on this transaction, so the expiry sweep
+    // sees the run as a use of its plugin.
+    pluginId: spec.pluginId,
     // The declared topology goes on the row the ceiling counts, or the GPU
     // demand the ask was charged for is invisible to every later admission.
     spec: spec.topology ? { topology: spec.topology } : undefined,
@@ -773,9 +814,10 @@ async function admitAndOpenA2AContextSend(
       `INSERT INTO claw_session_events (event_id, session_id, event, data)
        VALUES ($1, $2, 'UserMessage', $3::jsonb)
        ON CONFLICT (event_id, session_id) DO NOTHING`,
+      // Masked as stored (`redactStoredText`); the run is published with `text` as the caller sent it.
       [spec.messageId, target.taskId, JSON.stringify({
         type: "UserMessage", message_id: spec.messageId, role: "user",
-        data: { content: [{ type: "text", text }] },
+        data: { content: [{ type: "text", text: redactStoredText(text).text }] },
       })],
     );
     return { kind: "opened", target, taskId };
@@ -788,8 +830,8 @@ async function openContextRun(input: OpenRunInput<A2AAuthContext>): Promise<Cont
   const { text, callerId, rpcId, auth, metadata } = input;
   const message: Message = { ...input.message, messageId: input.message.messageId || randomUUID() };
   const resolved = await resolveA2ARunSpec(message.messageId, metadata, auth);
-  if ("invalidTopology" in resolved) {
-    return { kind: "error", error: makeInvalidParams(rpcId, resolved.invalidTopology.join("; ")).error };
+  if (isA2AInvalidRequest(resolved)) {
+    return { kind: "error", error: makeInvalidParams(rpcId, a2aInvalidText(resolved)).error };
   }
   const contextId = message.contextId || `ctx-${randomUUID()}`;
   const admitted = await admitAndOpenA2AContextSend(message, text, contextId, callerId, auth, resolved.spec);
@@ -925,7 +967,9 @@ async function publishA2AExecuteTask(
     history,
     // A peer agent's message is not the user's word: no memory tools (memory/service.ts memoryAccess).
     memory_enabled: false,
-    skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
+    skill_evolution_enabled: CLAW_SKILL_AUTO_EVOLUTION_ENABLED,
+    // Nor its skills: a peer's request saves nothing into the user's personal skills.
+    user_skills_enabled: false,
     user_id: auth.userId || "a2a",
     platform_key: auth.platformKey,
     llm_api_key: auth.virtualKey,
@@ -1052,8 +1096,8 @@ async function handleSendMessage(
   }
 
   const resolved = await resolveA2ARunSpec(message.messageId, metadata as Record<string, unknown> | undefined, auth);
-  if ("invalidTopology" in resolved) {
-    return makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, resolved.invalidTopology.join("; "));
+  if (isA2AInvalidRequest(resolved)) {
+    return makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, a2aInvalidText(resolved));
   }
 
   try {
@@ -1394,8 +1438,7 @@ function mapInternalEventToStream(
       return { responses: [{ artifactUpdate }], terminal: false };
     }
     case "ResultMessage": {
-      const subtype = (event.data as Record<string, unknown>)?.subtype;
-      const state = subtype === "success" ? TaskState.COMPLETED : TaskState.FAILED;
+      const state = resultMessageState(event);
       return { responses: makeTerminalStream(taskId, contextId, state, s), terminal: true };
     }
     case "toolUsed": {
@@ -1454,9 +1497,9 @@ async function handleSendStreamingMessage(
   }
 
   const resolved = await resolveA2ARunSpec(message.messageId, metadata as Record<string, unknown> | undefined, auth);
-  if ("invalidTopology" in resolved) {
+  if (isA2AInvalidRequest(resolved)) {
     reply.status(400).send(
-      makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, resolved.invalidTopology.join("; ")),
+      makeJsonRpcError(rpcId, JSON_RPC_INVALID_PARAMS, a2aInvalidText(resolved)),
     );
     return;
   }
@@ -2034,7 +2077,7 @@ async function handleLegacyInvoke(
   try {
     const payload: Record<string, unknown> = {
       session_id: target.taskId, prompt: text, history: [], memory_enabled: false,
-      skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED, user_id: "a2a",
+      skill_evolution_enabled: CLAW_SKILL_AUTO_EVOLUTION_ENABLED, user_skills_enabled: false, user_id: "a2a",
     };
     if (CLAW_AGENT_GUIDELINE_ENABLED) withAgentGuideline(payload);
     await js.publish("tasks.execute", sc.encode(JSON.stringify(payload)));

@@ -36,7 +36,7 @@ describe("assistant observe", { skip }, () => {
   let alice: { userId: string; routerSid: string };
 
   before(async () => {
-    w = await startWorld({ CLAW_ASSISTANT_OBSERVE: "true", CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "clawy" });
+    w = await startWorld({ CLAW_ASSISTANT_OBSERVE: "true", CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "chat-client" });
     observe = await import("../src/assistant/observe.js");
     app = Fastify();
     app.addHook("preHandler", async (req) => {
@@ -93,7 +93,7 @@ describe("assistant observe", { skip }, () => {
     await w.q("DELETE FROM claw_pending_messages WHERE id = $1", [row.id]);
     const run = await w.openRun(sessionId);
     await w.q("UPDATE claw_tasks SET prompt = $2 WHERE task_id = $1", [run.taskId, row.content]);
-    const task: Record<string, unknown> = { task_id: run.taskId, message_id: run.messageId, prompt: row.content, mcp_servers: { mine: { type: "http", url: "http://elsewhere" } }, skills: { s: 1 } };
+    const task: Record<string, unknown> = { task_id: run.taskId, message_id: run.messageId, prompt: row.content, mcp_servers: { mine: { type: "http", url: "http://elsewhere" } }, skills: { s: 1 }, user_skills: [{ name: "x" }], user_skills_enabled: true };
     await w.mod.role.applySessionRoleToTask(task, sessionId);
     const server = (task.mcp_servers as Record<string, any>).assistant;
     return { run, task, token: server.token as string, content: row.content as string };
@@ -236,10 +236,10 @@ describe("assistant observe", { skip }, () => {
     const back = await http("PUT", "/v1/assistant/scopes", "alice", { scope: GROUP, mode: "observe" }, { "x-test-method": "api_key" });
     assert.equal(back.status, 200, "observe only takes power away, so any request of hers may set it");
     assert.equal(await mode(), "observe");
-    const service = await http("PUT", "/v1/assistant/scopes", "alice", { scope: GROUP, mode: "auto" }, { "x-test-client": "clawy" });
+    const service = await http("PUT", "/v1/assistant/scopes", "alice", { scope: GROUP, mode: "auto" }, { "x-test-client": "chat-client" });
     assert.equal(service.status, 200);
     const via = (await w.q("SELECT mode_set_via FROM claw_assistant_scopes WHERE user_id = 'alice' AND scope = $1", [GROUP]))[0].mode_set_via;
-    assert.deepEqual(via, { method: "identity_token", service: { clientId: "clawy", actorSub: "svc" } });
+    assert.deepEqual(via, { method: "identity_token", service: { clientId: "chat-client", actorSub: "svc" } });
 
     // A switch is per person and per place.
     await w.user("bob");
@@ -306,7 +306,7 @@ describe("assistant observe", { skip }, () => {
     assert.ok(verdict.ok);
     assert.equal(verdict.claims.role, "observer");
     assert.equal(verdict.claims.sid, watcher);
-    assert.equal(await w.mod.role.skipsSkillSelection(watcher), true);
+    assert.deepEqual([turn.task.user_skills, turn.task.user_skills_enabled], [undefined, false], "none of the owner's personal skills");
     const role = await w.mod.role.sessionRole(watcher);
     assert.deepEqual(role, { role: "observer", userId: "alice", scope: GROUP });
   });

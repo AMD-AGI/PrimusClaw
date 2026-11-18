@@ -42,7 +42,7 @@ const MAX_STALL_MESSAGES = 16;
 const LOGGED_TEXT_LIMIT = 2000;
 
 /**
- * Gap between status reads.
+ * Gap between status reads once a wait has gone on for a while.
  *
  * A constant rather than a setting. The two loops this replaces both polled every
  * 5s -- one hardcoded, one from RAY_JOB_POLL_INTERVAL_MS, which no deployment set
@@ -52,6 +52,33 @@ const LOGGED_TEXT_LIMIT = 2000;
  * worth exposing, and those are configured.
  */
 const POLL_INTERVAL_MS = 5000;
+
+/**
+ * Gap between status reads at the start of a wait, and how long the start lasts.
+ *
+ * A sandbox is usually Running a few seconds after its create (measured on the
+ * CPU sandbox workspace, 480 sandboxes over four days: 4.2s p50, 6.8s p90), and a
+ * read every POLL_INTERVAL_MS finds it there up to that much later -- on the path
+ * the first tool call of every cold run waits on. So a wait reads every
+ * POLL_FAST_MS for its first POLL_FAST_WINDOW_MS and then backs off to the old
+ * interval, on the old grid: a workload still queued or pulling its image by then
+ * is read exactly as often as before, and no workload is seen later than it was.
+ * What that costs the platform is bounded per wait, not per minute of waiting:
+ * at most POLL_FAST_WINDOW_MS / POLL_FAST_MS reads of one workload's status where
+ * there were four, all in the wait's first seconds.
+ */
+const POLL_FAST_MS = 1000;
+const POLL_FAST_WINDOW_MS = 20_000;
+
+/**
+ * The gap before the next status read, `elapsedMs` into the wait: POLL_FAST_MS
+ * during the window, then whatever reaches the next multiple of POLL_INTERVAL_MS
+ * (never less than POLL_FAST_MS). Exported for its test.
+ */
+export function nextPollGapMs(elapsedMs: number): number {
+  if (elapsedMs < POLL_FAST_WINDOW_MS) return POLL_FAST_MS;
+  return Math.max(POLL_FAST_MS, POLL_INTERVAL_MS - (elapsedMs % POLL_INTERVAL_MS));
+}
 
 /**
  * Phases from which a workload will never become ready.
@@ -104,6 +131,7 @@ export interface WorkloadWaitDeps {
   fetchImpl?: typeof fetch;
   sleepImpl?: (ms: number) => Promise<void>;
   nowImpl?: () => number;
+  /** A fixed gap between reads, in place of the schedule of `nextPollGapMs`. */
   pollMs?: number;
   /** Per-request timeout for one status read. */
   requestTimeoutMs?: number;
@@ -115,6 +143,13 @@ export interface WorkloadWaitDeps {
   startTimeoutMs?: number;
   /** Consecutive 404s that mean the workload is gone. */
   notFoundLimit?: number;
+  /**
+   * How long those 404s must span as well. Defaults to the span the limit had when
+   * every read was POLL_INTERVAL_MS apart (or `pollMs` apart, when that is given), so
+   * that reading faster at the start of a wait does not also give up on a workload
+   * the platform has not synced yet sooner than it used to.
+   */
+  notFoundWindowMs?: number;
   /** Minimum gap between progress events. */
   notifyIntervalMs?: number;
   /**
@@ -219,9 +254,34 @@ export interface WorkloadWaitOptions {
    * queued workload (a queue moves, and the Pending ceiling bounds it) and an
    * admitted one with a scale-up under way (a node can take minutes to arrive);
    * those keep the ceilings of their phase, the Pending one while Pending and the
-   * start one once the platform reports it NotReady. 0 or absent disables.
+   * start one once the platform reports it NotReady. Nor an admitted one the
+   * autoscaler says capacity can come for (`capacityWait`: an account at its
+   * per-user limit, a node being given back): that is a wait for capacity too, on
+   * the same ceilings as a node being added. 0 or absent disables.
    */
   unschedulableTimeoutMs?: number;
+  /**
+   * The ceiling for a workload the platform reports dispatched (NotReady) while it
+   * says a node is being added for it (`TriggeredScaleUp`): such a wait is for
+   * capacity, which for a GPU node can take hours, not for a start. When set, that
+   * wait runs on this ceiling, counted from the first read of the scale-up, and the
+   * start ceiling does not run during it; 0 means no ceiling. Absent (the default,
+   * and what a multi-node cluster passes) keeps the ceilings of the phase: the
+   * start ceiling applies as it always did. Opt-in, so that a caller whose start
+   * ceiling is "wait indefinitely" is never given a limit it did not ask for.
+   *
+   * The same ceiling, on the same clock, covers a dispatched workload the
+   * autoscaler says capacity can come for (`capacityWait`), which is a wait for
+   * capacity of the same kind; the clock runs on through a change between the two.
+   */
+  scaleUpTimeoutMs?: number;
+  /**
+   * The ceiling on one continuous Pending wait, in place of
+   * SANDBOX_PENDING_TIMEOUT_SECONDS, for a caller that derives its own (the sandbox
+   * a run opens bounds it by what the run's own timeout leaves; see
+   * `capacityWaitTimeoutMs`). 0 means no ceiling; absent keeps the setting.
+   */
+  pendingTimeoutMs?: number;
   deps?: WorkloadWaitDeps;
 }
 
@@ -263,7 +323,12 @@ async function sleepUnlessAborted(
  *     2xx whose body carries no phase;
  *   - Pending past the ceiling         -> sandbox_pending_timeout, counted only
  *     while queued and reset on dispatch;
- *   - admitted, no node has taken the pod and none is being added, past
+ *   - dispatched with a node being added, or with the autoscaler saying capacity
+ *     can come (an account at its limit, a node being given back), past
+ *     `scaleUpTimeoutMs`, for a caller that set it -> sandbox_pending_timeout,
+ *     counted from the first read of either and reset once it is neither;
+ *   - admitted, no node has taken the pod, none is being added and none can come
+ *     by waiting, past
  *     `unschedulableTimeoutMs` -> sandbox_unschedulable, counted from the first
  *     such read, restarted by a message the stall has not had before, and
  *     cleared the moment a pod is taken, a scale-up is triggered (and it stays
@@ -271,8 +336,8 @@ async function sleepUnlessAborted(
  *     autoscaler says it will not add a node) or the workload goes back to the
  *     queue;
  *   - dispatched but not ready past its own ceiling -> sandbox_start_timeout,
- *     counted from the first read that is not Pending and reset if the workload
- *     falls back to Pending. SaFE reports a container's waiting state nowhere
+ *     counted from the first read that is not Pending (nor, for a caller that set
+ *     `scaleUpTimeoutMs`, a node being added), and reset if it falls back to either. SaFE reports a container's waiting state nowhere
  *     (an image that can never be pulled reads as an ordinary slow start), so
  *     the only honest signal that a start will not finish is time;
  *   - the run's signal aborting        -> sandbox_wait_interrupted.
@@ -287,20 +352,30 @@ export async function waitForWorkloadReady(
   const doFetch = deps?.fetchImpl ?? fetch;
   const doSleep = deps?.sleepImpl ?? sleep;
   const now = deps?.nowImpl ?? Date.now;
-  const POLL_MS = deps?.pollMs ?? POLL_INTERVAL_MS;
+  const FIXED_POLL_MS = deps?.pollMs;
   const REQUEST_TIMEOUT_MS = deps?.requestTimeoutMs ?? 15_000;
   const UNREADABLE_TIMEOUT_MS = deps?.unreadableTimeoutMs ?? SANDBOX_POLL_TIMEOUT_MS;
-  const PENDING_TIMEOUT_MS = deps?.pendingTimeoutMs ?? SANDBOX_PENDING_TIMEOUT_MS;
+  const PENDING_TIMEOUT_MS = opts.pendingTimeoutMs ?? deps?.pendingTimeoutMs ?? SANDBOX_PENDING_TIMEOUT_MS;
   const START_TIMEOUT_MS = deps?.startTimeoutMs ?? SANDBOX_START_TIMEOUT_MS;
   const NOT_FOUND_LIMIT = deps?.notFoundLimit ?? 12;
+  const NOT_FOUND_WINDOW_MS = deps?.notFoundWindowMs
+    ?? Math.max(0, NOT_FOUND_LIMIT - 1) * (FIXED_POLL_MS ?? POLL_INTERVAL_MS);
   const NOTIFY_INTERVAL_MS = deps?.notifyIntervalMs ?? 600_000;
   const WAIT_NOTICE_GAP_MS = deps?.waitNoticeGapMs ?? 30_000;
   const UNSCHEDULABLE_TIMEOUT_MS = opts.unschedulableTimeoutMs ?? 0;
+  const SCALE_UP_TIMEOUT_MS = opts.scaleUpTimeoutMs;
 
   const detailUrl = `${SAFE_API_URL}/api/v1/workloads/${workloadId}`;
   const pollStart = now();
   let lastNotifyMs = 0;
   let consecutiveNotFound = 0;
+  // When the current run of 404s began; meaningful only while consecutiveNotFound > 0.
+  let notFoundSince = 0;
+  // What the last `poll_status` line said, and when, so a read every second does
+  // not also log every second: a line is written when the status changes, and
+  // otherwise no more often than the old poll interval.
+  let lastStatusLog = "";
+  let lastStatusLogMs = 0;
   let lastReadableMs = pollStart;
   let lastProblem = "";
   // When the workload was first seen queued. Measured only while it is still
@@ -313,6 +388,9 @@ export async function waitForWorkloadReady(
   // soon as a read shows anything else, so it only grows through an unbroken
   // absence of progress.
   let unscheduledSince: number | null = null;
+  // When a dispatched workload was first seen with a node being added for it, in
+  // an unbroken run of such reads; used only when the caller set scaleUpTimeoutMs.
+  let scaleUpSince: number | null = null;
   // What the platform has said about the pod during this stall. A message not
   // among them is the platform doing something, so the stall starts over; one it
   // has already said, again, is not. Bounded, so a message that changes on every
@@ -322,6 +400,9 @@ export async function waitForWorkloadReady(
   // workload only while it is the newest scheduling event, so the next read is
   // asked to keep it in force (see readWaitingState).
   let scaleUpSeen = false;
+  // The same for a wait for capacity: the reason the last read was given, or
+  // false when it was not one.
+  let capacitySeen: string | false = false;
   // When the workload was first seen waiting with nothing said about why, in an
   // unbroken run of such reads. Such a wait is announced only once it has lasted
   // WAIT_NOTICE_GAP_MS: a workload the platform has not synced yet looks the same.
@@ -354,7 +435,7 @@ export async function waitForWorkloadReady(
 
   while (true) {
     if (signal?.aborted) return await interrupted("");
-    await sleepUnlessAborted(doSleep, POLL_MS, signal);
+    await sleepUnlessAborted(doSleep, FIXED_POLL_MS ?? nextPollGapMs(now() - pollStart), signal);
     if (signal?.aborted) return await interrupted("");
     const elapsed = ((now() - pollStart) / 1000).toFixed(1);
 
@@ -382,8 +463,9 @@ export async function waitForWorkloadReady(
       });
       if (!resp.ok) {
         if (resp.status === 404) {
+          if (consecutiveNotFound === 0) notFoundSince = now();
           consecutiveNotFound++;
-          if (consecutiveNotFound >= NOT_FOUND_LIMIT) {
+          if (consecutiveNotFound >= NOT_FOUND_LIMIT && now() - notFoundSince >= NOT_FOUND_WINDOW_MS) {
             return await giveUp(
               "sandbox_gone",
               "",
@@ -429,7 +511,12 @@ export async function waitForWorkloadReady(
     }
 
     const ready = Boolean(phase) && isReady(detail);
-    logger.info({ workloadId, phase, queuePosition, ready, elapsed }, `${logPrefix}.poll_status`);
+    const statusLog = `${phase}|${queuePosition}|${ready}`;
+    if (statusLog !== lastStatusLog || now() - lastStatusLogMs >= POLL_INTERVAL_MS) {
+      lastStatusLog = statusLog;
+      lastStatusLogMs = now();
+      logger.info({ workloadId, phase, queuePosition, ready, elapsed }, `${logPrefix}.poll_status`);
+    }
 
     if (ready) {
       await opts.onReady?.({ phase, queuePosition }).catch(() => {});
@@ -481,10 +568,13 @@ export async function waitForWorkloadReady(
     // before the ceilings below so that an admitted workload nothing will run is
     // ended on its own, shorter limit rather than on the long one meant for a
     // sandbox that is genuinely starting.
-    const waiting = readWaitingState(detail, scaleUpSeen);
+    const waiting = readWaitingState(detail, scaleUpSeen, capacitySeen);
     // A body with no phase says nothing about the workload, so what was seen
     // before it stands; any other read decides it.
-    if (phase) scaleUpSeen = waiting?.scalingUp === true;
+    if (phase) {
+      scaleUpSeen = waiting?.scalingUp === true;
+      capacitySeen = waiting?.capacityWait === true ? waiting.reason : false;
+    }
     if (waiting?.kind === "unscheduled") {
       const t = now();
       if (unscheduledSince === null) {
@@ -519,19 +609,44 @@ export async function waitForWorkloadReady(
     // dispatched and busy pulling a large image is never reaped as "pending".
     // An unreadable phase leaves the clock alone; that case belongs to the
     // backstop above.
+    //
+    // A dispatched workload with a node being added for it is waiting for
+    // capacity, which for a GPU node can take hours, not for a start: for a caller
+    // that asked (scaleUpTimeoutMs), it runs on that ceiling, from the first read
+    // of the scale-up, and the start ceiling does not run.
+    // A node being added and a node the autoscaler will add once capacity frees
+    // up are both waits for capacity, on one clock.
+    const scalingUp = waiting?.scalingUp === true || waiting?.capacityWait === true;
     if (phase === "pending") {
       dispatchedSince = null;
+      scaleUpSince = null;
       if (pendingSince === null) pendingSince = now();
       if (PENDING_TIMEOUT_MS > 0 && now() - pendingSince > PENDING_TIMEOUT_MS) {
         const pendingFor = ((now() - pendingSince) / 1000).toFixed(1);
         return await giveUp(
           "sandbox_pending_timeout",
           phase,
-          `workload ${workloadId} still queued (Pending) after ${pendingFor}s`,
+          `workload ${workloadId} still queued (Pending) after ${pendingFor}s`
+          + (waiting?.capacityWait ? `: ${waiting.reason}` : ""),
+        );
+      }
+    } else if (phase && scalingUp && SCALE_UP_TIMEOUT_MS !== undefined) {
+      pendingSince = null;
+      dispatchedSince = null;
+      if (scaleUpSince === null) scaleUpSince = now();
+      if (SCALE_UP_TIMEOUT_MS > 0 && now() - scaleUpSince > SCALE_UP_TIMEOUT_MS) {
+        const scalingFor = ((now() - scaleUpSince) / 1000).toFixed(1);
+        return await giveUp(
+          "sandbox_pending_timeout",
+          phase,
+          waiting?.capacityWait
+            ? `workload ${workloadId} still waiting for capacity after ${scalingFor}s (phase=${phase}): ${waiting.reason}`
+            : `workload ${workloadId} still waiting for the platform to add a node after ${scalingFor}s (phase=${phase})`,
         );
       }
     } else if (phase) {
       pendingSince = null;
+      scaleUpSince = null;
       // Dispatched and still short of ready (the terminal and ready cases left
       // above), so the start has to finish within its own ceiling.
       if (dispatchedSince === null) dispatchedSince = now();

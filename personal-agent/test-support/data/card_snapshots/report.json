@@ -1,0 +1,33 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "primusclaw": "report",
+       "prompt": "p-1"
+      },
+      "title": "Report a problem",
+      "type": "Action.Execute",
+      "verb": "primusclaw.feedback"
+     }
+    ],
+    "body": [
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "💬 Did something go wrong? You can tell the PrimusClaw team.",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

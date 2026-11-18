@@ -63,6 +63,18 @@ const skillStageTotal = new Counter({
   labelNames: ["source", "outcome"] as const,
   registers: [registry],
 });
+const citeCheckJudgeTotal = new Counter({
+  name: "claw_cite_check_judge_total",
+  help: "Judge calls of a research report's citation check, by outcome: answered, answered on its one retry, or no answer after it (the batch's statements are then not checked).",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+const citeCheckStatementsTotal = new Counter({
+  name: "claw_cite_check_statements_total",
+  help: "Cited statements of the research reports checked before delivery, by verdict: supported, unverified, not checked, or too little to check.",
+  labelNames: ["verdict"] as const,
+  registers: [registry],
+});
 const platformDefaultChatsTotal = new Counter({
   name: "claw_platform_default_chats_total",
   help: "Chats that were offered at least one platform-default skill.",
@@ -78,6 +90,39 @@ const platformSkillReadTotal = new Counter({
   name: "claw_platform_skill_read_total",
   help: "Platform-default skills whose SKILL.md the agent actually read.",
   labelNames: ["skill"] as const,
+  registers: [registry],
+});
+// A user's personal skills (`agent/user-skills.ts`). Names only in logs, never in labels: a label per user's skill
+// name would be a series per user. `role` is `worker` here; the API counts the router's own list.
+const userSkillListedChars = new Histogram({
+  name: "claw_user_skill_listed_chars",
+  help: "Characters of the personal-skill list placed in a turn's prompt.",
+  labelNames: ["role"] as const,
+  buckets: [100, 500, 1000, 2000, 3000, 5000, 8000],
+  registers: [registry],
+});
+const userSkillListedTotal = new Counter({
+  name: "claw_user_skill_listed_total",
+  help: "Personal skills listed to the model by name and description.",
+  labelNames: ["role"] as const,
+  registers: [registry],
+});
+const userSkillTruncatedTotal = new Counter({
+  name: "claw_user_skill_truncated_total",
+  help: "Personal skills the list had no room for (still loadable by name).",
+  labelNames: ["role"] as const,
+  registers: [registry],
+});
+const userSkillReadTotal = new Counter({
+  name: "claw_user_skill_read_total",
+  help: "Reads of a personal skill's SKILL.md by the model, by outcome.",
+  labelNames: ["role", "outcome"] as const,
+  registers: [registry],
+});
+const userSkillStagedTotal = new Counter({
+  name: "claw_user_skill_staged_total",
+  help: "Personal skills fetched from the API onto Brain, or written into a sandbox, by outcome.",
+  labelNames: ["outcome"] as const,
   registers: [registry],
 });
 const platformSkillLazyWriteTotal = new Counter({
@@ -183,6 +228,25 @@ const handsBinaryDownloadDuration = new Histogram({
 // rightful holder of a NATS KV lock and therefore skipped the delete.
 // Steady-state value MUST be 0; any non-zero rate signals competing
 // brain pods or post-pause holder mismatch and warrants investigation.
+const processFaultTotal = new Counter({
+  name: "claw_brain_process_fault_total",
+  help: "Errors that escaped every handler and reached the process: an unhandled rejection (logged and survived) or an uncaught exception (drained, then exited). Any increase is a bug to fix.",
+  labelNames: ["kind"] as const, // "unhandled_rejection" | "uncaught_exception"
+  registers: [registry],
+});
+
+const deadHolderLockTakeoverTotal = new Counter({
+  name: "claw_brain_dead_holder_lock_takeover_total",
+  help: "Task locks taken over from a holder that stopped renewing them (a brain lost with its node), for a run the API had already requeued to this pod.",
+  registers: [registry],
+});
+
+const lockSelfFencedTotal = new Counter({
+  name: "claw_brain_lock_self_fenced_total",
+  help: "Runs that stopped because their task lock had gone unrenewed for long enough that another brain could soon take it over (the holder gives up first).",
+  registers: [registry],
+});
+
 const lockReleaseSkippedTotal = new Counter({
   name: "claw_brain_lock_release_skipped_total",
   help: "Session-lock release calls that detected we are no longer the holder (INV-13 protection fired).",
@@ -517,6 +581,13 @@ const resumeWorkspaceModeTotal = new Counter({
   registers: [registry],
 });
 
+const workspaceRestoreTotal = new Counter({
+  name: "claw_brain_workspace_restore_total",
+  help: "Restores of a new sandbox's /workspace from the session's S3 prefix, by result. A failed one holds every later prune of that sandbox.",
+  labelNames: ["result"] as const, // "ok" | "failed"
+  registers: [registry],
+});
+
 const taskRedeliveryTotal = new Counter({
   name: "claw_brain_task_redelivery_total",
   help: "NATS task redeliveries observed by this brain pod.",
@@ -773,6 +844,17 @@ export const metrics = {
   onPlatformDefault(kind: "skill" | "mcp" | "config", outcome: "ok" | "failed" | "skipped", reason: string): void {
     platformDefaultTotal.inc({ kind, outcome, reason });
   },
+  /** One judge call of a citation check (`tools/cite-check.ts`): answered, answered on its retry, or no answer after it. */
+  onCiteCheckJudge(outcome: "answered" | "answered_on_retry" | "no_answer"): void {
+    citeCheckJudgeTotal.inc({ outcome });
+  },
+  /** The verdicts of one checked report's statements. */
+  onCiteCheckStatements(supported: number, unverified: number, unchecked: number, thin = 0): void {
+    if (supported) citeCheckStatementsTotal.inc({ verdict: "supported" }, supported);
+    if (unverified) citeCheckStatementsTotal.inc({ verdict: "unverified" }, unverified);
+    if (unchecked) citeCheckStatementsTotal.inc({ verdict: "not_checked" }, unchecked);
+    if (thin) citeCheckStatementsTotal.inc({ verdict: "too_little" }, thin);
+  },
   /** One skill staged for a turn: `outcome` says whether its files were downloaded. */
   onSkillStage(source: "plugin" | "tool", outcome: "hit" | "joined" | "downloaded"): void {
     skillStageTotal.inc({ source, outcome });
@@ -785,6 +867,20 @@ export const metrics = {
   /** The agent read a platform-default skill's SKILL.md. */
   onPlatformSkillRead(skill: string): void {
     platformSkillReadTotal.inc({ skill });
+  },
+  /** A turn whose prompt lists personal skills: how long the list is, how many it holds and how many it left out. */
+  onUserSkillList(role: "worker", listChars: number, listed: number, truncated: number): void {
+    userSkillListedChars.observe({ role }, listChars);
+    userSkillListedTotal.inc({ role }, listed);
+    if (truncated > 0) userSkillTruncatedTotal.inc({ role }, truncated);
+  },
+  /** The model read a personal skill's SKILL.md (`ok`), or asked for one that is gone or changed (`not_found`) or could not be had (`failed`). */
+  onUserSkillRead(role: "worker", outcome: "ok" | "not_found" | "failed"): void {
+    userSkillReadTotal.inc({ role, outcome });
+  },
+  /** One personal skill fetched from the API (`fetched`, `changed`, `not_found`, `failed`) or written into a sandbox (`written`, `write_failed`). */
+  onUserSkillStaged(outcome: "fetched" | "changed" | "not_found" | "failed" | "written" | "write_failed"): void {
+    userSkillStagedTotal.inc({ outcome });
   },
   /** One lazy write of platform-default skills into a sandbox. */
   onPlatformSkillLazyWrite(outcome: "ok" | "failed", elapsedSec: number, coldSandbox: boolean): void {
@@ -949,6 +1045,15 @@ export const metrics = {
       handsBinaryDownloadDuration.observe(elapsedSec);
     }
   },
+  onProcessFault(kind: "unhandled_rejection" | "uncaught_exception"): void {
+    processFaultTotal.inc({ kind });
+  },
+  onDeadHolderLockTakenOver(): void {
+    deadHolderLockTakeoverTotal.inc();
+  },
+  onLockSelfFenced(): void {
+    lockSelfFencedTotal.inc();
+  },
   onLockReleaseSkipped(reason: "not_holder" | "cas_lost" | "legacy_format"): void {
     lockReleaseSkippedTotal.inc({ reason });
   },
@@ -1062,6 +1167,9 @@ export const metrics = {
     mode: "sandbox_reuse" | "workspace_restore" | "no_data_turn0" | "skip_no_ckpt",
   ): void {
     resumeWorkspaceModeTotal.inc({ mode });
+  },
+  onWorkspaceRestore(result: "ok" | "failed"): void {
+    workspaceRestoreTotal.inc({ result });
   },
   onTaskRedelivery(has_checkpoint: "true" | "false"): void {
     taskRedeliveryTotal.inc({ has_checkpoint });

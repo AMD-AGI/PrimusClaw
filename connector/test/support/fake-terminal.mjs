@@ -1,0 +1,280 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * A stand-in for Claude Code's terminal interface, run inside a real tmux pane by the tests: an input box drawn the way
+ * Claude Code 2.1.x draws it (a rule, `❯` and the text or a dimmed suggestion, a rule), bracketed paste, Enter to submit,
+ * Ctrl-U to clear. A submitted message is written to the transcript as a typed prompt, the registry row says `busy` while it
+ * "works", then an answer and the end of the turn are written and the row says `idle` again.
+ *
+ * FAKE_TRANSCRIPT: the transcript file. FAKE_ROW: the registry row (written by the test; only its status is changed here).
+ * FAKE_SESSION: the session id. FAKE_WORK_MS: how long a turn takes. FAKE_MODE_FILE: a file holding the permission mode the footer
+ * below the box names, as Claude Code names it (`manual mode on` for `default`, `accept edits on`...); `none` draws a footer that
+ * names no mode; `nobox` draws a screen with no input box at all (another program, a layout the connector does not know). Read
+ * again every 50 ms, so the test can switch it as shift+tab would. FAKE_TITLE: a conversation name Claude Code writes into the rule
+ * above the box (`/rename`). FAKE_IDLE_STATUS: what the row says between turns (`idle`; `shell` is what Claude Code 2.1.32x says
+ * when background shells run). FAKE_TORN_ROW=1: the row is never written (Claude Code gives up on a row it cannot read). FAKE_TASKS_DIR:
+ * a conversation's task folder the process keeps open, as Claude Code does once that conversation ran a background task.
+ * A message submitted while a turn runs is queued, as Claude Code 2.1.285 queues it (measured 2026-11-10): `queue-operation`
+ * enqueue with its text at once; then, with FAKE_QUEUE=absorb, taken into the running turn (`remove` absorbed_mid_turn and a
+ * `queued_command` attachment, answered in that turn), or else after that turn's end (`dequeue`, then a turn of its own as a typed
+ * prompt).
+ * FAKE_BUSY_MS: a turn of its own runs from the start for this long (a prompt that is not the phone's; `esc to interrupt` below the
+ * box, the row `busy`).
+ * FAKE_DIALOG_FILE: an adversary. Once anything is typed or pasted (the first time only), a permission question is drawn under the box (the
+ * typed text still shows in it), and an Enter while it shows approves it: "approved" is written to this file and nothing is
+ * submitted. Once the file FAKE_DIALOG_DISMISS exists, the question is answered at the terminal and goes; with FAKE_DIALOG_CLEARS=1
+ * that also empties the box.
+ * A question's options are Yes and No, Yes highlighted; End highlights the last (No), as Claude Code's do; Enter chooses the
+ * highlighted one: Yes writes "approved" to FAKE_DIALOG_FILE, No writes "denied" to FAKE_DIALOG_FILE.denied; either way the
+ * question goes and the box keeps what it held.
+ * FAKE_DIALOG_AT_ENTER=1 (with FAKE_DIALOG_FILE): an adversary for the moment between the last screen read and the Enter: the question
+ * shows as the first Enter arrives, before it is read.
+ * FAKE_ESC_FILE: every Esc the terminal receives is recorded in this file (a line each).
+ * FAKE_DIALOG_ON_KEY=1 (with FAKE_DIALOG_FILE): an adversary for the moment between the screen read and the keys. The question shows
+ * as the first input arrives, before it is read; while it shows, a typed digit answers it ("approved", as Claude Code 2.1.285 takes a
+ * lone `1`) and a paste is dropped (as Claude Code drops one, measured 2026-11-10).
+ * FAKE_QUESTION_FILE: while this file exists, a permission question of the terminal's own (a background agent's dangerous `rm`) is
+ * drawn in place of the box, as Claude Code 2.1.325 draws one (claude-question.mjs): the box, and the conversation's name in the
+ * rule above it, are not on the screen until the file is gone (answered at the terminal).
+ * FAKE_DRAW_LAG_MS: while a turn runs, what comes in (a paste, a key) is drawn this much later (a busy Claude Code drawing late); what
+ * the transcript records is written at once.
+ * FAKE_PASTE_REF=1: a paste of several lines shows in the box as `[Pasted text #n +k lines]`, and the prompt (and the queue) records
+ * it as Claude Code 2.1.285-2.1.327 does: `\n\n<pasted_content id="…">\n<the text>\n</pasted_content id="…">\n` in its place.
+ * FAKE_PASTE_REF=placeholder: the paste shows in the box the same way, but the prompt records the placeholder as the box showed it
+ * (`[Pasted text #n +k lines]`, not expanded): a prompt recorded in words the connector cannot compare with what it pasted.
+ * FAKE_ESC_REWIND=1: an Esc while a turn of the phone's prompt runs, before its answer is written, stops it and puts the prompt back
+ * into the box as it was submitted (a long paste as its `[Pasted text #n +k lines]`), as Claude Code 2.1.327 does (measured
+ * 2026-11-18); nothing more is written for that turn.
+ * FAKE_ENTER_IGNORE=n: the first n Enters in the box are dropped (a Claude Code that lost the key): the text stays in the box.
+ * FAKE_RECORD_LAG_MS: a submitted prompt is recorded in the transcript this much later (a busy Claude Code writing late); the turn
+ * starts at once (the row says `busy`).
+ */
+import fs from "node:fs";
+import { bashQuestion, toolLine } from "./claude-question.mjs";
+
+const transcript = process.env.FAKE_TRANSCRIPT;
+const rowFile = process.env.FAKE_ROW;
+const sessionId = process.env.FAKE_SESSION;
+const workMs = Number(process.env.FAKE_WORK_MS || "300");
+const idleStatus = process.env.FAKE_IDLE_STATUS || "idle";
+if (process.env.FAKE_TASKS_DIR) fs.openSync(process.env.FAKE_TASKS_DIR, "r");   // (held open for as long as it runs)
+let buffer = "";
+let pasting = false;
+let working = false;
+let pending = "";
+let pasted = "";
+const pastes = new Map();
+/** `text` with each `[Pasted text #n +k lines]` it holds as the prompt records it (FAKE_PASTE_REF=1). */
+const expand = (text) => text.replace(/\[Pasted text #(\d+) \+\d+ lines\]/g, (m, n) => {
+  const p = pastes.get(Number(n));
+  if (p === undefined) return m;
+  const id = (0x1000 + Number(n)).toString(16);
+  return `\n\n<pasted_content id="${id}">\n${p}\n</pasted_content id="${id}">\n`;
+});
+const modeFile = process.env.FAKE_MODE_FILE;
+// Claude Code's own table (indicator per mode id), as the connector reads it back.
+const INDICATOR = { default: "manual mode", plan: "plan mode", acceptEdits: "accept edits", bypassPermissions: "bypass permissions", dontAsk: "don't ask", auto: "auto mode" };
+const readMode = () => { try { return fs.readFileSync(modeFile, "utf8").trim(); } catch { return "default"; } };
+let mode = readMode();
+let dialog = false;
+let dialogShown = false;
+let selected = 0;   // (0: Yes, 1: No)
+/** A question of the terminal's own is up (FAKE_QUESTION_FILE exists). */
+const questionUp = () => Boolean(process.env.FAKE_QUESTION_FILE) && fs.existsSync(process.env.FAKE_QUESTION_FILE);
+let asking = questionUp();
+const QUESTION = {
+  command: 'rm -rf "$(echo /home/dev/project/build)"', description: "Remove the build folder",
+  warning: "Dangerous rm operation on statically-unresolvable target: command substitution output", width: 100,
+};
+const queue = [];
+const footer = () => (mode === "none" ? "  ? for shortcuts" : mode === "default"
+  ? "  \x1b[38;5;246m⏸ manual mode on · ? for shortcuts\x1b[39m"
+  : `  \x1b[38;5;147m⏵⏵ ${INDICATOR[mode] ?? mode} on\x1b[38;5;246m (shift+tab to cycle)\x1b[39m          ◐ medium · /effort`);
+
+const status = (s) => {
+  if (process.env.FAKE_TORN_ROW === "1") return;
+  try {
+    const row = JSON.parse(fs.readFileSync(rowFile, "utf8"));
+    row.status = s;
+    // (written whole and moved into place, as a reader must never see half a row)
+    const real = fs.realpathSync(rowFile);
+    fs.writeFileSync(`${real}.tmp`, JSON.stringify(row));
+    fs.renameSync(`${real}.tmp`, real);
+  } catch { /* the test has not written it yet */ }
+};
+// (every entry dated, as Claude Code dates them)
+const line = (doc) => fs.appendFileSync(transcript, `${JSON.stringify({ sessionId, isSidechain: false, timestamp: new Date().toISOString(), ...doc })}\n`);
+
+function draw() {
+  const rule = "─".repeat(60);
+  const top = process.env.FAKE_TITLE ? `${"─".repeat(50)} ${process.env.FAKE_TITLE} ─` : rule;
+  if (asking) {
+    const q = [...toolLine("Bash", QUESTION.command), ...bashQuestion(QUESTION)];
+    process.stdout.write(`\x1b[2J\x1b[H${working ? "✻ Working…" : "  ready"}\r\n${q.join("\r\n")}\r\n`);
+    return;
+  }
+  if (mode === "nobox") { process.stdout.write("\x1b[2J\x1b[H  another program\r\n  nothing to type into here\r\n"); return; }
+  const lines = buffer ? buffer.split("\n") : [];
+  const box = lines.length ? [`\x1b[39m❯ ${lines[0]}`, ...lines.slice(1).map((l) => `  ${l}`)] : ["\x1b[39m❯ \x1b[2mTry \"fix lint errors\"\x1b[0m"];
+  const question = dialog ? `\r\n Bash command\r\n   touch approved.txt\r\n Do you want to proceed?\r\n ${selected === 0 ? "❯" : " "} 1. Yes\r\n ${selected === 1 ? "❯" : " "} 2. No\r\n Esc to cancel · Tab to amend\r\n` : "";
+  const queued = queue.map((q) => `❯ ${q.split("\n")[0]}\r\n`).join("");
+  process.stdout.write(`\x1b[2J\x1b[H${queued}${working ? "✻ Working…" : "  ready"}\r\n${top}\r\n${box.join("\r\n")}\r\n${rule}\r\n${footer()}${working ? " · esc to interrupt" : ""}\r\n${question}`);
+}
+
+/** A turn that answers `text` (null: one that is not the phone's), ending after workMs, and what was queued meanwhile. */
+let enterIgnored = 0;
+let turnTimer = null;
+let turnText = null;
+/** Esc stops the running turn of a prompt before its answer, and the prompt goes back into the box (FAKE_ESC_REWIND=1). */
+function rewind() {
+  if (process.env.FAKE_ESC_REWIND !== "1" || !working || turnText === null || turnTimer === null) return;
+  clearTimeout(turnTimer);
+  turnTimer = null;
+  working = false;
+  status(idleStatus);
+  buffer = turnText;
+  turnText = null;
+}
+
+function runTurn(text, ms) {
+  working = true;
+  status("busy");
+  draw();
+  turnText = text;
+  turnTimer = setTimeout(() => {
+    turnTimer = null;
+    turnText = null;
+    if (text !== null) line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: `echo: ${text}` }], stop_reason: "end_turn" } });
+    if (process.env.FAKE_QUEUE === "absorb") {
+      for (const q of queue.splice(0)) {
+        line({ type: "queue-operation", operation: "remove", content: q, reason: "absorbed_mid_turn" });
+        line({ type: "attachment", attachment: { type: "queued_command", prompt: q, commandMode: "prompt" } });
+        line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: `echo: ${q}` }], stop_reason: "end_turn" } });
+      }
+    }
+    line({ type: "system", subtype: "turn_duration", durationMs: ms });
+    working = false;
+    status(idleStatus);
+    const next = queue.shift();
+    if (next !== undefined) {
+      line({ type: "queue-operation", operation: "dequeue" });
+      buffer = next;
+      return submit();
+    }
+    draw();
+  }, ms);
+}
+
+function submit() {
+  const text = buffer;
+  buffer = "";
+  if (!text.trim()) return draw();
+  const record = () => line({ type: "user", message: { role: "user", content: process.env.FAKE_PASTE_REF === "placeholder" ? text : expand(text) }, promptSource: "typed", origin: { kind: "human" } });
+  const lag = Number(process.env.FAKE_RECORD_LAG_MS || "0");
+  if (lag <= 0) {
+    record();
+    return runTurn(text, workMs);
+  }
+  working = true;
+  status("busy");
+  draw();
+  setTimeout(() => { record(); runTurn(text, workMs); }, lag);
+}
+
+process.stdin.setRawMode?.(true);
+process.stdout.write("\x1b[?2004h");
+process.stdin.setEncoding("utf8");
+const showDialog = () => { dialog = true; dialogShown = true; selected = 0; };
+process.stdin.on("data", (chunk) => {
+  if (process.env.FAKE_DIALOG_ON_KEY === "1" && !dialogShown) showDialog();
+  if (process.env.FAKE_DIALOG_AT_ENTER === "1" && !dialogShown && !pasting && chunk.includes("\r")) showDialog();
+  pending += chunk;
+  while (pending) {
+    if (pending.startsWith("\x1b[200~")) { pasting = true; pasted = ""; pending = pending.slice(6); continue; }
+    if (pending.startsWith("\x1b[201~")) {
+      pasting = false;
+      pending = pending.slice(6);
+      if ((process.env.FAKE_PASTE_REF === "1" || process.env.FAKE_PASTE_REF === "placeholder") && pasted.includes("\n")) {
+        const n = pastes.size + 1;
+        pastes.set(n, pasted);
+        buffer = buffer.slice(0, buffer.length - pasted.length) + `[Pasted text #${n} +${pasted.split("\n").length - 1} lines]`;
+      }
+      if (process.env.FAKE_DIALOG_FILE && !process.env.FAKE_DIALOG_AT_ENTER && !process.env.FAKE_DIALOG_ON_KEY && !dialogShown && buffer) showDialog();
+      continue;
+    }
+    // (a lone ESC at the end of what came is Esc: tmux sends a paste's start in one piece)
+    if (pending === "\x1b") {
+      pending = "";
+      if (process.env.FAKE_ESC_FILE) fs.appendFileSync(process.env.FAKE_ESC_FILE, "esc\n");
+      if (dialog) { dialog = false; fs.writeFileSync(`${process.env.FAKE_DIALOG_FILE}.denied`, "denied"); }
+      else rewind();
+      continue;
+    }
+    if (pending.startsWith("\x1b") && pending.length < 6 && "\x1b[200~".startsWith(pending)) break;   // the rest comes next
+    // A key sent as an escape sequence (End: ESC [ F, ESC O F, ESC [ 4 ~, ESC [ 8 ~); a lone ESC is Esc.
+    const key = /^\x1b(?:\[[0-9;]*[A-Za-z~]|O[A-Za-z])/.exec(pending);
+    if (key) {
+      pending = pending.slice(key[0].length);
+      if (dialog && /^\x1b(?:\[F|OF|\[4~|\[8~)$/.test(key[0])) selected = 1;
+      continue;
+    }
+    if (pending.startsWith("\x1b") && !pending.startsWith("\x1b[")) {
+      pending = pending.slice(1);
+      if (process.env.FAKE_ESC_FILE) fs.appendFileSync(process.env.FAKE_ESC_FILE, "esc\n");
+      if (dialog) { dialog = false; fs.writeFileSync(`${process.env.FAKE_DIALOG_FILE}.denied`, "denied"); }
+      else rewind();
+      continue;
+    }
+    const ch = pending[0];
+    pending = pending.slice(1);
+    if (pasting) {
+      if (!(dialog && process.env.FAKE_DIALOG_ON_KEY === "1")) { const c = ch === "\r" ? "\n" : ch; buffer += c; pasted += c; }
+      continue;
+    }
+    if (dialog && process.env.FAKE_DIALOG_ON_KEY === "1" && /[0-9]/.test(ch)) { fs.writeFileSync(process.env.FAKE_DIALOG_FILE, "approved"); dialog = false; continue; }
+    if (ch === "\r") {
+      if (dialog) {
+        if (selected === 0) fs.writeFileSync(process.env.FAKE_DIALOG_FILE, "approved");
+        else fs.writeFileSync(`${process.env.FAKE_DIALOG_FILE}.denied`, "denied");
+        dialog = false;
+        continue;
+      }
+      if (enterIgnored < Number(process.env.FAKE_ENTER_IGNORE || "0")) { enterIgnored += 1; continue; }
+      if (!working) submit();
+      else if (buffer.trim()) {
+        // (Claude Code queues it: taken at the running turn's next step, or once it ends)
+        queue.push(buffer);
+        line({ type: "queue-operation", operation: "enqueue", content: expand(buffer) });
+        buffer = "";
+      }
+      continue;
+    }
+    if (ch === "\x15") { buffer = ""; continue; }   // Ctrl-U
+    // Backspace (nothing on a question); a `[Pasted text #n …]` it ends on goes whole, as in Claude Code (2.1.327, measured 2026-11-18)
+    if (ch === "\x7f") { if (!dialog) buffer = /\[Pasted text #\d+(?: \+\d+ lines)?\]$/.test(buffer) ? buffer.replace(/\[Pasted text #\d+(?: \+\d+ lines)?\]$/, "") : [...buffer].slice(0, -1).join(""); continue; }
+    if (ch === "\x1b" || ch < " ") continue;
+    buffer += ch;
+    if (process.env.FAKE_DIALOG_FILE && !process.env.FAKE_DIALOG_AT_ENTER && !process.env.FAKE_DIALOG_ON_KEY && !dialogShown) showDialog();
+  }
+  const lag = Number(process.env.FAKE_DRAW_LAG_MS || "0");
+  if (lag > 0 && working) setTimeout(draw, lag);
+  else draw();
+});
+if (Number(process.env.FAKE_BUSY_MS) > 0) {
+  line({ type: "user", message: { role: "user", content: "a long task of its own" }, origin: { kind: "human" } });
+  runTurn(null, Number(process.env.FAKE_BUSY_MS));
+}
+draw();
+setInterval(() => {
+  const m = readMode();
+  if (m !== mode) { mode = m; draw(); }
+  if (questionUp() !== asking) { asking = !asking; draw(); }
+  if (dialog && process.env.FAKE_DIALOG_DISMISS) {
+    if (fs.existsSync(process.env.FAKE_DIALOG_DISMISS)) {
+      dialog = false;
+      if (process.env.FAKE_DIALOG_CLEARS === "1") buffer = "";
+      draw();
+    }
+  }
+}, 50);

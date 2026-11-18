@@ -53,6 +53,11 @@ export interface GithubReviewSettings {
   fastMaxChangedLines: number;
   /** The deep review: a source change takes the sandbox path, and the default instructions require the checkout, the tests and a second pass. */
   deepReview: boolean;
+  /**
+   * The independent check of a deep review's findings before they are posted (finding-check.ts), on unless
+   * `CLAW_GITHUB_REVIEW_FINDING_CHECK` is false. It needs the deep review and a model for the service (`ReviewDeps.completeFindingCheck`).
+   */
+  findingCheck: boolean;
   /** The services (identity client ids, compared exactly as signed) that may decide a held write for the user their token names. */
   decisionClientIds: string[];
   /** How the footer of a review names its author: one line of plain text, nothing that could open markup or end the footer. */
@@ -91,6 +96,11 @@ export function readGithubReviewSettings(env: Env = process.env, enabled: boolea
   if (deepRaw && !deepOff && !bool(deepRaw)) {
     problems.push(`CLAW_GITHUB_REVIEW_DEEP_ENABLED=${deepRaw} is not true or false; using true`);
   }
+  const checkRaw = (env.CLAW_GITHUB_REVIEW_FINDING_CHECK ?? "").trim().toLowerCase();
+  const checkOff = ["false", "0", "no"].includes(checkRaw);
+  if (checkRaw && !checkOff && !bool(checkRaw)) {
+    problems.push(`CLAW_GITHUB_REVIEW_FINDING_CHECK=${checkRaw} is not true or false; using true`);
+  }
   const apiUrl = ((env.CLAW_GITHUB_API_URL ?? "").trim() || "https://api.github.com").replace(/(?<!\/)\/+$/, "");
   return {
     enabled,
@@ -108,6 +118,7 @@ export function readGithubReviewSettings(env: Env = process.env, enabled: boolea
     fastMaxFiles: num("CLAW_GITHUB_REVIEW_FAST_MAX_FILES", 15, { min: 0, max: 500 }),
     fastMaxChangedLines: num("CLAW_GITHUB_REVIEW_FAST_MAX_CHANGED_LINES", deepReview ? 200 : 600, { min: 0, max: 100_000 }),
     deepReview,
+    findingCheck: deepReview && !checkOff,
     decisionClientIds: parseClientIds(env.CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS),
     agentName: agentName || DEFAULT_AGENT_NAME,
     problems,

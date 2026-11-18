@@ -7,7 +7,7 @@
  * The role lives in `claw_assistants` and `claw_work_items`, server-side tables a caller cannot write. A
  * field on the session would not do: `config`, `team_role` and `parent_session_id` are caller input.
  *
- * A router turn is cut down to the assistant tools (`tools_allowlist`, which Brain enforces), given its
+ * A router turn is cut down to the assistant tools and its read-only lookups (`tools_allowlist`, which Brain enforces; `read-tools.ts`), given its
  * prompt and the current list of work items, and kept short. An observer turn is cut the same way, without the list. A worker turn gets its prompt and the one tool
  * it reports through. Both get a bearer for the assistant MCP service that names this turn.
  *
@@ -16,29 +16,53 @@
  * at send time and the bearer expires, and the item list must be the one of that moment.
  */
 import pino from "pino";
+import { REMOTE_AGENT_TIMING } from "@claw/protocol";
 import {
-  CLAW_AGENT_GUIDELINE_ENABLED, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_ROUTER_MAX_TURNS, CLAW_ASSISTANT_TOKEN_KEY,
-  CLAW_ASSISTANT_TOOLS, CLAW_ASSISTANT_WORKER_MODEL, INTERNAL_BACKEND_URL,
+  ASSISTANT_DEPLOYMENT_MODEL, CLAW_AGENT_GUIDELINE_ENABLED, CLAW_ASSISTANT_DECISION_WAIT_SEC, CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_ROUTER_MAX_TURNS,
+  CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS, CLAW_ASSISTANT_WORKER_MODEL, CLAW_REMOTE_AGENTS_ENABLED, INTERNAL_BACKEND_URL,
 } from "../config.js";
 import { db } from "../infra/db.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
-import { reviewProfileSession } from "../github-review/session-tools.js";
+import { readGithubMcpSettings } from "../github-mcp/settings.js";
 import { RUN_BUDGET_DEFAULT_SEC } from "../tasks/run-budget.js";
-import { languageToAnswerIn, withReplyLanguage } from "./language.js";
-import { reviewMemoryBlock, routerMemoryParts, workerMemoryBlock } from "./memory-tools.js";
+import { replyLanguageFor, withReplyLanguage, type ChosenLanguage } from "./language.js";
+import { memoryTurnRecallOn, reviewMemoryBlock, routerMemoryParts, routerTurnRecall, workerMemoryBlock } from "./memory-tools.js";
 import {
-  ASSISTANT_MCP_SERVER, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
-  ROUTER_READ_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, renderModelChoice,
+  ASSISTANT_MCP_SERVER, confirmationRef, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
+  ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_SKILLS_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, ROUTER_DISCIPLINE_PROMPT_VERSION, WORKER_DISCIPLINE_PROMPT_VERSION, renderModelChoice,
   renderObserverSystem, renderReviewState, renderRouterItems, renderRouterPrompt, renderWorkerSystem, withTurnState,
+  ROUTER_DEVENV_PROMPT_VERSION, renderAttachedState, renderRouterDevenvSection,
   type AskedOfOtherLine, type ManifestItem,
 } from "./prompts.js";
 import { allowedModels, modelChoiceOn, platformModel, readModelPrefs } from "./model-choice.js";
 import { rerunModelOf } from "./model-fallback.js";
-import { AFTER_READ_TOOLS, routerReadTools } from "./read-tools.js";
-import { askedOfOthers } from "./requester-view.js";
+import { AFTER_READ_TOOLS, routerLookups } from "./read-tools.js";
+import { heldForPersonManifest, renderHeldForPerson } from "./holds.js";
+import { triggerToolSettings } from "../triggers/mcp.js";
+import { askedOfOthers, askedOfOthersTotals, type AskedOfOthersTotals } from "./requester-view.js";
 import { reviewContextFor } from "./review-tools.js";
+import { toldRefs } from "./told.js";
+import { earlierFilesOf, promptImagesOf, renderFilesState } from "./files.js";
+import { turnChannelTold, turnMessage } from "./inbound.js";
 import { startWorkerRun } from "./run-started.js";
+import { githubEventsEnabled } from "./github-events.js";
+import { jobHttpSources, jobWatchesEnabled } from "./job-watch.js";
+import { renderRouterProactiveSection, ROUTER_PROACTIVE_PROMPT_VERSION } from "./proactive-prompt.js";
+import { renderRouterWritingSection, ROUTER_WRITING_PROMPT_VERSION } from "./writing-prompt.js";
+import { devenvToolsOn } from "./devenv-tools.js";
+import { remoteManifest } from "./remote-items.js";
+import { renderRouterSelfSection, ROUTER_SELF_PROMPT_VERSION, selfStatusOn } from "./self-status.js";
+import { chatSurface } from "./chat-surface.js";
+import { assistantSchedulesOn, renderScheduleState } from "./schedules.js";
+import { commandLanguage } from "./typed-commands.js";
 import { mintAssistantToken, type AssistantTokenClaims } from "./token.js";
+import { disciplineOn } from "./discipline.js";
+import { applyRouterTurnSpeed, streamTextOn } from "./router-speed.js";
+import { routerCite } from "./citations.js";
+import { routerSkillParts } from "./skill-tools.js";
+import { renderNowState, routerClock } from "./now.js";
+import { lastServedModel, renderOwnModelState, routerTurnModel } from "./own-model.js";
+import { applyWorkerResearch, assistantResearchOn, RESEARCH_PROMPT_VERSION, ROUTER_RESEARCH_PROMPT } from "./research.js";
 
 const logger = pino({ name: "assistant-role" });
 
@@ -84,16 +108,17 @@ export async function sessionRole(sessionId: string): Promise<SessionRole | null
 }
 
 /**
- * Whether a turn of this session must skip skill selection: a router's or an observer's, which costs an LLM call they have no use for, and a review someone
- * asked of the owner, whose fixed profile has none of the owner's skills (`github-review/review-profile.ts`). Both skill entries (the
- * immediate turn and the queued one) ask here.
+ * A closed development environment item (`kind = 'remote'`) whose machine is no longer one of the user's is not listed. A machine is
+ * the user's while a connector of theirs that is not revoked has its name (a machine set up again under its name is theirs: the old
+ * row is revoked, and the new one has the name), which is exactly what `devenv_list` names. The name of one that is not was the only
+ * trace of it in the router's context, and an answer about the user's machines took it for one of theirs: "之前的 dev-box-1 已离线"
+ * with no machine connected (DM21-zms-a, 2026-11-07). Only where remote agents are on: their tables exist only then.
  */
-export async function skipsSkillSelection(sessionId: string): Promise<boolean> {
-  if (await reviewProfileSession(sessionId)) return true;
-  if (!CLAW_ASSISTANT_ENABLED) return false;
-  const role = (await sessionRole(sessionId))?.role;
-  return role === "router" || role === "observer";
-}
+const CLOSED_ITEM_OF_REMOVED_MACHINE = `AND NOT (w.kind = 'remote' AND NOT EXISTS (
+           SELECT 1 FROM claw_remote_connectors c
+            WHERE c.owner_user_id = w.user_id AND c.revoked_at IS NULL
+              AND (c.connector_id::text = w.params->>'connector_id'
+                   OR left(btrim(regexp_replace(c.name, '[[:cntrl:][:space:]]+', ' ', 'g')), 60) = w.params->>'machine')))`;
 
 /**
  * The router's item list: every open item, and the newest items closed in the last day. Open items are never cut: the
@@ -106,16 +131,22 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
             outcome, created_at, closed_at FROM (
        (SELECT * FROM claw_work_items WHERE user_id = $1 AND board_state <> 'done')
        UNION ALL
-       (SELECT * FROM claw_work_items
-         WHERE user_id = $1 AND board_state = 'done' AND closed_at > NOW() - $2::interval
-         ORDER BY seq DESC LIMIT $3)
+       (SELECT w.* FROM claw_work_items w
+         WHERE w.user_id = $1 AND w.board_state = 'done' AND w.closed_at > NOW() - $2::interval
+           ${CLAW_REMOTE_AGENTS_ENABLED ? CLOSED_ITEM_OF_REMOVED_MACHINE : ""}
+         ORDER BY w.seq DESC LIMIT $3)
      ) listed ORDER BY seq`,
     [userId, MANIFEST_CLOSED_WINDOW, MANIFEST_MAX_ITEMS],
   )).rows as Array<Record<string, unknown>>;
+  // Development environment items: where each runs, and whether that machine is online now (`remote-items.ts`).
+  const remote = await remoteManifest(userId, rows as Array<{ item_id: string; kind: string; params: unknown }>, REMOTE_AGENT_TIMING.onlineWindowMs);
+  // The pull requests each item watches, and whether the user turned on automatic replies there: the router must not promise an
+  // approval card for an answer that goes out without one.
+  const watches = githubEventsEnabled() ? await itemWatches(userId, rows.map((r) => String(r.item_id))) : new Map<string, NonNullable<ManifestItem["watches"]>>();
   return rows.map((r) => ({
     itemId: String(r.item_id),
     seq: Number(r.seq),
-    title: String(r.title),
+    title: remote.get(String(r.item_id))?.title ?? String(r.title),
     boardState: String(r.board_state),
     summary: String(r.summary ?? ""),
     lastReportKind: (r.last_report_kind as string | null) ?? null,
@@ -125,12 +156,46 @@ export async function routerManifest(userId: string): Promise<ManifestItem[]> {
     createdAt: (r.created_at as Date | null) ?? null,
     closedAt: (r.closed_at as Date | null) ?? null,
     ...(r.kind === "review" ? { review: reviewOf(r.params) } : {}),
+    ...(remote.has(String(r.item_id)) ? { remote: remote.get(String(r.item_id)) } : {}),
+    ...(watches.has(String(r.item_id)) ? { watches: watches.get(String(r.item_id)) } : {}),
+    ...deliveredOf(r.params),
   }));
+}
+
+/** A result delivered by policy (`applyWorkerReport`): its version, and the pull requests the item stays open watching. */
+function deliveredOf(params: unknown): { delivered?: NonNullable<ManifestItem["delivered"]> } {
+  const p = params !== null && typeof params === "object" ? params as Record<string, unknown> : {};
+  const version = Number(p.delivered);
+  if (!Number.isInteger(version) || version < 1) return {};
+  const watching = Array.isArray(p.watching_pr) ? p.watching_pr.filter((x): x is string => typeof x === "string") : [];
+  return { delivered: { version, watching } };
+}
+
+/** The active pull request watches of these items of the user's, by item. */
+async function itemWatches(userId: string, itemIds: string[]): Promise<Map<string, NonNullable<ManifestItem["watches"]>>> {
+  const out = new Map<string, NonNullable<ManifestItem["watches"]>>();
+  if (!itemIds.length) return out;
+  const rows = (await db.query(
+    `SELECT item_id, owner, repo, number, reply_allowed FROM claw_work_item_subscriptions
+      WHERE user_id = $1 AND state = 'active' AND item_id = ANY($2::text[]) ORDER BY id`,
+    [userId, itemIds],
+  )).rows as Array<{ item_id: string; owner: string; repo: string; number: number; reply_allowed: boolean }>;
+  for (const r of rows) {
+    const list = out.get(r.item_id) ?? [];
+    list.push({ pr: `${r.owner}/${r.repo}#${r.number}`, autoReply: r.reply_allowed === true });
+    out.set(r.item_id, list);
+  }
+  return out;
 }
 
 /** The reviews the user asked of others, in the same window as their own items: the four facts each, read-only. */
 export async function askedOfOthersManifest(userId: string): Promise<AskedOfOtherLine[]> {
   return (await askedOfOthers(db, userId, MANIFEST_CLOSED_WINDOW, MANIFEST_MAX_ITEMS)).map((a) => ({ itemId: a.item_id, view: a.view }));
+}
+
+/** The counts of those reviews in the same window, without the list's limit (`renderRouterItems` says them before the latest). */
+export async function askedOfOthersTotalsManifest(userId: string): Promise<AskedOfOthersTotals> {
+  return askedOfOthersTotals(db, userId, MANIFEST_CLOSED_WINDOW);
 }
 
 function reviewOf(params: unknown): NonNullable<ManifestItem["review"]> {
@@ -141,6 +206,11 @@ function reviewOf(params: unknown): NonNullable<ManifestItem["review"]> {
     actingAsName: typeof p.acting_as_name === "string" ? p.acting_as_name : null,
     model: typeof p.model === "string" ? p.model : null,
     reviewOnly: p.review_only !== false,
+    // How a merge of this review is made, said only of one the assistant started, which is the one asked about (a stored value but false
+    // reads as one that waits, as the review tools read it).
+    ...(p.started_by_assistant === true || (p.merge_needs_confirmation !== undefined && p.merge_needs_confirmation !== null)
+      ? { mergeNeedsConfirmation: p.merge_needs_confirmation !== undefined && p.merge_needs_confirmation !== null && p.merge_needs_confirmation !== false }
+      : {}),
   };
 }
 
@@ -159,18 +229,36 @@ async function earlierUserMessages(sessionId: string): Promise<string[]> {
 }
 
 /**
- * Say in which language to answer, beside the message being answered (`language.ts`). The message the turn starts
- * with is the user's own, or a worker's report that woke the assistant; a report says nothing about the user's
- * language, so for it the language is the one they last wrote in. Only the request changes: the turn that is stored
- * and shown is the user's words as they sent them.
+ * Say in which language to answer, beside the message being answered (`language.ts`). The language the person chose in their channel
+ * (`/lang zh|en`, sent as `channel_context.reply_language`) when they chose one, whatever their message is written in; else the one
+ * read from what they wrote. The message the turn starts with is the user's own, or a worker's report that woke the assistant; a
+ * report says nothing about the user's language, so for it the language is their choice as of their latest message, or the one they
+ * last wrote in. Only the request changes: the turn that is stored and shown is the user's words as they sent them.
  */
-async function addReplyLanguage(task: Record<string, unknown>, sessionId: string): Promise<void> {
+async function replyLanguageOf(task: Record<string, unknown>, sessionId: string, chosen: ChosenLanguage | null): Promise<string | null> {
   const prompt = stringField(task, "prompt");
-  if (!prompt) return;
-  const language = await languageToAnswerIn(
-    prompt.startsWith(WORK_EVENT_PREFIX) ? null : prompt, () => earlierUserMessages(sessionId),
-  );
-  if (language) task.prompt = withReplyLanguage(prompt, language);
+  if (!prompt) return null;
+  const report = prompt.startsWith(WORK_EVENT_PREFIX);
+  return replyLanguageFor(chosen, report ? null : prompt, () => earlierUserMessages(sessionId));
+}
+
+/**
+ * What the channel told with the message the turn answers (`turnChannelTold`): a worker's report answers none of the person's.
+ * A turn with no words (one the system starts) reads nothing, as the reply language never did for it: nothing chosen, Teams, no name.
+ */
+async function turnTold(
+  task: Record<string, unknown>, sessionId: string, messageId: string,
+): Promise<{ chosen: ChosenLanguage | null; channel: string | undefined; assistantName: string | undefined }> {
+  const prompt = stringField(task, "prompt");
+  if (!prompt) return { chosen: null, channel: undefined, assistantName: undefined };
+  const report = prompt.startsWith(WORK_EVENT_PREFIX);
+  return turnChannelTold((t, p) => db.query(t, p), sessionId, report ? null : messageId);
+}
+
+/** The line `replyLanguageOf` worked out, put beside the message. */
+function addReplyLanguage(task: Record<string, unknown>, language: string | null): void {
+  const prompt = stringField(task, "prompt");
+  if (prompt && language) task.prompt = withReplyLanguage(prompt, language);
 }
 
 export function tokenTtlSeconds(): number {
@@ -218,39 +306,108 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN];
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
     task.mcp_servers = {};
-    for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
+    for (const field of ["skills", "user_skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
+    task.user_skills_enabled = false;
     task.skip_platform_defaults = true;
     withSystemAppend(task, renderObserverSystem(role.scope));
     logger.info({ sessionId, taskId, scope: role.scope, prompt: OBSERVER_PROMPT_VERSION }, "assistant.observer_turn");
   } else if (role.role === "router") {
     claims = { ...base, role: "router" };
-    // The read-only tools of the deployment's assistant plugin (`read-tools.ts`), and nothing else of it: no skills, rules or write
-    // tools. A plugin the message named is not one the read list can vouch for, so it gives the router nothing.
-    const read = await routerReadTools(role.userId);
-    task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN, ...(read?.allowlist ?? [])];
+    // What the router may look up itself (`read-tools.ts`): the read-only tools of the deployment's assistant plugin, and nothing
+    // else of it but its reply-style rule (no skills or write tools; a plugin the message named is not one the read list can vouch
+    // for, so it gives the router nothing); the reads of the user's own GitHub; their scheduled tasks; and the web.
+    // What the channel told with the message this turn answers (the person's latest, for a worker's report): the language they
+    // chose, and the chat app it came through (`chat-surface.ts`), which picks the reply-style rule and where it is told it is talked to.
+    const told = await turnTold(task, sessionId, messageId);
+    const surface = chatSurface(told.channel);
+    const lookups = await routerLookups(role.userId, sessionId, {
+      mcpServers: task.mcp_servers, messageId, taskId, triggerKey: triggerToolSettings.key, surface,
+    });
+    const read = lookups.plugin;
+    task.tools_allowlist = [ASSISTANT_TOOLS_PATTERN, ...lookups.allowlist];
     task.max_turns = CLAW_ASSISTANT_ROUTER_MAX_TURNS;
-    // Only the assistant's own server and the plugin's read servers: any other is a connection made and a tool never offered.
-    task.mcp_servers = {};
-    for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
+    // A turn that used every step on lookups still answers: Brain asks the model once more, for text only, and that text is delivered
+    // as the turn's answer (`router-turn-end.ts`). Without it the person heard nothing (2026-11-06, bczh-202: 11 web lookups, no reply).
+    task.report_at_turn_cap = true;
+    // Only the assistant's own server, the plugin's read servers, the user's GitHub and the turn's own scheduled tasks: any other is
+    // a connection made and a tool never offered. The GitHub entry is built here from the session, as `githubMcpServers` builds a
+    // worker's; the `schedules` one is kept only when this API minted its bearer for this turn (`ownTriggerServer`).
+    task.mcp_servers = { ...lookups.servers };
+    // The plugin's log reads: bounded to their last lines, and masked before the model reads them (Brain, `log-reads.ts`).
+    if (lookups.logReads) task.log_reads = lookups.logReads;
+    else delete task.log_reads;
+    // Nor the user's personal skills as a worker is told of them (`user_skills`): that list is for a turn that works in a sandbox. The
+    // router's own are listed with its message and read with skill_read (`skill-tools.ts`), below.
+    for (const field of ["skills", "user_skills", "tool_ids", "plugin_id", "plugin_tools"]) delete task[field];
+    task.user_skills_enabled = false;
     if (read) {
       task.plugin_id = read.pluginId;
       task.plugin_tools = read.pluginTools;
-      // Once it has read one of their results, the turn no longer acts for the person: Brain refuses the acting tools.
-      task.read_taint = { sources: read.allowlist, allow_after: AFTER_READ_TOOLS.map((t) => `${TOOL_NAME_PREFIX}${t}`) };
     }
+    // Once it has read one of their results, the turn no longer acts for the person: Brain refuses the acting tools. A GitHub or
+    // web lookup that failed read nothing, and leaves the turn free to start the work instead.
+    task.read_taint = {
+      sources: lookups.allowlist, allow_after: AFTER_READ_TOOLS.map((t) => `${TOOL_NAME_PREFIX}${t}`), clean_failures: lookups.cleanFailures,
+    };
+    // Its say may cite what the lookups returned (`citations.ts`): Brain keeps their sources and hands say the ones it names.
+    const cite = routerCite(lookups.githubServers, stringField(task, "prompt"), undefined, read?.servers ?? []);
+    if (cite) task.cite = cite;
+    else delete task.cite;
+    // A router's deliver_text is its own writing, delivered at once: never checked as a worker's research report is.
+    delete task.cite_check;
     // Neither the deployment's default MCP servers nor its default skills: the hint that lists them would follow the user's message.
     task.skip_platform_defaults = true;
     // The system prompt is the same on every turn, so it and the history after it come from the prompt cache. What changes
     // from turn to turn (the item list, what waits for the user, what the channel sent) goes with the message instead.
-    withSystemAppend(task, renderRouterPrompt(read?.servers ?? []));
-    const state = [renderRouterItems(await routerManifest(role.userId), await askedOfOthersManifest(role.userId))];
+    const github = lookups.githubTools.length > 0;
+    // The routing discipline (`discipline.ts`): per user while it is a canary, so the prompt stays the same from turn to turn for each.
+    const discipline = disciplineOn(role.userId);
+    withSystemAppend(task, renderRouterPrompt(
+      {
+        servers: read?.servers ?? [], github: lookups.githubTools, cite: cite !== null, githubBinding: readGithubMcpSettings().binding,
+        where: surface.where, ...(told.assistantName ? { name: told.assistantName } : {}),
+      },
+      { discipline },
+    ));
+    // What it writes itself (a document, a draft, a translation), and how a file or a comment of its reaches the user (`writing-prompt.ts`).
+    withSystemAppend(task, renderRouterWritingSection({ comment: assistantSchedulesOn() }));
+    // A research report is a work item, never text the router writes from what it knows: after the writing section, which it narrows.
+    const research = assistantResearchOn(role.userId);
+    if (research) withSystemAppend(task, ROUTER_RESEARCH_PROMPT);
+    // The language this turn answers in (`language.ts`), worked out once: beside the message, and in every command the turn's state
+    // tells the router the user can type back (`typed-commands.ts`), so that a hint repeated to the user is in their language.
+    const replyLanguage = await replyLanguageOf(task, sessionId, told.chosen);
+    const commands = commandLanguage(replyLanguage);
+    const asked = await askedOfOthersManifest(role.userId);
+    const now = routerClock.now();
+    const state = [renderRouterItems(await routerManifest(role.userId), asked, now, asked.length ? await askedOfOthersTotalsManifest(role.userId) : undefined)];
+    // What a worker holds for the person (a write to approve, a question to answer): theirs to answer on its card, and the router's to point at.
+    const held = renderHeldForPerson(await heldForPersonManifest(role.userId));
+    if (held) state.push(held);
+    // What the person sent beside their words (`files.ts`): the router is told what came, and is shown the pictures itself (Brain
+    // reads them from this session's uploads), since it has no sandbox to open them in.
+    const message = await turnMessage((t, p) => db.query(t, p), sessionId, messageId);
+    // What now is for the person, in their time zone (`now.ts`): a date or a weekday they ask about is theirs, not UTC's.
+    state.push(renderNowState(now, message?.context.timezone));
+    const files = message?.context.files ?? [];
+    // And what they sent earlier in the conversation, which a new item gets too (`earlierFilesOf`): a follow-up is about those.
+    const earlier = message ? await earlierFilesOf((t, p) => db.query(t, p), sessionId, messageId, files) : [];
+    if (files.length || earlier.length) state.push(renderFilesState(files, earlier));
+    // Which session the chat the message came from is attached to, when the channel said (`channel_context.attached`).
+    if (message?.context.attached !== undefined) state.push(renderAttachedState(message.context.attached, message.context.assistant_name));
+    if (files.length) {
+      const images = promptImagesOf(files);
+      if (images.length) task.prompt_images = images;
+    }
     if (CLAW_ASSISTANT_TOOLS) {
       withSystemAppend(task, ROUTER_REVIEW_PROMPT);
       const review = await reviewContextFor(role.userId, sessionId, messageId);
       const ctx = review.message?.context;
+      const told = await toldRefs((t, p) => db.query(t, p), role.userId,
+        review.confirmations.map((c) => ({ ref: confirmationRef(c.id), since: c.created_at })));
       state.push(renderReviewState({
-        confirmations: review.confirmations, reviewMode: review.reviewMode,
-        people: ctx?.people ?? [], actions: ctx?.actions ?? [], repos: ctx?.repos ?? [],
+        confirmations: review.confirmations.map((c) => ({ ...c, told_at: told.get(confirmationRef(c.id)) ?? null })), reviewMode: review.reviewMode,
+        people: ctx?.people ?? [], actions: ctx?.actions ?? [], repos: ctx?.repos ?? [], commands,
       }));
     }
     const memory = await routerMemoryParts(role.userId, sessionId);
@@ -258,6 +415,33 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       withSystemAppend(task, memory.prompt);
       if (memory.entries) state.push(memory.entries);
     }
+    // The entries the person's message is about, in full, beside the index (`CLAW_MEMORY_TURN_RECALL`): only where the index is shown.
+    const recall = memory?.entries && message?.content && memoryTurnRecallOn(role.userId)
+      ? await routerTurnRecall(role.userId, sessionId, message.content)
+      : null;
+    if (recall) state.push(recall.text);
+    // The user's personal skills (`skill-tools.ts`): what skill_read is in the system prompt, the same on every turn; the list of them
+    // with the message, so that saving or using one changes no system prompt.
+    const skills = await routerSkillParts(role.userId, sessionId, message?.content ?? "");
+    if (skills) {
+      withSystemAppend(task, skills.prompt);
+      if (skills.list) state.push(skills.list);
+      // A skill the message names, whole, and the drafts waiting for the user's answer.
+      state.push(...skills.extra);
+    }
+    const devenv = devenvToolsOn();
+    if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS, send: true }));
+    // Who it is (by the name its client calls it, with claw_self_status) and how to count what a lookup returned: the same on every
+    // turn, so it stays cached.
+    const self = selfStatusOn();
+    withSystemAppend(task, renderRouterSelfSection(self, surface.where, told.assistantName, surface.help));
+    const proactive = {
+      schedules: assistantSchedulesOn(), jobs: jobWatchesEnabled(), pullRequests: githubEventsEnabled(),
+      jobKinds: jobHttpSources().map((k) => ({ kind: k.kind, description: k.description })),
+    };
+    const proactiveSection = renderRouterProactiveSection(proactive);
+    if (proactiveSection) withSystemAppend(task, proactiveSection);
+    if (proactive.schedules) state.push(await renderScheduleState(role.userId, commands));
     const choice = modelChoiceOn();
     if (choice) {
       // The allow-list with its labels and the user's own defaults, so that "the fast one" becomes a name the tools take. In the
@@ -271,13 +455,30 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       const rerun = await rerunModelOf(sessionId, messageId);
       if (rerun) task.model = rerun;
     }
-    await addReplyLanguage(task, sessionId);
+    // Which model the router itself runs on (`own-model.ts`): asked "你用的什么模型", it named only the item defaults. After the re-run
+    // above, which changes this turn's model.
+    state.push(renderOwnModelState({
+      runsOn: routerTurnModel(task.model, ASSISTANT_DEPLOYMENT_MODEL),
+      lastServed: await lastServedModel((t, p) => db.query(t, p), sessionId),
+    }));
+    // Little thinking, and the say streamed while it is written (`router-speed.ts`); for the users who have it, the turn's own text
+    // too, when it answers them (a worker's report is not theirs: what the turn writes then is not for them).
+    applyRouterTurnSpeed(task, undefined, streamTextOn(role.userId) && !stringField(task, "prompt").startsWith(WORK_EVENT_PREFIX));
+    addReplyLanguage(task, replyLanguage);
     // Even with no words (a turn the system starts): the list is what the prompt says to answer from.
     task.prompt = withTurnState(stringField(task, "prompt"), state);
     logger.info({
       sessionId, taskId, prompt: CLAW_ASSISTANT_TOOLS ? ROUTER_REVIEW_PROMPT_VERSION : ROUTER_PROMPT_VERSION, base: ROUTER_PROMPT_VERSION,
-      ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
-      ...(read ? { read: ROUTER_READ_PROMPT_VERSION, readServers: read.servers, pluginId: read.pluginId } : {}),
+      ...(memory ? { memory: ROUTER_MEMORY_PROMPT_VERSION } : {}), ...(recall ? { turnRecall: recall.ids } : {}),
+      ...(skills ? { userSkills: ROUTER_SKILLS_PROMPT_VERSION, userSkillsListed: skills.list !== null, ...(skills.named.length ? { userSkillsNamed: skills.named } : {}) } : {}),
+      ...(choice ? { models: ROUTER_MODEL_PROMPT_VERSION } : {}),
+      ...(proactiveSection ? { proactive: ROUTER_PROACTIVE_PROMPT_VERSION } : {}),
+      ...(devenv ? { devenv: ROUTER_DEVENV_PROMPT_VERSION } : {}),
+      read: ROUTER_READ_PROMPT_VERSION, write: ROUTER_WRITING_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),
+      ...(cite ? { cite: ROUTER_CITE_PROMPT_VERSION } : {}), self: ROUTER_SELF_PROMPT_VERSION, selfStatus: self,
+      ...(discipline ? { discipline: ROUTER_DISCIPLINE_PROMPT_VERSION } : {}),
+      ...(research ? { research: RESEARCH_PROMPT_VERSION } : {}),
+      ...(task.stream_text_as ? { streamText: true } : {}),
     }, "assistant.router_turn");
   } else {
     const started = await startWorkerRun(sessionId, taskId);
@@ -286,10 +487,21 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     // With model choice on, the worker's session holds the model chosen for its item (`model-choice.ts`), and the deployment's worker
     // model only fills in for a session that names none. Off, it is every worker turn's model, as it always was.
     if (CLAW_ASSISTANT_WORKER_MODEL && !(modelChoiceOn() && stringField(task, "model"))) task.model = CLAW_ASSISTANT_WORKER_MODEL;
-    withSystemAppend(task, renderWorkerSystem({ seq: started.seq, title: started.title }));
+    const discipline = disciplineOn(role.userId);
+    withSystemAppend(task, renderWorkerSystem({ seq: started.seq, title: started.title }, { discipline }));
+    // A worker does its item's work in the sandbox, so Brain opens it beside the turn's first model call rather than after it.
+    task.sandbox_prestart = true;
+    // A write it holds, or a question it asks, waits for a person who is told on their channel and may be away: not Brain's minutes.
+    if (CLAW_ASSISTANT_DECISION_WAIT_SEC > 0) task.decision_wait_ms = CLAW_ASSISTANT_DECISION_WAIT_SEC * 1000;
     const memory = await workerMemoryBlock(role.userId, started.itemId, sessionId);
     if (memory) withSystemAppend(task, memory);
-    logger.info({ sessionId, taskId, itemId: started.itemId, generation: started.generation, prompt: WORKER_PROMPT_VERSION }, "assistant.worker_turn");
+    // A research report: its method, and its deliver_text checked against its citations by Brain before the file is stored.
+    const research = applyWorkerResearch(task, (text) => withSystemAppend(task, text), assistantResearchOn(role.userId));
+    logger.info({
+      sessionId, taskId, itemId: started.itemId, generation: started.generation,
+      prompt: discipline ? WORKER_DISCIPLINE_PROMPT_VERSION : WORKER_PROMPT_VERSION,
+      ...(research ? { research: RESEARCH_PROMPT_VERSION } : {}),
+    }, "assistant.worker_turn");
   }
 
   // Replaces a server of the same name that the request carried: the user's own session config must not

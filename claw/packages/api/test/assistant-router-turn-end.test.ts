@@ -10,9 +10,23 @@
  *   T3  a turn that a worker's report started may end silent on purpose: what it wrote is not delivered
  *   T4  a turn that failed, was interrupted or was written by the sweeper delivers none of its words, only the system's notice, once;
  *       a turn that wrote nothing delivers nothing
- *   T5  a text too long for say is cut to fit; a refusal (the hourly cap) is not a fault and stores nothing
+ *   T5  a text too long for say is cut to fit; a refusal (the hourly cap) is not a fault and stores none of the model's
+ *       words, and the user has the cap's notice instead of nothing
  *   T6  only an assistant's router session is looked at
  *   T7  the completion handler asks for it when a router turn ends, and the user's say is there afterwards
+ *   T8  a fault delivering it (the database failing over) is tried again by the completion handler, not given up
+ *   T9  a turn whose every say came before its last lookup answered ("查一下 Autopilot 的状态。", then the lookup, then the answer in
+ *       plain text: the parity run's K2; a lookup that failed as well) has its text delivered as the answer, once; a say after the lookup, a refused say, or no
+ *       lookup at all leaves the turn alone as in T2
+ *   T10 every such turn is counted by what its end did (`claw_assistant_router_unsaid_total`): its text delivered, delivered in place
+ *       of an early line (K2), the system's notice, said with an internal id left out, or left unsaid after a say that answered; a turn
+ *       that said its answer is not counted; an attach command for the user to send is delivered as written (N23)
+ *   T11 a turn a worker's answer woke that ended without saying it -- stopped for the user's next message, failed, written in plain
+ *       text, or silent -- has the answer said by the system at once, once, about the item (release gate run 1108021655-0c1088: the
+ *       turn was stopped for the next message and the answer came only from the silent sweep five minutes later); a turn that said it,
+ *       naming the item or not, is left alone
+ *   T13 a completion that names no message still returns the answer and the lost-turn notice to the surface of the turn's message
+ *       (read from its runs), not to the surface the person used last
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -98,9 +112,11 @@ describe("assistant router turn end", { skip }, () => {
     const turn = await endedTurn("How is the build going?");
     for (const extra of [{ finalText: "" }, { finalText: "   \n " }, {}]) assert.equal(await end(turn, extra), "skipped", JSON.stringify(extra));
     assert.equal((await says()).length, 0);
-    for (const extra of [
-      { failed: true, finalText: "partial" }, { interrupted: true, finalText: "partial" }, { fromSweeper: true, finalText: "[Task timed out]" },
-    ]) {
+    for (const [extra, said] of [
+      [{ failed: true, finalText: "partial" }, /did not go through/],
+      [{ interrupted: true, finalText: "partial" }, /^Stopped\.$/],   // (the person stopped it: not asked to say it again)
+      [{ fromSweeper: true, finalText: "[Task timed out]" }, /did not go through/],
+    ] as const) {
       await w.q("TRUNCATE claw_assistant_says");
       const lost = await endedTurn("How is the build going?");
       assert.equal(await end(lost, extra), "said", JSON.stringify(extra));
@@ -108,21 +124,21 @@ describe("assistant router turn end", { skip }, () => {
       const [notice, ...more] = await says();
       assert.equal(more.length, 0);
       assert.equal(notice.fallback, true, "the system's words, not the model's");
-      assert.match(notice.text, /did not go through/);
+      assert.match(notice.text, said);
     }
   });
 
-  test("T5 a text too long for say is cut to fit, and a refusal stores nothing and is not a fault", async () => {
-    const long = "x".repeat(700);
+  test("T5 a text too long for say is cut to fit, and a refusal is not a fault and leaves the user the cap's notice", async () => {
+    const long = "x".repeat(9500);
     assert.equal(await end(await endedTurn("Tell me everything"), { finalText: long }), "said");
     const [said] = await says();
-    assert.equal(said.text.length, 600);
+    assert.equal(said.text.length, 9000);
     assert.ok(said.text.endsWith("x…"));
     // What say counts is UTF-16 units, so a text of two-unit characters is cut sooner, and never in the middle of one.
     await w.q("TRUNCATE claw_assistant_says");
-    assert.equal(await end(await endedTurn("Tell me more"), { finalText: "😀".repeat(700) }), "said");
+    assert.equal(await end(await endedTurn("Tell me more"), { finalText: "😀".repeat(4600) }), "said");
     const emoji = (await says())[0].text as string;
-    assert.ok(emoji.length <= 600 && emoji.length >= 598, String(emoji.length));
+    assert.ok(emoji.length <= 9000 && emoji.length >= 8998, String(emoji.length));
     assert.ok(emoji.endsWith("😀…"));
     assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(emoji), "no half of a character");
 
@@ -132,7 +148,7 @@ describe("assistant router turn end", { skip }, () => {
       { ...w.sayDeps, maxPerHour: 0 },
     );
     assert.equal(capped, "skipped");
-    assert.equal((await says()).length, 0);
+    assert.deepEqual((await says()).map((s) => [s.text, s.fallback]), [[w.mod.outbound.sayCapNotice("Hi"), true]], "the system's words, not the model's");
   });
 
   test("T6 only an assistant's router session is looked at", async () => {
@@ -179,5 +195,335 @@ describe("assistant router turn end", { skip }, () => {
     }
     assert.deepEqual((await says()).map((s) => s.text), ["Sunny, and the build is green."], `delivered by the handler (${acked.join(", ")})`);
     assert.deepEqual(ended.map((e) => e.messageId), [turn.mid], "the say is the ended turn's: its message id goes with it");
+  });
+
+  test("T8 a fault delivering the unsaid answer is tried again by the completion handler", async () => {
+    const turn = await w.routerTurn(alice);
+    await w.q("UPDATE claw_tasks SET prompt = 'Is the build green?' WHERE task_id = $1", [turn.task_id]);
+    const { completionPorts, consumeEventDelivery, tombstoneReader, setUnsaidAnswerRetryDelayForTest } = w.mod.consumer;
+    const realDeliver = completionPorts.deliverUnsaidAnswer;
+    let calls = 0;
+    // The first attempt meets the database mid-failover, as the Router's own say did.
+    completionPorts.deliverUnsaidAnswer = (async (end: never, deps?: never) => {
+      calls += 1;
+      if (calls === 1) throw Object.assign(new Error("cannot execute INSERT in a read-only transaction"), { code: "25006" });
+      return realDeliver(end, deps);
+    }) as typeof completionPorts.deliverUnsaidAnswer;
+    const { sc } = await import("../src/infra/nats.js");
+    const { resetDeletedSessionCache } = await import("../src/sessions/deleted-cache.js");
+    const originalTombstone = { ...tombstoneReader };
+    Object.assign(tombstoneReader, { has: async () => false });
+    resetDeletedSessionCache();
+    setUnsaidAnswerRetryDelayForTest(5);
+    try {
+      await consumeEventDelivery({
+        subject: `events.${alice.routerSid}`,
+        data: sc.encode(JSON.stringify({
+          type: "exec_complete", session_id: alice.routerSid, user_id: "alice", message_id: turn.mid,
+          task_id: turn.task_id, prompt: "Is the build green?", final_text: "Yes, all green.", failed: false, error_count: 0, skills_used: {},
+        })),
+        seq: 2,
+        ack: () => {}, nak: () => {},
+      });
+    } finally {
+      Object.assign(tombstoneReader, originalTombstone);
+      completionPorts.deliverUnsaidAnswer = realDeliver;
+      setUnsaidAnswerRetryDelayForTest(2_000);
+      resetDeletedSessionCache();
+    }
+    assert.equal(calls, 2, "tried again after the fault");
+    assert.deepEqual((await says()).map((s) => s.text), ["Yes, all green."]);
+  });
+  test("T9 a turn that said only a line before its lookup answered gets its plain-text answer delivered, once", async () => {
+    const SAY_TOOL = "mcp__assistant__say";
+    let seq = 0;
+    /** The turn's toolUsed events, in the order Brain emitted them, as the event consumer stores them. */
+    const emitted = async (mid: string, events: Array<{ tool: string; status: string; is_error?: boolean; description?: string }>) => {
+      for (const e of events) {
+        seq += 1;
+        await w.q(
+          "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, 'toolUsed', $3)",
+          [`claw-t9-${seq}`, alice.routerSid, JSON.stringify({ type: "toolUsed", message_id: mid, ...e })],
+        );
+      }
+    };
+    const LINE = "查一下 Autopilot 的状态。";
+    const ANSWER = "三个节点都 unhealthy，是因为节点池不可用：crsuse2-m2m-v3-173 在退避中，18:30 UTC 恢复。";
+    const said = async (text: string) =>
+      w.q("INSERT INTO claw_assistant_says (say_id, user_id, text, fallback) VALUES (gen_random_uuid(), 'alice', $1, false)", [text]);
+
+    // K2: the line, then the lookup, then the answer written as plain text.
+    const k2 = await endedTurn("为什么我在autopilot页面看这3个节点都是unhealthy");
+    await said(LINE);
+    await emitted(k2.mid, [
+      { tool: SAY_TOOL, status: "start" }, { tool: SAY_TOOL, status: "success", description: '{"ok":true,"say_id":"s1"}' },
+      { tool: "mcp__autopilot__get_status", status: "start" }, { tool: "mcp__autopilot__get_status", status: "success", description: "{}" },
+    ]);
+    assert.equal(await end(k2, { finalText: ANSWER, messageId: k2.mid }), "said", "the person had only the line");
+    assert.deepEqual((await says()).map((s) => s.text), [LINE, ANSWER]);
+    // A completion delivered again finds the answer it stored.
+    assert.equal(await end(k2, { finalText: ANSWER, messageId: k2.mid }), "skipped");
+    assert.equal((await says()).length, 2);
+
+    // The answer said after the lookup: the turn answered, and its closing words are not a second message.
+    await w.q("TRUNCATE claw_assistant_says");
+    const answered = await endedTurn("autopilot 有几台节点");
+    await said("3 台。");
+    await emitted(answered.mid, [
+      { tool: "mcp__autopilot__get_status", status: "success", description: "{}" },
+      { tool: SAY_TOOL, status: "success", description: '{"ok":true}' },
+    ]);
+    assert.equal(await end(answered, { finalText: "Done.", messageId: answered.mid }), "skipped");
+
+    // A say refused after the lookup is not one the person got, so the line before it is all they hold.
+    await w.q("TRUNCATE claw_assistant_says");
+    const refused = await endedTurn("autopilot 有几台节点");
+    await said("查一下。");
+    await emitted(refused.mid, [
+      { tool: SAY_TOOL, status: "success", description: '{"ok":true}' },
+      { tool: "web_search", status: "success", description: "results" },
+      { tool: SAY_TOOL, status: "success", description: '{"ok":false,"error":"refused"}' },
+    ]);
+    assert.equal(await end(refused, { finalText: "节点池里有 3 台。", messageId: refused.mid }), "said");
+
+    // A lookup that failed ended as well: the turn's text after it (that it could not find out) is its answer.
+    await w.q("TRUNCATE claw_assistant_says");
+    const failedLookup = await endedTurn("autopilot 有几台节点");
+    await said("查一下。");
+    await emitted(failedLookup.mid, [
+      { tool: SAY_TOOL, status: "success", description: '{"ok":true}' },
+      { tool: "mcp__autopilot__get_status", status: "success", is_error: true, description: "node pool unavailable" },
+    ]);
+    assert.equal(await end(failedLookup, { finalText: "我现在查不到 Autopilot 的状态，稍后再试。", messageId: failedLookup.mid }), "said");
+
+    // No lookup in the turn (or one of another turn): a say is its answer, as in T2.
+    await w.q("TRUNCATE claw_assistant_says");
+    const plain = await endedTurn("你好");
+    await said("你好！");
+    await emitted(plain.mid, [{ tool: SAY_TOOL, status: "success", description: '{"ok":true}' }]);
+    await emitted("claw-another-turn", [{ tool: "mcp__autopilot__get_status", status: "success", description: "{}" }]);
+    assert.equal(await end(plain, { finalText: "Greeted.", messageId: plain.mid }), "skipped");
+
+    // Through a channel: the line was a real say of the turn, so the answer delivered at its end takes that line's place (`replaces`,
+    // AMD-AGI/PrimusClaw#360), one message, instead of a second one beside it.
+    await w.q("TRUNCATE claw_assistant_says, claw_notification_outbox");
+    await w.subscribe("alice");
+    const live = await w.routerTurn(alice);
+    await w.q("UPDATE claw_tasks SET prompt = $2, started_at = NOW() - INTERVAL '1 second' WHERE task_id = $1", [live.task_id, "为什么这3个节点都是unhealthy"]);
+    const line = await w.mod.tools.say(live as never, { text: LINE }, w.sayDeps);
+    await w.closeRun(live.task_id, "completed", undefined, 1);
+    await emitted(live.mid, [
+      { tool: SAY_TOOL, status: "success", description: JSON.stringify({ ok: true, say_id: line.say_id }) },
+      { tool: "mcp__autopilot__get_status", status: "success", description: "{}" },
+    ]);
+    assert.equal(await end(live, { finalText: ANSWER, messageId: live.mid }), "said");
+    const payloads = (await w.q("SELECT payload FROM claw_notification_outbox ORDER BY id")).map((r) => r.payload);
+    assert.equal(payloads.length, 2);
+    assert.equal(payloads[1].text, ANSWER);
+    assert.equal(payloads[1].replaces, line.say_id, "the answer takes the line's place");
+  });
+  test("T10 each turn that ended without its answer said is counted by what its end did; one that said its answer is not", async () => {
+    const family = w.h.app.metrics.registry.getSingleMetric("claw_assistant_router_unsaid_total");
+    assert.ok(family, "the counter is on the api registry");
+    const OUTCOMES = ["delivered", "replaced_early_line", "lost_notice", "withheld", "redacted", "refused", "after_say"] as const;
+    const read = async () => {
+      const values = (await family.get()).values;
+      return Object.fromEntries(OUTCOMES.map((o) => [o, values.find((v) => v.labels.outcome === o)?.value ?? 0]));
+    };
+    let last = await read();
+    /** What the counter gained since the last call, only the outcomes that moved. */
+    const gained = async () => {
+      const now = await read();
+      const moved = Object.fromEntries(OUTCOMES.filter((o) => now[o] !== last[o]).map((o) => [o, now[o] - last[o]]));
+      last = now;
+      return moved;
+    };
+    let seq = 0;
+    const emitted = async (mid: string, events: Array<{ tool: string; status: string; description?: string }>) => {
+      for (const e of events) {
+        seq += 1;
+        await w.q(
+          "INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, 'toolUsed', $3)",
+          [`claw-t10-${seq}`, alice.routerSid, JSON.stringify({ type: "toolUsed", message_id: mid, ...e })],
+        );
+      }
+    };
+    const said = async (text: string) =>
+      w.q("INSERT INTO claw_assistant_says (say_id, user_id, text, fallback) VALUES (gen_random_uuid(), 'alice', $1, false)", [text]);
+
+    // A turn that said nothing: its plain text is delivered.
+    assert.equal(await end(await endedTurn("How is the build going?"), { finalText: "Still running." }), "said");
+    assert.deepEqual(await gained(), { delivered: 1 });
+
+    // K2: a line, then the lookup, then the answer in plain text: delivered in the line's place, and counted as that.
+    await w.q("TRUNCATE claw_assistant_says");
+    const k2 = await endedTurn("为什么我在autopilot页面看这3个节点都是unhealthy");
+    await said("查一下 Autopilot 的状态。");
+    await emitted(k2.mid, [
+      { tool: "mcp__assistant__say", status: "success", description: '{"ok":true}' },
+      { tool: "mcp__autopilot__get_status", status: "success", description: "{}" },
+    ]);
+    assert.equal(await end(k2, { finalText: "三个节点都在退避中。", messageId: k2.mid }), "said");
+    assert.deepEqual(await gained(), { replaced_early_line: 1 });
+    // Delivered again, the completion finds the answer it stored, and counts nothing more.
+    assert.equal(await end(k2, { finalText: "三个节点都在退避中。", messageId: k2.mid }), "skipped");
+    assert.deepEqual(await gained(), {});
+
+    // A say after the lookup answered: the closing words stay unsaid, and that is counted.
+    await w.q("TRUNCATE claw_assistant_says");
+    const answered = await endedTurn("autopilot 有几台节点");
+    await emitted(answered.mid, [
+      { tool: "mcp__autopilot__get_status", status: "success", description: "{}" },
+      { tool: "mcp__assistant__say", status: "success", description: '{"ok":true}' },
+    ]);
+    await said("3 台。");
+    assert.equal(await end(answered, { finalText: "Done.", messageId: answered.mid }), "skipped");
+    assert.deepEqual(await gained(), { after_say: 1 });
+
+    // A turn that failed before it said anything: the system's notice.
+    await w.q("TRUNCATE claw_assistant_says");
+    assert.equal(await end(await endedTurn("autopilot 有几台节点"), { failed: true, finalText: "boom" }), "said");
+    assert.deepEqual(await gained(), { lost_notice: 1 });
+
+    // A turn whose plain text names a tool: withheld, the system's notice in its place.
+    await w.q("TRUNCATE claw_assistant_says");
+    assert.equal(await end(await endedTurn("autopilot 有几台节点"), { finalText: "我调用了 mcp__autopilot__get_status，有 3 台。" }), "said");
+    assert.deepEqual(await gained(), { withheld: 1 });
+
+    // A turn whose plain text has an internal id and nothing else internal: said without the id.
+    await w.q("TRUNCATE claw_assistant_says");
+    assert.equal(await end(await endedTurn("autopilot 有几台节点"), { finalText: "有 3 台（会话 3f2b8c1e-9a4d-4e6f-8b2a-1c5d7e9f0a3b）。" }), "said");
+    assert.deepEqual(await gained(), { redacted: 1 });
+
+    // A turn whose plain text is an attach command for the user to send: delivered as written, not withheld (N23).
+    await w.q("TRUNCATE claw_assistant_says");
+    const attach = "发送 /agent attach 8bd9c2e4-1f3a-4b5c-9d6e-7f8a9b0c1d2e 就能连到那个会话。";
+    assert.equal(await end(await endedTurn("怎么链接？"), { finalText: attach }), "said");
+    assert.deepEqual(await gained(), { delivered: 1 });
+    assert.deepEqual((await says()).map((s) => [s.text, s.fallback]), [[attach, false]]);
+
+    // A report turn ends silent on purpose: nothing to count.
+    await w.q("TRUNCATE claw_assistant_says");
+    assert.equal(await end(await endedTurn(REPORT), { finalText: "Nothing for the user." }), "skipped");
+    assert.deepEqual(await gained(), {});
+  });
+
+  test("T11 a turn an answer woke that ended without saying it has the answer said by the system at once, once", async () => {
+    await w.subscribe("alice");
+    const ANSWER = "The first line is GATE-FILE-1.";
+    /** An item answered by its worker, and the router turn its report woke, ended. */
+    async function answeredAndWoken(title: string) {
+      const answered = await w.createItem(alice, title);
+      const worker = await w.workerTurn(answered.itemId);
+      assert.equal((await w.mod.tools.report(worker, { kind: "answer", summary: ANSWER })).status, "recorded");
+      await w.closeRun(worker.task_id);
+      const wake = String((await w.pending(alice.routerSid)).at(-1)!.content);
+      assert.ok(wake.startsWith(`[work_event] #${answered.seq} (item_id: ${answered.itemId}) answer:`), wake);
+      assert.ok(!wake.includes("already sent"), "a short answer with no file is the router's to say");
+      return { answered, wake };
+    }
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["stopped for the user's next message", { interrupted: true, finalText: "[Interrupted by user before any turn completed]" }],
+      ["failed", { failed: true }],
+      ["ended in plain text", { finalText: `The answer: ${ANSWER}` }],
+      ["ended without a word", {}],
+    ];
+    for (const [n, [why, extra]] of cases.entries()) {
+      await w.q("TRUNCATE claw_assistant_says, claw_pending_messages, claw_notification_outbox");
+      const title = `Read file ${n}`;
+      const { answered, wake } = await answeredAndWoken(title);
+      assert.equal((await says()).length, 0, `nothing said before the turn ends: ${why}`);
+      const turn = await endedTurn(wake);
+      assert.equal(await end(turn, extra), "said", why);
+      const [told, ...more] = await says();
+      assert.equal(more.length, 0, `the answer only, no notice that the turn was lost: ${why}`);
+      assert.deepEqual([told.fallback, told.item_id], [true, answered.itemId], why);
+      assert.equal(told.text, `#${answered.seq} "${title}": ${ANSWER}`, why);
+      assert.equal((await w.q("SELECT 1 FROM claw_notification_outbox WHERE event_id = $1", [told.say_id])).length, 1, `queued: ${why}`);
+      assert.equal(await end(turn, extra), "skipped", `once: ${why}`);
+      assert.equal((await says()).length, 1, `once: ${why}`);
+    }
+
+    // The router said it (naming no item: the say is recorded about the item its answer woke it for): nothing more.
+    await w.q("TRUNCATE claw_assistant_says, claw_pending_messages, claw_notification_outbox");
+    const { wake } = await answeredAndWoken("Read file again");
+    const turn = await w.routerTurn(alice);
+    await w.q("UPDATE claw_tasks SET prompt = $2, started_at = NOW() WHERE task_id = $1", [turn.task_id, wake]);
+    await w.mod.tools.say(turn, { text: `Done: ${ANSWER}` }, w.sayDeps);
+    await w.closeRun(turn.task_id, "completed", undefined, 1);
+    assert.equal(await end(turn, { finalText: "Said it." }), "skipped");
+    assert.deepEqual((await says()).map((s) => [s.text, s.fallback]), [[`Done: ${ANSWER}`, false]]);
+  });
+
+  test("T12 a turn whose own text was shown as it was written has it taken back when the text is not said as its answer", async () => {
+    const shownTurn = async (prompt: string) => {
+      const turn = await endedTurn(prompt);
+      await (await import("../src/assistant/lookup-ack.js")).noteTextPreview(alice.routerSid, turn.mid, "text-1-0", true);
+      return turn;
+    };
+    const voids = () => w.events.filter((e) => e.type === "toolTextVoid");
+    // Said as the answer: what was shown is the message, nothing is taken back.
+    const said = await shownTurn("autopilot 有几台节点");
+    assert.equal(await end(said, { finalText: "有 3 台。", messageId: said.mid }), "said");
+    assert.deepEqual(voids(), []);
+    // Withheld (it names a tool): the words shown are taken back, for that turn, and the system's notice is said instead.
+    const leaked = await shownTurn("autopilot 有几台节点");
+    assert.equal(await end(leaked, { finalText: "我调用了 mcp__autopilot__get_status，有 3 台。", messageId: leaked.mid }), "said");
+    assert.deepEqual(voids().map((e) => [e.tool, e.message_id, e.reason]), [["mcp__assistant__say", leaked.mid, "withheld"]]);
+    // Failed after its text was shown: taken back too.
+    w.events.length = 0;
+    const failed = await shownTurn("autopilot 有几台节点");
+    assert.equal(await end(failed, { failed: true, finalText: "boom", messageId: failed.mid }), "said");
+    assert.deepEqual(voids().map((e) => e.reason), ["turn_lost"]);
+    // A model call that failed took its text back, and the retry shows its own (review of #539): that one is still on screen, and
+    // a turn that withholds it takes it back.
+    w.events.length = 0;
+    const lookupAck = await import("../src/assistant/lookup-ack.js");
+    const retried = await endedTurn("autopilot 有几台节点");
+    await lookupAck.noteTextPreview(alice.routerSid, retried.mid, "text-1-0", true);
+    await lookupAck.noteTextPreview(alice.routerSid, retried.mid, "text-1-0", false);
+    await lookupAck.noteTextPreview(alice.routerSid, retried.mid, "text-2-0", true);
+    assert.equal(await end(retried, { finalText: "我调用了 mcp__autopilot__get_status，有 3 台。", messageId: retried.mid }), "said");
+    assert.deepEqual(voids().map((e) => [e.message_id, e.reason]), [[retried.mid, "withheld"]]);
+    // A turn that said its answer and then wrote closing text that was shown: the closing text is not said, so it is taken back.
+    w.events.length = 0;
+    const spoke = await shownTurn("autopilot 有几台节点");
+    await w.q("INSERT INTO claw_assistant_says (say_id, user_id, text) VALUES (gen_random_uuid(), 'alice', '有 3 台。')");
+    assert.equal(await end(spoke, { finalText: "已回答。", messageId: spoke.mid }), "skipped");
+    assert.deepEqual(voids().map((e) => [e.message_id, e.reason]), [[spoke.mid, "after_say"]]);
+    // Nothing shown (the switch off for this person): nothing to take back, as before.
+    w.events.length = 0;
+    const plain = await endedTurn("autopilot 有几台节点");
+    assert.equal(await end(plain, { finalText: "我调用了 mcp__autopilot__get_status，有 3 台。", messageId: plain.mid }), "said");
+    assert.deepEqual(voids(), []);
+  });
+  test("T13 a completion that names no message still returns the answer, or the lost-turn notice, to the surface of the turn's message", async () => {
+    const teams = await w.subscribe("alice");
+    const slack = await w.subscribe("alice");
+    await w.q("UPDATE claw_notification_subscriptions SET surface = 'slack' WHERE subscription_id = $1", [slack]);
+    await w.q("DELETE FROM claw_assistant_surfaces WHERE user_id = 'alice'");
+    // Teams is the surface used last; the turns below answer messages that came from Slack.
+    await w.q("INSERT INTO claw_assistant_surfaces (user_id, surface, last_inbound_at) VALUES ('alice', 'slack', NOW() - interval '1 minute'), ('alice', 'teams', NOW())");
+    const fromSlack = async (prompt: string) => {
+      const turn = await endedTurn(prompt);
+      await w.q(
+        "INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context) VALUES ($1, $2, 'alice', $3, $4::jsonb)",
+        [alice.routerSid, turn.mid, prompt, JSON.stringify({ channel: "slack" })],
+      );
+      return turn;
+    };
+    const subsOf = async (text: RegExp) => (await w.q(
+      "SELECT o.subscription_id, s.text FROM claw_notification_outbox o JOIN claw_assistant_says s ON s.say_id::text = o.event_id",
+    )).filter((r) => text.test(r.text)).map((r) => r.subscription_id);
+    try {
+      assert.equal(await end(await fromSlack("How is the build going?"), { finalText: "Still running." }), "said");
+      assert.deepEqual(await subsOf(/^Still running\.$/), [slack], "the answer, though the completion named no message");
+      assert.equal(await end(await fromSlack("And the tests?"), { failed: true, finalText: "partial" }), "said");
+      assert.deepEqual(await subsOf(/did not go through/), [slack], "the lost-turn notice too");
+      assert.ok(teams);
+    } finally {
+      await w.q("DELETE FROM claw_assistant_surfaces WHERE user_id = 'alice'");
+      await w.q("DELETE FROM claw_assistant_messages WHERE user_id = 'alice'");
+    }
   });
 });

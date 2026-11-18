@@ -21,14 +21,16 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import crypto from "node:crypto";
+import { workspaceSaveHeldSql } from "../sessions/save-hold.js";
 import { db, MarketplaceDb } from "../infra/db.js";
-import { canViewPlugin, ownerOrAdmin, formatPluginRow } from "../marketplace/plugins.js";
+import { canViewPlugin, ownerOrAdmin, formatPluginRow, pluginLaunchable } from "../marketplace/plugins.js";
+import { holdPluginReference } from "../marketplace/plugin-expiry.js";
 import { getUser } from "../auth/middleware.js";
 import { anthropicErrorPayload } from "../auth/middleware.js";
 import { isAdmin } from "../auth/models.js";
 import { asJsonObject, dispatchTaskToBrain, newChatMessageId } from "../sessions/dispatch.js";
 import { resolveUserLlmKey } from "../llm/key-source.js";
-import { RUN_DOORBELL_DISPATCH } from "../config.js";
+import { RUN_DOORBELL_DISPATCH, SSE_HISTORY_TAIL } from "../config.js";
 import { pendingSecretColumns } from "../tasks/run-secrets.js";
 import { applySessionGateTransition, stopSessionRuns } from "../tasks/chat-run.js";
 import { actingTurnRefusal } from "../github-review/acting-turns.js";
@@ -39,6 +41,7 @@ import {
 import { metrics } from "../infra/metrics.js";
 import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
 import pino from "pino";
+import { sandboxWorkspaceRefusal } from "../tasks/sandbox-workspaces.js";
 
 const logger = pino({ name: "anthropic-managed-agents" });
 
@@ -201,7 +204,8 @@ function parsePrimusClawMetadata(metadata: unknown): PrimusClawAgentHint | null 
  */
 async function canUsePlugin(pluginId: number, userId: string, admin: boolean): Promise<boolean> {
   const row = await MarketplaceDb.pluginGetById(pluginId, false);
-  return !!row && row.status !== "archived" && canViewPlugin(row, userId, admin);
+  return !!row && row.status !== "archived" && canViewPlugin(row, userId, admin)
+    && await pluginLaunchable(pluginId, userId, admin);
 }
 
 /** Best-effort resolved-agent echo for a Session response (agents.create() is stateless — no table to read back from). */
@@ -821,6 +825,10 @@ function registerAnthropicSessionCreateRoutes(app: FastifyInstance): void {
     // hint convention. Absent/unparseable metadata yields undefined, so the
     // Brain keeps falling back to its default namespace (prior behavior).
     const workspaceId = parsePrimusClawMetadata(body.metadata)?.workspace_id;
+    // A pin to a workspace the deployment does not isolate is refused here, before
+    // the session exists (SANDBOX_ALLOWED_NAMESPACES).
+    const refusedWorkspace = sandboxWorkspaceRefusal([workspaceId]);
+    if (refusedWorkspace) return sendError(reply, 400, "invalid_request_error", refusedWorkspace.message);
 
     const primusAnthropicCompat = {
       agent_id: agentId,
@@ -1038,8 +1046,8 @@ function registerAnthropicSessionEventListRoute(app: FastifyInstance): void {
 
     const data: Record<string, unknown>[] = [];
     for (const row of rows) {
-      // Same masking the SSE stream applies. Stored events keep the raw text
-      // for audit; anything leaving over the API goes through redaction.
+      // Same masking the SSE stream applies. Stored events are already masked
+      // (`redactStoredValue`); anything leaving over the API goes through redaction too.
       const rowData = sanitizeSessionEvent(
         (typeof row.data === "object" && row.data) ? row.data as Record<string, unknown> : {},
       );
@@ -1207,6 +1215,7 @@ interface UserMessageTurnConfig {
 
 type UserMessageGateResult =
   | { kind: "missing" }
+  | { kind: "plugin_gone" }
   | { kind: "queued"; messageId: string }
   | { kind: "dispatch"; messageId: string; userEnv: Record<string, string> };
 
@@ -1222,16 +1231,24 @@ async function gateUserMessageTurn(
   try {
     await client.query("BEGIN");
     const locked = await client.query(
-      "SELECT agent_status FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE",
+      `SELECT agent_status, ${workspaceSaveHeldSql()} AS save_held FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL FOR UPDATE`,
       [sessionId],
     );
     if (!locked.rows.length) {
       await client.query("ROLLBACK");
       return { kind: "missing" };
     }
+    // A turn under a plugin that is gone (deleted, or a temporary one past its
+    // expiry) is refused, queued or not; a queued row also keeps the hold so
+    // the expiry sweep cannot race its insert.
+    if (!(await holdPluginReference(client, config.pluginId ?? null))) {
+      await client.query("ROLLBACK");
+      return { kind: "plugin_gone" };
+    }
     // None for a session that acts as a user (see `loadUserEnvForSession`).
     const userEnv = await loadUserEnvForSession(client, userId, sessionId, logger);
-    if (locked.rows[0].agent_status === "running") {
+    // Queued behind the last turn's workspace save as behind a running turn (sessions/save-hold.ts).
+    if (locked.rows[0].agent_status === "running" || locked.rows[0].save_held === true) {
       const secrets = pendingSecretColumns({
         llmKey: resolveUserLlmKey(user) || "",
         platformKey: user?.platformKey || "",
@@ -1398,6 +1415,9 @@ function registerAnthropicEventRoutes(app: FastifyInstance): void {
     if (gate.kind === "missing") {
       return sendError(reply, 404, "not_found_error", "session not found");
     }
+    if (gate.kind === "plugin_gone") {
+      return sendError(reply, 404, "not_found_error", "the session's agent plugin no longer exists");
+    }
     const sentEvent = { id: `evt_${Date.now()}`, type: "user.message", content: [{ type: "text", text: messageContent }], processed_at: new Date().toISOString() };
     if (gate.kind === "queued") return reply.send({ data: [sentEvent] });
     return await dispatchUserMessageTurn({
@@ -1415,6 +1435,22 @@ interface AnthropicEventStream {
   closeAfterHistory: boolean;
   keepAlive: NodeJS.Timeout;
   write: (frame: string) => boolean;
+}
+
+/**
+ * The history the stream sends before its live events: the session's last `tail` (SSE_HISTORY_TAIL) stored events,
+ * oldest first, not all of them -- a long session's whole history was read into this process on every connection. The
+ * CLI needs only the latest turn; all of it is the paged list route (`GET /anthropic/v1/sessions/:id/events`).
+ */
+export async function streamHistoryRows(
+  sessionId: string, tail: number = SSE_HISTORY_TAIL,
+): Promise<Array<{ event_id: unknown; data: unknown }>> {
+  return (await db.query(
+    `SELECT event_id, data FROM (
+       SELECT id, event_id, data FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL ORDER BY id DESC LIMIT $2
+     ) w ORDER BY id`,
+    [sessionId, tail],
+  )).rows as Array<{ event_id: unknown; data: unknown }>;
 }
 
 async function openAnthropicEventStream(
@@ -1443,10 +1479,7 @@ async function openAnthropicEventStream(
     try { response.write(frame); return true; } catch { return false; }
   };
   const seenIds = new Set<string>();
-  const historyRows = (await db.query(
-    "SELECT event_id, data FROM claw_session_events WHERE session_id = $1 AND deleted_at IS NULL ORDER BY id",
-    [sessionId],
-  )).rows;
+  const historyRows = await streamHistoryRows(sessionId);
   for (const row of historyRows) {
     const data = sanitizeSessionEvent(
       (typeof row.data === "object" && row.data) ? row.data as Record<string, unknown> : {},

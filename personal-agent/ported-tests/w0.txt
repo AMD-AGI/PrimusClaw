@@ -1,0 +1,3 @@
+# W0: the workspace skeleton, the ports and the gates. W0 ports no Python test module; this ledger only records the
+# baseline the contract (messenger.py, activity.py, safe.py, apim_key.py, on_behalf.py, exchange.py, feedback.py) follows.
+python-baseline: 26d66d75de2f8100cbb62bcda0a25fdde1e8682c

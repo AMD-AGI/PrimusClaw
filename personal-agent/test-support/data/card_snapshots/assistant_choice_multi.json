@@ -1,0 +1,93 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "card": "card-7",
+       "primusclaw": "assistant_choice"
+      },
+      "style": "positive",
+      "title": "Send",
+      "type": "Action.Execute",
+      "verb": "primusclaw.assistant_choice"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Accent",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "❓ Pick any that apply",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "text": "Which repositories should the weekly report cover?",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "choices": [
+       {
+        "title": "AMD-AGI/PrimusClaw",
+        "value": "0"
+       },
+       {
+        "title": "AMD-AGI/Primus-SaFE",
+        "value": "1"
+       },
+       {
+        "title": "AMD-AGI/Primus-Turbo",
+        "value": "2"
+       }
+      ],
+      "id": "choice",
+      "isMultiSelect": true,
+      "style": "expanded",
+      "type": "Input.ChoiceSet"
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "You can also just reply in the chat.",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

@@ -8,15 +8,17 @@ import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
   AUTH_INTERNAL_TOKEN, NATS_URL,
-  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_EVOLUTION_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
+  CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_AUTO_EVOLUTION_ENABLED, CLAW_USER_SKILLS_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   SESSION_PURGE_DAYS, SESSION_RETENTION_BATCH, SESSION_RETENTION_DAYS, SESSION_RETENTION_DRY_RUN,
   SESSION_RETENTION_HOLD_BUDGET_SEC, SESSION_RETENTION_LOCK_RETRY_MIN,
   runLeaseTiming, envSettingProblems, assertAdmissionSettings,
+  SHUTDOWN_DEADLINE_MS, SHUTDOWN_DELAY_MS, CLAW_API_BACKGROUND,
 } from "./config.js";
 import { runLeaseTimingProblems } from "@claw/protocol";
-import { initDb } from "./infra/db.js";
+import { buildDeferredIndexes, db, initDb } from "./infra/db.js";
+import { GracefulShutdown } from "./infra/graceful-shutdown.js";
 import { bindApiAppGrant } from "./grants/app-grant.js";
-import { initNats } from "./infra/nats.js";
+import { initNats, nc as natsConnection } from "./infra/nats.js";
 import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
@@ -35,14 +37,17 @@ import { registerUserEnvVarRoutes } from "./routes/user-env-vars.js";
 import { registerAssistantRoutes } from "./routes/assistant.js";
 import { registerAssistantMcpRoutes } from "./assistant/mcp.js";
 import { registerAssistantGithubEventRoutes } from "./routes/assistant-github-events.js";
+import { registerAssistantProactiveRoutes } from "./routes/assistant-proactive.js";
 import { startGithubEventWatch } from "./assistant/github-events.js";
+import { startJobWatch } from "./assistant/job-watch.js";
 import { assertAssistantTokenKey } from "./assistant/token.js";
 import { registerTriggerMcpRoutes } from "./triggers/mcp.js";
 import { assertTriggerToolsConfig } from "./triggers/token.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
 import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
-import { startNotificationWorker } from "./notifications/outbox.js";
+import { deliverNotificationsOnRequest, startNotificationWorker, stopNotificationDelivery } from "./notifications/outbox.js";
 import { registerAssistantDeliveryHook } from "./assistant/outbound.js";
+import { registerHoldDeliveryHook } from "./assistant/holds.js";
 import { a2aPushEnabled } from "./routes/a2a-flags.js";
 import { startA2aPushWorker } from "./routes/a2a-push.js";
 import { registerSystemEnvVarRoutes, publishSystemEnvToKv } from "./routes/system-env-vars.js";
@@ -51,7 +56,8 @@ import { registerTerminalRoutes } from "./routes/terminal.js";
 import { registerMcpRoutes } from "./routes/mcp.js";
 import { registerGithubReviewRoutes } from "./github-review/mcp.js";
 import { registerGithubMcpRoutes } from "./github-mcp/mcp.js";
-import { githubMcpConfigErrors, readGithubMcpSettings } from "./github-mcp/settings.js";
+import { githubMcpStartupErrors } from "./github-mcp/public-read.js";
+import { readGithubMcpSettings } from "./github-mcp/settings.js";
 import { githubReviewConfigErrors, readGithubReviewSettings } from "./github-review/settings.js";
 import { identityClient } from "./auth/identity.js";
 import { identityTokenSettings } from "./auth/identity-token.js";
@@ -62,6 +68,7 @@ import { registerInternalRunRoutes } from "./routes/internal-runs.js";
 import { registerInternalAppRoutes } from "./routes/internal-apps.js";
 import { registerInternalWorkspaceRoutes } from "./routes/internal-workspaces.js";
 import { registerInternalMemoryRoutes } from "./routes/internal-memory.js";
+import { registerInternalSkillRoutes } from "./routes/internal-skills.js";
 import { registerTaskDagRoutes } from "./routes/task-dags.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
 import { registerRunRoutes } from "./runs/routes.js";
@@ -74,11 +81,13 @@ import { startExternalResolver } from "./tasks/external-resolver.js";
 import { startEventConsumer } from "./events/consumer.js";
 import { startEvolveWorker } from "./marketplace/evolve-worker.js";
 import { startUploadSweeper } from "./sessions/upload-sweeper.js";
+import { startPluginExpirySweeper } from "./marketplace/plugin-expiry.js";
 import { archiveIdleSessions } from "./sessions/archive.js";
 import { DEFAULT_RETENTION_RUN, runSessionRetentionOnce } from "./sessions/retention.js";
-import { cleanupOrphanSkillFiles, cleanupOldPatterns } from "./marketplace/skill-service.js";
+import { cleanupOrphanSkillFiles, cleanupOldPatterns, cleanupExpiredSkillDrafts, cleanupOldSkillChanges } from "./marketplace/skill-service.js";
 import { registry as metricsRegistry } from "./infra/metrics.js";
 import { assertRolloutConfigAtStartup } from "./startup/rollout-config.js";
+import { apiBackgroundLoops, logBackgroundOff, startBackgroundLoops } from "./startup/background.js";
 import pino from "pino";
 
 const logger = pino({ name: "api" });
@@ -185,14 +194,32 @@ function assertGithubReviewConfig(): void {
 
 /** Refuse to serve the GitHub tools without the secret that signs their token. */
 function assertGithubMcpConfig(): void {
-  const errors = githubMcpConfigErrors(readGithubMcpSettings());
+  // The read-only App is used only by the GitHub tools' reads (`pr_state`): checked when they are on.
+  const errors = githubMcpStartupErrors(readGithubMcpSettings(), identityClient() !== null, readGithubReviewSettings().enabled);
   if (errors.length === 0) return;
   logger.error({ errors }, "startup.github_mcp_refused");
   throw new Error(`CLAW_GITHUB_MCP_ENABLED is true but the GitHub tools cannot be offered: ${errors.join("; ")}`);
 }
 
+/**
+ * Refuse to start on a CLAW_API_BACKGROUND that is neither on nor off (`startup/background.ts`): either guess is wrong
+ * for somebody -- loops run against a database another deployment owns, or a production replica stops its own.
+ */
+function assertApiBackgroundSetting(): void {
+  if (CLAW_API_BACKGROUND.problem === undefined) return;
+  logger.error({ problem: CLAW_API_BACKGROUND.problem }, "startup.api_background_refused");
+  throw new Error(CLAW_API_BACKGROUND.problem);
+}
+
 async function main() {
   validateStartupConfig();
+  assertApiBackgroundSetting();
+  // HTTP only: no loop below starts, and a request asks this process to deliver nothing (startup/background.ts).
+  const background = CLAW_API_BACKGROUND.on === true;
+  if (!background) {
+    deliverNotificationsOnRequest(false);
+    logBackgroundOff(logger);
+  }
   assertNoSharedIdentityBypass();
   assertRunLeaseTiming();
   assertAssistantTokenKey(CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY);
@@ -293,7 +320,34 @@ async function main() {
     },
   });
 
+  // Before any route: the shutdown has to see every response, including the
+  // event streams that hijack theirs. See infra/graceful-shutdown.ts.
+  const shutdown = new GracefulShutdown({
+    logger,
+    deadlineMs: SHUTDOWN_DEADLINE_MS,
+    delayMs: SHUTDOWN_DELAY_MS,
+    closeServer: () => app.close(),
+    steps: [
+      // Before the pools end: what this process claimed to deliver is sent or handed back, and it claims nothing more.
+      { name: "notifications", run: () => stopNotificationDelivery() },
+      { name: "nats", run: async () => { await natsConnection?.drain(); } },
+      { name: "db", run: () => Promise.all([db.pool.end(), db.lockPool.end()]) },
+    ],
+    exit: (code) => process.exit(code),
+  });
+  app.addHook("onRequest", async (_req, reply) => {
+    shutdown.watchResponse(reply.raw);
+  });
+  shutdown.install();
+
+  // Liveness: the process is up. Stays 200 while draining, so a pod finishing
+  // its requests is not restarted for doing so.
   app.get("/health", async () => ({ status: "ok", service: "api-v2" }));
+  // Readiness: the process wants new requests. 503 from SIGTERM on.
+  app.get("/ready", async (_req, reply) => {
+    if (shutdown.draining) return reply.status(503).send({ status: "draining", service: "api-v2" });
+    return { status: "ok", service: "api-v2" };
+  });
 
   // Prometheus scrape endpoint (text/plain Prom exposition).
   app.get("/metrics", async (_req, reply) => {
@@ -329,11 +383,13 @@ async function main() {
   await registerUserEnvVarRoutes(app);
   await registerNotificationSubscriptionRoutes(app);
   // Off unless CLAW_REMOTE_AGENTS_ENABLED: the module registers nothing otherwise.
-  await registerRemoteAgentRoutes(app);
+  await registerRemoteAgentRoutes(app, { closing: shutdown.closing, crossReplicaWake: true, background });
   // Off unless CLAW_ASSISTANT_ENABLED: the module registers nothing otherwise.
   await registerAssistantRoutes(app);
   // The pull requests a work item watches; nothing unless CLAW_ASSISTANT_ENABLED and CLAW_ASSISTANT_GITHUB_EVENTS.
   await registerAssistantGithubEventRoutes(app);
+  // The brief and the cards the router puts to the user; nothing unless CLAW_ASSISTANT_ENABLED.
+  await registerAssistantProactiveRoutes(app);
   // The assistant's own MCP service, under /v1/internal/; registers nothing unless CLAW_ASSISTANT_ENABLED.
   await registerAssistantMcpRoutes(app);
   await registerTriggerMcpRoutes(app);
@@ -350,6 +406,7 @@ async function main() {
   await registerInternalAppRoutes(app);
   await registerInternalWorkspaceRoutes(app);
   await registerInternalMemoryRoutes(app);
+  await registerInternalSkillRoutes(app);
   await registerTaskDagRoutes(app);
   await registerTaskRoutes(app);
   await registerRunRoutes(app);
@@ -359,45 +416,15 @@ async function main() {
   // Scheduled triggers: nothing is registered unless the deployment turns them on.
   if (CLAW_TRIGGERS_ENABLED) await registerTriggerRoutes(app);
 
-  // Reconcile SYSTEM_ENV KV with DB at boot so brain sees current global env
-  // even if no admin write happens during this process lifetime.
-  await publishSystemEnvToKv().catch((err) =>
-    logger.warn({ err }, "system_env.initial_publish_failed"),
-  );
-
-  startScheduler();
-  startSweeper();
-  await startExternalResolver();
-
-  startEventConsumer().catch((err) => logger.error({ err }, "event-consumer.failed"));
-
-  // Durable skill-evolution worker — drains claw_evolution_jobs queue
-  // populated by exec_complete handler. Survives crashes; FOR UPDATE
-  // SKIP LOCKED makes it safe across multiple API replicas.
-  // Gated: when skill evolution is OFF, no jobs are enqueued so the worker
-  // would just poll an empty queue forever. Skip the empty polling loop.
-  if (CLAW_SKILL_EVOLUTION_ENABLED) {
-    startEvolveWorker();
-  } else {
-    logger.info("evolve_worker.skipped_flag_off");
-  }
-
-  // Background upload TTL sweeper (deletes user uploads > UPLOAD_TTL_DAYS old)
-  startUploadSweeper();
-
-  if (CLAW_TRIGGERS_ENABLED) startTriggerScheduler();
-  // Outbound notification delivery (HMAC-signed webhooks from the outbox).
-  // Gated: with the flag off no table exists and nothing polls.
-  if (CLAW_NOTIFICATIONS_ENABLED) startNotificationWorker();
-  // The assistant's messages go out through the same outbox, so both switches have to be on.
+  // The assistant's messages go out through the same outbox, so both switches have to be on. Hooks, not loops: they run
+  // when this process delivers, which with CLAW_API_BACKGROUND=off it does not.
   if (CLAW_NOTIFICATIONS_ENABLED && CLAW_ASSISTANT_ENABLED) registerAssistantDeliveryHook();
-  if (a2aPushEnabled()) startA2aPushWorker();
-  // Reads the pull requests work items watch and hands what is new to their workers; does nothing unless both switches are on.
-  startGithubEventWatch();
+  // A work item's request that a channel took is the item's needs-you message (`assistant/holds.ts`).
+  if (CLAW_NOTIFICATIONS_ENABLED && CLAW_ASSISTANT_ENABLED) registerHoldDeliveryHook();
 
   // Daily maintenance crons (every 24h, first run 1 min after startup).
-  // Skill cleanups gated by CLAW_SKILL_EVOLUTION_ENABLED — when OFF, old data
-  // is fully frozen so toggling the flag back ON restores prior state without
+  // Skill cleanups gated by the skill switches — when both are OFF, old data
+  // is fully frozen so toggling a flag back ON restores prior state without
   // value loss. Memory has none: nothing about it changes on a timer.
   const runMaintenance = () => {
     // Archive first, then retention: a session archived today is days away from
@@ -415,24 +442,72 @@ async function main() {
         lockRetryDelayMs: SESSION_RETENTION_LOCK_RETRY_MIN * 60 * 1000,
       }))
       .catch(err => logger.error({ err }, "session_retention.failed"));
-    if (CLAW_SKILL_EVOLUTION_ENABLED) {
+    if (CLAW_USER_SKILLS_ENABLED || CLAW_SKILL_AUTO_EVOLUTION_ENABLED) {
       cleanupOrphanSkillFiles().catch(err => logger.error({ err }, "skill_files.cleanup_failed"));
+    }
+    if (CLAW_USER_SKILLS_ENABLED) {
+      cleanupExpiredSkillDrafts().catch(err => logger.error({ err }, "skill_drafts.cleanup_failed"));
+      cleanupOldSkillChanges().catch(err => logger.error({ err }, "skill_changes.cleanup_failed"));
+    }
+    if (CLAW_SKILL_AUTO_EVOLUTION_ENABLED) {
       cleanupOldPatterns().catch(err => logger.error({ err }, "skill_patterns.cleanup_failed"));
     }
   };
-  if (CLAW_SKILL_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0
-    || SESSION_RETENTION_DAYS > 0 || SESSION_PURGE_DAYS > 0) {
-    setTimeout(() => {
-      runMaintenance();
-      setInterval(runMaintenance, 24 * 60 * 60 * 1000);
-    }, 60_000);
-  } else {
-    logger.info("maintenance_cron.skipped_all_flags_off");
-  }
+
+  // Every loop this process runs, each started only when CLAW_API_BACKGROUND is on (startup/background.ts).
+  const loops = apiBackgroundLoops({
+    // Reconcile SYSTEM_ENV KV with DB at boot so brain sees current global env
+    // even if no admin write happens during this process lifetime.
+    system_env_publish: () => publishSystemEnvToKv().catch((err) =>
+      logger.warn({ err }, "system_env.initial_publish_failed"),
+    ),
+    task_scheduler: () => startScheduler(),
+    task_sweeper: () => startSweeper(),
+    external_resolver: () => startExternalResolver(),
+    event_consumer: () => { startEventConsumer().catch((err) => logger.error({ err }, "event-consumer.failed")); },
+    // Durable skill-evolution worker — drains claw_evolution_jobs queue
+    // populated by exec_complete handler. Survives crashes; FOR UPDATE
+    // SKIP LOCKED makes it safe across multiple API replicas.
+    // Gated: when skill evolution is OFF, no jobs are enqueued so the worker
+    // would just poll an empty queue forever. Skip the empty polling loop.
+    evolve_worker: () => startEvolveWorker(),
+    // Background upload TTL sweeper (deletes user uploads > UPLOAD_TTL_DAYS old)
+    upload_sweeper: () => startUploadSweeper(),
+    // Soft-deletes temporary plugins past their expires_at (never a public one).
+    plugin_expiry_sweeper: () => startPluginExpirySweeper(db.pool),
+    trigger_scheduler: () => startTriggerScheduler(),
+    // Outbound notification delivery (HMAC-signed webhooks from the outbox).
+    // Gated: with the flag off no table exists and nothing polls.
+    notification_worker: () => startNotificationWorker(),
+    a2a_push_worker: () => startA2aPushWorker(),
+    // Reads the pull requests work items watch and hands what is new to their workers; does nothing unless both switches are on.
+    github_event_watch: () => startGithubEventWatch(),
+    // Reads the jobs the assistant watches for users and tells them what changed; does nothing unless CLAW_ASSISTANT_JOB_EVENTS is on.
+    job_watch: () => startJobWatch(),
+    maintenance_cron: () => {
+      setTimeout(() => {
+        runMaintenance();
+        setInterval(runMaintenance, 24 * 60 * 60 * 1000);
+      }, 60_000);
+    },
+    // The performance-only indexes over large tables, built while this replica serves rather than before it may
+    // (infra/db.ts, buildDeferredIndexes). Not awaited: a build can outlast any startup probe, and every query they
+    // serve works without them. One replica builds; the rest find the lock taken.
+    deferred_index_build: () => { void buildDeferredIndexes().catch((err) => logger.warn({ err }, "db.deferred_indexes_failed")); },
+  }, {
+    skillEvolution: CLAW_SKILL_AUTO_EVOLUTION_ENABLED,
+    triggers: CLAW_TRIGGERS_ENABLED,
+    notifications: CLAW_NOTIFICATIONS_ENABLED,
+    a2aPush: a2aPushEnabled(),
+    maintenance: CLAW_USER_SKILLS_ENABLED || CLAW_SKILL_AUTO_EVOLUTION_ENABLED || SESSION_AUTO_ARCHIVE_DAYS > 0
+      || SESSION_RETENTION_DAYS > 0 || SESSION_PURGE_DAYS > 0,
+  });
+  await startBackgroundLoops(background, loops.beforeListen, logger);
 
   // Start
   await app.listen({ host: "0.0.0.0", port: API_PORT });
   logger.info({ port: API_PORT }, "api-v2.ready");
+  await startBackgroundLoops(background, loops.afterListen, logger);
 }
 
 main().catch((err) => { logger.fatal({ err }, "api.startup_failed"); process.exit(1); });

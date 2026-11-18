@@ -61,6 +61,7 @@ beforeEach(async () => {
   safe.containers = {};
   safe.calls.length = 0;
   safe.key = SAFE_KEY;
+  safe.memberOf = null;
   binding = { provider: "safe-workload", workloadId: "wl-1" };
   terminalPorts.readBinding = async () => binding;
   await seedSession(h, "s1", { agentStatus: "idle", userId: OWNER.userId });
@@ -197,6 +198,54 @@ test("a binding whose workload SaFE no longer knows is stale, and the lookup fal
   const res = await get("owner");
   assert.equal(res.json().state, "ready");
   assert.ok(safe.calls.some((c) => c === "/api/v1/workloads/wl-gone"), "the binding was tried first");
+});
+
+test("a reclaimed sandbox of an ordinary user is ended with cause sandbox_gone, not a 502", async () => {
+  // SaFE lists across workspaces only for an operator: the unscoped list is a 403 for this caller.
+  safe.memberOf = ["ws-a", "ws-b"];
+  binding = { provider: "safe-workload", workloadId: "wl-gone", workspaceId: "ws-a" };
+  safe.list = [{ ...workload({ workloadId: "wl-other-session" }), __env: "some-other-session" }];
+  const res = await get("owner");
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().state, "ended");
+  assert.equal(res.json().cause, "sandbox_gone");
+  assert.match(res.json().message, /gone/);
+  // It looked in the caller's own workspaces after the unscoped list was refused, not only at the binding.
+  const lists = safe.calls.filter((c) => c.startsWith("/api/v1/workloads?"))
+    .map((c) => new URL(c, "http://x").searchParams.get("workspaceId"));
+  assert.deepEqual(lists, [null, "ws-a", "ws-b"]);
+  // A ticket is refused with the same cause, so a client can offer to start one.
+  const t = await ticket("owner", { cols: 80, rows: 24 });
+  assert.equal(t.statusCode, 409);
+  assert.equal(t.json().state, "ended");
+  assert.equal(t.json().cause, "sandbox_gone");
+});
+
+test("for an ordinary user, a sandbox running again after a reclaim is found in their workspace", async () => {
+  safe.memberOf = ["ws-a"];
+  binding = { provider: "safe-workload", workloadId: "wl-gone" };
+  safe.list = [{ ...workload({ workloadId: "wl-1" }), __env: "s1" }];
+  safe.workloads["wl-1"] = workload();
+  safe.containers["wl-1/wl-1-pod-0"] = [{ name: "main" }];
+  const res = await get("owner");
+  assert.deepEqual(res.json(), { state: "ready", target: { pod: "wl-1-pod-0", container: "main" } });
+});
+
+test("with no binding, an ordinary user whose session never had a sandbox gets none, not a 502", async () => {
+  safe.memberOf = ["ws-a"];
+  binding = null;
+  const res = await get("owner");
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.json().state, "none");
+  assert.equal(res.json().cause, undefined);
+});
+
+test("a list SaFE refuses in every workspace is still a 502: what the sandbox is cannot be said", async () => {
+  safe.memberOf = [];
+  binding = { provider: "safe-workload", workloadId: "wl-gone" };
+  const res = await get("owner");
+  assert.equal(res.statusCode, 502);
+  assert.equal(res.json().error, "terminal_upstream_refused");
 });
 
 test("a workload listed for the session but owned by someone else is not the caller's shell", async () => {

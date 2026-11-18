@@ -23,6 +23,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
+	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -35,6 +36,8 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
+	"sigs.k8s.io/agent-sandbox/pkg/authz"
+	"sigs.k8s.io/agent-sandbox/pkg/identity"
 )
 
 type staticAuth struct{}
@@ -43,21 +46,20 @@ func (staticAuth) Authenticate(context.Context, string) error { return nil }
 
 type staticIdentity struct{}
 
-func (staticIdentity) Check(context.Context, string, string) (string, error) {
-	return "alice", nil
+func (staticIdentity) Introspect(context.Context, string) (identity.Token, error) {
+	return identity.Token{Subject: "u-123", Username: "alice"}, nil
 }
 
-type staticMembership struct {
+// workspaceReviewer allows use of the listed workspaces and nothing else.
+type workspaceReviewer struct {
 	allow []string
 }
 
-func (m staticMembership) Check(_ context.Context, _ string, workspaces []string) error {
-	for _, ws := range workspaces {
-		if !contains(m.allow, ws) {
-			return opErr(403, "user_not_in_workspace", ws)
-		}
-	}
-	return nil
+func (r workspaceReviewer) Create(_ context.Context, sar *authorizationv1.SubjectAccessReview, _ metav1.CreateOptions) (*authorizationv1.SubjectAccessReview, error) {
+	out := sar.DeepCopy()
+	a := sar.Spec.ResourceAttributes
+	out.Status.Allowed = a != nil && a.Resource == "workspaces" && a.Verb == "use" && contains(r.allow, a.Name)
+	return out, nil
 }
 
 type memRecord struct {
@@ -127,16 +129,17 @@ func testService(t *testing.T, now time.Time, intercept ...interceptor.Funcs) (*
 	rec := &memRecord{}
 	reclaimer := &memReclaimer{}
 	svc := New(Options{
-		Client:     cl,
-		Namespace:  "agent-sandbox-system",
-		DataKey:    bytes32('k'),
-		Authn:      staticAuth{},
-		Attest:     checker,
-		Identity:   staticIdentity{},
-		Membership: staticMembership{allow: []string{"top-models", "lab"}},
-		Reclaimer:  reclaimer,
-		Record:     rec,
-		Now:        func() time.Time { return now },
+		Client:      cl,
+		Namespace:   "agent-sandbox-system",
+		DataKey:     bytes32('k'),
+		Authn:       staticAuth{},
+		Attest:      checker,
+		Identity:    staticIdentity{},
+		Authz:       authz.NewClient(workspaceReviewer{allow: []string{"lab", "prod"}}, "primus:"),
+		ReviewOwner: true,
+		Reclaimer:   reclaimer,
+		Record:      rec,
+		Now:         func() time.Time { return now },
 	})
 	return svc, priv, rec, reclaimer
 }
@@ -197,7 +200,7 @@ func signGrantShape(t *testing.T, priv *ecdsa.PrivateKey, req IssueRequest, kind
 func sampleRequest(expires time.Time) IssueRequest {
 	return IssueRequest{
 		GrantID:     "gr-01jb7m9k2x",
-		Owner:       OwnerRequest{UserID: "u-123", Workspaces: []string{"top-models"}},
+		Owner:       OwnerRequest{UserID: "u-123", Workspaces: []string{"lab"}},
 		PlatformKey: "ak-test",
 		Issuer:      IssuerRequest{SessionID: "s-8f2a", AppRunID: "ar-01ja"},
 		Roles: map[string]RoleRequest{
@@ -290,7 +293,7 @@ func TestIssueReplayMatchesExecutionSpec(t *testing.T) {
 	}{
 		{"session", func(r *IssueRequest) { r.Issuer.SessionID = "s-other" }},
 		{"app run", func(r *IssueRequest) { r.Issuer.AppRunID = "ar-other" }},
-		{"workspace", func(r *IssueRequest) { r.Owner.Workspaces = []string{"lab"} }},
+		{"workspace", func(r *IssueRequest) { r.Owner.Workspaces = []string{"prod"} }},
 		{"budget", func(r *IssueRequest) { r.GPUHoursBudget = 2 }},
 		{"lifetime", func(r *IssueRequest) { r.MaxSandboxSeconds = 60 }},
 		{"cards", func(r *IssueRequest) { r.Templates[0].PerGPUCount = []int32{1} }},
@@ -662,6 +665,46 @@ func TestReconcileKeepsMissingPendingSandboxWithinTemplateWindow(t *testing.T) {
 	}
 }
 
+func TestReconcileEndsPresentPendingSandboxAtDeadline(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, reclaimer := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	svc.exists = memExists{}
+	svc.reclaimer = reclaimer
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 4, TimeoutSec: 60, PendingTimeoutSec: 90,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc.ReapOnce(context.Background())
+	view, err := svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Sandboxes[0].State != runtimev1alpha1.SandboxPending {
+		t.Fatalf("pending sandbox ended early: %+v", view.Sandboxes[0])
+	}
+	clock = now.Add(90 * time.Second)
+	svc.ReapOnce(context.Background())
+	view, err = svc.Get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Sandboxes[0].State != runtimev1alpha1.SandboxEnded || !strings.HasPrefix(view.Sandboxes[0].EndReason, "pending_timeout") {
+		t.Fatalf("present pending sandbox was kept: %+v", view.Sandboxes[0])
+	}
+	if len(reclaimer.ids) != 1 || reclaimer.ids[0] != "sbx-1" {
+		t.Fatalf("reclaimed=%v", reclaimer.ids)
+	}
+}
+
 func TestExtendRejectsEarlierExpiry(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	svc, priv, _, _ := testService(t, now)
@@ -775,7 +818,7 @@ func TestIssueRegistersFromImage(t *testing.T) {
 	if g1.Spec.GPU.Count != 1 || g1.Spec.GPU.SharedMemory != "125Gi" {
 		t.Fatalf("gpu=%+v", g1.Spec.GPU)
 	}
-	assertQuantity(t, g1.Spec.Template.Resources.Requests, "24", "256Gi")
+	assertQuantity(t, g1.Spec.Template.Resources.Requests, "24", "224Gi")
 	if got := g1.Spec.Template.Resources.Requests[corev1.ResourceEphemeralStorage]; got.Cmp(resource.MustParse("187.5Gi")) != 0 {
 		t.Fatalf("storage=%s", got.String())
 	}
@@ -789,7 +832,7 @@ func TestIssueRegistersFromImage(t *testing.T) {
 	if g8.Spec.GPU.Count != 8 || g8.Spec.GPU.SharedMemory != "1000Gi" {
 		t.Fatalf("gpu=%+v", g8.Spec.GPU)
 	}
-	assertQuantity(t, g8.Spec.Template.Resources.Requests, "192", "2048Gi")
+	assertQuantity(t, g8.Spec.Template.Resources.Requests, "192", "1792Gi")
 	if got := g8.Spec.Template.Resources.Requests[corev1.ResourceEphemeralStorage]; got.Cmp(resource.MustParse("1500Gi")) != 0 {
 		t.Fatalf("storage=%s", got.String())
 	}
@@ -901,6 +944,37 @@ func TestTimeoutCannotOutliveGrant(t *testing.T) {
 	}
 }
 
+// The lifetime cap of a timeout change counts from the time the sandbox was first running.
+func TestTimeoutCapCountsFromRunning(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, _ := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	req := sampleRequest(now.Add(2 * time.Hour))
+	req.MaxSandboxSeconds = 600
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 600,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(400 * time.Second)
+	if err := svc.MarkRunning(context.Background(), req.GrantID, "sbx-1", RunningUpdate{SandboxName: "sbx-1"}); err != nil {
+		t.Fatal(err)
+	}
+	clock = now.Add(500 * time.Second)
+	if err := svc.SetSandboxTimeout(context.Background(), req.GrantID, "measurement", "sbx-1", 500); err != nil {
+		t.Fatalf("timeout within the cap from running: %v", err)
+	}
+	if err := svc.SetSandboxTimeout(context.Background(), req.GrantID, "measurement", "sbx-1", 501); !IsReason(err, "timeout_not_allowed") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestReclaimCountsLiveGPUSecondsOnce(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	clock := now
@@ -919,6 +993,9 @@ func TestReclaimCountsLiveGPUSecondsOnce(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := svc.MarkRunning(context.Background(), req.GrantID, "sbx-1", RunningUpdate{}); err != nil {
+		t.Fatal(err)
+	}
 	clock = now.Add(10 * time.Second)
 	if err := svc.EndSandbox(context.Background(), req.GrantID, "sbx-1", "killed"); err != nil {
 		t.Fatal(err)
@@ -927,6 +1004,9 @@ func TestReclaimCountsLiveGPUSecondsOnce(t *testing.T) {
 		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-2",
 		TemplateID: "ar-01ja-runner-g1", GPUs: 4, TimeoutSec: 60,
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.MarkRunning(context.Background(), req.GrantID, "sbx-2", RunningUpdate{}); err != nil {
 		t.Fatal(err)
 	}
 	clock = now.Add(15 * time.Second)
@@ -943,6 +1023,100 @@ func TestReclaimCountsLiveGPUSecondsOnce(t *testing.T) {
 	}
 	if len(reclaimer.ids) != 1 || reclaimer.ids[0] != "sbx-2" {
 		t.Fatalf("reclaimed=%v", reclaimer.ids)
+	}
+}
+
+// gpuSecondsGrant issues a grant with a GPU-hour budget and a clock the test moves.
+func gpuSecondsGrant(t *testing.T) (*Service, IssueRequest, *time.Time) {
+	t.Helper()
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	svc, priv, _, _ := testService(t, now)
+	svc.now = func() time.Time { return clock }
+	req := sampleRequest(now.Add(2 * time.Hour))
+	req.GPUHoursBudget = 6
+	req.Roles["measurement"] = RoleRequest{Templates: []string{"runner"}, MaxSandboxes: 2, MaxGPUs: 8}
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"sbx-1", "sbx-2"} {
+		if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+			GrantID: req.GrantID, Role: "measurement", SandboxID: id,
+			TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 3600,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return svc, req, &clock
+}
+
+func grantGPUSeconds(t *testing.T, svc *Service, grantID string) int64 {
+	t.Helper()
+	view, err := svc.Get(context.Background(), grantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return view.GPUSeconds
+}
+
+// Two sandboxes held SchedulingGated for 1677 s and then deleted must not
+// spend the grant's GPU hours (hosting smoke #4 charged 3354 s).
+func TestPendingSandboxEndedChargesNoGPUSeconds(t *testing.T) {
+	svc, req, clock := gpuSecondsGrant(t)
+	*clock = clock.Add(1677 * time.Second)
+	if err := svc.EndSandbox(context.Background(), req.GrantID, "sbx-1", "killed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.FailSandbox(context.Background(), req.GrantID, "sbx-2", "pending_timeout"); err != nil {
+		t.Fatal(err)
+	}
+	if got := grantGPUSeconds(t, svc, req.GrantID); got != 0 {
+		t.Fatalf("gpuSeconds=%d after two never-running sandboxes ended, want 0", got)
+	}
+}
+
+// A sandbox pending for 100 s and then running for 30 s on 1 GPU charges 30 s.
+// Marking it running again does not move the start of the charge.
+func TestGPUSecondsChargeOnlyRunningTime(t *testing.T) {
+	svc, req, clock := gpuSecondsGrant(t)
+	start := *clock
+	*clock = start.Add(100 * time.Second)
+	if err := svc.MarkRunning(context.Background(), req.GrantID, "sbx-1", RunningUpdate{}); err != nil {
+		t.Fatal(err)
+	}
+	*clock = start.Add(120 * time.Second)
+	if err := svc.MarkRunning(context.Background(), req.GrantID, "sbx-1", RunningUpdate{NodeName: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+	*clock = start.Add(130 * time.Second)
+	if err := svc.EndSandbox(context.Background(), req.GrantID, "sbx-1", "killed"); err != nil {
+		t.Fatal(err)
+	}
+	if got := grantGPUSeconds(t, svc, req.GrantID); got != 30 {
+		t.Fatalf("gpuSeconds=%d, want 30 (running 100s..130s on 1 GPU)", got)
+	}
+	// The pending sibling reclaimed at revoke adds nothing.
+	*clock = start.Add(200 * time.Second)
+	if _, err := svc.Revoke(context.Background(), req.GrantID); err != nil {
+		t.Fatal(err)
+	}
+	if got := grantGPUSeconds(t, svc, req.GrantID); got != 30 {
+		t.Fatalf("gpuSeconds=%d after revoke, want 30", got)
+	}
+}
+
+// A running ref written before runningAt existed is still charged from startedAt.
+func TestChargedGPUSecondsLegacyRunningRef(t *testing.T) {
+	start := time.Now().UTC().Truncate(time.Second)
+	end := start.Add(50 * time.Second)
+	legacy := runtimev1alpha1.GrantSandboxRef{GPUs: 2, State: runtimev1alpha1.SandboxRunning, StartedAt: metav1.NewTime(start)}
+	if got := chargedGPUSeconds(legacy, end); got != 100 {
+		t.Fatalf("legacy running=%d, want 100", got)
+	}
+	pending := runtimev1alpha1.GrantSandboxRef{GPUs: 2, State: runtimev1alpha1.SandboxPending, StartedAt: metav1.NewTime(start)}
+	if got := chargedGPUSeconds(pending, end); got != 0 {
+		t.Fatalf("pending=%d, want 0", got)
 	}
 }
 
@@ -1050,6 +1224,36 @@ func TestIssueRejectsReservedAppRunID(t *testing.T) {
 		if err := validateIssue(req, now); err != nil {
 			t.Fatalf("%s: err = %v", appRunID, err)
 		}
+	}
+}
+
+// A Workload deletion observed after the pending deadline does not replace
+// the pending_timeout reason.
+func TestFailSandboxKeepsPendingTimeout(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginSandbox(context.Background(), BeginRequest{
+		GrantID: req.GrantID, Role: "measurement", SandboxID: "sbx-1",
+		TemplateID: "ar-01ja-runner-g1", GPUs: 1, TimeoutSec: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, reason := range []string{
+		"pending_timeout: not running after 1s (pendingTimeoutSec=1)",
+		"sandbox_create_failed: workload sbx-1 is being deleted: phase NotReady: In queue",
+	} {
+		if err := svc.FailSandbox(context.Background(), req.GrantID, "sbx-1", reason); err != nil {
+			t.Fatal(err)
+		}
+	}
+	view, err := svc.Get(context.Background(), req.GrantID)
+	if err != nil || len(view.Sandboxes) != 1 || !strings.HasPrefix(view.Sandboxes[0].EndReason, "pending_timeout: ") {
+		t.Fatalf("sandboxes=%+v err=%v", view.Sandboxes, err)
 	}
 }
 

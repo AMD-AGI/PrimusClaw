@@ -11,13 +11,11 @@
  * deleting: the row goes, and the audit trail keeps only that it existed.
  *
  * Rows with `kind` set belong to the knowledge base, not to the user, and are never read or written here.
- * The optional remote backend (`MEMORY_BACKEND=remote`) is frozen at v1 and does not serve this model, so
- * with it memory is off.
  */
 import pino from "pino";
 
 import {
-  CLAW_MEMORY_CATALOGUE_MAX_LINES, CLAW_MEMORY_CATALOGUE_MAX_TOKENS, CLAW_MEMORY_ENABLED, CLAW_MEMORY_MAX_ENTRIES,
+  CLAW_MEMORY_CATALOGUE_MAX_LINES, CLAW_MEMORY_CATALOGUE_MAX_TOKENS, CLAW_MEMORY_DEFAULT_ON, CLAW_MEMORY_ENABLED, CLAW_MEMORY_MAX_ENTRIES,
   CLAW_MEMORY_PROJECT_REVIEW_DAYS, CLAW_MEMORY_REFERENCE_REVIEW_DAYS,
 } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -26,17 +24,15 @@ import { sessionWithholdsMemory } from "../github-review/session-tools.js";
 import { estimateTokens } from "../shared/tokens.js";
 import {
   BODY_MAX, NOTE_MAX, SIMILARITY_THRESHOLD, TITLE_MAX, isMemoryType, legacyType, memoryCommand, normalizeText,
-  quoteIsFrom, quoteSupports, scanInjection, scanSecrets, similarity, type MemoryType,
+  quoteIsFrom, quoteSupports, rankByMessage, scanInjection, scanSecrets, similarity, type MemoryType,
 } from "./gates.js";
+import { citedBy, linkDerived, relinkEntry, resolveNames, unlinkErased } from "./links.js";
 
 const logger = pino({ name: "memory-service" });
 
-const REMOTE_BACKEND = process.env.MEMORY_BACKEND === "remote";
-if (REMOTE_BACKEND && CLAW_MEMORY_ENABLED) logger.warn("memory.remote_backend_frozen: long-term memory is off with MEMORY_BACKEND=remote");
-
 /** The deployment has memory at all. */
 export function memoryAvailable(): boolean {
-  return CLAW_MEMORY_ENABLED && !REMOTE_BACKEND;
+  return CLAW_MEMORY_ENABLED;
 }
 
 /** What a user-memory row is: not the knowledge base's, not the legacy profile. */
@@ -49,20 +45,49 @@ export const memoryPorts = {
   publishSessionEvent: (sessionId: string, event: Record<string, unknown>) => publishEvent(sessionId, event),
 };
 
-// ===== Per-user opt-in =====
+/**
+ * One writer of a user's memory at a time: taken first in every transaction that writes an entry, before any of its rows is
+ * locked, so that two writes (an update and a forget-all) never hold one each of the lock and a row the other waits for.
+ * Reentrant within the transaction.
+ */
+async function lockUser(q: Querier, userId: string): Promise<void> {
+  await q("SELECT pg_advisory_xact_lock(hashtext('claw_memory:' || $1))", [userId]);
+}
 
 /**
- * Whether this user has opted in to long-term memory. Default is no: a user
- * with no row is off. Deliberately not wrapped in a catch -- when the preference
- * cannot be read, the caller must fail closed (nothing injected, nothing stored).
- * This is the user's choice; CLAW_MEMORY_ENABLED stays the deployment-wide switch
- * and both must be on for memory to be used.
+ * Keep the entries' citations (`links.ts`) inside the transaction that changed them, under the user's write lock (`lockUser`, which
+ * the caller has taken already, so two writes never resolve the same name at once) and a savepoint: a citation that cannot be kept
+ * is lost and logged, and the write it follows stands.
+ */
+async function maintainLinks(q: Querier, userId: string, what: string, work: () => Promise<void>): Promise<void> {
+  await lockUser(q, userId);
+  await q("SAVEPOINT memory_links");
+  try {
+    await work();
+    await q("RELEASE SAVEPOINT memory_links");
+  } catch (err) {
+    await q("ROLLBACK TO SAVEPOINT memory_links");
+    logger.error({ err, userId, what }, "memory.links_failed");
+  }
+}
+
+// ===== Per-user preference =====
+
+/**
+ * Whether this user has long-term memory on. Their own row decides when they have one, on or off; a user with
+ * no row gets the deployment's default (`CLAW_MEMORY_DEFAULT_ON`, off unless set, and off wherever
+ * CLAW_MEMORY_ENABLED is). The one place a preference is read: every check of it (the session access below, the
+ * routes, the assistant's memory) comes through here.
+ * Deliberately not wrapped in a catch -- when the preference cannot be read, the caller must fail closed (nothing
+ * injected, nothing stored). CLAW_MEMORY_ENABLED stays the deployment-wide switch and both must be on for memory
+ * to be used.
  */
 export async function getMemoryPreference(userId: string): Promise<boolean> {
   const row = (await db.query(
     "SELECT enabled FROM claw_user_memory_prefs WHERE user_id = $1", [userId],
   )).rows[0];
-  return row?.enabled === true;
+  // The default turns nothing on where the deployment has no memory: the REST writes ask only this.
+  return row ? row.enabled === true : CLAW_MEMORY_DEFAULT_ON && memoryAvailable();
 }
 
 export async function setMemoryPreference(userId: string, enabled: boolean): Promise<void> {
@@ -76,7 +101,7 @@ export async function setMemoryPreference(userId: string, enabled: boolean): Pro
 // ===== Which sessions memory serves =====
 
 export interface MemoryAccess {
-  /** The user turned memory on (and the deployment has it). */
+  /** The user has memory on, by their own choice or the deployment's default (and the deployment has it). */
   optedIn: boolean;
   /** This session's turns are shown the catalogue and offered the memory tools. */
   serves: boolean;
@@ -350,7 +375,7 @@ export async function writeMemory(userId: string, draft: MemoryDraft, actor: Mem
 
   const result = await inTransaction(async (q) => {
     // One writer per user at a time, so the count and the duplicate check hold for the insert that follows.
-    await q("SELECT pg_advisory_xact_lock(hashtext('claw_memory:' || $1))", [userId]);
+    await lockUser(q, userId);
     await opts.guard?.(q);
     const live = (await q(
       `SELECT id, category, content, mtype, title, evidence_quote, work_item_id FROM claw_memory_entries WHERE user_id = $1 AND ${LIVE_ROWS}`,
@@ -391,6 +416,11 @@ export async function writeMemory(userId: string, draft: MemoryDraft, actor: Mem
     )).rows[0];
     const id = Number(row.id);
     await recordEvent(q, { userId, entryId: id, op: "add", actor: actor.kind, sessionId: actor.kind === "model" ? actor.sessionId : null, title, quote });
+    await maintainLinks(q, userId, "add", async () => {
+      await relinkEntry(q, userId, id);
+      await resolveNames(q, userId, id);
+      if (closest) await linkDerived(q, userId, id, Number(closest.row.id), actor.kind);
+    });
     return { ok: true as const, id, op: "add" as const, status, title, live: live.length + 1 };
   });
   if (!result.ok) await recordRefusal(userId, actor, result.error, result.similar?.id ?? null);
@@ -421,6 +451,7 @@ export async function updateMemory(
   const days = reviewDays(type, draft.expires_in_days);
   const quote = actor.kind === "model" ? actor.quote : null;
   const done = await inTransaction(async (q) => {
+    await lockUser(q, userId);
     await opts.guard?.(q);
     // The model's edit holds only while the entry is still active (a REST edit may have made it pending since).
     const updated = await q(
@@ -437,6 +468,10 @@ export async function updateMemory(
     );
     if (!updated.rowCount) return false;
     await recordEvent(q, { userId, entryId: id, op: "update", actor: actor.kind, sessionId: actor.kind === "model" ? actor.sessionId : null, title, quote });
+    await maintainLinks(q, userId, "update", async () => {
+      await relinkEntry(q, userId, id);
+      await resolveNames(q, userId, id);
+    });
     return true;
   });
   if (!done) return refuse("not_found", `no memory #${id}`);
@@ -445,19 +480,31 @@ export async function updateMemory(
 }
 
 /**
+ * The chat notices that announced the entries (`memory_saved`, see `runMemoryTool`) lose their title. Exported for the
+ * plan test.
+ *
+ * The memory id is compared as the text `->>` returns, so the lookup is `idx_events_memory_saved` (infra/db.ts): the
+ * notices are a sliver of claw_session_events, and anything else -- a cast of every row's memory_id, or walking the
+ * user's sessions, which for a busy user is most of the table -- reads millions of rows and outlives the pool's
+ * statement timeout, so the delete fails. The user's sessions still bound the update: a notice in another user's
+ * session is not this user's to change.
+ */
+export const ERASE_NOTICE_TITLES_SQL = `UPDATE claw_session_events SET data = data - 'title'
+  WHERE event = 'memory_saved' AND (data->>'memory_id') = ANY($1::text[]) AND data ? 'title'
+    AND session_id IN (SELECT session_id FROM claw_sessions WHERE user_id = $2)`;
+
+/**
  * What a deleted entry leaves behind: nothing it said. The row goes, its earlier events lose their title and
  * quote, the chat notice that announced it loses its title, and one content-free event records the delete.
  */
 async function eraseEntries(q: Querier, userId: string, ids: number[], actor: string, op: string): Promise<void> {
   if (!ids.length) return;
+  // What cited them by number goes; what cited them by name names another entry, or none, once they are gone.
+  await maintainLinks(q, userId, "erase", () => unlinkErased(q, userId, ids));
   await q("DELETE FROM claw_memory_entries WHERE user_id = $1 AND id = ANY($2::int[])", [userId, ids]);
+  await maintainLinks(q, userId, "erase_resolve", () => resolveNames(q, userId, null));
   await q("UPDATE claw_memory_events SET title = NULL, evidence_quote = NULL WHERE user_id = $1 AND entry_id = ANY($2::int[])", [userId, ids]);
-  await q(
-    `UPDATE claw_session_events SET data = data - 'title'
-      WHERE event = 'memory_saved' AND data ? 'title' AND (data->>'memory_id')::int = ANY($1::int[])
-        AND session_id IN (SELECT session_id FROM claw_sessions WHERE user_id = $2)`,
-    [ids, userId],
-  );
+  await q(ERASE_NOTICE_TITLES_SQL, [ids.map(String), userId]);
   for (const id of ids) await recordEvent(q, { userId, entryId: id, op, actor });
 }
 
@@ -471,6 +518,7 @@ export async function forgetMemory(
   userId: string, id: number, actorKind: "model" | "api", guard?: (q: Querier) => Promise<void>,
 ): Promise<boolean> {
   return inTransaction(async (q) => {
+    await lockUser(q, userId);
     await guard?.(q);
     const found = (await q(
       `SELECT id FROM claw_memory_entries WHERE user_id = $1 AND id = $2 AND kind IS NULL AND deleted_at IS NULL${modelSees(actorKind)} FOR UPDATE`,
@@ -489,6 +537,7 @@ export async function undoMemory(
   userId: string, id: number, actorKind: "model" | "api", guard?: (q: Querier) => Promise<void>,
 ): Promise<"restored" | "deleted" | "not_found"> {
   return inTransaction(async (q) => {
+    await lockUser(q, userId);
     await guard?.(q);
     const row = (await q(
       `SELECT prev_title, prev_body FROM claw_memory_entries WHERE user_id = $1 AND id = $2 AND kind IS NULL AND deleted_at IS NULL${modelSees(actorKind)} FOR UPDATE`,
@@ -506,6 +555,10 @@ export async function undoMemory(
     );
     await q("UPDATE claw_memory_events SET title = NULL, evidence_quote = NULL WHERE user_id = $1 AND entry_id = $2 AND op = 'update'", [userId, id]);
     await recordEvent(q, { userId, entryId: id, op: "undo", actor: actorKind });
+    await maintainLinks(q, userId, "undo", async () => {
+      await relinkEntry(q, userId, id);
+      await resolveNames(q, userId, id);
+    });
     return "restored";
   });
 }
@@ -513,6 +566,7 @@ export async function undoMemory(
 /** Delete every entry of the user, the legacy profile with them. The count is what was deleted. */
 export async function forgetAllMemories(userId: string): Promise<number> {
   return inTransaction(async (q) => {
+    await lockUser(q, userId);
     const ids = (await q("SELECT id FROM claw_memory_entries WHERE user_id = $1 AND kind IS NULL", [userId])).rows.map((r) => Number(r.id));
     await eraseEntries(q, userId, ids, "api", "delete");
     return ids.length;
@@ -548,6 +602,105 @@ export async function recallMemory(
   const ids = rows.map((r) => r.id);
   if (ids.length) await db.query("UPDATE claw_memory_entries SET access_count = access_count + 1, last_accessed = NOW() WHERE user_id = $1 AND id = ANY($2::int[])", [userId, ids]);
   return rows;
+}
+
+/** At most this many entries are recalled for one message (`memoriesForMessage`). */
+export const MESSAGE_RECALL_LIMIT = 5;
+/** The share of a message's known wording an entry must hold to be recalled for it (`rankByMessage`). */
+export const MESSAGE_RECALL_MIN_SCORE = 0.25;
+
+/**
+ * The user's entries a message is about, best first (`rankByMessage`): what the catalogue would list, active and not past
+ * review, of this user only, over every binding (the router's index lists them all). Not counted as a use: nobody asked for
+ * them, and `access_count` stays the count of reads a model chose to make. One read of at most CLAW_MEMORY_MAX_ENTRIES rows,
+ * scored in memory.
+ */
+export async function memoriesForMessage(userId: string, message: string): Promise<MemoryRow[]> {
+  if (!message.trim()) return [];
+  // Past review in the query, and CLAW_MEMORY_MAX_ENTRIES only, pinned then newest: a store left above a cap lowered since is not read whole.
+  const rows = (await db.query(
+    `SELECT ${ROW_COLUMNS} FROM claw_memory_entries
+      WHERE user_id = $1 AND ${USER_ROWS} AND status = 'active' AND (expires_at IS NULL OR expires_at > NOW())
+      ORDER BY pinned DESC, id DESC LIMIT $2`,
+    [userId, CLAW_MEMORY_MAX_ENTRIES],
+  )).rows.map(toRow);
+  return rankByMessage(message, rows, (r) => `${r.title}\n${r.body}`, { limit: MESSAGE_RECALL_LIMIT, minScore: MESSAGE_RECALL_MIN_SCORE })
+    .map((x) => x.item);
+}
+
+/** How far the turn recall follows the entries' links from what the message matched (E242: at most two hops). */
+export const LINK_RECALL_DEPTH = 2;
+
+/** An entry reached along a link, and the link it was reached by: `#410 cites it`, `it cites #415`. */
+export interface LinkedMemory { row: MemoryRow; hop: number; via: string }
+
+/**
+ * The entries the user's links reach from `seeds`, breadth first, at most LINK_RECALL_DEPTH hops and `max` entries, in both
+ * directions (what a seed cites or is derived from, and what cites it or is derived from it). Every hop is read from this user's
+ * rows only: a link is this user's, and the entry it reaches must be this user's, active and not past review; a hop never passes
+ * through one that is not. Not counted as reads, as the seeds are not. Per hop, one read of the links of the entries it starts
+ * from (all of them) and one read of the entries it reaches.
+ */
+export async function expandAlongLinks(userId: string, seeds: readonly MemoryRow[], max: number): Promise<LinkedMemory[]> {
+  if (!seeds.length || max <= 0) return [];
+  // The links of the entries a hop starts from, read per hop and only theirs: no limit can drop one of them. An entry has at most
+  // LINKS_PER_ENTRY_MAX + 1 links of its own and the user at most CLAW_MEMORY_MAX_ENTRIES entries, so a read is bounded by those.
+  const linksOf = async (ids: readonly number[]): Promise<Map<number, Array<{ to: number; via: (from: number) => string }>>> => {
+    const rows = (await db.query(
+      `SELECT from_id, rel, to_id FROM claw_memory_links
+        WHERE user_id = $1 AND to_kind = 'memory' AND (from_id = ANY($2::int[]) OR to_id = ANY($3::text[]))
+        ORDER BY from_id, to_id`,
+      [userId, ids, ids.map(String)],
+    )).rows as Array<{ from_id: number; rel: string; to_id: string }>;
+    const next = new Map<number, Array<{ to: number; via: (from: number) => string }>>();
+    const add = (a: number, b: number, via: (from: number) => string): void => {
+      const list = next.get(a) ?? [];
+      list.push({ to: b, via });
+      next.set(a, list);
+    };
+    for (const l of rows) {
+      const from = Number(l.from_id);
+      const to = Number(l.to_id);
+      if (!Number.isSafeInteger(to) || from === to) continue;
+      const verb = l.rel === "derived_from" ? "is derived from" : "cites";
+      add(from, to, (x) => `#${x} ${verb} it`);
+      add(to, from, (x) => `it ${verb} #${x}`);
+    }
+    return next;
+  };
+  const seen = new Set(seeds.map((r) => r.id));
+  const out: LinkedMemory[] = [];
+  let frontier = seeds.map((r) => r.id);
+  for (let hop = 1; hop <= LINK_RECALL_DEPTH && frontier.length && out.length < max; hop += 1) {
+    const reached: Array<{ id: number; via: string }> = [];
+    const next = await linksOf(frontier);
+    for (const f of frontier) {
+      for (const e of next.get(f) ?? []) {
+        if (seen.has(e.to) || reached.some((r) => r.id === e.to)) continue;
+        reached.push({ id: e.to, via: e.via(f) });
+      }
+    }
+    if (!reached.length) break;
+    const rows = new Map((await db.query(
+      `SELECT ${ROW_COLUMNS} FROM claw_memory_entries
+        WHERE user_id = $1 AND id = ANY($2::int[]) AND ${USER_ROWS} AND status = 'active' AND (expires_at IS NULL OR expires_at > NOW())`,
+      [userId, reached.map((r) => r.id)],
+    )).rows.map(toRow).map((r) => [r.id, r] as const));
+    frontier = [];
+    for (const r of reached) {
+      const row = rows.get(r.id);
+      if (!row || out.length >= max) continue;
+      seen.add(r.id);
+      out.push({ row, hop, via: r.via });
+      frontier.push(r.id);
+    }
+  }
+  return out;
+}
+
+/** The active entries each of `ids` cites (`claw_memory_links`), of this user only. */
+export async function citationsOf(userId: string, ids: readonly number[]): Promise<Map<number, Array<{ id: number; title: string }>>> {
+  return citedBy((text, params) => db.query(text, params), userId, ids);
 }
 
 // ===== The catalogue =====

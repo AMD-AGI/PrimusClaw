@@ -119,7 +119,8 @@ test("X1 an idle session: the gate is taken inside the lock's transaction, then 
 
 test("X2 a running session: the message is parked, the gate is not touched and nothing is dispatched", async () => {
   dispatchOpensRun();
-  const stub = stubFor("running");
+  // The queued row names plugin 9, which the insert holds (and finds) first.
+  const stub = stubFor("running", (sql) => (/FROM plugins WHERE id = \$1/.test(sql) ? [{ "?column?": 1 }] : undefined));
 
   const result = await submitSessionMessage(message({ pluginId: 9 }));
 

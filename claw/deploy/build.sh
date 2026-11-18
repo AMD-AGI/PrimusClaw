@@ -44,7 +44,9 @@ source "$SCRIPT_DIR/common.sh"
 TAG="${TAG:-$(date +%Y%m%d%H%M)}"
 export TAG
 
-IMG="$REGISTRY/claw:$TAG"
+# Builds push to a registry of your own; docker.io/rocm/primusclaw is published by AMD's release pipeline only.
+[ "$REGISTRY" != docker.io/rocm ] || fail "set REGISTRY to a registry you can push to (docker.io/rocm is release-only)"
+IMG="$REGISTRY/$REPOSITORY:$TAG"
 export IMG
 
 # Auto-select the kaniko backend when a push password is supplied; an
@@ -55,6 +57,12 @@ if [ -z "${USE_KANIKO:-}" ]; then
 fi
 
 log "Building $IMG ..."
+
+# The build this image is, for what the assistant's claw_self_status names as the version running: written into the
+# build context as packages/api/BUILD (ignored by git), which reaches the image with packages/, and removed once the
+# context is packed.
+BUILD_FILE="$HARNESS_ROOT/packages/api/BUILD"
+printf '%s\n' "$TAG" > "$BUILD_FILE"
 
 if [ "$USE_KANIKO" = "true" ]; then
   # ── In-cluster kaniko build from the LOCAL working tree (no docker) ───────
@@ -129,6 +137,7 @@ if [ "$USE_KANIKO" = "true" ]; then
   if [ "$ctx_bytes" -gt "$KANIKO_CONTEXT_MAX_BYTES" ]; then
     fail "build context $((ctx_bytes / 1024))KB exceeds the sanity ceiling ($((KANIKO_CONTEXT_MAX_BYTES / 1024))KB). Something is in the context that should not be -- check for node_modules or large binaries, or raise KANIKO_CONTEXT_MAX_BYTES."
   fi
+  rm -f "$BUILD_FILE"
 
   # Split across ConfigMaps rather than fitting into one.
   #
@@ -278,6 +287,7 @@ else
     | docker build --no-cache --progress=plain --network host \
         ${EXTRA_CA_CERT_URLS:+--build-arg "EXTRA_CA_CERT_URLS=$EXTRA_CA_CERT_URLS"} \
         -t "$IMG" -f Dockerfile -
+  rm -f "$BUILD_FILE"
 
   docker push "$IMG"
   log "Built and pushed: $IMG"

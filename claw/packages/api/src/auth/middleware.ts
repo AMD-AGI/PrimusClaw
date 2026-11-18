@@ -16,9 +16,12 @@ import { resolveUserLlmKey, usePlatformKeyForLlm } from "../llm/key-source.js";
 import { ByokInvalidKeyError, ByokRateLimitError, ByokUpstreamUnavailableError, verifyByokKey } from "./byok.js";
 import { constantTimeEquals } from "@claw/utils";
 import { verifyConnectorToken } from "./connector-token.js";
+import { verifyConnectorGrant } from "./connector-grant.js";
 import { verifyIdentityAccessToken } from "./identity-token.js";
+import { safeFailureOf } from "./delegated-keys.js";
 import { recordRequestCredential } from "./request-credential.js";
 import { platformAccessRefusal } from "./platform-access.js";
+import { browserSignInRedirect } from "./browser-sign-in.js";
 import pino from "pino";
 
 const logger = pino({ name: "auth" });
@@ -88,12 +91,16 @@ export function devAuthBypassEnabled(): boolean {
 // authenticate today.
 const ANONYMOUS_PATHS = new Set([
   "/health",
+  "/ready",
   "/metrics",
   "/.well-known/agent-card.json",
   "/.well-known/agent.json",
   "/a2a/.well-known/agent-card.json",
   "/a2a/.well-known/agent.json",
   "/a2a/health",
+  // Pairing a machine: the one-time code in the body is the credential (remote-agents/pairing.ts). The route exists only
+  // while remote agents are on.
+  "/v1/remote-agents/pairings/claim",
 ]);
 
 /**
@@ -243,20 +250,26 @@ function verificationFailureSpec(
   unreachableMessage: string,
   invalidLegacyError: string,
 ): AuthErrorSpec {
-  if (e instanceof AuthUpstreamUnreachableError) {
+  // One reading for every credential SaFE is asked about (delegated-keys.ts): SaFE that cannot be reached, that
+  // answers 5xx, or that answers 2xx with something that is not an answer has not judged the credential. A 401 for
+  // that tells a person (and a connector, which stops for good after a run of them) that a good key is invalid.
+  const failure = safeFailureOf(e);
+  if (failure.status === "unavailable") {
     return {
       status: 503,
       legacyError: "authentication_service_unavailable",
       anthropicType: "api_error",
-      message: unreachableMessage,
+      // SaFE's own error text stays in the log (verificationFailureLogFields), not in the answer.
+      message: e instanceof AuthUpstreamUnreachableError ? unreachableMessage
+        : "SaFE could not verify the credential now (it answered with an error); this is not an invalid-credential response.",
     };
   }
-  if (e instanceof AuthServiceMisconfiguredError) {
+  if (failure.status === "misconfigured") {
     return {
       status: 500,
       legacyError: "authentication_misconfigured",
       anthropicType: "api_error",
-      message: (e as Error).message,
+      message: failure.message,
     };
   }
   return {
@@ -530,6 +543,21 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
     devAuthBypass: devAuthBypassEnabled(),
   }, "auth.incoming");
 
+  // A connector grant (`cpg_`, auth/connector-grant.ts): what a machine paired
+  // with a one-time code holds. Judged before anything else, so it is never sent
+  // on to SaFE or the identity provider; it abstains for every other credential.
+  const connectorGrant = await verifyConnectorGrant(req, pathname);
+  if (connectorGrant.status === "verified") {
+    const refused = refuseWithoutPlatformAccess(connectorGrant.user, connectorGrant.method);
+    if (refused) return refused as any;
+    grantVerifiedUser(req, connectorGrant.user, connectorGrant.method);
+    return;
+  }
+  if (connectorGrant.status === "rejected") {
+    const { status, legacyError, anthropicType, message } = connectorGrant.error;
+    return sendAuthError(req, reply, status, legacyError, anthropicType, message) as any;
+  }
+
   // A connector's access token, on the connector-side routes of remote agents
   // only (auth/connector-token.ts). First, so that a request which carries one
   // is judged by it in every mode; it abstains for everything else.
@@ -644,6 +672,13 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
     parsedCookieNames: Object.keys(cookies),
     hasAuthorization: authHeaderRaw.length > 0,
   }, "auth.rejected.no_credentials");
+  // A browser that opened a delivery link with no session at all is sent to sign
+  // in and back, when the operator named a sign-in page (auth/browser-sign-in.ts).
+  const signIn = browserSignInRedirect(req, pathname);
+  if (signIn) {
+    logger.info({ path: pathname }, "auth.rejected.no_credentials.sign_in_redirect");
+    return reply.header("Cache-Control", "no-store").redirect(signIn, 302) as any;
+  }
   return sendAuthError(req, reply, 401, "authentication_required", "authentication_error",
     "provide Bearer API key (ak-...), x-api-key header, or Token cookie") as any;
 }

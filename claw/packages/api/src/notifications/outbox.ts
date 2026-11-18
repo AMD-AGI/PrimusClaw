@@ -22,15 +22,24 @@ import { decryptUserEnvValue } from "../crypto/user-env.js";
 import { db, type Querier } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { approvalTarget, redactCommandSecrets } from "./approval-target.js";
-import type { AssistantEventPayload } from "./assistant-events.js";
+import type { NotificationEventType, NotificationPayload, OutboundPayload } from "@claw/protocol";
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER, signPayload } from "./signing.js";
 import { httpTransport, type Transport } from "./transport.js";
+import { routeToSurface } from "./surfaces.js";
 import { guardWebhookUrl, parseAllowedHosts, type Resolver } from "./url-guard.js";
 
 const logger = pino({ name: "notification-outbox" });
 
 /** Seconds to wait after the Nth failed attempt; the last step repeats. */
 export const RETRY_BACKOFF_SECONDS = [1, 5, 30, 300];
+/**
+ * The longest wait of a subscription's probe: its oldest row that has failed, after a failure that says the receiver is down
+ * rather than refusing (a connection error, a timeout, a 5xx, 408, 429). The other rows keep the backoff above, and go out the
+ * moment the probe gets a 2xx (`releaseWaiting`). Without it a receiver that was down for more than about 40 s -- a pod rolled
+ * with the Recreate strategy -- heard nothing until the 300 s step ran out: every notice of the outage came five minutes late.
+ * One row per failing subscription, so a receiver down for a day is asked once every `PROBE_SECONDS`, not once per row.
+ */
+export const PROBE_SECONDS = 15;
 /** A row that has not been delivered this long after it was created is dropped. */
 export const GIVE_UP_AFTER_HOURS = 24;
 /**
@@ -45,42 +54,9 @@ const CLAIM_LEASE_SECONDS = 120;
 const CLAIM_BATCH = 10;
 const SUMMARY_MAX = 500;
 
-export type NotificationEventType = "run.completed" | "run.failed" | "approval.requested";
-
-/** The part of an `approval.requested` payload that says what is being asked. */
-export interface ApprovalInfo {
-  tool_use_id: string;
-  tool: string;
-  /** Redacted and clipped to 300 characters; see approval-target.ts. */
-  target: string;
-  /** ISO-8601 with an offset: when Brain stops waiting, after which the request is refused. */
-  expires_at: string;
-}
-
-export interface NotificationPayload {
-  event_id: string;
-  type: NotificationEventType;
-  occurred_at: string;
-  user_id: string;
-  session_id: string;
-  task_id: string;
-  /**
-   * Run events only: the message whose turn this run was (`metadata.message_id` of its task: a chat message, or the one a
-   * trigger or an A2A call sent; `null` for a task that has none).
-   * A client that sent the message and already showed the turn's answer can tell this run's end is that turn's
-   * by the id, not by when it ended: a run ends after its last answer, sometimes minutes after.
-   */
-  message_id?: string | null;
-  trigger_id: string | null;
-  title: string;
-  summary: string;
-  link: string;
-  /** Present on `approval.requested` only. */
-  approval?: ApprovalInfo;
-}
-
-/** Everything an outbox row can carry. Run events keep `NotificationPayload`; an assistant event has its own. */
-export type OutboundPayload = NotificationPayload | AssistantEventPayload;
+// The payloads are the HTTP API's contract, defined in @claw/protocol (`claw-api/notifications.ts`) so that the receivers of these
+// events share them; re-exported here so the API's own modules keep one import path.
+export type { ApprovalInfo, HeldQuestion, NotificationEventType, NotificationPayload, OutboundPayload } from "@claw/protocol";
 
 /** Same inputs, same id: the receiver's dedup key. */
 export function deterministicEventId(type: string, sessionId: string, taskId: string): string {
@@ -92,6 +68,21 @@ export function clipSummary(text: string): string {
   const redacted = String(redactPublicJson(text) ?? "");
   return redacted.length > SUMMARY_MAX ? `${redacted.slice(0, SUMMARY_MAX - 1)}…` : redacted;
 }
+
+/**
+ * How long a run ran, in seconds, across every claim of it.
+ *
+ * Not `completed_at - started_at`: a run a draining brain hands back (`releaseClaim`) or a reaper requeues has its
+ * `started_at` cleared, and the claim that resumes it stamps a new one. Measured from there, a 70-second run taken over
+ * three seconds before its end ran three seconds, and was not announced as a long run at all (2026-11-07 11:21Z, release
+ * claw-rel-1917: the run's `run.completed` was never recorded, so the chat that started it never heard it end). The row's
+ * run-time anchor (`run_time_epoch_at`, stamped once) and the queue time banked across every requeue
+ * (`queued_ms_accrued`) give the run's whole life minus its time in the queue, which is what `started_at` measured
+ * for a run claimed once. A row from before the anchor existed keeps the old measure.
+ */
+const RUN_SECONDS_SQL = `CASE WHEN t.run_time_epoch_at IS NOT NULL
+              THEN EXTRACT(EPOCH FROM (COALESCE(t.completed_at, NOW()) - t.run_time_epoch_at)) - t.queued_ms_accrued / 1000.0
+              ELSE EXTRACT(EPOCH FROM (COALESCE(t.completed_at, NOW()) - COALESCE(t.started_at, t.created_at))) END`;
 
 export interface RunFinished {
   sessionId: string;
@@ -118,7 +109,7 @@ export async function recordRunFinished(input: RunFinished): Promise<number> {
     `SELECT t.task_id, t.metadata->>'message_id' AS message_id, s.user_id, s.name, s.config->>'trigger_id' AS trigger_id,
             (s.config->'notify_on_finish' = 'true'::jsonb) AS notify_on_finish,
             COALESCE(t.completed_at, NOW()) AS finished_at,
-            EXTRACT(EPOCH FROM (COALESCE(t.completed_at, NOW()) - COALESCE(t.started_at, t.created_at))) AS seconds
+            ${RUN_SECONDS_SQL} AS seconds
        FROM claw_tasks t JOIN claw_sessions s ON s.session_id = t.session_id
       WHERE t.session_id = $1 AND t.task_id = ANY($2)`,
     [input.sessionId, input.taskIds],
@@ -131,11 +122,12 @@ export async function recordRunFinished(input: RunFinished): Promise<number> {
     if (row.trigger_id) sources.push("trigger");
     if (row.notify_on_finish === true && Number(row.seconds) >= NOTIFY_MIN_RUN_SECONDS) sources.push("long_run");
     if (!sources.length) continue;
-    const subs = (await db.query(
-      `SELECT subscription_id FROM claw_notification_subscriptions
+    // On the surface the owner wrote from last (`routeToSurface`): nobody's message in the chat is answered by a run's end.
+    const subs = await routeToSurface(db.query, row.user_id, (await db.query(
+      `SELECT subscription_id, surface FROM claw_notification_subscriptions
         WHERE owner_user_id = $1 AND enabled AND $2 = ANY(event_types) AND sources && $3::text[]`,
       [row.user_id, type, sources],
-    )).rows;
+    )).rows as Array<{ subscription_id: string; surface: string }>);
     if (!subs.length) continue;
     const eventId = deterministicEventId(type, input.sessionId, row.task_id);
     const name = String(row.name || "").trim();
@@ -169,13 +161,16 @@ export async function enqueue(
   subs: Array<{ subscription_id: string }>,
   payload: OutboundPayload,
   q: Querier = direct,
+  hold?: { status: string; seconds: number },
 ): Promise<number> {
   let written = 0;
   for (const sub of subs) {
+    // A held row is not due until `seconds` from now, and says so in `last_status` (`assistant/say-hold.ts`): whoever holds it
+    // releases it (due now) or drops it before then.
     const r = await q(
-      `INSERT INTO claw_notification_outbox (event_id, subscription_id, payload)
-       VALUES ($1, $2, $3::jsonb) ON CONFLICT (event_id, subscription_id) DO NOTHING`,
-      [eventId, sub.subscription_id, JSON.stringify(payload)],
+      `INSERT INTO claw_notification_outbox (event_id, subscription_id, payload, next_attempt_at, last_status)
+       VALUES ($1, $2, $3::jsonb, NOW() + make_interval(secs => $4), $5) ON CONFLICT (event_id, subscription_id) DO NOTHING`,
+      [eventId, sub.subscription_id, JSON.stringify(payload), hold?.seconds ?? 0, hold?.status ?? null],
     );
     written += r.rowCount ?? 0;
   }
@@ -189,6 +184,20 @@ const APPROVAL_MAX_WAIT_MS = 24 * 3_600_000;
 const TITLE_MAX = 200;
 
 const text = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+
+/**
+ * When Brain began waiting for a person on this request (`permissionRequest`, `userQuestion`), and when it stops: epoch
+ * milliseconds. The wait began when Brain emitted the event. A timestamp in the future can only be clock skew: the wait
+ * began now. A timestamp in the past is a late delivery (a consumer that fell behind, a redelivery) and is kept, so the
+ * expiry is the one Brain is working to.
+ */
+export function waitWindow(event: Record<string, unknown>, clock: number): { startedAt: number; expiresAt: number } {
+  const emittedAt = Number(event.ts);
+  const startedAt = Number.isFinite(emittedAt) && emittedAt > 0 ? Math.min(emittedAt, clock) : clock;
+  const waitMs = Number(event.timeout_ms);
+  const waitWindowMs = Number.isFinite(waitMs) && waitMs > 0 && waitMs <= APPROVAL_MAX_WAIT_MS ? waitMs : APPROVAL_DEFAULT_WAIT_MS;
+  return { startedAt, expiresAt: startedAt + waitWindowMs };
+}
 
 /**
  * Record a notification for a tool call that is held for a person's decision.
@@ -233,26 +242,21 @@ export async function recordApprovalRequested(
   if (session.trigger_id) sources.push("trigger");
   if (session.notify_on_finish === true) sources.push("long_run");
   if (!sources.length) return 0;
-  const subs = (await db.query(
-    `SELECT subscription_id FROM claw_notification_subscriptions
+  const subs = await routeToSurface(db.query, session.user_id, (await db.query(
+    `SELECT subscription_id, surface FROM claw_notification_subscriptions
       WHERE owner_user_id = $1 AND enabled AND 'approval.requested' = ANY(event_types) AND sources && $2::text[]`,
     [session.user_id, sources],
-  )).rows;
+  )).rows as Array<{ subscription_id: string; surface: string }>);
   if (!subs.length) return 0;
 
   const clock = now();
-  const emittedAt = Number(event.ts);
-  // The wait began when Brain emitted the event. A timestamp in the future can only be clock skew:
-  // the wait began now. A timestamp in the past is a late delivery (a consumer that fell behind, a
-  // redelivery) and is kept, so the expiry is the one Brain is working to.
-  const startedAt = Number.isFinite(emittedAt) && emittedAt > 0 ? Math.min(emittedAt, clock) : clock;
-  const waitMs = Number(event.timeout_ms);
-  const waitWindowMs = Number.isFinite(waitMs) && waitMs > 0 && waitMs <= APPROVAL_MAX_WAIT_MS ? waitMs : APPROVAL_DEFAULT_WAIT_MS;
+  const window = waitWindow(event, clock);
   // Brain has already stopped waiting: a push now would announce a request nobody can still answer.
-  if (startedAt + waitWindowMs <= clock) {
-    logger.info({ sessionId, lateByMs: clock - startedAt - waitWindowMs }, "notification.approval_expired_skipped");
+  if (window.expiresAt <= clock) {
+    logger.info({ sessionId, lateByMs: clock - window.expiresAt }, "notification.approval_expired_skipped");
     return 0;
   }
+  const { startedAt } = window;
 
   // The run this request belongs to: Brain stamps every event with the message id of the turn.
   const messageId = text(event.message_id);
@@ -282,7 +286,7 @@ export async function recordApprovalRequested(
       tool_use_id: toolUseId.slice(0, 200),
       tool: redactCommandSecrets(tool).slice(0, 200),
       target: approvalTarget(tool, event.input),
-      expires_at: new Date(startedAt + waitWindowMs).toISOString(),
+      expires_at: new Date(window.expiresAt).toISOString(),
     },
   };
   return enqueue(eventId, subs, payload);
@@ -339,13 +343,39 @@ async function claimDue(): Promise<Claimed[]> {
       WHERE id IN (
         SELECT id FROM claw_notification_outbox
          WHERE delivered_at IS NULL AND dropped_at IS NULL AND next_attempt_at <= NOW()
-         ORDER BY next_attempt_at ASC
+           -- A row whose subscription was deleted waits for its owner's next subscription (adoptOrphanedRows).
+           AND subscription_id IS NOT NULL
+         ORDER BY next_attempt_at ASC, id ASC
          LIMIT $1
          FOR UPDATE SKIP LOCKED)
       RETURNING id, event_id, subscription_id, payload, attempts,
                 created_at < NOW() - make_interval(hours => $3) AS expired`,
     [CLAIM_BATCH, CLAIM_LEASE_SECONDS, GIVE_UP_AFTER_HOURS],
   )).rows;
+}
+
+/** A failure that says the receiver is not there (yet) rather than that it refuses: what the probe retries soon. */
+export function receiverDown(status: string): boolean {
+  if (status.startsWith("error:")) return true;
+  const code = /^http_(\d{3})$/.exec(status)?.[1];
+  return code !== undefined && (code.startsWith("5") || code === "408" || code === "429");
+}
+
+/**
+ * A subscription whose receiver just answered 2xx after failing: every row of it that waits out a long backoff from an earlier
+ * failure is due now, so what queued during an outage goes out with the probe's success instead of when each row's own wait runs
+ * out. Not touched: a row never tried (a held say, `say-hold.ts`), and any row due within `CLAIM_LEASE_SECONDS` -- which is every
+ * row a replica has claimed and may be sending right now (its lease), so releasing it cannot send it twice; such a row goes within
+ * that time anyway. Returns how many were released.
+ */
+async function releaseWaiting(subscriptionId: string): Promise<number> {
+  const r = await db.query(
+    `UPDATE claw_notification_outbox SET next_attempt_at = NOW()
+      WHERE subscription_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL
+        AND attempts > 0 AND last_status IS NOT NULL AND next_attempt_at > NOW() + make_interval(secs => $2)`,
+    [subscriptionId, CLAIM_LEASE_SECONDS],
+  );
+  return r.rowCount ?? 0;
 }
 
 async function recordFailure(row: Claimed, status: string): Promise<void> {
@@ -356,12 +386,19 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
     );
     logger.warn({ eventId: row.event_id, subscriptionId: row.subscription_id, status }, "notification.dropped_after_retries");
   } else {
-    const wait = RETRY_BACKOFF_SECONDS[Math.min(row.attempts - 1, RETRY_BACKOFF_SECONDS.length - 1)];
+    const backoff = RETRY_BACKOFF_SECONDS[Math.min(row.attempts - 1, RETRY_BACKOFF_SECONDS.length - 1)];
+    // The subscription's probe (`PROBE_SECONDS`): its oldest row that has been tried and is still pending, when the receiver is down.
     await db.query(
-      `UPDATE claw_notification_outbox
-          SET next_attempt_at = NOW() + make_interval(secs => $2), last_status = $3
-        WHERE id = $1`,
-      [row.id, wait, status],
+      `UPDATE claw_notification_outbox o
+          SET next_attempt_at = NOW() + make_interval(secs => CASE
+                WHEN $4::boolean AND NOT EXISTS (
+                  SELECT 1 FROM claw_notification_outbox p
+                   WHERE p.subscription_id = o.subscription_id AND p.id < o.id
+                     AND p.delivered_at IS NULL AND p.dropped_at IS NULL AND p.attempts > 0)
+                THEN LEAST($2::int, $5::int) ELSE $2::int END),
+              last_status = $3
+        WHERE o.id = $1`,
+      [row.id, backoff, status, receiverDown(status), PROBE_SECONDS],
     );
   }
   const sub = (await db.query(
@@ -395,7 +432,11 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
       `SELECT url, secret_enc, enabled FROM claw_notification_subscriptions WHERE subscription_id = $1`,
       [row.subscription_id],
     )).rows[0];
-    if (!sub || !sub.enabled) {
+    if (!sub) {
+      // Deleted after the claim: the row is now its owner's to carry over (`adoptOrphanedRows`), not a send that failed.
+      return;
+    }
+    if (!sub.enabled) {
       await db.query(
         `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'subscription_gone' WHERE id = $1`,
         [row.id],
@@ -427,7 +468,7 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
             `UPDATE claw_notification_outbox SET delivered_at = NOW(), last_status = $2 WHERE id = $1`,
             [row.id, String(code)],
           );
-          await db.query(
+          const recovered = await db.query(
             `UPDATE claw_notification_subscriptions
                 SET consecutive_failures = 0, failing_since = NULL,
                     -- A 2xx proves the receiver works. If another replica's failure
@@ -438,7 +479,22 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
                 AND (consecutive_failures <> 0 OR failing_since IS NOT NULL OR auto_disabled)`,
             [row.subscription_id],
           );
+          // The receiver is back: what waits behind the probe goes now, in this process's next round.
+          if ((recovered.rowCount ?? 0) > 0 && await releaseWaiting(row.subscription_id) > 0) rerun = true;
           delivered += 1;
+          return;
+        }
+        if (code === 410) {
+          // Gone: the receiver says this event has nowhere to go and never will (a person it cannot reach), so it is
+          // dropped now rather than retried for a day. It says nothing against the receiver itself -- which answered,
+          // and on purpose -- so it is not a failure of the subscription: counted as one, a receiver that cannot reach
+          // one of a user's conversations would have that user's whole subscription disabled within a day.
+          await db.query(
+            `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'http_410' WHERE id = $1`,
+            [row.id],
+          );
+          logger.warn({ eventId: row.event_id, subscriptionId: row.subscription_id }, "notification.dropped_gone");
+          failed += 1;
           return;
         }
         status = `http_${code}`;
@@ -451,6 +507,7 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
   };
   // One receiver's slowness must not hold up the others: each subscription's rows
   // are sent in order, and the subscriptions run side by side.
+  await sweepOrphans();
   const bySub = new Map<string, Claimed[]>();
   for (const row of await claimDue()) {
     const list = bySub.get(row.subscription_id) ?? [];
@@ -467,11 +524,100 @@ export function newSubscriptionId(): string {
   return randomUUID();
 }
 
+/**
+ * Which of a subscription's `sources` an outbox row `o` was queued under, read from its payload: an item's approval
+ * (`assistant_item`), a run or approval of a session a trigger started (`trigger`), any other run or approval (`long_run`: the only
+ * other way one is queued), and none for the assistant's events, which every subscription that takes their type gets. A run both
+ * started by a trigger and long reads as `trigger`: a subscription carried over only by `long_run` misses it rather than gets one
+ * it did not ask for.
+ */
+const PAYLOAD_SOURCE_SQL = `CASE WHEN o.payload->>'source' = 'assistant_item' THEN 'assistant_item'
+            WHEN o.payload->>'type' NOT IN ('run.completed', 'run.failed', 'approval.requested') THEN NULL
+            WHEN o.payload->>'trigger_id' IS NOT NULL THEN 'trigger' ELSE 'long_run' END`;
+
+/**
+ * Hand a new (or re-enabled) subscription what its owner's deleted subscriptions had not delivered yet.
+ *
+ * Deleting a subscription leaves its pending rows in place, with no subscription (`ON DELETE SET NULL`, schema.ts), because the
+ * usual reason for a delete is a receiver that makes its subscription again: a chat bot that lost the secret of its old one, or a
+ * person who unlinked and linked again. Before, the delete took the rows with it, and every notice queued for that person -- most
+ * of them during the receiver's own restart -- was gone for good. Here each such row from the last `GIVE_UP_AFTER_HOURS` whose type
+ * (and, for a work item's approval, source) the subscription takes is moved to it and made due (a row that may be in flight keeps
+ * its lease), one row per event, so a receiver
+ * that dedups by event id sees it once. Concurrent calls cannot both take a row: the update re-reads `subscription_id` under its row
+ * lock. Returns how many rows were carried over.
+ */
+export async function adoptOrphanedRows(subscriptionId: string, q: Querier = direct): Promise<number> {
+  const r = await q(
+    `WITH sub AS (
+       SELECT subscription_id, owner_user_id, event_types, sources FROM claw_notification_subscriptions
+        WHERE subscription_id = $1 AND enabled
+     ), picked AS (
+       SELECT DISTINCT ON (o.event_id) o.id
+         FROM claw_notification_outbox o, sub
+        WHERE o.subscription_id IS NULL AND o.delivered_at IS NULL AND o.dropped_at IS NULL
+          AND o.created_at > NOW() - make_interval(hours => $2)
+          AND o.payload->>'user_id' = sub.owner_user_id
+          AND o.payload->>'type' = ANY(sub.event_types)
+          AND ((${PAYLOAD_SOURCE_SQL}) IS NULL OR (${PAYLOAD_SOURCE_SQL}) = ANY(sub.sources))
+          AND NOT EXISTS (SELECT 1 FROM claw_notification_outbox d WHERE d.event_id = o.event_id AND d.subscription_id = sub.subscription_id)
+        ORDER BY o.event_id, o.id
+     )
+     UPDATE claw_notification_outbox o
+        -- A row that failed before is due now, its failure forgotten, unless it is due within the claim lease anyway: that may be a
+        -- row a replica claimed and is sending right now (deleted under it), which must not be sent a second time. One never tried
+        -- keeps its time and status (a held say).
+        SET subscription_id = $1,
+            next_attempt_at = CASE WHEN o.attempts > 0 AND o.next_attempt_at > NOW() + make_interval(secs => $3) THEN NOW()
+                                   ELSE o.next_attempt_at END,
+            last_status = CASE WHEN o.attempts > 0 THEN NULL ELSE o.last_status END
+       FROM picked
+      WHERE o.id = picked.id AND o.subscription_id IS NULL`,
+    [subscriptionId, GIVE_UP_AFTER_HOURS, CLAIM_LEASE_SECONDS],
+  );
+  const n = r.rowCount ?? 0;
+  if (n > 0) logger.info({ subscriptionId, rows: n }, "notification.orphans_adopted");
+  return n;
+}
+
+const ORPHAN_SWEEP_MS = 10 * 60_000;
+let lastOrphanSweep = 0;
+
+/**
+ * Rows of a deleted subscription that no new one took within `GIVE_UP_AFTER_HOURS` are dropped, as a row that could not be delivered
+ * in that time is. At most every `ORPHAN_SWEEP_MS` per process. Never throws.
+ */
+async function sweepOrphans(): Promise<void> {
+  if (Date.now() - lastOrphanSweep < ORPHAN_SWEEP_MS) return;
+  lastOrphanSweep = Date.now();
+  await db.query(
+    `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'subscription_gone'
+      WHERE subscription_id IS NULL AND delivered_at IS NULL AND dropped_at IS NULL
+        AND created_at < NOW() - make_interval(hours => $1)`,
+    [GIVE_UP_AFTER_HOURS],
+  ).catch((err) => logger.error({ err }, "notification.orphan_sweep_failed"));
+}
+
+/** Test seam: the next `deliverDue` sweeps orphans whenever the last sweep was. */
+export function __sweepOrphansNextForTest(): void {
+  lastOrphanSweep = 0;
+}
+
 const POLL_MS = 5000;
 let timer: NodeJS.Timeout | null = null;
 let running: Promise<void> | null = null;
 let rerun = false;
 let latestDeps: DeliveryDeps = {};
+let stopping = false;
+let onRequest = true;
+
+/**
+ * Whether a request's kick delivers from this process. Off with CLAW_API_BACKGROUND=off (`index.ts`): a process that
+ * runs no delivery worker claims no row either, and the replicas that run one send it within POLL_MS.
+ */
+export function deliverNotificationsOnRequest(on: boolean): void {
+  onRequest = on;
+}
 
 /**
  * Deliver what is due now instead of at the next tick. The poll waits up to
@@ -483,6 +629,10 @@ let latestDeps: DeliveryDeps = {};
  * Never rejects.
  */
 export function kickDelivery(deps: DeliveryDeps = {}): Promise<void> {
+  // A process that is shutting down claims nothing more: a row it claimed is leased to it for CLAIM_LEASE_SECONDS, and its pools
+  // end before it could send it, so the row waited out the lease (2026-11-07 07:14Z: a review handoff kicked in the last
+  // milliseconds of a pod reached the person two minutes late). Another replica's poll delivers it within POLL_MS.
+  if (stopping || !onRequest) return Promise.resolve();
   latestDeps = deps;
   if (running) {
     rerun = true;
@@ -511,4 +661,19 @@ export function startNotificationWorker(): void {
 export function stopNotificationWorker(): void {
   if (timer) clearInterval(timer);
   timer = null;
+}
+
+/**
+ * The shutdown's step, before the pools end (`index.ts`): no new claim from here on, and the round in flight finishes, so every
+ * row this process claimed is sent or handed back (`recordFailure`) while it can still write, instead of held for the lease.
+ */
+export async function stopNotificationDelivery(): Promise<void> {
+  stopping = true;
+  stopNotificationWorker();
+  if (running) await running;
+}
+
+/** Test seam: a process that is not shutting down. */
+export function __resumeNotificationDeliveryForTest(): void {
+  stopping = false;
 }

@@ -33,17 +33,86 @@ export const EXIT_FILE = "exit.json";
 export const generationTag = (workloadId: string, restarts: number): string => `${workloadId}:${restarts}`;
 
 /**
+ * Exit status of {@link expandStateDirCommand} when the template needs
+ * `$USER_DATA_PATH` and the sandbox has none, nor any it can be derived from.
+ * Deterministic: both come from the workload's volumes and identity, so asking
+ * the same sandbox again answers the same.
+ */
+export const STATE_DIR_NO_USER_DATA = 4;
+/** Exit status of a command whose derived user data directory could not be created. */
+export const USER_DATA_DIR_NOT_CREATED = 5;
+
+/**
+ * Where the start command's env map carries a `USER_ID` of the application's env while
+ * the derivation runs: the derivation must read the sandbox's own (SaFE's), and the
+ * application must still get its own. See {@link startCommand}.
+ */
+export const USER_ID_CARRIER = "CLAW_APP_USER_ID";
+
+/** The users directory below a volume's mount path, as SaFE names it (`UserDirsPath`). */
+export const USER_DIRS = "users";
+
+/** A mount path usable as a user data root: absolute, plain characters, no `..`. */
+export function usableUserDataRoot(path: string): boolean {
+  return /^\/[A-Za-z0-9._/-]*$/.test(path) && !path.split("/").includes("..");
+}
+
+/**
+ * Shell that gives the command a `USER_DATA_PATH` when SaFE set none.
+ *
+ * SaFE sets `USER_DATA_PATH` only from a workspace volume with `enableUserDir`,
+ * as `{mountPath}/users/{userId}` (job-manager `generateUserDir`), where the user
+ * id is the workload's, which SaFE also sets as `USER_ID`. A workspace whose
+ * hostpath volume has no `enableUserDir` gets neither the variable nor the
+ * directory. Then the same path is derived here, from the first of `roots` (the
+ * mount paths of the workspace's hostpath volumes, in the workspace's order) that
+ * is mounted in this sandbox, and the directory is created when missing.
+ *
+ * A value SaFE set is never replaced. Nothing is derived without a `USER_ID`
+ * that names a directory (SaFE refuses the same ones), or without a mounted
+ * root; the variable then stays unset and whoever needs it refuses. A directory
+ * that cannot be created exits {@link USER_DATA_DIR_NOT_CREATED}. Empty when there
+ * is no usable root: the command is then exactly what it was.
+ */
+export function userDataPathPrelude(roots: readonly string[]): string {
+  const usable = roots.filter(usableUserDataRoot);
+  if (usable.length === 0) return "";
+  return 'if [ -z "$USER_DATA_PATH" ]; then '
+    + 'case "$USER_ID" in ""|.|..|*/*) ;; '
+    + `*) for r in ${usable.map(shq).join(" ")}; do if [ -d "$r" ]; then USER_DATA_PATH="$r/${USER_DIRS}/$USER_ID"; break; fi; done ;; esac; `
+    + `if [ -n "$USER_DATA_PATH" ]; then mkdir -p "$USER_DATA_PATH" || exit ${USER_DATA_DIR_NOT_CREATED}; export USER_DATA_PATH; fi; `
+    + "fi; ";
+}
+
+/**
+ * Whether the application uses `USER_DATA_PATH` at all: its `state_dir`, its
+ * command or its bootstrap file names the variable. Only such an application has
+ * one derived for it (and fails without one); any other runs exactly as it did
+ * before Claw derived the variable, with no prelude in front of its commands.
+ */
+export function needsUserDataPath(manifest: Pick<AppManifestV1, "state_dir" | "command" | "bootstrap">): boolean {
+  const names = (text: string): boolean => text.includes("USER_DATA_PATH");
+  if (names(manifest.state_dir)) return true;
+  if (manifest.command.some(names)) return true;
+  const boot = manifest.bootstrap?.content_b64;
+  return boot !== undefined && names(Buffer.from(boot, "base64").toString("utf8"));
+}
+
+/**
  * A command that prints the state directory: the manifest's template with
  * `${run_id}` filled in here and `${USER_DATA_PATH}` left to the sandbox, which
- * is the only place that knows it. Refuses (exit 4) when the variable is needed
- * and empty, because the result would otherwise be a path at the filesystem root.
+ * is the only place that knows it (derived from `roots` when SaFE set none, see
+ * {@link userDataPathPrelude}). Refuses ({@link STATE_DIR_NO_USER_DATA}) when the
+ * variable is needed and still empty, because the result would otherwise be a
+ * path at the filesystem root.
  */
-export function expandStateDirCommand(template: string, runId: string): string {
+export function expandStateDirCommand(template: string, runId: string, roots: readonly string[] = []): string {
   const withRun = template.split("${run_id}").join(runId);
   const parts = withRun.split("${USER_DATA_PATH}");
   const word = parts.map(shq).join('"$USER_DATA_PATH"');
-  const guard = parts.length > 1 ? '[ -n "$USER_DATA_PATH" ] || exit 4; ' : "";
-  return `${guard}printf %s ${word}`;
+  const needed = parts.length > 1;
+  const guard = needed ? `[ -n "$USER_DATA_PATH" ] || exit ${STATE_DIR_NO_USER_DATA}; ` : "";
+  return `${needed ? userDataPathPrelude(roots) : ""}${guard}printf %s ${word}`;
 }
 
 /** A state directory is an absolute path on one line, or the expansion went wrong. */
@@ -51,10 +120,37 @@ export function isUsableStateDir(dir: string): boolean {
   return dir.startsWith("/") && dir.length > 1 && !/[\0\n\r]/.test(dir) && !dir.split("/").includes("..");
 }
 
-/** Write base64 `$CLAW_FILE_B64` to `path` atomically. The content rides in the env map. */
-export function writeFileCommand(path: string, mode: string): string {
+/**
+ * The modes of a file the runner writes: `inUserDir` when it lies inside
+ * `$USER_DATA_PATH`, `elsewhere` otherwise.
+ *
+ * The user directory belongs to one user and holds nothing of anyone else's,
+ * but that user's Pods do not all run as one account: an application restarted
+ * in a new sandbox can run as another account of the same group, and must still
+ * read what the runner wrote for it. So inside it a file is readable by the
+ * group, and only by the group; anywhere else it stays the writer's own.
+ */
+export interface FileModes { inUserDir: string; elsewhere: string }
+
+/** `input.json`. It holds the run's input, which carries no credential: those ride in the env map. */
+export const INPUT_FILE_MODES: FileModes = { inUserDir: "640", elsewhere: "600" };
+/** The manifest's bootstrap file, which the application runs. */
+export const BOOTSTRAP_FILE_MODES: FileModes = { inUserDir: "750", elsewhere: "700" };
+
+/**
+ * Write base64 `$CLAW_FILE_B64` to `path` atomically. The content rides in the env map.
+ *
+ * The mode is chosen in the sandbox, which is the only place that knows
+ * `$USER_DATA_PATH`; an unset or root `$USER_DATA_PATH` means `elsewhere`. A
+ * temporary file left by an interrupted write is removed first: written by
+ * another account, it could not be truncated. `roots`: see {@link userDataPathPrelude}.
+ */
+export function writeFileCommand(path: string, modes: FileModes, roots: readonly string[] = []): string {
   const p = shq(path);
-  return `mkdir -p "$(dirname ${p})" && printf %s "$CLAW_FILE_B64" | base64 -d > ${p}.tmp && chmod ${mode} ${p}.tmp && mv ${p}.tmp ${p}`;
+  return `${userDataPathPrelude(roots)}mkdir -p "$(dirname ${p})" && rm -f ${p}.tmp && printf %s "$CLAW_FILE_B64" | base64 -d > ${p}.tmp && `
+    + `u="\${USER_DATA_PATH%/}" && m=${modes.elsewhere} && `
+    + `if [ -n "$u" ]; then case ${p} in "$u"/*) m=${modes.inUserDir} ;; esac; fi && `
+    + `chmod "$m" ${p}.tmp && mv -f ${p}.tmp ${p}`;
 }
 
 export type ProbeVerdict = "alive" | "dead" | "none";
@@ -132,12 +228,20 @@ const BREAK_LOCK = ".start.lock.break";
  * The marker is written before the launch so a launch that is never recorded
  * still names its generation.
  */
-export function startCommand(manifest: AppManifestV1, stateDir: string, tag: string): string {
+export function startCommand(manifest: AppManifestV1, stateDir: string, tag: string, roots: readonly string[] = []): string {
   const d = shq(stateDir);
   const workload = tag.slice(0, tag.lastIndexOf(":"));
   const argv = manifest.command.map(shq).join(" ");
   const events = manifest.events ? `mkdir -p ${shq(`${stateDir}/${manifest.events.dir}`)} && ` : "";
+  // The application gets the same USER_DATA_PATH the state directory was expanded with,
+  // derived from the sandbox's own USER_ID; a USER_ID of the application's env, carried
+  // under another name past the derivation (see USER_ID_CARRIER), is its own again after.
+  const prelude = userDataPathPrelude(roots);
   return [
+    ...(prelude ? [
+      prelude.replace(/; $/, ""),
+      `if [ -n "\${${USER_ID_CARRIER}+x}" ]; then USER_ID="$${USER_ID_CARRIER}"; export USER_ID; unset ${USER_ID_CARRIER}; fi`,
+    ] : []),
     `mkdir -p ${d} && ${events}cd ${d} || exit 1`,
     // The lock is a symlink whose target is "<pid>|<sandbox>": creating it is one
     // atomic step that also writes the holder, so a contender never sees a lock with

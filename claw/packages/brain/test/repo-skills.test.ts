@@ -22,6 +22,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { startWorld, skillZip, baseRequest } from "./support/platform-defaults-world.js";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 const world = await startWorld({ skills: [{ tool_id: 21 }] });
 process.env.PROGRESSIVE_SKILLS_ENABLED = "true";
@@ -52,7 +53,7 @@ const discover = (repo: string) => {
 };
 
 test("K1 discovery: both layouts, first name wins, frontmatter description, links and odd names skipped", () => {
-  const world = fs.mkdtempSync(path.join(os.tmpdir(), "repo-skills-"));
+  const world = tmpDir("repo-skills-");
   const repo = path.join(world, "repo");
   write(repo, {
     ".claude/skills/fmt/SKILL.md": md("fmt", "Format the code the way CI checks it"),
@@ -80,7 +81,7 @@ test("K1 discovery: both layouts, first name wins, frontmatter description, link
 });
 
 test("K2 staging: regular files of the skill only, bounded, and nothing from outside the repository", async () => {
-  const world = fs.mkdtempSync(path.join(os.tmpdir(), "repo-skills-stage-"));
+  const world = tmpDir("repo-skills-stage-");
   const repo = path.join(world, "repo");
   write(repo, {
     ".claude/skills/fmt/SKILL.md": md("fmt", "d", "FMT-BODY"),

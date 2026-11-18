@@ -19,6 +19,34 @@ phone / chat client --> Claw (remote agents) <-- connector on your machine --> a
 Claw's side is documented in [claw/docs/remote-agents.md](https://github.com/AMD-AGI/PrimusClaw/blob/main/claw/docs/remote-agents.md); the wire
 contract is `claw/packages/protocol/src/remote-agents.ts`, compiled into this package.
 
+## Fastest: pair from the chat (one command)
+
+In the personal agent (or another chat client built on Claw), say **连接我的开发环境** ("connect my dev environment"). It answers one line
+with a one-time code in it, for example:
+
+```sh
+npm install -g --no-update-notifier @primusclaw/connector@latest && claw-connector pair ABCD-EFGH-JKMN --server https://claw.example.com/claw-api
+```
+
+Run it in a terminal on the machine, in the folder the agents may work in. That is the whole setup: it installs the connector,
+pairs this machine with you (running the command is the approval; the code works once, for 10 minutes), writes `agents.toml`
+for the agents it finds (`claude`, `codex`, `cursor-agent` on your `PATH`), each asking before it writes a file or runs a
+command and working in that folder (one that is installed but not signed in, such as `codex` before `codex login`, is written
+commented out, and the command prints what to run before you turn it on), and starts the connector as a service (see [Keep it running](#quick-start-about-5-minutes)).
+Before it starts the connector it asks once whether to add the Claude Code hooks to your Claude `settings.json` (Enter is yes):
+the session hooks, and the approval hooks that also put a question Claude Code asks in a terminal on your chat (see
+[Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)). Run where nobody can answer (a script,
+a pipe), it adds nothing and prints the command that would; `--no-hooks` skips the question, `--no-approval-hooks` leaves the
+approval hooks out. On a machine where Claude Code is installed but has never run (`claude` is on your `PATH`, and its
+config directory, `~/.claude` or `$CLAUDE_CONFIG_DIR`, does not exist yet), it asks the same question, and Enter creates that
+directory with the hooks in it; Claude Code adds its own files there on its first run. Where Claude Code is not installed
+(no `claude` on your `PATH`), nothing is asked or created: it says so and prints `claw-connector hooks install --approvals`,
+to run once you have installed it (`--hooks` adds them anyway). The chat tells you when the machine is connected. To disconnect it, `/agent off <machine>` in the chat or `claw-connector logout`
+here; either ends this machine's sign-in for good. An `agents.toml` that is already there is kept as it is.
+
+The pairing is a connector grant: it reaches the connector routes of Claw for this one machine and nothing else, and it ends
+when the machine is disconnected. Pair again (a new code) to connect it again.
+
 ## Quick start (about 5 minutes)
 
 You need Node.js 22 or newer, a coding agent that already works on this machine (Claude Code, Codex or the Cursor CLI), and the
@@ -41,7 +69,12 @@ If npm answers `EACCES`, point its global prefix at a directory you own (`npm co
 ```sh
 claw-connector init      # writes agents.toml and prints where: ~/.config/claw-connector/agents.toml unless XDG_CONFIG_HOME or CLAW_CONNECTOR_HOME is set
 claw-connector status    # after you edit it: prints a "problem:" line if the file is wrong
+claw-connector doctor    # checks the machine (step 5), then starts each agent's adapter, opens a session (no prompt) and checks the modes it offers
 ```
+
+At a terminal, `init` also asks once whether to add the Claude Code hooks (Enter is yes; see `init` under [Commands](#commands)).
+`init` runs the adapter check of `doctor` at the end. `doctor` says `ok` for an agent whose phone sessions will open, and otherwise a
+`problem:` line with the fix, for example an agent whose sessions would be refused with `mode_unavailable`.
 
 By default every agent asks before it writes a file or runs a command, and your phone answers each question. To let phone sessions run
 like your terminal instead, run `claw-connector init --approval never` (or set `approval = "never"` on an agent later); see
@@ -71,23 +104,56 @@ CLAW_CONNECTOR_KEY='replace-with-your-claw-api-key' claw-connector login --serve
 
 The key is stored as it is in `credentials.json` (mode 0600) and is for trying things out; the device sign-in is the normal way.
 
-**4. Run**
+**4. Keep it running**
 
 ```sh
-claw-connector run
+claw-connector service install
+claw-connector service status
 ```
 
-It prints `connecting claude to https://claw.example.com/claw-api as "<machine name>"` and stays in the foreground: keep it in a
-terminal tab, `tmux` or `screen`. Ctrl-C stops it and every agent it started. From another terminal, `claw-connector status` shows
-whether it is running and signed in.
+This starts the connector now and keeps it up: at login and after a reboot, and again 5 seconds after it dies for any reason, except
+one that only you can fix (the connector was revoked, or Claw refused the sign-in), which leaves it stopped until you run `login` again.
+A revocation stops it at once. A refused sign-in stops it only after Claw has refused it four times in a row over two minutes
+while answering everything else: a 401 that comes while Claw or its sign-in service is failing (no answer, 5xx), or within ten
+minutes of such a failure, is not counted, and the connector keeps retrying until the outage ends.
+Only `claw-connector stop` (or stopping the service) stops it for good: a `kill` of the connector's process from anywhere else ends it
+with exit 75, and it is started again.
+It uses `systemd --user` on Linux and launchd on macOS. On Linux, run `loginctl enable-linger $USER` once (`service install` says so
+when it is needed) so it also runs while you are logged out. In a container without systemd, `service install` starts a small
+supervisor, writes `keepalive.sh` and adds it to your crontab when a cron daemon runs; when none does it says so, and the container's
+startup command must run that script (it does nothing when the supervisor is up) for a restarted container to come back. Keys the
+agents read from your shell (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`...) are kept for the service in a 0600 file, never in the unit.
+See [Keeping it running](#keeping-it-running).
 
-**5. See it in Clawy**
+To try it in the foreground instead, `claw-connector run` prints `connecting claude to https://claw.example.com/claw-api as
+"<machine name>"` and stays up until Ctrl-C, which stops it and every agent it started.
 
-In Clawy (or any chat client built on Claw), send `/agents`. The agents of this machine are listed, online while `run` is up.
+**5. Check the machine**
+
+```sh
+claw-connector doctor
+```
+
+`doctor` checks what makes a first phone session fail far from the machine that caused it, and prints one fix per problem:
+Node.js 22 or newer; each agent's program on `PATH` (and on the `PATH` the installed service starts it with, which is not your
+shell's); whether Claude Code and Codex are signed in (`claude auth status`, `codex login status`, or the model provider's key
+variable in `~/.codex/config.toml`); the `roots` writable; `HTTPS_PROXY` and `https_proxy` not set to different values; a service
+installed (and, for `keepalive.sh`, something calling it); and Claw answering, including whether Node.js trusts its certificate
+(the connector trusts this machine's CA store as well as Node's own list and `NODE_EXTRA_CA_CERTS`, on Node.js 22.19+ / 24.5+, and passes
+`NODE_USE_SYSTEM_CA=1` to the programs it starts; `NODE_USE_SYSTEM_CA=0` turns that off; on an older Node.js doctor names the fix). Then it
+runs the adapter check of step 2. It exits 1 when something will stop sessions (`--json`: `ok` is the adapters' verdict,
+`machine_ok` and `environment` the machine's). The
+running connector repeats the machine checks with its own environment (in a child process, so a stalled disk cannot stall
+it) every 15 minutes, and at once when `doctor` runs (it signals the connector), and the chat client's `/agents` card shows what it found under the machine ("Codex is not signed in: run `codex login` on that machine").
+
+**6. See it in the chat**
+
+In the personal agent (or any chat client built on Claw), send `/agents`. The agents of this machine are listed, online while `run` is up.
 A session started there runs on this machine, inside one of your `roots`, and each permission request comes back as a card in the chat.
 
 To disconnect: `claw-connector pause` (stay offline until `resume`), `claw-connector stop`, or `claw-connector logout` (also
-asks the identity service to revoke the device sign-in; a saved key is deleted from this machine, not revoked at Claw).
+revokes this machine's connector at Claw, so it can be sent nothing more, and asks the identity service to revoke the device
+sign-in; a saved key is deleted from this machine, not revoked at Claw).
 
 ## agents.toml
 
@@ -108,7 +174,9 @@ id = "codex"
 preset = "codex"
 roots = ["~/work/repo-a", "~/work/repo-b"]
 [agents.env]                       # passed to the adapter; the model settings live here, never in Claw
-OPENAI_API_KEY = "..."             # or leave your own environment / CODEX_HOME to supply it
+OPENAI_API_KEY = "..."             # or leave your own environment / CODEX_HOME to supply it; with only a key, the
+                                   # connector signs Codex in with it (Codex keeps it in its auth.json, like
+                                   # "codex login --with-api-key")
 
 [[agents]]
 id = "mine"
@@ -128,10 +196,25 @@ Presets and the adapter versions they pin (override `command` and `args` to move
 | `codex` | `npx @agentclientprotocol/codex-acp@2.3.0` | `read-only` | `read-only` | `agent-full-access` |
 | `cursor` | `agent acp` (the Cursor CLI) | `ask` | `ask`, `plan` | `agent`, started as `agent --force acp` |
 
+The pinned adapters (the `npx -y <package>@<version>` presets above) are installed once into the connector's state
+directory (`adapters/<package>@<version>`), by `init`, by `service install` and in the background when `run` starts, and are
+then started from there with the connector's own Node.js: a session does not wait for npx to look the package up in a
+registry (about 70 seconds when the registry cannot be reached) or download it (Claude's adapter takes about 350 MB on
+disk with its dependencies), and a repository's own `.npmrc` cannot pick the registry. The install uses `npm install` with your npm
+settings (`~/.npmrc`, `npm_config_*`, `NPM_TOKEN`, an `npm_config_registry` in the agent's `env`), and never with the agents'
+sign-in variables: anything named like a credential that is not npm's own (`ANTHROPIC_API_KEY`, a gateway token...) is left
+out of npm's environment, so no install script of the adapter or its dependencies sees it. A session that opens while its
+adapter is still being installed waits for it; if the install failed, the agent's npx command runs as before, in the
+connector's state directory, and the install is tried again in the background ten minutes later. An agent with its own
+`command` or `args` is started exactly as written.
+
 `claude-attach` does not start new conversations: it takes over Claude Code conversations that already exist on this
 machine (see [Taking over an existing conversation](#taking-over-an-existing-conversation)).
 
-An agent with no `roots` is never offered. A configuration problem is reported at start-up, not skipped.
+An agent with no `roots` is never offered. A configuration problem is reported at start-up, not skipped. A root that does
+not exist, or whose disk does not answer (a network mount that is down or not mounted yet), is not a configuration problem:
+`run` warns about it and keeps going, and that root's sessions are refused (`cwd_not_found`, `root_unavailable`) until it is
+back. Reading `agents.toml` never touches a root.
 
 ## Running without per-step approval
 
@@ -157,22 +240,19 @@ unattended while Cursor keeps asking. For that agent the connector then:
   `mode_update` carry `unattended`, so a client can always show whether a session asks. `status` and the line `run` prints
   at start-up name the agents without per-step approval.
 
-**Before the first phone session, check which way your Claude settings go.** When `permissions.defaultMode` is
-`bypassPermissions` in your user `settings.json` (`$CLAUDE_CONFIG_DIR`, else `~/.claude`) or in Claude's managed settings,
-every session of a `claude` agent without `approval = "never"` is closed with `mode_not_enforced` (a `claude-attach`
-agent accepts the warning while it takes a conversation over, so it is not affected).
-`claw-connector status` and the start-up line of `run` say so for each such agent:
-
-```
-warning:    claude: sessions will be refused (mode_not_enforced): Claude defaults to bypassPermissions here (permissions.defaultMode in /home/me/.claude/settings.json); set approval = "never" on this agent or change defaultMode
-```
-
-Choose one: `approval = "never"` on that agent (knowing the risk below), or another `defaultMode` in that file. The check
-reads the two files from which the Claude adapter takes `bypassPermissions` (it ignores that value in a repository's
-`.claude/settings.json` and `.claude/settings.local.json`), and only the exact spelling counts, as for the adapter; root
-without `IS_SANDBOX` cannot use bypass, and `permissions.disableBypassPermissionsMode = "disable"` turns it off. It applies
-to every agent that runs `claude-agent-acp` except `claude-attach`. Codex and Cursor have no equivalent: their own
+**Your own Claude settings may default to `bypassPermissions`** (`permissions.defaultMode` in your user `settings.json`,
+`$CLAUDE_CONFIG_DIR` or `~/.claude`, or in Claude's managed settings). For a `claude` agent that asks (no
+`approval = "never"`), the connector tells the adapter to leave that mode out (`allowDangerouslySkipPermissions: false`),
+so its sessions start in `default` and ask; before 0.1.5 each of them was closed with `mode_not_enforced`. An agent with
+`approval = "never"` runs in `bypassPermissions` either way. A `claude-attach` agent takes over a conversation in the mode
+its terminal chose and accepts the adapter's warning while it starts. Codex and Cursor have no equivalent: their own
 settings are replaced by the mode the connector sets and reads back.
+
+**Root.** Claude Code offers `bypassPermissions` to root only when `IS_SANDBOX` is set. For an agent that runs
+`claude-agent-acp` with `approval = "never"` (or `allow_unsafe_modes = true`), the connector sets `IS_SANDBOX=1` in that
+agent's adapter environment when it runs as root, and `run` prints a `note:` line saying so; nothing else gets it. Without
+that, every phone session of such an agent was refused with `mode_unavailable`. To keep it off, set `IS_SANDBOX` yourself
+in the agent's `[agents.env]` (an empty value is kept as it is; `status` then warns that sessions will be refused).
 
 **The risk, in one sentence:** an agent without per-step approval acts on whatever it is told, including text it read in
 a file or a web page, with everything your account can do inside its roots (and `--force` or full access reach outside the
@@ -201,7 +281,28 @@ All of these run on your machine and fail closed.
 
 - **Directories.** A session's working directory is resolved (symlinks included) and must be inside one of the agent's
   `roots`; otherwise no process is started and the session is closed with `cwd_outside_roots`. The agent runs in the
-  resolved path.
+  resolved path. A folder can be given the way people type it: `~` and `~/x` are the agent's home directory (its
+  `[agents.env]` `HOME`, else the connector's), and a relative name (`repo`, `repo/sub`) is looked up under each root and
+  taken when exactly one has it (`cwd_ambiguous` when several do); a root's own last segment names that root. A relative
+  name never climbs out (`..`). Every look at the disk on the way to opening a session is asynchronous with a 10-second
+  limit, so a root on a stalled network mount refuses its own sessions (`root_unavailable`), never those under a healthy
+  root, and never freezes the connector or its heartbeat. A restored session whose root does not answer is kept: its
+  commands are rejected `root_unavailable` until it does, and `close` still closes it.
+- **Opened, never used, then a restart.** Claude keeps a conversation only from its first message, so a session opened
+  from the phone and restarted before anyone wrote in it has nothing to resume ("Resource not found"). Such a session (never
+  prompted, not a takeover) gets a fresh conversation in the same folder (audited `session_recreated`) instead of being
+  closed; a session that was used keeps the error.
+- **Signed in before ready.** A new session of an agent that reports its sign-in (Claude Code does) and reports none is
+  refused at once with `agent_auth_required`, instead of opening and failing at its first message; a session that
+  already exists is kept and its prompts say why. A prompt refused for the same reason later
+  (an expired login) ends its turn with `error: "agent_auth_required"` and the fix, and the next prompt starts the agent
+  afresh, so a sign-in done on the machine meanwhile is picked up. An adapter that needs a sign-in and offers an
+  `api-key` method (Codex) is told to `authenticate` with it when its environment has `OPENAI_API_KEY` or `CODEX_API_KEY`;
+  the key itself is never sent, the adapter reads its own environment.
+- **Why, in one sentence.** Every refusal (`session_closed`, `command_rejected`, and a `turn_end` that failed for a known
+  reason) carries its stable `reason` code and a `hint`: one English sentence of what to do about it (sign in with which
+  command, which folder to pick, `claw-connector doctor`), with no path and nothing secret, for a client to show beside
+  its own translation of the code.
 - **Ask mode, read back.** After the adapter creates a session, the connector sets the agent's ask mode and reads the
   mode back from the adapter. Your own agent settings may start an adapter in a mode that never asks (bypass, full
   access); an adapter that does not confirm the ask mode, or that warns it will not invoke its permission callback, is
@@ -221,6 +322,9 @@ All of these run on your machine and fail closed.
   which cannot write. `approval = "never"` selects `agent` and starts `agent --force acp` (`--force` is a root flag of the
   Cursor CLI, "force allow commands unless explicitly denied"; it is accepted before or after `acp`). Cursor
   has no `session/resume`; the connector uses `session/load` and marks the replayed history `replay: true`.
+  A Cursor agent that asks therefore answers and plans but changes no file: its capabilities say `edits: false` with an
+  `edits_hint`, `read_only_modes` lists `ask` and `plan` (each such mode in `session_started` carries `read_only: true`),
+  `run` prints a note, and the sample `agents.toml` says so above the Cursor block.
 - **Permissions.** Each permission request becomes a card with the options **the adapter offered**, passed through with
   their own ids and kinds (`allow_once`, `allow_always`, `reject_once`). An answer must be one of those ids; any other is refused
   and the request stays open. An unanswered request is answered `cancelled` after 10 minutes, and a cancel,
@@ -250,12 +354,35 @@ reference, title, directory, last activity, and whether anything holds it open),
 chat client can offer a choice; `session.new` then names the chosen one (`resume_ref`). Claw and the chat client know no
 product: the agent's `kind` is the label `attach`.
 
+**You do not have to add this agent.** Every agent made from the `claude` preset brings one with the same roots, adapter,
+approval and environment, named `<id>-sessions`, so the conversations already on the machine show up on the phone by
+themselves. `existing_sessions = false` on the `claude` agent turns that off; an explicit `claude-attach` agent reading the same
+Claude config directory replaces it. `terminal_input` and `tmux_cli` (below) set on the `claude` agent are that derived agent's:
+`terminal_input = false` there keeps the watch and turns only the typing off.
+
+```toml
+[[agents]]
+id = "claude"
+preset = "claude"
+roots = ["~/work"]
+# terminal_input = false        # conversations open in a tmux pane are watched only, never typed into (default: true)
+# tmux_cli = "tmux"             # the tmux command used to type (default: tmux, from PATH)
+```
+
+Each entry also says, for a conversation a terminal holds open, what Claude Code says that terminal is doing (`activity`:
+`working`, `waiting` for the person at it, or `idle`; with `waiting`, `waiting_for` in its words, such as "input needed"). The
+connector looks at Claude Code's session registry and projects directory every 10 seconds (file names and times only; nothing
+is started) and reports a change at once instead of at the next heartbeat, so a conversation a terminal has just opened, or one
+that starts waiting, reaches the phone within seconds.
+
 ```toml
 [[agents]]
 id = "claude-attach"
 preset = "claude-attach"
 roots = ["~/work"]
 # attach_cli = "claude"        # the command asked which sessions are open (default: claude, from PATH)
+# terminal_input = true         # a message to a conversation open in a tmux pane is typed into that terminal (default: true)
+# tmux_cli = "tmux"             # the tmux command used for that (default: tmux, from PATH)
 # [agents.env]
 # CLAUDE_CONFIG_DIR = "/home/me/.claude"   # where the conversations live, if not the default
 ```
@@ -275,7 +402,13 @@ before it starts the agent again after a pause and before every prompt. A prompt
 (the session stays, and the prompt can be sent again once the terminal is closed), and the connector's agent for the
 conversation is discarded: what the terminal wrote is not in its memory, so the next prompt starts a fresh one that reads
 the transcript. The same happens when the transcript is no longer the size the connector left it, which is how a terminal
-that came and went between two prompts is noticed.
+that came and went between two prompts is noticed. What the agent itself writes between two prompts does not count: a
+background task it started finishes and Claude Code answers it with a turn of its own. Those entries name the same program
+(`entrypoint`) as the agent's own turns, and their only prompt is the one Claude Code writes for itself
+(`origin.kind: "task-notification"`) about a task whose id the agent's own turn recorded, so the agent is kept and the
+prompt goes through. An entry from any other program
+(a terminal's say `cli`), any other prompt (one a person typed, or a `claude -p`), or anything that cannot be read still
+discards the agent, and the prompt is refused `recently_written` while that write is fresh.
 
 While the connector's own agent is working on the conversation (starting, or running a turn) the size cannot say whether
 someone else wrote, because the agent's own writes grow it too. So during that time the registry is read every second and
@@ -284,8 +417,8 @@ is noticed even if it has exited by the next prompt: that prompt goes to a fresh
 while the agent is starting refuses the takeover (`session_live`) and stops the agent. A terminal that opens and closes the
 conversation between two reads, which is shorter than anything that can take a turn, is not seen.
 
-The first thing asked is the terminal itself. `claw-connector init` (or `claw-connector hooks install`) adds two Claude Code
-hooks, `SessionStart` and `SessionEnd`, to the user-level `settings.json` of the Claude config directory. Each runs a tiny
+The first thing asked is the terminal itself. `claw-connector hooks install` (or `claw-connector init` and `claw-connector pair`,
+when you say yes at their question or pass `--hooks`) adds two Claude Code hooks, `SessionStart` and `SessionEnd`, to the user-level `settings.json` of the Claude config directory. Each runs a tiny
 program that keeps one row per terminal session, `<config dir>/claw-connector-terminals/<pid>.json`: the session id and the
 process that holds it, with that process's start time. Claude Code runs the same hooks for sessions started by an ACP adapter
 (this connector's own included) and by `claude -p`; they are told apart by `CLAUDE_CODE_ENTRYPOINT` in the hook's environment
@@ -307,9 +440,121 @@ and of the registry Claude Code keeps in `$CLAUDE_CONFIG_DIR/sessions/`, whose r
 name. The command does not report a row from another host or container that shares the directory (it asks whether the pid is
 alive here), and such a row cannot be checked: it counts as open whatever the command says. If the command is missing or
 fails, the registry alone is the answer; if neither can be read, the answer is "cannot tell" and the takeover is refused.
+A running Claude Code process of this machine whose own row (`sessions/<pid>.json`) is not valid JSON (an empty file a lost
+write left, measured on a dev pod with a terminal open for days) has a conversation open that neither answer names: every
+conversation in that process's folder (every one, when its folder cannot be read) is then reported `unknown`, not `idle`, and
+a takeover of one is refused (`twin_check_failed`, naming the process and the file); `doctor` warns
+(`claude_registry_row_unreadable`). Claude Code never writes such a row again (a status change reads the row first and gives up on
+one that does not parse; measured on 2.1.321), so the connector proves the conversation that process has open another way where it
+can (Linux): the process keeps its conversation's task folder (`<tmp>/claude-<uid>/<project>/<session>/tasks`) open once that
+conversation ran a background task. When exactly one such folder is open, it is this user's (the uid in its name, its owner and the
+process's owner), of the process's own folder, written since the process started, its name (`/rename`, `--name`) shown by the
+process's own tmux pane in the rule above its input box, and no other conversation of that folder written since then known to share
+that name (a `/clear` or `/resume` leaves the old folder open), that conversation is reported `live` (and typed into, as below) and
+the rest of the folder is not held by it. Any doubt (an unnamed conversation, a file or folder that cannot be read) leaves the folder
+`unknown` as above.
 A transcript written within the last 10 seconds is refused too (a terminal that has only just exited may still be writing). The reasons Claw is told are
 `session_live`, `recently_written` and `twin_check_failed`; the agent that this connector itself started for the conversation
 is not mistaken for a twin.
+
+A conversation that a terminal has open when the phone asks for it is not refused but watched, read-only. Nothing is
+started: the connector reads the transcript the terminal writes, from its end (opened read-only; nothing is ever written to it),
+and sends each new line as the update an adapter would have sent (the user's words, the agent's words, the steps it starts
+and how they end; thinking and sub-agents are left out), scrubbed for credentials like every event and marked `read_only`.
+The transcript is read every 250 ms, and each event carries the time Claude Code wrote on its line (`ts`), not the time it was
+read; a step's `tool_call` names its tool in `_meta.claudeCode.toolName`, as the Claude Code ACP adapter does.
+The last twenty updates already there are sent first, marked `replay`. `session_started` says `read_only: true` and
+`read_only_reason: "session_live"`. A prompt, a mode change or a decision sent to it is refused with
+`read_only_live_session` and reaches nothing that could write to the transcript; the server refuses them too
+(`session_read_only`). The heartbeat still reports the conversation as `live`, and an attach agent's capabilities say `watch_live: true`, so a
+client offers the watch only where the connector can do it. When the terminal no longer has it open the
+watch ends (`session_closed`, reason `terminal_closed`), and taking it over is then a new session, through every check
+above. A watched session stays read-only across a restart of the connector.
+
+When the terminal that has the conversation open is a **tmux pane**, the phone can talk to it without taking it over: what
+is sent is typed into that terminal, as the person at it would type it, and the replies are read from the transcript as for a
+watch. Nothing else writes to the conversation, so its history never forks, and the terminal and the phone show the same
+conversation. `session_started` then says `live_terminal: true` and `input: "terminal"` instead of `read_only`, and a prompt is
+accepted and typed at once, whatever Claude Code is doing there: one submitted while a turn runs is queued by Claude Code
+itself and taken in at that turn's next step or once it ends, as one typed by the person at the terminal is (no registry status, no
+transcript reading and no footer decides when it may be typed). When the busy terminal draws the paste late, and once Claude Code
+has queued it (its `queue-operation` enqueue in the transcript), the phone is told, each at most once (`terminal_input_queued`,
+`reason` `terminal_working`; `held: "terminal"` once it is in Claude Code's queue, where only the terminal can take it back, with ↑). It waits (one notice, `terminal_input_queued`, with `reason`
+`terminal_typing`, `terminal_dialog`, `terminal_screen` or `terminal_scrolled`) only while it could not be typed safely: the input
+box holds someone's half-typed text, a question or a menu is on the screen (an Enter there would answer it: on a permission
+question it would approve a tool call), or the pane is scrolled back. A `terminal_dialog` notice also says what the question asks
+(`dialog`: its title and command, such as `Bash command: rm -rf "$(echo …/build)"`, every path cut to its last part and
+credentials masked), and a question is waited out for as long as it is up, even while it hides what proves that the process holds the
+conversation (a process whose registry row cannot be read is proven by the conversation's name above its input box); the notice and
+`session_started` say `registry_row_unreadable: true` for such a process (restarting it with `claude --resume` writes a new row). It is pasted as one bracketed paste (`load-buffer` and
+`paste-buffer -p -d`), one line or several: nothing in it is read as a key name, and a question that shows at that moment does not
+take it as its choice (a typed `1` would approve a permission question), and it is
+submitted with Enter once the box shows it (a busy Claude Code may draw a paste late: it is waited for up to 20 seconds, the phone
+told after 3 that the message waits; one never shown is refused, `terminal_input_unseen`, and nothing is submitted), and only on a screen that, read twice 250 ms apart, shows the box holding exactly that
+text and no question or menu, with End and Enter sent together (one write): in the box they submit it; on a question that came
+up in the moment after that read, End picks its last option ("No") and Enter chooses that, so a phone's message never approves
+anything (if a question took them, the Enter is tried again once it is gone). A question that shows after the text went in holds the Enter: no key at all is sent while it shows,
+the phone is told (`terminal_dialog`), and once it is answered at the terminal the Enter goes if the box holds the text again, or
+the text is typed again if the question emptied the box. A box that then holds anything else (the person at the terminal typed into
+it) is left as it is and the message is refused (`terminal_input_failed`): a phone's message never answers a permission question. Before that every control character is removed from it (C0, DEL, C1, the Unicode line separators; tabs
+become spaces), so nothing in a message can act as a key or end the paste. Its turn ends (`turn_end`, naming the prompt) when the
+transcript records the end of the turn that took it in (a queued message: the turn whose `queued_command` it is, or its own turn
+after the `dequeue`), when the turn is stopped there (`cancelled`), or once Claude Code has said it is idle for 5 seconds; a message
+that neither appears in the transcript nor is queued there (`queue-operation` enqueue) within 20 seconds ends as
+`terminal_input_unconfirmed`. Its prompt is told by its words once both are read alike (Claude Code's `<pasted_content>` blocks
+unwrapped, line breaks and every run of white space as one, one Unicode form); when none matches in those 20 seconds but the
+terminal recorded a prompt after the message's Enter (and did not queue the message), that prompt is taken as the message's and its
+turn ends as any other, with `input_unconfirmed: true` on its `turn_end`. One Claude Code queued whose queue went back into the box (`popAll`, to be edited there) as
+`terminal_input_withdrawn`. A
+`cancel` presses Esc in the terminal only for a turn the phone's message started itself (submitted straight at a prompt, not
+through Claude Code's queue), which stops it there; Claude Code puts a prompt whose turn Esc stopped before any answer back into its box, and the connector
+takes it out again before the next message goes in; a message whose Enters did not submit it is taken out when it is refused. Either
+only while the box holds exactly that text and no question shows; anything else in the box is waited for. While the message is still being put in, waiting on a question, or
+held in Claude Code's queue or taken into a turn the person started, no key is sent: the phone stops following it (the question
+stays the person's to answer; a message Claude Code already queued is still Claude Code's to run, and text already in the box stays
+there). A mode change is refused (`terminal_session`): the terminal keeps
+its own mode.
+
+**The terminal's own permission mode applies to what is typed.** The terminal's owner chose that mode, and a message from the phone
+is typed in any of them (`default`/manual, `plan`, `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`), whatever the agent's
+`approval`: in `auto`, `acceptEdits`, `dontAsk` and `bypassPermissions` it runs its tools without asking, as a message typed at the
+terminal would. The mode is read from the line Claude Code draws below its input box (`⏸ manual mode on`, `⏵⏵ bypass permissions on`...)
+when the session starts, and `session_started` names it (`terminal_mode`, null when that line names none) so the chat can say so;
+the audit log records it with each message typed. The terminal is never switched to another mode for it. A conversation with a name
+(`/rename`) has it in the rule above the box; that rule is still the box's edge. A Claude Code that says it is idle while its screen
+is not its input box (another program, a layout the connector does not know) is read again for 30 seconds, then the message is
+refused (`terminal_screen_unknown`); while it waits the phone is
+told why (`terminal_input_queued`). Connectors 0.1.8 to 0.1.13 refused a mode the agent's approval did not allow
+(`terminal_mode_not_allowed`, `terminal_mode_unknown`); this one no longer sends those. A message that starts with `!`
+(Claude Code runs the rest as a shell command, with no question) or `/` (a slash command such as `/permissions` or `/add-dir`) is
+never typed, in any mode (`terminal_command_refused`). The audit log records each message typed (`terminal_input`: the pid, the pane, its length, line count and a digest,
+never its words). The heartbeat marks such a conversation `input: "terminal"` and the agent's capabilities say `terminal_input: true`.
+
+Only the terminal of this connector's own user is typed into, and only one that is proven: exactly one local process holds the
+conversation open, Claude Code's own `claude agents --json` (or its registry row with the same process start) names it, its working
+directory is inside the agent's roots, it runs as this user, the `TMUX` socket it was started with is a socket owned by this user,
+and that tmux server reports a pane whose process is that process or one of its parents. Before every message this is asked
+again: the same process (same start time) still runs in that pane, and Claude Code's registry row for it still names this
+conversation (a `/resume` or `/clear` in that terminal moves it to another one: the message is refused, `terminal_switched`). Anything less (a plain terminal, `screen`,
+another user's tmux, two terminals on one conversation, a holder on another machine, not Linux) is watched read-only as above, and
+`session_started` says why (`read_only_why`). The owner turns it off with `terminal_input = false` on the agent (on a `claude`
+agent, for the `<id>-sessions` agent derived from it). Claude Code's
+own messaging between sessions was not used for this: a message sent that way arrives as a message from another session, not as
+the person's own input. A second `claude --resume` process was not either: two writers fork the conversation.
+
+Taking it over while the terminal still has it is the person's choice, made on the phone after being told what it does:
+`session.new` with `takeover: true` (Claw passes it on only with a `resume_ref`). The connector then asks every process on
+this machine that holds the conversation open to end (`SIGTERM`: Claude Code writes the end of its transcript, removes its
+registry row and exits, about a second, measured on 2.1.319; a turn running in that terminal stops), waits until none is left
+and the transcript has been quiet for 10 seconds, and resumes the conversation through every check above;
+`session_started` then says `took_over: true` and the audit log records `terminal_ended` with the pids. It fails closed,
+and resumes nothing, when the holder is a process this machine cannot see (another host or container sharing the config
+directory: `session_live_elsewhere`), belongs to another user (`takeover_not_permitted`), cannot be proven to be the local
+process that holds it, inside this agent's roots (`takeover_failed`: Claude Code's own `claude agents --json` lists it, or
+its registry row names this machine and the same process start time, and its working directory is inside the roots), or
+is still there after 15 seconds (`terminal_did_not_exit`; it is never killed harder). Without `takeover` the conversation is only watched, as above.
+A takeover is acted on only while the confirmation is fresh: Claw sends `takeover_until` (the live-command TTL, 5 minutes, from when it was confirmed) and drops an uncollected one after that; one that reaches the connector later, or names no deadline, is refused (`takeover_expired`) and ends nothing. An attach agent reports `takeover: true` in its capabilities so that a client knows it can offer this. Afterwards the
+terminal continues the same conversation with `claude --resume <id>` once the phone session is closed.
 
 The ask mode still applies: a conversation keeps the mode it was left in, often one that never asks (`bypassPermissions`),
 and the adapter says so while it sets the session up. That warning describes the mode that is about to be replaced, so it is
@@ -317,18 +562,149 @@ set aside until the ask mode (`default`) is locked and read back from the adapte
 that is not confirmed, closes the session. The phone can select only the safe modes, as for every agent. Closing the
 session stops the agent process; it never deletes the conversation.
 
+## Questions asked in a terminal, answered from the chat
+
+A Claude Code session you started yourself, in your own terminal, still stops and waits for you when it wants to run a command,
+edit a file, leave plan mode or put a multiple-choice question to you. With the approval hooks installed, that question is also
+put to you in the chat as a card with the same choices, so you can answer it away from the screen. `claw-connector init` and
+`claw-connector pair` offer them together with the session hooks (one question at the terminal, Enter is yes; `--no-approval-hooks`
+leaves them out); on a machine set up before, or to add them by hand:
+
+```sh
+claw-connector hooks install --approvals      # "hooks uninstall --approvals" takes them out again
+```
+
+A setup that already has the session hooks gets only the approval hooks offered when `init` or `pair` runs again at a terminal;
+run without one (a script, a pipe), they add nothing to `settings.json` and print this command instead. With Claude Code
+installed but never run, `hooks install` (like `init` and `pair`) creates its config directory with the hooks in it; with
+Claude Code not installed and no `--config-dir`, it refuses and says so, since there is nothing to hook into yet.
+
+The card names the tool that asked and the machine, as in "Claude Code in a terminal on dev-pod (fix CI, work/claw) is waiting
+for you" (or Codex, or Cursor, for their hooks below).
+
+This adds a `PermissionRequest` hook, plus `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop` (all run in the
+background) and `SessionEnd`, to the Claude config directory's user-level `settings.json`, merged the same way as the session
+hooks above (marked `--managed-by claw-connector`, nothing else in the file is touched). They run `approval-hook.js` from this
+installation, which talks to the running connector over a socket in its state directory (`approvals.sock`, 0600, in a
+directory only you can enter).
+
+- **The terminal keeps asking.** Claude Code shows its own dialog while the hook waits (measured on 2.1.322). The first answer,
+  in the terminal or in the chat, decides; the other is withdrawn (the card says it was answered in the terminal). A
+  connector that is not running, not connected, paused, or a question no card can carry (a multi-select question, more than
+  four answers) leaves the question to the terminal at once.
+- **What a card offers.** A command, an edit or another tool: *Yes*, *No*, *No, and stop*, and, when Claude Code suggests an
+  allow rule for it, *Always allow this session: <rule>* (never written to a settings file; a rule too long to name is not offered).
+  A plan: *Approve (ask before each edit)*, which also sets the session back to the mode that asks, or *Keep planning*. A
+  question (`AskUserQuestion`): its own answers, one card per question. No card switches a session into a mode that stops
+  asking (auto, accept edits, bypass).
+- **Nothing is approved unseen.** A card carries the request whole (credentials masked). One too long for that (over 12 KB
+  as JSON) is shown cut and offers only the options that turn it down; it is approved at the terminal.
+- **Which conversations.** Only sessions with a person at the terminal. The folder must be inside the roots of the agent that
+  reads that Claude config directory (a `claude-attach` agent, or the one derived from a `claude` agent).
+- **Automation sends nothing.** The hook leaves a session with nobody to answer alone, at once, and Claude Code behaves as
+  without it (measured on 2.1.322, from what the hook is handed):
+  - `claude -p` / `--print`, and `claude` with its stdin piped in: Claude Code sets `CLAUDE_CODE_ENTRYPOINT=sdk-cli` and
+    `CLAUDE_CODE_SESSION_ATTENDED=0` for those itself, whatever the shell exported, so a script that runs them is never carded;
+  - a session this connector runs (its adapter is `sdk-cli` too): it already asks through its own cards;
+  - a session in `bypassPermissions` (`--dangerously-skip-permissions`) or `dontAsk` mode: bypass mode still raises Claude
+    Code's multiple-choice questions, but those stay in the terminal;
+  - anything started with `CLAW_APPROVAL_HOOKS=off` in its environment (also `0`, `false`, `no`). Use it for what the hook
+    cannot tell from a person: a script that drives an interactive `claude` in tmux, or a terminal you do not want on your
+    phone (`CLAW_APPROVAL_HOOKS=off claude`, or export it in that shell).
+- **A machine set up before.** Where the session hooks are installed and the approval hooks are not, the next
+  `claw-connector` command you run at a terminal (`status`, `doctor`, `service install`, ...) asks once whether to add them
+  (`[y/N]`; yes runs `hooks install --approvals` for you). The answer is kept in the state directory
+  (`approval-hooks-offer.json`) and never asked again for that Claude config directory; a no prints the command. Nothing is
+  asked where nobody can answer (a script, a pipe, the service), after `--json`, or with `CLAW_APPROVAL_HOOKS=off`.
+- **On Claw's side** each conversation's questions go on a session of its own (`origin: "terminal_hook"`) that carries
+  nothing but these cards: it cannot be sent a prompt. Turning the cards off there (`/approvals off`) makes the connector
+  leave every question to the terminal.
+- A card nobody answers is withdrawn after an hour; the terminal still has the question. The audit log records each request,
+  answer and withdrawal (`approval_requested`, `permission_resolved`, `approval_withdrawn`), never what was typed.
+
+### The same for Codex
+
+A Codex CLI session started in a terminal (`codex`, measured on 0.153.4) asks before it runs a command, applies a patch or calls an
+MCP tool. With its approval hook installed, that question can go to the chat too:
+
+```sh
+claw-connector hooks install --agent codex     # into $CODEX_HOME/hooks.json; "hooks uninstall --agent codex" takes it out (--codex is the same)
+```
+
+Codex runs a hook only once you have trusted it: the next time it starts it says "Hooks need review"; choose *Trust all* (or
+review it under `/hooks`). Installing it again after the connector moved asks again.
+
+Codex works differently from Claude Code here: it asks the hook *before* it shows its own prompt, and shows the prompt only once
+the hook is done. So:
+
+- **The chat gets the question only when nobody is at the terminal**: when nothing was typed in that terminal for 30 seconds
+  (the terminal's last-input time, as `w` reads it). Otherwise the hook steps aside at once and Codex asks in the terminal as usual.
+- **While the card waits, the terminal says so** ("Asked on your phone (Claw); type anything here to answer in this terminal").
+  Typing anything there gives the question back to the terminal within a second or two, and the card is withdrawn. Esc stops the
+  turn, as always, and withdraws the card.
+- **What a card offers**: *Yes* or *No*. Codex takes nothing else from a hook, so "don't ask again" and "No, and tell Codex what
+  to do differently" stay in the terminal. A request too long to show whole (over 12 KB) can only be turned down from the chat.
+- **Which sessions**: only the interactive `codex` TUI (its transcript says `originator: codex-tui`); `codex exec` and the
+  sessions this connector runs through codex-acp are left alone. The folder must be inside the roots of a `codex` agent whose
+  `CODEX_HOME` is the one the hook was installed in. Codex's own multiple-choice questions (`request_user_input`, plan mode)
+  reach no hook and stay in the terminal.
+- **Left alone, as for Claude Code**: a session started with `CLAW_APPROVAL_HOOKS=off` (`CLAW_APPROVAL_HOOKS=off codex`), a session this connector runs
+  (`CLAW_CONNECTOR_AGENT` in its environment), and a question asked in bypass mode (`permission_mode: bypassPermissions`, which Codex
+  reports under approval policy `never` or `--dangerously-bypass-approvals-and-sandbox`). Claude Code's `claude -p` signals have no
+  Codex counterpart; `codex exec` is left out by the TUI rule above.
+- Everything else is as above: a session of its own at Claw (`origin: "terminal_hook"`, agent `codex`), `/approvals off`, the
+  one-hour limit, and the audit log.
+
+### Cursor
+
+```sh
+claw-connector hooks install --approvals --agent cursor [--hold 60]   # "hooks uninstall --agent cursor" takes them out
+```
+
+This adds `beforeShellExecution` and `beforeMCPExecution` hooks, plus `afterShellExecution`, `afterMCPExecution`,
+`postToolUseFailure`, `beforeSubmitPrompt`, `stop` and `sessionEnd`, to the user-level `hooks.json` of the Cursor configuration
+directory (`$CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else `~/.cursor`; `--config-dir` names another), merged the same way
+(marked `--managed-by claw-connector`). Their questions are filed under a `cursor` agent of `agents.toml` whose Cursor directory that is,
+and only for folders inside its roots.
+
+Cursor's hooks can do less than Claude Code's (measured on the Cursor Agent CLI 2026.11.11): a hook runs *before* Cursor decides
+whether to ask, Cursor shows its own question only after the hook has returned, and a hook can turn a call down or let Cursor ask, but
+never approve one. So for Cursor the phone goes first and the terminal second:
+
+- A shell command or MCP call that Cursor would ask about (not on the allow lists of `cli-config.json` or the project's
+  `.cursor/cli.json`, not run in the sandbox, Run Everything off) is put on your phone, and Cursor waits up to `--hold` seconds
+  (default 60, 5 to 3600) while it is there. The terminal shows "Working" meanwhile.
+- **No** on the phone blocks it (the agent is told you declined it from your phone). **Ask me at the terminal**, or no answer
+  within the hold, lets Cursor go on as it would have: it asks at the terminal, where you approve it. There is no **Yes** on the
+  phone, because Cursor would still ask at the terminal.
+- Ctrl-C at the terminal, a new prompt or the end of the conversation withdraws the card at once.
+- A call Cursor would not ask about is neither put on the phone nor held. That is judged from those files: a command line this
+  cannot split for sure (`$(...)`, backticks) counts as asked about, and Cursor's own extra checks (a recursive delete outside the
+  sandbox, an administrator's list) are not seen, so such a call is asked about at the terminal only.
+- `agent --force` (`--yolo`) turns Run Everything on for one run without writing it to `cli-config.json`, and a hook cannot see
+  it: such a run still holds every command that is not on an allow list for the phone first (then runs it, as `--force` says).
+- A Cursor session keeps the hooks it started with: install, uninstall or a new `--hold` takes effect in the next one.
+- The card's event says `terminal_asks: "after_card"`, so Claw and the chat say that the terminal asks only after the card: decline
+  it there, or hand it back and approve it at the terminal (not "the first answer counts", as for Claude Code).
+- `CLAW_APPROVAL_HOOKS=off` in the environment of `agent` leaves its questions in the terminal, as for Claude Code.
+- Only sessions of the Cursor Agent CLI started by hand. A session this connector runs asks through its own cards; the Cursor
+  editor (IDE) is not covered: it keeps its allow list in its own settings, which a hook cannot read.
+
 ## Commands
 
 | Command | |
 |---|---|
-| `init [--approval ask\|never \| AGENT=ask\|never] [--no-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). Also installs the Claude Code session hooks (`--no-hooks` skips that). |
-| `hooks install\|uninstall\|status` | The `SessionStart`/`SessionEnd` hooks alone; `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). |
+| `init [--approval ask\|never \| AGENT=ask\|never] [--hooks \| --no-hooks] [--no-approval-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). At a terminal it then asks once (`[Y/n]`, Enter is yes) before adding the Claude Code hooks to Claude's `settings.json`: the session hooks and the approval hooks (only those not there yet are offered); `--hooks` adds them without asking, `--no-hooks` skips them, `--no-approval-hooks` leaves the approval hooks out, and with nobody to answer (a script, a pipe) nothing is added and the `hooks install --approvals` command is printed instead. |
+| `pair CODE --server URL [--name HOST] [--no-start] [--hooks \| --no-hooks] [--no-approval-hooks]` | Connect this machine with the one-time code from the chat (see [Fastest](#fastest-pair-from-the-chat-one-command)); offers the Claude Code hooks as `init` does, then starts the service. |
+| `hooks install\|uninstall\|status [--approvals] [--agent claude\|codex\|cursor] [--hold SECONDS]` | The `SessionStart`/`SessionEnd` hooks alone (with `--approvals`, also the approval hooks: see [Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)); `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). `--agent codex` (or `--codex`): the Codex approval hook instead (see [The same for Codex](#the-same-for-codex)), in `DIR/hooks.json` (default: the `CODEX_HOME` of the `codex` agents, else `$CODEX_HOME` or `~/.codex`). `--agent cursor`: Cursor's approval hooks instead (see [Cursor](#cursor)), in the Cursor directory of each `cursor` agent; `--hold` is how long Cursor waits for the phone. |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
-| `run` | Connect and serve. Exit code 3 means the connector was revoked. |
-| `status [--json]` | Running or not, paused, signed in, agents, adapter processes, and a `warning:` line for each agent whose sessions will be refused because Claude's own settings default to `bypassPermissions` (see [Running without per-step approval](#running-without-per-step-approval)). |
+| `run [--supervised]` | Connect and serve. Exit code 78 means starting it again will not help: the connector was revoked, Claw or the identity service refused the sign-in (at start, or for two minutes in a row while running), or there is no usable `agents.toml` or sign-in; the reason is kept in `needs-login.json`, and until `login` removes it `run` exits 78 at once without contacting Claw. `--supervised` marks a run the service started. Any other non-zero exit is worth a restart. A unit written by hand for 0.1.2 and older (`RestartPreventExitStatus=3`): replace it with `claw-connector service install`, which writes the same file. |
+| `service install\|uninstall\|status [--supervisor systemd\|launchd\|script] [--env NAME ...]` | Keep `run` up (see [Keeping it running](#keeping-it-running)). `install` stops a `run` started by hand so the service takes over, and starts an installed service again (a script supervisor too) so an edited `agents.toml` or environment takes effect; `status` also lists the last five disconnects and why. |
+| `status [--json]` | Running or not, paused, signed in, agents, adapter processes, the last disconnect and its reason (`last down:`), a `problem:` line when a new sign-in is needed, and a `warning:` line for each agent whose sessions will be refused because Claude's own settings default to `bypassPermissions` (see [Running without per-step approval](#running-without-per-step-approval)). |
+| `doctor [--agent ID] [--json]` | Check this machine and print one fix per problem (see step 5 of the quick start), then each agent's adapter (step 2); exit 1 when something stops sessions. The report is kept in `doctor.json`; a running connector is signalled to check again and sends what it finds to Claw (each agent's `capabilities.health`). |
 | `pause` / `resume` | Stop every agent within a second and stay offline, or undo that. |
 | `stop` | Stop the running connector and every agent it started. |
-| `logout` | Stop, ask the identity service to revoke the sign-in, delete it from this machine. The stored connector id stays, so the next sign-in reuses the same connector. |
+| `logout` | Stop, revoke this machine's connector at Claw (with a key, `DELETE /v1/remote-agents/connectors/:cid`; with a device sign-in, the connector-side `POST .../connectors/:cid/revoke`), ask the identity service to revoke the sign-in, and delete it from this machine. The next sign-in registers a new connector. When Claw cannot be reached or refuses (a Claw from before the connector-side route refuses a device sign-in), the sign-in is still deleted, but `logout` says the connector was not revoked, prints the `curl` that revokes it with a Claw API key of yours, keeps its id (so a later sign-in reuses it), and exits 1. |
 
 **Kill switch.** Every adapter is started in its own process group and recorded (pid and start time) in
 `children.json`. `stop`, `pause`, a revocation and Ctrl-C signal exactly those groups: a process that is not recorded, or
@@ -338,19 +714,87 @@ the connector sees it within a heartbeat, stops every agent and exits without re
 
 ## Files
 
-`~/.config/claw-connector/` (or `$XDG_CONFIG_HOME/claw-connector/`): `agents.toml`, `credentials.json` (0600; a file other users can read is
-refused). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME/claw-connector/`): `connector.json` (the connector's identity and the
-commands handled), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
+`~/.config/claw-connector/` (or `$XDG_CONFIG_HOME/claw-connector/`, or `$CLAW_CONNECTOR_CONFIG_DIR`): `agents.toml`, `credentials.json`
+(0600; a file other users can read is refused), and `service-env.json` (0600, the agents' sign-in variables `service install` kept). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME/claw-connector/`): `connector.json` (the connector's identity and the
+commands handled), `connector-id.json` (the identity alone, written once and flushed to the disk: a `connector.json` damaged
+by a crash falls back to it instead of registering the machine as a new connector), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
 decisions, every command received, every permission request and answer, every automatic approval, mode changes),
-`logs/`, `children.json`, `connector.pid`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
+`logs/`, `children.json`, `connector.pid`, `disconnects.jsonl`, `needs-login.json` (only after a run that needs a new sign-in), `doctor.json`
+(the last `doctor` report), `approval-hooks-offer.json` (the answer to the one-time offer of the approval hooks), and with the script supervisor `supervisor.pid`, `keepalive.sh`, `keepalive-last` (when it last ran) and `run.log`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
+
+## Keeping it running
+
+`service install` picks the supervisor (override with `--supervisor`):
+
+- **systemd** (Linux, when systemd is the machine's init): `~/.config/systemd/user/claw-connector.service` with `Restart=on-failure`,
+  `RestartSec=5`, `RestartPreventExitStatus=78` and no start limit. Logs: `journalctl --user -u claw-connector`.
+- **launchd** (macOS): `~/Library/LaunchAgents/com.primusclaw.connector.plist` (mode 0600) with `KeepAlive` on any unclean exit. launchd cannot
+  exempt one exit code, so a run it started exits 0 instead of 78.
+  Log: `run.log` in the state directory.
+- **script** (a container without systemd; an `systemctl` that answers "Running in chroot" counts as none): `claw-connector supervise`
+  runs in the background and restarts the connector 5 seconds after it dies; `keepalive.sh` in the state directory starts that
+  supervisor unless it is alive (recorded pid and start time) or a sign-in is needed. Where a cron daemon runs, `install` adds an
+  `@reboot` and a 5-minute line that call `keepalive.sh` to your crontab (once; `uninstall` removes them). Where none runs (most
+  containers), `install` says so: nothing brings the connector back after a restart until the container's startup command (or
+  `~/.bashrc`) runs `sh keepalive.sh`. Log: `run.log`.
+
+**A container whose home directory does not outlive it** (a dev pod): when `agents.toml` and the sign-in sit on the container's own
+file system (overlay, tmpfs), `init` and `service install` say so. Keep them on storage that survives the container with
+`CLAW_CONNECTOR_CONFIG_DIR=/mnt/<your persistent volume>/claw-connector` (only the configuration and sign-in move; pid files, the outbox
+and logs stay on the local disk), set in your shell profile and in the container's startup command, which then runs
+`claw-connector service ensure` (after installing the package again, if it lived on the container's file system too).
+
+A successful `login` starts an installed service again, so after a revocation or a refused key signing in is the whole fix.
+`keepalive.sh` and the script supervisor start nothing while only a person can help (no `agents.toml`, not signed in,
+`needs-login.json`); under launchd every exit 78 is turned into a clean exit, which launchd does not restart. The service
+installed for a state directory is recorded in its `service.json`.
+
+The unit carries `PATH` (so the agents are found), `CLAW_CONNECTOR_HOME`, `CLAW_CONNECTOR_CONFIG_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, the CA and proxy variables (with `NODE_USE_SYSTEM_CA` and `NODE_USE_ENV_PROXY`), `LANG`, `IS_SANDBOX`, the npm registry and proxy settings, and every
+plain setting of the agents (`ANTHROPIC_*`, `CLAUDE_CODE_*`, `OPENAI_*`, `CODEX_*`, `CURSOR_*` that is not named like a credential:
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `CLAUDE_CODE_USE_BEDROCK`...) from the shell that ran `install` (a proxy URL with a password in
+it only when named with `--env`, e.g. `--env HTTPS_PROXY`); `--env NAME` adds another.
+
+The agents' own sign-in variables are never written into a unit. When the shell that runs `install` has `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CURSOR_API_KEY`, the
+AWS keys, a variable Codex's `config.toml` names as a provider's `env_key`, or an `--env` name that looks like a credential (`KEY`,
+`TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`), they are kept in `service-env.json` beside `credentials.json` (mode 0600) and every `run`
+gives them to the agents that do not set them in `[agents.env]` (a configuration directory its group or others may write is first made 0700; one owned by another account is refused). `install` prints their names, never their values; `service status`
+lists them; `uninstall` deletes the file. Without this a connector that works in a terminal loses its agents' sign-in as a service,
+and each session fails at its first message. `CLAW_CONNECTOR_KEY` is never copied. Run `install` again after changing any of them, or
+after moving Node. With a service installed, `claw-connector stop` stops the connector until the next login,
+boot or keep-alive check; to stay offline use `pause`, or `service uninstall`.
+
+**Why it went down.** Every disconnect is appended to `disconnects.jsonl` in the state directory: `server_closed` (a Claw release or
+restart, `superseded` by another run, `token_expired`; reconnected at once), `stream_lost` (the network, with the error), `stopped`,
+`revoked`, `auth_failed`, `failed`, `process_died` (the previous run never shut down: killed, crashed or the machine restarted;
+dated by its last heartbeat), and `connector_limit_reached` (Claw already holds the most connectors one person may have: remove a
+machine you no longer use, in the chat with `/agents` or with `claw-connector logout` on it; the run stays up and tries again every 10
+minutes instead of being restarted every 5 seconds). `status` shows the latest, `service status` the last five.
 
 ## Restarts and crashes
 
-A prompt counts as handled only when it reaches the agent (or is dropped by a cancel, a close or a stop), so a connector that
-dies with a prompt still queued is sent that prompt again by Claw instead of losing it. A permission request waiting
-for an answer lives in the adapter, which dies with the connector: the next run closes such a card (`cancelled`, by
-`connector_restart`), so a phone is not left with a button that does nothing. Session state, unacknowledged events and
-their sequence numbers are on disk; a session resumes in a fresh adapter on its next prompt.
+A prompt counts as handled only when it reaches the agent (or is dropped by a cancel or a close), so a connector that
+dies, or is stopped or restarted by its supervisor, with a prompt still queued is sent that prompt again by Claw instead of
+losing it. A permission request waiting for an answer lives in the adapter, which dies with the connector: the next run
+closes such a card (`cancelled`, by `connector_restart`), so a phone is not left with a button that does nothing. Session
+state, unacknowledged events and their sequence numbers are on disk; a session resumes in a fresh adapter on its next prompt
+(Claude Code's `session/resume`, the conversation intact).
+
+The turn an agent is running is on disk too, from the moment its prompt reaches the agent until its `turn_end`. The next run
+(after a crash, a kill, a pod restart, `stop`, or an upgrade) finds it and:
+
+- carries it on when the agent was waiting for a person's permission for a tool call (not a plan or a question card), the agent
+  always asks (no `approval = "never"`, no `allow_unsafe_modes`) and its session was in a mode that asks, the connector is not
+  paused, and it was away no longer than a card lives (10 minutes): the agent is told the connector restarted and to go on, so
+  it asks again and a new card comes; the prompt's own `turn_end` still ends it. It only asks, so nothing runs that nobody
+  approved. Nothing is carried on before the run has signed in (a revoked connector carries on nothing);
+- otherwise ends it with `turn_end` `{"stopReason": "error", "error": "connector_restarted"}`, naming its prompt (`cmd_id`,
+  `cmd_seq`), so a phone stops waiting for it. The agent is not re-run by itself; the next message resumes the conversation.
+
+Every session used in the last 4 hours, and every one with a turn found this way, then gets one `session_recovered` event
+(`interrupted`: a turn was cut off; `continuing`: it is being carried on; `cmd_id` and `cmd_seq` of that turn), which a chat
+shows as "recovered". A stop by the kill switch (`pause`, a revocation) still ends every turn and drops the queue.
 
 Known limit: the working-directory check resolves the path and starts the adapter in the resolved path, but another process of
 the same user that can rewrite a directory in that path could swap a symlink between the check and the start. The
@@ -379,7 +823,12 @@ npm pack && npm install -g ./primusclaw-connector-*.tgz   # the package as the r
 
 ## Releasing (maintainers)
 
-A release is a GitHub Release whose tag is `connector-vX.Y.Z`, cut the way Hyperloom's are. Publishing it starts
+A release is a GitHub Release whose tag is `connector-vX.Y.Z`. Which number it moves, and what its notes must say (each incompatible
+change called out, the wire protocol with Claw included, and the oldest Claw a feature needs), follow the repository's versioning rules in
+the root [CHANGELOG.md](https://github.com/AMD-AGI/PrimusClaw/blob/main/CHANGELOG.md#versioning), shared with Claw and the personal agent:
+before 1.0.0, PATCH for fixes and small features, MINOR only for a big feature or an incompatible change (the wire protocol with Claw
+included); releases are batched into the day's release window, or go out at once when urgent or asked for, never during the nightly
+evaluation (see the root CHANGELOG's "When releases are cut"). Publishing a release starts
 [connector-release.yml](https://github.com/AMD-AGI/PrimusClaw/blob/main/.github/workflows/connector-release.yml): it builds, tests and
 checks the tarball, signs a build-provenance attestation for it, attaches it to the release and publishes it to npm with Trusted Publishing
 (an OIDC credential; no npm token is stored anywhere). Only stable `MAJOR.MINOR.PATCH` versions are released: a prerelease needs a dist-tag,

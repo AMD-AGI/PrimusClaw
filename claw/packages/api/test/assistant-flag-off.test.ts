@@ -7,7 +7,7 @@
  * tables, so any query that reaches for one fails loudly. Skipped without DATABASE_URL, and a skip is not a pass.
  *
  *   O1  a turn's request is finished without a single statement, and without a change
- *   O2  the sweep does nothing, and the router skips nothing
+ *   O2  the sweep does nothing
  *   O3  the MCP route is not registered
  *   O4  a completion does not ask for a worker turn's record, nor for a router turn's unsaid answer
  */
@@ -40,12 +40,10 @@ describe("assistant switched off", { skip }, () => {
     assert.equal(JSON.stringify(task), before);
   });
 
-  test("O2 the sweep does nothing and a router skips nothing", async () => {
+  test("O2 the sweep does nothing", async () => {
     const { sweepAssistant } = await import("../src/assistant/sweep.js");
-    const { skipsSkillSelection } = await import("../src/assistant/role-profile.js");
     await withNoDatabase(async () => {
       await sweepAssistant();
-      assert.equal(await skipsSkillSelection("any-session"), false);
     });
   });
 

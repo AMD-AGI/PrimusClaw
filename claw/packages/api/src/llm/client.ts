@@ -143,3 +143,25 @@ export async function callMemoryLLM<T = Record<string, unknown>>(
 
   throw new Error("llm-client: unreachable");
 }
+
+/**
+ * One model call whose answer is wanted as text (the GitHub review's independent finding check): the user's cached key, or the
+ * deployment's, like {@link callMemoryLLM}, with the caller's abort signal instead of a fixed timeout. Throws on any failure.
+ */
+export async function callLlmText(
+  userId: string | null, prompt: string, opts: { model: string; maxTokens: number; signal: AbortSignal; system?: string },
+): Promise<string> {
+  const { apiKey, baseUrl, source } = resolveKey(userId);
+  if (!apiKey || !baseUrl) throw new Error(`LLM key unavailable (source=${source})`);
+  const resp = await fetch(`${baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: opts.model, max_tokens: opts.maxTokens, ...(opts.system ? { system: opts.system } : {}), messages: [{ role: "user", content: prompt }],
+    }),
+    signal: opts.signal,
+  });
+  if (!resp.ok) throw new Error(`LLM ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+  const data = await resp.json() as { content?: Array<{ type?: string; text?: string }> };
+  return (data.content ?? []).filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
+}

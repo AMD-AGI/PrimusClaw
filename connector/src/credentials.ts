@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Sign-in state: a 0600 file holding either a development API key or the
- * rotating refresh token of a device grant, and the provider that turns it into
- * the bearer credential each request carries.
+ * Sign-in state: a 0600 file holding a development API key, the rotating refresh
+ * token of a device grant, or the connector grant a pairing code was traded for
+ * (`claw-connector pair`), and the provider that turns it into the bearer
+ * credential each request carries.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -21,9 +22,11 @@ export const CONNECTOR_SCOPE = "claw.connector";
 export interface Credentials {
   v: 1;
   server: string;
-  kind: "device" | "key";
+  kind: "device" | "key" | "grant";
   /** A development API key, for `login --key`. */
   key?: string;
+  /** A connector grant (`cpg_...`), for `pair`: good on this connector's routes at Claw until the connector is revoked. */
+  token?: string;
   /** Device grant: where to refresh, as whom, and the current (rotating) refresh token. */
   identity_url?: string;
   client_id?: string;
@@ -33,6 +36,32 @@ export interface Credentials {
 }
 
 export class CredentialsError extends Error {}
+
+/** What a machine paired from the chat (`claw-connector pair`) runs to come back: it never had a login to run again. */
+export const PAIR_AGAIN = 'ask the chat for a new pairing command ("连接我的开发环境") and run it here';
+export const LOGIN_AGAIN = "claw-connector login";
+
+/**
+ * The fix for a connector that only a person can bring back (revoked, its sign-in refused): a new pairing command for a
+ * machine whose sign-in came from one, `claw-connector login` for any other (or an unreadable sign-in file).
+ */
+export function reconnectFix(file: string): string {
+  let kind: Credentials["kind"] | undefined;
+  try { kind = loadCredentials(file)?.kind; } catch { /* unreadable: login writes a new one */ }
+  return kind === "grant" ? PAIR_AGAIN : LOGIN_AGAIN;
+}
+
+/** {@link reconnectFix} as the end of a status line: "run: claw-connector login", or the pairing step. */
+export function reconnectStep(file: string): string {
+  const fix = reconnectFix(file);
+  return fix === LOGIN_AGAIN ? `run: ${fix}` : fix;
+}
+
+/** {@link reconnectFix} as a sentence. */
+export function reconnectAdvice(file: string): string {
+  const fix = reconnectFix(file);
+  return fix === PAIR_AGAIN ? `Pair it again: ${fix}.` : `Sign in again (${fix}).`;
+}
 /** The identity service says the grant is gone: stop, do not retry. */
 export class GrantRevokedError extends Error {
   constructor(message = "the sign-in was revoked") { super(message); }
@@ -65,7 +94,7 @@ export function loadCredentials(file: string): Credentials | null {
   } catch (e) {
     throw new CredentialsError(`${file} is not valid JSON (${errMessage(e)})`);
   }
-  if (!isObject(raw) || raw.v !== 1 || typeof raw.server !== "string" || (raw.kind !== "device" && raw.kind !== "key")) {
+  if (!isObject(raw) || raw.v !== 1 || typeof raw.server !== "string" || (raw.kind !== "device" && raw.kind !== "key" && raw.kind !== "grant")) {
     throw new CredentialsError(`${file} is not a sign-in file written by this program; run login again`);
   }
   return raw as unknown as Credentials;
@@ -187,6 +216,10 @@ export function providerFor(creds: Credentials, save: (c: Credentials) => void, 
   if (creds.kind === "key") {
     if (!creds.key) throw new CredentialsError("the sign-in file has no key; run login again");
     return new KeyTokenProvider(creds.key);
+  }
+  if (creds.kind === "grant") {
+    if (!creds.token) throw new CredentialsError("the sign-in file has no connector grant; pair this machine again");
+    return new KeyTokenProvider(creds.token);
   }
   return new DeviceTokenProvider({ creds, save, ...extra });
 }

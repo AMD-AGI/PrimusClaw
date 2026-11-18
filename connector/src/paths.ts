@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 /** Where the connector keeps its files. */
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -14,23 +15,51 @@ export interface Dirs {
 
 /**
  * `CLAW_CONNECTOR_HOME` puts everything under one directory (tests, containers);
- * otherwise the XDG locations, with their usual defaults.
+ * otherwise the XDG locations, with their usual defaults. `CLAW_CONNECTOR_CONFIG_DIR` moves only the configuration
+ * (agents.toml, the sign-in) somewhere else: onto storage that outlives a container, while the state (pid files, the
+ * outbox, logs) stays on the local disk.
  */
 export function resolveDirs(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): Dirs {
   const one = env.CLAW_CONNECTOR_HOME?.trim();
-  if (one) return { config: path.join(one, "config"), state: path.join(one, "state") };
+  const own = env.CLAW_CONNECTOR_CONFIG_DIR?.trim();
+  if (one) return { config: own ? path.resolve(own) : path.join(one, "config"), state: path.join(one, "state") };
   const cfg = env.XDG_CONFIG_HOME?.trim() || path.join(home, ".config");
   const st = env.XDG_STATE_HOME?.trim() || path.join(home, ".local", "state");
-  return { config: path.join(cfg, "claw-connector"), state: path.join(st, "claw-connector") };
+  return { config: own ? path.resolve(own) : path.join(cfg, "claw-connector"), state: path.join(st, "claw-connector") };
 }
 
 export const configFile = (d: Dirs) => path.join(d.config, "agents.toml");
 export const credentialsFile = (d: Dirs) => path.join(d.config, "credentials.json");
+/** The agents' own sign-in variables (ANTHROPIC_API_KEY...) that `service install` kept for the service; 0600. */
+export const serviceEnvFile = (d: Dirs) => path.join(d.config, "service-env.json");
 export const identityFile = (d: Dirs) => path.join(d.state, "connector.json");
+/**
+ * The connector id alone ({server, connector_id}), written when the id is first stored and not rewritten by every
+ * heartbeat as connector.json is: what `run` falls back to when connector.json is there but cannot be read, so a damaged
+ * file does not register the machine again as another connector.
+ */
+export const identityKeepFile = (d: Dirs) => path.join(d.state, "connector-id.json");
+/** Forget this machine's connector id (both files): the next `run` registers it anew. */
+export function forgetIdentity(d: Dirs): void {
+  fs.rmSync(identityFile(d), { force: true });
+  fs.rmSync(identityKeepFile(d), { force: true });
+}
 export const sessionsFile = (d: Dirs) => path.join(d.state, "sessions.json");
 export const childrenFile = (d: Dirs) => path.join(d.state, "children.json");
 export const pidFile = (d: Dirs) => path.join(d.state, "connector.pid");
 export const pauseFile = (d: Dirs) => path.join(d.state, "paused");
+/** Written by `stop` for the run it is about to end: only that run ends with exit 0, which a supervisor does not restart. */
+export const stopRequestFile = (d: Dirs) => path.join(d.state, "stop-requested.json");
 export const auditFile = (d: Dirs) => path.join(d.state, "audit.jsonl");
 export const outboxDir = (d: Dirs) => path.join(d.state, "outbox");
 export const logDir = (d: Dirs) => path.join(d.state, "logs");
+export const disconnectsFile = (d: Dirs) => path.join(d.state, "disconnects.jsonl");
+export const needsLoginFile = (d: Dirs) => path.join(d.state, "needs-login.json");
+export const supervisorPidFile = (d: Dirs) => path.join(d.state, "supervisor.pid");
+export const runLogFile = (d: Dirs) => path.join(d.state, "run.log");
+export const keepaliveFile = (d: Dirs) => path.join(d.state, "keepalive.sh");
+export const serviceFile = (d: Dirs) => path.join(d.state, "service.json");
+/** The last `claw-connector doctor` report. */
+export const doctorFile = (d: Dirs) => path.join(d.state, "doctor.json");
+/** Touched by every `service ensure` (what keepalive.sh runs), so `doctor` can tell whether anything calls it. */
+export const keepaliveStampFile = (d: Dirs) => path.join(d.state, "keepalive-last");

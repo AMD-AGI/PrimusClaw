@@ -88,12 +88,16 @@ describe("assistant MCP service", { skip }, () => {
     const worker = await connect(bearer(await w.workerTurn(item.itemId)));
     try {
       const routerTools = (await router.listTools()).tools;
-      assert.deepEqual(routerTools.map((t) => t.name).sort(), ["say", "work_create", "work_recall", "work_send", "work_stop"]);
-      assert.deepEqual((await worker.listTools()).tools.map((t) => t.name), ["report"]);
+      assert.deepEqual(routerTools.map((t) => t.name).sort(), ["claw_self_status", "deliver_text", "say", "work_create", "work_recall", "work_send", "work_stop"]);
+      assert.deepEqual((await worker.listTools()).tools.map((t) => t.name).sort(), ["deliver_text", "report"]);
       // The names Brain gives them are what the router's allowlist pattern selects.
       for (const t of routerTools) assert.ok(`mcp__assistant__${t.name}`.startsWith("mcp__assistant__"));
       const sayTool = routerTools.find((t) => t.name === "say")!;
       assert.deepEqual((sayTool.inputSchema as any).required, ["text"]);
+      // The router is told what a repository passed to work_create costs (a clone before the work starts), on the tool itself.
+      const { WORK_CREATE_REPO_PARAM } = await import("../src/assistant/prompts.js");
+      const createTool = routerTools.find((t) => t.name === "work_create")!;
+      assert.equal((createTool.inputSchema as any).properties.repo.description, WORK_CREATE_REPO_PARAM);
       assert.equal(routerTools.some((t) => /accept/.test(t.name)), false, "no tool accepts a result for the user");
     } finally { await router.close(); await worker.close(); }
   });

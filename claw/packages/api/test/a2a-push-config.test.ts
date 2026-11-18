@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import test, { describe } from "node:test";
 
-import { validatePushConfig } from "../src/routes/a2a-push.js";
+import { guardPushUrl, validatePushConfig } from "../src/routes/a2a-push.js";
 
 describe("P1 the shape of a config", () => {
   const ok = (raw: unknown) => { const v = validatePushConfig(raw); assert.equal(v.ok, true, JSON.stringify(v)); return (v as { ok: true; value: Record<string, unknown> }).value; };
@@ -47,3 +47,36 @@ describe("P1 the shape of a config", () => {
   for (const [name, raw, pattern] of refusals) test(`refuses ${name}`, () => bad(raw, pattern));
 });
 
+
+describe("P1 the operator's list as the whole of it", () => {
+  const listed = new Set(["hooks.internal", "receiver.example.com", "::1"]);
+  const publicAddress = async () => [{ address: "203.0.113.9", family: 4 }];
+  const privateAddress = async () => [{ address: "10.2.3.4", family: 4 }];
+
+  test("off, a public host not named passes, as it always did", async () => {
+    assert.equal((await guardPushUrl("https://elsewhere.example.org/x", listed, false, publicAddress)).ok, true);
+  });
+  test("on, a public host not named is refused before it is resolved", async () => {
+    let asked = 0;
+    const r = await guardPushUrl("https://elsewhere.example.org/x", listed, true, async () => { asked += 1; return publicAddress(); });
+    assert.deepEqual(r, { ok: false, reason: "host_not_allowed" });
+    assert.equal(asked, 0);
+  });
+  test("on, a named host passes, private over http and public over https", async () => {
+    assert.equal((await guardPushUrl("http://hooks.internal:8080/hook", listed, true, privateAddress)).ok, true);
+    assert.equal((await guardPushUrl("https://Receiver.Example.com/hook", listed, true, publicAddress)).ok, true);
+    assert.equal((await guardPushUrl("http://[::1]:9/hook", listed, true)).ok, true, "a bracketed IPv6 literal is matched without its brackets");
+  });
+  test("on, a named host is still held to the rest of the guard", async () => {
+    assert.deepEqual(await guardPushUrl("https://u:p@hooks.internal/x", listed, true, privateAddress), { ok: false, reason: "credentials_in_url" });
+    assert.deepEqual(await guardPushUrl("ftp://hooks.internal/x", listed, true, privateAddress), { ok: false, reason: "https_required" });
+  });
+  test("on, a name that only differs from a listed one is refused", async () => {
+    for (const url of ["https://hooks.internal.evil.example/x", "https://evil.example/hooks.internal", "https://xhooks.internal/x"]) {
+      assert.deepEqual(await guardPushUrl(url, listed, true, publicAddress), { ok: false, reason: "host_not_allowed" }, url);
+    }
+  });
+  test("on, an unparseable url is refused", async () => {
+    assert.deepEqual(await guardPushUrl("not a url", listed, true), { ok: false, reason: "invalid_url" });
+  });
+});

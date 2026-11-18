@@ -369,6 +369,137 @@ function markUnneutralised(hands: HandsClient, s3Prefix: string, yes: boolean): 
 }
 
 /**
+ * Where a sandbox records that its /workspace was not restored in full.
+ *
+ * A restore that fails leaves /workspace holding only what the new sandbox
+ * started with (often a fresh clone), and every save mirrors /workspace into the
+ * session prefix: whatever the listing does not have is deleted. So the first save
+ * after a failed restore deleted the saved copy of every file the restore did not
+ * bring back -- a 534-file snapshot came out of one such save as 52 files, with
+ * the save reported as a success. While this note stands, a save only adds:
+ * it deletes nothing, and it does not upload over an object the prefix already
+ * has, since the sandbox's file of that name may be what it started with rather
+ * than the session's (`isRestoreHeld`).
+ *
+ * It belongs to the sandbox, not to the run: the next run reuses the sandbox and
+ * its incomplete /workspace without restoring again, and must not prune either. A
+ * rebuilt sandbox starts without it and restores from the prefix the hold kept
+ * whole. Brain keeps the same note in memory (`restoreHeld`), because the sandbox
+ * that could not be restored may not be able to take the write either.
+ *
+ * The note guards against Brain's own failure, not against the sandbox: a command
+ * in the sandbox that removes it gains nothing it did not have, since the same
+ * command can delete the files in /workspace and the next save then deletes
+ * their saved copies, as it should. What removing it does is let a Brain process
+ * that never saw the failure (one restarted since) prune by this sandbox again --
+ * the outcome of that command deleting the files themselves.
+ */
+export const RESTORE_HOLD_PATH = `${SYNC_STATE_DIR}/restore-incomplete`;
+
+/**
+ * An error's text with the addresses in it cut out, for anything a user or the
+ * sandbox is shown: a URL (a presigned one is a credential), an IPv4 or IPv6
+ * address with or without its port, and a cluster service name -- a sandbox's
+ * address is internal.
+ */
+export function withoutAddresses(text: string): string {
+  const hex = "[0-9a-fA-F]{1,4}";
+  return text
+    .replace(/https?:\/\/\S+/g, "<url>")
+    .replace(/\[[0-9a-fA-F:.]*:[0-9a-fA-F:.]*\](?::\d+)?/g, "<address>")
+    // Compressed IPv6 (`fd00::4`, `::1`), then the full form of four groups or
+    // more, so a clock time (`12:34:56`) is left alone.
+    .replace(new RegExp(`(?<![\\w:])(?:${hex}(?::${hex})*)?::(?:${hex}(?::${hex})*)?(?![\\w:])`, "g"), "<address>")
+    .replace(new RegExp(`(?<![\\w:])(?:${hex}:){3,7}${hex}(?![\\w:])`, "g"), "<address>")
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, "<address>")
+    .replace(/\b[\w.-]+\.svc(?:\.cluster\.local)?(?::\d+)?\b/g, "<address>");
+}
+
+const RESTORE_HELD_MAX_SANDBOXES = 1024;
+/** Sandboxes this process saw fail a restore (`restoreHoldKey`); bounded like `unneutralised`. */
+const restoreHeld = new Set<string>();
+
+/**
+ * What the in-memory hold is kept under: the session and the sandbox's address.
+ *
+ * The address alone (`HandsClient.generation`, the MCP url) is not an identity
+ * that is never reused: it is the pod's IP, and a later sandbox -- another
+ * session's, or this one's after a reclaim -- can come up on it. With the
+ * session in the key another session's sandbox is never held by this note; a
+ * later sandbox of the same session is always restored into first, and a
+ * restore that succeeds releases the note (`releaseRestoreHold`).
+ */
+function restoreHoldKey(hands: HandsClient, sessionId: string): string {
+  return JSON.stringify([sessionId, hands.generation]);
+}
+
+/**
+ * Record that this sandbox's restore did not complete, so no save from it
+ * deletes or replaces anything. Never throws: the in-memory note is set first, and a sandbox
+ * that refuses the write is still held by this process.
+ */
+export async function holdAfterFailedRestore(hands: HandsClient, sessionId: string, reason: string): Promise<void> {
+  const key = restoreHoldKey(hands, sessionId);
+  restoreHeld.delete(key);
+  restoreHeld.add(key);
+  while (restoreHeld.size > RESTORE_HELD_MAX_SANDBOXES) {
+    restoreHeld.delete(restoreHeld.values().next().value as string);
+  }
+  try {
+    const out = await withHandsTimeout<string>(
+      hands,
+      "write",
+      { path: RESTORE_HOLD_PATH, contents: `${JSON.stringify({ reason: withoutAddresses(reason).slice(0, 200), at: Date.now() })}\n` },
+      (STATE_TIMEOUT_SEC + 5) * 1000,
+    );
+    // `write` reports a failure as text rather than by throwing.
+    if (!/^Written to /.test(out)) {
+      logger.warn({ answer: out.slice(0, 200) }, "s3.restore_hold.write_refused");
+    }
+  } catch (e) {
+    logger.warn({ err: (e as Error)?.message ?? String(e) }, "s3.restore_hold.write_failed");
+  }
+}
+
+/**
+ * Whether a save from this sandbox must leave every object in place: true when a
+ * restore into it failed, and also when the sandbox cannot say. A held save
+ * deletes and replaces nothing, and what it leaves out is still there for the
+ * next save that can tell, so the doubtful case costs a deferred save at most.
+ */
+export async function isRestoreHeld(hands: HandsClient, sessionId: string): Promise<boolean> {
+  if (isRestoreHeldInProcess(hands, sessionId)) return true;
+  let raw: string | null;
+  try {
+    raw = finishedOutput(await bash(
+      hands,
+      `if test -e ${RESTORE_HOLD_PATH}; then echo held; else echo clear; fi; echo ${DONE}`,
+      STATE_TIMEOUT_SEC,
+    ));
+  } catch {
+    return true;
+  }
+  return raw?.trim() !== "clear";
+}
+
+/**
+ * This process's half of the hold alone, with no call into the sandbox: for a
+ * caller that puts the sandbox's half into its own command (the shared-disk
+ * sync, `restoreHeldGuard`).
+ */
+export function isRestoreHeldInProcess(hands: HandsClient, sessionId: string): boolean {
+  return restoreHeld.has(restoreHoldKey(hands, sessionId));
+}/**
+ * Forget this process's hold on a sandbox a restore has just filled in full. The
+ * hold was for a sandbox at this address that could not be restored; a restore
+ * that succeeded there is a sandbox whose /workspace is whole, and its own note
+ * on disk, if any, is the one `isRestoreHeld` still reads.
+ */
+export function releaseRestoreHold(hands: HandsClient, sessionId: string): void {
+  restoreHeld.delete(restoreHoldKey(hands, sessionId));
+}
+
+/**
  * Make this prefix's manifest unusable. True only when the sandbox confirmed it.
  *
  * Exported for the paths that rewrite the S3 prefix behind the sync's back (the

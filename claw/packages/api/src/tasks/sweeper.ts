@@ -34,12 +34,15 @@ import {
   type AttemptRecord,
 } from "@claw/protocol";
 import {
+  CLAW_ASSISTANT_ENABLED, DOORBELL_DEAD_LEASE_GRACE_SEC, DOORBELL_TAKEOVER_SWEEP_MS, RUN_LEASE_HEARTBEAT_MS, RUN_LEASE_TTL_MS,
   envBool, envInt, LEASE_LOST_GRACE_SEC, RUN_FAT_PREPARING_RECONCILE, TASK_SWEEPER_TICK_MS,
 } from "../config.js";
-import { nc, taskDeliverySettlement } from "../infra/nats.js";
+import { jsm, kv, nc, TASK_STREAM, taskDeliverySettlement } from "../infra/nats.js";
+import { isNoMessageFound } from "./sandbox-stopper.js";
 import { LEADER_LOCK_IDS, type LeaderLease, withLeaderLock } from "../infra/leader-lock.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
 import { runCleanupSweep } from "../sessions/cleanup-sweep.js";
+import { releaseFinishedWorkspaceSaves, workspaceSaveHeldSql, workspaceSaveHoldsSession } from "../sessions/save-hold.js";
 // `handleRegistry` is this branch's replacement for the bare `handleMap()`
 // accessor main imported here: same KV bucket, but every read goes through the
 // registry so a lookup can be re-read consistently before a destroy. The only
@@ -79,6 +82,66 @@ const SESSION_STUCK_TIMEOUT_SEC = envInt(
   BRAIN_TASK_TIMEOUT_SEC,
   { min: 1 },
 );
+/**
+ * How long background work may keep the sandbox of a work item's worker once
+ * the item no longer has its worker doing anything: it waits for a person
+ * (`needs_you`) or it is over (`done`).
+ *
+ * Background shells hold a parked sandbox for as long as they run, which is
+ * right for a chat whose user started a job and will come back to it. A work
+ * item's worker is different: once its turn ended with a question for a person,
+ * or the item closed, nothing in the session reads what those shells produce,
+ * and the person may answer hours later or never. A review session that started
+ * a Postgres for its tests and left it running held a global-cpu sandbox for
+ * two hours this way (2026-11-06, Wei Lei's held merges). Past this quiet time
+ * the sandbox is stopped like any other orphan; the item, the session and its
+ * history stay, and the next turn (the person's answer) starts a fresh sandbox.
+ */
+const WAITING_ITEM_SANDBOX_RELEASE_SEC = envInt(
+  "WAITING_ITEM_SANDBOX_RELEASE_SECONDS", 15 * 60, { min: 60 },
+);
+
+/**
+ * The work item `sessionId` is the worker of (one at most: the column is
+ * unique), when it waits for a person, only watches a pull request after its
+ * result was delivered, or is over, nothing is queued for the
+ * session, and the session's last run -- or the item's last change, whichever
+ * is later -- is at least WAITING_ITEM_SANDBOX_RELEASE_SEC ago. Null otherwise,
+ * and null on a failed read: keeping the sandbox one more tick is what the
+ * sweep did before this existed.
+ */
+export async function waitingItemPastRelease(
+  sessionId: string,
+  releaseSec: number = WAITING_ITEM_SANDBOX_RELEASE_SEC,
+): Promise<{ itemId: string; boardState: string; quietSec: number } | null> {
+  // Work items exist only with the assistant on (assistant/schema.ts).
+  if (!sessionId || !CLAW_ASSISTANT_ENABLED) return null;
+  try {
+    const r = await db.query(
+      `SELECT w.item_id, w.board_state, w.params ? 'watching_pr' AS watching,
+              EXTRACT(EPOCH FROM NOW() - GREATEST(
+                w.updated_at,
+                (SELECT MAX(COALESCE(t.completed_at, t.started_at, t.created_at)) FROM claw_tasks t WHERE t.session_id = $1)
+              ))::float8 AS quiet_sec,
+              EXISTS (SELECT 1 FROM claw_pending_messages p WHERE p.session_id = $1) AS queued
+         FROM claw_work_items w
+        WHERE w.worker_session_id = $1`,
+      [sessionId],
+    );
+    const row = r.rows[0] as
+      | { item_id: string; board_state: string; watching: boolean; quiet_sec: number | string | null; queued: boolean }
+      | undefined;
+    // A delivered result's item that only watches its pull request (`watching_pr`) waits for GitHub as one in needs_you waits for a person.
+    if (!row || (row.board_state !== "needs_you" && row.board_state !== "done" && !row.watching) || row.queued) return null;
+    const quietSec = Number(row.quiet_sec);
+    if (row.quiet_sec === null || !Number.isFinite(quietSec) || quietSec < releaseSec) return null;
+    return { itemId: row.item_id, boardState: row.board_state, quietSec: Math.round(quietSec) };
+  } catch (err) {
+    logger.warn({ sessionId, err: (err as Error)?.message ?? err }, "sweeper.waiting_item_read_failed");
+    return null;
+  }
+}
+
 /**
  * How long the orphan sweep will wait for a background-work verdict that has
  * not been published yet, before it stops waiting for one.
@@ -308,6 +371,7 @@ export const sweeperPorts = {
 
 let stopped = false;
 let timer: NodeJS.Timeout | null = null;
+let takeoverTimer: NodeJS.Timeout | null = null;
 
 /**
  * Backstop for runs that outlived their budget and did not stop themselves.
@@ -584,7 +648,10 @@ export async function reapStuckDagRoots(): Promise<number> {
  * statement, because a `--` comment inside a template literal survives only as
  * long as nobody collapses the string onto one line.
  */
-export async function requeueLostDoorbellLeases(): Promise<number> {
+export async function requeueLostDoorbellLeases(
+  graceSec: number = LEASE_LOST_GRACE_SEC,
+  event = "sweeper.requeued_lost_doorbell_leases",
+): Promise<number> {
   const rows = await applyTaskStatusTransition("queued", {
     extra: {
       lease_owner: null,
@@ -602,13 +669,126 @@ export async function requeueLostDoorbellLeases(): Promise<number> {
         AND lease_expires_at IS NOT NULL
         AND lease_expires_at < NOW() - ($1::int * INTERVAL '1 second')
         AND (deadline_at IS NULL OR deadline_at > NOW())`,
-    params: [LEASE_LOST_GRACE_SEC],
+    params: [graceSec],
   });
   if (!rows.length) return 0;
   logger.warn(
-    { requeued: rows.length, graceSec: LEASE_LOST_GRACE_SEC,
+    { requeued: rows.length, graceSec,
       rows: rows.map((row: ClawTaskRow) => ({ task_id: row.task_id, session_id: row.session_id })) },
-    "sweeper.requeued_lost_doorbell_leases",
+    event,
+  );
+  metrics.onDoorbellLeaseRequeued(rows.length);
+  metrics.onQueueEntered("requeue", rows.length);
+  return rows.length;
+}
+
+/**
+ * Whether this process has been able to hear lease renewals for long enough to
+ * judge them, as of `now`; and the bookkeeping that answers it.
+ *
+ * A lease that looks expired is only evidence of a dead worker if the renewals
+ * that would have extended it could have landed. They cannot while this
+ * process is not running (a fresh pod, or the whole API rolled at once) or
+ * while the database is not answering it -- and in both cases the renewals
+ * of perfectly healthy brains failed too, so every lease in the table is
+ * expired the moment things come back. Requeueing then would hand live runs
+ * to other brains (they would find the lock fresh and defer, but the live
+ * holder's next renewal is refused and its turn restarts from a checkpoint).
+ * So the fast pass waits one whole lease TTL of clean observation first:
+ * from its first successful round trip, and again after any pass that failed
+ * or took longer than a heartbeat. The slow reaper's long grace already
+ * outlasts such a window and is left as it is.
+ */
+export class LeaseObservation {
+  private since: number | null = null;
+  constructor(private readonly windowMs: number, private readonly slowMs: number) {}
+  /** True when a pass may act. */
+  ready(now: number): boolean {
+    return this.since !== null && now - this.since >= this.windowMs;
+  }
+  /** After each pass, with how long it took and whether it failed. */
+  record(now: number, tookMs: number, failed: boolean): void {
+    if (failed || tookMs > this.slowMs) this.since = null;
+    else if (this.since === null) this.since = now;
+  }
+}
+
+const deadLeaseObservation = new LeaseObservation(RUN_LEASE_TTL_MS, RUN_LEASE_HEARTBEAT_MS);
+
+/**
+ * Hand a doorbell run whose brain was lost with its node to another brain,
+ * one or two minutes after the loss rather than eleven.
+ *
+ * A brain restarted in place gives its runs back itself (release-orphans). One
+ * whose node went away is rescheduled under a new name, so nothing ever speaks
+ * for the dead id: its runs used to wait for the lease, the registry TTL on
+ * its `lock.<key>` and LEASE_LOST_GRACE_SEC -- 675 s measured on 2026-11-06.
+ * This is the same requeue with DOORBELL_DEAD_LEASE_GRACE_SEC instead, run on
+ * its own short loop; brain completes it by taking the stale lock over for the
+ * run it was handed (task-lock `deadHolderTakeover`).
+ *
+ * Exclusive execution does not rest on this guess being right. The claim that
+ * follows bumps `claim_count`, so the previous holder's renewals and its
+ * `agent_done` are refused from then on; and the next brain takes the lock
+ * only if nobody has rewritten it for TASK_LOCK_DEAD_HOLDER_MS -- a holder
+ * that is alive but cut off from the API is still renewing that, and keeps it.
+ */
+export async function requeueDeadDoorbellLeases(now = Date.now()): Promise<number> {
+  if (DOORBELL_DEAD_LEASE_GRACE_SEC <= 0) return 0;
+  const act = deadLeaseObservation.ready(now);
+  const started = Date.now();
+  let failed = true;
+  try {
+    // Until the window is full, a bare round trip: it is the observation.
+    const n = act
+      ? await requeueLostDoorbellLeases(DOORBELL_DEAD_LEASE_GRACE_SEC, "sweeper.requeued_dead_doorbell_leases")
+      : (await db.query("SELECT 1"), 0);
+    failed = false;
+    return n;
+  } finally {
+    deadLeaseObservation.record(Date.now(), Date.now() - started, failed);
+  }
+}
+
+/**
+ * Put back every doorbell run a brain's previous incarnation was holding.
+ *
+ * Asked by a brain as it starts, before it claims anything, and only by one
+ * whose `BRAIN_ID` is its pod name: a container restarted in place keeps that
+ * name and is the only process that can carry it, so a running row leased to
+ * it at this moment can only have belonged to the process that just died. On
+ * 2026-11-06 a brain container crashed and restarted in seconds, and its runs
+ * then stood for eleven minutes -- the lease's 45 seconds plus the reaper's
+ * grace -- for a takeover the restarted container could have made at once.
+ * The lock side of the same hand-back is in brain/src/tasks/lock.ts.
+ *
+ * Same transition, same columns, as `requeueLostDoorbellLeases`; what differs
+ * is only how the row is known to be orphaned -- by its owner's own word rather
+ * than by its lease running out.
+ */
+export async function requeueOrphanedDoorbellLeases(brainId: string): Promise<number> {
+  const rows = await applyTaskStatusTransition("queued", {
+    extra: {
+      lease_owner: null,
+      lease_expires_at: null,
+      heartbeat_at: null,
+      internal_token_hash: null,
+      attempt_id: null,
+      started_at: null,
+    },
+    setSql: [`metadata = ${requeueSojournSql("COALESCE(metadata, '{}'::jsonb)")}`],
+    where: `status IN ('preparing','running')
+        AND origin = 'chat'
+        AND metadata->>'dispatch' = 'doorbell'
+        AND lease_owner = $1
+        AND (deadline_at IS NULL OR deadline_at > NOW())`,
+    params: [brainId],
+  });
+  if (!rows.length) return 0;
+  logger.warn(
+    { requeued: rows.length, brainId,
+      rows: rows.map((row: ClawTaskRow) => ({ task_id: row.task_id, session_id: row.session_id })) },
+    "sweeper.requeued_orphaned_doorbell_leases",
   );
   metrics.onDoorbellLeaseRequeued(rows.length);
   metrics.onQueueEntered("requeue", rows.length);
@@ -962,6 +1142,13 @@ async function restoreFinishOnlyTasks(extraWhere: string, params: unknown[]): Pr
                                 THEN NULL ELSE metadata->'app_finish_prior'->>'failure_reason' END`,
           `error_message = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
                                THEN NULL ELSE metadata->'app_finish_prior'->>'error_message' END`,
+          // What a success reported by the run's own holder carries (`outcomeOf`): the state
+          // directory and the application's stop reason.
+          `captures = CASE WHEN COALESCE(${succeeded}, false) AND metadata->'app_finish_prior'->>'status' = 'failed'
+                          THEN COALESCE(captures, '{}'::jsonb) || (SELECT jsonb_strip_nulls(jsonb_build_object(
+                                 'session_dir', r.state_dir, 'stop_reason', left(r.last_exit->>'stop_reason', 300)))
+                               FROM claw_app_runs r WHERE r.task_id = claw_tasks.task_id)
+                          ELSE captures END`,
         ],
         where: `mode = 'app' AND metadata->'app_finish_prior' IS NOT NULL AND ${extraWhere}`,
         params,
@@ -1051,6 +1238,66 @@ export async function giveUpExhaustedAppFinishes(): Promise<number> {
 /** How many times one run's finishing may be handed to a new worker before it is left for an operator. */
 const APP_FINISH_REQUEUE_MAX = 5;
 
+/** The run states a live AppRunner drives; a run left in one of them with its task closed has nobody driving it. */
+const APP_RUN_DRIVEN_STATES = "('provisioning','starting','running','restarting')";
+
+/**
+ * Move a run whose task was closed while it was still being driven to `finishing`, so that
+ * {@link requeueUnfinishedAppRuns} hands its finish to a live Brain.
+ *
+ * A task is closed under its holder by a deleted session (straight to `cancelled`), by
+ * `reapLostLeases` and by `reapStaleTasks`, and the API renews no lease on a closed task, so
+ * the holder has what was left of its lease to move the run row to `finishing` and stop the
+ * sandbox. A holder that did not -- it died, or it was still waiting for its sandbox to start
+ * when the lease ran out and every write after that was refused (`not_holder`) -- leaves the
+ * run row in a state only a live AppRunner moves, so `requeueUnfinishedAppRuns`, which takes
+ * `finishing` rows only, never saw it. The sandbox then ran to its workload timeout: an app
+ * sandbox carries no `CLAW_SESSION_ID`, so neither session teardown nor the Hands reaper finds
+ * it, and only the run's own finish stops it.
+ *
+ * Only once the lease has been gone for the grace (`LEASE_GONE_SQL`) and the task closed for as
+ * long, the same wait `requeueUnfinishedAppRuns` makes: until then the holder may still be
+ * finishing inside its lease, and a Brain that takes a run over is never preempted. Nothing can
+ * be handing the run over after that: a closed task's lease is never renewed, and the holder's
+ * writes are refused. The finish that follows needs no recorded workload id: its last step
+ * stops every live sandbox carrying the run's `CLAW_APP_RUN_ID`, a queued one included.
+ *
+ * `last_exit` says why (`row_terminal`); the restart history it held is not a finish's, and only
+ * `recovery` (shared storage was already read once) is kept. Not a task with `app_finish_prior`:
+ * that is a finish-only dispatch, whose rows the passes above own.
+ */
+export async function finishAbandonedAppRuns(): Promise<number> {
+  const r = await db.query(
+    `WITH closed AS (
+       SELECT task_id FROM claw_tasks
+        WHERE mode = 'app'
+          AND executor = 'brain'
+          AND status IN ('cancelling','cancelled','failed')
+          AND metadata->'app_finish_prior' IS NULL
+          AND ${LEASE_GONE_SQL}
+          AND (completed_at IS NULL OR completed_at < NOW() - ($1::int * INTERVAL '1 second'))
+          AND task_id IN (SELECT task_id FROM claw_app_runs WHERE state IN ${APP_RUN_DRIVEN_STATES})
+        FOR UPDATE
+     ), prior AS (
+       SELECT r.task_id, r.state FROM claw_app_runs r JOIN closed c ON c.task_id = r.task_id
+     )
+     UPDATE claw_app_runs r
+        SET state = 'finishing',
+            last_exit = jsonb_build_object('at', to_jsonb(NOW()), 'cause', 'row_terminal', 'final', false)
+                        || CASE WHEN r.last_exit->'recovery' = 'true'::jsonb
+                                THEN '{"recovery": true}'::jsonb ELSE '{}'::jsonb END,
+            updated_at = NOW()
+       FROM prior p
+      WHERE r.task_id = p.task_id
+        AND r.state IN ${APP_RUN_DRIVEN_STATES}
+      RETURNING r.task_id, r.sandbox_workload_id, p.state AS prior_state`,
+    [LEASE_LOST_GRACE_SEC],
+  );
+  const rows = r.rows as Array<{ task_id: string; sandbox_workload_id: string | null; prior_state: string }>;
+  if (rows.length) logger.warn({ runs: rows }, "sweeper.abandoned_app_runs_to_finishing");
+  return rows.length;
+}
+
 /**
  * Give a run left in `finishing` by a holder that lost its lease back to a live Brain.
  *
@@ -1071,8 +1318,9 @@ const APP_FINISH_REQUEUE_MAX = 5;
  * back to what it was, so a user's cancel stays a cancel.
  *
  * Only a lease that is dead for the grace -- or a finish-only dispatch that nobody accepted for
- * as long (`FINISH_DISPATCH_UNACCEPTED_SQL`) -- and only `finishing`: a `running`
- * run with a closed task is not a finish to resume. Bounded, so a run whose
+ * as long (`FINISH_DISPATCH_UNACCEPTED_SQL`) -- and only `finishing`. A run whose task was
+ * closed before its holder got it that far is moved to `finishing` first, by
+ * `finishAbandonedAppRuns`, under the same wait. Bounded, so a run whose
  * finish cannot complete is not handed round for ever.
  */
 export async function requeueUnfinishedAppRuns(): Promise<number> {
@@ -1117,6 +1365,129 @@ export async function requeueUnfinishedAppRuns(): Promise<number> {
     { requeued: rows.length, ids: rows.map((row: ClawTaskRow) => row.task_id) },
     "sweeper.requeued_unfinished_app_runs",
   );
+  return rows.length;
+}
+
+/** How many times one app run is handed to a new Brain after its holder went away; past it the run is closed as worker_lost. */
+export const APP_TAKEOVER_REQUEUE_MAX = 10;
+
+/**
+ * Whether the task stream no longer holds the message at `seq`, so nothing can redeliver it.
+ * True only on the stream's own "no message found"; any other answer, an error included, is
+ * false: "could not look" must never send a second dispatch out beside a redelivery.
+ */
+export const appTakeoverPorts = {
+  async taskMessageGone(
+    seq: number,
+    getMessage: (seq: number) => Promise<unknown> = (n) => jsm.streams.getMessage(TASK_STREAM, { seq: n }),
+  ): Promise<boolean> {
+    if (!(seq > 0)) return false;
+    try {
+      await getMessage(seq);
+      return false;
+    } catch (err) {
+      if (isNoMessageFound(err)) return true;
+      logger.warn({ seq, err: (err as Error)?.message ?? String(err) }, "sweeper.app_takeover_message_unknown");
+      return false;
+    }
+  },
+  /**
+   * Whether nobody holds the run's lock (`lock.app.<task_id>` in the Brain registry): no entry,
+   * or the tombstone a release leaves. A Brain still running the run refreshes it every few
+   * seconds, whatever its database lease says, so a held lock means a holder that may be alive.
+   * A read that fails, or an entry that is there, is false.
+   */
+  async runLockFree(
+    taskId: string,
+    get: (key: string) => Promise<{ operation?: string; value?: Uint8Array } | null> = (key) => kv.get(key),
+  ): Promise<boolean> {
+    try {
+      const entry = await get(`lock.app.${taskId}`);
+      // The same reading as Brain's `isTombstone`: a delete, a purge, or an empty value.
+      return !entry || entry.operation === "DEL" || entry.operation === "PURGE" || !entry.value || entry.value.length === 0;
+    } catch (err) {
+      logger.warn({ taskId, err: (err as Error)?.message ?? String(err) }, "sweeper.app_takeover_lock_unknown");
+      return false;
+    }
+  },
+};
+
+const LOST_APP_LEASE_SQL = `mode = 'app'
+        AND executor = 'brain'
+        AND status IN ('preparing','running')
+        AND metadata->'app_finish_prior' IS NULL
+        AND lease_expires_at IS NOT NULL
+        AND lease_expires_at < NOW() - ($1::int * INTERVAL '1 second')
+        AND (deadline_at IS NULL OR deadline_at > NOW())
+        AND COALESCE((metadata->>'app_takeover_requeues')::int, 0) < $2::int
+        AND EXISTS (SELECT 1 FROM claw_app_runs r
+                     WHERE r.task_id = claw_tasks.task_id AND r.state IN ${APP_RUN_DRIVEN_STATES})`;
+
+/**
+ * Hand an app run whose holder went away to another Brain, instead of closing it as `worker_lost`,
+ * once the queue can no longer do it.
+ *
+ * A Brain that drains (a release) or dies leaves its app run to be taken over, and the takeover
+ * comes from the queue redelivering the task's message. The task stream keeps a message for
+ * `resolveTaskStreamMaxAgeNs` (2 h 41 min on the default budget), and an app run routinely
+ * outlives that: on 2026-11-08 a three-hour run's Brain was drained at 3 h 16 min, there was no
+ * message left to redeliver, nobody took the run over, and `reapLostLeases` closed it as
+ * `worker_lost` -- while the application finished normally six minutes later and wrote
+ * `final: true, returncode: 0` to its state directory, which nothing then read.
+ *
+ * So such a run is requeued: the scheduler dispatches it again and the Brain that takes it
+ * reconciles the run row from where it is, which is the takeover a redelivery would have given.
+ * The new holder reads `exit.json` when it finds the process or the sandbox gone, so an
+ * application that finished in the gap ends as the success it was, and one still running carries
+ * on.
+ *
+ * Only when the stream no longer holds the message the last holder was executing (`delivery_seq`,
+ * asked of the stream itself), and nobody holds the run's lock (`lock.app.<task_id>`): while the
+ * message is there a redelivery of it may still come, and while the lock is held a Brain may still
+ * be running the run with its database lease unrenewed; either one would hold the lock against
+ * the new dispatch (whose token replaces theirs), and the new delivery would wait out its budget
+ * behind it. Such a run is left to the redelivery or its holder, and to `reapLostLeases` after
+ * them, as before. Otherwise only after the lease has been gone for the grace, the same wait
+ * `reapLostLeases` makes; only a run row a live AppRunner drives (a run in `finishing` has its own
+ * hand-over, `requeueUnfinishedAppRuns`); not a finish-only dispatch; not past the task's
+ * deadline; and bounded, so a run that loses every holder is closed in the end. `started_at` and
+ * `deadline_at` are kept: the run has not started again.
+ */
+export async function requeueLostAppLeases(): Promise<number> {
+  const params = [LEASE_LOST_GRACE_SEC, APP_TAKEOVER_REQUEUE_MAX];
+  const candidates = (await db.query(
+    `SELECT task_id, delivery_seq FROM claw_tasks WHERE ${LOST_APP_LEASE_SQL} ORDER BY lease_expires_at LIMIT 50`,
+    params,
+  )).rows as Array<{ task_id: string; delivery_seq: string | number | null }>;
+  const gone: string[] = [];
+  for (const c of candidates) {
+    if (!(await appTakeoverPorts.taskMessageGone(Number(c.delivery_seq ?? 0)))) continue;
+    if (await appTakeoverPorts.runLockFree(c.task_id)) gone.push(c.task_id);
+  }
+  if (!gone.length) return 0;
+  const rows = await applyTaskStatusTransition("queued", {
+    extra: {
+      lease_owner: null,
+      lease_expires_at: null,
+      heartbeat_at: null,
+      internal_token_hash: null,
+      attempt_id: null,
+    },
+    setSql: [`metadata = jsonb_set(${requeueSojournSql("COALESCE(metadata, '{}'::jsonb)")},
+         '{app_takeover_requeues}', to_jsonb(COALESCE((metadata->>'app_takeover_requeues')::int, 0) + 1))`],
+    // Every condition again, in the statement that moves the row: a holder that came back, or a
+    // redelivery that took the run, between the read and here keeps it.
+    where: `task_id = ANY($3::text[]) AND ${LOST_APP_LEASE_SQL}`,
+    params: [...params, gone],
+  });
+  if (!rows.length) return 0;
+  logger.warn(
+    { requeued: rows.length, graceSec: LEASE_LOST_GRACE_SEC,
+      rows: rows.map((row: ClawTaskRow) => ({ task_id: row.task_id, session_id: row.session_id,
+        requeues: Number(row.metadata?.app_takeover_requeues ?? 0) })) },
+    "sweeper.requeued_lost_app_leases",
+  );
+  metrics.onQueueEntered("requeue", rows.length);
   return rows.length;
 }
 
@@ -2301,6 +2672,7 @@ export async function drainOrphanedPendingMessages(limit = 20): Promise<number> 
        JOIN claw_sessions s ON s.session_id = p.session_id
       WHERE s.agent_status IN ('idle','failed')
         AND s.deleted_at IS NULL
+        AND NOT ${workspaceSaveHeldSql("s")}
         AND NOT EXISTS (
           SELECT 1 FROM claw_tasks t
            WHERE t.session_id = p.session_id
@@ -2698,6 +3070,14 @@ export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
       // A terminal the owner has open holds the sandbox, and so does one that is
       // unreadable. The claim lapses on its own, so this defers rather than
       // keeps: the next tick after the expiry reaps it like any other orphan.
+      // A run whose turn ended is still uploading its workspace from this sandbox
+      // until its save is over: its row is closed, but stopping the sandbox now
+      // loses every file not yet uploaded (sessions/save-hold.ts).
+      if (sessionId && await workspaceSaveHoldsSession(sessionId)) {
+        logger.info({ dagRoot, sessionId }, "sweeper.orphan_handles_workspace_save");
+        deferred++;
+        continue;
+      }
       if (sessionId) {
         const termHold = await handleRegistry.terminalHold(sessionId);
         if (termHold.state !== "none") {
@@ -2738,12 +3118,25 @@ export async function reapOrphanHandles(lease?: LeaderLease): Promise<number> {
         }
       }
       if (bg.state === "running") {
+        // A work item's worker that waits for a person, or whose item is over,
+        // does not keep its sandbox for background work past the release time
+        // (WAITING_ITEM_SANDBOX_RELEASE_SEC): it is stopped below like any orphan.
+        const waiting = await waitingItemPastRelease(sessionId);
+        if (!waiting) {
+          logger.info(
+            { dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running, measuredAt: bg.at },
+            "sweeper.orphan_handles_background_work",
+          );
+          deferred++;
+          continue;
+        }
         logger.info(
-          { dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running, measuredAt: bg.at },
-          "sweeper.orphan_handles_background_work",
+          {
+            dagRoot, sessionId, workloadId: bg.workloadId, running: bg.running,
+            itemId: waiting.itemId, boardState: waiting.boardState, quietSec: waiting.quietSec,
+          },
+          "sweeper.orphan_handles_waiting_item_released",
         );
-        deferred++;
-        continue;
       }
       // A finished turn leaves its sandbox parked for the session's next message
       // (Brain's SANDBOX_IDLE_REUSE_SECONDS). The DAG row being terminal and
@@ -2901,9 +3294,13 @@ export async function sweeperTick(): Promise<void> {
   // Ahead of the wait-external and session scans, and after the deadline
   // backstop, so a run that is both past its budget and abandoned is closed
   // with the reason that explains it rather than the one that noticed second.
-  await runContained("sweeper.requeued_doorbell_leases_failed", requeueLostDoorbellLeases);
+  await runContained("sweeper.requeued_doorbell_leases_failed", () => requeueLostDoorbellLeases());
+  // Before reapLostLeases: an app run whose holder went away is handed to another Brain, not closed.
+  await runContained("sweeper.lost_app_leases_failed", requeueLostAppLeases);
   await runContained("sweeper.lost_leases_failed", reapLostLeases);
   // After the reapers that close a task: a run they closed mid-finish is handed back here.
+  // First one closed before its holder reached `finishing`, so the requeue below takes it in this tick.
+  await runContained("sweeper.abandoned_app_runs_failed", finishAbandonedAppRuns);
   await runContained("sweeper.app_finish_exhausted_failed", giveUpExhaustedAppFinishes);
   await runContained("sweeper.unfinished_app_runs_failed", requeueUnfinishedAppRuns);
   // After reapLostLeases, so an accepted row whose worker died is closed as
@@ -2914,6 +3311,8 @@ export async function sweeperTick(): Promise<void> {
   // decided is settled by the path that owns it rather than aged out by one
   // that does not know what it was.
   await runContained("sweeper.dispatch_reconcile_failed", reconcileAmbiguousDispatches);
+  // Before the orphan drain: a save whose finish no replica released it for is released and drained here.
+  await runContained("sweeper.finished_workspace_saves_failed", () => releaseFinishedWorkspaceSaves(drainOldestPendingMessage));
   await runContained("sweeper.orphaned_pending_drain_failed", drainOrphanedPendingMessages);
   // After the orphan drain, so a queued report is already on its way; before the session reapers, which close runs this reads.
   await runContained("sweeper.assistant_failed", sweepAssistant);
@@ -2988,6 +3387,18 @@ export function startSweeper(): void {
   };
   void loop();
   logger.info({ tickMs: TASK_SWEEPER_TICK_MS }, "sweeper.started");
+  if (DOORBELL_DEAD_LEASE_GRACE_SEC > 0) {
+    const takeover = async () => {
+      if (stopped) return;
+      await runContained("sweeper.requeued_dead_doorbell_leases_failed", () => requeueDeadDoorbellLeases());
+      if (!stopped) takeoverTimer = setTimeout(takeover, DOORBELL_TAKEOVER_SWEEP_MS);
+    };
+    takeoverTimer = setTimeout(takeover, DOORBELL_TAKEOVER_SWEEP_MS);
+    logger.info(
+      { tickMs: DOORBELL_TAKEOVER_SWEEP_MS, graceSec: DOORBELL_DEAD_LEASE_GRACE_SEC },
+      "sweeper.dead_lease_takeover_started",
+    );
+  }
 }
 
 export function stopSweeper(): void {
@@ -2995,6 +3406,10 @@ export function stopSweeper(): void {
   if (timer) {
     clearTimeout(timer);
     timer = null;
+  }
+  if (takeoverTimer) {
+    clearTimeout(takeoverTimer);
+    takeoverTimer = null;
   }
 }
 

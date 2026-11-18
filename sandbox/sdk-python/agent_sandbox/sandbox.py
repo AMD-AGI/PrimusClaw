@@ -429,8 +429,8 @@ class Sandbox:
         return cp.get_template(name, namespace=namespace)
 
     @staticmethod
-    def create_template(name: str, spec: dict, *, namespace: str = "default",
-                        public: bool = False, dockerfile: Optional[str] = None,
+    def create_template(name: str, spec: dict, *, namespace: Optional[str] = None,
+                        workspace: Optional[str] = None, public: bool = False, dockerfile: Optional[str] = None,
                         api_url: Optional[str] = None, api_key: Optional[str] = None) -> dict:
         """Create a new CodeInterpreter template.
 
@@ -438,25 +438,30 @@ class Sandbox:
         and returns build_log with per-phase diagnostics.
 
         Args:
+            namespace: Namespace to store the template in; the server default when None.
+            workspace: SaFE workspace of the template; it is then stored in the
+                    control-plane namespace and E2B creates may use it.
             public: Mark template as publicly visible/usable by all users.
                     Only system-admin can set this to True.
         """
         cp = ControlPlaneClient(api_url, api_key=api_key)
-        return cp.create_template(name, spec, namespace=namespace, public=public, dockerfile=dockerfile)
+        return cp.create_template(name, spec, namespace=namespace, workspace=workspace, public=public, dockerfile=dockerfile)
 
     @staticmethod
-    def create_template_stream(name: str, spec: dict, *, namespace: str = "default",
-                               public: bool = False, dockerfile: Optional[str] = None,
+    def create_template_stream(name: str, spec: dict, *, namespace: Optional[str] = None,
+                               workspace: Optional[str] = None, public: bool = False, dockerfile: Optional[str] = None,
                                api_url: Optional[str] = None, api_key: Optional[str] = None) -> Generator[dict, None, None]:
         """Create a template with SSE streaming progress.
 
         Yields dicts with "event" and "data" keys for real-time build progress.
 
         Args:
+            namespace: Namespace to store the template in; the server default when None.
+            workspace: SaFE workspace of the template, as in create_template.
             public: Mark template as publicly visible/usable by all users.
         """
         cp = ControlPlaneClient(api_url, api_key=api_key)
-        yield from cp.create_template_stream(name, spec, namespace=namespace, public=public, dockerfile=dockerfile)
+        yield from cp.create_template_stream(name, spec, namespace=namespace, workspace=workspace, public=public, dockerfile=dockerfile)
 
     @staticmethod
     def update_template(name: str, spec: dict, *, namespace: str = "default",

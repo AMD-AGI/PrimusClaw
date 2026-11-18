@@ -10,14 +10,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 const { LazyDefaultSkills } = await import("../src/agent/platform-defaults.js");
 type DefaultSkill = import("../src/agent/platform-defaults.js").DefaultSkill;
 
 function skillDir(name: string): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `lazy-skill-${name}-`));
+  const dir = tmpDir(`lazy-skill-${name}-`);
   fs.writeFileSync(path.join(dir, "SKILL.md"), `---\ndescription: ${name}\n---\nbody\n`);
   return dir;
 }

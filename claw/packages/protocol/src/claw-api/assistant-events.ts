@@ -1,0 +1,339 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * The outbound events an assistant produces, and the payloads they carry: what a
+ * notification subscription that lists their types receives (`POST` to its URL), and
+ * what the API builds in `packages/api/src/assistant/outbound.ts`.
+ *
+ * They are not run events: there is no session, task or link to report, only
+ * something the assistant said, so they do not reuse `NotificationPayload`. They
+ * say nothing about who receives them -- a subscription asks for the type and
+ * the receiver decides how a person sees it.
+ */
+
+export const ASSISTANT_EVENT_TYPES = ["assistant.say", "work_item.needs_you", "assistant.action"] as const;
+export type AssistantEventType = (typeof ASSISTANT_EVENT_TYPES)[number];
+
+/** What a receiver needs to draw the item a message is about; derived from the item's state, never written by a model. */
+export interface AssistantItemSnapshot {
+  item_id: string;
+  seq: number;
+  title: string;
+  board_state: string;
+  result_version: number;
+  can_accept: boolean;
+  /**
+   * The result version Claw delivered without the user's Accept (`CLAW_ASSISTANT_AUTO_DELIVER`), while the item stands delivered:
+   * closed by that delivery, or open only to watch a pull request (`watching_pr`). Absent otherwise, and from an API without it.
+   */
+  delivered_version?: number;
+  /** The pull requests, as owner/repo#123, a delivered item stays open watching for comments and failed CI. Absent when none. */
+  watching_pr?: string[];
+}
+
+interface AssistantEventBase {
+  /** The id of the stored message: the receiver's dedup key. */
+  event_id: string;
+  occurred_at: string;
+  user_id: string;
+  text: string;
+  item?: AssistantItemSnapshot;
+}
+
+/**
+ * A channel action put to the person rather than run (`channel_action` when their message was not its command typed whole).
+ * A channel that can draw a button shows one for `/{name} {args}` and runs it, as if the person typed it, only when that person
+ * presses it, under the same checks as an `assistant.action` (a message it sent for them, an action that message declared).
+ * A channel that cannot shows the text, which tells the person the command to type.
+ */
+export interface AssistantConfirmAction {
+  name: string;
+  args: string;
+  /** The id of the turn's message in Claw. */
+  message_id: string;
+  /** What the channel called that message when it sent it. */
+  channel_message_id: string;
+}
+
+/**
+ * A source the message cites (`assistant/citations.ts`): `n` is the number its text writes as `[n]`. Each comes from a lookup the turn
+ * made (a web page it found or read, an object of the user's GitHub), never from the model's own words. `title` is a plain line,
+ * already cut and stripped of markup, but what someone else wrote: shown as text only.
+ */
+export interface AssistantSaySource {
+  n: number;
+  url: string;
+  title: string;
+  kind: "web" | "github_pr" | "github_issue" | "github_repo" | "github_check" | "github_file" | "board";
+}
+
+/**
+ * A write the router proposed and Claw holds until the person answers it (`assistant/schedules.ts`): creating or cancelling a
+ * scheduled task. A channel that can draw buttons shows the message's text with two: one that lets it through and one that does
+ * not, each calling `POST /v1/assistant/confirmations/{confirmation_id}/decision` as that person (`allow` or `deny`). A channel that
+ * cannot shows the text, which tells the person the command that lets it through (`批准 #{ref}`).
+ */
+export interface AssistantConfirmWrite {
+  confirmation_id: string;
+  /** The short id the person may type back. */
+  ref: string;
+  /**
+   * `devenv_send`: an instruction for an agent on the person's own machine (`assistant/devenv-tools.ts`). `skill_save`: a personal skill
+   * the assistant drafted on its own, saved only when the person lets it through (`assistant/skill-writes.ts`); its message carries
+   * `skill_card` with what would be saved. `github_merge` and `github_review`: a merge, or an approval, that a review the assistant
+   * started for the person's own account holds for them (`claw_github_confirmations`, `assistant/review-items.ts`); the same decision
+   * route answers it, and it is made exactly as `POST /v1/github-review/confirmations/{confirmation_id}/decision` makes it.
+   */
+  kind: "trigger_create" | "trigger_cancel" | "github_comment" | "devenv_send" | "devenv_hide" | "skill_save" | "github_merge" | "github_review";
+  /** What the button that lets it through says, in the language of the text. */
+  allow_label: string;
+  expires_at: string;
+}
+
+/**
+ * A personal skill as a message shows it (`assistant/skill-writes.ts`): what was just saved, changed, turned off or deleted at the
+ * person's request, or what the assistant drafted for them to confirm. The message's text says the same in words, for a channel that
+ * draws no card. Everything here is the person's own skill, so it goes only to their own conversation, never a group's.
+ *
+ *  - `saved` (a skill created, or a new version of one), `deleted`, `disabled`, `enabled`: done already. `change_id` is what an Undo
+ *    button takes back, `POST /v1/users/me/skill-changes/{change_id}/undo` made as the person, until `undo_expires_at`: a created skill
+ *    is deleted again, an update goes back to the version before, a delete is restored, a turn off or on is turned back. An Edit
+ *    button changes the skill as it is now (`GET` then `PUT /v1/users/me/skills/{name}`).
+ *  - `draft`: nothing is saved yet. The message also carries `confirm_write` (kind `skill_save`); its two buttons are Save (`allow`)
+ *    and Discard (`deny`) on that confirmation.
+ */
+export interface AssistantSkillCard {
+  kind: "saved" | "deleted" | "disabled" | "enabled" | "draft";
+  name: string;
+  /** The version now (for `draft`, the version a save would make; null when not known). */
+  version: number | null;
+  /** `saved`: true for a new skill (or one brought back), false for a new version of one the person had. */
+  created?: boolean;
+  /** When to use it, in the person's words: what decides whether it is used without being named. */
+  description: string;
+  /** `manual`: used only when the person names it. */
+  invocation: "auto" | "manual";
+  files: Array<{ path: string; size_bytes: number }>;
+  /** The first lines of SKILL.md (at most 30 lines and 1500 characters), for the card to show; empty for `deleted`. */
+  preview: string;
+  change_id?: string;
+  undo_expires_at?: string;
+  /** `draft`: the confirmation its Save and Discard answer, the same as `confirm_write.confirmation_id`. */
+  confirmation_id?: string;
+  /**
+   * `draft` shown where the user has no assistant (a session event of the chat a worker saved from): no confirmation, the draft itself,
+   * saved with `POST /v1/users/me/skill-drafts/{draft_id}/confirm` and dropped with `DELETE` on the same path.
+   */
+  draft_id?: string;
+}
+
+/**
+ * A file a work item's worker delivered (`deliver_file`, `deliver_text`), or one the router wrote (`deliver_text`), for a channel to
+ * offer as a download. The download is Claw's own link, `GET /v1/sessions/{session_id}/deliveries/{id}`, which answers only the
+ * signed-in owner of that session (the item's worker session, or the assistant's own, both the user's). `data_base64` is a small image itself (`DELIVERY_INLINE_TYPES`, at most
+ * `DELIVERY_INLINE_MAX_BYTES`), for a channel that shows it without fetching the link.
+ */
+export interface AssistantFile {
+  /** The work item whose worker delivered it; absent for a file the router wrote itself (`text-delivery.ts`). */
+  item_id?: string;
+  session_id: string;
+  id: string;
+  name: string;
+  size: number;
+  content_type: string;
+  data_base64?: string;
+}
+
+/**
+ * What a development environment session's own message is about (`assistant/remote-items.ts`): one of the three things a session is
+ * ever said for, so a channel can draw it and tell it apart. `done`: the instruction finished; `needs_you`: the agent waits on the person
+ * (`ask`: the permission request, for a channel to put to them with its options as buttons, answered as an attached chat's card is, a
+ * decision on the session); `error`: the instruction failed, was refused, or its session ended before it finished. `machine` and
+ * `agent` are what the connector reported, and `ask`'s words what the agent wrote: untrusted text, shown as text only.
+ */
+export interface AssistantRemoteNotice {
+  /**
+   * `resolved` (only for a terminal's request, `ask.origin` "terminal"): a request this channel was sent as a card was answered, or stopped
+   * waiting, somewhere else (`resolved`), so a channel that still shows that card marks it so in place; the text says the same in one line
+   * for a channel that does not.
+   */
+  kind: "done" | "needs_you" | "error" | "resolved";
+  session_id: string;
+  machine: string;
+  agent: string;
+  /**
+   * A terminal's request (`ask.origin` "terminal"): which tool asked there (`claude`, `codex`, `cursor`), for a channel to name it as its
+   * users know it (Claude Code, Codex, Cursor) instead of by `agent`, the connector's id for it. Absent when the connector did not say.
+   */
+  tool?: "claude" | "codex" | "cursor";
+  ask?: AssistantRemoteAsk;
+  /** With `kind: "resolved"`: which request, and who ended it (`terminal`, or `timeout`, `session_end`, `connector_restart` when nobody did). */
+  resolved?: { action_id: string; by: string };
+}
+
+/** A permission request a development environment's agent waits on (`permissionRequest`), as its connector posted it. */
+export interface AssistantRemoteAsk {
+  action_id: string;
+  tool: string;
+  /** The options the agent offered, ids as the agent gave them: the only answers a decision may carry. */
+  options: Array<{ optionId: string; name: string; kind: string }>;
+  /** When the connector stops waiting for an answer (it refuses the request then); absent when it did not say. */
+  expires_at?: string;
+  /**
+   * `terminal`: asked in a terminal on the machine (a conversation its person started there), which asks it too (when: see
+   * `terminal_asks`); whichever answer comes first is taken. Absent for a session opened through Claw.
+   */
+  origin?: "terminal";
+  /** A terminal's request: what kind of prompt it is (`execute`, `edit`, `question`, `switch_mode` for a plan, `mcp`, `other`). */
+  kind?: string;
+  /**
+   * A terminal's request: what it would do, whole, as its connector posted it (the command, the edit, the plan, the question): a channel
+   * shows all of it, or offers only the options that refuse. Absent when it was too large to carry whole; the options are then only
+   * those that refuse.
+   */
+  input?: unknown;
+  /** A terminal's request: the conversation's title (its project or session name) and the folder it runs in; plain one-line text. */
+  title?: string;
+  cwd?: string;
+  /** A terminal's question asked as several cards: which this is (from 0), and how many. */
+  question_index?: number;
+  question_count?: number;
+  /**
+   * A terminal's request: when the terminal asks it too, as its connector said (`terminal_asks` on the request). Absent: alongside
+   * the card, and the first answer counts (Claude Code). `after_card`: only once the card is answered or its time is up, and the
+   * card offers only to decline or to hand it back to the terminal (Cursor). `on_input`: only once someone types in that terminal,
+   * which withdraws the card (Codex).
+   */
+  terminal_asks?: TerminalAsks;
+}
+
+/** When a terminal asks a request that is also on a card, besides alongside it: see {@link AssistantRemoteAsk.terminal_asks}. */
+export type TerminalAsks = "after_card" | "on_input";
+/** The values of `terminal_asks` a channel knows; any other is read as absent. */
+export const TERMINAL_ASKS: readonly TerminalAsks[] = ["after_card", "on_input"];
+
+/** A choice a say puts to the person: from 2 to 10 options, one plain line each; `multiple` when several may be picked. */
+export interface AssistantSayChoice {
+  options: string[];
+  multiple: boolean;
+}
+
+/** Something the assistant chose to say to the user. */
+export interface AssistantSayPayload extends AssistantEventBase {
+  type: "assistant.say";
+  confirm_action?: AssistantConfirmAction;
+  /** Present only when the message cites any (`CLAW_ASSISTANT_CITATIONS`); a receiver that does not read it shows the text alone. */
+  sources?: AssistantSaySource[];
+  /**
+   * Present only when the router suggested any (`CLAW_ASSISTANT_SUGGESTED_REPLIES`): up to three short replies the user may send
+   * next, each one plain line. A channel shows them as buttons that send the words as the user's message; one that cannot ignores them.
+   */
+  suggested_replies?: string[];
+  /**
+   * Present only when the router put a choice to the person (`CLAW_ASSISTANT_CHOICES`): the options they pick from, each one plain
+   * line, and whether they may pick several. A channel shows them as a card whose Send sends the picked options as the person's own
+   * message (their words, joined); one that cannot ignores it, and the text still names the options.
+   */
+  choices?: AssistantSayChoice;
+  confirm_write?: AssistantConfirmWrite;
+  /** A personal skill the message is about (`AssistantSkillCard`); present only with `CLAW_USER_SKILLS_ENABLED`. */
+  skill_card?: AssistantSkillCard;
+  /** Files the user gets with the message (a worker's deliveries, `deliveries.ts`): one download each. */
+  files?: AssistantFile[];
+  /** Present on a development environment session's own message: which session, and which of its three kinds of news. */
+  remote?: AssistantRemoteNotice;
+  /**
+   * The `event_id` of an earlier message of this turn that this one adds to: the system's start notice of an item, after which the
+   * router's words belong in that same message. A channel that still has that message shows it with these words added (its current
+   * text, a blank line, this text); one that does not shows this as a message of its own. When the start notice took the place of the
+   * server's "on it" line (`replaces`), this names that line's id: the message the channel shows, whose current text is the notice.
+   */
+  amends?: string;
+  /**
+   * The `event_id` of the router's first message of this turn, which this one takes the place of: a turn speaks to the user once, and a
+   * later say of it (the answer after a quick "查一下", or a correction) is that whole message again. A channel that still has that message
+   * shows this text in its place; one that does not shows this as a message of its own.
+   */
+  replaces?: string;
+  /** The message id of the turn a system notice answers or a router say belongs to (what an `amends` or a `replaces` is matched by). */
+  turn_message_id?: string;
+  /**
+   * Present when the turn was refused something only the person may do because their message came with a key, not with a confirmed
+   * identity (`not_attended`): a channel that can bind the person's identity offers it with this message; one that cannot ignores it.
+   */
+  needs_identity?: true;
+}
+
+/** The system's own message, sent when an item has needed the user for a while and nobody has said so. */
+export interface WorkItemNeedsYouPayload extends AssistantEventBase {
+  type: "work_item.needs_you";
+  fallback: true;
+  item: AssistantItemSnapshot;
+  /** Present when what the item waits for is a write its worker holds for the person (`AssistantHeldWrite`). */
+  held_write?: AssistantHeldWrite;
+}
+
+/**
+ * A write an item's worker holds for the person (`assistant/holds.ts`), on the message that says so: what a card needs to put it to them
+ * beside the text. The person answers it as any held call is answered: a `decision` (`allow` or `deny`, with `tool_use_id`) on the
+ * worker's session, `POST /v1/sessions/{session_id}/messages`; the channel that got the item's `approval.requested` draws the same card
+ * from that. Every field is what Claw recorded of the hold, never a model's words; `action` is in the person's language.
+ */
+export interface AssistantHeldWrite {
+  item_id: string;
+  /** The worker's session, where the decision is sent. */
+  session_id: string;
+  tool_use_id: string;
+  /** What it would do, in plain words (`approvalAction`). */
+  action: string;
+  expires_at?: string;
+}
+
+/**
+ * A review the person asked of someone else, handed to the channel that carried their message (`review_start` with a reviewer, when
+ * that message declared `channel_context.handoffs: ["review_for_other"]`). It runs on the reviewer's own credentials, which only that
+ * channel holds, so the channel starts it itself (`POST /v1/assistant/reviews` with the reviewer's token and key) and answers the
+ * person's message about it, in one message (the router says nothing about it). Every field is the router's call as Claw checked it: the
+ * reviewer is someone the channel listed with this message, each pull request is one the person's message names. `requester_note` is the
+ * person's own message, to quote to the reviewer as untrusted. `handoff_id` names the record Claw kept of it: the channel echoes it as
+ * `handoff_id` in that request, which then starts once and merges only if `merge` is true (Claw reads the record, not the request); how it
+ * merges is the reviewer's own review setting's, as for a review asked of them in the chat, and the route's answer says so per item.
+ */
+export interface AssistantReviewHandoff {
+  handoff_id: string;
+  reviewer: { user_id: string; name: string };
+  prs: Array<{ owner: string; repo: string; number: number }>;
+  merge: boolean;
+  requester_note: string;
+  /**
+   * What the router said in the same turn before handing the review over (another question of the person's answered), in order. Held
+   * and never delivered on its own (`say-hold.ts`), so the channel's one answer carries it: the channel adds it to that answer. Absent
+   * when nothing was said.
+   */
+  held_says?: string[];
+}
+
+/** The name an `assistant.action` carries when it is a handoff rather than one of the channel's own commands. */
+export const REVIEW_HANDOFF_ACTION = "review_for_other";
+
+/**
+ * A setting the channel offered beside the user's message, to be run by that channel as if the user typed it
+ * (`channel_action`); or, with `review` (and the action named `review_for_other`), a review asked of someone else, handed to the
+ * channel to start with that person's credentials. The channel runs it only for a message it sent itself (`channel_message_id`), once
+ * per `event_id`.
+ */
+export interface AssistantActionPayload {
+  type: "assistant.action";
+  event_id: string;
+  occurred_at: string;
+  user_id: string;
+  /** The id of the turn's message in Claw. */
+  message_id: string;
+  /** What the channel called that message when it sent it. */
+  channel_message_id: string;
+  action: { name: string; args: string };
+  review?: AssistantReviewHandoff;
+}
+
+export type AssistantEventPayload = AssistantSayPayload | WorkItemNeedsYouPayload | AssistantActionPayload;

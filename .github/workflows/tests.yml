@@ -32,9 +32,12 @@ on:
       - "CODEOWNERS"
       - ".gitattributes"
 
+# One run per pull request: a new head cancels the previous head's run.
+# Every other event (push to main or deploy/**, tags, schedules, manual runs)
+# gets a group of its own, so it is never cancelled or replaced.
 concurrency:
-  group: tests-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -106,6 +109,12 @@ jobs:
           bash scripts/lint-tests-must-resolve.sh --self-test
           bash scripts/lint-tests-must-resolve.sh --all
 
+      # The Claw HTTP API's wire types (packages/protocol/src/claw-api) against what the API builds: the type
+      # assertions in that test file are compiled here, since no package's own build reads its test directory.
+      - name: Wire types compile against the API
+        if: matrix.extras
+        run: npx --no-install tsc -p packages/protocol/tsconfig.wire-test.json
+
       # Runs each package's own `npm test` command with the shard flag added.
       # A TAP copy of the results feeds the per-package counts the gate jobs
       # below check and print.
@@ -172,7 +181,10 @@ jobs:
   claw:
     name: ${{ matrix.check }}
     needs: claw-shard
-    if: always()
+    # !cancelled(), not always(): it still reports failed shards, but a run
+    # cancelled because the pull request has a newer head no longer queues
+    # this job for a runner.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -230,6 +242,71 @@ jobs:
           if (errors.length) { for (const e of errors) console.log(`::error::${e}`); process.exit(1); }
           JS
 
+  # Restarting a component must not cost the turns that are running. The
+  # suite starts the real API and Brain entry points against a real Postgres
+  # and a real JetStream server, then rolls the API, rolls a Brain, kills a
+  # Brain, stalls JetStream, and loses a Brain with its node (killed and never
+  # restarted under its name), each in the middle of a turn, and checks that a
+  # long run's run.completed reaches its webhook exactly once through a Brain
+  # roll and an API roll (claw/packages/api/test/rolling-restart-chaos.test.ts). The package shards
+  # above skip it: they have no nats-server.
+  claw-rolling-restart:
+    name: Claw rolling restart (chaos)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: claw
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NATS_SERVER_VERSION: v2.11.9
+      NATS_SERVER_SHA256: 3eef83faa048d3879937a6871f59ae5d9c3bbf5900905b7a9ff996a894d755ab
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: claw/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: nats-server (pinned by checksum)
+        run: |
+          set -euo pipefail
+          tarball="nats-server-${NATS_SERVER_VERSION}-linux-amd64.tar.gz"
+          # --retry: GitHub's release downloads answer 504 for minutes during GitHub incidents (2026-11-09); curl --retry retries 5xx/timeouts.
+          curl -fsSL --retry 6 --retry-delay 20 -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/nats-io/nats-server/releases/download/${NATS_SERVER_VERSION}/$tarball"
+          echo "${NATS_SERVER_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          echo "CLAW_CHAOS_NATS_SERVER=$RUNNER_TEMP/nats-server-${NATS_SERVER_VERSION}-linux-amd64/nats-server" >> "$GITHUB_ENV"
+
+      - name: Rolling restarts mid-turn
+        working-directory: claw/packages/api
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+        run: |
+          set -euo pipefail
+          test -x "$CLAW_CHAOS_NATS_SERVER"
+          npx --no-install tsx --test --test-reporter=spec test/rolling-restart-chaos.test.ts | tee "$RUNNER_TEMP/chaos.log"
+          # A skipped suite passes too; this job exists to run it.
+          grep -q "^ℹ pass 8$" "$RUNNER_TEMP/chaos.log"
+
   connector:
     name: Connector (TypeScript)
     runs-on: ubuntu-latest
@@ -251,16 +328,152 @@ jobs:
       - run: npm run typecheck
         working-directory: connector
 
+      # test/terminal-input.test.ts types into a real tmux pane (a server of
+      # its own, on its own socket); in CI a missing tmux fails it, not skips it.
+      - name: tmux for the terminal-input tests
+        run: command -v tmux >/dev/null || { sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -q && sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -q tmux; }
+
       # Real child processes and sockets: a stand-in Claw and a stand-in ACP
-      # adapter, no database and no network beyond the loopback.
-      - run: npm test
+      # adapter, no database and no network beyond the loopback. TMPDIR is a
+      # directory of this step's own, so the check after the run sees only what
+      # the suite made: every directory a test makes is removed when its file
+      # ends (test/support/tmp.ts), and one left behind fails the job. tsx's and
+      # node's own caches are reused across runs and are not the suite's.
+      - name: npm test, leaving nothing in TMPDIR
         working-directory: connector
+        run: |
+          set -euo pipefail
+          export TMPDIR="$RUNNER_TEMP/connector-tmp"
+          mkdir -p "$TMPDIR"
+          npm test
+          left="$(find "$TMPDIR" -mindepth 1 -maxdepth 1 ! -name 'tsx-*' ! -name node-compile-cache -printf '%f\n' | sort)"
+          if [ -n "$left" ]; then
+            echo "::error::the connector tests left $(printf '%s\n' "$left" | wc -l) entries in TMPDIR ($(printf '%s\n' "$left" | grep -c '^cc-' || true) of them cc-*)"
+            # What is in each one says who wrote it (2026-11-07: a cm-* holding only state/connector.json was a command still
+            # being carried out after its connector had stopped).
+            printf '%s\n' "$left" | head -50 | while IFS= read -r e; do
+              echo "$e"
+              { find "$TMPDIR/$e" -maxdepth 5 -mindepth 1 -printf '  %P\n' | head -20; } || true
+            done
+            exit 1
+          fi
+          echo "TMPDIR is clean after the run: $(ls -A "$TMPDIR" | tr '\n' ' ')"
 
       - name: The bundle builds and runs
         working-directory: connector
         run: |
           npm run build
           node dist/cli.js --version
+
+  # The personal agent (personal-agent/): its own npm workspace, which compiles the Claw wire contract in from
+  # claw/packages/protocol (see personal-agent/packages/core/src/protocol.ts). The job has no path filter, like every
+  # job here, so a pull request that changes the contract runs it too: a field Claw renames fails the typecheck below.
+  # Each step is a gate, and each was seen to fail on a deliberate violation before it was trusted.
+  personal-agent:
+    name: Personal agent (TypeScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: personal-agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: personal-agent/package-lock.json
+
+      # Python with `cryptography`, for the cross-language Fernet test (tokens made here must decrypt in Python, as the
+      # Python worker reads the same database). Without it that test fails in CI rather than skipping.
+      # Retried once after 90 s: a GitHub release download can fail for minutes during an incident.
+      - id: python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        continue-on-error: true
+        with:
+          python-version: "3.12"
+      - name: Wait before retrying setup-python
+        if: steps.python.outcome == 'failure'
+        run: sleep 90
+      - name: Set up Python (retry)
+        if: steps.python.outcome == 'failure'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Python for the cross-language tests
+        run: pip install -r test-support/python/requirements.txt
+
+      - run: npm ci
+
+      # strict, noUncheckedIndexedAccess and exactOptionalPropertyTypes, over every package, test and fake.
+      - name: Typecheck
+        run: npm run typecheck
+
+      # typescript-eslint strict (type-checked), import cycles, complexity <= 15, functions <= 80 lines, files <= 600
+      # lines, no any, no floating promises, and no eslint-disable without a reason or of a gate rule.
+      - name: ESLint
+        run: npm run lint
+
+      - name: Prettier
+        run: npm run format:check
+
+      # The layers: core is channel-neutral, runtime depends on core only, teams on core and runtime, no cycles,
+      # packages used through their entry, no test code in src, protocol only through core/src/protocol.ts.
+      - name: Layers (dependency-cruiser)
+        run: npm run depcruise
+
+      # The whole suite, once, under c8; each package is held to its floor (core 90%, runtime 85%, teams 85%: lines,
+      # statements, functions and branches). The names of the tests that ran feed the ported-tests check.
+      - name: Tests and coverage floors
+        run: npm run coverage
+
+      # Every TS test a ported-tests ledger names ran and passed in the run above.
+      - name: Ported-tests ledgers
+        run: npm run ported-tests
+
+  # The connector against the REAL Claude adapter, as the runner's own user and as root: Claude Code offers
+  # bypassPermissions to root only with IS_SANDBOX set, and an agent with approval = "never" was refused with
+  # mode_unavailable on every root machine until the connector set it. Opening a session sends no prompt, so no
+  # model and no credentials are needed. The file skips without the adapter, so the pass count is checked.
+  connector-real-adapter:
+    name: Connector real adapter (${{ matrix.user }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        user: [runner, root]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: connector/package-lock.json
+
+      - run: npm ci
+        working-directory: connector
+
+      - name: Install the adapter the claude preset runs
+        run: npm i --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/acp" @agentclientprotocol/claude-agent-acp@0.99.0
+
+      - name: Open sessions with approval never and ask
+        working-directory: connector
+        shell: bash
+        env:
+          AS_USER: ${{ matrix.user }}
+        run: |
+          adapter="$RUNNER_TEMP/acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"
+          node="$(command -v node)"
+          if [ "$AS_USER" = root ]; then
+            sudo env "PATH=$PATH" "CLAW_REAL_CLAUDE_ACP=$adapter" "$node" --import tsx --test test/real-modes.test.ts | tee "$RUNNER_TEMP/real.log"
+          else
+            env -u IS_SANDBOX "CLAW_REAL_CLAUDE_ACP=$adapter" "$node" --import tsx --test test/real-modes.test.ts | tee "$RUNNER_TEMP/real.log"
+          fi
+          grep -q "^ℹ pass 5$" "$RUNNER_TEMP/real.log"
 
   sandbox:
     name: Sandbox (Go)
@@ -292,7 +505,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - run: python3 -c 'import yaml' || sudo apt-get install -y python3-yaml
+      - run: python3 -c 'import yaml' || sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y python3-yaml
 
       - run: bash scripts/release-tests/sandbox-router-ingress.sh
 

@@ -11,7 +11,9 @@ import readline from "node:readline";
 
 const env = process.env;
 const START_MODE = env.FAKE_START_MODE || "default";
-const MODES = ["default", "plan", "acceptEdits", "bypassPermissions"].map((id) => ({ id, name: id === "default" && env.FAKE_MODE_NAME ? env.FAKE_MODE_NAME : id }));
+// FAKE_ROOT=1 stands in for running as root: like claude-agent-acp 0.99.0, bypassPermissions is offered only with IS_SANDBOX set.
+const BYPASS_OFFERED = env.FAKE_ROOT !== "1" || !!env.IS_SANDBOX;
+const MODES = ["default", "plan", "acceptEdits", ...(BYPASS_OFFERED ? ["bypassPermissions"] : [])].map((id) => ({ id, name: id === "default" && env.FAKE_MODE_NAME ? env.FAKE_MODE_NAME : id }));
 const OPTION_IDS = (env.FAKE_OPTIONS || "allow-once,allow-with-updates,reject").split(",");
 const OPTION_KINDS = ["allow_once", "allow_always", "reject_once"];
 const log = env.FAKE_LOG ? (o) => fs.appendFileSync(env.FAKE_LOG, JSON.stringify(o) + "\n") : () => {};
@@ -20,6 +22,7 @@ let nextId = 1;
 let nextOut = 1000;
 const waiting = new Map();
 
+let signedIn = false;
 const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\n");
 const reply = (id, result) => send({ id, result });
 const fail = (id, code, message) => send({ id, error: { code, message } });
@@ -34,11 +37,44 @@ if (env.FAKE_STDERR_SPLIT === "1") { process.stderr.write("auth: Bearer abcdefgh
 // Some real adapters do not leave when their stdin closes; this one can be told not to either.
 if (env.FAKE_SURVIVE_EOF === "1") setInterval(() => {}, 1000);
 
+/**
+ * FAKE_TRANSCRIPT=1: each turn is appended to the conversation's transcript in `$CLAUDE_CONFIG_DIR/projects/<cwd>/<id>.jsonl`,
+ * in the shapes claude-agent-acp 0.99.0 has Claude Code write (measured): its entries say `entrypoint: "sdk-cli"`, and the
+ * prompt `origin: {kind: "human"}, promptSource: "sdk"`.
+ */
+function transcriptOf(sessionId, s) {
+  return path.join(env.CLAUDE_CONFIG_DIR, "projects", s.cwd.replace(/[^A-Za-z0-9]/g, "-"), `${sessionId}.jsonl`);
+}
+function writeTurn(sessionId, s, promptEntry, answer, extra = []) {
+  if (env.FAKE_TRANSCRIPT !== "1") return;
+  const file = transcriptOf(sessionId, s);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const base = { sessionId, cwd: s.cwd, entrypoint: "sdk-cli", userType: "external", isSidechain: false, version: "2.1.312" };
+  const lines = [
+    { type: "queue-operation", operation: "enqueue", sessionId },
+    { type: "queue-operation", operation: "dequeue", sessionId },
+    { ...base, type: "user", ...promptEntry },
+    { type: "api-request", sessionId },
+    ...extra.map((e) => ({ ...base, ...e })),
+    { ...base, type: "assistant", message: { role: "assistant", content: [{ type: "text", text: answer }] } },
+  ];
+  fs.appendFileSync(file, lines.map((l) => JSON.stringify(l) + "\n").join(""));
+}
+
 async function prompt(id, params) {
   const s = sessions.get(params.sessionId);
-  const text = (params.prompt || []).map((p) => p.text || "").join(" ");
+  const said = (params.prompt || []).map((p) => p.text || "").join(" ");
+  // A `background` turn records the task it started as a real run_in_background call does (`toolUseResult.backgroundTaskId`).
+  const task = /^background \S+$/.test(said) ? `b${nextOut++}` : null;
+  const ran = task ? [
+    { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: `toolu_${task}`, name: "Bash", input: { run_in_background: true } }] } },
+    { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: `toolu_${task}`, content: `Command running in background with ID: ${task}` }] }, toolUseResult: { stdout: "", backgroundTaskId: task } },
+  ] : [];
+  if (said) writeTurn(params.sessionId, s, { message: { role: "user", content: said }, promptSource: "sdk", origin: { kind: "human" } }, said.startsWith("say ") ? said.slice(4) : "ok", ran);
+  // The connector's own "go on" after a restart (manager.ts CONTINUE_PROMPT): like a real agent, it asks again.
+  const text = said.startsWith("[claw-connector]") ? "write continued.txt" : said;
   s.cancelled = false;
-  log({ prompt: text, mode: s.mode });
+  log({ prompt: said, mode: s.mode });
   const done = (stopReason) => reply(id, { stopReason, usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } });
   const m = /^write (\S+)(?: (.*))?$/.exec(text);
   if (m) {
@@ -75,6 +111,18 @@ async function prompt(id, params) {
   }
   if (text === "bigoutput") {
     update(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "big", status: "completed", content: [{ type: "content", content: { type: "text", text: "x".repeat(30000) } }] });
+    return done("end_turn");
+  }
+  // `background <file>`: like a Bash call with run_in_background, the turn ends at once; the task finishes once <file> exists
+  // (the test says when, rather than a timer racing the connector), and Claude Code then writes the notification as a prompt
+  // of its own and answers it, in this same process, with no one asking.
+  if ((n = /^background (\S+)$/.exec(text))) {
+    update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "started" } });
+    const note = `<task-notification>\n<task-id>${task}</task-id>\n<status>completed</status>\n</task-notification>`;
+    void (async () => {
+      for (let i = 0; i < 1200 && !fs.existsSync(n[1]); i++) await new Promise((r) => setTimeout(r, 25));
+      if (fs.existsSync(n[1])) writeTurn(params.sessionId, s, { message: { role: "user", content: note }, promptSource: "system", origin: { kind: "task-notification", producer: "session-task" } }, "finished");
+    })();
     return done("end_turn");
   }
   if (text.startsWith("say ")) {
@@ -127,23 +175,48 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
   const { id, method, params } = msg;
   log({ method, params: method === "session/prompt" ? undefined : params });
   switch (method) {
-    case "initialize":
-      return reply(id, { protocolVersion: 1, agentInfo: { name: "fake" }, authMethods: [], agentCapabilities: { loadSession: true, sessionCapabilities: env.FAKE_NO_RESUME === "1" ? { close: {} } : { resume: {}, close: {}, list: {} } } });
+    case "initialize": {
+      // FAKE_AUTH_STATUS: report a sign-in as claude-agent-acp does (`_auth/status_update`, a moment after initialize).
+      // FAKE_API_KEY_AUTH: sign in only through `authenticate {methodId: "api-key"}` with OPENAI_API_KEY set, as codex-acp.
+      const authMethods = env.FAKE_API_KEY_AUTH === "1" ? [{ id: "api-key", name: "API Key", _meta: { "api-key": { provider: "openai" } } }, { id: "chat-gpt", name: "ChatGPT" }] : [];
+      reply(id, { protocolVersion: 1, agentInfo: { name: "fake" }, authMethods, agentCapabilities: { loadSession: true, ...(env.FAKE_AUTH_STATUS ? { _meta: { authStatus: {} } } : {}), sessionCapabilities: env.FAKE_NO_RESUME === "1" ? { close: {} } : { resume: {}, close: {}, list: {} } } });
+      // FAKE_AUTH_STATUS_FILE: the status is read from that file when the process starts (a sign-in that changes later).
+      const kind = env.FAKE_AUTH_STATUS_FILE ? fs.readFileSync(env.FAKE_AUTH_STATUS_FILE, "utf8").trim() : env.FAKE_AUTH_STATUS;
+      if (env.FAKE_AUTH_STATUS) setTimeout(() => send({ method: "_auth/status_update", params: { authStatus: { kind, label: kind === "none" ? "Not logged in" : "API key" } } }), Number(env.FAKE_AUTH_STATUS_DELAY_MS || 50));
+      return;
+    }
+    case "authenticate":
+      if (params?.methodId === "api-key" && env.OPENAI_API_KEY) { signedIn = true; return reply(id, {}); }
+      return fail(id, -32603, "no api key");
     case "session/list": {
       // The shape of a real adapter's answer: {sessionId, cwd, title, updatedAt}, newest first, paged by an opaque cursor.
-      const all = JSON.parse(env.FAKE_SESSIONS || "[]");
+      // FAKE_SESSIONS_FILE: the list as it is on disk now (a test adds a conversation between two lists).
+      const all = JSON.parse(env.FAKE_SESSIONS_FILE ? fs.readFileSync(env.FAKE_SESSIONS_FILE, "utf8") : env.FAKE_SESSIONS || "[]");
       const size = Number(env.FAKE_PAGE_SIZE || 100);
       const from = params?.cursor ? Number(String(params.cursor).replace("offset:", "")) : 0;
       return reply(id, { sessions: all.slice(from, from + size), ...(from + size < all.length ? { nextCursor: `offset:${from + size}` } : {}) });
     }
     case "session/new": {
       if (env.FAKE_AUTH_REQUIRED) return fail(id, -32000, "Authentication required");
+      if (env.FAKE_API_KEY_AUTH === "1" && !signedIn) return fail(id, -32000, "Authentication required");
+      // An agent that signs in with a variable (ANTHROPIC_API_KEY): without it, refused as the real adapters refuse.
+      if (env.FAKE_NEEDS_ENV && !env[env.FAKE_NEEDS_ENV]) return fail(id, -32000, "Authentication required");
       const sessionId = "acp-" + nextId++;
-      const s = { cwd: params.cwd, mode: START_MODE, cancelled: false };
+      // Like claude-agent-acp 0.99.0: a client that sets allowDangerouslySkipPermissions to false gets no bypass at all,
+      // and a session the user's settings start in bypassPermissions starts in default instead.
+      const noBypass = params?._meta?.claudeCode?.options?.allowDangerouslySkipPermissions === false;
+      const start = noBypass && START_MODE === "bypassPermissions" ? "default" : START_MODE;
+      // ... and, starting in a mode that never asks, it says so while it sets the session up.
+      if (env.FAKE_NEW_WARN === "1" && start === "bypassPermissions") process.stderr.write("Warning: canUseTool will not be invoked: permissionMode 'bypassPermissions' auto-approves every tool call\n");
+      const s = { cwd: params.cwd, mode: start, cancelled: false };
       sessions.set(sessionId, s);
       return reply(id, { sessionId, modes: modesOf(s), configOptions: configOptions(s) });
     }
     case "session/resume": case "session/load": {
+      // A sign-in that lapsed before an existing session comes back (Codex's resume needs one).
+      if (env.FAKE_RESUME_AUTH === "1") return fail(id, -32000, "Authentication required");
+      // What claude-agent-acp answers for a session that never had a message: it kept nothing to resume.
+      if (env.FAKE_RESUME_NOT_FOUND === "1" && !sessions.has(params.sessionId)) return fail(id, -32002, "Resource not found");
       const s = sessions.get(params.sessionId) ?? { cwd: params.cwd, mode: START_MODE, cancelled: false };
       sessions.set(params.sessionId, s);
       // The trap measured on a real adapter: resuming puts the user's own configured mode back.
@@ -171,6 +244,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       return reply(id, { configOptions: configOptions(s) });
     }
     case "session/prompt":
+      // A sign-in that lapsed after the session opened (an expired login): the prompt is refused, as claude-agent-acp does.
+      if (env.FAKE_PROMPT_AUTH === "1") return fail(id, -32000, "Authentication required");
       return void prompt(id, params).catch((e) => fail(id, -32603, String(e)));
     case "session/cancel": {
       const s = sessions.get(params.sessionId);

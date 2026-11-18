@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * A turn of the assistant the gateway refused because the user's key has no binding to the upstream subscription, run again once on the
- * fallback model, which needs none.
+ * A turn of the assistant the gateway refused because of the user's key -- it has no binding to the upstream subscription, or the
+ * subscription key it is bound to is refused as invalid (`key-refusal.ts`) -- run again once on the fallback model, which needs none.
  *
  * Claw calls a model with the user's own key. A key with no subscription binding is refused by the gateway for a model behind that
  * subscription, before the model runs: the turn fails with nothing done, and its whole text is the gateway's refusal. The gateway's
@@ -34,25 +34,16 @@ import { queuedMessageId } from "../tasks/chat-run.js";
 import { detectLanguage } from "./language.js";
 import { drainSessionIfIdle, queueServerMessage, type QueuedServerMessage } from "./messages.js";
 import { fallbackModel, modelChoiceOn } from "./model-choice.js";
+import { keyRefusalOf, type KeyRefusal } from "./key-refusal.js";
 import { recordSystemNotice, type SayDeps } from "./outbound.js";
 import { queueReviewFirstTurnAgain } from "./review-items.js";
+import { redactStoredText } from "@claw/utils";
 
 const logger = pino({ name: "assistant-model-fallback" });
 
-/**
- * The gateway's refusal of a key without a subscription binding, as a failed turn's text begins: an SDK's or the gateway's error class in
- * front at most, then the status and the sentence. Two shapes: the proxy's 403 for a user with no binding at all, and the upstream's 401
- * for a request that carried no subscription key. Bounded and without nested quantifiers, so a hostile text costs linear time.
- */
-const MISSING_KEY = new RegExp(
-  String.raw`^\s*(?:(?:API |[A-Za-z_.]{1,40})Error:\s*){0,3}`
-  + String.raw`(?:403\b[^\n]{0,40}No APIM Key binding found|401\b[^\n]{0,160}?missing subscription key)`,
-  "i",
-);
-
-/** Whether a failed turn's text is that refusal (only a failed turn's: an answer that quotes it is an answer). */
+/** Whether a failed turn's text is the gateway's refusal of a key with no subscription binding (`key-refusal.ts`). */
 export function isMissingKeyRefusal(text: unknown): boolean {
-  return typeof text === "string" && MISSING_KEY.test(text);
+  return keyRefusalOf(text) === "missing";
 }
 
 /** The model the turn under `messageId` runs on when it is a router turn run again here, or null. */
@@ -89,18 +80,25 @@ async function whoseSession(sessionId: string): Promise<Whose | null> {
   return { kind: item.kind, ownerId: item.user_id, itemId: item.item_id, seq: Number(item.seq) };
 }
 
-function notice(whose: Whose, from: string | null, to: string, words: string): string {
+function notice(whose: Whose, refusal: KeyRefusal, from: string | null, to: string, words: string): string {
   const zh = detectLanguage(words) === "Chinese";
   const url = CLAW_ASSISTANT_KEY_BINDING_URL;
   const was = from ?? (zh ? "默认模型" : "the default model");
+  const invalid = refusal === "invalid";
+  const why = invalid
+    ? (zh ? "你绑定的 APIM Key 无效或已过期" : "the APIM key bound to your key is invalid or expired")
+    : (zh ? "你的 key 还没有绑定 APIM Key" : "your key has no APIM key bound");
+  const cure = invalid
+    ? (zh ? "重新上传有效的 APIM Key 后" : "Upload a valid APIM key")
+    : (zh ? "上传 APIM Key 后" : "Upload an APIM key");
   if (whose.kind === "router") {
     return zh
-      ? `你的 key 还没有绑定 APIM Key，用不了 ${was}，这条消息改用 ${to} 处理。${url ? `上传 APIM Key 后即可使用 ${was}：\n${url}` : ""}`
-      : `Your key has no APIM key bound, so ${was} could not answer; ${to} handled this message instead.${url ? ` Upload an APIM key to use ${was}:\n${url}` : ""}`;
+      ? `${why}，用不了 ${was}，这条消息改用 ${to} 处理。${url ? `${cure}即可使用 ${was}：\n${url}` : ""}`
+      : `${why[0].toUpperCase()}${why.slice(1)}, so ${was} could not answer; ${to} handled this message instead.${url ? ` ${cure} to use ${was}:\n${url}` : ""}`;
   }
   return zh
-    ? `#${whose.seq} 用 ${was} 时被拒：你的 key 还没有绑定 APIM Key。已改用 ${to} 重新运行。${url ? `上传 APIM Key 后再说一次即可改回 ${was}：\n${url}` : ""}`
-    : `#${whose.seq} was refused on ${was}: your key has no APIM key bound. It runs again on ${to}.${url ? ` Upload an APIM key, then ask again to use ${was}:\n${url}` : ""}`;
+    ? `#${whose.seq} 用 ${was} 时被拒：${why}。已改用 ${to} 重新运行。${url ? `${cure}再说一次即可改回 ${was}：\n${url}` : ""}`
+    : `#${whose.seq} was refused on ${was}: ${why}. It runs again on ${to}.${url ? ` ${cure}, then ask again to use ${was}:\n${url}` : ""}`;
 }
 
 /**
@@ -109,7 +107,8 @@ function notice(whose: Whose, from: string | null, to: string, words: string): s
  */
 export async function rerunOnFallback(end: FailedTurn, deps: SayDeps = {}): Promise<"rerun" | "skipped"> {
   if (!modelChoiceOn() || !end.failed || end.interrupted || !end.runIds.length) return "skipped";
-  if (!isMissingKeyRefusal(end.finalText) && !isMissingKeyRefusal(end.failureReason)) return "skipped";
+  const refusal = keyRefusalOf(end.finalText) ?? keyRefusalOf(end.failureReason);
+  if (!refusal) return "skipped";
   const to = fallbackModel();
   if (!to) return "skipped";
   const run = (await db.query(
@@ -138,7 +137,7 @@ export async function rerunOnFallback(end: FailedTurn, deps: SayDeps = {}): Prom
     );
     if (!once.rowCount) return null;
     const dedupeKey = `model-fallback:${messageId}`;
-    if (whose.kind === "router") return rerunRouterTurn(query, end.sessionId, whose.ownerId, messageId, dedupeKey);
+    if (whose.kind === "router") return rerunRouterTurn(query, end.sessionId, whose.ownerId, messageId, dedupeKey, run.prompt);
     // The item's row, held to the end of this transaction, as a stop and a restart hold it (`stopWorkItem`, `restartReview`): one that was
     // stopped or restarted since it was read above is not run again, and none can be stopped between this check and the queueing.
     const open = (await query("SELECT board_state FROM claw_work_items WHERE item_id = $1 FOR UPDATE", [whose.itemId])).rows[0] as
@@ -163,7 +162,7 @@ export async function rerunOnFallback(end: FailedTurn, deps: SayDeps = {}): Prom
     await query(
       `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
        SELECT item_id, 'model_fallback', 'policy', generation, $2 FROM claw_work_items WHERE item_id = $1`,
-      [whose.itemId, `The gateway refused ${run.model ?? "the default model"} for want of a key binding; running again on ${to}.`],
+      [whose.itemId, `The gateway refused ${run.model ?? "the default model"} ${refusal === "invalid" ? "for an invalid subscription key" : "for want of a key binding"}; running again on ${to}.`],
     );
     return { words: content };
   }).catch((err) => {
@@ -177,7 +176,9 @@ export async function rerunOnFallback(end: FailedTurn, deps: SayDeps = {}): Prom
     : ((await db.query("SELECT session_id FROM claw_assistants WHERE user_id = $1", [whose.ownerId])).rows[0] as { session_id: string } | undefined)?.session_id;
   if (router) {
     await recordSystemNotice({
-      userId: whose.ownerId, sessionId: router, text: notice(whose, run.model, to, queued.words), key: `model_fallback:${end.sessionId}:${messageId}`,
+      userId: whose.ownerId, sessionId: router, text: notice(whose, refusal, run.model, to, queued.words), key: `model_fallback:${end.sessionId}:${messageId}`,
+      // A router turn's notice goes back to the surface of the message it was answering; a worker's is not the person's turn.
+      ...(whose.kind === "router" && messageId ? { sourceTurn: messageId } : {}),
     }, deps).catch((err) => logger.warn({ err, sessionId: end.sessionId }, "assistant.model_fallback_notice_failed"));
   }
   logger.warn({ sessionId: end.sessionId, kind: whose.kind, from: run.model, to }, "assistant.model_fallback_rerun");
@@ -191,15 +192,20 @@ class NotRerun extends Error {}
  * The user's message queued again on their router session, with what the route wrote down about it copied to the new turn's id: the same
  * words, the same authentication, the same moment received (so it goes stale when the first would have), and whether it had read what a
  * worker wrote. Nothing for a turn that answers no message of the user's.
+ *
+ * The stored message has credential-shaped content masked (`recordAssistantMessage`), and the model is not to be given a different message
+ * the second time: when the refused run's prompt is that same message as the user wrote it (masking it gives the stored words), the
+ * prompt is what is queued. Otherwise the stored words are.
  */
 async function rerunRouterTurn(
-  query: Querier, sessionId: string, userId: string, messageId: string, dedupeKey: string,
+  query: Querier, sessionId: string, userId: string, messageId: string, dedupeKey: string, prompt: string,
 ): Promise<{ words: string } | null> {
   const message = (await query(
     "SELECT content FROM claw_assistant_messages WHERE session_id = $1 AND message_id = $2", [sessionId, messageId],
   )).rows[0] as { content: string } | undefined;
   if (!message) throw new NotRerun();
-  const out = await queueServerMessage({ query }, { sessionId, userId, content: message.content, dedupeKey });
+  const words = prompt && redactStoredText(prompt).text === message.content ? prompt : message.content;
+  const out = await queueServerMessage({ query }, { sessionId, userId, content: words, dedupeKey });
   if (!out.ok || out.pendingId === null) throw new NotRerun();
   const rerunId = queuedMessageId(out.pendingId);
   await query(
@@ -210,5 +216,5 @@ async function rerunRouterTurn(
     [sessionId, messageId, rerunId],
   );
   await query("UPDATE claw_assistant_model_fallbacks SET rerun_message_id = $3 WHERE session_id = $1 AND message_id = $2", [sessionId, messageId, rerunId]);
-  return { words: message.content };
+  return { words };
 }

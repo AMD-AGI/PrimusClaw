@@ -21,12 +21,12 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
+import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
-const WORKSPACE = mkdtempSync(join(tmpdir(), "fg-cut-"));
+const WORKSPACE = tmpDir("fg-cut-");
 // The command may run under the sandbox's unprivileged child identity.
 chmodSync(WORKSPACE, 0o777);
 process.env.WORKSPACE_PATH = WORKSPACE;

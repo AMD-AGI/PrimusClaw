@@ -90,9 +90,8 @@ helm lint "$repo_root/sandbox/deploy/helm" \
   --values "$repo_root/scripts/release-tests/values/sandbox-release.yaml"
 sandbox_render="$(mktemp)"
 claw_render="$(mktemp)"
-memory_render="$(mktemp)"
 background_render="$(mktemp)"
-trap 'rm -f "$sandbox_render" "$claw_render" "$memory_render" "$background_render"' EXIT
+trap 'rm -f "$sandbox_render" "$claw_render" "$background_render"' EXIT
 helm template sandbox-release "$repo_root/sandbox/deploy/helm" \
   --namespace agent-sandbox-system \
   --values "$repo_root/scripts/release-tests/values/sandbox-release.yaml" >"$sandbox_render"
@@ -186,50 +185,6 @@ helm template claw-background "$repo_root/claw/deploy/charts/claw" \
   --values "$background_values" --set features.backgroundShell=true >/dev/null
 helm template claw-background "$repo_root/claw/deploy/charts/claw" \
   --values "$background_values" --set-string features.backgroundShell=true >/dev/null
-
-helm lint "$repo_root/memory/memory-service/deploy/helm" \
-  --set-string 'postgres.auth.password=p@ss/word'
-helm template memory-release "$repo_root/memory/memory-service/deploy/helm" \
-  --set-string 'postgres.auth.password=p@ss/word' >"$memory_render"
-rg -q 'name: memory-release-claw-memory-service-postgres-secret' "$memory_render"
-rg -q 'POSTGRES_PASSWORD: "p@ss/word"' "$memory_render"
-rg -q 'name: POSTGRES_HOST' "$memory_render"
-# The bundled path must hand the service its credentials as discrete
-# POSTGRES_* keys and let Python percent-encode them, so any DSN in the render
-# means the chart went back to concatenating one itself.
-if rg -q 'MEMORY_SERVICE_DATABASE_URL|postgresql://' "$memory_render"; then
-  echo "memory-service bundled render must not contain a database URL" >&2
-  exit 1
-fi
-# A password-only change has to move the Deployment checksum, otherwise Pods
-# keep serving with the credentials baked into their current environment.
-memory_checksum_a="$(rg -o 'checksum/postgres-secret: \S+' "$memory_render")"
-memory_checksum_b="$(helm template memory-release \
-  "$repo_root/memory/memory-service/deploy/helm" \
-  --set-string 'postgres.auth.password=rotated/p@ss' |
-  rg -o 'checksum/postgres-secret: \S+')"
-if [ -z "$memory_checksum_a" ] || [ "$memory_checksum_a" = "$memory_checksum_b" ]; then
-  echo "memory-service Deployment does not roll on a Postgres password change" >&2
-  exit 1
-fi
-helm template memory-release "$repo_root/memory/memory-service/deploy/helm" \
-  --set postgres.auth.existingSecret=release-postgres-secret >/dev/null
-# An external database wins over postgres.enabled: no bundled resources, and no
-# bundled password required.
-memory_external_render="$(helm template memory-release \
-  "$repo_root/memory/memory-service/deploy/helm" \
-  --set-string 'externalDatabase.url=postgresql://user:p%40ss@db.example.invalid:5432/claw_memory')"
-if printf '%s' "$memory_external_render" | rg -q 'component: postgres'; then
-  echo "memory-service chart deployed bundled Postgres alongside an external database" >&2
-  exit 1
-fi
-printf '%s' "$memory_external_render" |
-  rg -q 'MEMORY_SERVICE_DATABASE_URL: "postgresql://user:p%40ss@db.example.invalid:5432/claw_memory"'
-if helm template memory-release "$repo_root/memory/memory-service/deploy/helm" \
-  >/dev/null 2>&1; then
-  echo "memory-service chart accepted a missing database credential" >&2
-  exit 1
-fi
 
 require_tool docker
 echo "==> Claw image build and Hands compatibility smoke"

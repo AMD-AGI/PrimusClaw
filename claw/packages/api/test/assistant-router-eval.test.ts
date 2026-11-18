@@ -13,7 +13,7 @@
  *   R1  the set has at least 60 cases, unique ids, and at least 12 of each of the plan's five kinds
  *   R2  every decision the Router can make is labelled somewhere: create, send, stop, nothing, and a mix
  *   R3  every item a label names exists, and is open where the label sends to it or stops it
- *   R4  the Router is offered exactly the assistant's five tools, and sees the fixture's items in its prompt
+ *   R4  the Router is offered exactly the assistant's six tools, and sees the fixture's items in its prompt
  *   R5  the stand-in refuses what the real tools refuse: a long say, a send to a closed item, an unknown item, a name that is not one
  *   R5b the stand-in names an item as the real tools do: by id or by number, in every tool and in say
  *   R6  the loop follows the model's calls to the end, and a refused call changes nothing
@@ -108,9 +108,9 @@ test("R3 every item a label names exists, and is open where the label sends to i
   assert.ok(FIXTURE.some((i) => i.boardState === "done") && FIXTURE.some((i) => i.boardState === "needs_you") && FIXTURE.some((i) => i.boardState === "in_progress"));
 });
 
-test("R4 the Router is offered exactly the assistant's five tools, and sees the fixture's items in its prompt", async () => {
+test("R4 the Router is offered exactly the assistant's six tools, and sees the fixture's items in its prompt", async () => {
   const tools = await routerTools();
-  assert.deepEqual(tools.map((t) => t.name), ["say", "work_create", "work_recall", "work_send", "work_stop"].map((n) => `${P}${n}`));
+  assert.deepEqual(tools.map((t) => t.name), ["deliver_text", "say", "work_create", "work_recall", "work_send", "work_stop"].map((n) => `${P}${n}`));
   assert.ok(ASSISTANT_TOOLS_PATTERN.startsWith(P));
   for (const t of tools) assert.ok(t.description.length > 0 && (t.input_schema as { type?: string }).type === "object", t.name);
   // The worker's tool is not the router's.
@@ -168,7 +168,7 @@ test("R6 the loop follows the model's calls to the end, and a repeated title is 
   const results = script.sent[1]?.messages.at(-1)?.content as Array<{ tool_use_id: string }>;
   assert.deepEqual(results.map((r) => r.tool_use_id), ["a1", "a2"]);
   // Every call is made with the system prompt of the fixture, and the tools.
-  assert.ok(script.sent.every((s) => s.system.includes("Work items") && s.tools.length === 5));
+  assert.ok(script.sent.every((s) => s.system.includes("Work items") && s.tools.length === 6));
   const score = scoreCase(byId("new-01"), trace);
   assert.ok(score.dispatchOk && score.turnOk);
 });
@@ -392,7 +392,7 @@ test("R8b the model call is the Messages request, retries only what may pass, an
     assert.equal(seen[0]?.headers["x-api-key"], "k-secret");
     assert.equal(seen[0]?.body.model, "m-1");
     assert.deepEqual(seen[0]?.body.system, [{ type: "text", text: "SYS" }]);
-    assert.equal(seen[0]?.body.tools.length, 5);
+    assert.equal(seen[0]?.body.tools.length, 6);
     assert.ok(!JSON.stringify(seen[0]?.body).includes("k-secret"));
 
     answers.push(new Response("bad request", { status: 400 }));

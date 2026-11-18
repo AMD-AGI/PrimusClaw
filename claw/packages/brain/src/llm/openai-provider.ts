@@ -4,6 +4,7 @@
 import OpenAI from "openai";
 import pino from "pino";
 import type {
+  ChatCompletionContentPart,
   ChatCompletionChunk,
   ChatCompletionMessageParam,
   ChatCompletionTool,
@@ -95,12 +96,31 @@ export function toOpenAiMessages(messages: Message[]): ChatCompletionMessagePara
       });
     }
     const rest = blocks.filter((b) => b.type !== "tool_result");
+    if (m.role === "user" && rest.some(isImageBlock)) {
+      // A picture the person sent with the message (`prompt_images`): the wire's own image part, never its base64 pasted as text.
+      out.push({ role: "user", content: rest.map(userContentPart) });
+      continue;
+    }
     if (rest.length) {
       const text = rest.map((b) => (b.type === "text" ? String(b.text ?? "") : JSON.stringify(b))).join("\n");
       out.push({ role: m.role === "system" ? "system" : "user", content: text } as ChatCompletionMessageParam);
     }
   }
   return out;
+}
+
+function isImageBlock(b: Record<string, unknown>): boolean {
+  const source = b.source as { type?: unknown; data?: unknown; media_type?: unknown } | undefined;
+  return b.type === "image" && source?.type === "base64" && typeof source.data === "string" && typeof source.media_type === "string";
+}
+
+/** One block of a user message with a picture in it, as the OpenAI wire takes it: text, or an image as a data URL. */
+function userContentPart(b: Record<string, unknown>): ChatCompletionContentPart {
+  if (isImageBlock(b)) {
+    const source = b.source as { data: string; media_type: string };
+    return { type: "image_url", image_url: { url: `data:${source.media_type};base64,${source.data}` } };
+  }
+  return { type: "text", text: b.type === "text" ? String(b.text ?? "") : JSON.stringify(b) };
 }
 
 function toOpenAiTools(tools: ToolSchema[]): ChatCompletionTool[] {

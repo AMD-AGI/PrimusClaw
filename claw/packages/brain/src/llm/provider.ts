@@ -141,8 +141,31 @@ export interface LlmCacheReport {
  * user/session id headers, client instance) is built once and reused across
  * turns — mirrors the previous per-loop Anthropic client lifetime.
  */
+/** Per-call knobs of `LlmSession.streamTurn`. Absent: the turn is streamed and returned as it always was. */
+export interface StreamTurnOptions {
+  /**
+   * Calls of these tools have their `text` argument read as it is written: each such tool is offered with its input streamed as
+   * the model writes it (Anthropic `eager_input_streaming`), and `onText` is given the text decoded so far each time more of a
+   * call's arguments arrives (every value a prefix of the final one). What the call does is unchanged: it runs, as every call
+   * does, once the turn is whole. A provider that cannot stream tool input calls nothing.
+   */
+  toolText?: {
+    tools: ReadonlySet<string>;
+    onText: (call: { id: string; name: string; text: string }) => void;
+  };
+  /**
+   * The model's own text, outside any tool call, read as it is written: `onText` is given a text block's index and its text so far each
+   * time more of it arrives (every value a prefix of the final one), and `onToolCall` is called when a tool call starts in the same turn.
+   * The turn is unchanged. A provider that cannot stream text calls nothing.
+   */
+  text?: {
+    onText: (block: { index: number; text: string }) => void;
+    onToolCall: () => void;
+  };
+}
+
 export interface LlmSession {
-  streamTurn(messages: Message[], tools: ToolSchema[], signal?: AbortSignal): Promise<LlmTurnResult>;
+  streamTurn(messages: Message[], tools: ToolSchema[], signal?: AbortSignal, options?: StreamTurnOptions): Promise<LlmTurnResult>;
   /** Non-streaming single-shot completion used for conversation compaction.
    *  Returns the plain summary text; throws on failure so the caller can
    *  fall back to the uncompacted messages. `signal` cancels the request. */

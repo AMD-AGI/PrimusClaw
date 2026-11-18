@@ -4,11 +4,13 @@
 /**
  * The assistant and its board of work items.
  *
- *   POST /v1/assistant                    the caller's assistant session, made on first use
+ *   POST /v1/assistant                    the caller's assistant session, made on first use, and their hourly say cap
  *   GET  /v1/work-items?state=            the board: in_progress | needs_you | done
+ *   GET  /v1/work-items/asked-of-others   the reviews the caller asked of others: open, or closed in the last ASKED_CLOSED_WINDOW
  *   GET  /v1/work-items/:id               one item with its latest events
  *   POST /v1/work-items/:id/accept        {version}: the result the user saw, and only that one
  *   POST /v1/work-items/:id/stop
+ *   POST /v1/work-items/:id/retry         a task that failed or was stopped runs again (`retry.ts`)
  *   POST /v1/assistant/reviews            reviews on someone's behalf, as items (`review-items.ts`)
  *   POST /v1/assistant/reviews/:id/restart the same pull request again, with what the body changes
  *   GET  /v1/assistant/scopes             the group chats and repositories the caller's assistant watches
@@ -27,15 +29,18 @@
  *
  * One exception, and it is narrow: a review someone (R) asked of another person
  * (X) is X's item, and R may read how it stands and stop it, nothing else. R is
- * answered with four facts only (`requester-view.ts`), on the read and on both
- * branches of the stop; accept and restart stay X's (404 for R), and X's session
+ * answered with its requester view only (`requester-view.ts`), on the read, on both
+ * branches of the stop and in the list of reviews R asked of others; accept and restart stay X's (404 for R), and X's session
  * is X's (its routes answer R 404 as for any other session).
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import pino from "pino";
+import type { WorkItemDetail } from "@claw/protocol";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { getOrCreateAssistant } from "../assistant/assistant.js";
+import { sayMaxPerHour } from "../assistant/outbound.js";
+import { retryWorkItem } from "../assistant/retry.js";
 import {
   acceptWorkItem, BOARD_STATES, getWorkItem, itemView, listWorkItems, recentEvents, stopWorkItem,
   type BoardState, type DecisionResult,
@@ -54,7 +59,7 @@ import {
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_OBSERVE, CLAW_ASSISTANT_REVIEW_ITEMS, CLAW_GITHUB_REVIEW_ENABLED,
 } from "../config.js";
 import { asRequesterAnswer } from "../assistant/review-items.js";
-import { requestedItemOf, requesterViewOf } from "../assistant/requester-view.js";
+import { askedOfOthers, requestedItemOf, requesterViewOf } from "../assistant/requester-view.js";
 import { verifyActingAsCredentials } from "../auth/identity-token.js";
 import { credentialVerifier } from "../auth/middleware.js";
 import { db } from "../infra/db.js";
@@ -98,6 +103,10 @@ function answer(reply: FastifyReply, result: DecisionResult) {
   return reply.send({ ok: true, data: result.item });
 }
 
+/** How long a review the caller asked of someone else stays listed after it closed, and how many are listed at most. */
+const ASKED_CLOSED_WINDOW = "3 days";
+const ASKED_MAX_ITEMS = 50;
+
 export async function registerAssistantRoutes(app: FastifyInstance): Promise<void> {
   if (!CLAW_ASSISTANT_ENABLED) return;
 
@@ -105,7 +114,8 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
     const userId = requireRealUser(req, reply);
     if (!userId) return;
     const { sessionId, created } = await getOrCreateAssistant(userId);
-    return reply.send({ ok: true, data: { session_id: sessionId, created } });
+    // The caller's own hourly say cap: an evaluation run paces itself under it (`sa-eval.ts`, EVAL_SAY_PER_HOUR).
+    return reply.send({ ok: true, data: { session_id: sessionId, created, say_max_per_hour: sayMaxPerHour(userId) } });
   });
 
   app.get("/v1/work-items", async (req, reply) => {
@@ -116,6 +126,14 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
       return reply.status(400).send({ ok: false, error: `state must be one of ${BOARD_STATES.join(", ")}` });
     }
     return reply.send({ ok: true, data: await listWorkItems(userId, (state as BoardState | undefined) ?? null) });
+  });
+
+  // A review the caller (R) asked of someone else is not on R's board (it is X's item): R's channel shows these beside it, each with
+  // its item_id, whom R asked and R's view of it (`requester-view.ts`), and nothing else of X's item.
+  app.get("/v1/work-items/asked-of-others", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    return reply.send({ ok: true, data: await askedOfOthers(db, userId, ASKED_CLOSED_WINDOW, ASKED_MAX_ITEMS) });
   });
 
   app.get("/v1/work-items/:id", async (req, reply) => {
@@ -131,12 +149,12 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
       ok: true,
       data: {
         ...itemView(row),
-        worker_session_id: row.worker_session_id,
+        worker_session_id: row.worker_session_id as string,
         repo: row.repo ?? null,
-        created_at: row.created_at,
-        closed_at: row.closed_at ?? null,
+        created_at: row.created_at as Date,
+        closed_at: (row.closed_at ?? null) as Date | null,
         events: await recentEvents(row.item_id as string),
-      },
+      } satisfies WorkItemDetail<Date>,
     });
   });
 
@@ -186,6 +204,16 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
       logger.error({ err, itemId }, "assistant.stop_interrupt_failed");
       return reply.status(503).send({ ok: false, error: "interrupt_not_recorded" });
     }
+  });
+
+  // Retry is the owner's alone: a review asked of someone else answers its requester 404 here, as accept does.
+  app.post("/v1/work-items/:id/retry", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    const result = await retryWorkItem(userId, (req.params as { id: string }).id);
+    if (result.status === "not_found") return reply.status(404).send({ ok: false, error: "not_found" });
+    if (result.status === "conflict") return reply.status(409).send({ ok: false, error: result.error, data: result.item });
+    return reply.send({ ok: true, data: result.item });
   });
 
   if (CLAW_ASSISTANT_OBSERVE) registerObserveRoutes(app);

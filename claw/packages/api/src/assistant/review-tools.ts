@@ -17,9 +17,13 @@
  * Two acts are never read from a sentence at all, since a misreading there merges a pull request or changes a setting: letting a
  * held write through needs the person's message to be the exact command `批准 #<ref>` / `approve #<ref>` naming it (or the card's
  * button), and a channel action runs at once only when the message is its command typed whole; otherwise it is put to the person
- * as that command with a button, and runs only when they press it. So `merge=true` on a review this router starts or restarts never
- * merges by itself: the review's session holds its merge for the person's confirmation (`config.merge_needs_confirmation`), which only
- * that command or the card's button gives.
+ * as that command with a button, and runs only when they press it. So `merge=true` on a review this router starts or restarts does
+ * not merge by itself for a person whose review mode is `high_risk_confirm`: the review's session holds its merge for their confirmation
+ * (`config.merge_needs_confirmation`), which only that command or the card's button gives. A person who chose `fully_auto` asked for
+ * merges nobody confirms, and their own sentence is enough (Yihan, 2026-11-18): the review merges once it approves, held only by what
+ * holds any of their reviews (the repository's own requirements, CI, open threads, an earlier hold of the same commit), and only while they keep that mode
+ * (`config.started_by_assistant`). A review of someone else's account is not started here: it is handed to the person's channel
+ * (`handOffReview`), which starts it as a review asked of that person, merging as their own review setting says.
  *
  * Everything past that is the review's own gates, which these call rather than repeat: creating, stopping and restarting
  * a review item is `review-items.ts`; answering a held write is the decision route's own `decideConfirmation`
@@ -43,29 +47,76 @@ import {
   CONTEXT_STRING_MAX, decidedViaOf, parseChannelContext, turnMessage, type AttendedVia, type ChannelPerson, type TurnMessage,
 } from "./inbound.js";
 import {
-  parseRestartRequest, parseReviewRequest, recordReviewHandoff, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused, reviewItemsEnabled,
-  startReviews,
+  parseRestartRequest, parseReviewRequest, recordReviewHandoff, REQUESTER_NOTE_MAX_CHARS, restartReview, ReviewItemRefused,
+  reviewItemsEnabled, REVIEWS_STARTED_AT_ONCE, startReviews,
 } from "./review-items.js";
 import type { AssistantTokenClaims } from "./token.js";
-import { attendedTurn, ToolRefused } from "./tools.js";
+import { commandLanguageOf, typedCommand } from "./typed-commands.js";
+import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
+import { attachRefOf, ownAttachRef } from "./devenv-tools.js";
 import { resolveWorkItemNow } from "./work-items.js";
 import { modelChoiceOn } from "./model-choice.js";
+import { voidStreamedSay } from "./router-speed.js";
+import { dropHeldSays } from "./say-hold.js";
+import { pullStates, type PullState } from "./pr-state.js";
+import { routeToSurface } from "../notifications/surfaces.js";
 
 export { confirmationRef };
 
 const logger = pino({ name: "assistant-review-tools" });
 
+/**
+ * Which message a review_start answers, as the messages table keys it (`claw_assistant_messages`, primary key session and message id):
+ * a message id alone (`claw-<ms>`) is unique only within its session.
+ */
+export function requestKey(claims: Pick<AssistantTokenClaims, "sid" | "mid">): string {
+  return `${claims.sid}/${claims.mid}`;
+}
+
+/**
+ * The user's own reviews of every one of `prs` that a turn answering message `messageKey` (`requestKey`) started (`request_message`), or null when any
+ * is missing. One transaction starts all of a call's reviews, so it is all or none.
+ */
+export async function startedFor(userId: string, messageKey: string, prs: readonly PrRef[]): Promise<Array<{ item_id: string; seq: number; pr: string }> | null> {
+  const rows = (await db.query(
+    `SELECT item_id, seq, params->'pr'->>'owner' AS owner, params->'pr'->>'repo' AS repo, params->'pr'->>'number' AS number
+       FROM claw_work_items
+      WHERE user_id = $1 AND kind = 'review' AND params->>'request_message' = $2
+      ORDER BY created_at DESC`,
+    [userId, messageKey],
+  )).rows as Array<{ item_id: string; seq: number; owner: string; repo: string; number: string }>;
+  const out: Array<{ item_id: string; seq: number; pr: string }> = [];
+  for (const pr of prs) {
+    const hit = rows.find((r) => r.owner.toLowerCase() === pr.owner.toLowerCase() && r.repo.toLowerCase() === pr.repo.toLowerCase()
+      && r.number === String(pr.number));
+    if (!hit) return null;
+    out.push({ item_id: hit.item_id, seq: Number(hit.seq), pr: `${pr.owner}/${pr.repo}#${pr.number}` });
+  }
+  return out;
+}
+
 /** The ways out of this module, so a test can stand in for what lies beyond the HTTP boundary of each. */
 export const reviewToolPorts = {
+  startedFor,
   startReviews,
   restartReview,
   /** The decision route's own function (`decideConfirmation`), with the process's review service, not a copy of it. */
   decide: (userId: string, id: string, decision: "allow" | "deny", via: DecidedVia | null, guard?: (q: Querier) => Promise<void>) =>
     decideConfirmation(githubReviewService(), db, userId, id, decision, via, guard),
   kick: (): Promise<void> => kickDelivery(),
+  /** Where each pull request a review request names stands on GitHub (open, merged, closed), read as the person (`pr-state.ts`). */
+  pullStates: (userId: string, sessionId: string, prs: readonly PrRef[]): Promise<PullState[]> => pullStates(userId, sessionId, prs),
+  /** Takes back what the turn streamed of a say (`router-speed.ts`). */
+  voidStreamedSay: (sessionId: string, messageId: string | undefined, reason: string): Promise<void> =>
+    voidStreamedSay(sessionId, messageId, reason),
 };
 
-export const MAX_PRS = 10;
+/**
+ * One review_start may name as many pull requests as one request for reviews (`MAX_REVIEWS_PER_REQUEST`): the first ten start, the rest
+ * wait for a slot. A literal, since review-items.js may not be initialised yet when this module is (they import each other); a test holds
+ * the two equal.
+ */
+export const MAX_PRS = 30;
 /** At most this many people are offered when the message names no reviewer alone. */
 const MAX_REVIEWER_CANDIDATES = 5;
 /** How long after the person's request their answer naming the reviewer (`确认 <name>`) still answers it. */
@@ -161,10 +212,10 @@ export function repoGrounded(text: string, pr: Pick<PrRef, "owner" | "repo">, ch
  * `pull request #12` (a pull request, whatever item has that number).
  */
 export function mentionsItem(text: string, seq: number): boolean {
-  for (const m of text.matchAll(new RegExp(`(?<![A-Za-z0-9_.-])#${seq}(?![0-9])`, "g"))) {
-    if (!/(?:\bprs?|\bpull(?:\s+request)?|拉取请求|合并请求)[\s:：]*$/i.test(text.slice(0, m.index))) return true;
-  }
-  return false;
+  // What comes before each `#` is read backwards from it, as a lookbehind, so a long message is read once and not once per `#`. Only
+  // the pull-request word is read case aside (`(?i:`), not the number.
+  const pullRequestWord = String.raw`(?i:\bprs?|\bpull(?:\s+request)?|拉取请求|合并请求)[\s:：]*#`;
+  return new RegExp(`(?<![A-Za-z0-9_.-])#(?<!${pullRequestWord})${seq}(?![0-9])`).test(text);
 }
 
 /**
@@ -392,11 +443,50 @@ export function reviewerReply(text: string, person: ChannelPerson & { user_id: s
   return `${plain} (${person.user_id})`;
 }
 
-/** The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased. */
+const isAlnum = (c: number): boolean => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+const isOwnerChar = (c: number): boolean => isAlnum(c) || c === 45; // [A-Za-z0-9-]
+const isRepoChar = (c: number): boolean => isOwnerChar(c) || c === 95 || c === 46; // [A-Za-z0-9_.-]
+const isDigit = (c: number): boolean => c >= 48 && c <= 57;
+
+/**
+ * The pull requests the text names in full (`owner/repo#N`, or a pull request URL), lower-cased: what
+ * `/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9_.-]+)(?:#|\/pull\/)(\d{1,9})(?![0-9])/g` finds, read in one pass so that a long message
+ * costs its length and not its length squared. An owner runs to the end of its characters wherever it starts in them, and so does
+ * a repository, so a place that names nothing tells the scan to go on after the owner's characters, not from the next character.
+ */
 export function fullRefsIn(text: string): string[] {
   const out: string[] = [];
-  for (const m of text.matchAll(/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9_.-]+)(?:#|\/pull\/)(\d{1,9})(?![0-9])/g)) {
-    out.push(`${m[1]}/${m[2]}#${m[3]}`.toLowerCase());
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    if (!isAlnum(text.charCodeAt(i))) {
+      i++;
+      continue;
+    }
+    let slash = i + 1;
+    while (slash < n && isOwnerChar(text.charCodeAt(slash))) slash++;
+    if (text.charCodeAt(slash) !== 47 /* / */) {
+      i = slash;
+      continue;
+    }
+    let end = slash + 1;
+    while (end < n && isRepoChar(text.charCodeAt(end))) end++;
+    let digits = -1;
+    if (end > slash + 1) {
+      if (text.charCodeAt(end) === 35 /* # */) digits = end + 1;
+      else if (text.startsWith("/pull/", end)) digits = end + 6;
+    }
+    if (digits >= 0) {
+      // 1 to 9 digits, and no tenth: reading ten is enough to tell.
+      let stop = digits;
+      while (stop < n && stop - digits < 10 && isDigit(text.charCodeAt(stop))) stop++;
+      if (stop > digits && stop - digits <= 9) {
+        out.push(`${text.slice(i, slash)}/${text.slice(slash + 1, end)}#${text.slice(digits, stop)}`.toLowerCase());
+        i = stop;
+        continue;
+      }
+    }
+    i = slash;
   }
   return out;
 }
@@ -415,7 +505,9 @@ export function prGrounded(text: string, pr: PrRef): boolean {
 /** The pull requests a call names, parsed, or the refusal for the first that is not one. */
 export function parsePrs(prs: unknown): PrRef[] {
   if (!Array.isArray(prs) || prs.length === 0) throw new ToolRefused("invalid_arguments", "prs needs at least one pull request, as owner/repo#number or its URL");
-  if (prs.length > MAX_PRS) throw new ToolRefused("too_many_prs", `at most ${MAX_PRS} pull requests at once: ask the user which to start with`);
+  if (prs.length > MAX_PRS) {
+    throw new ToolRefused("too_many_prs", `at most ${MAX_PRS} pull requests in one call (the first ${REVIEWS_STARTED_AT_ONCE} start, the rest wait for a slot): start the first ${MAX_PRS} the user named and tell them to send the others once some have started`);
+  }
   const out: PrRef[] = [];
   for (const raw of prs) {
     const ref = parsePrRef(raw);
@@ -468,6 +560,76 @@ function refuseWhichReviewer(code: string, text: string, people: readonly Channe
   { candidates });
 }
 
+/**
+ * The refusals for a turn that cannot act for the person (their message came with a key, or is too old): a merged pull request the
+ * message names is said before them too, since saying it acts for nobody.
+ */
+const CANNOT_ACT: ReadonlySet<string> = new Set(["not_attended", "attendance_expired"]);
+
+/**
+ * Who asked, when this turn answers a message of theirs that names every one of `prs` (number and repository), else null: a worker's
+ * report answers no message, and a pull request the message does not name is never looked up.
+ */
+async function askerNaming(claims: AssistantTokenClaims, prs: readonly PrRef[]): Promise<string | null> {
+  return inTransaction(async (q) => {
+    const { userId } = await assertLiveRun(q, claims);
+    const message = await turnMessage(q, claims.sid, claims.mid);
+    if (!message) return null;
+    const recent = await recentReviewRepos(q, userId);
+    return prs.every((pr) => prGrounded(message.content, pr) && repoGrounded(message.content, pr, message.context.repos, recent)) ? userId : null;
+  });
+}
+
+/** The refusals that ask the person which reviewer they meant: a merged pull request is said before any of them. */
+const ASKS_WHICH_REVIEWER: ReadonlySet<string> = new Set(["reviewer_not_named", "reviewer_not_in_message", "reviewer_not_linked"]);
+
+/**
+ * Nothing is started, handed over or asked about for a pull request that is already merged, or closed without a merge: the person is
+ * told when it merged and its merge commit (or when it was closed) instead (`pr-state.ts`). Only pull requests the message grounded
+ * reach here. The router reads the same with `pr_state` before it calls review_start; this is what holds when it did not.
+ */
+async function refuseMerged(userId: string, sessionId: string, prs: readonly PrRef[]): Promise<void> {
+  const states = await reviewToolPorts.pullStates(userId, sessionId, prs);
+  const merged = states.filter((s): s is Extract<PullState, { state: "merged" }> => s.state === "merged").map(({ state: _s, ...m }) => m);
+  const closed = states.filter((s): s is Extract<PullState, { state: "closed" }> => s.state === "closed").map(({ state: _s, ...c }) => c);
+  const missing = states.filter((s) => s.state === "not_found").map((s) => s.pr);
+  if (!merged.length && !closed.length && !missing.length) return;
+  const open = prs.length - merged.length - closed.length - missing.length;
+  const are = (n: number) => (n === 1 ? "is" : "are");
+  const said = [
+    ...(merged.length ? [`${merged.map((m) => m.pr).join(", ")} ${are(merged.length)} already merged on GitHub (data.merged: when, the merge commit)`] : []),
+    ...(closed.length ? [`${closed.map((c) => c.pr).join(", ")} ${are(closed.length)} closed on GitHub without a merge (data.closed: when)`] : []),
+    ...(missing.length ? [`${missing.join(", ")} ${missing.length === 1 ? "does" : "do"} not exist on GitHub (data.not_found: its repository has no pull request of that number)`] : []),
+  ];
+  throw new ToolRefused(
+    merged.length ? "already_merged" : closed.length ? "already_closed" : "not_found",
+    `${said.join("; ")}, so nothing was started or handed over. `
+      + "Tell the user each one is already merged, with merged_at and the short merge commit, closed, with when, or does not exist, with its number, and that no review was asked for; ask nothing about the reviewer. "
+      + (open ? `The other ${open} ${are(open)} open: say that only those would be reviewed, and call review_start with only them if the user's message still asks for it.` : "Offer the next step: nothing more is needed, or a review after the merge if they want one."),
+    { ...(merged.length ? { merged } : {}), ...(closed.length ? { closed } : {}), ...(missing.length ? { not_found: missing } : {}) },
+  );
+}
+
+/**
+ * `pr_state`: where each pull request stands on GitHub (open, merged with when and its merge commit, closed with when), read as the
+ * person and only read. The router calls it before review_start, so a request about a pull request that is merged or closed is
+ * answered without any write being asked for (parity G3, 2026-11-07). It returns no text anyone wrote on the pull request, so a turn
+ * that read it may still act for the person.
+ */
+export async function prState(claims: AssistantTokenClaims, args: { prs: unknown }): Promise<Record<string, unknown>> {
+  requireRouter(claims);
+  const prs = parsePrs(args.prs);
+  const userId = await inTransaction(async (q) => (await assertLiveRun(q, claims)).userId);
+  const states = await reviewToolPorts.pullStates(userId, claims.sid, prs);
+  const unread = states.filter((s) => s.state === "unknown").length;
+  const missing = states.filter((s) => s.state === "not_found").length;
+  const notes = [
+    ...(missing ? [`${missing} ${missing === 1 ? "does" : "do"} not exist (state not_found: GitHub read the repository and it has no pull request of that number): tell the user so, with the number they wrote, and start nothing for ${missing === 1 ? "it" : "them"}.`] : []),
+    ...(unread ? [`${unread} could not be read on GitHub (state unknown): for those, call review_start as before, which reads them again.`] : []),
+  ];
+  return { ok: true, prs: states, ...(notes.length ? { note: notes.join(" ") } : {}) };
+}
+
 // --- Tools ------------------------------------------------------------------------------------------------------
 
 export async function reviewStart(
@@ -479,6 +641,7 @@ export async function reviewStart(
   const prs = parsePrs(args.prs);
   if (typeof args.merge !== "boolean") throw new ToolRefused("invalid_arguments", "merge must be true or false: true only when the user clearly asked to merge");
   // Asked here, so a refusal costs the review service nothing.
+  let grounded: string | null = null;
   const ready = await inTransaction(async (q) => {
     const { userId, message, via } = await attendedTurn(q, claims);
     // `确认 <name>` answers the question which reviewer the person meant, for a review by someone else: the pull requests (and the model)
@@ -497,6 +660,8 @@ export async function reviewStart(
         refuseUngrounded("repo_not_grounded", `the user did not name ${pr.owner}/${pr.repo}: ask them which repository`);
       }
     }
+    // Every pull request is one the person named: from here on, one already merged is said before anything is asked or started.
+    grounded = userId;
     // With model choice on, the model is checked against the allow-list and the payer's key instead (`model-choice.ts`): "use the fast
     // one" names a model without its name, and the quota spent is the user's own.
     if (args.model && !modelChoiceOn() && !modelGrounded(answered ? `${asked}\n${message.content}` : asked, args.model)) {
@@ -515,7 +680,24 @@ export async function reviewStart(
     const named = !person && people.some((p) => !p.user_id && (lower(p.name) === reviewer || (p.email !== undefined && lower(p.email) === reviewer)));
     if (named) refuseUngrounded("reviewer_not_linked", "that person has not linked their account, so nobody can review as them: tell the user");
     return refuseWhichReviewer(person ? "reviewer_not_named" : "reviewer_not_in_message", message.content, people, userId);
+  }).catch(async (err: unknown) => {
+    if (grounded && err instanceof ToolRefused && ASKS_WHICH_REVIEWER.has(err.code)) await refuseMerged(grounded, claims.sid, prs);
+    if (err instanceof ToolRefused && CANNOT_ACT.has(err.code)) {
+      const asker = await askerNaming(claims, prs).catch(() => null);
+      if (asker) await refuseMerged(asker, claims.sid, prs);
+    }
+    throw err;
   });
+  // Sent again (Brain resends a call whose answer was lost, `idempotentHint`): what the first call started is the answer, even when it
+  // has already finished or merged, which the one-open-review-per-pull-request rule alone would not catch.
+  if (ready.actingAs === ready.userId) {
+    const started = await reviewToolPorts.startedFor(ready.userId, requestKey(claims), prs);
+    if (started) {
+      logger.info({ items: started.map((i) => i.item_id) }, "assistant.review_start_repeated");
+      return { ok: true, items: started, repeated: "these reviews were already started for this message (by an earlier call whose answer was lost): nothing new was started" };
+    }
+  }
+  await refuseMerged(ready.userId, claims.sid, prs);
   // A review asked of someone else runs on their own credentials, which only the channel that carried the message can bring. When it
   // said it can be handed one, it is: the channel starts it as the reviewer and tells the person how it went. Otherwise it is refused
   // below, as before (`asRequesterOfOther`).
@@ -524,8 +706,9 @@ export async function reviewStart(
     if (handed) return { ...handed, ...(args.model || args.effort ? { set_aside: [...(args.model ? ["model"] : []), ...(args.effort ? ["effort"] : [])] } : {}) };
   }
   // The body `POST /v1/assistant/reviews` would have been sent, read by the same parser: the same checks either way.
-  // `merge=true` is the router's reading of a sentence, and natural language never approves a merge: the review's session merges only once
-  // the acting user confirms that very merge (`mergeNeedsConfirmation`, held by the review tools; the card's button or `批准 #<ref>`).
+  // `merge=true` is the router's reading of a sentence: the review's session merges only once the acting user confirms that very merge
+  // (`mergeNeedsConfirmation`, held by the review tools; the card's button or `批准 #<ref>`), unless they chose fully automatic merges.
+  const mergeNeedsConfirmation = await assistantMergeNeedsConfirmation(ready.userId, ready.actingAs);
   const items = await asTool(async () => asRequesterOfOther(ready.actingAs !== ready.userId, () => reviewToolPorts.startReviews(ready.signedIn.user, ready.signedIn.method, {
     ...parseReviewRequest({
       prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
@@ -534,9 +717,47 @@ export async function reviewStart(
       ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
       review_only: !args.merge,
     }),
-    mergeNeedsConfirmation: true,
+    mergeNeedsConfirmation,
+    requestMessageId: requestKey(claims),
   }, stillActing(claims, ready.userId))));
-  return { ok: true, items };
+  return { ok: true, items: items.map(withMergeRule), ...(args.merge ? { merge: mergeNote(mergeNeedsConfirmation) } : {}) };
+}
+
+/**
+ * Whether a merge of a review the router starts or restarts as `actingAs`, for `userId`, waits for the acting user's own confirmation: not
+ * for a review of their own account while their review mode is `fully_auto` (Yihan, 2026-11-18: under fully_auto the person's sentence is
+ * enough), always otherwise. Read now, when the review starts; the review keeps it until it is restarted.
+ */
+export async function assistantMergeNeedsConfirmation(userId: string, actingAs: string): Promise<boolean> {
+  if (actingAs !== userId) return true;
+  return (await getReviewMode(db, userId)).mode !== LOOSER_MODE;
+}
+
+/** A started review as the router is told of it: whether its merge waits for the user, said either way. */
+function withMergeRule<T extends { review_only?: boolean; merge_needs_confirmation?: true }>(item: T): T & { merge_needs_confirmation?: boolean } {
+  return item.review_only === false ? { ...item, merge_needs_confirmation: item.merge_needs_confirmation === true } : item;
+}
+
+/** What the router tells the user of how a review it started or restarted with merge=true merges. */
+export function mergeNote(mergeNeedsConfirmation: boolean): string {
+  return mergeNeedsConfirmation
+    ? "merge_needs_confirmation is true: nothing merges by itself. Once the review approves, the user is asked to confirm the merge (the button on its card, or approve #<ref>, 批准 #<ref> in Chinese). Never say it will be merged automatically."
+    : "merge_needs_confirmation is false (the user's review mode is fully_auto): once the review approves, it merges without asking the user. What holds any of their merges still holds it: what the repository itself requires (its required checks and rules, a confirmation it asks for), failed CI, open review threads, and an earlier approval or merge of the same commit that waits for the user or that they refused. In Chinese say 审过就会直接合入（仓库自身要求的检查仍然生效）. Never promise them they will be asked to confirm it, nor that nothing can hold it: if a merge is held after all, it is listed under Waiting for you.";
+}
+
+/**
+ * The person's subscriptions that run a channel's actions, on the surface the turn's message came from (`routeToSurface`): an
+ * action names that message (`channel_message_id`), which only the channel it came from can act on.
+ */
+async function actionSubscriptions(
+  q: Querier, userId: string, claims: Pick<AssistantTokenClaims, "sid" | "mid">,
+): Promise<Array<{ subscription_id: string }>> {
+  const subs = (await q(
+    `SELECT subscription_id, surface FROM claw_notification_subscriptions
+      WHERE owner_user_id = $1 AND enabled AND 'assistant.action' = ANY(event_types)`,
+    [userId],
+  )).rows as Array<{ subscription_id: string; surface: string }>;
+  return routeToSurface(q, userId, subs, { sessionId: claims.sid, messageId: claims.mid });
 }
 
 /**
@@ -548,10 +769,11 @@ export async function reviewStart(
  * handed over: the caller refuses it as it always did.
  *
  * The handoff is written down (`recordReviewHandoff`) with the event, and its id travels in the payload (`review.handoff_id`) for the
- * channel to echo. The router's `merge` is its reading of a sentence, so `POST /v1/assistant/reviews` reads that record, not the
- * channel's body: such a review merges only once the reviewer confirms that very merge (`merge_needs_confirmation`), never when the
- * router did not read a merge, and is started from one handoff once. Whether the reviewer lets anyone act for them, and every other gate
- * of the review, are the review service's, when the channel asks it.
+ * channel to echo. `POST /v1/assistant/reviews` reads that record, not the channel's body: such a review never merges when the router did
+ * not read a merge, and is started from one handoff once. When it may merge, it merges as the reviewer's own review setting says, as a
+ * review the person asked of them in the chat would (a reviewer who chose to confirm high-risk writes is asked; one who chose fully
+ * automatic merges is not). Whether the reviewer lets anyone act for them, and every other gate of the review, are the review service's,
+ * when the channel asks it.
  */
 async function handOffReview(
   claims: AssistantTokenClaims, prs: PrRef[], reviewer: { userId: string; name: string }, merge: boolean, note: string,
@@ -560,23 +782,24 @@ async function handOffReview(
     const { userId, message } = await attendedTurn(q, claims);
     const channelMessageId = message.context.channel_message_id;
     if (!message.context.handoffs.includes("review_for_other") || !channelMessageId) return null;
-    const subs = (await q(
-      `SELECT subscription_id FROM claw_notification_subscriptions
-        WHERE owner_user_id = $1 AND enabled AND 'assistant.action' = ANY(event_types)`,
-      [userId],
-    )).rows as Array<{ subscription_id: string }>;
+    const subs = await actionSubscriptions(q, userId, claims);
     if (!subs.length) return null;
     // One handoff per message, reviewer, pull requests and merge: a replayed call queues nothing more.
     const key = [reviewer.userId, merge ? "merge" : "review", ...prs.map((p) => `${p.owner}/${p.repo}#${p.number}`.toLowerCase()).sort()].join("\u0000");
     const eventId = deterministicEventId("assistant.review_handoff", claims.mid, key);
+    await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge, messageId: claims.mid });
+    // What the turn said before this, held until it ended (`say-hold.ts`), does not go out on its own: the channel's answer is the
+    // one message, and it carries these words (`held_says`), so nothing the person asked besides the review is lost.
+    const held = await dropHeldSays(q, claims.mid);
+    if (held.length) logger.info({ eventId, held: held.length }, "assistant.held_says_joined_to_handoff");
     const review: AssistantReviewHandoff = {
       handoff_id: eventId,
       reviewer: { user_id: reviewer.userId, name: reviewer.name },
       prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
       merge,
       requester_note: note.slice(0, REQUESTER_NOTE_MAX_CHARS),
+      ...(held.length ? { held_says: held } : {}),
     };
-    await recordReviewHandoff(q, { handoffId: eventId, userId, reviewerUserId: reviewer.userId, prs, merge });
     const payload: AssistantActionPayload = {
       type: "assistant.action", event_id: eventId, occurred_at: new Date().toISOString(), user_id: userId,
       message_id: claims.mid, channel_message_id: channelMessageId, action: { name: REVIEW_HANDOFF_ACTION, args: "" }, review,
@@ -586,11 +809,17 @@ async function handOffReview(
   });
   if (!queued) return null;
   logger.info({ eventId: queued.eventId, prs: prs.length }, "assistant.review_handed_off");
+  // Whatever this turn streamed of a say, or streams from now on, is not said: the channel's answer stands in its place.
+  await reviewToolPorts.voidStreamedSay(claims.sid, claims.mid, "handed_off");
   void reviewToolPorts.kick().catch((err) => logger.error({ err }, "assistant.review_handoff_kick_failed"));
+  // What the router may tell the person of it: nothing. The channel answers their message about this review itself, in one message, once
+  // it has started it or knows why not: which pull requests, on which model, and how the merge is made, which only the started review
+  // knows (`CreatedReview.merge_needs_confirmation`). A word from the router beside it would be a second answer, written before any of
+  // that is known, so this turn's `say` is refused from here on (`turnHandedOffReview`).
   return {
     ok: true, handed_off: true, event_id: queued.eventId, reviewer: reviewer.name || reviewer.userId,
     prs: prs.map((p) => `${p.owner}/${p.repo}#${p.number}`), merge,
-    note: `nothing has started yet: the user's channel starts this review as ${reviewer.name || "that person"}, on their own credentials, and tells the user itself whether it started (or why not). ${merge ? `Even then it merges nothing by itself: ${reviewer.name || "that person"} must confirm the merge. ` : ""}Say only that it was handed over; do not say it has started, will merge, or name items.`,
+    note: `nothing has started yet. The user's chat starts this review as ${reviewer.name || "that person"}, and answers the user's message about it itself, in one message: whether it started, which model it runs on, and how the merge is made. Do not tell the user anything about this review: end the turn without say (any say in this turn is refused now).`,
   };
 }
 
@@ -692,17 +921,22 @@ export async function reviewRestart(
     if (args.model && !modelChoiceOn() && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out to keep the one it had");
     }
-    return { userId, itemId: item.item_id, signedIn: await requesterSignedIn(q, claims.sid, userId, message, via) };
+    const actingAs = typeof item.params?.acting_as === "string" ? item.params.acting_as : userId;
+    return { userId, itemId: item.item_id, actingAs, signedIn: await requesterSignedIn(q, claims.sid, userId, message, via) };
   });
-  // As at a start: whatever the router passed for merge, the restarted review merges only on the acting user's confirmation.
+  // As at a start, resolved again from the acting user's review mode now: whatever the router passed for merge, the restarted review merges
+  // only on the acting user's confirmation unless they chose fully automatic merges. (Only the owner restarts an item, and the owner is the
+  // acting user.)
+  const mergeNeedsConfirmation = await assistantMergeNeedsConfirmation(chosen.userId, chosen.actingAs);
   const restarted = await asTool(async () => reviewToolPorts.restartReview(chosen.signedIn.user, chosen.signedIn.method, chosen.itemId, {
     ...parseRestartRequest({
       ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
       ...(typeof args.merge === "boolean" ? { review_only: !args.merge } : {}),
     }),
-    mergeNeedsConfirmation: true,
+    mergeNeedsConfirmation,
   }, stillActing(claims, chosen.userId)));
-  return { ok: true, ...restarted };
+  const item = restarted.item ? withMergeRule(restarted.item) : restarted.item;
+  return { ok: true, ...restarted, item, ...(item?.review_only === false ? { merge: mergeNote(mergeNeedsConfirmation) } : {}) };
 }
 
 interface PendingConfirmation { id: string; repo: string; pr: number; kind: string; created_at: Date; expires_at: Date }
@@ -732,7 +966,9 @@ async function waitingWhenWritten(q: Querier, userId: string, at: Date): Promise
  * through (it can be misread, and the router reads what workers wrote beside it); the card's button still does.
  */
 export function approvalCommand(text: string): string | null {
-  const m = /^\s*(?:批准|approve)\s*[#＃]\s*([0-9a-f]{6}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*[.。!！]*\s*$/i.exec(text);
+  // The closing spaces and punctuation are matched one way only (`\s*[.。!！]*\s*` would let spaces go to either `\s*`, and trying
+  // every split costs a long run of spaces its length squared).
+  const m = /^\s*(?:批准|approve)\s*[#＃]\s*([0-9a-f]{6}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*(?:[.。!！]+\s*)?$/i.exec(text);
   return m ? m[1].toLowerCase() : null;
 }
 
@@ -749,7 +985,9 @@ export async function confirmationAnswer(
     const { userId, message, via } = await attendedTurn(q, claims);
     const pending = await pendingConfirmationsFor(q, userId);
     if (!pending.length) throw new ToolRefused("no_pending_confirmation", "nothing waits for the user's answer");
-    const replies = pending.map((c) => `批准 #${confirmationRef(c.id)} for ${c.repo}#${c.pr}`).join("; ");
+    // (each command in the language of the user's message, as the router repeats it to them: `typed-commands.ts`)
+    const lang = await commandLanguageOf(message.content, undefined, message.context.reply_language ?? null);
+    const replies = pending.map((c) => `${typedCommand("approve", confirmationRef(c.id), lang)} for ${c.repo}#${c.pr}`).join("; ");
     let pick: PendingConfirmation | undefined;
     if (args.decision === "allow") {
       // Saying yes is one exact command carrying the id of the write the person was shown (`approvalCommand`), or the card's
@@ -851,8 +1089,21 @@ export async function channelAction(claims: AssistantTokenClaims, args: { name: 
   }
   if (actionArgs.length > ACTION_ARGS_MAX) throw new ToolRefused("invalid_arguments", `args is at most ${ACTION_ARGS_MAX} characters`);
   const command = actionCommand(name, actionArgs);
+  const attachRef = attachRefOf(name, actionArgs);
   const sent = await inTransaction(async (q) => {
-    const { userId, message } = await attendedTurn(q, claims);
+    let turn: Awaited<ReturnType<typeof attendedTurn>>;
+    // Whether this is a turn that has read untrusted text (a development environment list, `devenv-tools.ts`) putting the attach
+    // command of one of the user's own sessions to them: the one thing such a turn may still do, and only as a button.
+    let untrustedAttach = false;
+    try {
+      turn = await attendedTurn(q, claims);
+    } catch (err) {
+      if (!(err instanceof ToolRefused && err.code === "read_untrusted" && attachRef)) throw err;
+      turn = await attendedTurn(q, claims, { readUntrustedOk: true });
+      if (!(await ownAttachRef(turn.userId, attachRef))) throw err;
+      untrustedAttach = true;
+    }
+    const { userId, message } = turn;
     // Only what the channel that carried this message said it can do: Claw knows no channel's commands.
     const offered = message.context.actions.find((a) => a.name.replace(/^\/+/, "") === name);
     if (!offered) {
@@ -864,7 +1115,7 @@ export async function channelAction(claims: AssistantTokenClaims, args: { name: 
     // Listed is what the channel can do; asked is what the person wants. Only the command typed whole runs at once: the router
     // reads what workers wrote beside the message, so how it read a sentence never changes a setting. Anything else is put to
     // the person as the exact command, with a button, and runs only when they press it (or type it).
-    if (!typedActionCommand(message.content, name, actionArgs)) {
+    if (untrustedAttach || !typedActionCommand(message.content, name, actionArgs)) {
       const zh = /\p{Script=Han}/u.test(message.content);
       const confirm = await recordActionConfirm(q, {
         userId, sessionId: claims.sid, key: `${claims.mid}\u0000${name}\u0000${actionArgs}`,
@@ -881,11 +1132,7 @@ export async function channelAction(claims: AssistantTokenClaims, args: { name: 
       type: "assistant.action", event_id: eventId, occurred_at: new Date().toISOString(), user_id: userId,
       message_id: claims.mid, channel_message_id: message.context.channel_message_id, action: { name, args: actionArgs },
     };
-    const subs = (await q(
-      `SELECT subscription_id FROM claw_notification_subscriptions
-        WHERE owner_user_id = $1 AND enabled AND 'assistant.action' = ANY(event_types)`,
-      [userId],
-    )).rows as Array<{ subscription_id: string }>;
+    const subs = await actionSubscriptions(q, userId, claims);
     if (!subs.length) throw new ToolRefused("no_channel", "no channel of the user runs actions now: tell them the setting cannot be changed from here");
     await enqueue(eventId, subs, payload, q);
     return { eventId };

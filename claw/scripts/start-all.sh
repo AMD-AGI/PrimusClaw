@@ -9,10 +9,6 @@ if [ -f .env ]; then set -a; source .env; set +a; fi
 export BRAIN_ID="${BRAIN_ID:-brain-$(whoami)}"
 echo "BRAIN_ID: $BRAIN_ID"
 
-# MEMORY_BACKEND=remote routes memory through MEMORY_SERVICE_URL. Run that
-# service yourself (see memory/memory-service/README.md); this script does not
-# start it.
-
 # Each service is started in its own subshell, from this script's directory
 # rather than from the previous service's.
 #

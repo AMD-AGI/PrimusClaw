@@ -14,7 +14,10 @@ import { requiredArgToolNames } from "./tool-schema.js";
 import { parseToolArguments, sanitizeToolUseInputs } from "./tool-input.js";
 import { prepareAnthropicRequest, stripCacheControl, type PreparedAnthropicRequest } from "./anthropic-cache.js";
 import type { Message, ReasoningEffort } from "@claw/protocol";
-import type { LlmCacheReport, LlmContentBlock, LlmProvider, LlmSession, LlmSessionOptions, LlmTurnResult } from "./provider.js";
+import type {
+  LlmCacheReport, LlmContentBlock, LlmProvider, LlmSession, LlmSessionOptions, LlmTurnResult, StreamTurnOptions,
+} from "./provider.js";
+import { partialStringField } from "./partial-json.js";
 import {
   headerModelFromStream,
   resolveRoutedModel,
@@ -58,6 +61,63 @@ interface SessionCacheState {
  * loop cheerfully re-sent the same rejected body up to twelve times a turn.
  */
 
+/** The tools as sent, those named in `names` with their input streamed as it is written. The others are the very same objects. */
+export function withEagerInput(tools: AnthropicTool[], names: ReadonlySet<string>): AnthropicTool[] {
+  return tools.map((t) => (names.has(t.name) ? ({ ...t, eager_input_streaming: true } as AnthropicTool) : t));
+}
+
+/**
+ * Hand the caller the `text` of a streaming tool call when more of it has arrived. A callback that throws is logged and the
+ * turn goes on: what it reports is a preview of a call that still runs when the turn is whole.
+ */
+function toolTextSoFar(
+  options: StreamTurnOptions, block: { id: string; name: string }, json: string, sent: Map<string, string>,
+): void {
+  const text = partialStringField(json, "text");
+  if (text === null || text === "" || sent.get(block.id) === text) return;
+  sent.set(block.id, text);
+  try {
+    options.toolText!.onText({ id: block.id, name: block.name, text });
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message, tool: block.name }, "llm.tool_text.callback_failed");
+  }
+}
+
+/** Run a `StreamTurnOptions.text` callback: one that throws is logged and the turn goes on, as for `toolTextSoFar`. */
+function plainTextCallback(call: () => void): void {
+  try {
+    call();
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message }, "llm.plain_text.callback_failed");
+  }
+}
+
+/**
+ * The stream's events, with an event that is not JSON reported as a cut stream.
+ *
+ * The SDK parses each SSE event with `JSON.parse` and lets a SyntaxError out.
+ * The gateway produces such an event when its own upstream connection closes
+ * mid-event: LiteLLM's pass-through forwards bytes as they arrive and then
+ * writes its error frame (`data: {"error": {"message": "Connection closed. ..."}}`)
+ * straight after the partial line, so the SDK reads
+ * `{"type":"content_block_delta","index"data: {"error": ...` as one event.
+ * That is the same failure as a stream that ends without a stop_reason, and is
+ * retried the same way; left as a bare SyntaxError it failed the whole run.
+ * Only errors from the stream itself pass through here: one thrown by the loop
+ * body that consumes these events never reaches this generator.
+ */
+export async function* streamEvents<T>(stream: AsyncIterable<T>): AsyncGenerator<T> {
+  try {
+    for await (const evt of stream) yield evt;
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    const cut: any = new Error(`stream truncated: an event was not valid JSON (${err.message})`);
+    cut.code = "STREAM_TRUNCATED";
+    cut.cause = err;
+    throw cut;
+  }
+}
+
 async function streamingTurn(
   client: Anthropic,
   model: string,
@@ -68,6 +128,7 @@ async function streamingTurn(
   cacheState: SessionCacheState,
   effort?: ReasoningEffort,
   rollingCacheTtl?: "5m",
+  options?: StreamTurnOptions,
 ): Promise<LlmTurnResult> {
   // One abort controller PER ATTEMPT, not per turn.
   //
@@ -106,6 +167,10 @@ async function streamingTurn(
   // promptly. If it doesn't, we abort and let the caller handle the failure.
   // Each attempt gets its own budget, not the remainder of the previous one's.
   const t0 = Date.now();
+  // Tools whose `text` the caller reads as it is written (`StreamTurnOptions.toolText`). Without eager input streaming the API holds a
+  // call's arguments back and sends them in one piece when the call is whole, so there would be nothing to read before the end. Claude
+  // models only: another model behind an Anthropic-style gateway is not asked to take a field it may not know.
+  const textTools = options?.toolText && /claude/i.test(model) ? options.toolText.tools : new Set<string>();
   const openStream = async (body: PreparedAnthropicRequest) => {
     const ctrl = new AbortController();
     activeCtrl = ctrl;
@@ -119,7 +184,7 @@ async function streamingTurn(
           model,
           ...(body.system ? { system: body.system as any } : {}),
           messages: body.messages as unknown as MessageParam[],
-          tools,
+          tools: textTools.size ? withEagerInput(tools, textTools) : tools,
           max_tokens: 16384,
           // Only the effort: the models think adaptively by default, and a run without one sends exactly what it always did.
           ...(effort ? { output_config: { effort } } : {}),
@@ -199,6 +264,8 @@ async function streamingTurn(
   // append thinking_delta + signature_delta.
   const blocks: ContentBlock[] = [];
   const toolJsonBuf: Map<number, string> = new Map();
+  // Per tool call, the `text` last handed to `toolText.onText`: a fragment that adds nothing to it is not reported again.
+  const toolTextSent: Map<string, string> = new Map();
   let stopReason: string | null = null;
   const usage = { input_tokens: 0, output_tokens: 0, cache_create: 0, cache_read: 0 };
   let sawUsage = false;
@@ -211,7 +278,7 @@ async function streamingTurn(
   let bodyModel: string | undefined;
 
   try {
-    for await (const evt of stream as AsyncIterable<RawMessageStreamEvent>) {
+    for await (const evt of streamEvents(stream as AsyncIterable<RawMessageStreamEvent>)) {
       armIdleTimer();
       if (signal?.aborted) break;
 
@@ -243,7 +310,10 @@ async function streamingTurn(
         case "content_block_start": {
           const b = evt.content_block as ContentBlock;
           blocks[evt.index] = structuredClone(b);
-          if (b.type === "tool_use") toolJsonBuf.set(evt.index, "");
+          if (b.type === "tool_use") {
+            toolJsonBuf.set(evt.index, "");
+            if (options?.text) plainTextCallback(() => options.text!.onToolCall());
+          }
           break;
         }
         case "content_block_delta": {
@@ -252,12 +322,17 @@ async function streamingTurn(
           const d = evt.delta as unknown as Record<string, unknown>;
           if (cur.type === "text" && d.type === "text_delta") {
             cur.text += String(d.text ?? "");
+            const soFar = cur.text;
+            const index = evt.index;
+            if (options?.text && soFar) plainTextCallback(() => options.text!.onText({ index, text: soFar }));
           } else if (cur.type === "thinking" && d.type === "thinking_delta") {
             cur.thinking += String(d.thinking ?? "");
           } else if (cur.type === "thinking" && d.type === "signature_delta") {
             cur.signature = (cur.signature ?? "") + String(d.signature ?? "");
           } else if (cur.type === "tool_use" && d.type === "input_json_delta") {
-            toolJsonBuf.set(evt.index, (toolJsonBuf.get(evt.index) ?? "") + String(d.partial_json ?? ""));
+            const buf = (toolJsonBuf.get(evt.index) ?? "") + String(d.partial_json ?? "");
+            toolJsonBuf.set(evt.index, buf);
+            if (textTools.has(cur.name)) toolTextSoFar(options!, cur, buf, toolTextSent);
           }
           break;
         }
@@ -498,7 +573,7 @@ export function buildAnthropicSession(
 ): LlmSession {
   const cacheState: SessionCacheState = { disabled: false, decoratedFailures: 0 };
   return {
-    streamTurn: (messages, tools, signal) =>
+    streamTurn: (messages, tools, signal, options) =>
       streamingTurn(
         client,
         model,
@@ -509,6 +584,7 @@ export function buildAnthropicSession(
         cacheState,
         effort,
         rollingCacheTtl,
+        options,
       ),
       async complete(systemPrompt, userText, maxTokens, signal, options) {
         const resp = await client.messages.create({

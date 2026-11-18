@@ -3284,7 +3284,14 @@ async function collectKvTargets(deps: KeepaliveDeps, census: TargetCensus): Prom
         logger.warn({ err: (err as Error)?.message, key }, "keepalive.entry_read_failed");
         continue;
       }
-      if (!e) continue;
+      // A key deleted between the listing and this read comes back as a DEL or
+      // PURGE marker with an empty payload, not as a miss. It names no sandbox:
+      // the record was removed because its target is gone, exactly as if the
+      // listing had been taken a moment later. Parsing it instead failed, which
+      // marked the census incomplete and the shared roster stale, and every
+      // replica then refused new sandboxes until a later sweep read clean --
+      // whenever one replica's teardown landed inside another replica's walk.
+      if (!e || isTombstone(e)) continue;
       try {
         if (!await collectKvTarget(deps, census, key, e)) complete = false;
       } catch (err) {

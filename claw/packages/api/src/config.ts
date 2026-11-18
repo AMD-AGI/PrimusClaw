@@ -9,15 +9,18 @@ import {
   DEFAULT_SANDBOX_IDLE_REUSE_SECONDS,
   DEFAULT_TASK_MAX_ACK_PENDING,
   DEFAULT_TASK_MAX_DELIVER,
+  isReasoningEffort,
   MIN_RENEWAL_INTERVAL_MS,
   parseAppContainerCaps,
   parseAppSandboxCaps,
   resolveLeaseReapGraceSec,
   resolveTaskDeliveryBudget,
   RUN_LEASE_HEARTBEATS_PER_TTL,
+  type ReasoningEffort,
   type RunLeaseTiming,
 } from "@claw/protocol";
 import { readIntSetting, type IntSettingBounds } from "@claw/utils";
+import { readApiBackground } from "./startup/background.js";
 
 /**
  * Read a setting, treating blank the same as unset.
@@ -92,7 +95,21 @@ export function envBool(key: string, fallback: boolean): boolean {
   return ["true", "1", "yes"].includes(v);
 }
 
+/** CLAW_ASSISTANT_ROUTER_EFFORT: an effort every provider takes, or null for `default`; anything else is reported and read as `default`. */
+function routerEffortSetting(raw: string): ReasoningEffort | null {
+  const v = raw.toLowerCase();
+  if (v === "default") return null;
+  if (isReasoningEffort(v)) return v;
+  settingProblems.push(`CLAW_ASSISTANT_ROUTER_EFFORT=${raw} is not low, medium, high or default; using default`);
+  return null;
+}
+
 export const API_PORT = envInt("API_PORT", 8000);
+/**
+ * CLAW_API_BACKGROUND: `on` (default) or `off`. Off, the process answers HTTP and starts no background loop
+ * (`startup/background.ts` names them). Any other value is refused at startup (`index.ts`).
+ */
+export const CLAW_API_BACKGROUND = readApiBackground(process.env.CLAW_API_BACKGROUND);
 export const APP_ENV = env("APP_ENV", "production");
 
 /**
@@ -243,6 +260,12 @@ export const SESSION_SANDBOX_HOLD_MS = Math.min(
   BRAIN_REGISTRY_TTL_MS,
 );
 
+// Session history an event stream replays (routes/events.ts, routes/anthropic-managed-agents.ts). A stream that does not
+// say where it resumes (no `?after=`, no Last-Event-ID) is sent the session's last SSE_HISTORY_TAIL stored events, not
+// all of them: an assistant session runs for weeks (one reached 33,196 events, 28.6 MB), and every connection to it read
+// the whole history into this process and wrote it to the client. `?history=all` still asks for everything.
+export const SSE_HISTORY_TAIL = envInt("SSE_HISTORY_TAIL", 2000, { min: 1, max: 1_000_000 });
+
 // --- The browser terminal ---
 // `GET /v1/sessions/:id/terminal/ws` is a WebSocket proxy to the sandbox's shell,
 // so every open terminal holds two sockets and a pod's pty for as long as it
@@ -362,6 +385,19 @@ export const RUN_LEASE_TTL_MS = envInt(
 // sweeper that runs slightly too often.
 export const TASK_SWEEPER_TICK_MS = envInt("TASK_SWEEPER_TICK_MS", 60_000, { min: 1_000 });
 /**
+ * From SIGTERM to exit, at most (see infra/graceful-shutdown.ts). Must fit
+ * inside what the pod's terminationGracePeriodSeconds leaves after its preStop
+ * sleep, or the kubelet's SIGKILL ends the drain instead; the chart's 90s grace
+ * minus a 10s preStop leaves 80s, and this keeps 5s of it spare.
+ */
+export const SHUTDOWN_DEADLINE_MS = envInt("SHUTDOWN_DEADLINE_MS", 75_000, { min: 1_000 });
+/**
+ * How long to keep serving after SIGTERM before closing. Zero behind the chart,
+ * whose preStop sleep has already taken the pod out of the endpoints; a
+ * deployment without one sets this instead.
+ */
+export const SHUTDOWN_DELAY_MS = envInt("SHUTDOWN_DELAY_MS", 0, { min: 0 });
+/**
  * How long past its expiry a lease may sit before the run is declared gone.
  *
  * Derived rather than chosen, and derived from the thing it must not preempt:
@@ -386,6 +422,29 @@ export const LEASE_LOST_GRACE_SEC = envInt(
   // reaper behind it would be skipped on every tick.
   { min: 1 },
 );
+
+/**
+ * How long past its expiry a doorbell run's lease may sit before the run is
+ * handed to another brain as one whose worker was lost with its node. Zero
+ * turns this fast path off and leaves such runs to LEASE_LOST_GRACE_SEC.
+ *
+ * Shorter than LEASE_LOST_GRACE_SEC on purpose, and safe to be: that grace is
+ * long because the next worker would find the dead one's `lock.<key>` held
+ * until the registry bucket's TTL. A doorbell claim may now take that lock over
+ * once it has gone unrenewed for brain's TASK_LOCK_DEAD_HOLDER_MS (60 s), so
+ * the wait is a function of that instead: the lease expires no sooner than
+ * (RUN_LEASE_TTL_MS - RUN_LEASE_HEARTBEAT_MS) after the holder's last renewal,
+ * 30 s at the defaults, and this adds the other 30 s. A holder that is alive
+ * keeps renewing its lease over HTTP even while NATS is stalled, so it is
+ * never requeued here; and see `requeueDeadDoorbellLeases` for why an API that
+ * could not hear renewals does not judge them.
+ */
+export const DOORBELL_DEAD_LEASE_GRACE_SEC = envInt("DOORBELL_DEAD_LEASE_GRACE_SEC", 30, { min: 0 });
+/**
+ * How often the fast pass above runs. Its own loop rather than the sweeper's
+ * tick, whose 60 s would be most of the two minutes a lost node may cost.
+ */
+export const DOORBELL_TAKEOVER_SWEEP_MS = envInt("DOORBELL_TAKEOVER_SWEEP_MS", 10_000, { min: 1_000 });
 
 /** The timings above as the one thing they actually are: a single ordering. */
 export function runLeaseTiming(): RunLeaseTiming {
@@ -421,6 +480,12 @@ export const DELIVERY_TTL_DAYS = envInt("DELIVERY_TTL_DAYS", 7, { min: 1 });
 // Sweep cadence in minutes.
 export const UPLOAD_SWEEP_INTERVAL_MIN = envInt("UPLOAD_SWEEP_INTERVAL_MIN", 60);
 
+// --- Temporary plugins (marketplace/plugin-expiry.ts) ---
+/** The furthest ahead a plugin write may set `expires_at` / `ttl_seconds`. */
+export const PLUGIN_TTL_MAX_DAYS = envInt("PLUGIN_TTL_MAX_DAYS", 30, { min: 1 });
+/** How often expired temporary plugins are soft-deleted. */
+export const PLUGIN_EXPIRY_SWEEP_INTERVAL_MIN = envInt("PLUGIN_EXPIRY_SWEEP_INTERVAL_MIN", 5, { min: 1 });
+
 // --- Session auto-archive ---
 // A session with no activity for this many days, and no run in flight, is
 // archived by the daily maintenance pass. 0 disables it. Archiving only changes
@@ -435,11 +500,18 @@ export const SESSION_AUTO_ARCHIVE_DAYS = envInt("SESSION_AUTO_ARCHIVE_DAYS", 7, 
 // prefixes are removed by the cleanup sweeper). 0 disables it. See
 // sessions/retention.ts for which archived sessions are never taken.
 export const SESSION_RETENTION_DAYS = envInt("SESSION_RETENTION_DAYS", 0, { min: 0 });
+// For this many seconds after a session is deleted, GET /v1/tasks/:id still
+// answers for its tasks with how they ended (status, failure reason, times) and
+// nothing they carried -- so a caller that deleted a session with a run in it can
+// see the run's final state. 0 answers 404 at once, as before.
+export const DELETED_SESSION_TASK_READ_SEC = envInt("DELETED_SESSION_TASK_READ_SEC", 86_400, { min: 0 });
 // The soft-deleted conversation rows of a session deleted more than this many
 // days ago (turns, events, summaries) are removed for good. 0 disables it.
 export const SESSION_PURGE_DAYS = envInt("SESSION_PURGE_DAYS", 0, { min: 0 });
-// How many sessions one daily pass deletes, and separately how many deleted
-// sessions it purges the rows of.
+// How many sessions retention deletes in a day, across all replicas (counted
+// from the deletions of the last 24 hours, so restarts and more replicas do not
+// multiply it), and separately how many deleted sessions one pass purges the
+// rows of.
 export const SESSION_RETENTION_BATCH = envInt("SESSION_RETENTION_BATCH", 500, { min: 1 });
 // Count and log what the pass would delete and purge, and change nothing.
 export const SESSION_RETENTION_DRY_RUN = envBool("SESSION_RETENTION_DRY_RUN", false);
@@ -465,12 +537,12 @@ export const BYOK_VERIFY_MODELS_URL = env("BYOK_VERIFY_MODELS_URL");
 export const BYOK_VERIFY_API_STYLE = env("BYOK_VERIFY_API_STYLE");
 export const ANTHROPIC_BASE_URL = env("ANTHROPIC_BASE_URL");
 
-// --- Skill selection ---
-export const MAX_SELECTED_SKILLS = envInt("MAX_SELECTED_SKILLS", 3);
-
 // --- Phase-2 feature flags (default OFF; opt-in per deployment) ---
 // When false: long-term memory read and write paths are short-circuited.
 export const CLAW_MEMORY_ENABLED = envBool("CLAW_MEMORY_ENABLED", false);
+// Whether long-term memory is on for a user who has never set it (no row in claw_user_memory_prefs). Default false: memory
+// is opt-in. A user's own choice, on or off, always wins over it, and CLAW_MEMORY_ENABLED still has to be on for anyone.
+export const CLAW_MEMORY_DEFAULT_ON = envBool("CLAW_MEMORY_DEFAULT_ON", false);
 // Long-term memory limits. The catalogue is what every turn of an opted-in user carries (one line per entry);
 // a write past the entry limit is refused, never made room for by dropping another entry.
 export const CLAW_MEMORY_MAX_ENTRIES = envInt("CLAW_MEMORY_MAX_ENTRIES", 100, { min: 1 });
@@ -479,9 +551,21 @@ export const CLAW_MEMORY_CATALOGUE_MAX_TOKENS = envInt("CLAW_MEMORY_CATALOGUE_MA
 // Days after which a project / reference entry leaves the catalogue until the user confirms it again.
 export const CLAW_MEMORY_PROJECT_REVIEW_DAYS = envInt("CLAW_MEMORY_PROJECT_REVIEW_DAYS", 30, { min: 1 });
 export const CLAW_MEMORY_REFERENCE_REVIEW_DAYS = envInt("CLAW_MEMORY_REFERENCE_REVIEW_DAYS", 90, { min: 1 });
-// When false: skill selection, save, mutation, feedback, evolution, pattern
-// recording, evolve worker, and skill-files cleanup are all short-circuited.
-export const CLAW_SKILL_EVOLUTION_ENABLED = envBool("CLAW_SKILL_EVOLUTION_ENABLED", false);
+// Personal skills, two switches.
+// CLAW_USER_SKILLS_ENABLED: a user's own skills are listed to the turns of their own conversations
+// (`request.user_skills`, sessions/user-skills.ts; the assistant's router gets its own list with each message and the
+// skill_read tool, assistant/skill-tools.ts), and what such a turn saves (the save_skill tool and the
+// *_skill_file tools) is kept. Off: no skill is listed to a turn, Brain neither offers nor runs the skill-writing
+// tools, and what a worker sends to save is dropped. The skill routes (/v1/users/:id/skills) work
+// either way, as before: they are the user's own explicit writes, under the same checks.
+export const CLAW_USER_SKILLS_ENABLED = envBool("CLAW_USER_SKILLS_ENABLED", false);
+// CLAW_SKILL_AUTO_EVOLUTION_ENABLED: skills the platform writes on its own -- pattern promotion, the evolution
+// worker, per-run feedback and probation graduation, and their cleanups. Independent of the switch above.
+// CLAW_SKILL_EVOLUTION_ENABLED is the name it had while it also gated the user's own skills; it is read only when
+// the new name is unset, for one release.
+export const CLAW_SKILL_AUTO_EVOLUTION_ENABLED = envBool(
+  "CLAW_SKILL_AUTO_EVOLUTION_ENABLED", envBool("CLAW_SKILL_EVOLUTION_ENABLED", false),
+);
 
 // When true: every turn that does the user's work (not an assistant Router turn) carries the
 // general working guideline (sessions/agent-guideline.ts) in its system message.
@@ -504,6 +588,14 @@ export const NOTIFY_LINK_BASE = env("NOTIFY_LINK_BASE", "/primus-claw");
 // The most `say` messages one user's assistant may send in an hour. A guard against a
 // looping assistant, not a quota: a person is not meant to meet it.
 export const CLAW_ASSISTANT_SAY_MAX_PER_HOUR = envInt("CLAW_ASSISTANT_SAY_MAX_PER_HOUR", 120, { min: 1 });
+// The evaluation identities (Claw user ids, comma-separated; no wildcard) whose assistant may say up to
+// CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR messages an hour instead: a nightly evaluation runs one identity through hundreds of
+// cases, about two says each, and at the people's cap it spends most of the night waiting. Still a cap, against a looping run.
+// Empty (the default): nobody, and every user has CLAW_ASSISTANT_SAY_MAX_PER_HOUR.
+export const CLAW_ASSISTANT_SAY_EVAL_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_ASSISTANT_SAY_EVAL_USERS").split(",").map((u) => u.trim()).filter((u) => u && u !== "*"),
+);
+export const CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR = envInt("CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR", 600, { min: 1 });
 
 // --- Assistant (default OFF) ---
 // When false: no assistant tables and no routes, as if the feature did not exist.
@@ -513,6 +605,12 @@ export const CLAW_ASSISTANT_ENABLED = envBool("CLAW_ASSISTANT_ENABLED", false);
 export const CLAW_ASSISTANT_ROUTER_MODEL = env("CLAW_ASSISTANT_ROUTER_MODEL");
 // Work items one user may have unfinished (not on the done board) at once.
 export const CLAW_ASSISTANT_MAX_ACTIVE_ITEMS = envInt("CLAW_ASSISTANT_MAX_ACTIVE_ITEMS", 20, { min: 1 });
+// `true` delivers a worker's ready result without asking: the item closes as accepted, by policy, the way a review item closes when
+// it posts its review, and the user changes the result by replying (`work_send` reopens an item delivered in the last
+// DONE_WINDOW_DAYS). An item whose result names a pull request it watches stays open and holds no slot until that pull request is
+// merged or closed (`params.watching_pr`): new comments and failed CI still reach its worker. Off (the default), a ready result
+// waits for the user's Accept, as before.
+export const CLAW_ASSISTANT_AUTO_DELIVER = envBool("CLAW_ASSISTANT_AUTO_DELIVER", false);
 // On-behalf GitHub reviews as work items of the assistant (`POST /v1/assistant/reviews`). Needs
 // CLAW_ASSISTANT_ENABLED and CLAW_GITHUB_REVIEW_ENABLED as well; off, the routes do not exist.
 export const CLAW_ASSISTANT_REVIEW_ITEMS = envBool("CLAW_ASSISTANT_REVIEW_ITEMS", false);
@@ -521,6 +619,15 @@ export const CLAW_ASSISTANT_REVIEW_ITEMS = envBool("CLAW_ASSISTANT_REVIEW_ITEMS"
 // read-only index, a review item's session the entries bound to its item. Needs CLAW_ASSISTANT_ENABLED and
 // CLAW_MEMORY_ENABLED as well; anything else leaves every assistant turn exactly as without memory.
 export const CLAW_ASSISTANT_MEMORY_TOOLS = env("CLAW_ASSISTANT_MEMORY_TOOLS", "off").trim().toLowerCase() === "on";
+// `on` recalls the user's memory for every router turn before the model answers (`assistant/memory-tools.ts`, `routerTurnRecall`):
+// the entries the person's message is about, in full, go with the message, so a name the index does not list (a project's entries
+// pushed out of a full index) is answered from memory instead of looked up on the web. Off (the default), only the users named in
+// CLAW_MEMORY_TURN_RECALL_USERS (Claw user ids, comma-separated) get it: the canary, opened for the evaluation identities first.
+// Needs the assistant's memory (CLAW_ASSISTANT_MEMORY_TOOLS) and the user's own opt-in, as every read of their memory does.
+export const CLAW_MEMORY_TURN_RECALL = env("CLAW_MEMORY_TURN_RECALL", "off").trim().toLowerCase() === "on";
+export const CLAW_MEMORY_TURN_RECALL_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_MEMORY_TURN_RECALL_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
 // GitHub events for work items: an item watches a pull request, and new comments, reviews and failed CI
 // reach its worker without anybody mentioning it (`assistant/github-events.ts`). Needs CLAW_ASSISTANT_ENABLED
 // as well; off, there are no subscription routes, no tools for them and nothing polls.
@@ -535,6 +642,20 @@ export const CLAW_ASSISTANT_GITHUB_MAX_SUBSCRIPTIONS = envInt("CLAW_ASSISTANT_GI
 export const CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS: ReadonlySet<string> = new Set(
   env("CLAW_ASSISTANT_GITHUB_TRUSTED_BOTS").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
 );
+// Job watches: the assistant watches a SaFE workload or one of the user's own runs (a run another service such as a
+// planner started for them included) and tells the user when its state changes and when it ends
+// (`assistant/job-watch.ts`). Needs CLAW_ASSISTANT_ENABLED as well; off, there are no tools for it and nothing polls.
+export const CLAW_ASSISTANT_JOB_EVENTS = envBool("CLAW_ASSISTANT_JOB_EVENTS", false);
+// How often a watched job is read. A change reaches the user at most this long after it happened.
+export const CLAW_ASSISTANT_JOB_POLL_SEC = envInt("CLAW_ASSISTANT_JOB_POLL_SEC", 30, { min: 10 });
+// Jobs one user may have watched at once.
+export const CLAW_ASSISTANT_JOB_MAX_WATCHES = envInt("CLAW_ASSISTANT_JOB_MAX_WATCHES", 20, { min: 1 });
+// More kinds of job to watch, each read over HTTP with the user's own platform key: a JSON array of
+// {kind, description, url, state, detail?, owner?, ended}. `url` names the job with `{id}`, once and after its host (https, or plain http only to an in-cluster
+// `*.svc` host); `state`, `detail` and `owner` are dotted paths into the JSON answer; `ended` lists the states a job does not leave.
+// `owner`, when set, is compared with the user's id: a job of someone else's is not theirs to watch. An entry that does not parse is
+// left out and logged at start-up. Empty by default: workloads and runs only. (`assistant/job-watch.ts`)
+export const CLAW_ASSISTANT_JOB_HTTP_SOURCES = env("CLAW_ASSISTANT_JOB_HTTP_SOURCES");
 
 // --- Remote agents (default OFF) ---
 // When false: no remote-agent tables, no routes, and nothing polls. A connector
@@ -552,6 +673,10 @@ export const CLAW_GITHUB_REVIEW_ENABLED = envBool("CLAW_GITHUB_REVIEW_ENABLED", 
 // --- GitHub tools for every session whose owner stored a GH_TOKEN (default OFF) ---
 // When false: no route, and no `github` MCP server is offered to a session. See claw/docs/github-mcp.md.
 export const CLAW_GITHUB_MCP_ENABLED = envBool("CLAW_GITHUB_MCP_ENABLED", false);
+// --- ... and, for an owner who keeps none, the GitHub account they bound (`/github bind`) at the identity provider (default OFF) ---
+// When false: only GH_TOKEN counts, as before. When true the API also needs IDENTITY_CLIENT_ENABLED and CLAW_GITHUB_REVIEW_ENABLED
+// (whose audit log every call made with a binding is written to). See claw/docs/github-mcp.md.
+export const CLAW_GITHUB_MCP_BINDING_ENABLED = envBool("CLAW_GITHUB_MCP_BINDING_ENABLED", false);
 
 /**
  * How a connector's access token is checked (see auth/connector-token.ts). Read
@@ -563,11 +688,24 @@ export const CLAW_GITHUB_MCP_ENABLED = envBool("CLAW_GITHUB_MCP_ENABLED", false)
  *   CLAW_CONNECTOR_TOKEN_INTROSPECT  also ask the identity provider whether the
  *                                    token is still active, so a revoked grant
  *                                    stops at once instead of when the token expires
+ *   CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS
+ *                                    the oldest provider answer a connector token is
+ *                                    judged by, default 5 (0: ask every time). The
+ *                                    identity client keeps an answer for
+ *                                    IDENTITY_INTROSPECTION_CACHE_SECONDS (30) for
+ *                                    every caller; this bounds it for connectors, so
+ *                                    a revoked grant is refused within this many
+ *                                    seconds on every replica. A value out of 0..300
+ *                                    is not believed and the default is used.
  */
-export function connectorTokenSettings(): { audience: string; introspect: boolean } {
+export const CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_DEFAULT_SECONDS = 5;
+
+export function connectorTokenSettings(): { audience: string; introspect: boolean; introspectMaxAgeMs: number } {
+  const maxAge = readIntSetting(process.env.CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS, { wholeNumbersOnly: true, min: 0, max: 300 });
   return {
     audience: env("CLAW_CONNECTOR_TOKEN_AUDIENCE", "claw-api"),
     introspect: envBool("CLAW_CONNECTOR_TOKEN_INTROSPECT", false),
+    introspectMaxAgeMs: (maxAge && !("problem" in maxAge) ? maxAge.value : CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_DEFAULT_SECONDS) * 1000,
   };
 }
 
@@ -791,11 +929,66 @@ export const CLAW_ASSISTANT_TOKEN_KEY = env("CLAW_ASSISTANT_TOKEN_KEY");
 export const CLAW_ASSISTANT_WORKER_MODEL = env("CLAW_ASSISTANT_WORKER_MODEL");
 // LLM calls a router turn may make. A router only classifies, calls a tool and says one line.
 export const CLAW_ASSISTANT_ROUTER_MAX_TURNS = envInt("CLAW_ASSISTANT_ROUTER_MAX_TURNS", 8, { min: 1 });
+// How hard a router turn's model thinks (`ExecuteRequest.effort`): low, medium or high, or `default` (the default) for the model's own.
+// Thinking is most of a router turn's time on a reasoning model, so `low` makes it quicker (`assistant/router-speed.ts`); it is not the
+// default because a model that takes no reasoning effort (an OpenAI-style deployment's gpt-4o) refuses a request that names one. A
+// session that chose an effort of its own keeps it.
+export const CLAW_ASSISTANT_ROUTER_EFFORT = routerEffortSetting(env("CLAW_ASSISTANT_ROUTER_EFFORT", "default"));
+// `false` stops publishing a router's `say` while the model writes it (`ExecuteRequest.stream_tool_text`, `toolTextDelta` events): a
+// channel that follows the turn shows the words as they come instead of when the step ends.
+export const CLAW_ASSISTANT_STREAM_SAY = envBool("CLAW_ASSISTANT_STREAM_SAY", true);
+// `on` publishes a router turn's own text (outside any tool call) as its say's text while the model writes it, for every user
+// (`ExecuteRequest.stream_text_as`, `assistant/router-speed.ts`): a turn that ends in plain text is said by the server only after it ends
+// (`deliverUnsaidAnswer`), so without it the person sees none of its words until then. Off (the default), only the users named in
+// CLAW_ASSISTANT_STREAM_TEXT_USERS (Claw user ids, comma-separated) get it: the evaluation identities first. Needs CLAW_ASSISTANT_STREAM_SAY.
+export const CLAW_ASSISTANT_STREAM_TEXT = env("CLAW_ASSISTANT_STREAM_TEXT", "off").trim().toLowerCase() === "on";
+export const CLAW_ASSISTANT_STREAM_TEXT_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_ASSISTANT_STREAM_TEXT_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
+// `true` lets a router's `say` cite where its answer came from (`assistant/citations.ts`): the model writes [1], [2] in the text and
+// names each number's address in `sources`; Brain keeps only addresses this turn's lookups returned, and an `assistant.say` carries
+// them as `sources` for the channel to show. Off (the default): no `sources` on `say`, and the prompt asks for links in the text.
+export const CLAW_ASSISTANT_CITATIONS = envBool("CLAW_ASSISTANT_CITATIONS", false);
+// With citations on, the plugin read servers whose results carry their own pages as `html_url` (Gitea's, for the agent board), each
+// with the prefix those pages' addresses have: `agent-board=https://host/board/`, comma-separated. A router turn that has such a
+// server may cite the issues and boards it read there (`ExecuteRequest.cite.link_servers`). Empty (the default): none.
+export const CLAW_ASSISTANT_CITE_LINK_SERVERS = env("CLAW_ASSISTANT_CITE_LINK_SERVERS");
+// `true` makes a research report a background work item whose citations are checked before it is delivered (`assistant/research.ts`):
+// the router hands "research X / a comparison report on X" to a worker, the worker researches with web_search and web_fetch and
+// delivers a Markdown report with numbered citations through deliver_text, and Brain opens every cited source and marks each
+// statement no source supports as unverified before the file is stored (`ExecuteRequest.cite_check`). Off (the default): neither.
+export const CLAW_ASSISTANT_RESEARCH = envBool("CLAW_ASSISTANT_RESEARCH", false);
+// With CLAW_ASSISTANT_RESEARCH off, the users who get research reports all the same (Claw user ids, comma-separated): the canary,
+// opened for the evaluation identities first. `*` among them is everyone, as the switch itself is.
+export const CLAW_ASSISTANT_RESEARCH_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_ASSISTANT_RESEARCH_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
+// `true` (the default) gives the router's `say` an optional `suggested`: up to three short replies the user is likely to send next,
+// carried by `assistant.say` as `suggested_replies` for a channel to show as buttons that send them (`assistant/suggested.ts`).
+export const CLAW_ASSISTANT_SUGGESTED_REPLIES = envBool("CLAW_ASSISTANT_SUGGESTED_REPLIES", true);
+// `true` (the default) gives the router's `say` an optional `choices`: the options of a question the user answers by picking one or
+// several, carried by `assistant.say` as `choices` for a channel to show as a card whose Send sends the picked options as the user's
+// message (`assistant/choices.ts`).
+export const CLAW_ASSISTANT_CHOICES = envBool("CLAW_ASSISTANT_CHOICES", true);
+// `false` takes `claw_self_status` from the router (`assistant/self-status.ts`): how the assistant itself has been running over the last
+// day, read from Claw's own tables. On by default: it reads only counts, never a message, a session's settings or a user.
+export const CLAW_ASSISTANT_SELF_STATUS = envBool("CLAW_ASSISTANT_SELF_STATUS", true);
+// The build running, when the deployment says it; else `claw_self_status` reads the tag `deploy/build.sh` wrote into the image.
+export const CLAW_BUILD = env("CLAW_BUILD", "").trim();
 // How long an item may need the user with nobody having told them before the system tells them.
 export const CLAW_ASSISTANT_SILENT_SWEEP_SEC = envInt("CLAW_ASSISTANT_SILENT_SWEEP_SEC", 300, { min: 1 });
 // `on` gives the router the review and settings tools (review_start, review_restart, confirmation_answer,
 // review_mode_set, channel_action); anything else leaves it the five tools of a conversation.
 export const CLAW_ASSISTANT_TOOLS = env("CLAW_ASSISTANT_TOOLS", "off").trim().toLowerCase() === "on";
+// `on` turns on the routing and result discipline (`assistant/discipline.ts`, router-discipline-v2 and worker-v13) for every user: a
+// reply to a result already given is acknowledged and acts on nothing, a request to read ~/.ssh, keys or credentials is declined in
+// chat and work_create refuses it, and a worker whose task changed nothing outside reports what it delivered as an answer, with no
+// Accept. Off (the default), only the users named in CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS (Claw user ids, comma-separated) get it: the
+// canary, opened for the evaluation identities first.
+export const CLAW_ASSISTANT_ROUTE_DISCIPLINE = env("CLAW_ASSISTANT_ROUTE_DISCIPLINE", "off").trim().toLowerCase() === "on";
+export const CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
 // The marketplace plugin whose MCP servers the assistant reads from and its workers run with, when the message names
 // none (a chat client that talks to the assistant sends no plugin). Blank or 0: none, and a router turn has no read tools.
 // A router turn is offered only the read tools `assistant/read-tools.ts` lists of it; a worker gets the whole plugin.
@@ -808,6 +1001,11 @@ export const CLAW_ASSISTANT_OBSERVE = envBool("CLAW_ASSISTANT_OBSERVE", false);
 // How long an item in progress may go without any sign of progress before the watchdog puts it in front of
 // its owner, with the reason (`assistant/watchdog.ts`). 0 is off.
 export const CLAW_ASSISTANT_WATCHDOG_SEC = envInt("CLAW_ASSISTANT_WATCHDOG_SEC", 0, { min: 0 });
+// How long a work item's worker waits for its person's decision on a held tool call, or for the answer to its question,
+// before the call is refused (`decision_wait_ms` of its turns; `assistant/holds.ts`). The item waits in needs_you meanwhile,
+// and the person is told on their channel. 0 leaves Brain's own settings, a few minutes, which nobody away from the
+// console could meet.
+export const CLAW_ASSISTANT_DECISION_WAIT_SEC = envInt("CLAW_ASSISTANT_DECISION_WAIT_SEC", 3600, { min: 0, max: 86_400 });
 // Model choice for the assistant's items (`assistant/model-choice.ts`): an item's model asked for in the message, the user's
 // own defaults, an allow-list, and a fallback when the payer's key cannot use a model. `on` turns it on; anything else (the
 // default) leaves every tool, prompt, table and turn exactly as without it. An empty CLAW_ASSISTANT_MODELS is the same as off.
@@ -828,3 +1026,17 @@ export const ASSISTANT_DEPLOYMENT_MODEL = env("DEFAULT_MODEL");
 // The address Brain reaches this API at; the assistant MCP service is served under it.
 export const INTERNAL_BACKEND_URL =
   process.env.INTERNAL_BACKEND_URL || `http://127.0.0.1:${process.env.API_PORT || "8200"}`;
+// `true` (the default) has the server tell the person "on it" when a router turn answering them starts its first lookup (a web search,
+// an MCP read) without having said anything yet (`assistant/lookup-ack.ts`): the lookup can take seconds, and the first reply is what the
+// person waits on. The answer the turn says later takes that line's place in a channel that can edit it. Off: only the router's own words.
+export const CLAW_ASSISTANT_LOOKUP_ACK = envBool("CLAW_ASSISTANT_LOOKUP_ACK", true);
+// How long after a router turn's first lookup starts the server waits for the router's own line before it says its own (milliseconds):
+// a model that writes its line beside the lookup, in the same step, is not answered twice.
+export const CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS = envInt("CLAW_ASSISTANT_LOOKUP_ACK_GRACE_MS", 600, { min: 0 });
+// Whom the server tells "on it" when a router turn answering them has said nothing CLAW_ASSISTANT_FIRST_ACK_MS after it began, whatever the
+// turn is doing (thinking, the assistant's own tools, a slow start), as the lookup line above is said for a lookup
+// (`assistant/lookup-ack.ts`): `*` for everyone, or a comma-separated list of user ids; blank, the default, for no one. Measured on the
+// evaluation identities first (2026-11-06 baseline: first reply p90 7.28 s, 21 turns that only answered at their end).
+export const CLAW_ASSISTANT_FIRST_ACK_USERS = env("CLAW_ASSISTANT_FIRST_ACK_USERS");
+// How long after a router turn began (its run row) the server waits for the router's first word before it says its own (milliseconds).
+export const CLAW_ASSISTANT_FIRST_ACK_MS = envInt("CLAW_ASSISTANT_FIRST_ACK_MS", 3500, { min: 0 });

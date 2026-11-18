@@ -22,10 +22,13 @@
  *   F2  a review's first turn runs again with its first message; a later turn of a review is not run again
  *   F3  a router turn answering the user runs again with the user's message and its attendance; only that turn takes the fallback
  *   F4  the completion handler runs it and then records no failure of the refused turn; a second failure is reported as it is
+ *   F5  a router turn refused for an invalid bound key (the upstream's 401) runs again once on the fallback too; the user is told the key
+ *       is invalid and where to upload a valid one, and a re-run refused the same way says so instead of asking them to say it again
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
 import Fastify, { type FastifyInstance } from "fastify";
+import { redactStoredText } from "@claw/utils";
 
 import { postgresSkipReason } from "./support/pg-cluster.js";
 import { startWorld, type Claims, type World } from "./support/assistant-world.js";
@@ -38,6 +41,11 @@ const HAIKU = "claude-haiku-5.5";
 const GLM = "glm-5-3-with-fallback";
 const GPT = "gpt-6-luna";
 const APIM_403 = "403 {\"error\":\"No APIM Key binding found. Please upload your APIM Key on the SaFE platform first.\"}";
+/** A bound subscription key the upstream refused, as a failed turn's text reads in production (the gateway's own fallback found none). */
+const APIM_401_INVALID = "401 {\"error\":{\"message\":\"{ \\\"statusCode\\\": 401, \\\"message\\\": \\\"Access denied due to invalid subscription key. "
+  + "Make sure to provide a valid key for an active subscription.\\\" }No fallback model group found for original model_group=claude-sonnet-5.5. "
+  + "Fallbacks=[{'glm-5-3-with-fallback': ['sonnet-5.5-alt']}]. Received Model Group=claude-sonnet-5.5\\nAvailable Model Group Fallbacks=None\\n"
+  + "Error doing the fallback: { \\\"statusCode\\\": 401, \\\"message\\\": \\\"Access denied due to invalid subscription key.\\\" }\"}}";
 const APIM_401 = "litellm.AuthenticationError: 401 {\"error\":{\"message\":\"{ \\\"statusCode\\\": 401, \\\"message\\\": \\\"Access denied due to missing subscription key. Make sure to include subscription key\"}}";
 
 describe("assistant model choice", { skip }, () => {
@@ -67,7 +75,7 @@ describe("assistant model choice", { skip }, () => {
       CLAW_GITHUB_REVIEW_ENABLED: "true",
       CLAW_GITHUB_REVIEW_MCP_SECRET: "t".repeat(40),
       CLAW_ASSISTANT_REVIEW_ITEMS: "true",
-      CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "clawy",
+      CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS: "chat-client",
     });
     mc = await import("../src/assistant/model-choice.js");
     fb = await import("../src/assistant/model-fallback.js");
@@ -427,6 +435,29 @@ describe("assistant model choice", { skip }, () => {
     assert.equal(await sessionModel(item2.worker_session_id), OPUS, "unchanged");
   });
 
+  test("F3b a router turn run again is given the user's words as the model first was, not the masked copy stored of them", async () => {
+    // Assembled from pieces so no scanner reads this file as holding a credential.
+    const words = `deploy with ak-${"Q7w8E9r0T1y2".repeat(4)} please`;
+    const turn = await userTurn(alice, redactStoredText(words).text);
+    await w.q("UPDATE claw_tasks SET prompt = $2 WHERE task_id = $1", [turn.task_id, words]);
+    await w.closeRun(turn.task_id, "failed", "agent_error", 0);
+    const end = { sessionId: alice.routerSid, runIds: [turn.task_id], messageId: turn.mid, failed: true, interrupted: false, finalText: APIM_401 };
+    assert.equal(await fb.rerunOnFallback(end, w.sayDeps), "rerun");
+    const [queued] = await w.pending(alice.routerSid);
+    assert.equal(queued.content, words);
+    const copied = await w.q("SELECT content FROM claw_assistant_messages WHERE session_id = $1", [alice.routerSid]);
+    assert.ok(copied.every((r: { content: string }) => r.content === "deploy with <redacted> please"), "the stored copies stay masked");
+    await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [alice.routerSid]);
+
+    // A run whose prompt is not that message (masking it does not give the stored words) is run again with the stored words.
+    const other = await userTurn(alice, "review AMD-AGI/PrimusClaw#255");
+    await w.q("UPDATE claw_tasks SET prompt = 'something else' WHERE task_id = $1", [other.task_id]);
+    await w.closeRun(other.task_id, "failed", "agent_error", 0);
+    assert.equal(await fb.rerunOnFallback({ ...end, runIds: [other.task_id], messageId: other.mid }, w.sayDeps), "rerun");
+    assert.equal((await w.pending(alice.routerSid))[0].content, "review AMD-AGI/PrimusClaw#255");
+    await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [alice.routerSid]);
+  });
+
   test("F3 a router turn answering the user runs again with their message and its attendance, and only that turn takes the fallback", async () => {
     const turn = await userTurn(alice, "review AMD-AGI/PrimusClaw#254");
     await w.closeRun(turn.task_id, "failed", "agent_error", 0);
@@ -489,8 +520,61 @@ describe("assistant model choice", { skip }, () => {
       await complete(rerunId, run.taskId, 2);
       const after = await w.q("SELECT text FROM claw_assistant_says WHERE user_id = 'alice' ORDER BY created_at");
       assert.equal(after.length, 2);
-      assert.match(after[1].text, /没有处理成功/, "the re-run's failure is told as any failed turn");
+      assert.match(after[1].text, /还没有绑定 APIM Key[^]*https:\/\/console\.example\.com\/llm-gateway/,
+        "the re-run's refusal is told as the key's, with where to bind one");
+      assert.doesNotMatch(after[1].text, /请再说一次/);
       assert.equal((await w.pending(alice.routerSid)).length, 0, "and not run a third time");
+    } finally {
+      Object.assign(tombstoneReader, originalTombstone);
+      resetDeletedSessionCache();
+    }
+  });
+  test("F5 a router turn refused for an invalid bound key runs again on the fallback, and the user is told the key is invalid and where to fix it", async () => {
+    assert.equal(fb.isMissingKeyRefusal(APIM_401_INVALID), false, "not the missing-key refusal");
+    const kr = await import("../src/assistant/key-refusal.js");
+    assert.equal(kr.keyRefusalOf(APIM_401_INVALID), "invalid");
+    assert.equal(kr.keyRefusalOf(`litellm.AuthenticationError: ${APIM_401_INVALID}`), "invalid");
+    assert.equal(kr.keyRefusalOf(APIM_401), "missing");
+    assert.equal(kr.keyRefusalOf(APIM_403), "missing");
+    assert.equal(kr.keyRefusalOf(`Your key was refused: ${APIM_401_INVALID}`), null, "an answer that quotes it is an answer");
+    assert.equal(kr.keyRefusalOf("500 internal error: invalid subscription key"), null, "only the 401");
+    const turn = await userTurn(alice, "为什么没有回答我？");
+    const { consumeEventDelivery, tombstoneReader } = w.mod.consumer;
+    const { sc } = await import("../src/infra/nats.js");
+    const { resetDeletedSessionCache } = await import("../src/sessions/deleted-cache.js");
+    const originalTombstone = { ...tombstoneReader };
+    Object.assign(tombstoneReader, { has: async () => false });
+    resetDeletedSessionCache();
+    const complete = async (mid: string, taskId: string, seq: number) => consumeEventDelivery({
+      subject: `events.${alice.routerSid}`,
+      data: sc.encode(JSON.stringify({
+        type: "exec_complete", session_id: alice.routerSid, user_id: "alice", message_id: mid, task_id: taskId,
+        final_text: APIM_401_INVALID, failed: true, failure_reason: "agent_error", error_count: 1, skills_used: {},
+      })),
+      seq, ack: () => {}, nak: () => {},
+    });
+    try {
+      await complete(turn.mid, turn.task_id, 1);
+      const says = await w.q("SELECT text FROM claw_assistant_says WHERE user_id = 'alice' ORDER BY created_at");
+      assert.equal(says.length, 1, says.map((s) => s.text).join(" | "));
+      assert.equal(says[0].text,
+        `你绑定的 APIM Key 无效或已过期，用不了 默认模型，这条消息改用 ${GLM} 处理。重新上传有效的 APIM Key 后即可使用 默认模型：\nhttps://console.example.com/llm-gateway`,
+        "the router runs on the deployment's model, which its session does not name");
+      const [queued] = await w.pending(alice.routerSid);
+      assert.equal(queued?.content, "为什么没有回答我？", "the user's message, queued again");
+      const rerunId = `claw-pending-${queued.id}`;
+      const [fell] = await w.q("SELECT model, from_model, rerun_message_id FROM claw_assistant_model_fallbacks WHERE session_id = $1", [alice.routerSid]);
+      assert.deepEqual(fell, { model: GLM, from_model: null, rerun_message_id: rerunId });
+      // The re-run refused the same way: told what to fix and where, not asked to say it again, and not run a third time.
+      await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [alice.routerSid]);
+      const run = await w.openRun(alice.routerSid, { messageId: rerunId });
+      await w.q("UPDATE claw_tasks SET prompt = $2 WHERE task_id = $1", [run.taskId, queued.content]);
+      await complete(rerunId, run.taskId, 2);
+      const after = await w.q("SELECT text FROM claw_assistant_says WHERE user_id = 'alice' ORDER BY created_at");
+      assert.equal(after.length, 2, after.map((s) => s.text).join(" | "));
+      assert.equal(after[1].text, "你绑定的 APIM Key 无效或已过期，模型网关拒绝了这条消息。重新上传有效的 APIM Key 后再发一次即可：\nhttps://console.example.com/llm-gateway");
+      assert.equal((await w.pending(alice.routerSid)).length, 0, "not run a third time");
+      assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_model_fallbacks WHERE session_id = $1", [alice.routerSid]))[0].n, 1);
     } finally {
       Object.assign(tombstoneReader, originalTombstone);
       resetDeletedSessionCache();

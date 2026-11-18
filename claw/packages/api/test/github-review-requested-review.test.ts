@@ -12,7 +12,8 @@
  *   G3  the person who asked cannot send a turn into the reviewer's session
  *   P1  the review profile on a turn: the fixed list, only the review tools' server, none of the owner's belongings, the turn budget;
  *       the owner's own review of their account keeps what it had
- *   P2  skill selection is skipped for such a review (both entries ask `skipsSkillSelection`)
+ *   P2  such a review, and the owner's own review of their account, are not told of the owner's personal skills
+ *       (`userSkillsServe`, which both entries ask); the owner's own chat is
  *   U1  who asked, and whose profile it is, read from a stored config; the requester's note quoted as untrusted
  */
 import assert from "node:assert/strict";
@@ -25,6 +26,7 @@ process.env.CLAW_GITHUB_REVIEW_MCP_URL = "http://api.internal.example:8200/v1/in
 process.env.CLAW_ASSISTANT_ENABLED = "true";
 process.env.CLAW_ASSISTANT_REVIEW_ITEMS = "true";
 process.env.SANDBOX_CPU_NAMESPACE = "global-cpu";
+process.env.CLAW_USER_SKILLS_ENABLED = "true";
 
 type Mod<T> = T extends Promise<infer U> ? U : never;
 let h: Mod<ReturnType<typeof import("./scenario-harness.js").startHarness>>;
@@ -40,7 +42,7 @@ let items: typeof import("../src/assistant/review-items.js");
 const ALICE = { userId: "u-alice", userName: "Alice A" };
 const BOB = { userId: "u-bob", userName: "Bob B" };
 const REQUESTED = { acting_as: "u-bob", requested_by: { user_id: "u-alice", label: "Alice A" }, sandbox_profile: "review" };
-const PROFILE_TOOLS = ["mcp__github_review__*", "read", "glob", "grep", "ls", "bash", "bash_output", "kill_shell", "task", "todo_write"];
+const PROFILE_TOOLS = ["mcp__github_review__*", "read", "glob", "grep", "ls", "bash", "bash_output", "wait", "kill_shell", "task", "todo_write"];
 
 before(async () => {
   const harness = await import("./scenario-harness.js");
@@ -120,7 +122,7 @@ test("P1 a turn of a requested review gets the fixed profile and nothing of its 
   await seed("s-own", "u-bob", { acting_as: "u-bob" });
   const loaded = () => ({
     session_id: "", skills: { s: { content: "x" } }, tool_ids: [1], plugin_id: 3, plugin_tools: [], user_env: { GH_TOKEN: "x" }, workspace_id: "gpu-ws",
-    topology: { nodes: 2 }, agent_hooks: { pre: [] }, rules_text: "be nice", memory_enabled: true, skill_evolution_enabled: true, tools_allowlist: ["*"],
+    topology: { nodes: 2 }, agent_hooks: { pre: [] }, rules_text: "be nice", memory_enabled: true, skill_evolution_enabled: true, user_skills_enabled: true, tools_allowlist: ["*"],
     mcp_servers: { mine: { type: "http", url: "http://x" }, github_review: { type: "http", url: "http://stale" } },
   });
   const task: Record<string, unknown> = loaded();
@@ -130,7 +132,7 @@ test("P1 a turn of a requested review gets the fixed profile and nothing of its 
   for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "workspace_id", "topology", "agent_hooks", "rules_text"]) {
     assert.equal(field in task, false, field);
   }
-  assert.deepEqual([task.memory_enabled, task.skill_evolution_enabled, task.sandbox_profile, task.withhold_sandbox_keys, task.max_turns], [false, false, "review", true, 200]);
+  assert.deepEqual([task.memory_enabled, task.skill_evolution_enabled, task.user_skills_enabled, task.sandbox_profile, task.withhold_sandbox_keys, task.max_turns], [false, false, false, "review", true, 200]);
   const own: Record<string, unknown> = loaded();
   await tools.applySandboxKeyPolicyToTask(own, "s-own");
   assert.deepEqual([own.sandbox_profile, own.tools_allowlist, own.max_turns, own.memory_enabled, "skills" in own, "user_env" in own],
@@ -142,15 +144,14 @@ test("P1 a turn of a requested review gets the fixed profile and nothing of its 
   if (claims.ok) assert.deepEqual([claims.claims.requesterUserId, claims.claims.actorUserId], ["u-alice", "u-bob"]);
 });
 
-test("P2 skill selection is skipped for a requested review, and not for the owner's own review", async () => {
+test("P2 a requested review and the owner's own review are not told of the owner's skills; the owner's own chat is", async () => {
   await seed("s-req", "u-bob", REQUESTED);
   await seed("s-own", "u-bob", { acting_as: "u-bob" });
-  // The assistant's tables, which this harness does not make: the owner's own review is asked whether it is a router's turn.
-  await h.sql("CREATE TABLE IF NOT EXISTS claw_assistants (user_id TEXT PRIMARY KEY, session_id TEXT)");
-  await h.sql("CREATE TABLE IF NOT EXISTS claw_work_items (item_id TEXT, user_id TEXT, seq INT, title TEXT, worker_session_id TEXT, kind TEXT)");
-  await h.sql("CREATE TABLE IF NOT EXISTS claw_assistant_scopes (user_id TEXT, scope TEXT, session_id TEXT)");
-  assert.equal(await role.skipsSkillSelection("s-req"), true);
-  assert.equal(await role.skipsSkillSelection("s-own"), false);
+  await seed("s-chat", "u-bob", {});
+  const { userSkillsServe } = await import("../src/sessions/user-skills.js");
+  assert.equal(await userSkillsServe("s-req", "u-bob"), false);
+  assert.equal(await userSkillsServe("s-own", "u-bob"), false);
+  assert.equal(await userSkillsServe("s-chat", "u-bob"), true);
 });
 
 test("U1 who asked and whose profile it is, read from a stored config; the requester's note quoted as untrusted", () => {

@@ -33,9 +33,12 @@ on:
 permissions:
   contents: read
 
+# A new pull request head cancels the previous head's run. Pushes stay
+# serialised per ref, as before, so registry pushes do not race, and a push
+# run that has started is never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   detect-changes:
@@ -76,7 +79,7 @@ jobs:
           echo "Release tag: rebuilding every image in this workflow"
           echo "workflow_changed=true" >> "$GITHUB_OUTPUT"
           echo "claw_changed=true" >> "$GITHUB_OUTPUT"
-          echo "memory_service_changed=true" >> "$GITHUB_OUTPUT"
+          echo "personal_agent_changed=true" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
@@ -99,12 +102,22 @@ jobs:
 
         # Changes to the workflow itself should rebuild all images described by
         # this workflow, so a CI-only edit is still validated end-to-end.
-        if echo "$CHANGED_FILES" | grep -qE '^\.github/workflows/build\.yaml$'; then
+        # The image scan's script is part of every image's check, so the same applies to it.
+        if echo "$CHANGED_FILES" | grep -qE '^(\.github/workflows/build\.yaml|\.github/scripts/image-scan\.sh)$'; then
           WORKFLOW_CHANGED=true
           echo "workflow_changed=true" >> $GITHUB_OUTPUT
         else
           WORKFLOW_CHANGED=false
           echo "workflow_changed=false" >> $GITHUB_OUTPUT
+        fi
+
+        # personal-agent-teams: the three npm packages, built from personal-agent/ and the Claw wire contract it
+        # compiles in (claw/packages/protocol), installed into personal-agent/Dockerfile's image. Built only:
+        # never pushed by this workflow (see "Push with Buildah").
+        if [[ "$WORKFLOW_CHANGED" == "true" ]] || echo "$CHANGED_FILES" | grep -qE '^(personal-agent/|claw/packages/protocol/|claw/tsconfig\.base\.json$|LICENSE$)'; then
+          echo "personal_agent_changed=true" >> $GITHUB_OUTPUT
+        else
+          echo "personal_agent_changed=false" >> $GITHUB_OUTPUT
         fi
 
         # claw (unified image): TS monorepo sources baked into claw/Dockerfile
@@ -114,13 +127,6 @@ jobs:
           echo "claw_changed=false" >> $GITHUB_OUTPUT
         fi
 
-        # claw-memory-service: owned memory API + Postgres-backed service
-        if [[ "$WORKFLOW_CHANGED" == "true" ]] || echo "$CHANGED_FILES" | grep -qE '^(memory/memory-service/)'; then
-          echo "memory_service_changed=true" >> $GITHUB_OUTPUT
-        else
-          echo "memory_service_changed=false" >> $GITHUB_OUTPUT
-        fi
-
     - name: Generate matrix
       id: generate-matrix
       run: |
@@ -128,8 +134,10 @@ jobs:
         if [[ "${{ steps.detect-changes.outputs.claw_changed }}" == "true" ]]; then
           MATRIX+='{"name":"claw","context_path":"claw","dockerfile_path":"claw/Dockerfile"},'
         fi
-        if [[ "${{ steps.detect-changes.outputs.memory_service_changed }}" == "true" ]]; then
-          MATRIX+='{"name":"claw-memory-service","context_path":"memory/memory-service","dockerfile_path":"memory/memory-service/deploy/Dockerfile"},'
+        # "push":"no": the image is built and smoke-tested here and never pushed, on any event. No workflow pushes it
+        # yet: publishing it is for the personal agent's own release workflow, still to be written.
+        if [[ "${{ steps.detect-changes.outputs.personal_agent_changed }}" == "true" ]]; then
+          MATRIX+='{"name":"personal-agent-teams","context_path":".","dockerfile_path":"personal-agent/Dockerfile","push":"no"},'
         fi
         MATRIX=${MATRIX%,}
         MATRIX+=']}'
@@ -162,17 +170,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # The runner image ships Buildah; apt runs only where it is missing, bounded, so a mirror that hangs fails the
+      # step in minutes instead of holding the job to its timeout.
       - name: Install Buildah
         run: |
-          sudo apt-get update
-          sudo apt-get install -y buildah
+          set -euo pipefail
+          if ! command -v buildah >/dev/null; then
+            apt=(sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+            "${apt[@]}" update
+            "${apt[@]}" install -y buildah
+          fi
+          buildah --version
 
       # Pull requests build but never push, so they need no registry credentials
       # at all. A failed login now fails the job: previously it was swallowed by
       # `|| echo`, and the run continued to the push, which then failed with an
       # authentication error far from its actual cause.
       - name: Login registries
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && matrix.push != 'no'
         run: |
           echo "Logging in to Docker Hub..."
           buildah login -u "${{ secrets.DOCKER_USERNAME }}" -p "${{ secrets.DOCKER_PASSWORD }}" docker.io
@@ -188,12 +203,104 @@ jobs:
           buildah bud \
             --layers \
             --build-context agent-sandbox=sandbox \
+            --build-arg CLAW_BUILD=${DATE_TIME} \
             -t ${{ matrix.name }}:${IMAGE_VERSION} \
             -t ${{ matrix.name }}:${DATE_TIME} \
             -f ${{ matrix.dockerfile_path }} ${{ matrix.context_path }}
 
+      # The claw image reports its own build to the assistant through CLAW_BUILD
+      # (claw/Dockerfile). Assert the image just built carries exactly the tag it
+      # is about to be pushed under, so a dropped build-arg fails here rather
+      # than as "build unknown" on a live deployment.
+      - name: Assert the image knows its tag
+        if: matrix.name == 'claw'
+        env:
+          DATE_TIME: ${{ needs.detect-changes.outputs.date_time }}
+        run: |
+          set -e
+          ENVS=$(buildah inspect --type image --format '{{range .OCIv1.Config.Env}}{{println .}}{{end}}' ${{ matrix.name }}:${DATE_TIME})
+          GOT=$(printf '%s\n' "$ENVS" | sed -n 's/^CLAW_BUILD=//p')
+          echo "CLAW_BUILD in image: '${GOT}', tag: '${DATE_TIME}'"
+          if [[ -z "$DATE_TIME" || "$GOT" != "$DATE_TIME" ]]; then
+            echo "::error::claw image CLAW_BUILD='${GOT}' does not equal its tag '${DATE_TIME}'"
+            exit 1
+          fi
+
+      # The personal agent's image as it would run: as uid 65534, with the three packages at the version they were
+      # built as, and, started through the release gate's test entry (loopback only, no queue, no real Teams or
+      # Claw), answering /healthz and naming its build on /metrics.
+      - name: Smoke-test the personal agent image
+        if: matrix.name == 'personal-agent-teams'
+        env:
+          IMAGE: localhost/${{ matrix.name }}:${{ needs.detect-changes.outputs.image_version }}
+        run: |
+          set -euo pipefail
+          # The runner image ships podman (it shares Buildah's image store); install it only where it is missing.
+          command -v podman >/dev/null || { sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo timeout 300 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y podman; }
+          VERSION=$(node -p 'require("./personal-agent/packages/teams/package.json").version')
+          USER_ID=$(podman run --rm "$IMAGE" id -u)
+          echo "user in image: $USER_ID"
+          [[ "$USER_ID" == "65534" ]] || { echo "::error::the image runs as uid $USER_ID, expected 65534"; exit 1; }
+          GOT=$(podman run --rm -w /app "$IMAGE" node -p 'const v=(n)=>require("./node_modules/@primusclaw/"+n+"/package.json").version; [v("personal-agent"),v("personal-agent-runtime"),v("personal-agent-teams")].join(" ")')
+          echo "packages in image: $GOT"
+          [[ "$GOT" == "$VERSION $VERSION $VERSION" ]] || { echo "::error::packages in the image are '$GOT', expected $VERSION"; exit 1; }
+          podman run -d --name pa-smoke --network host \
+            -e TEAMS_ENCRYPTION_KEYS="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_')" \
+            -e TEAMS_DB_PATH=/data/state.db -e PUBLIC_BASE_URL=https://claw.example.com \
+            -e CLAW_API_URL=http://claw.invalid -e SAFE_API_URL=http://safe.invalid/api/v1 \
+            -e OUTBOUND_MODE=direct -e BOT_MSI_CLIENT_ID=smoke -e SECRETS_SOURCE=env \
+            -e TEAMS_GATE_ENTRY=1 -e GATE_RUN_ID=image-smoke -e TEAMS_GATE_CONNECTOR_URL=http://127.0.0.1:9 \
+            -e PORT=18080 -e METRICS_PORT=19090 \
+            "$IMAGE"
+          ok=""
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          if [[ -z "$ok" ]]; then echo "::error::/healthz did not answer within 60 s"; podman logs pa-smoke; exit 1; fi
+          METRICS=$(curl -fsS http://127.0.0.1:19090/metrics)
+          grep '^personal_agent_build_info' <<<"$METRICS" || true
+          grep -q "^personal_agent_build_info{version=\"$VERSION\"," <<<"$METRICS" \
+            || { echo "::error::/metrics does not name version $VERSION"; podman logs pa-smoke; exit 1; }
+          podman stop -t 10 pa-smoke >/dev/null
+
+      # Before anything is pushed, the image goes through the scan that gates the publication of a public image: the
+      # same Trivy release and parameters, no ignore list (.github/scripts/image-scan.sh says what fails and why). A
+      # pull request builds, and so scans, only the images whose inputs it changes; a push to main or a tag scans
+      # what it is about to push, and a finding stops the push.
+      - name: Export the image for the scan
+        env:
+          NAME: ${{ matrix.name }}
+          IMAGE_VERSION: ${{ needs.detect-changes.outputs.image_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/image-scan"
+          buildah push "localhost/$NAME:$IMAGE_VERSION" "docker-archive:$RUNNER_TEMP/image-scan/$NAME.tar:$NAME:$IMAGE_VERSION"
+
+      - name: Day of the scanner's database cache
+        id: scan-day
+        run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      # Trivy's vulnerability database and checks bundle, one cache a day. Trivy still replaces a database past its
+      # own next-update time, exactly as on any runner, so the cache saves the download and changes no answer.
+      - name: Restore the scanner's database
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/trivy/db
+            ~/.cache/trivy/java-db
+            ~/.cache/trivy/policy
+          key: image-scan-trivy-0.74.0-${{ steps.scan-day.outputs.day }}
+          restore-keys: image-scan-trivy-0.74.0-
+
+      - name: Scan the image as its publication will
+        env:
+          NAME: ${{ matrix.name }}
+        run: bash .github/scripts/image-scan.sh "$NAME" "$RUNNER_TEMP/image-scan/$NAME.tar"
+
       - name: Push with Buildah
-        if: github.event_name != 'pull_request'
+        id: push
+        if: github.event_name != 'pull_request' && matrix.push != 'no'
         env:
           DOCKERIO_REPOSITORY: docker.io/primussafe
           IMAGE_VERSION: ${{ needs.detect-changes.outputs.image_version }}
@@ -203,5 +310,101 @@ jobs:
           echo "Pushing ${{ matrix.name }} to ${DOCKERIO_REPOSITORY}..."
           buildah tag ${{ matrix.name }}:${IMAGE_VERSION} ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
           buildah tag ${{ matrix.name }}:${DATE_TIME} ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
-          buildah push ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
-          buildah push ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
+          buildah push --digestfile "$RUNNER_TEMP/version-digest" ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${IMAGE_VERSION}
+          buildah push --digestfile "$RUNNER_TEMP/build-digest" ${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME}
+          version_digest="$(cat "$RUNNER_TEMP/version-digest")" build_digest="$(cat "$RUNNER_TEMP/build-digest")"
+          for d in "$version_digest" "$build_digest"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::buildah reported digest \"$d\""; exit 1; }
+          done
+          echo "${DOCKERIO_REPOSITORY}/${{ matrix.name }}:${DATE_TIME} is ${build_digest}"
+          {
+            echo "repository=${DOCKERIO_REPOSITORY}/${{ matrix.name }}"
+            echo "build-digest=$build_digest"
+            echo "version-digest=$version_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      # The digests go to the attest job: only that job, which runs no repository code, may sign with the workflow's
+      # OIDC identity.
+      - name: Hand the pushed digests to the attest job
+        if: steps.push.outcome == 'success'
+        env:
+          REPOSITORY: ${{ steps.push.outputs.repository }}
+          BUILD_DIGEST: ${{ steps.push.outputs.build-digest }}
+          VERSION_DIGEST: ${{ steps.push.outputs.version-digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/image-digest"
+          printf '%s\n' "$REPOSITORY" > "$RUNNER_TEMP/image-digest/repository"
+          printf '%s\n' "$BUILD_DIGEST" > "$RUNNER_TEMP/image-digest/build-digest"
+          printf '%s\n' "$VERSION_DIGEST" > "$RUNNER_TEMP/image-digest/version-digest"
+
+      - name: Upload the pushed digests
+        if: steps.push.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-digest-${{ matrix.name }}
+          path: ${{ runner.temp }}/image-digest/
+          retention-days: 1
+          if-no-files-found: error
+
+  # Signs the build provenance of each pushed image, as the personal agent's release does for its image. The build tag
+  # is what deployments pin and what a release relays by digest to the ROCm staging repository (image-relay.yml); a
+  # copy that keeps the digest keeps the attestation valid for it. This job checks out and runs nothing from the
+  # repository and never runs for a pull request, so the OIDC permission is never given to code a pull request
+  # controls. `gh attestation verify oci://<image>@<digest> --repo AMD-AGI/PrimusClaw` checks it.
+  attest:
+    name: Attest pushed images
+    needs: [detect-changes, build]
+    if: always() && github.event_name != 'pull_request' && needs.detect-changes.outputs.matrix != '' && needs.detect-changes.outputs.matrix != '{"include":[]}'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write # sign the attestation
+      attestations: write # store it
+    steps:
+      # A leg whose build failed, or an image this workflow never pushes, uploaded no digests; that leg attests nothing.
+      - name: Fetch the pushed digests
+        id: fetch
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-digest-${{ matrix.name }}
+          path: ${{ runner.temp }}/image-digest
+
+      - name: Read the pushed digests
+        id: digests
+        if: steps.fetch.outcome == 'success'
+        env:
+          NAME: ${{ matrix.name }}
+          DIR: ${{ runner.temp }}/image-digest
+        run: |
+          set -euo pipefail
+          repository="$(cat "$DIR/repository")" build_digest="$(cat "$DIR/build-digest")" version_digest="$(cat "$DIR/version-digest")"
+          [ "$repository" = "docker.io/primussafe/$NAME" ] || { echo "::error::unexpected repository \"$repository\""; exit 1; }
+          for d in "$build_digest" "$version_digest"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::unexpected digest \"$d\""; exit 1; }
+          done
+          {
+            echo "repository=$repository"
+            echo "build-digest=$build_digest"
+            echo "version-digest=$version_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest the image's provenance
+        if: steps.digests.outcome == 'success'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.digests.outputs.repository }}
+          subject-digest: ${{ steps.digests.outputs.build-digest }}
+
+      # The two tags are two pushes of one image and normally one digest; should they differ, the other is attested too.
+      - name: Attest the version tag's provenance
+        if: steps.digests.outcome == 'success' && steps.digests.outputs.version-digest != steps.digests.outputs.build-digest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.digests.outputs.repository }}
+          subject-digest: ${{ steps.digests.outputs.version-digest }}

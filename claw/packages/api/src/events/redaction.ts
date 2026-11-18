@@ -5,7 +5,8 @@ import type { ClawTaskRow } from "../tasks/types.js";
 import { isSensitiveKey, redactSecrets } from "@claw/utils";
 
 /**
- * Deep-copy a JSON-compatible value while masking credential-bearing fields.
+ * Deep-copy a JSON-compatible value while masking credential-bearing fields. A value with
+ * `toJSON` (a Date) is copied as what `JSON.stringify` would write for it.
  *
  * `isSensitiveKey` is shared with brain's `redactPersistedEvent`, which masks
  * the same agent-loop events on their way into NATS. This pass is not
@@ -21,6 +22,14 @@ export function redactPublicJson(value: unknown): unknown {
     );
   }
   if (!value || typeof value !== "object") return value;
+  // What JSON.stringify would send in its place: a Date (node-postgres's timestamptz) is its ISO
+  // string, or null when invalid, and walking its entries instead would answer `{}`. Same for any
+  // other value that defines toJSON, unless it answers with itself.
+  const toJSON = (value as { toJSON?: unknown }).toJSON;
+  if (typeof toJSON === "function") {
+    const json: unknown = toJSON.call(value);
+    if (json !== value) return redactPublicJson(json);
+  }
 
   const safe: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value as Record<string, unknown>)) {

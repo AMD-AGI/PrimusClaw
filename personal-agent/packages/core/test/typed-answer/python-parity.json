@@ -1,0 +1,3456 @@
+{
+  "pending": {
+    "pulls": [
+      ["AMD-AGI/PrimusClaw", 243],
+      ["AMD-AGI/PrimusClaw", 234],
+      ["AMD-AGI/Primus-SaFE", 823]
+    ],
+    "same": [
+      ["AMD-AGI/PrimusClaw", 12],
+      ["AMD-AGI/Hyperloom", 12]
+    ],
+    "none": []
+  },
+  "answers": [
+    {
+      "text": "确认 #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 #243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "拒绝 #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "deny"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "拒绝 #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "deny"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "拒绝 #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "拒绝 #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "拒绝 #243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "拒绝 #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "不合入 #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "deny"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "不合入 #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "deny"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "不合入 #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "不合入 #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "不合入 #243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "不合入 #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "#243 #234 都确认",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "#243 #234 都确认",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "#243 #234 都确认",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "#243 #234 都确认",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "#243 #234 都确认",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "#243 #234 都确认",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243，拒绝 #234",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #243，拒绝 #234",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #243，拒绝 #234",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #243，拒绝 #234",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 #243，拒绝 #234",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243，拒绝 #234",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "243 可以合，234 先别合",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "243 可以合，234 先别合",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "243 可以合，234 先别合",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "243 可以合，234 先别合",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "243 可以合，234 先别合",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "243 可以合，234 先别合",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "全部确认",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"],
+          [["AMD-AGI/Primus-SaFE", 823], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "全部确认",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"],
+          [["AMD-AGI/Primus-SaFE", 823], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "全部确认",
+      "pending": "same",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 12], "allow"],
+          [["AMD-AGI/Hyperloom", 12], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "全部确认",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 12], "allow"],
+          [["AMD-AGI/Hyperloom", 12], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "全部确认",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "全部确认",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "都合吧",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"],
+          [["AMD-AGI/Primus-SaFE", 823], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "都合吧",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"],
+          [["AMD-AGI/Primus-SaFE", 823], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "都合吧",
+      "pending": "same",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 12], "allow"],
+          [["AMD-AGI/Hyperloom", 12], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "都合吧",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 12], "allow"],
+          [["AMD-AGI/Hyperloom", 12], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "都合吧",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "都合吧",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "don't merge 234",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 234], "deny"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "don't merge 234",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 234], "deny"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "don't merge 234",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "don't merge 234",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#234 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #234 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "don't merge 234",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "don't merge 234",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 Primus-SaFE#823",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/Primus-SaFE", 823], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 Primus-SaFE#823",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/Primus-SaFE", 823], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 Primus-SaFE#823",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 Primus-SaFE#823",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "Primus-SaFE#823 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / Primus-SaFE#823 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 Primus-SaFE#823",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 Primus-SaFE#823",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 PR #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 PR #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 PR #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 PR #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 PR #243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 PR #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "PR#243 PR#234 都合入",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "PR#243 PR#234 都合入",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "PR#243 PR#234 都合入",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "PR#243 PR#234 都合入",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "PR#243 PR#234 都合入",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "PR#243 PR#234 都合入",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 https://github.com/AMD-AGI/PrimusClaw/pull/243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 https://github.com/AMD-AGI/PrimusClaw/pull/243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 https://github.com/AMD-AGI/PrimusClaw/pull/243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 https://github.com/AMD-AGI/PrimusClaw/pull/243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "AMD-AGI/PrimusClaw#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / AMD-AGI/PrimusClaw#243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 https://github.com/AMD-AGI/PrimusClaw/pull/243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 https://github.com/AMD-AGI/PrimusClaw/pull/243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "在等你确认的有：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。请回复「确认 #243」「拒绝 #243」，或「全部确认」/「全部拒绝」。 / These wait for your confirmation: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823. Reply 确认 #243 or 拒绝 #243, or 全部确认 / 全部拒绝."
+      }
+    },
+    {
+      "text": "确认",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "在等你确认的有：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。请回复「确认 #243」「拒绝 #243」，或「全部确认」/「全部拒绝」。 / These wait for your confirmation: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823. Reply 确认 #243 or 拒绝 #243, or 全部确认 / 全部拒绝."
+      }
+    },
+    {
+      "text": "确认",
+      "pending": "same",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "在等你确认的有：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。请回复「确认 #12」「拒绝 #12」，或「全部确认」/「全部拒绝」。 / These wait for your confirmation: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12. Reply 确认 #12 or 拒绝 #12, or 全部确认 / 全部拒绝."
+      }
+    },
+    {
+      "text": "确认",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "在等你确认的有：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。请回复「确认 #12」「拒绝 #12」，或「全部确认」/「全部拒绝」。 / These wait for your confirmation: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12. Reply 确认 #12 or 拒绝 #12, or 全部确认 / 全部拒绝."
+      }
+    },
+    {
+      "text": "确认",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认 #243 拒绝 #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "在等你确认的有：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。请回复「确认 #243」「拒绝 #243」，或「全部确认」/「全部拒绝」。 / These wait for your confirmation: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823. Reply 确认 #243 or 拒绝 #243, or 全部确认 / 全部拒绝."
+      }
+    },
+    {
+      "text": "确认 #243 拒绝 #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "在等你确认的有：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。请回复「确认 #243」「拒绝 #243」，或「全部确认」/「全部拒绝」。 / These wait for your confirmation: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823. Reply 确认 #243 or 拒绝 #243, or 全部确认 / 全部拒绝."
+      }
+    },
+    {
+      "text": "确认 #243 拒绝 #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #243 拒绝 #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 #243 拒绝 #243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243 拒绝 #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "好的",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "好的",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "好的",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "好的",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "好的",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "好的",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "都可以",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "都可以",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "都可以",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "都可以",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "都可以",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "都可以",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "#243 为什么是高风险？",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "#243 为什么是高风险？",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "#243 为什么是高风险？",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "#243 为什么是高风险？",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "#243 为什么是高风险？",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "#243 为什么是高风险？",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认 #243 吗？",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #243 吗？",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认 #243 吗？",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #243 吗？",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认 #243 吗？",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #243 吗？",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "我看过了 #243 那个代码没问题，合吧",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "我看过了 #243 那个代码没问题，合吧",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "我看过了 #243 那个代码没问题，合吧",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "我看过了 #243 那个代码没问题，合吧",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "我看过了 #243 那个代码没问题，合吧",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "我看过了 #243 那个代码没问题，合吧",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认一下这个函数是否正确",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认一下这个函数是否正确",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认一下这个函数是否正确",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认一下这个函数是否正确",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认一下这个函数是否正确",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认一下这个函数是否正确",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "请帮忙确认 #243 的状态",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "请帮忙确认 #243 的状态",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "请帮忙确认 #243 的状态",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "请帮忙确认 #243 的状态",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "请帮忙确认 #243 的状态",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "请帮忙确认 #243 的状态",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认一下 #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认一下 #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认一下 #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认一下 #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认一下 #243",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认一下 #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "帮我确认 #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "帮我确认 #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "帮我确认 #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "帮我确认 #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "帮我确认 #243",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "帮我确认 #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "请确认 #243 吧",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "请确认 #243 吧",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "请确认 #243 吧",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "请确认 #243 吧",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "请确认 #243 吧",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "请确认 #243 吧",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "帮我 review 合入 #250",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "帮我 review 合入 #250",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#250 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。 / #250 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823."
+      }
+    },
+    {
+      "text": "帮我 review 合入 #250",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "帮我 review 合入 #250",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#250 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #250 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "帮我 review 合入 #250",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "帮我 review 合入 #250",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #250",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #250",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#250 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。 / #250 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823."
+      }
+    },
+    {
+      "text": "确认 #250",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #250",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#250 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #250 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 #250",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #250",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "合入前高风险的都先人工确认一下",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "合入前高风险的都先人工确认一下",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "合入前高风险的都先人工确认一下",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "合入前高风险的都先人工确认一下",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "合入前高风险的都先人工确认一下",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "合入前高风险的都先人工确认一下",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "改成全自动合入",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "改成全自动合入",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "改成全自动合入",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "改成全自动合入",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "改成全自动合入",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "改成全自动合入",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认 #２４３",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #２４３",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #２４３",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #２４３",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 #２４３",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #２４３",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认ok #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认ok #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "ok#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。 / ok#243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823."
+      }
+    },
+    {
+      "text": "确认ok #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认ok #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "ok#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / ok#243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认ok #243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认ok #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "ok #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "ok #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "ok#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。 / ok#243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823."
+      }
+    },
+    {
+      "text": "ok #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "ok #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "ok#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / ok#243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "ok #243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "ok #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "approve #243 and #234",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "approve #243 and #234",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "approve#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。 / approve#243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823."
+      }
+    },
+    {
+      "text": "approve #243 and #234",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "approve #243 and #234",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "approve#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / approve#243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "approve #243 and #234",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "approve #243 and #234",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "deny all",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "deny"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"],
+          [["AMD-AGI/Primus-SaFE", 823], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "deny all",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "deny"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"],
+          [["AMD-AGI/Primus-SaFE", 823], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "deny all",
+      "pending": "same",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 12], "deny"],
+          [["AMD-AGI/Hyperloom", 12], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "deny all",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 12], "deny"],
+          [["AMD-AGI/Hyperloom", 12], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "deny all",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "deny all",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "yes",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "yes",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "yes",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "yes",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "yes",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "yes",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "#243 ok",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "#243 ok",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "#243 ok",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "#243 ok",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "#243 ok",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "#243 ok",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243 #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 243], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #243 #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 243], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #243 #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #243 #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 #243 #243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243 #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243，拒绝 #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "在等你确认的有：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。请回复「确认 #243」「拒绝 #243」，或「全部确认」/「全部拒绝」。 / These wait for your confirmation: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823. Reply 确认 #243 or 拒绝 #243, or 全部确认 / 全部拒绝."
+      }
+    },
+    {
+      "text": "确认 #243，拒绝 #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "在等你确认的有：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。请回复「确认 #243」「拒绝 #243」，或「全部确认」/「全部拒绝」。 / These wait for your confirmation: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823. Reply 确认 #243 or 拒绝 #243, or 全部确认 / 全部拒绝."
+      }
+    },
+    {
+      "text": "确认 #243，拒绝 #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #243，拒绝 #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 #243，拒绝 #243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243，拒绝 #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243\n拒绝 #234",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #243\n拒绝 #234",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #243\n拒绝 #234",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #243\n拒绝 #234",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 #243\n拒绝 #234",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243\n拒绝 #234",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243，#234",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #243，#234",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 #243，#234",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #243，#234",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 #243，#234",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #243，#234",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 primusclaw#243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 primusclaw#243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 primusclaw#243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 primusclaw#243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "primusclaw#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / primusclaw#243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 primusclaw#243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 primusclaw#243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 AMD-AGI/PrimusClaw#243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 AMD-AGI/PrimusClaw#243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 AMD-AGI/PrimusClaw#243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 AMD-AGI/PrimusClaw#243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "AMD-AGI/PrimusClaw#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / AMD-AGI/PrimusClaw#243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 AMD-AGI/PrimusClaw#243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 AMD-AGI/PrimusClaw#243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "merge 243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "merge 243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "merge 243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "merge 243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "merge 243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "merge 243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "nope, don't merge 823",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/Primus-SaFE", 823], "deny"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "nope, don't merge 823",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/Primus-SaFE", 823], "deny"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "nope, don't merge 823",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "nope, don't merge 823",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#823 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #823 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "nope, don't merge 823",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "nope, don't merge 823",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认全自动",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认全自动",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认全自动",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认全自动",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认全自动",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认全自动",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "选全自动合入",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "选全自动合入",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "选全自动合入",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "选全自动合入",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "选全自动合入",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "选全自动合入",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认高风险再问我",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认高风险再问我",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认高风险再问我",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认高风险再问我",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认高风险再问我",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认高风险再问我",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "改成全自动",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "改成全自动",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "改成全自动",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "改成全自动",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "改成全自动",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "改成全自动",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "全自动驾驶是什么原理",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "全自动驾驶是什么原理",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "全自动驾驶是什么原理",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "全自动驾驶是什么原理",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "全自动驾驶是什么原理",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "全自动驾驶是什么原理",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认全自动吗？",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认全自动吗？",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认全自动吗？",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认全自动吗？",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认全自动吗？",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认全自动吗？",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认全自动还是高风险",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认全自动还是高风险",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认全自动还是高风险",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认全自动还是高风险",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认全自动还是高风险",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认全自动还是高风险",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "confirm fully automatic",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "confirm fully automatic",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "confirm fully automatic",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "confirm fully automatic",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "confirm fully automatic",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "confirm fully automatic",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "use high-risk",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "use high-risk",
+      "pending": "pulls",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "use high-risk",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "use high-risk",
+      "pending": "same",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "use high-risk",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "use high-risk",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    },
+    {
+      "text": "确认全自动 #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认全自动 #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认全自动 #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认全自动 #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认全自动 #243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认全自动 #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #12",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #12",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#12 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。 / #12 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823."
+      }
+    },
+    {
+      "text": "确认 #12",
+      "pending": "same",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "#12 有 2 个：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。请写上仓库名，例如「确认 AMD-AGI/PrimusClaw#12」。 / Which one? Write the repository, e.g. 确认 AMD-AGI/PrimusClaw#12."
+      }
+    },
+    {
+      "text": "确认 #12",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#12 有 2 个：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。请写上仓库名，例如「确认 AMD-AGI/PrimusClaw#12」。 / Which one? Write the repository, e.g. 确认 AMD-AGI/PrimusClaw#12."
+      }
+    },
+    {
+      "text": "确认 #12",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #12",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 Hyperloom#12",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 Hyperloom#12",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "Hyperloom#12 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。 / Hyperloom#12 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823."
+      }
+    },
+    {
+      "text": "确认 Hyperloom#12",
+      "pending": "same",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/Hyperloom", 12], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 Hyperloom#12",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/Hyperloom", 12], "allow"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 Hyperloom#12",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 Hyperloom#12",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #250 吧，之前那个",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #250 吧，之前那个",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#250 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。 / #250 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823."
+      }
+    },
+    {
+      "text": "确认 #250 吧，之前那个",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #250 吧，之前那个",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#250 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #250 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 #250 吧，之前那个",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #250 吧，之前那个",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "Lgtm #243",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "Lgtm #243",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "Lgtm#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。 / Lgtm#243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823."
+      }
+    },
+    {
+      "text": "Lgtm #243",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "Lgtm #243",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "Lgtm#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / Lgtm#243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "Lgtm #243",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "Lgtm #243",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 243 和 234",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 243 和 234",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "allow"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "确认 243 和 234",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 243 和 234",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 243 和 234",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 243 和 234",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "243、234 都拒绝",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "deny"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "243、234 都拒绝",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "deny"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "243、234 都拒绝",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "243、234 都拒绝",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "243、234 都拒绝",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "243、234 都拒绝",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "拒绝 #243，确认",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "deny"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "拒绝 #243，确认",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [[["AMD-AGI/PrimusClaw", 243], "deny"]],
+        "question": ""
+      }
+    },
+    {
+      "text": "拒绝 #243，确认",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "拒绝 #243，确认",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "拒绝 #243，确认",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "拒绝 #243，确认",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "批准 #243；拒绝 #234。",
+      "pending": "pulls",
+      "strict": true,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "批准 #243；拒绝 #234。",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [
+          [["AMD-AGI/PrimusClaw", 243], "allow"],
+          [["AMD-AGI/PrimusClaw", 234], "deny"]
+        ],
+        "question": ""
+      }
+    },
+    {
+      "text": "批准 #243；拒绝 #234。",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "批准 #243；拒绝 #234。",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#243 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #243 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "批准 #243；拒绝 #234。",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "批准 #243；拒绝 #234。",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #1234567",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #1234567",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#1234567 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。 / #1234567 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823."
+      }
+    },
+    {
+      "text": "确认 #1234567",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 #1234567",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "#1234567 没有在等你确认。在等你确认的是：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。 / #1234567 is not waiting for your confirmation; these are: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12."
+      }
+    },
+    {
+      "text": "确认 #1234567",
+      "pending": "none",
+      "strict": true,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 #1234567",
+      "pending": "none",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "现在没有在等你确认的合入或 review（可能已经处理过，或已过期）。 / Nothing is waiting for your confirmation now."
+      }
+    },
+    {
+      "text": "确认 12345678",
+      "pending": "pulls",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 12345678",
+      "pending": "pulls",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "在等你确认的有：AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823。请回复「确认 #243」「拒绝 #243」，或「全部确认」/「全部拒绝」。 / These wait for your confirmation: AMD-AGI/PrimusClaw#243、AMD-AGI/PrimusClaw#234、AMD-AGI/Primus-SaFE#823. Reply 确认 #243 or 拒绝 #243, or 全部确认 / 全部拒绝."
+      }
+    },
+    {
+      "text": "确认 12345678",
+      "pending": "same",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 12345678",
+      "pending": "same",
+      "strict": false,
+      "answer": {
+        "decisions": [],
+        "question": "在等你确认的有：AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12。请回复「确认 #12」「拒绝 #12」，或「全部确认」/「全部拒绝」。 / These wait for your confirmation: AMD-AGI/PrimusClaw#12、AMD-AGI/Hyperloom#12. Reply 确认 #12 or 拒绝 #12, or 全部确认 / 全部拒绝."
+      }
+    },
+    {
+      "text": "确认 12345678",
+      "pending": "none",
+      "strict": true,
+      "answer": null
+    },
+    {
+      "text": "确认 12345678",
+      "pending": "none",
+      "strict": false,
+      "answer": null
+    }
+  ],
+  "modes": [
+    {
+      "text": "确认 #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "拒绝 #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "不合入 #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "#243 #234 都确认",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 #243，拒绝 #234",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "243 可以合，234 先别合",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "全部确认",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "都合吧",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "don't merge 234",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 Primus-SaFE#823",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 PR #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "PR#243 PR#234 都合入",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 https://github.com/AMD-AGI/PrimusClaw/pull/243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 #243 拒绝 #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "好的",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "都可以",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "#243 为什么是高风险？",
+      "mode": null,
+      "decision_words": false,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 #243 吗？",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "我看过了 #243 那个代码没问题，合吧",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认一下这个函数是否正确",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "请帮忙确认 #243 的状态",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认一下 #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "帮我确认 #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "请确认 #243 吧",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "帮我 review 合入 #250",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": true
+    },
+    {
+      "text": "确认 #250",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "合入前高风险的都先人工确认一下",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "改成全自动合入",
+      "mode": null,
+      "decision_words": false,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 #２４３",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认ok #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "ok #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "approve #243 and #234",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "deny all",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "yes",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "#243 ok",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 #243 #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 #243，拒绝 #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 #243\n拒绝 #234",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 #243，#234",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 primusclaw#243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 AMD-AGI/PrimusClaw#243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "merge 243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "nope, don't merge 823",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认全自动",
+      "mode": {
+        "mode": "fully_auto",
+        "bare": true
+      },
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "选全自动合入",
+      "mode": {
+        "mode": "fully_auto",
+        "bare": true
+      },
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认高风险再问我",
+      "mode": {
+        "mode": "high_risk_confirm",
+        "bare": true
+      },
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "改成全自动",
+      "mode": null,
+      "decision_words": false,
+      "review_and_merge": false
+    },
+    {
+      "text": "全自动驾驶是什么原理",
+      "mode": null,
+      "decision_words": false,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认全自动吗？",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认全自动还是高风险",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "confirm fully automatic",
+      "mode": {
+        "mode": "fully_auto",
+        "bare": true
+      },
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "use high-risk",
+      "mode": {
+        "mode": "high_risk_confirm",
+        "bare": true
+      },
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认全自动 #243",
+      "mode": {
+        "mode": "fully_auto",
+        "bare": false
+      },
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 #12",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 Hyperloom#12",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 #250 吧，之前那个",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "Lgtm #243",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 243 和 234",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "243、234 都拒绝",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "拒绝 #243，确认",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "批准 #243；拒绝 #234。",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 #1234567",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    },
+    {
+      "text": "确认 12345678",
+      "mode": null,
+      "decision_words": true,
+      "review_and_merge": false
+    }
+  ]
+}

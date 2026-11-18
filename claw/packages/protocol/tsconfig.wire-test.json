@@ -1,0 +1,16 @@
+{
+  // Compiles test/claw-api-wire.test.ts, whose type assertions hold the wire types in src/claw-api/ to what the API
+  // package builds. It reads the API's sources, so it runs after `npm run build` (tests.yml) rather than as part of
+  // this package's own build, which comes first. The API's entry point is compiled with it so that the module
+  // augmentations its plugins register (request.cookies, request.parts) are in scope as they are for the API itself.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "..",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": [],
+  "files": ["test/claw-api-wire.test.ts", "../api/src/index.ts"]
+}

@@ -12,6 +12,12 @@ import { z } from "zod";
 import { REPORT_KINDS, type WorkReport } from "./work-items.js";
 
 export const REPORT_SUMMARY_MAX = 600;
+/**
+ * An answer's summary is the answer itself (`kind: "answer"`), said to the user whole: up to this, so that the system's message
+ * that carries it (`#12 "title": <answer>`) stays within what one message may hold (`SAY_TEXT_MAX`, 9000). A longer answer goes in
+ * a file the worker delivers.
+ */
+export const REPORT_ANSWER_MAX = 8800;
 export const REPORT_QUESTION_MAX = 300;
 export const REPORT_NOTES_MAX = 2000;
 export const REPORT_REFS_MAX = 20;
@@ -25,7 +31,10 @@ const ref = z.object({
 
 export const reportSchema = z.object({
   kind: z.enum(REPORT_KINDS),
-  summary: z.string().trim().min(1).max(REPORT_SUMMARY_MAX),
+  summary: z.string().trim().min(1).max(
+    REPORT_ANSWER_MAX,
+    `at most ${REPORT_ANSWER_MAX} characters even for an answer: put a longer one in a file, hand it over with deliver_file, and report its gist`,
+  ),
   question: z.string().trim().min(1).max(REPORT_QUESTION_MAX).optional(),
   result: z.object({
     refs: z.array(ref).max(REPORT_REFS_MAX).optional(),
@@ -48,6 +57,9 @@ export function parseReport(input: unknown): ParsedReport {
     return { ok: false, error: `invalid report (${problems.join("; ")}). Fix the fields and call report again.` };
   }
   const report = parsed.data;
+  if (report.kind !== "answer" && report.summary.length > REPORT_SUMMARY_MAX) {
+    return { ok: false, error: `invalid report (summary: at most ${REPORT_SUMMARY_MAX} characters for a ${report.kind} report; only an answer may be longer). Fix the fields and call report again.` };
+  }
   if (report.question !== undefined && report.kind !== "waiting" && report.kind !== "blocked") {
     return { ok: false, error: `question is only allowed on a waiting or blocked report, not on ${report.kind}. Put it in summary or report waiting/blocked.` };
   }

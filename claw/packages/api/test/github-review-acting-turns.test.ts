@@ -339,6 +339,7 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
     "assistant/tools.ts": "work_create makes sessions without acting_as; work_send into a review item's session is refused by queueServerMessage, which it gives no proof",
     "assistant/reports.ts": "wakes the user's router session, which never carries acting_as",
     "assistant/github-events.ts": "hands GitHub events to a task item's worker through queueServerMessage, which it gives no proof, so an acting session is refused; a review item cannot subscribe and its stored events are dropped before that",
+    "assistant/retry.ts": "queues the retry on a task item's worker session through queueServerMessage, which it gives no proof, so an acting session is refused; a review item is never retried",
     "assistant/observe.ts": "queues a place's message on the caller's own watcher session, made without acting_as; queueServerMessage, given no proof, refuses one that carries it",
     "assistant/review-items.ts": "queues a review session's first message with the proof that routes/assistant.ts's request passed checkSessionCreate (below)",
     "assistant/model-fallback.ts": "runs a refused turn again: a worker's or the router's through queueServerMessage, which refuses an acting session without the proof, and a review's first message through review-items.ts with proofForFirstMessageAgain (below)",
@@ -376,11 +377,41 @@ test("A8 every place in the source that can start a turn is gated, or is on a li
   assert.match(actingSession, /if \(!caller\.ok\) return[\s\S]*?attended = \{ via: caller\.via \} as AttendedProof;/, "and only after the classifier said yes");
   // The one other proof: the same first message queued again, once its first turn was refused before its model ran, made only when the
   // database shows that session ran that one turn, it failed and its words are the same; asked for by the review items alone.
-  assert.equal((actingSession.match(/as AttendedProof\b/g) ?? []).length, 2, "two places make a proof: the create's check and the first message's re-run");
+  assert.equal((actingSession.match(/as AttendedProof\b/g) ?? []).length, 6,
+    "six places make a proof: the create's check, the first message's re-run, a queued review's first message, a review run again once CI is green, a review run again once its author pushed, and a review run again after a turn that called no review tool");
   assert.match(actingSession, /Number\(row\.turns\) !== 1[\s\S]*?row\.status !== "failed" \|\| row\.words !== content\) return null;\s*return \{ via: null \} as AttendedProof;/,
     "the re-run's proof only for a session whose one turn failed with the same words");
   const rerunProof = [...found.keys()].filter((f) => /\bproofForFirstMessageAgain\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
   assert.deepEqual(rerunProof, ["assistant/review-items.ts"], "only the review items ask for the re-run's proof");
+  // A review that waited for a slot: made by a request that passed the create's check, with no message until then. Its proof is made only
+  // for a session that acts as a user, belongs to an open review item still marked queued, and has had no turn and has no message.
+  assert.match(actingSession, /Number\(row\.turns\) !== 0 \|\| Number\(row\.queued\) !== 0 \|\| !row\.waiting\) return null;\s*return \{ via: null \} as AttendedProof;/,
+    "the queued review's proof only for a session with no turn and no message whose item still waits");
+  const queuedProof = [...found.keys()].filter((f) => /\bproofForQueuedFirstMessage\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
+  assert.deepEqual(queuedProof, ["assistant/review-items.ts"], "only the review items ask for a queued review's proof");
+  // A review of the owner's own account whose one turn posted a comment because CI was not green: its same words once more, once CI is
+  // green. Made only for a session that acts as a user, had one completed turn with those words and nothing queued, whose approval was
+  // refused ci_not_green, and whose item is the owner's own, open and still waiting.
+  assert.match(actingSession, /Number\(row\.turns\) !== 1 \|\| Number\(row\.queued\) !== 0\) return null;\s*if \(row\.status !== "completed" \|\| row\.words !== content \|\| !row\.waiting\) return null;\s*return \{ via: null \} as AttendedProof;/,
+    "the green-CI re-run's proof only for one completed turn with the same words, whose item is open and still waiting");
+  // Waiting: the owner's own review refused ci_not_green, or a re-review of a head the same account already reviewed that wrote and held nothing.
+  assert.match(actingSession, /AND NOT \(w\.params \? 'ci_wait_ended'\)\s*AND \(\(NOT \(w\.params \? 'requested_by'\)\s*AND EXISTS \(SELECT 1 FROM claw_github_audit a WHERE a\.session_id = s\.session_id AND a\.tool = 'gh_review_submit'\s*AND a\.result = 'refused' AND a\.detail = 'ci_not_green'\)\)\s*OR \(NOT EXISTS \(SELECT 1 FROM claw_github_audit a WHERE a\.session_id = s\.session_id\s*AND a\.tool IN \('gh_review_submit', 'gh_pr_merge'\)\)\s*AND NOT EXISTS \(SELECT 1 FROM claw_github_confirmations c WHERE c\.session_id = s\.session_id\)/,
+    "and waiting is exactly the two cases: an own review held by CI, or an unchanged re-review that tried no write at all");
+  const greenProof = [...found.keys()].filter((f) => /\bproofForReviewAfterGreenCi\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
+  assert.deepEqual(greenProof, ["assistant/review-items.ts"], "only the review items ask for the green-CI re-run's proof");
+  // A review someone asked of the owner whose merge waited for the pull request's author (a conflict, the branch rules, the workflow scope):
+  // its same words once more after new commits. Made only for one completed turn with those words and nothing queued, whose item is open,
+  // asked by someone, and still marked as waiting for the author.
+  assert.match(actingSession, /AND w\.board_state = 'in_progress'\s*AND w\.params \? 'requested_by' AND w\.params \? 'author_waiting'\) AS waiting/,
+    "the author re-run's proof only for an open requested review still marked as waiting for its author");
+  const authorProof = [...found.keys()].filter((f) => /\bproofForReviewAfterAuthor\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
+  assert.deepEqual(authorProof, ["assistant/review-items.ts"], "only the review items ask for the author re-run's proof");
+  // A review whose one turn called no review tool at all: its same words once more, once. Made only for one completed turn with those
+  // words and nothing queued, with no review tool call and no confirmation in the session, whose item is open and was not run again so before.
+  assert.match(actingSession, /AND NOT \(w\.params \? 'empty_rerun'\)\)\s*AND NOT EXISTS \(SELECT 1 FROM claw_github_audit a WHERE a\.session_id = s\.session_id AND a\.tool <> 'gh_pr_follow'\s*AND a\.at > \(SELECT MIN\(t\.created_at\) FROM claw_tasks t WHERE t\.session_id = s\.session_id AND t\.origin = 'chat'\)\)\s*AND NOT EXISTS \(SELECT 1 FROM claw_github_confirmations c WHERE c\.session_id = s\.session_id\)\) AS waiting/,
+    "the no-call re-run's proof only for an open review item not run again so before, whose session called no review tool and holds nothing");
+  const noCallProof = [...found.keys()].filter((f) => /\bproofForReviewAfterNoCall\(/.test(stripComments(readFileSync(join(src, f), "utf8"))));
+  assert.deepEqual(noCallProof, ["assistant/review-items.ts"], "only the review items ask for the no-call re-run's proof");
   const messages = stripComments(readFileSync(join(src, "assistant/messages.ts"), "utf8"));
   assert.match(messages, /if \(actingUserOf\(session\.config\) !== null && !m\.attended\) return \{ ok: false, error: "acting_session_unattended" \};/, "queueServerMessage refuses an acting session without the proof");
   const handsProof = [...found.keys()].filter((f) => /\battended: \w+\.attended\b/.test(stripComments(readFileSync(join(src, f), "utf8"))));

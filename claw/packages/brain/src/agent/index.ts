@@ -93,6 +93,38 @@ export interface CheckpointState {
    * steps. Present only on a script run's checkpoint.
    */
   script?: ScriptProgress;
+  /**
+   * The turn that was running when this was written, if it had begun calling
+   * tools that are not plain reads. See {@link PendingTurn}.
+   */
+  pending_turn?: PendingTurn;
+}
+
+/**
+ * A turn caught part-way through its tool calls.
+ *
+ * A checkpoint is otherwise written only at a turn boundary, so a run stopped
+ * inside a turn -- a SIGTERM drain, a failure that is retried -- went back to
+ * the start of that turn and asked the model again. The model then issued the
+ * calls afresh, and a call that had already left the process (a review
+ * comment posted, a message sent) was made a second time.
+ *
+ * With this the resumed run does not ask the model again: it replays the
+ * model's own answer for the turn. A call whose result was recorded is given
+ * that result without running; a call that had started but has no recorded
+ * result may or may not have taken effect, so it is not run again either, and
+ * the model is told so; every other call runs as it would have.
+ */
+export interface PendingTurn {
+  /** Equal to the checkpoint's `turns_completed`; any other value is ignored. */
+  turn: number;
+  /** The model's content blocks for this turn, verbatim. */
+  content: unknown[];
+  stop_reason: string | null;
+  /** tool_use id -> the result the call returned. */
+  results: Record<string, string>;
+  /** tool_use ids dispatched with no recorded result. */
+  started: string[];
 }
 
 /**
@@ -188,6 +220,13 @@ export interface ExecuteExtras {
   ) => Promise<HandsClient | RecreateHandsResult>;
   /** Called after each complete turn to persist execution state. */
   onCheckpoint?: (state: CheckpointState) => Promise<void>;
+  /**
+   * Called inside a turn, before and after each call that is not a plain read,
+   * with a state carrying `pending_turn`. Unlike `onCheckpoint` it must still
+   * persist once the run is aborted: a call that finished while a drain began
+   * is exactly the one a resumed run must not make again.
+   */
+  onTurnJournal?: (state: CheckpointState) => Promise<void>;
   /** Called when a turn uses the prefix cache, so a SIGTERM mid-tool-batch can
    *  persist a fresher last_cache_use_at than the last turn boundary wrote. */
   onCacheUse?: (at: number | undefined) => void;

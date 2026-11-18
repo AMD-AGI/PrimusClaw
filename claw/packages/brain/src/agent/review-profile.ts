@@ -21,7 +21,7 @@ import { parseToolAllowlist, type ToolAllowlist } from "../tools/allowlist.js";
 export const REVIEW_SERVER_NAME = "github_review";
 /** The whole of what a requested review may use. */
 export const REVIEW_PROFILE_TOOLS: readonly string[] = [
-  `mcp__${REVIEW_SERVER_NAME}__*`, "read", "glob", "grep", "ls", "bash", "bash_output", "kill_shell", "task", "todo_write",
+  `mcp__${REVIEW_SERVER_NAME}__*`, "read", "glob", "grep", "ls", "bash", "bash_output", "wait", "kill_shell", "task", "todo_write",
 ];
 
 export function isReviewProfile(request: Pick<ExecuteRequest, "sandbox_profile">): boolean {
@@ -34,6 +34,7 @@ export function applyReviewProfileBackstop(request: ExecuteRequest): void {
   request.withhold_sandbox_keys = true;
   request.memory_enabled = false;
   request.skill_evolution_enabled = false;
+  request.user_skills_enabled = false;
   for (const field of ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "topology", "workspace_id", "rules_text"] as const) delete request[field];
   const review = request.mcp_servers?.[REVIEW_SERVER_NAME];
   request.mcp_servers = review ? { [REVIEW_SERVER_NAME]: review } : {};

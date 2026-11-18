@@ -20,6 +20,13 @@
  *   T5 the S3 workspace and checkpoint prefixes are removed by the existing cleanup sweep
  *   T6 the purge removes stamped rows of sessions deleted past the window, and nothing else
  *   T7 archiving stamps archived_at, re-archiving keeps it, unarchiving clears it
+ *   T8 the batch is the day's limit across passes and replicas, not each pass's
+ *   T9 the next day's pass, 24 hours on, waits for the last day's deletions to leave the window
+ *      and deletes a whole batch, once across replicas; one whose window frees far later ends
+ *   T10 a user's delete of an archived session between retention's count and its deletion
+ *      takes a place of the day: retention asks the count again under the lock and stops
+ *   T11 a deletion of an archived session holds the day's lock, and retention waits for an
+ *      archived deletion in flight and counts it
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -353,5 +360,169 @@ describe("session retention", { skip }, () => {
     assert.equal(await archive.unarchiveSession("owner"), true);
     const back = (await rows("SELECT status, archived_at FROM claw_sessions WHERE session_id = 'owner'"))[0];
     assert.deepEqual([back.status, back.archived_at], ["active", null]);
+  });
+
+  test("T8 the batch is the day's limit across passes and replicas, not each pass's", async () => {
+    // Every replica runs a pass a minute after it boots, so one rollout of four
+    // replicas was four passes, each deleting a whole batch: a batch of 5000
+    // deleted 16,535 sessions in the hour after one rollout, and the cleanup
+    // sweeper was hours behind on all of them.
+    for (let i = 1; i <= 4; i += 1) await seed({ id: `exp-${i}`, archivedDays: 40 + i });
+    // Deleted today by their owners: an archived session counts against the day,
+    // since nothing on the row says who deleted it; a compatible-API session does
+    // not, since its client deletes its own and retention never takes one.
+    await seed({ id: "user-gone", archivedDays: 40, deletedDays: 0 });
+    await seed({ id: "compat-gone", archivedDays: 40, compat: true, deletedDays: 0 });
+    const batch = { ...SETTINGS, batch: 3 };
+
+    const first = await retention.runSessionRetention(batch);
+    assert.deepEqual([first.eligible, first.deleted], [4, 2], "the batch less the one deleted today");
+    assert.deepEqual(await deletedIds(), ["compat-gone", "exp-3", "exp-4", "user-gone"], "oldest first");
+
+    // Another replica's pass the same day, with a fresh batch of its own.
+    const second = await retention.runSessionRetention(batch);
+    assert.deepEqual([second.eligible, second.deleted], [2, 0], "the day's batch is spent");
+    const dry = await retention.runSessionRetention({ ...batch, dryRun: true });
+    assert.equal(dry.deleted, 0, "a dry run reports what today's pass would delete");
+    assert.deepEqual(await deletedIds(), ["compat-gone", "exp-3", "exp-4", "user-gone"]);
+
+    // A day later the window has moved past those deletions.
+    await q("UPDATE claw_sessions SET deleted_at = NOW() - INTERVAL '25 hours' WHERE deleted_at IS NOT NULL");
+    const nextDay = await retention.runSessionRetention(batch);
+    assert.deepEqual([nextDay.eligible, nextDay.deleted], [2, 2]);
+    assert.deepEqual(await deletedIds(),
+      ["compat-gone", "exp-1", "exp-2", "exp-3", "exp-4", "user-gone"]);
+  });
+
+  test("T9 the next day's pass waits for the last day's deletions to leave the window", { timeout: 60_000 }, async () => {
+    // The daily pass runs every 24 hours and the window is the last 24 hours, so
+    // the next day's pass starts a little before the last day's deletions leave
+    // it: they were made a little after their pass started. Ending there with
+    // nothing deleted left the backlog to the day after, a batch every other day.
+    for (let i = 1; i <= 8; i += 1) await seed({ id: `exp-${i}`, archivedDays: 40 + i });
+    const batch = { ...SETTINGS, batch: 2 };
+    const run = {
+      ...retention.DEFAULT_RETENTION_RUN,
+      continueDelayMs: 10, lockRetryDelayMs: 20, lockRetries: 10_000, windowWaitMs: 60_000,
+    };
+    /** Put the last day's two deletions 24 hours back, less 3 and 5 seconds; when each leaves the window. */
+    const dayLater = async (ids: [string, string]): Promise<Date[]> => {
+      await q("UPDATE claw_sessions SET deleted_at = NOW() - INTERVAL '2 days' WHERE deleted_at IS NOT NULL");
+      await q(`UPDATE claw_sessions SET deleted_at = NOW() - INTERVAL '1 day'
+                 + CASE session_id WHEN $1 THEN INTERVAL '3 seconds' ELSE INTERVAL '5 seconds' END
+                WHERE session_id = ANY($2::text[])`, [ids[0], ids]);
+      const now = await retention.runSessionRetention({ ...batch, dryRun: true });
+      assert.equal(now.deleted, 0, "the day's batch is spent when the pass starts");
+      return (await rows(`SELECT deleted_at + INTERVAL '1 day' AS t FROM claw_sessions
+                           WHERE session_id = ANY($1::text[]) ORDER BY deleted_at`, [ids])).map((r) => r.t as Date);
+    };
+    /** Each of the day's deletions was made after a place had left the window. */
+    const madeAfter = async (ids: string[], leaves: Date[]): Promise<void> => {
+      const made = (await rows(`SELECT deleted_at FROM claw_sessions WHERE session_id = ANY($1::text[])
+                                 ORDER BY deleted_at`, [ids])).map((r) => r.deleted_at as Date);
+      for (const [i, t] of made.entries()) {
+        assert.ok(t >= leaves[i], `deletion ${i + 1} waited for its place: ${t.toISOString()} >= ${leaves[i].toISOString()}`);
+      }
+    };
+
+    await retention.runSessionRetentionOnce(batch, run);
+    assert.deepEqual(await deletedIds(), ["exp-7", "exp-8"], "day one");
+
+    // Day two: one pass deletes the whole batch, one as each place leaves.
+    let leaves = await dayLater(["exp-8", "exp-7"]);
+    await retention.runSessionRetentionOnce(batch, run);
+    assert.deepEqual(await deletedIds(), ["exp-5", "exp-6", "exp-7", "exp-8"], "a whole batch on day two");
+    await madeAfter(["exp-5", "exp-6"], leaves);
+
+    // Day three, two replicas' passes at once: still one batch for the fleet.
+    leaves = await dayLater(["exp-6", "exp-5"]);
+    await Promise.all([retention.runSessionRetentionOnce(batch, run), retention.runSessionRetentionOnce(batch, run)]);
+    assert.deepEqual(await deletedIds(), ["exp-3", "exp-4", "exp-5", "exp-6", "exp-7", "exp-8"], "one batch on day three");
+    await madeAfter(["exp-3", "exp-4"], leaves);
+
+    // A pass whose window frees hours from now (a replica booted after the day's
+    // pass) ends at once with nothing deleted, and leaves it to the next day's.
+    await q("UPDATE claw_sessions SET deleted_at = NOW() - INTERVAL '2 hours' WHERE session_id IN ('exp-3', 'exp-4')");
+    const started = Date.now();
+    await retention.runSessionRetentionOnce(batch, run);
+    assert.ok(Date.now() - started < 30_000, "it did not wait for the window");
+    assert.deepEqual(await deletedIds(), ["exp-3", "exp-4", "exp-5", "exp-6", "exp-7", "exp-8"]);
+  });
+  /** Archived sessions deleted in the last 24 hours that the day's limit counts. */
+  const countedToday = async () => Number((await rows(
+    `SELECT COUNT(*)::int AS n FROM claw_sessions s
+      WHERE s.deleted_at > NOW() - INTERVAL '1 day' AND s.status = 'archived'
+        AND NOT COALESCE(s.config ? 'primus_anthropic_compat', false)`,
+  ))[0].n);
+
+  test("T10 a user's delete after retention's count takes a place of the day, and retention does not spend it again", async () => {
+    await seed({ id: "exp-1", archivedDays: 41 });
+    await seed({ id: "exp-2", archivedDays: 42 });
+    // Archived yesterday: retention would not take it, its owner deletes it.
+    await seed({ id: "user-mid", archivedDays: 1 });
+    const batch = { ...SETTINGS, batch: 2 };
+    const real = dbModule.db.query;
+    let ownerDeleted = false;
+    // The owner's delete lands after retention has counted the day (2 left) and chosen its sessions.
+    dbModule.db.query = (async (text: string, params?: unknown[]) => {
+      const r = await real(text, params);
+      if (!ownerDeleted && /ORDER BY COALESCE\(s\.archived_at, s\.updated_at\)/.test(text)) {
+        ownerDeleted = true;
+        assert.equal(await teardown.commitSessionDeletion("user-mid"), true);
+      }
+      return r;
+    }) as typeof real;
+    let report;
+    try {
+      report = await retention.runSessionRetention(batch);
+    } finally {
+      dbModule.db.query = real;
+    }
+    assert.equal(ownerDeleted, true, "the owner's delete ran mid-pass");
+    assert.equal(report.deleted, 1, "one place was left once the owner's delete took the other");
+    assert.deepEqual(await deletedIds(), ["exp-2", "user-mid"], "the older one, and the owner's");
+    assert.equal(await countedToday(), 2, "the day's count never passes the batch");
+  });
+
+  test("T11 deleting an archived session holds the day's lock; retention waits for one in flight and counts it", { timeout: 30_000 }, async () => {
+    await seed({ id: "exp-1", archivedDays: 41 });
+    await seed({ id: "user-mid", archivedDays: 1 });
+    await seed({ id: "user-other", archivedDays: 1 });
+    const other = await cluster!.connect();
+    const waiting = async () => Number((await rows(
+      "SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+    ))[0].n);
+    const until = async (cond: () => Promise<boolean>, ms: number) => {
+      const end = Date.now() + ms;
+      while (Date.now() < end) {
+        if (await cond()) return true;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return false;
+    };
+    try {
+      // An owner's deletion in flight, holding the lock every archived deletion takes.
+      await other.query("BEGIN");
+      await other.query("SELECT pg_advisory_xact_lock($1)", [teardown.ARCHIVED_DELETION_LOCK_ID]);
+      await other.query("UPDATE claw_sessions SET deleted_at = NOW() WHERE session_id = 'user-mid'");
+
+      // A user's own delete of an archived session waits for it.
+      let ownerDone = false;
+      const owner = teardown.commitSessionDeletion("user-other").then((v) => { ownerDone = true; return v; });
+      assert.equal(await until(async () => (await waiting()) === 1, 5_000), true, "the owner's delete waits for the lock");
+      assert.equal(ownerDone, false);
+
+      // Retention, with one place left by the count it reads first, waits too.
+      const pass = retention.runSessionRetention({ ...SETTINGS, batch: 1 });
+      const bothWait = await until(async () => (await waiting()) === 2, 5_000);
+      await other.query("COMMIT");
+      assert.equal(bothWait, true, "retention's deletion waits for the lock");
+      assert.equal(await owner, true);
+      const report = await pass;
+      assert.equal(report.deleted, 0, "the in-flight deletion took the day's only place");
+      assert.equal((await deletedIds()).includes("exp-1"), false);
+    } finally {
+      await other.query("ROLLBACK").catch(() => {});
+    }
   });
 });

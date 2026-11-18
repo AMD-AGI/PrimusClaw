@@ -1,0 +1,334 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * A review alice asked of bob that stops on a conflict in the pull request's branch (`assistant/review-conflict.ts`), against a real
+ * Postgres with the production schema. Skipped without DATABASE_URL, and a skip is not a pass.
+ *
+ *   C1  bob's worker reports blocked after GitHub refused its merge on merge state DIRTY: alice, who asked, is told through her own
+ *       assistant, in the language she writes in, which pull request and that the author resolves the conflict; once per head commit
+ *       (a second block on the same head is not told again, a new head that still conflicts is)
+ *   C2  nothing is told to alice when the block is not a conflict (BEHIND, a merge that later went through, no merge tried), when the
+ *       item is bob's own (no requested_by), when it does not need bob, or when alice asked for a review only (no merge)
+ *   C3  the shape production has (2026-11-08, N5): a review handed over on someone's behalf whose session posts its review and then has
+ *       its merge refused on DIRTY sends no worker report; the item is brought to its state by `syncReviewItem` (a 'policy' event; since
+ *       C6 it waits for the author rather than being blocked), and the one who asked is told from there, once per head commit; a sync
+ *       that finds the same state again tells nothing new
+ *   C4  a merge GitHub refused for the missing `workflow` scope (`github_workflow_scope_missing`, 2026-11-09, N17) is told to the one who
+ *       asked the same way: the pull request changes CI workflow files and has to be merged by hand on GitHub; once per head commit
+ *   C5  a merge GitHub refused on merge state BLOCKED (branch protection rules, after the approval; 2026-11-10, N20) is told to the one
+ *       who asked the same way: the branch rules block it and the author or CI has to meet them; once per head commit, in her language
+ *   C6  such a merge (DIRTY, BLOCKED, the missing `workflow` scope) asked for by someone else no longer wakes the reviewer (2026-11-12,
+ *       PrimusClaw#770, #784, #806: three "blocked, needs your reply" with nothing for the reviewer to do): the item stays in progress,
+ *       waiting for the author (`author_waiting`), with no 'blocked' event and nothing queued to the reviewer's assistant, and the one
+ *       who asked is still told, once per head commit, from that state
+ * The check runs after the report is answered, not waited for (`checkConflictLater`): the tests wait for it (`conflictChecksSettled`).
+ * The audit rows are written as the review service writes them; that it records GitHub's merge state on a refused merge is
+ * github-review-service.test.ts M8c.
+ */
+import assert from "node:assert/strict";
+import { after, before, beforeEach, describe, test } from "node:test";
+
+import { postgresSkipReason } from "./support/pg-cluster.js";
+import { startWorld, type World } from "./support/assistant-world.js";
+
+const skip = postgresSkipReason();
+type Row = Record<string, any>;
+
+describe("a review stopped by a conflict tells the one who asked", { skip }, () => {
+  let w: World;
+  let conflict: typeof import("../src/assistant/review-conflict.js");
+  let ri: typeof import("../src/assistant/review-items.js");
+  let alice: { userId: string; routerSid: string };
+  let bob: { userId: string; routerSid: string };
+
+  before(async () => {
+    w = await startWorld({ CLAW_GITHUB_REVIEW_ENABLED: "true", CLAW_GITHUB_REVIEW_MCP_SECRET: "t".repeat(40) });
+    conflict = await import("../src/assistant/review-conflict.js");
+    ri = await import("../src/assistant/review-items.js");
+  });
+  after(async () => { await w?.stop(); });
+  beforeEach(async () => {
+    await w.q(`TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_assistant_messages, claw_pending_messages,
+      claw_tasks, claw_assistants, claw_sessions, claw_github_audit, claw_github_confirmations CASCADE`);
+    alice = await w.user("alice");
+    bob = await w.user("bob");
+    // alice asked for the review in Chinese, through her own assistant; bob has never written to his.
+    await w.q(
+      `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context) VALUES ($1, 'm-ask', 'alice', $2, '{}'::jsonb)`,
+      [alice.routerSid, "请 bob 帮我 review 并合入：https://github.com/AMD-AGI/demo/pull/7"],
+    );
+  });
+
+  const HEAD = "a".repeat(40);
+  type Review = { itemId: string; workerSid: string; pr: number };
+  /** bob's review item for AMD-AGI/demo#N, asked by `requestedBy` (none: bob's own); the first one made is #7. */
+  let made = 0;
+  async function reviewFor(requestedBy: string | null, extra: Record<string, unknown> = {}): Promise<Review> {
+    // A pull request and a title of its own each: one open review per pull request, and work_create gives the open item of a title back.
+    made += 1;
+    const pr = 6 + made;
+    const item = await w.createItem(bob, `Review+merge AMD-AGI/demo#${pr}`);
+    const params = { pr: { owner: "AMD-AGI", repo: "demo", number: pr }, review_only: false, ...(requestedBy ? { requested_by: requestedBy, requester_label: `Name ${requestedBy}` } : {}), ...extra };
+    await w.q("UPDATE claw_work_items SET kind = 'review', params = params || $2::jsonb WHERE item_id = $1", [item.itemId, JSON.stringify(params)]);
+    return { ...item, pr };
+  }
+  /** A `gh_pr_merge` call of the session as the review service records it. */
+  async function merged(item: Review, result: string, detail: string, mergeState: string | null, head = HEAD): Promise<void> {
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, repo, pr, head_sha, result, detail, merge_state)
+       VALUES ('alice', 'bob', $1, 'gh_pr_merge', 'AMD-AGI/demo', $2, $3, $4, $5, $6)`,
+      [item.workerSid, item.pr, head, result, detail, mergeState],
+    );
+  }
+  let n = 0;
+  async function blocked(item: { itemId: string }): Promise<void> {
+    const turn = await w.workerTurn(item.itemId);
+    n += 1;
+    await w.mod.reports.ingestReport({ itemId: item.itemId, workerSessionId: turn.sid, generation: Number(turn.gen), runId: turn.task_id },
+      { kind: "blocked", summary: `GitHub will not merge it (${n})`, question: "The branch has conflicts; what now?" }, "worker");
+    await w.closeRun(turn.task_id);
+    await conflict.conflictChecksSettled();
+  }
+  const toldAlice = async (): Promise<Row[]> => w.q("SELECT text FROM claw_assistant_says WHERE user_id = 'alice' ORDER BY created_at");
+
+  test("C1 a block on a conflict is told to the one who asked, in her language, once per head commit", async () => {
+    const item = await reviewFor("alice");
+    await merged(item, "refused", "merge_state_not_clean", "DIRTY");
+    await blocked(item);
+    assert.equal((await w.item(item.itemId)).board_state, "needs_you");
+    let told = await toldAlice();
+    assert.equal(told.length, 1, JSON.stringify(told));
+    assert.match(told[0].text, /^你请人评审并合入的 AMD-AGI\/demo#7 合不进去：GitHub 显示这个分支和目标分支有冲突。需要作者先解决冲突/);
+    // What comes next is what the sweep does, and never a promise of a merge.
+    assert.match(told[0].text, /作者推送新提交后，评审会在新提交上自动再做一次；一天内没有新提交，会交回评审人处理。/);
+    assert.doesNotMatch(told[0].text, /才能继续合入|之后才能合入/);
+    assert.match(told[0].text, /https:\/\/github\.com\/AMD-AGI\/demo\/pull\/7$/);
+    // Blocked again on the same head: not told twice.
+    await blocked(item);
+    assert.equal((await toldAlice()).length, 1);
+    // The author pushed, and the new head still conflicts: told again.
+    await merged(item, "refused", "merge_state_not_clean", "DIRTY", "b".repeat(40));
+    await blocked(item);
+    told = await toldAlice();
+    assert.equal(told.length, 2);
+    // In English to one who writes English.
+    await w.q("UPDATE claw_assistant_messages SET content = 'Please ask bob to review and merge AMD-AGI/demo#7' WHERE user_id = 'alice'");
+    await merged(item, "refused", "merge_state_not_clean", "DIRTY", "c".repeat(40));
+    await blocked(item);
+    told = await toldAlice();
+    assert.equal(told.length, 3);
+    assert.match(told[2].text, /^AMD-AGI\/demo#7, which you asked to be reviewed and merged, cannot be merged: GitHub says its branch has conflicts/);
+    assert.match(told[2].text, /Once the author pushes new commits, the review runs once more on them; if none come within a day, it goes back to the reviewer\./);
+    assert.doesNotMatch(told[2].text, /before the review can merge it|before it can be merged/);
+    // Nothing of this goes to bob through this path: his own notices are his item's.
+    assert.equal((await w.q("SELECT 1 FROM claw_assistant_says WHERE user_id = 'bob' AND text LIKE '%which you asked%'")).length, 0);
+  });
+
+  test("C2 nothing is told when the block is not a conflict, the review is bob's own, or the item does not need bob", async () => {
+    const behind = await reviewFor("alice");
+    await merged(behind, "refused", "merge_state_not_clean", "BEHIND");
+    await blocked(behind);
+    const later = await reviewFor("alice");
+    await merged(later, "refused", "merge_state_not_clean", "DIRTY");
+    await merged(later, "ok", "merged", null);
+    await blocked(later);
+    const none = await reviewFor("alice");
+    await blocked(none);
+    const own = await reviewFor(null);
+    await merged(own, "refused", "merge_state_not_clean", "DIRTY");
+    await blocked(own);
+    assert.deepEqual(await toldAlice(), []);
+    // The item does not need bob (a progress report): nothing, even on a conflict.
+    const going = await reviewFor("alice");
+    await merged(going, "refused", "merge_state_not_clean", "DIRTY");
+    const turn = await w.workerTurn(going.itemId);
+    await w.mod.reports.ingestReport({ itemId: going.itemId, workerSessionId: turn.sid, generation: Number(turn.gen), runId: turn.task_id },
+      { kind: "progress", summary: "looking at it" }, "worker");
+    await conflict.conflictChecksSettled();
+    assert.deepEqual(await toldAlice(), []);
+    // A review only (no merge was asked): nothing, even on a conflict.
+    const only = await reviewFor("alice", { review_only: true });
+    await merged(only, "refused", "merge_state_not_clean", "DIRTY");
+    await blocked(only);
+    assert.deepEqual(await toldAlice(), []);
+  });
+
+  test("C3 a review handed over on someone's behalf, blocked by its sync on a DIRTY merge, tells the one who asked", async () => {
+    // The params a handed-over review is made with in production (`review-items.ts`): bob reviews as himself, alice asked, merge asked.
+    const item = await reviewFor("alice", {
+      acting_as: "bob", acting_as_name: "Name bob", brief: "Review and merge it", effort: null, model: null, requester_note: null,
+    });
+    // Its one turn ran and finished: the review was posted, then the merge was refused on DIRTY (gh_pr_follow rows follow it, as live).
+    const run = await w.openRun(item.workerSid);
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, repo, pr, head_sha, result, detail, at)
+       VALUES ('alice', 'bob', $1, 'gh_review_submit', 'AMD-AGI/demo', $2, $3, 'ok', 'submitted', NOW() - interval '10 seconds')`,
+      [item.workerSid, item.pr, HEAD],
+    );
+    await merged(item, "refused", "merge_state_not_clean", "DIRTY");
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, repo, pr, head_sha, result, detail)
+       VALUES ('alice', 'bob', $1, 'gh_pr_follow', 'AMD-AGI/demo', $2, $3, 'ok', 'merge_state_not_clean')`,
+      [item.workerSid, item.pr, HEAD],
+    );
+    await w.closeRun(run.taskId);
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    const row = await w.item(item.itemId);
+    // Waiting for the author, not blocked on bob (C6).
+    assert.equal(row.board_state, "in_progress");
+    assert.equal(row.last_report_kind, "progress");
+    const events = await w.itemEvents(item.itemId);
+    assert.deepEqual(events.filter((e: Row) => e.kind === "progress").map((e: Row) => e.source), ["policy"]);
+    // Through the same sync as bob's own blocked notice, nothing reported by a worker.
+    assert.equal(events.filter((e: Row) => e.source === "worker").length, 0);
+    let told = await toldAlice();
+    assert.equal(told.length, 1, JSON.stringify(told));
+    const pr = `AMD-AGI/demo#${item.pr}`;
+    assert.ok(told[0].text.startsWith(`你请人评审并合入的 ${pr} 合不进去：GitHub 显示这个分支和目标分支有冲突`), told[0].text);
+    assert.match(told[0].text, new RegExp(`https://github\\.com/AMD-AGI/demo/pull/${item.pr}$`));
+    // A sync that finds the same state writes nothing and tells nothing new.
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await toldAlice()).length, 1);
+    // The author pushed, and the merge on the new head is refused on DIRTY again: the state reads the same, the one who asked is told again.
+    await merged(item, "refused", "merge_state_not_clean", "DIRTY", "b".repeat(40));
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    told = await toldAlice();
+    assert.equal(told.length, 2);
+    // A block that is not a conflict, through the same sync: nothing more.
+    await merged(item, "refused", "merge_state_not_clean", "BEHIND", "c".repeat(40));
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await toldAlice()).length, 2);
+  });
+
+  test("C4 a merge GitHub refused because the pull request changes a CI workflow file and the reviewer's token has no `workflow` scope is told to the one who asked: merge it by hand on GitHub, not bind again", async () => {
+    // The shape of 2026-11-09 12:05Z (daily gaps N17): a handed-over review posts its review, its merge is refused, its sync blocks the item.
+    const item = await reviewFor("alice", {
+      acting_as: "bob", acting_as_name: "Name bob", brief: "Review and merge it", effort: null, model: null, requester_note: null,
+    });
+    const run = await w.openRun(item.workerSid);
+    await merged(item, "refused", "github_workflow_scope_missing", null);
+    await w.closeRun(run.taskId);
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await w.item(item.itemId)).board_state, "in_progress", "waiting for the author (C6)");
+    let told = await toldAlice();
+    assert.equal(told.length, 1, JSON.stringify(told));
+    const pr = `AMD-AGI/demo#${item.pr}`;
+    assert.ok(told[0].text.startsWith(`你请人评审并合入的 ${pr} 没能合入：这个 PR 改了 CI workflow 文件`), told[0].text);
+    assert.match(told[0].text, /需要 GitHub 的 workflow 权限，目前没有这个权限。请在 GitHub 上手动合入。/);
+    assert.doesNotMatch(told[0].text, /绑定/, "binding GitHub again does not add the scope, so it is not suggested");
+    assert.match(told[0].text, new RegExp(`https://github\\.com/AMD-AGI/demo/pull/${item.pr}$`));
+    // The same head again: not told twice.
+    await merged(item, "refused", "github_workflow_scope_missing", null);
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await toldAlice()).length, 1);
+    // A new head refused the same way, to one who writes English: told again, in English.
+    await w.q("UPDATE claw_assistant_messages SET content = 'Please ask bob to review and merge it' WHERE user_id = 'alice'");
+    await merged(item, "refused", "github_workflow_scope_missing", null, "b".repeat(40));
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    told = await toldAlice();
+    assert.equal(told.length, 2);
+    assert.match(told[1].text, new RegExp(`^AMD-AGI/demo#${item.pr}, which you asked to be reviewed and merged, was not merged: it changes CI workflow files`));
+    assert.match(told[1].text, /Please merge it by hand on GitHub\./);
+    assert.doesNotMatch(told[1].text, /bind/i);
+    // Any other refusal from GitHub (a plain 403, github_error) is still not told.
+    const other = await reviewFor("alice");
+    await merged(other, "refused", "github_error", null);
+    await blocked(other);
+    assert.equal((await toldAlice()).length, 2);
+    // Nor to bob through this path, and not for his own review.
+    const own = await reviewFor(null);
+    await merged(own, "refused", "github_workflow_scope_missing", null);
+    await blocked(own);
+    assert.equal((await toldAlice()).length, 2);
+    assert.equal((await w.q("SELECT 1 FROM claw_assistant_says WHERE user_id = 'bob' AND text LIKE '%which you asked%'")).length, 0);
+  });
+
+  test("C5 a merge blocked by the branch's protection rules (BLOCKED) after the approval is told to the one who asked: the author or CI has to meet them", async () => {
+    // The shape of 2026-11-10 06:49Z (daily gaps N20): the review was posted, the merge refused on BLOCKED, and only the reviewer was told.
+    const item = await reviewFor("alice", {
+      acting_as: "bob", acting_as_name: "Name bob", brief: "Review and merge it", effort: null, model: null, requester_note: null,
+    });
+    const run = await w.openRun(item.workerSid);
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, repo, pr, head_sha, result, detail, at)
+       VALUES ('alice', 'bob', $1, 'gh_review_submit', 'AMD-AGI/demo', $2, $3, 'ok', 'submitted', NOW() - interval '10 seconds')`,
+      [item.workerSid, item.pr, HEAD],
+    );
+    await merged(item, "refused", "merge_state_not_clean", "BLOCKED");
+    await w.closeRun(run.taskId);
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await w.item(item.itemId)).board_state, "in_progress", "waiting for the author (C6)");
+    let told = await toldAlice();
+    assert.equal(told.length, 1, JSON.stringify(told));
+    const pr = `AMD-AGI/demo#${item.pr}`;
+    assert.ok(told[0].text.startsWith(`你请人评审并合入的 ${pr} 没能合入：GitHub 的分支保护规则挡住了合入`), told[0].text);
+    assert.match(told[0].text, /需要作者或 CI 先满足这些规则/);
+    assert.doesNotMatch(told[0].text, /[A-Za-z]{4,} [A-Za-z]{4,}/, "no English sentence in a Chinese notice");
+    assert.match(told[0].text, new RegExp(`https://github\\.com/AMD-AGI/demo/pull/${item.pr}$`));
+    // The same head again: not told twice.
+    await merged(item, "refused", "merge_state_not_clean", "BLOCKED");
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    assert.equal((await toldAlice()).length, 1);
+    // A new head still blocked, to one who writes English: told again, in English.
+    await w.q("UPDATE claw_assistant_messages SET content = 'Please ask bob to review and merge it' WHERE user_id = 'alice'");
+    await merged(item, "refused", "merge_state_not_clean", "BLOCKED", "b".repeat(40));
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    told = await toldAlice();
+    assert.equal(told.length, 2);
+    assert.match(told[1].text, new RegExp(`^AMD-AGI/demo#${item.pr}, which you asked to be reviewed and merged, was not merged: GitHub's branch protection rules block the merge`));
+    assert.match(told[1].text, /The author or CI has to meet those rules/);
+    // Nor to bob through this path, and not for his own review.
+    const own = await reviewFor(null);
+    await merged(own, "refused", "merge_state_not_clean", "BLOCKED");
+    await blocked(own);
+    assert.equal((await toldAlice()).length, 2);
+    assert.equal((await w.q("SELECT 1 FROM claw_assistant_says WHERE user_id = 'bob' AND text LIKE '%which you asked%'")).length, 0);
+  });
+
+  test("C6 a merge someone else asked for, refused on a conflict, waits for the author: the reviewer is not woken, the one who asked is told", async () => {
+    // The shape of 2026-11-12 (PrimusClaw#770, #784, #806): the review was posted, the merge refused on DIRTY, and bob was asked to reply.
+    const item = await reviewFor("alice", {
+      acting_as: "bob", acting_as_name: "Name bob", brief: "Review and merge it", effort: null, model: null, requester_note: null,
+    });
+    const run = await w.openRun(item.workerSid);
+    await w.q(
+      `INSERT INTO claw_github_audit (requester_user_id, actor_user_id, session_id, tool, repo, pr, head_sha, result, detail, at)
+       VALUES ('alice', 'bob', $1, 'gh_review_submit', 'AMD-AGI/demo', $2, $3, 'ok', 'submitted', NOW() - interval '10 seconds')`,
+      [item.workerSid, item.pr, HEAD],
+    );
+    await merged(item, "refused", "merge_state_not_clean", "DIRTY");
+    await w.closeRun(run.taskId);
+    const pendingBob = async (): Promise<number> => (await w.q("SELECT 1 FROM claw_pending_messages WHERE session_id = $1", [bob.routerSid])).length;
+    const before = await pendingBob();
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    const pr = `AMD-AGI/demo#${item.pr}`;
+    const row = await w.item(item.itemId);
+    assert.deepEqual([row.board_state, row.last_report_kind, row.params.author_waiting, row.pending_question],
+      ["in_progress", "progress", "conflict", `Waiting for the author to resolve the conflicts of ${pr}`]);
+    assert.equal((await w.itemEvents(item.itemId)).filter((e: Row) => e.kind === "blocked").length, 0, "no 'blocked' for bob");
+    assert.equal(await pendingBob(), before, "nothing queued to bob's assistant");
+    let told = await toldAlice();
+    assert.equal(told.length, 1, JSON.stringify(told));
+    assert.ok(told[0].text.startsWith(`你请人评审并合入的 ${pr} 合不进去：GitHub 显示这个分支和目标分支有冲突`), told[0].text);
+    // The author pushed and the new head still conflicts: the item reads the same, alice is told again, bob still is not woken.
+    await merged(item, "refused", "merge_state_not_clean", "DIRTY", "b".repeat(40));
+    await ri.syncReviewItem(item.itemId);
+    await conflict.conflictChecksSettled();
+    told = await toldAlice();
+    assert.equal(told.length, 2);
+    assert.equal(await pendingBob(), before);
+    assert.equal((await w.item(item.itemId)).board_state, "in_progress");
+  });
+});

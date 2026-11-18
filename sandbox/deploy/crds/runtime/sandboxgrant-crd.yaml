@@ -155,6 +155,9 @@ spec:
                       startedAt:
                         type: string
                         format: date-time
+                      runningAt:
+                        type: string
+                        format: date-time
                       endedAt:
                         type: string
                         format: date-time

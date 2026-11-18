@@ -1,0 +1,87 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "card": "card-8",
+       "op": "save_edit",
+       "primusclaw": "assistant_skill"
+      },
+      "style": "positive",
+      "title": "保存修改",
+      "type": "Action.Execute",
+      "verb": "primusclaw.assistant_skill_save_edit"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Accent",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "📝 修改技能：standup-notes",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "text": "什么时候用",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+     },
+     {
+      "id": "skill_description",
+      "isMultiline": true,
+      "maxLength": 300,
+      "type": "Input.Text",
+      "value": "写站会纪要时使用（standup、站会）"
+     },
+     {
+      "text": "SKILL.md",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+     },
+     {
+      "id": "skill_content",
+      "isMultiline": true,
+      "type": "Input.Text",
+      "value": "## 何时用\n写站会纪要时。\n## 步骤\n1. 昨天完成\n2. 今天计划\n3. 阻塞"
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

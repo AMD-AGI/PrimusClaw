@@ -65,6 +65,14 @@ export interface AppRunView {
   workspace_id: string | null;
   /** The user the grant is signed for (`claw_app_runs.created_by`). */
   user_id: string | null;
+  /**
+   * The task's status as the user last saw it: the one a finish-only dispatch
+   * reopened it from (`metadata.app_finish_prior.status`) when there is one, else
+   * the row's. A Brain reads it before it creates a sandbox for the run.
+   */
+  task_status: string;
+  /** The run's session was deleted. */
+  session_deleted: boolean;
 }
 
 interface RunRow {
@@ -87,12 +95,20 @@ interface RunRow {
   sandbox_spec: Record<string, unknown> | null;
   workspace_id: string | null;
   created_by: string | null;
+  task_status: string;
+  session_deleted: boolean;
 }
+
+/** The task's status as the user last saw it; see {@link AppRunView.task_status}. Reads `t.status` and `t.metadata`. */
+const TASK_STATUS_SQL = "COALESCE(t.metadata->'app_finish_prior'->>'status', t.status)";
+/** Whether the run's session is deleted; a session row that is missing altogether counts as deleted. */
+const SESSION_DELETED_SQL = `NOT EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = r.session_id AND s.deleted_at IS NULL)`;
 
 const VIEW_SQL = `
   SELECT r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
          r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_templates, r.grant_expires_at, r.grant_revoked_at, r.created_at,
-         r.created_by, t.input, t.sandbox_spec, t.workspace_id
+         r.created_by, t.input, t.sandbox_spec, t.workspace_id,
+         ${TASK_STATUS_SQL} AS task_status, ${SESSION_DELETED_SQL} AS session_deleted
     FROM claw_app_runs r JOIN claw_tasks t ON t.task_id = r.task_id`;
 
 function toView(row: RunRow): AppRunView {
@@ -116,6 +132,8 @@ function toView(row: RunRow): AppRunView {
     sandbox_spec: row.sandbox_spec,
     workspace_id: row.workspace_id,
     user_id: row.created_by,
+    task_status: row.task_status,
+    session_deleted: row.session_deleted === true,
   };
 }
 
@@ -268,7 +286,7 @@ export async function patchAppRun(
   // from before the wait, and a stale holder could still write.
   const updated = await db.query(
     `WITH t AS (
-       SELECT task_id, input, sandbox_spec, workspace_id
+       SELECT task_id, input, sandbox_spec, workspace_id, status, metadata
          FROM claw_tasks
         WHERE task_id = $1
           AND lease_owner = $2
@@ -291,7 +309,8 @@ export async function patchAppRun(
         AND (${patch.grant_keys !== undefined ? "r.grant_id IS NOT NULL" : "TRUE"})
       RETURNING r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
                 r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_templates, r.grant_expires_at, r.grant_revoked_at, r.created_at,
-                r.created_by, t.input, t.sandbox_spec, t.workspace_id`,
+                r.created_by, t.input, t.sandbox_spec, t.workspace_id,
+                ${TASK_STATUS_SQL} AS task_status, ${SESSION_DELETED_SQL} AS session_deleted`,
     params,
   );
   if (updated.rowCount === 1) {

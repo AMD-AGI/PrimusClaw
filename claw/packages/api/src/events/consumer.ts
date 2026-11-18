@@ -13,28 +13,35 @@ import { buildMessages } from "../sessions/context-builder.js";
 import { sessionEffortFromRow, sessionModelFromRow } from "../sessions/session-model.js";
 import { sessionRepoFromRow } from "../sessions/session-repo.js";
 import { withPendingDrainClaim } from "../sessions/drain-claim.js";
+import { releaseWorkspaceSaveHold, workspaceSaveHoldSet } from "../sessions/save-hold.js";
+import {
+  RUN_FAILURE_MESSAGE_FIELD, RUN_FAILURE_REASON_FIELD,
+  WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_ID_FIELD, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD,
+} from "@claw/protocol";
 import { WORK_EVENT_PREFIX } from "../assistant/prompts.js";
 import { memoryAccess } from "../memory/service.js";
-import { scanMemoryContent } from "../memory/gates.js";
 import {
-  saveSkill, recordSkillFeedback,
-  selectSkillsForTask,
-  addSkillFile, updateSkillFile, removeSkillFile,
+  recordSkillFeedback,
   maybeRecordTaskPattern,
   checkProbationGraduation,
 } from "../marketplace/skill-service.js";
+import { handleWorkerSkillWrites } from "../assistant/skill-writes.js";
+import { maybeAutoDraft } from "../assistant/skill-auto-draft.js";
 import { appEventIdentity } from "./app-events.js";
+import { ensureEventIdUniqueness, normalizeLegacyEventIdsOnce } from "./legacy-event-ids.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_EVOLUTION_ENABLED } from "../config.js";
-import { skipsSkillSelection } from "../assistant/role-profile.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_NOTIFICATIONS_ENABLED, CLAW_SKILL_AUTO_EVOLUTION_ENABLED, CLAW_USER_SKILLS_ENABLED } from "../config.js";
+import { applyTurnUserSkills, userSkillsForTurn, userSkillsServe } from "../sessions/user-skills.js";
 import { reviewProfileSession } from "../github-review/session-tools.js";
 import { deliverUnsaidAnswer } from "../assistant/router-turn-end.js";
+import { ackBeforeLookupInBackground, noteTextPreview } from "../assistant/lookup-ack.js";
 import { recordWorkerTurnEnd } from "../assistant/turn-end.js";
 import { rerunOnFallback } from "../assistant/model-fallback.js";
 import { a2aPushEnabled } from "../routes/a2a-flags.js";
 import { recordSessionEvent as recordA2aPushEvent } from "../routes/a2a-push.js";
-import { recordApprovalRequested, recordRunFinished } from "../notifications/outbox.js";
+import { recordApprovalRequested, recordRunFinished, type RunFinished } from "../notifications/outbox.js";
+import { holdForPerson, QUESTION_TOOL, releaseHold, releaseRunHolds } from "../assistant/holds.js";
 import {
   markChatRunRunning, closeChatRun, gateNamesEndedTurnSql, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
@@ -42,12 +49,18 @@ import {
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
 import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
+import { redactStoredValue } from "@claw/utils";
 import pino from "pino";
+import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
 import { metrics } from "../infra/metrics.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
+import type { LeaderLease } from "../infra/leader-lock.js";
 import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
+
+/** Brain's event for a streaming tool call's text so far (`ExecuteRequest.stream_tool_text`); never stored. */
+export const TOOL_TEXT_DELTA_EVENT = "toolTextDelta";
 
 export { recordCompletionTurns } from "./completion-turns.js";
 // Re-exported: this predicate lived here until it gained a second caller, and
@@ -160,31 +173,12 @@ export async function startEventConsumer(): Promise<void> {
     });
   } catch { /* consumer may already exist */ }
 
-  // One-time migrations
-  try {
-    // 1. Normalize legacy event_ids (PRIMUS_CLAW_EVENTS-xxx, claw-evt-xxx, bare numbers)
-    const migrated = await db.query(
-      `UPDATE claw_session_events
-       SET event_id = 'claw-' || regexp_replace(event_id, '^.*?(\\d+)$', '\\1')
-       WHERE event_id !~ '^claw-\\d'
-         AND event_id ~ '\\d+$'
-         AND deleted_at IS NULL`,
-    );
-    if (migrated.rowCount) {
-      logger.info({ count: migrated.rowCount }, "event-consumer.migrated_legacy_event_ids");
-    }
-
-    // 2. Replace UNIQUE(event_id) with UNIQUE(event_id, session_id) to prevent
-    //    cross-session collisions when multiple sessions share stream seq space.
-    //    Always ensure the composite index exists first, then drop old if present.
-    await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS claw_session_events_event_session_idx ON claw_session_events (event_id, session_id)`);
-    try {
-      await db.query(`ALTER TABLE claw_session_events DROP CONSTRAINT IF EXISTS claw_session_events_event_id_key`);
-      logger.info("event-consumer.dropped_old_unique_constraint");
-    } catch { /* constraint may not exist */ }
-  } catch (e) {
-    logger.warn({ err: (e as Error).message }, "event-consumer.migration_failed");
-  }
+  // The uniqueness the inserts below arbitrate on: two catalog reads once it is
+  // in place. Then the legacy event-id rewrite: once per database (a marker row
+  // records it), and in the background, so this replica persists events while
+  // it runs.
+  await ensureEventIdUniqueness();
+  void normalizeLegacyEventIdsOnce();
 
   const consumer = await js.consumers.get(EVENT_STREAM, consumerName);
   const iter = await consumer.consume();
@@ -222,21 +216,98 @@ function listenForCleanupNotices(): void {
   });
 }
 
+/**
+ * What a completion delivery left to do. `done`: nothing, ack. `busy`: another
+ * delivery holds the session's completion lock, ask again shortly. `owed`: the
+ * completion is processed but its run notification could not be recorded, and
+ * the event is redelivered until it is.
+ */
+type CompletionOutcome = "done" | "busy" | "owed";
+
+/**
+ * The run notification a processed completion still owes, as the stamp stored
+ * it, or null. A value that is not one is logged and dropped rather than
+ * redelivered for ever: nothing a retry does can make it readable.
+ */
+function owedRunNotice(raw: unknown, rowId: number): RunFinished | null {
+  if (raw === null || raw === undefined) return null;
+  const v = raw as Partial<RunFinished>;
+  if (typeof v === "object" && typeof v.sessionId === "string" && Array.isArray(v.taskIds)
+    && v.taskIds.every((t) => typeof t === "string") && (v.outcome === "completed" || v.outcome === "failed")) {
+    return {
+      sessionId: v.sessionId,
+      taskIds: v.taskIds,
+      outcome: v.outcome,
+      ...(typeof v.failureReason === "string" ? { failureReason: v.failureReason } : {}),
+    };
+  }
+  logger.error({ rowId }, "notification.owed_unreadable");
+  return null;
+}
+
+/**
+ * A processed completion whose run notification was not recorded (see the stamp in `processCompletionEvent`): record
+ * that and nothing else. Everything else the completion did is done and is not done again; the notification's own key
+ * (the run, not the delivery) is what makes recording it a second time, after a clear that did not land, write nothing.
+ * Called with the completion lock held.
+ */
+async function recordOwedRunNotice(
+  sessionId: string,
+  rowId: number,
+  raw: unknown,
+  lease: Pick<LeaderLease, "lost">,
+): Promise<CompletionOutcome> {
+  const owed = CLAW_NOTIFICATIONS_ENABLED ? owedRunNotice(raw, rowId) : null;
+  if (!owed) return "done";
+  try {
+    await completionPorts.recordRunFinished(owed);
+  } catch (err) {
+    logger.error({ err, sessionId, rowId }, "notification.record_failed");
+    return "owed";
+  }
+  if (lease.lost()) return "done";
+  await db.query("UPDATE claw_session_events SET run_notification_owed = NULL WHERE id = $1", [rowId]);
+  logger.info({ sessionId, rowId, taskIds: owed.taskIds }, "notification.owed_recorded");
+  return "done";
+}
+
+/**
+ * The redelivery of a completion whose session was deleted after it was processed: the run it announces did end, and
+ * a notification it still owes is recorded before the delivery is dropped (the run's end, not the session's content).
+ * A completion that was never processed, or owes nothing, is dropped as before.
+ */
+async function recordOwedRunNoticeOfDeletedSession(sessionId: string, eventId: string): Promise<CompletionOutcome> {
+  const stored = (await db.query(
+    `SELECT id, run_notification_owed FROM claw_session_events
+      WHERE event_id = $1 AND session_id = $2 AND processed_at IS NOT NULL AND run_notification_owed IS NOT NULL`,
+    [eventId, sessionId],
+  )).rows[0] as { id: number } | undefined;
+  if (!stored) return "done";
+  const outcome = await withCompletionLock(sessionId, async (lease): Promise<CompletionOutcome> => {
+    const current = (await db.query(
+      "SELECT run_notification_owed FROM claw_session_events WHERE id = $1",
+      [stored.id],
+    )).rows[0] as { run_notification_owed?: unknown } | undefined;
+    return recordOwedRunNotice(sessionId, stored.id, current?.run_notification_owed, lease);
+  });
+  return outcome.ran ? outcome.result : "busy";
+}
+
 async function processCompletionEvent(
   sessionId: string,
   event: Record<string, unknown>,
   rowId: number,
-): Promise<boolean> {
+): Promise<CompletionOutcome> {
   const messageId = typeof event.message_id === "string" && event.message_id
     ? event.message_id : null;
-  const outcome = await withCompletionLock(sessionId, async (lease) => {
+  const outcome = await withCompletionLock(sessionId, async (lease): Promise<CompletionOutcome> => {
     // Another delivery may have finished while this one was acquiring the lock.
     const current = (await db.query(
-      "SELECT processed_at FROM claw_session_events WHERE id = $1 AND session_id = $2",
+      "SELECT processed_at, run_notification_owed FROM claw_session_events WHERE id = $1 AND session_id = $2",
       [rowId, sessionId],
     )).rows[0];
     if (!current || !("processed_at" in current)) throw new Error("completion event row is missing");
-    if (current.processed_at !== null) return;
+    if (current.processed_at !== null) return recordOwedRunNotice(sessionId, rowId, current.run_notification_owed, lease);
 
     // A sweeper completion describes a row it already terminalized; its task id
     // is context for the turn, not a worker-generation fence.
@@ -256,7 +327,8 @@ async function processCompletionEvent(
     // `processed_at` NULL, which is the column's existing contract for a body
     // that did not finish: the nak retry re-runs it under whoever holds the
     // lock then.
-    if (lease.lost()) return;
+    if (lease.lost()) return "done";
+    let owed: RunFinished | undefined;
     if (alreadyProcessed) {
       if (messageId && event.completion_source !== "sweeper") {
         await recordCompletionTurns(sessionId, event, messageId, () => !lease.lost());
@@ -265,7 +337,7 @@ async function processCompletionEvent(
     } else if (namesChatRow && messageAlreadyProcessed) {
       const verdict = await completionAdmissibility(provenance, runClaimOf(event));
       if (verdict === "active") {
-        await handleComplete(sessionId, event, rowId, provenance, () => !lease.lost());
+        owed = await handleComplete(sessionId, event, rowId, provenance, () => !lease.lost());
       } else {
         if (verdict === "settled" && messageId && event.completion_source !== "sweeper") {
           await recordCompletionTurns(sessionId, event, messageId, () => !lease.lost());
@@ -276,7 +348,7 @@ async function processCompletionEvent(
         );
       }
     } else {
-      await handleComplete(sessionId, event, rowId, provenance, () => !lease.lost());
+      owed = await handleComplete(sessionId, event, rowId, provenance, () => !lease.lost());
     }
     // The durable done-marker, and the one statement in this body that a hold
     // which has already lost its lock must not write.
@@ -330,10 +402,20 @@ async function processCompletionEvent(
     // stamp fail rather than succeed -- which needs `LeaderLease` to expose its
     // client (infra/leader-lock.ts), and would put a completion's write on the
     // lock pool the bulkhead in db.ts keeps it off.
-    if (lease.lost()) return;
-    await db.query("UPDATE claw_session_events SET processed_at = NOW() WHERE id = $1", [rowId]);
+    //
+    // A run notification `handleComplete` could not record is written in the same statement, so the marker that says the
+    // completion is done and the record of what it still owes cannot be separated: stamped alone, a failed outbox write
+    // was gone for good -- the redelivery read the marker and acked -- and the run's `run.completed` was never sent.
+    // Left unstamped instead, the redelivery would run the whole completion again (skill feedback, the evolution job,
+    // the fallback rerun) to retry one write.
+    if (lease.lost()) return "done";
+    await db.query(
+      "UPDATE claw_session_events SET processed_at = NOW(), run_notification_owed = $2::jsonb WHERE id = $1",
+      [rowId, owed ? JSON.stringify(owed) : null],
+    );
+    return owed ? "owed" : "done";
   });
-  return outcome.ran;
+  return outcome.ran ? outcome.result : "busy";
 }
 
 /**
@@ -363,6 +445,22 @@ export async function consumeEventDelivery(msg: {
     }
     logger.info({ sessionId, type: event.type, seq: (msg as any).seq }, "event-consumer.msg_received");
 
+    // A streaming tool call's text so far (`toolTextDelta`: an assistant router's `say` while the model writes it). It is a preview
+    // for whoever follows the session live, who has it from the stream already; the call's whole input is stored with the call. So
+    // nothing is kept of it: it would be rows nobody reads back, several for every message the assistant says. Nor of the event that
+    // takes such a preview back (`toolTextVoid`): it is about the preview only.
+    if (event.type === TOOL_TEXT_DELTA_EVENT || event.type === TOOL_TEXT_VOID_EVENT) {
+      // A router turn's own text shown as its say's (`stream_text_as`), or taken back: noted on its run (`noteTextPreview`), which its
+      // end reads to take back what it does not say. A note that could not be written is asked for again, not dropped.
+      if (event.source === "text" && typeof event.message_id === "string" && typeof event.actionId === "string"
+        && !(await noteTextPreview(sessionId, event.message_id, event.actionId, event.type === TOOL_TEXT_DELTA_EVENT))) {
+        msg.nak(TOMBSTONE_UNKNOWN_NAK_MS);
+        return;
+      }
+      msg.ack();
+      return;
+    }
+
     // Dropped rather than persisted: everything below writes conversation
     // content, and the session it belongs to is gone. Acked because there is
     // nothing to retry -- no later attempt will find the session again.
@@ -378,6 +476,21 @@ export async function consumeEventDelivery(msg: {
       return;
     }
     if (deleted) {
+      if (event.type === "exec_complete" && CLAW_NOTIFICATIONS_ENABLED) {
+        let outcome: CompletionOutcome;
+        try {
+          outcome = await recordOwedRunNoticeOfDeletedSession(
+            sessionId, makeEventId((msg as any).seq ?? (msg as any).info?.streamSequence),
+          );
+        } catch (err) {
+          logger.error({ err, sessionId }, "notification.owed_record_failed");
+          outcome = "owed";
+        }
+        if (outcome !== "done") {
+          msg.nak(outcome === "busy" ? 1_000 : 10_000);
+          return;
+        }
+      }
       logger.info({ sessionId, type: event.type }, "event-consumer.dropped_deleted_session");
       msg.ack();
       return;
@@ -415,9 +528,11 @@ export async function consumeEventDelivery(msg: {
     const isAppEvent = event.type === "appEvent";
     const appEvent = appEventIdentity(event);
     try {
+      // The stored copy has credential-shaped content masked (`redactStoredValue`); `event` itself, which the completion below and
+      // every hook after it read, is not touched.
       const insertResult = await db.query(
         `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${isAppEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
-        [eventId, sessionId, (event.type as string) || "message", event],
+        [eventId, sessionId, (event.type as string) || "message", redactStoredValue(event)],
       );
       if (isAppEvent && !insertResult.rowCount) {
         logger.info({ sessionId, appTaskId: appEvent?.appTaskId, appEventId: appEvent?.eventId }, "event-consumer.app_event_duplicate_dropped");
@@ -453,8 +568,15 @@ export async function consumeEventDelivery(msg: {
     if (event.type === "exec_complete") {
       try {
         if (rowId === null) throw new Error("completion event has no durable row");
-        if (!await processCompletionEvent(sessionId, event, rowId)) {
+        const outcome = await processCompletionEvent(sessionId, event, rowId);
+        if (outcome === "busy") {
           msg.nak(1_000);
+          return;
+        }
+        if (outcome === "owed") {
+          // Processed, with its run notification still to record: redelivered until it is (see the stamp in
+          // `processCompletionEvent`). The wait is the one a failed completion gets.
+          msg.nak(10_000);
           return;
         }
       } catch (e) {
@@ -469,6 +591,20 @@ export async function consumeEventDelivery(msg: {
         // stamp in `processCompletionEvent`, which is the statement that makes
         // this comment true.
         logger.error({ err: e, sessionId }, "event-consumer.complete_failed");
+        msg.nak(10_000);
+        return;
+      }
+    } else if (event.type === WORKSPACE_SAVE_EVENT && event.phase === "finished" && typeof event.save_id === "string") {
+      // The save the session's queue was held for is over, however it went: release and drain now.
+      try {
+        const released = await releaseWorkspaceSaveHold(sessionId, event.save_id);
+        if (released) {
+          logger.info({ sessionId, saveId: event.save_id, outcome: event.outcome }, "workspace_save.hold_released");
+          await drainOldestPendingMessage(sessionId, released.userId);
+        }
+      } catch (e) {
+        // Retried: until it lands, the queue waits for the sweeper's backstop or the hold's time bound.
+        logger.error({ err: e, sessionId }, "workspace_save.hold_release_failed");
         msg.nak(10_000);
         return;
       }
@@ -495,16 +631,28 @@ export async function consumeEventDelivery(msg: {
       // up. Best-effort: a row left describing itself as preparing is a
       // reporting inaccuracy, and this event is not worth redelivering over.
       await markChatRunRunning(sessionId);
-    } else if (event.type === "permissionRequest" && CLAW_NOTIFICATIONS_ENABLED) {
-      // Brain is now waiting for a person to decide on a held tool call. Tell the
-      // owner's subscriptions, so the wait does not depend on someone watching the
-      // run. Best-effort like the run notifications, and idempotent: the row's
-      // key is derived from the request, so a redelivered event records nothing new.
-      try {
-        await eventNotificationPorts.recordApprovalRequested({ sessionId, event });
-      } catch (err) {
-        logger.error({ err, sessionId }, "notification.approval_record_failed");
+    } else if (event.type === "permissionRequest" || event.type === "userQuestion") {
+      // A work item's worker asking its person is the item's to tell (`assistant/holds.ts`).
+      const taken = CLAW_ASSISTANT_ENABLED ? await eventNotificationPorts.holdOrRetry(sessionId, event, msg) : "session";
+      if (taken === "retry") return;
+      if (taken === "session" && event.type === "permissionRequest" && CLAW_NOTIFICATIONS_ENABLED) {
+        // Brain is now waiting for a person to decide on a held tool call. Tell the
+        // owner's subscriptions, so the wait does not depend on someone watching the
+        // run. Best-effort like the run notifications, and idempotent: the row's
+        // key is derived from the request, so a redelivered event records nothing new.
+        try {
+          await eventNotificationPorts.recordApprovalRequested({ sessionId, event });
+        } catch (err) {
+          logger.error({ err, sessionId }, "notification.approval_record_failed");
+        }
       }
+    } else if (CLAW_ASSISTANT_ENABLED && event.type === "toolUsed" && event.status === "start" && event.tool !== QUESTION_TOOL) {
+      // A router turn starting a slow lookup with nothing said yet: the person is told it is on it (`assistant/lookup-ack.ts`).
+      // In the background: the lookup's own events are never held up by it.
+      ackBeforeLookupInBackground(sessionId, event);
+    } else if (CLAW_ASSISTANT_ENABLED && (event.type === "decisionResult" || (event.type === "toolUsed" && event.tool === QUESTION_TOOL))) {
+      // The wait is over (a decision, an answer, or Brain gave up): an item held for it goes back to in progress.
+      if ((await eventNotificationPorts.releaseOrRetry(sessionId, event, msg)) === "retry") return;
     }
 
     // After the event is stored and, for a completion, processed: the run row a
@@ -621,6 +769,7 @@ export async function releaseSessionGateIfLastRun(
   messageId: string | null,
   failed: boolean,
   taskId: string | null = null,
+  workspaceSaveId: string | null = null,
 ): Promise<boolean> {
   // Compared with `IS NOT DISTINCT FROM` rather than `=`, which is the sibling
   // idiom in `runCleanupAction` and in `applySessionGateTransition`, and the
@@ -645,7 +794,10 @@ export async function releaseSessionGateIfLastRun(
   // a live run. Occupancy cannot stand in for ownership across that window.
   const r = await db.query(
     `UPDATE claw_sessions
-        SET agent_status = $1, agent_gate_message_id = NULL, updated_at = NOW()
+        SET agent_status = $1, agent_gate_message_id = NULL, updated_at = NOW(),
+            -- In the statement that sets the session idle, so no message is admitted between the two
+            -- (sessions/save-hold.ts).
+            ${workspaceSaveHoldSet("$2", "$6", "$5")}
       WHERE session_id = $2
         AND deleted_at IS NULL
         AND (NOT $4::boolean OR agent_gate_message_id IS NOT DISTINCT FROM $3
@@ -673,7 +825,7 @@ export async function releaseSessionGateIfLastRun(
                    ELSE t.metadata->>'message_id' IS DISTINCT FROM $3
                  END
         )`,
-    [failed ? "failed" : "idle", sessionId, messageId, gateOwnershipEnforced(), taskId],
+    [failed ? "failed" : "idle", sessionId, messageId, gateOwnershipEnforced(), taskId, workspaceSaveId],
   );
   return (r.rowCount ?? 0) > 0;
 }
@@ -807,6 +959,36 @@ function runClaimOf(event: Record<string, unknown>): number | undefined {
  */
 export const eventNotificationPorts = {
   recordApprovalRequested,
+  holdForPerson,
+  releaseHold,
+  /**
+   * A worker of a work item asks its person (`assistant/holds.ts`). "taken": the item holds it and its person is told, or it
+   * is nobody's to tell any more. "session": not an item's worker; the request is any session's. "retry": recording it
+   * failed, and the event is redelivered (it is idempotent), since an item left in progress is a request nobody hears of.
+   */
+  async holdOrRetry(sessionId: string, event: Record<string, unknown>, msg: { nak: (millis?: number) => void }): Promise<"taken" | "session" | "retry"> {
+    try {
+      return (await eventNotificationPorts.holdForPerson({ sessionId, event })) === "not_an_item" ? "session" : "taken";
+    } catch (err) {
+      logger.error({ err, sessionId, type: event.type }, "assistant.hold_record_failed");
+      msg.nak(5_000);
+      return "retry";
+    }
+  },
+  /**
+   * The end of a wait an item may hold (`assistant/holds.ts`). "retry": recording it failed, and the event is redelivered (it is
+   * idempotent): no later event would put the item back in progress.
+   */
+  async releaseOrRetry(sessionId: string, event: Record<string, unknown>, msg: { nak: (millis?: number) => void }): Promise<"done" | "retry"> {
+    try {
+      await eventNotificationPorts.releaseHold({ sessionId, event });
+      return "done";
+    } catch (err) {
+      logger.error({ err, sessionId, type: event.type }, "assistant.hold_release_failed");
+      msg.nak(5_000);
+      return "retry";
+    }
+  },
 };
 
 /**
@@ -815,7 +997,7 @@ export const eventNotificationPorts = {
  * substituted). Production reads every one from here.
  */
 export const completionPorts = {
-  saveSkill,
+  handleWorkerSkillWrites,
   recordSkillFeedback,
   checkProbationGraduation,
   maybeSummarize: (sessionId: string, userId: string) => maybeSummarize(sessionId, userId),
@@ -823,9 +1005,22 @@ export const completionPorts = {
   enqueueEvolutionJob,
   recordRunFinished,
   recordWorkerTurnEnd,
+  releaseRunHolds,
   deliverUnsaidAnswer,
+  maybeAutoDraft,
   rerunOnFallback,
 };
+
+/**
+ * The run failure a turn that ended normally reports (`run_failure_reason`, and
+ * `run_failure_message` for a person), or null when it reports none.
+ */
+export function runFailureOf(event: Record<string, unknown>): { reason: string; message: string } | null {
+  const reason = event[RUN_FAILURE_REASON_FIELD];
+  if (typeof reason !== "string" || !reason.trim()) return null;
+  const message = event[RUN_FAILURE_MESSAGE_FIELD];
+  return { reason: reason.trim().slice(0, 200), message: typeof message === "string" ? message.slice(0, 2000) : "" };
+}
 
 async function handleComplete(
   sessionId: string,
@@ -836,9 +1031,15 @@ async function handleComplete(
   // steps above it each take a round trip, and the lock this body depends on
   // is held on another connection that can be released during any of them.
   stillHeld?: () => boolean,
-): Promise<void> {
+): Promise<RunFinished | undefined> {
   const { failed, user_id, interrupted, failure_reason } = event as any;
   const userId: string = user_id || "default";
+  // A turn that answered while its run failed (its sandbox could not be
+  // provided): the conversation keeps its normal ending, the run row and its
+  // notification record the failure (protocol run-failure.ts).
+  const runFailure = !failed && !interrupted ? runFailureOf(event) : null;
+  const runFailed = Boolean(failed) || runFailure !== null;
+  const runFailureReason = failed ? String(failure_reason ?? "agent_error") : runFailure?.reason;
   // Null rather than "" when absent: the unique index over the turns is partial
   // on this column, so an empty string would put every turn of every caller that
   // sends no message id into one index entry and let the first one written
@@ -866,9 +1067,12 @@ async function handleComplete(
     const closed = await closeChatRun(
       sessionId,
       messageId ?? undefined,
-      interrupted ? "cancelled" : failed ? "failed" : "completed",
-      failed ? String(failure_reason ?? "agent_error") : undefined,
-      { taskId: provenance ?? undefined, runClaim: runClaimOf(event) },
+      interrupted ? "cancelled" : runFailed ? "failed" : "completed",
+      runFailed ? runFailureReason : undefined,
+      {
+        taskId: provenance ?? undefined, runClaim: runClaimOf(event),
+        ...(runFailure ? { failureMessage: runFailure.message } : {}),
+      },
     );
     endedRunIds = closed.length ? closed : (provenance ? [provenance] : []);
     // A zero match classifies the event; it is not a yes/no gate. This
@@ -943,9 +1147,15 @@ async function handleComplete(
   // run.completed / run.failed notification. Everything below that is such a
   // side effect is gated on this one answer, or follows the early return.
   const sandboxOnly = messageId !== null && await isSandboxOnlyRun(sessionId, messageId);
+  // A save that follows this turn holds the session's queue until it is over (sessions/save-hold.ts).
+  const workspaceSaveId = (event as Record<string, unknown>)[WORKSPACE_SAVE_PENDING_FIELD] === WORKSPACE_SAVE_PENDING
+    && typeof (event as Record<string, unknown>)[WORKSPACE_SAVE_ID_FIELD] === "string"
+    ? String((event as Record<string, unknown>)[WORKSPACE_SAVE_ID_FIELD])
+    : null;
   const gateOpened = await releaseSessionGateIfLastRun(
     sessionId, gateTurn, Boolean(failed),
     provenance !== "foreign" ? provenance : null,
+    workspaceSaveId,
   );
 
   // 3. Save conversation turns.
@@ -959,62 +1169,24 @@ async function handleComplete(
   }
 
   // 4 + 4.5. Skill writes (save_skill tool, skill_file mutations).
-  // Gated by CLAW_SKILL_EVOLUTION_ENABLED. When OFF: drop, warn for audit.
+  // Gated by CLAW_USER_SKILLS_ENABLED, and kept only from a session the user's skills serve (`userSkillsServe`: the
+  // same turns that are offered the tools). Otherwise: dropped, warned for audit.
   const skillsToSave = sandboxOnly ? [] : (event as any).skills_to_save || [];
   const skillFileMutations = sandboxOnly ? [] : (event as any).skill_file_mutations || [];
-  if (!CLAW_SKILL_EVOLUTION_ENABLED) {
-    if (skillsToSave.length || skillFileMutations.length) {
+  const skillWrites = skillsToSave.length > 0 || skillFileMutations.length > 0;
+  if (!CLAW_USER_SKILLS_ENABLED || (skillWrites && !(await userSkillsServe(sessionId, userId)))) {
+    if (skillWrites) {
       logger.warn({
         sessionId,
         skills: skillsToSave.length,
         mutations: skillFileMutations.length,
-      }, "skill.write_skipped_flag_off");
+      }, CLAW_USER_SKILLS_ENABLED ? "skill.write_skipped_session_not_served" : "skill.write_skipped_flag_off");
     }
-  } else {
-    // 4. Process explicit save_skill events (from Brain's save_skill tool).
-    // Skills saved via tool are user-vouched, so source='manual' (skip probation).
-    for (const skill of skillsToSave) {
-      const blocked = scanMemoryContent(skill.content, 5000);
-      if (blocked) { logger.warn({ reason: blocked }, "skill.blocked"); continue; }
-      try {
-        await completionPorts.saveSkill(skill.skill_name, userId, skill.content, "manual", sessionId, skill.description || "");
-        logger.info({ skillName: skill.skill_name, sessionId }, "skill.saved");
-
-        // Sub-files passed in the same save_skill call (rare path; usually they come via mutations)
-        for (const f of skill.files || []) {
-          const r = await addSkillFile(userId, skill.skill_name, {
-            file_path: f.path, content: f.content, is_binary: f.is_binary,
-          });
-          if (!r.ok) logger.warn({ skill: skill.skill_name, path: f.path, err: r.error }, "skill_file.inline_save_failed");
-        }
-      } catch (err) {
-        logger.error({ err, sessionId }, "skill.save_failed");
-      }
-    }
-
-    // 4.5. Process sub-file mutations (E2: add/update/remove_skill_file)
-    for (const m of skillFileMutations) {
-      try {
-        let r;
-        if (m.action === "add") {
-          r = await addSkillFile(userId, m.skill_name, { file_path: m.file_path, content: m.content || "", is_binary: m.is_binary });
-        } else if (m.action === "update") {
-          r = await updateSkillFile(userId, m.skill_name, { file_path: m.file_path, content: m.content || "", is_binary: m.is_binary });
-        } else if (m.action === "remove") {
-          r = await removeSkillFile(userId, m.skill_name, m.file_path);
-        } else {
-          logger.warn({ action: m.action }, "skill_file.unknown_action");
-          continue;
-        }
-        if (r.ok) {
-          logger.info({ skill: m.skill_name, action: m.action, path: m.file_path }, "skill_file.mutation_applied");
-        } else {
-          logger.warn({ skill: m.skill_name, action: m.action, path: m.file_path, err: r.error }, "skill_file.mutation_failed");
-        }
-      } catch (err) {
-        logger.error({ err, skill: m.skill_name, action: m.action }, "skill_file.mutation_error");
-      }
-    }
+  } else if (skillWrites) {
+    // 4 + 4.5. A skill the user asked for in their own words (its request_quote) is saved now and shown with Undo; any other is a
+    // draft the user confirms first, its file writes folded in (`assistant/skill-writes.ts`). Every check a user's save passes is
+    // saveUserSkill's; a refusal is audited there.
+    await completionPorts.handleWorkerSkillWrites(sessionId, userId, skillsToSave, skillFileMutations);
   }
 
   // 5. Check pending messages (synchronous — must not be delayed by LLM calls).
@@ -1040,7 +1212,13 @@ async function handleComplete(
   if (!gateOpened) {
     logger.info({ sessionId, messageId }, "chat.pending_drain_deferred_session_busy");
   }
-  if (gateOpened) await drainOldestPendingMessage(sessionId, userId);
+  //    Nor while this turn's workspace save is still running: the next turn would
+  //    wait for the save on Brain's workspace lock, where its wait is bounded, and
+  //    the save's `finished` drains it instead (sessions/save-hold.ts). The drain's
+  //    claim refuses a held session too; this only says why in the log.
+  if (gateOpened && workspaceSaveId) {
+    logger.info({ sessionId, messageId, workspaceSaveId }, "chat.pending_drain_deferred_workspace_save");
+  } else if (gateOpened) await drainOldestPendingMessage(sessionId, userId);
 
   if (sandboxOnly) {
     logger.info({ sessionId, messageId, failed }, "exec_complete.handled_sandbox_only");
@@ -1050,11 +1228,11 @@ async function handleComplete(
   // 6. Record skill effectiveness feedback (synchronous DB update, no LLM).
   //    Score: failed = -1, mixed quality = 0, clean success = +1.
   //
-  //    Gated by CLAW_SKILL_EVOLUTION_ENABLED — when OFF, no feedback is
+  //    Gated by CLAW_SKILL_AUTO_EVOLUTION_ENABLED — when OFF, no feedback is
   //    recorded and probation skills don't graduate. selected_skills/skills_used
-  //    on the event are also harmless to ignore because selectSkillsForTask
-  //    already returns {} upstream.
-  if (CLAW_SKILL_EVOLUTION_ENABLED) {
+  //    on the event are harmless to ignore: no skill is inlined into a turn
+  //    (`request.skills` is no longer filled from the user's skills).
+  if (CLAW_SKILL_AUTO_EVOLUTION_ENABLED) {
     //    Attribution rules (revised after the "no-disk-write" optimization broke
     //    the simple selected ∩ used model):
     //
@@ -1115,7 +1293,8 @@ async function handleComplete(
     if (skillsUsedPatched) {
       (event as any).skills_used = skillsUsed;
       if (eventRowId) {
-        await db.query(`UPDATE claw_session_events SET data = $1 WHERE id = $2`, [event, eventRowId]);
+        // The stored copy again, masked as the insert above masked it: `event` itself is the one the turn's handling reads.
+        await db.query(`UPDATE claw_session_events SET data = $1 WHERE id = $2`, [redactStoredValue(event), eventRowId]);
       }
     }
 
@@ -1142,7 +1321,7 @@ async function handleComplete(
   //     These produce signal but losing one occurrence is acceptable —
   //     a summary will be regenerated on the next exec_complete, and
   //     pattern occurrences accumulate over many sessions.
-  //     Pattern recording gated by CLAW_SKILL_EVOLUTION_ENABLED. Summary
+  //     Pattern recording gated by CLAW_SKILL_AUTO_EVOLUTION_ENABLED. Summary
   //     stays unconditional. Memory is never extracted in the background.
   // A review someone asked of the owner learns nothing for the owner: no pattern, no skill evolution from what a stranger's pull request
   // made its model do (`github-review/review-profile.ts`). A session whose profile cannot be read is treated as one.
@@ -1150,7 +1329,7 @@ async function handleComplete(
   setImmediate(() => {
     completionPorts.maybeSummarize(sessionId, userId).catch(err =>
       logger.error({ err, sessionId }, "summarize_failed"));
-    if (CLAW_SKILL_EVOLUTION_ENABLED && learns) {
+    if (CLAW_SKILL_AUTO_EVOLUTION_ENABLED && learns) {
       completionPorts.maybeRecordTaskPattern(sessionId, userId, event).catch(err =>
         logger.error({ err, sessionId }, "skill.pattern_record_failed"));
     }
@@ -1160,8 +1339,8 @@ async function handleComplete(
   //     Skill evolution is the highest-value background task and the most
   //     expensive to lose (LLM-decided multi-mutation batches), so it goes
   //     into a real DB-backed queue. marketplace/evolve-worker.ts polls and runs jobs
-  //     with retries and crash recovery. Gated by CLAW_SKILL_EVOLUTION_ENABLED.
-  if (CLAW_SKILL_EVOLUTION_ENABLED && learns) {
+  //     with retries and crash recovery. Gated by CLAW_SKILL_AUTO_EVOLUTION_ENABLED.
+  if (CLAW_SKILL_AUTO_EVOLUTION_ENABLED && learns) {
     try {
       await completionPorts.enqueueEvolutionJob(sessionId, userId, event as Record<string, unknown>);
     } catch (err) {
@@ -1170,18 +1349,24 @@ async function handleComplete(
   }
 
   // 8. Notify subscribers that a run ended. Opt-in (flag and a subscription),
-  //    best-effort, and idempotent: the outbox row key is derived from the run,
-  //    so a redelivered completion records nothing new.
+  //    and idempotent: the outbox row key is derived from the run, so a
+  //    redelivered completion records nothing new. Not best-effort: a write that
+  //    fails here does not fail the rest of the completion, but it is returned,
+  //    stored with the completion's done-marker, and retried on redelivery until
+  //    it is recorded (`processCompletionEvent`). Nothing else would ever send it.
+  let owedNotice: RunFinished | undefined;
   if (CLAW_NOTIFICATIONS_ENABLED && !interrupted && endedRunIds.length) {
+    const notice: RunFinished = {
+      sessionId,
+      taskIds: endedRunIds,
+      outcome: runFailed ? "failed" : "completed",
+      ...(runFailed ? { failureReason: runFailureReason } : {}),
+    };
     try {
-      await completionPorts.recordRunFinished({
-        sessionId,
-        taskIds: endedRunIds,
-        outcome: failed ? "failed" : "completed",
-        failureReason: failed ? String(failure_reason ?? "agent_error") : undefined,
-      });
+      await completionPorts.recordRunFinished(notice);
     } catch (err) {
       logger.error({ err, sessionId }, "notification.record_failed");
+      owedNotice = notice;
     }
   }
 
@@ -1204,6 +1389,17 @@ async function handleComplete(
     }
   }
 
+  // 8b. A request an item's worker was still waiting on when its run ended is over with the run: an aborted wait sends no
+  //     decision (`assistant/holds.ts`). Before 9, so the turn's end reads the release as the run's last word. Best-effort:
+  //     the assistant sweep releases what this misses.
+  if (CLAW_ASSISTANT_ENABLED && endedRunIds.length) {
+    try {
+      await completionPorts.releaseRunHolds(sessionId, endedRunIds);
+    } catch (err) {
+      logger.error({ err, sessionId }, "assistant.run_hold_release_failed");
+    }
+  }
+
   // 9. A worker's turn that ended without telling the assistant anything it must act on becomes a report
   //    of its own (ready, or failed), so an accepted item is never one that just stopped. Best-effort here
   //    and not allowed to be the only line: the assistant sweep records a run whose end this lost.
@@ -1222,26 +1418,52 @@ async function handleComplete(
     }
   }
   // 9b. A router turn that answered the user in plain text and said nothing: the text is what it meant to say. One that
-  //     failed or was stopped and said nothing: the user is told it did not go through. Best-effort: a turn whose words
-  //     were lost here is a user who heard nothing, which the model could have caused on its own, so this is a repair
-  //     and not a promise.
+  //     failed or was stopped and said nothing: the user is told it did not go through. A fault is tried again, a few
+  //     times over a few seconds -- long enough to outlast a database failover, whose first seconds are exactly when a
+  //     model's `say` fails and its turn ends here -- and is not allowed to fail the completion, which is stored and
+  //     processed by now. Delivering twice is not a risk: a retry finds what the first attempt stored.
   if (CLAW_ASSISTANT_ENABLED && endedRunIds.length && !rerun) {
-    try {
-      await completionPorts.deliverUnsaidAnswer({
-        sessionId,
-        runIds: endedRunIds,
-        messageId: messageId ?? undefined,
-        failed: Boolean(failed),
-        interrupted: Boolean(interrupted),
-        fromSweeper: (event as any).completion_source === "sweeper",
-        finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
-      });
-    } catch (err) {
-      logger.error({ err, sessionId }, "assistant.unsaid_answer_failed");
+    const unsaid = {
+      sessionId,
+      runIds: endedRunIds,
+      messageId: messageId ?? undefined,
+      failed: Boolean(failed),
+      interrupted: Boolean(interrupted),
+      fromSweeper: (event as any).completion_source === "sweeper",
+      finalText: typeof (event as any).final_text === "string" ? (event as any).final_text : undefined,
+    };
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await completionPorts.deliverUnsaidAnswer(unsaid);
+        break;
+      } catch (err) {
+        if (attempt >= UNSAID_ANSWER_ATTEMPTS) {
+          logger.error({ err, sessionId, runIds: endedRunIds, attempts: attempt }, "assistant.unsaid_answer_failed");
+          break;
+        }
+        logger.warn({ err, sessionId, attempt }, "assistant.unsaid_answer_retry");
+        await new Promise((resolve) => setTimeout(resolve, unsaidAnswerRetryDelayMs * attempt));
+      }
     }
+  }
+  // 9c. A router turn whose message stated a way the user always works, and that saved or drafted no skill: the platform drafts one,
+  //     with its card (`skill-auto-draft.ts`), rather than leave the suggestion to the model. In the background: it is a model call,
+  //     and the completion is not held for it.
+  if (CLAW_ASSISTANT_ENABLED && CLAW_USER_SKILLS_ENABLED && endedRunIds.length && !rerun && !failed && !interrupted && messageId) {
+    void completionPorts.maybeAutoDraft({ sessionId, userId, messageId })
+      .catch((err) => logger.error({ err, sessionId }, "assistant.skill_auto_draft_failed"));
   }
 
   logger.info({ sessionId, failed, userId }, "exec_complete.handled");
+  return owedNotice;
+}
+
+/** How often a router turn's unsaid answer is tried when delivering it faults, and the first pause between tries. */
+const UNSAID_ANSWER_ATTEMPTS = 3;
+let unsaidAnswerRetryDelayMs = 2_000;
+/** For tests: the pause between tries of an unsaid answer. */
+export function setUnsaidAnswerRetryDelayForTest(ms: number): void {
+  unsaidAnswerRetryDelayMs = ms;
 }
 
 const SUMMARIZE_THRESHOLD = 80_000;
@@ -1282,42 +1504,6 @@ function resolvePendingRequestShape(
 }
 
 /**
- * The active skills a queued turn keeps, bundled the way a live turn gets them.
- *
- * Absent rather than empty when nothing is active, because an empty object and
- * "no skills were resolved" mean different things downstream.
- */
-async function pendingSkillBundle(
-  sessionId: string,
-  userId: string,
-  content: string,
-): Promise<Record<string, {
-  content: string; enabled: boolean; version?: number; description?: string;
-  files?: Array<{ path: string; content: string; is_binary?: boolean }>;
-}> | undefined> {
-let pendingSkills: Record<string, { content: string; enabled: boolean; version?: number; description?: string; files?: Array<{ path: string; content: string; is_binary?: boolean }> }> | undefined;
-try {
-  // A router turn has no use for skills, and selecting them can cost an LLM call (see sessions/dispatch.ts).
-  const activeSkills = await skipsSkillSelection(sessionId) ? {} : await selectSkillsForTask(userId, content);
-  pendingSkills = {};
-  for (const [name, bundle] of Object.entries(activeSkills)) {
-    pendingSkills[name] = {
-      content: bundle.content,
-      description: bundle.description,
-      enabled: true,
-      version: bundle.version,
-      files: bundle.files,
-    };
-  }
-  if (!Object.keys(pendingSkills).length) pendingSkills = undefined;
-} catch {
-  pendingSkills = undefined;
-}
-
-  return pendingSkills;
-}
-
-/**
  * Dispatch the next message parked behind this session, if there is one and the session is free.
  *
  * Extracted from the completion handler rather than duplicated, because the
@@ -1354,7 +1540,8 @@ if (pending) {
   const pendingUserId = pending.user_id || userId;
   const history = await buildMessages(sessionId, pending.content, pendingUserId);
 
-  const pendingSkills = await pendingSkillBundle(sessionId, pendingUserId, pending.content || "");
+  // Asked now, as the immediate path asks it: whose session it is and what the user's skills are when the turn is sent on.
+  const pendingUserSkills = await userSkillsForTurn(sessionId, pendingUserId);
   const rawTools = pending.tool_ids;
   const toolIds: number[] = Array.isArray(rawTools)
     ? rawTools.map((x) => Number(x)).filter((n) => Number.isFinite(n))
@@ -1416,11 +1603,10 @@ if (pending) {
     prompt: pending.content,
     history,
     memory_enabled: (await memoryAccess(sessionId, pendingUserId)).serves,
-    skill_evolution_enabled: CLAW_SKILL_EVOLUTION_ENABLED,
+    skill_evolution_enabled: CLAW_SKILL_AUTO_EVOLUTION_ENABLED,
     user_id: pendingUserId,
     llm_api_key: typeof pending.llm_api_key === "string" ? pending.llm_api_key : "",
     platform_key: typeof pending.platform_key === "string" ? pending.platform_key : "",
-    skills: pendingSkills,
     tool_ids: toolIds.length ? toolIds : undefined,
     plugin_id: pluginId !== undefined && Number.isFinite(pluginId) ? pluginId : undefined,
     ...(pluginTools !== undefined ? { plugin_tools: pluginTools } : {}),
@@ -1433,6 +1619,7 @@ if (pending) {
     topology: asJsonObject(pending.topology),
     ...(Array.isArray(pending.tools_allowlist) && pending.tools_allowlist.length ? { tools_allowlist: pending.tools_allowlist } : {}),
   };
+  applyTurnUserSkills(task, pendingUserSkills);
   // Same rule as the immediate path in sessions/dispatch.ts: no field at all for
   // a session with no choice, so Brain falls back on its own default.
   const pendingModel = sessionModelFromRow({ model: pending.session_model });

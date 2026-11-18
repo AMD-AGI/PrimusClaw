@@ -234,13 +234,14 @@ describe("assistant outbound", { skip }, () => {
       assert.deepEqual((await saysRows()).map((s) => s.text), ["one"]);
     });
 
-    test("must have text of at most 600 characters", async () => {
+    test("must have text of at most SAY_TEXT_MAX (9000) characters: a long answer whole, never more", async () => {
+      assert.equal(outbound.SAY_TEXT_MAX, 9000);
       const cases: Array<{ text: string; code?: string }> = [
         { text: "", code: "empty_text" },
         { text: " \n\t ", code: "empty_text" },
-        { text: "x".repeat(601), code: "text_too_long" },
-        { text: "x".repeat(600) },
-        { text: `  ${"y".repeat(600)}  ` },
+        { text: "x".repeat(9001), code: "text_too_long" },
+        { text: "x".repeat(9000) },
+        { text: `  ${"y".repeat(9000)}  ` },
       ];
       for (const c of cases) {
         if (c.code) await assert.rejects(say(c.text), (e: any) => e.code === c.code, c.code);
@@ -282,21 +283,117 @@ describe("assistant outbound", { skip }, () => {
   describe("the limit on how much an assistant says", () => {
     test("is 120 an hour unless configured", () => {
       assert.equal(config.CLAW_ASSISTANT_SAY_MAX_PER_HOUR, 120);
+      assert.equal(config.CLAW_ASSISTANT_SAY_EVAL_USERS.size, 0, "no evaluation identity unless named");
+      assert.equal(outbound.sayMaxPerHour("u1"), 120);
+    });
+
+    test("is the evaluation cap for a named evaluation identity only", async () => {
+      const evalUsers = new Set(["bot"]);
+      assert.equal(outbound.sayMaxPerHour("bot", evalUsers, 600, 120), 600);
+      assert.equal(outbound.sayMaxPerHour("u1", evalUsers, 600, 120), 120, "a person keeps the people's cap");
+      assert.equal(outbound.sayMaxPerHour("Bot", evalUsers, 600, 120), 120, "an id matches exactly");
+      // The cap that applies is the one the say is refused at: the evaluation identity's own, not a looser one.
+      const evalCap = deps({ maxPerHour: outbound.sayMaxPerHour("u1", new Set(["u1"]), 2, 120) });
+      await say("one", {}, evalCap);
+      await say("two", {}, evalCap);
+      await assert.rejects(say("three", {}, evalCap), (e: any) => e.code === "say_rate_limited" && /had 2 messages/.test(e.message));
     });
 
     test("stops a user at the limit, for that user only, and counts only the last hour", async () => {
       const limited = deps({ maxPerHour: 3 });
       for (let i = 0; i < 3; i += 1) await say(`m${i}`, {}, limited);
       await assert.rejects(say("m3", {}, limited), (e: any) => e.name === "SayRefused" && e.code === "say_rate_limited");
-      assert.equal((await saysRows()).length, 3);
+      const modelSays = async () => (await saysRows()).filter((s) => !s.fallback);
+      assert.equal((await modelSays()).length, 3);
 
       await outbound.recordAssistantSay({ userId: "u2", sessionId: "assistant-u2", text: "mine" }, limited);
-      assert.equal((await saysRows()).length, 4);
+      assert.equal((await modelSays()).length, 4);
 
       await q("UPDATE claw_assistant_says SET created_at = NOW() - interval '61 minutes' WHERE user_id = 'u1'");
       await say("a new hour", {}, limited);
-      assert.equal((await saysRows()).filter((s) => s.user_id === "u1").length, 4);
+      assert.equal((await modelSays()).filter((s) => s.user_id === "u1").length, 4);
     });
+
+    test("tells the user at the first refusal in an hour, once, in their language, tells the model it was not delivered, and counts every refusal", async () => {
+      const limited = deps({ maxPerHour: 2 });
+      const family = h.app.metrics.registry.getSingleMetric("claw_assistant_say_rate_limited_total");
+      assert.ok(family, "the counter is on the api registry");
+      const counted = async (notice: string) => (await family.get()).values.find((v) => v.labels.notice === notice)?.value ?? 0;
+      const before = { sent: await counted("sent"), already: await counted("already_sent") };
+      const tally = async () => [await counted("sent") - before.sent, await counted("already_sent") - before.already];
+      const notices = async () => (await saysRows()).filter((s) => s.fallback);
+      const capped = (e: any) => e.code === "say_rate_limited";
+
+      await say("one", {}, limited);
+      await say("two", {}, limited);
+      assert.equal((await notices()).length, 0, "no notice while there is room");
+      await assert.rejects(
+        say("three", {}, limited),
+        (e: any) => capped(e) && /NOT delivered/.test(e.message) && /has been told/.test(e.message),
+      );
+      const [notice] = await notices();
+      assert.deepEqual([notice?.text, notice?.user_id], [outbound.sayCapNotice("three"), "u1"], "the system's words, as a message of its own");
+      assert.deepEqual(events.filter((e) => e.event.text === notice.text).map((e) => e.sessionId), ["assistant-u1"], "the web client is told");
+
+      // The rest of the hour: refused and counted, and the user is not told again.
+      await assert.rejects(say("four", {}, limited), capped);
+      await assert.rejects(say("five", {}, limited), capped);
+      assert.equal((await notices()).length, 1);
+      assert.deepEqual(await tally(), [1, 2]);
+
+      // Under a steady overload the cap lets one message through each time the oldest turns an hour old: still the same hour.
+      await q(`UPDATE claw_assistant_says SET created_at = NOW() - interval '61 minutes'
+                WHERE say_id = (SELECT say_id FROM claw_assistant_says WHERE NOT fallback ORDER BY created_at LIMIT 1)`);
+      await say("six", {}, limited);
+      await assert.rejects(say("seven", {}, limited), capped);
+      assert.equal((await notices()).length, 1);
+      assert.deepEqual(await tally(), [1, 3]);
+
+      // A notice sent in the last clock hour, less than an hour ago, counts as well.
+      const hour = Number((await q("SELECT floor(extract(epoch FROM clock_timestamp()) / 3600)::bigint AS h")).rows[0].h);
+      const noticeId = (h: number) => outbox.deterministicEventId("assistant.notice", "u1", `say_capped:${h}`);
+      await q("UPDATE claw_assistant_says SET say_id = $1, created_at = NOW() - interval '30 minutes' WHERE fallback", [noticeId(hour - 1)]);
+      await assert.rejects(say("eight", {}, limited), capped);
+      assert.equal((await notices()).length, 1);
+      assert.deepEqual(await tally(), [1, 4]);
+
+      // An hour on, the next refusal tells the user again, in the language they are spoken to in.
+      await q("UPDATE claw_assistant_says SET created_at = created_at - interval '61 minutes'");
+      await say("九", {}, limited);
+      await say("十", {}, limited);
+      await assert.rejects(say("构建好了", {}, limited), capped);
+      assert.deepEqual((await notices()).map((s) => s.text), [outbound.sayCapNotice("three"), outbound.sayCapNotice("构建好了")]);
+      assert.match(outbound.sayCapNotice("构建好了"), /稍后再试/);
+      assert.deepEqual(await tally(), [2, 4]);
+    });
+
+    for (const order of ["the earlier hour first", "the later hour first"] as const) {
+      test(`tells the user once when two refusals come at once on either side of an hour, ${order}`, async () => {
+        const limited = deps({ maxPerHour: 1 });
+        await say("one", {}, limited);
+        // Each refusal's notice reads the hour, and waits there a little for the other: without the user's lock both
+        // would look for a notice before either had stored one, under two different hours. The later hour first is a
+        // transaction that started before the hour turned and got the lock after one that started after it.
+        let arrived = 0;
+        let bothThere!: () => void;
+        const both = new Promise<void>((resolve) => { bothThere = resolve; });
+        outbound.setCapNoticeHourForTest(async (hour) => {
+          arrived += 1;
+          const mine = arrived;
+          if (arrived === 2) bothThere();
+          await Promise.race([both, sleep(300)]);
+          return order === "the earlier hour first" ? hour + mine - 1 : hour + 2 - mine;
+        });
+        try {
+          const results = await Promise.allSettled([say("two", {}, limited), say("three", {}, limited)]);
+          assert.ok(results.every((r) => r.status === "rejected" && (r.reason as { code?: string }).code === "say_rate_limited"));
+        } finally {
+          outbound.setCapNoticeHourForTest(null);
+        }
+        assert.equal(arrived, 2, "both refusals reached the notice");
+        assert.equal((await saysRows()).filter((s) => s.fallback).length, 1);
+      });
+    }
 
     test("is a hard cap under concurrent says", async () => {
       const limited = deps({ maxPerHour: 3 });
@@ -309,7 +406,8 @@ describe("assistant outbound", { skip }, () => {
       const results = await Promise.allSettled(Array.from({ length: burst }, (_, i) => say(`burst ${i}`, { guard: barrier }, limited)));
       assert.equal(results.filter((r) => r.status === "fulfilled").length, 3);
       assert.ok(results.filter((r) => r.status === "rejected").every((r) => (r as PromiseRejectedResult).reason.code === "say_rate_limited"));
-      assert.equal((await saysRows()).length, 3);
+      assert.equal((await saysRows()).filter((s) => !s.fallback).length, 3);
+      assert.equal((await saysRows()).filter((s) => s.fallback).length, 1, "five refusals at once, one notice");
     });
 
     test("does not count the system's own needs-you messages, which are what is left when the assistant has not spoken", async () => {
@@ -508,19 +606,86 @@ describe("assistant outbound", { skip }, () => {
     });
 
     test("is shown to a web client in the user's assistant session when there is one", async () => {
-      await q("INSERT INTO claw_assistants (user_id, session_id) VALUES ('u1', 'assistant-u1')");
+      const { sessionId } = await (await import("../src/assistant/assistant.js")).getOrCreateAssistant("u1");
       const itemId = await seedItem();
       const out = await outbound.recordNeedsYouFallback({ itemId }, deps());
       assert.equal(events.length, 1);
       assert.deepEqual(
         [events[0].sessionId, events[0].event.type, events[0].event.say_id, events[0].event.fallback, events[0].event.item.can_accept],
-        ["assistant-u1", "AssistantSay", out!.say_id, true, true],
+        [sessionId, "AssistantSay", out!.say_id, true, true],
       );
 
       events = [];
       await q("DELETE FROM claw_assistants");
       await outbound.recordNeedsYouFallback({ itemId: await seedItem() }, deps());
       assert.equal(events.length, 0);
+    });
+
+    test("of a review someone else asked for, to a reviewer who has written nothing, is in the language the asker writes in, not the English title's", async () => {
+      await subscribe("u2");
+      const assistants = await import("../src/assistant/assistant.js");
+      const write = async (userId: string, content: string) => {
+        const { sessionId } = await assistants.getOrCreateAssistant(userId);
+        await q(
+          `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context) VALUES ($1, $2, $3, $4, '{}'::jsonb)`,
+          [sessionId, `m-${userId}-${Math.random()}`, userId, content],
+        );
+      };
+      await write("u1", "请 u2 帮我 review 并合入：https://github.com/AMD-AGI/demo/pull/7");
+      const review = async (params: Record<string, unknown>) => {
+        const itemId = await seedItem({ user_id: "u2", title: "Review+merge AMD-AGI/demo#7", last_report_kind: "blocked", pending_question: "GitHub says the branch has conflicts" });
+        await q("UPDATE claw_work_items SET kind = 'review', params = $2::jsonb WHERE item_id = $1", [itemId, JSON.stringify(params)]);
+        await outbound.recordNeedsYouFallback({ itemId }, deps());
+        return (await saysRows()).at(-1).text as string;
+      };
+      assert.equal(await review({ requested_by: "u1" }), `#${itemNo} Review+merge AMD-AGI/demo#7 卡住了，需要你回复：GitHub says the branch has conflicts`);
+      assert.equal(await review({}), `#${itemNo} "Review+merge AMD-AGI/demo#7" is blocked and needs your answer: GitHub says the branch has conflicts`, "no one asked: the title's");
+      // The reviewer's own words come first.
+      await write("u2", "Please merge it when it is green");
+      assert.equal(await review({ requested_by: "u1" }), `#${itemNo} "Review+merge AMD-AGI/demo#7" is blocked and needs your answer: GitHub says the branch has conflicts`);
+    });
+
+    test("of a review blocked with the server's own English question, to a reviewer who writes Chinese, is Chinese throughout (N20)", async () => {
+      await subscribe("u2");
+      const assistants = await import("../src/assistant/assistant.js");
+      const { sessionId } = await assistants.getOrCreateAssistant("u2");
+      await q(
+        `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context) VALUES ($1, 'm-u2-zh', 'u2', $2, '{}'::jsonb)`,
+        [sessionId, "好的，我看一下"],
+      );
+      // The question `reviewState` writes on a review whose merge was refused (2026-11-10: "卡住了，需要你回复：Look at AMD-AGI/PrimusClaw#646").
+      const itemId = await seedItem({ user_id: "u2", title: "Review+merge AMD-AGI/demo#7", last_report_kind: "blocked", pending_question: "Look at AMD-AGI/demo#7" });
+      await q("UPDATE claw_work_items SET kind = 'review', params = $2::jsonb WHERE item_id = $1", [itemId, JSON.stringify({ requested_by: "u1" })]);
+      await outbound.recordNeedsYouFallback({ itemId }, deps());
+      const text = (await saysRows()).at(-1).text as string;
+      assert.equal(text, `#${itemNo} Review+merge AMD-AGI/demo#7 卡住了，需要你回复：请看一下 AMD-AGI/demo#7`);
+      assert.doesNotMatch(text, /Look at/);
+      // A worker's own question that happens to read like one is not a review's: it is shown as the worker wrote it.
+      const own = await seedItem({ user_id: "u2", title: "看一下风险", last_report_kind: "blocked", pending_question: "Look at the risk report and suggest next steps" });
+      await outbound.recordNeedsYouFallback({ itemId: own }, deps());
+      assert.equal((await saysRows()).at(-1).text, `#${itemNo} 看一下风险 卡住了，需要你回复：Look at the risk report and suggest next steps`);
+    });
+
+    test("is in the language the person chose in their channel, whatever they write in; with no choice, in the one they write in", async () => {
+      await subscribe("u2");
+      const assistants = await import("../src/assistant/assistant.js");
+      const { sessionId } = await assistants.getOrCreateAssistant("u2");
+      let at = 0;
+      const write = async (content: string, context: Record<string, unknown>) => q(
+        `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, content, channel_context, received_at)
+         VALUES ($1, $2, 'u2', $3, $4::jsonb, NOW() + make_interval(secs => $5))`,
+        [sessionId, `m-u2-${++at}`, content, JSON.stringify(context), at],
+      );
+      const notice = async () => {
+        await outbound.recordNeedsYouFallback({ itemId: await seedItem({ user_id: "u2", title: "看一下风险", last_report_kind: "blocked", pending_question: "Which org?" }) }, deps());
+        return (await saysRows()).at(-1).text as string;
+      };
+      await write("好的，我看一下", { reply_language: "en" });
+      assert.equal(await notice(), `#${itemNo} "看一下风险" is blocked and needs your answer: Which org?`, "/lang en, Chinese words");
+      await write("Please keep going", { reply_language: "zh" });
+      assert.equal(await notice(), `#${itemNo} 看一下风险 卡住了，需要你回复：Which org?`, "/lang zh, English words");
+      await write("Please keep going", {});
+      assert.equal(await notice(), `#${itemNo} "看一下风险" is blocked and needs your answer: Which org?`, "no choice now: the words decide, as before");
     });
 
     test("belongs to the item's owner, not to whoever asked", async () => {
@@ -550,6 +715,434 @@ describe("assistant outbound", { skip }, () => {
       assert.equal(ok.statusCode, 200, ok.body);
       assert.equal(ok.json().data.event_types.length, 4);
       assert.equal((await patch(["assistant.shout"])).statusCode, 400);
+    });
+  });
+  describe("a message no channel can carry", () => {
+    const counter = () => h.app.metrics.registry.getSingleMetric("claw_assistant_say_unreachable_total")!;
+    const unreachable = async (type: string) => (await counter().get()).values.find((v) => v.labels.type === type)?.value ?? 0;
+    let warned: Array<Record<string, unknown>> = [];
+    let realWarn: typeof outbound.outboundLog.unreachable;
+    beforeEach(() => {
+      warned = [];
+      realWarn = outbound.outboundLog.unreachable;
+      outbound.outboundLog.unreachable = (fields) => { warned.push(fields); };
+    });
+    const restore = () => { outbound.outboundLog.unreachable = realWarn; };
+
+    test("is counted every time, and warned about once per user an hour, with the user and the item", async () => {
+      try {
+        const before = await unreachable("assistant.say");
+        const itemId = await seedItem();
+        const first = await say("about it", { itemId });
+        assert.equal(first.subscribers, 0);
+        await say("again");
+        await outbound.recordAssistantSay({ userId: "u2", sessionId: "assistant-u2", text: "hello" }, deps());
+        assert.equal(await unreachable("assistant.say") - before, 3, "every one is counted");
+        assert.deepEqual(warned, [
+          { user_id: "u1", item_id: itemId, say_id: first.say_id, type: "assistant.say" },
+          { user_id: "u2", item_id: null, say_id: warned[1]?.say_id, type: "assistant.say" },
+        ], "one line per user, the first of the hour, naming the user and the item");
+
+        // An hour on, the user is warned about again.
+        await q("UPDATE claw_assistant_says SET created_at = date_trunc('hour', NOW()) - interval '1 minute'");
+        const later = await say("a new hour");
+        assert.equal(warned.length, 3);
+        assert.equal(warned[2].say_id, later.say_id);
+
+        // A message a subscription carries is neither counted nor warned about.
+        await subscribe("u1", ["assistant.say"]);
+        const counted = await unreachable("assistant.say");
+        assert.equal((await say("carried")).subscribers, 1);
+        assert.equal(await unreachable("assistant.say"), counted);
+        assert.equal(warned.length, 3);
+      } finally { restore(); }
+    });
+
+    test("is not taken for told by the silent sweep: an unreached fallback is sent once a subscription takes it", async () => {
+      const silent = await import("../src/assistant/silent-sweep.js");
+      const ports = { ...silent.silentSweepPorts };
+      silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, deps());
+      try {
+        const itemId = await seedItem();
+        await q("UPDATE claw_work_items SET updated_at = NOW() - interval '1 hour'");
+        assert.equal(await silent.tellSilentItems(300), 1, "the fallback is stored");
+        const [fallback] = (await saysRows()).filter((x) => x.fallback);
+        assert.equal(fallback.item_id, itemId);
+        assert.equal((await outboxRows()).length, 0, "nothing could carry it");
+        assert.equal(await silent.tellSilentItems(300), 0, "with nothing to carry it, the item is not picked again");
+
+        const sub = await subscribe("u1", ["work_item.needs_you"]);
+        assert.equal(await silent.tellSilentItems(300), 1, "an undelivered fallback is not told");
+        const rows = await outboxRows();
+        assert.deepEqual(rows.map((r) => [r.event_id, r.subscription_id, r.payload.type, r.payload.item.item_id]),
+          [[fallback.say_id, sub, "work_item.needs_you", itemId]]);
+        assert.equal(await silent.tellSilentItems(300), 0, "once: its outbox row now tells it");
+        assert.equal((await outboxRows()).length, 1);
+      } finally {
+        Object.assign(silent.silentSweepPorts, ports);
+        restore();
+      }
+    });
+
+    test("is sent by the type a subscription takes: with only assistant.say taken, the model's say goes and the item is not picked again", async () => {
+      const silent = await import("../src/assistant/silent-sweep.js");
+      const ports = { ...silent.silentSweepPorts };
+      silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, deps());
+      try {
+        const itemId = await seedItem();
+        const said = await say("#1 is ready for your review.", { itemId });
+        await q("UPDATE claw_work_items SET updated_at = NOW() - interval '1 hour'");
+        assert.equal(await silent.tellSilentItems(300), 1, "the fallback is stored, newer than the say");
+        const sub = await subscribe("u1", ["assistant.say"]);
+        assert.equal(await silent.tellSilentItems(300), 1);
+        assert.deepEqual((await outboxRows()).map((r) => [r.event_id, r.subscription_id, r.payload.type]),
+          [[said.say_id, sub, "assistant.say"]], "the say the subscription takes, not the newer fallback it does not");
+        assert.equal(await silent.tellSilentItems(300), 0, "told now: not picked again");
+      } finally {
+        Object.assign(silent.silentSweepPorts, ports);
+        restore();
+      }
+    });
+
+    test("a fallback whose only send was refused 410 goes to a subscription added later, and only to it", async () => {
+      const silent = await import("../src/assistant/silent-sweep.js");
+      const ports = { ...silent.silentSweepPorts };
+      silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, deps());
+      try {
+        await seedItem();
+        await q("UPDATE claw_work_items SET updated_at = NOW() - interval '1 hour'");
+        assert.equal(await silent.tellSilentItems(300), 1, "stored, to nobody");
+        const first = await subscribe("u1", ["work_item.needs_you"]);
+        assert.equal(await silent.tellSilentItems(300), 1, "handed to the first subscription");
+        status = 410;
+        await deliver();
+        const [gone] = await outboxRows();
+        assert.deepEqual([gone.subscription_id, gone.last_status, gone.dropped_at !== null], [first, "http_410", true]);
+        assert.equal(await silent.tellSilentItems(300), 0, "nothing new can carry it: not picked");
+
+        const second = await subscribe("u1", ["work_item.needs_you"]);
+        assert.equal(await silent.tellSilentItems(300), 1, "a dropped send is not a told user");
+        const rows = await outboxRows();
+        assert.deepEqual(rows.map((r) => r.subscription_id), [first, second], "the refusing subscription is not handed it again");
+        assert.equal(rows[1].event_id, gone.event_id);
+        assert.equal(await silent.tellSilentItems(300), 0, "queued now: told");
+      } finally {
+        Object.assign(silent.silentSweepPorts, ports);
+        restore();
+      }
+    });
+
+    test("an answer the sweep said while nothing could carry it is sent when a subscription takes it", async () => {
+      const silent = await import("../src/assistant/silent-sweep.js");
+      const ports = { ...silent.silentSweepPorts };
+      silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, deps());
+      try {
+        const itemId = await seedItem({ board_state: "done", last_report_kind: "answer" });
+        await q("UPDATE claw_work_items SET outcome = 'answered', closed_at = NOW(), updated_at = NOW() - interval '1 hour' WHERE item_id = $1", [itemId]);
+        await q(
+          "INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary) VALUES ($1, 'answer', 'worker', 1, 'It is 42.')",
+          [itemId],
+        );
+        assert.equal(await silent.tellSilentItems(300), 1, "the answer is said, to nobody");
+        assert.equal((await outboxRows()).length, 0);
+        assert.equal(await silent.tellSilentItems(300), 0);
+
+        const post = await app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: { url: "https://93.184.216.34/a", event_types: ["work_item.needs_you"] } });
+        assert.equal(post.statusCode, 201, post.body);
+        const rows = await outboxRows();
+        assert.equal(rows.length, 1);
+        assert.deepEqual([rows[0].payload.type, rows[0].payload.item.item_id], ["work_item.needs_you", itemId]);
+        assert.match(rows[0].payload.text, /It is 42\./);
+        assert.equal(await silent.tellSilentItems(300), 0, "told now");
+      } finally {
+        Object.assign(silent.silentSweepPorts, ports);
+        restore();
+      }
+    });
+
+    test("about no item, is sent to the user's next subscription, once, as it was said; one older than a day is not", async () => {
+      // Before, only a say about an item that still needs the user was sent again: a user whose channel's subscription was
+      // missing for a moment lost every other say of that moment for good.
+      const post = (payload: unknown) => app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: payload as object });
+      try {
+        const old = await say("from yesterday");
+        await q("UPDATE claw_assistant_says SET created_at = NOW() - interval '25 hours' WHERE say_id = $1", [old.say_id]);
+        const first = await say("Done: the report is in your files.", { turnMessageId: "m-1" });
+        const second = await say("And the build is green.");
+        assert.deepEqual([first.subscribers, second.subscribers], [0, 0], "nothing could carry them");
+
+        const created = await post({ url: "https://93.184.216.34/a", event_types: ["assistant.say"] });
+        assert.equal(created.statusCode, 201, created.body);
+        const id = created.json().data.subscription_id;
+        const queued = await outboxRows();
+        assert.deepEqual(queued.map((r) => [r.event_id, r.subscription_id, r.payload.text]),
+          [[first.say_id, id, "Done: the report is in your files."], [second.say_id, id, "And the build is green."]],
+          "both, oldest first; not the one from yesterday");
+        assert.equal(queued[0].payload.turn_message_id, "m-1", "the payload it would have had, not one rebuilt from its text");
+        await deliver();
+        // A kick an earlier say started may still be running and claim one of the two rows while deliver() claims the other:
+        // two senders, so the order they reach the receiver in is not this test's to assert (CI 2026-11-09, PrimusClaw#551, the two
+        // came swapped). Wait for any delivery still running in this process (kickDelivery returns it, or runs one that finds
+        // nothing due), then check what matters here: both were sent, each once, and nothing else.
+        await outbox.kickDelivery(deliveryDeps());
+        const sentIds = sent.map((r) => r.headers[EVENT_ID_HEADER]);
+        assert.deepEqual([...sentIds].sort(), [first.say_id, second.say_id].sort(), "both, each once, not the one from yesterday");
+        assert.ok((await saysRows()).filter((x) => x.say_id !== old.say_id).every((x) => x.delivered_at), "marked delivered");
+
+        // Once: neither the same subscription changed nor another one made later is sent them again.
+        const patch = await app.inject({ method: "PATCH", url: `/v1/notification-subscriptions/${id}`, payload: { event_types: ["assistant.say", "run.completed"] } });
+        assert.equal(patch.statusCode, 200);
+        await post({ url: "https://93.184.216.34/b", event_types: ["assistant.say"] });
+        assert.equal((await outboxRows()).length, 2);
+        // A say a subscription carried is not kept for a later one.
+        assert.equal((await say("carried")).subscribers, 2);
+        assert.equal((await saysRows()).find((x) => x.text === "carried").unsent_payload, null);
+      } finally { restore(); }
+    });
+
+    test("about no item, every one of the last day is sent, however many there are", async () => {
+      const n = 230;
+      for (let i = 0; i < n; i++) {
+        const id = outbox.deterministicEventId("test.unsent", "u1", String(i));
+        await q(
+          `INSERT INTO claw_assistant_says (say_id, user_id, text, created_at, unsent_payload)
+           VALUES ($1, 'u1', $2, NOW() - make_interval(secs => $3), $4::jsonb)`,
+          [id, `say ${i}`, n - i, JSON.stringify({ type: "assistant.say", event_id: id, occurred_at: new Date().toISOString(), user_id: "u1", text: `say ${i}` })],
+        );
+      }
+      const created = await app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: { url: "https://93.184.216.34/a", event_types: ["assistant.say"] } });
+      assert.equal(created.statusCode, 201, created.body);
+      const queued = await outboxRows();
+      assert.equal(queued.length, n, "not only the first page");
+      assert.equal(new Set(queued.map((r) => r.event_id)).size, n, "each once");
+      assert.deepEqual(queued.slice(0, 3).map((r) => r.payload.text), ["say 0", "say 1", "say 2"], "oldest first");
+    });
+
+    test("a receiver that makes its subscription again is sent, once each, what was queued for the old one and what was said meanwhile", async () => {
+      // The restart-like case: the receiver is down, deletes its subscription and makes a new one, as the Teams bot does when it has lost the old one's secret.
+      const post = (payload: unknown) => app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: payload as object });
+      try {
+        const a = (await post({ url: "https://93.184.216.34/a", event_types: ["assistant.say"] })).json().data;
+        const before = await say("said while it was down");
+        status = 503;
+        await settle();
+        assert.equal((await outboxRows())[0].last_status, "http_503");
+        assert.equal((await app.inject({ method: "DELETE", url: `/v1/notification-subscriptions/${a.subscription_id}` })).statusCode, 200);
+        const between = await say("said while it had no subscription");
+        assert.equal(between.subscribers, 0);
+
+        status = 200;
+        sent.length = 0;
+        const b = (await post({ url: "https://93.184.216.34/b", event_types: ["assistant.say"] })).json().data;
+        assert.deepEqual((await outboxRows()).map((r) => [r.event_id, r.subscription_id]),
+          [[before.say_id, b.subscription_id], [between.say_id, b.subscription_id]], "one row each, both on the new subscription");
+        await deliver();
+        await makeDue();
+        await deliver();
+        assert.deepEqual(sent.map((r) => r.headers[EVENT_ID_HEADER]).sort(), [before.say_id, between.say_id].sort(), "each exactly once");
+      } finally { restore(); }
+    });
+
+    test("is sent to a subscription when it starts taking the assistant's events, once, for items that still need the user", async () => {
+      const post = (payload: unknown) => app.inject({ method: "POST", url: "/v1/notification-subscriptions", payload: payload as object });
+      try {
+        const waiting = await seedItem();
+        const moved = await seedItem();
+        const said = await say("#1 is ready for your review.", { itemId: waiting });
+        await say("#2 is ready too.", { itemId: moved });
+        await q("UPDATE claw_work_items SET board_state = 'in_progress' WHERE item_id = $1", [moved]);
+        assert.equal((await outboxRows()).length, 0);
+
+        const plain = await post({ url: "https://93.184.216.34/a" });
+        assert.equal(plain.statusCode, 201, plain.body);
+        assert.equal((await outboxRows()).length, 0, "a subscription without the assistant's events gets nothing");
+
+        const id = plain.json().data.subscription_id;
+        const patch = () => app.inject({ method: "PATCH", url: `/v1/notification-subscriptions/${id}`, payload: { event_types: ["assistant.say"] } });
+        assert.equal((await patch()).statusCode, 200);
+        const rows = await outboxRows();
+        assert.deepEqual(rows.map((r) => [r.event_id, r.subscription_id, r.payload.type, r.payload.text, r.payload.item.item_id]),
+          [[said.say_id, id, "assistant.say", "#1 is ready for your review.", waiting]], "only the item that still needs the user");
+        assert.equal((await patch()).statusCode, 200);
+        assert.equal((await outboxRows()).length, 1, "once");
+      } finally { restore(); }
+    });
+  });
+  describe("an item's result, said by the system on its own", () => {
+    /** A user whose assistant session is made (or, after a delete, made again) the way the product makes it. */
+    const assistantOf = async (userId = "u1") => (await import("../src/assistant/assistant.js")).getOrCreateAssistant(userId);
+    const deleteSession = (sessionId: string) => q("UPDATE claw_sessions SET deleted_at = NOW() WHERE session_id = $1", [sessionId]);
+    let workerNo = 0;
+    /** An item started from the user's current assistant session (`insertWorkItem`), answered, and quiet past the sweep's threshold. */
+    async function answeredItem(title: string, answer: string): Promise<string> {
+      const wi = await import("../src/assistant/work-items.js");
+      workerNo += 1;
+      const made = await wi.insertWorkItem({ query: (t: string, p?: unknown[]) => q(t, p ?? []) } as never, {
+        userId: "u1", title, workerSessionId: `worker-answered-${Date.now()}-${workerNo}`,
+      });
+      assert.ok(made.ok, JSON.stringify(made));
+      const itemId = (made as { itemId: string }).itemId;
+      await q(
+        "INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary) VALUES ($1, 'answer', 'worker', 1, $2)",
+        [itemId, answer],
+      );
+      await q(
+        `UPDATE claw_work_items SET board_state = 'done', outcome = 'answered', last_report_kind = 'answer', closed_at = NOW(),
+                updated_at = NOW() - interval '1 hour' WHERE item_id = $1`,
+        [itemId],
+      );
+      return itemId;
+    }
+    async function sweep(d = deps()): Promise<number> {
+      const silent = await import("../src/assistant/silent-sweep.js");
+      const ports = { ...silent.silentSweepPorts };
+      silent.silentSweepPorts.recordNeedsYouFallback = (i) => outbound.recordNeedsYouFallback(i, d);
+      silent.silentSweepPorts.reshowFallback = (i) => outbound.reshowFallback(i, d);
+      try { return await silent.tellSilentItems(300); } finally { Object.assign(silent.silentSweepPorts, ports); }
+    }
+    const shown = () => events.filter((e) => e.event.type === "AssistantSay").map((e) => ({ session: e.sessionId, text: String(e.event.text) }));
+
+    test("one the assistant said in its session is not said again, there or in the session that replaced it (2026-11-06: #119, #120, #121)", async () => {
+      const first = await assistantOf();
+      const kept = await answeredItem("jobs.csv 按 workspace 汇总", "总计 39,144.2 GPU 小时");
+      const reset = await answeredItem("后台运行 slow_job.sh", "RESULT=86972");
+      await say("✅ 总计 39,144.2 GPU 小时", { itemId: kept, sessionId: first.sessionId });
+      await say("✅ RESULT=86972", { itemId: reset, sessionId: first.sessionId });
+      assert.equal(shown().length, 2);
+
+      assert.equal(await sweep(), 0, "said in the session, which is where a user with no channel reads it: nothing is said again");
+      await deleteSession(first.sessionId);
+      assert.equal(await sweep(), 0, "deleted and not yet made again: still told");
+      assert.equal((await q("SELECT session_id FROM claw_assistants WHERE user_id = 'u1'")).rows[0].session_id, first.sessionId, "and no session is made for it");
+      const second = await assistantOf();
+      assert.equal(second.created, true);
+      assert.notEqual(second.sessionId, first.sessionId);
+      assert.equal(await sweep(), 0, "a new session is not a reason to say the old results again");
+      assert.deepEqual(shown().map((e) => e.session), [first.sessionId, first.sessionId], "nothing reached the new session");
+      assert.deepEqual((await saysRows()).filter((x) => x.fallback), [], "no system message was stored");
+    });
+
+    test("one whose session event failed to publish told nobody: the sweep says it, once", async () => {
+      const own = await assistantOf();
+      const itemId = await answeredItem("后台运行 slow_job.sh", "RESULT=86972");
+      await say("✅ RESULT=86972", { itemId, sessionId: own.sessionId }, deps({ publishSessionEvent: async () => { throw new Error("nats is down"); } }));
+      assert.equal(shown().length, 0);
+      assert.equal(await sweep(), 1);
+      assert.equal(await sweep(), 0, "once");
+      assert.deepEqual(shown().map((e) => e.session), [own.sessionId]);
+    });
+
+    test("the system's own message whose publish failed is shown again until it is, then never", async () => {
+      const own = await assistantOf();
+      await answeredItem("后台运行 slow_job.sh", "RESULT=86972");
+      const down = deps({ publishSessionEvent: async () => { throw new Error("nats is down"); } });
+      assert.equal(await sweep(down), 1, "stored");
+      assert.equal(shown().length, 0);
+      assert.equal(await sweep(down), 0, "still down: not shown, not counted");
+      // Two sweeps at once (two replicas): one publishes.
+      const itemId = (await saysRows()).find((x) => x.fallback).item_id;
+      const both = await Promise.all([outbound.reshowFallback({ itemId }, deps()), outbound.reshowFallback({ itemId }, deps())]);
+      assert.deepEqual(both.sort(), [false, true], "one claimed it");
+      assert.equal(await sweep(), 0, "once");
+      const told = shown();
+      assert.equal(told.length, 1);
+      assert.equal(told[0].session, own.sessionId);
+      assert.match(told[0].text, /RESULT=86972/);
+      assert.equal((await saysRows()).filter((x) => x.fallback).length, 1, "one message, shown under its one id");
+    });
+
+    test("the system's own message the session's stream already holds is not published again, though its record was lost", async () => {
+      const own = await assistantOf();
+      await answeredItem("后台运行 slow_job.sh", "RESULT=86972");
+      assert.equal(await sweep(), 1);
+      const [stored] = (await saysRows()).filter((x) => x.fallback);
+      // The event reached the stream (the event consumer persisted it), and then the record that it was shown was lost.
+      await q(
+        `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, 'AssistantSay', $3::jsonb)`,
+        [`ev-${stored.say_id}`, own.sessionId, JSON.stringify({ say_id: stored.say_id })],
+      );
+      await q("UPDATE claw_assistant_says SET session_id = NULL WHERE say_id = $1", [stored.say_id]);
+      assert.equal(await sweep(), 1, "recorded as shown");
+      assert.equal(await sweep(), 0);
+      assert.equal(shown().length, 1, "published once");
+    });
+
+    test("the system's own message is published once when a sweep elsewhere tries to show it while it is being published", async () => {
+      const own = await assistantOf();
+      const itemId = await answeredItem("后台运行 slow_job.sh", "RESULT=86972");
+      let other: Promise<boolean> | null = null;
+      const racing = deps({
+        publishSessionEvent: async (sessionId, event) => {
+          // Another replica's sweep, between this publish's claim and its event.
+          other = outbound.reshowFallback({ itemId }, deps());
+          await other;
+          events.push({ sessionId, event });
+        },
+      });
+      assert.ok(await outbound.recordNeedsYouFallback({ itemId }, racing));
+      assert.equal(await other, false, "the other sweep found it claimed");
+      assert.deepEqual(shown().map((e) => e.session), [own.sessionId], "one event");
+      assert.equal(await sweep(), 0);
+
+      // The other order: a sweep elsewhere shows an answer said whole after it was stored, before its own announcement runs.
+      const whole = await answeredItem("jobs.csv 汇总", "39,144.2");
+      const stored = await outbound.storeAnswerWhole((t: string, p?: unknown[]) => q(t, p ?? []) as never, whole, deps());
+      assert.ok(stored);
+      assert.equal(await outbound.reshowFallback({ itemId: whole }, deps()), true);
+      await stored!.announce();
+      assert.equal(shown().filter((e) => e.text.includes("39,144.2")).length, 1, "the announcement finds it shown and publishes nothing");
+    });
+
+    test("one said in a session deleted before its event was published told nobody", async () => {
+      const own = await assistantOf();
+      const itemId = await answeredItem("后台运行 slow_job.sh", "RESULT=86972");
+      await deleteSession(own.sessionId);
+      await say("✅ RESULT=86972", { itemId, sessionId: own.sessionId });
+      assert.equal((await saysRows())[0].session_id, null, "not recorded as shown");
+      assert.equal(await sweep(), 1, "said again, in a session that is read");
+      const next = (await q("SELECT session_id FROM claw_assistants WHERE user_id = 'u1'")).rows[0].session_id;
+      assert.notEqual(next, own.sessionId);
+      assert.equal(shown().at(-1)?.session, next);
+    });
+
+    test("one nobody said goes to the item's own session, once", async () => {
+      const own = await assistantOf();
+      const itemId = await answeredItem("jobs.csv 去掉 cancelled 后汇总", "36,661.0 GPU 小时");
+      assert.equal(await sweep(), 1);
+      assert.equal(await sweep(), 0, "once");
+      assert.deepEqual(shown(), [{ session: own.sessionId, text: "#" + (await q("SELECT seq FROM claw_work_items WHERE item_id = $1", [itemId])).rows[0].seq + " jobs.csv 去掉 cancelled 后汇总：36,661.0 GPU 小时" }]);
+    });
+
+    test("one nobody said, whose session was deleted and not yet made again, goes to the session made for it, once", async () => {
+      const first = await assistantOf();
+      await answeredItem("jobs.csv 去掉 cancelled 后汇总", "36,661.0 GPU 小时");
+      await deleteSession(first.sessionId);
+      assert.equal(await sweep(), 1);
+      assert.equal(await sweep(), 0, "once");
+      const made = (await q("SELECT session_id FROM claw_assistants WHERE user_id = 'u1'")).rows[0].session_id;
+      assert.notEqual(made, first.sessionId, "made as the user's next visit would");
+      const told = shown();
+      assert.equal(told.length, 1);
+      assert.equal(told[0].session, made, "never the deleted session");
+      assert.ok(told[0].text.startsWith(outbound.MOVED_PREFIX_ZH), told[0].text);
+      const again = await assistantOf();
+      assert.deepEqual([again.sessionId, again.created], [made, false], "the user's next visit finds that session");
+    });
+
+    test("one nobody said, whose session the user deleted, goes to the session they have now, once, saying where it came from", async () => {
+      const first = await assistantOf();
+      await answeredItem("jobs.csv 去掉 cancelled 后汇总", "36,661.0 GPU 小时");
+      await deleteSession(first.sessionId);
+      const second = await assistantOf();
+      assert.equal(await sweep(), 1);
+      assert.equal(await sweep(), 0, "once");
+      const told = shown();
+      assert.equal(told.length, 1);
+      assert.equal(told[0].session, second.sessionId, "the session the user has now: the deleted one is read by nobody");
+      assert.ok(told[0].text.startsWith(outbound.MOVED_PREFIX_ZH), told[0].text);
+      assert.match(told[0].text, /36,661\.0 GPU 小时/);
+      const [stored] = (await saysRows()).filter((x) => x.fallback);
+      assert.equal(stored.session_id, second.sessionId);
     });
   });
 });

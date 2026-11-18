@@ -305,6 +305,8 @@ spec:
         # route, and the reason "false" is the only value worth putting here.
         - name: BRAIN_LAZY_SANDBOX
           value: {{ .Values.brain.lazySandbox | quote }}
+        - name: BRAIN_SANDBOX_PRESTART
+          value: {{ .Values.brain.sandboxPrestart | quote }}
         - name: S3_WORKSPACE_TAGGING
           value: {{ .Values.brain.workspaceTagging | quote }}
         - name: S3_PRUNE_MAX_OBJECTS

@@ -10,7 +10,7 @@
 # ──────────────────────────────────────────────────────────────────────
 
 # ========== Stage 1: build ==========
-FROM node:26-bookworm-slim@sha256:bc0a2afd3b74ce12222fc8bab99271e66257f021078f5f4a5d687a77d280c1d9 AS builder
+FROM node:26-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68 AS builder
 WORKDIR /app
 
 # ============ Extra CA anchors (opt-in) ============
@@ -95,7 +95,8 @@ ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 # upstream published most recently.
 ARG BUN_VERSION=1.3.14
 ARG BUN_SHA256=951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f
-RUN curl -fsSL -o /tmp/bun.zip \
+# --retry: GitHub's release downloads answer 504 for minutes during GitHub incidents (2026-11-09); curl --retry retries 5xx/timeouts.
+RUN curl -fsSL --retry 6 --retry-delay 20 -o /tmp/bun.zip \
       "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" \
  && echo "${BUN_SHA256}  /tmp/bun.zip" | sha256sum -c - \
  && unzip -q /tmp/bun.zip -d /tmp/bun \
@@ -166,7 +167,7 @@ RUN bun build packages/hands/src/index.ts \
 
 # ========== Stage 2: runtime ==========
 # node:26-slim (Debian/glibc) — Node.js runs API and Brain processes.
-FROM node:26-bookworm-slim@sha256:bc0a2afd3b74ce12222fc8bab99271e66257f021078f5f4a5d687a77d280c1d9 AS runtime
+FROM node:26-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production \
     WORKSPACE_PATH=/workspace
@@ -191,7 +192,12 @@ ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /app/package.json       ./package.json
 COPY --from=builder /app/node_modules       ./node_modules
 COPY --from=builder /app/packages           ./packages
-RUN rm -rf packages/*/src packages/*/tsconfig*.json
+# Sources and tests are not shipped. Nor is the base image's global npm (and npx): nothing in this image runs them --
+# API, Brain and Hands start with `node` (deploy/entrypoint.sh) and spawn no package manager -- and npm's bundled
+# dependencies are what the image scan finds HIGH vulnerabilities in, on Node's release cadence rather than ours
+# (.github/scripts/image-scan.sh). The builder stage keeps npm for `npm ci`.
+RUN rm -rf packages/*/src packages/*/test packages/*/tsconfig*.json \
+      /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 # Reaper entry-point sanity guard. This image doubles as the workspace-reaper
 # CronJob image, which runs `node /app/packages/brain/dist/reaper-entry.js`.
@@ -208,6 +214,15 @@ RUN /app/hands-binary --self-check
 
 COPY deploy/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# The tag this image is published under, for the assistant's claw_self_status
+# (packages/api/src/assistant/self-status.ts reads CLAW_BUILD first). CI passes
+# the yyyymmddHHMM tag it pushes (.github/workflows/build.yaml); without it the
+# running API reports its build as unknown. Empty by default: deploy/build.sh
+# writes packages/api/BUILD instead, which buildOf reads when CLAW_BUILD is
+# empty. Declared last so a new tag invalidates no earlier layer.
+ARG CLAW_BUILD=""
+ENV CLAW_BUILD=${CLAW_BUILD}
 
 # API : 8200   Brain : 8100   Hands : 9100
 EXPOSE 8100 8200 9100

@@ -3,7 +3,9 @@
 
 /**
  * The state of a work item: what a worker's report does to it, and the two
- * things only a person can do, accept a result and stop the item.
+ * things only a person can do, accept a result and stop the item. With
+ * auto-delivery on (`deliveryPolicy`), a ready result is accepted by policy as
+ * it lands, and the user changes it by replying (`reopenWorkItem`).
  *
  * The row is the single source of truth. Every change is one UPDATE whose WHERE
  * clause is the rule (the item is still open, the caller is the worker of the
@@ -15,26 +17,26 @@
  * Nothing here talks to a model or to the outbox. Waking the router after a
  * report is the caller's job, in the same transaction, from `wake`.
  */
-import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS } from "../config.js";
+import { CLAW_ASSISTANT_AUTO_DELIVER, CLAW_ASSISTANT_MAX_ACTIVE_ITEMS } from "../config.js";
+import { parsePrRef } from "../github-review/github.js";
 import { closeConfirmationsForStop } from "../github-review/store.js";
 import { reviewAgentSettings } from "../github-review/review-profile.js";
 import { freezeRequesterView } from "./requester-view.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { ITEM_REF_HINT, parseItemRef, type ItemRefError } from "./item-ref.js";
 import { stopSessionRuns } from "../tasks/chat-run.js";
+import type {
+  BoardState, ItemKind, ReportKind, StopRefusal, WorkItemDecisionError, WorkItemEvent, WorkItemOutcome,
+  WorkItemView as ProtocolWorkItemView,
+} from "@claw/protocol";
 import { newWorkItemId } from "../tasks/ids.js";
 
-export const BOARD_STATES = ["in_progress", "needs_you", "done"] as const;
-export type BoardState = (typeof BOARD_STATES)[number];
-
-export const REPORT_KINDS = ["progress", "waiting", "ready", "answer", "blocked", "failed", "dropped"] as const;
-export type ReportKind = (typeof REPORT_KINDS)[number];
-
-export type Outcome = "accepted" | "answered" | "dropped" | "stopped";
-
-/** `task`: a worker that reports does it. `review`: a GitHub review on someone's behalf, whose state is read off what it did (`review-items.ts`). */
-export const ITEM_KINDS = ["task", "review"] as const;
-export type ItemKind = (typeof ITEM_KINDS)[number];
+// The item's wire shape and its closed sets are the HTTP API's contract, defined in @claw/protocol (`claw-api/work-items.ts`)
+// so that clients of the API share them; re-exported here so the API's own modules keep one import path.
+export { BOARD_STATES, ITEM_KINDS, REPORT_KINDS, type BoardState, type ItemKind, type ReportKind, type StopRefusal } from "@claw/protocol";
+export type Outcome = WorkItemOutcome;
+/** An item as the API builds it: `updated_at` is a `Date` here and an ISO 8601 string on the wire. */
+export type WorkItemView = ProtocolWorkItemView<Date>;
 
 export interface WorkReport {
   kind: ReportKind;
@@ -50,6 +52,41 @@ export const DONE_WINDOW_DAYS = 7;
 /** One line, at most `max` characters (not UTF-16 units: titles are mostly Chinese). */
 export function clipOneLine(text: string, max: number): string {
   return Array.from(text.replace(/\s+/g, " ").trim()).slice(0, max).join("");
+}
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+/** The characters of `text` as a reader counts them (an emoji with its modifiers, a letter with its accents: one each). */
+export const graphemes = (text: string): string[] => Array.from(graphemeSegmenter.segment(text), (x) => x.segment);
+/** A letter or digit of a script that separates words with spaces: two of them side by side are one word. Han and kana break anywhere. */
+const inWord = (g: string): boolean =>
+  /^[\p{L}\p{N}_]/u.test(g) && !/^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(g);
+
+/** How far past `max` {@link clipWords} goes to keep a word whole rather than leave less than `atLeast`. */
+const WORD_OVERRUN_MAX = 12;
+
+/**
+ * One line, at most `max` user-perceived characters (graphemes), cut where a reader sees a break: a text that does not fit ends in
+ * "…" after its last whole word, never in the middle of an emoji or a combined character. When that would keep fewer than
+ * `atLeast` characters, the word that crosses `max` is kept whole instead (the text then runs up to `WORD_OVERRUN_MAX` past it);
+ * a word longer than that, or one that fills the whole room, is cut where it must be.
+ */
+export function clipWords(text: string, max: number, atLeast = 0): string {
+  const gs = graphemes(text.replace(/\s+/g, " ").trim());
+  if (gs.length <= max) return gs.join("");
+  if (max < 1) return "";
+  let end = max - 1;
+  if (end > 0 && inWord(gs[end - 1]!) && inWord(gs[end]!)) {
+    let start = end - 1;
+    while (start > 0 && inWord(gs[start - 1]!)) start--;
+    let stop = end;
+    while (stop < gs.length && inWord(gs[stop]!)) stop++;
+    if (start > 0 && graphemes(gs.slice(0, start).join("").trimEnd()).length >= atLeast) end = start;
+    else if (start > 0 && stop - end <= WORD_OVERRUN_MAX) {
+      if (stop >= gs.length) return gs.join("");
+      end = stop;
+    }
+  }
+  return `${gs.slice(0, end).join("").trimEnd()}…`;
 }
 
 // --- What a report does -------------------------------------------------------------
@@ -94,6 +131,35 @@ export function reportTransition(report: Pick<WorkReport, "kind" | "question">):
 
 export type ReportSource = "worker" | "turn_end" | "sweep" | "watchdog";
 
+/**
+ * Whether a ready result is delivered as it lands instead of waiting for the user's Accept (`CLAW_ASSISTANT_AUTO_DELIVER`): read
+ * here, not at the call, so a test can turn it on and off.
+ */
+export const deliveryPolicy = { autoDeliver: CLAW_ASSISTANT_AUTO_DELIVER };
+
+/** The pull requests a ready result names in `result.refs` (by link, or as owner/repo#123), as lower-case `owner/repo#123`. */
+export function pullRequestsInRefs(result: unknown): Set<string> {
+  const refs = result !== null && typeof result === "object" ? (result as { refs?: unknown }).refs : undefined;
+  const out = new Set<string>();
+  if (!Array.isArray(refs)) return out;
+  for (const r of refs) {
+    const ref = parsePrRef(r !== null && typeof r === "object" ? (r as { url?: unknown }).url : undefined);
+    if (ref) out.add(`${ref.owner}/${ref.repo}#${ref.number}`.toLowerCase());
+  }
+  return out;
+}
+
+/**
+ * The pull requests the item watches now (`github-events.ts`), as owner/repo#123: the ones a delivered result keeps it open for.
+ * `named` keeps only those a ready result names; null keeps every one.
+ */
+async function watchedPullRequests(q: StatementRunner, itemId: string, named: ReadonlySet<string> | null): Promise<string[]> {
+  const rows = (await q.query(
+    "SELECT owner, repo, number FROM claw_work_item_subscriptions WHERE item_id = $1 AND state = 'active' ORDER BY id", [itemId],
+  )).rows as Array<{ owner: string; repo: string; number: number }>;
+  return rows.map((r) => `${r.owner}/${r.repo}#${r.number}`).filter((pr) => named === null || named.has(pr.toLowerCase()));
+}
+
 export interface ApplyReport {
   itemId: string;
   /** The generation the reporter was started under; a stale one matches nothing. */
@@ -115,6 +181,11 @@ export type ReportOutcome =
     wake: boolean;
     resultVersion: number;
     attentionSeq: number;
+    /**
+     * A ready result delivered by policy (`deliveryPolicy`): the item closed as accepted, or, when it names a pull request the item
+     * watches, stays open watching it (`watching`, as owner/repo#123). Null for any other report.
+     */
+    delivered: { watching: string[] } | null;
   };
 
 /**
@@ -129,6 +200,20 @@ export type ReportOutcome =
 export async function applyWorkerReport(q: StatementRunner, input: ApplyReport): Promise<ReportOutcome> {
   const t = reportTransition(input.report);
   const { report } = input;
+  // Delivered as it lands: closed as accepted (by policy, as a review item closes when it posts), the version recorded as the one
+  // accepted. One that names a pull request the item watches stays open and watching it (`watching_pr`), in progress and holding
+  // no slot (`RUNNING`), so comments and failed CI on it still reach the worker; its merge or close ends the item (`github-events.ts`).
+  const deliver = deliveryPolicy.autoDeliver && report.kind === "ready";
+  // A worker that only dealt with news on a watched pull request after its result was delivered (waiting, nothing to ask) goes back
+  // to watching it: the SQL keeps the watch only while the latest result is the delivered one (`params.delivered`, which a new result,
+  // a need of the user's and the user's own request for a change take away).
+  const quietWait = deliveryPolicy.autoDeliver && report.kind === "waiting" && t.question === null;
+  const keepsDelivered = report.kind === "progress" || quietWait;
+  const watching = deliver || quietWait
+    ? await watchedPullRequests(q, input.itemId, deliver ? pullRequestsInRefs(report.result) : null)
+    : [];
+  const boardState: BoardState = deliver ? (watching.length ? "in_progress" : "done") : t.boardState;
+  const outcome: Outcome | null = deliver && !watching.length ? "accepted" : t.outcome;
   const rows = (await q.query(
     `WITH upd AS (
        UPDATE claw_work_items
@@ -139,10 +224,15 @@ export async function applyWorkerReport(q: StatementRunner, input: ApplyReport):
               result_version = result_version + $8::int,
               attention_seq = attention_seq + $9::int,
               outcome = $10,
+              accepted_version = CASE WHEN $16 THEN result_version + 1 ELSE accepted_version END,
+              params = (CASE WHEN $18 THEN params ELSE params - 'delivered' END) - 'watching_pr'
+                || CASE WHEN $16 THEN jsonb_build_object('delivered', result_version + 1) ELSE '{}'::jsonb END
+                || CASE WHEN $17::jsonb IS NOT NULL AND ($16 OR params ? 'delivered')
+                        THEN jsonb_build_object('watching_pr', $17::jsonb) ELSE '{}'::jsonb END,
               closed_at = CASE WHEN $4 = 'done' THEN NOW() ELSE closed_at END,
               updated_at = NOW()
         WHERE item_id = $1 AND generation = $2 AND worker_session_id = $3 AND board_state <> 'done'
-    RETURNING item_id, user_id, generation, board_state, result_version, attention_seq
+    RETURNING item_id, user_id, generation, board_state, result_version, attention_seq, params->'watching_pr' AS watching_pr
      ), ev AS (
        INSERT INTO claw_work_item_events (item_id, kind, source, generation, run_id, summary, question, result)
        SELECT item_id, $5::text, $11::text, generation, $12::text, $13::text, $14::text, $15::jsonb FROM upd
@@ -151,14 +241,23 @@ export async function applyWorkerReport(q: StatementRunner, input: ApplyReport):
      SELECT upd.*, ev.id AS event_id FROM upd, ev`,
     [
       input.itemId, input.generation, input.workerSessionId,
-      t.boardState, report.kind, clipOneLine(report.summary, SUMMARY_MAX), t.question,
-      t.newResult ? 1 : 0, t.needsAttention ? 1 : 0, t.outcome,
+      boardState, report.kind, clipOneLine(report.summary, SUMMARY_MAX), t.question,
+      t.newResult ? 1 : 0, t.needsAttention ? 1 : 0, outcome,
       input.source, input.runId ?? null, report.summary, t.question,
       report.kind === "ready" && report.result !== undefined ? JSON.stringify(report.result) : null,
+      deliver, watching.length ? JSON.stringify(watching) : null, keepsDelivered,
     ],
   )).rows as Array<Record<string, unknown>>;
   const row = rows[0];
   if (!row) return { applied: false };
+  if (deliver) {
+    // What closed it, after the ready it delivers: by policy, never by the user, with the version and what it still watches.
+    await q.query(
+      `INSERT INTO claw_work_item_events (item_id, kind, source, generation, result)
+       VALUES ($1, 'accepted', 'policy', $2, $3::jsonb)`,
+      [input.itemId, row.generation, JSON.stringify({ version: Number(row.result_version), ...(watching.length ? { watching_pr: watching } : {}) })],
+    );
+  }
   return {
     applied: true,
     eventId: Number(row.event_id),
@@ -167,31 +266,14 @@ export async function applyWorkerReport(q: StatementRunner, input: ApplyReport):
     wake: t.wake,
     resultVersion: Number(row.result_version),
     attentionSeq: Number(row.attention_seq),
+    delivered: deliver ? { watching: Array.isArray(row.watching_pr) ? (row.watching_pr as string[]) : [] } : null,
   };
 }
 
 // --- What the user sees ---------------------------------------------------------------
 
-const ITEM_COLUMNS = `item_id, seq, title, summary, board_state, last_report_kind, pending_question,
+export const ITEM_COLUMNS = `item_id, seq, title, summary, board_state, last_report_kind, pending_question,
   outcome, result_version, accepted_version, worker_session_id, created_at, updated_at, closed_at, kind, params`;
-
-export interface WorkItemView {
-  item_id: string;
-  seq: number;
-  title: string;
-  summary: string;
-  board_state: BoardState;
-  last_report_kind: ReportKind | null;
-  pending_question: string | null;
-  outcome: Outcome | null;
-  result_version: number;
-  accepted_version: number | null;
-  can_accept: boolean;
-  kind: ItemKind;
-  /** What a review was asked with (`review-items.ts`); `{}` for a task. */
-  params: Record<string, unknown>;
-  updated_at: Date;
-}
 
 /** Derived from the state, never chosen by a model: a result waits for a person. */
 export function canAccept(row: { board_state: string; last_report_kind: string | null }): boolean {
@@ -207,11 +289,11 @@ export function itemView(row: Record<string, unknown>): WorkItemView {
     board_state: row.board_state as BoardState,
     last_report_kind: (row.last_report_kind ?? null) as ReportKind | null,
     pending_question: (row.pending_question ?? null) as string | null,
-    outcome: (row.outcome ?? null) as Outcome | null,
+    outcome: (row.outcome ?? null) as WorkItemOutcome | null,
     result_version: Number(row.result_version),
     accepted_version: row.accepted_version == null ? null : Number(row.accepted_version),
     can_accept: canAccept(row as { board_state: string; last_report_kind: string | null }),
-    kind: row.kind === "review" ? "review" : "task",
+    kind: row.kind === "review" || row.kind === "remote" ? row.kind : "task",
     params: row.params !== null && typeof row.params === "object" ? row.params as Record<string, unknown> : {},
     updated_at: row.updated_at as Date,
   };
@@ -277,19 +359,34 @@ export async function listWorkItems(userId: string, state: BoardState | null): P
   return rows.map(itemView);
 }
 
-export async function recentEvents(itemId: string, limit = 20): Promise<Array<Record<string, unknown>>> {
+export async function recentEvents(itemId: string, limit = 20): Promise<Array<WorkItemEvent<Date>>> {
   return (await db.query(
     `SELECT id, kind, source, generation, run_id, summary, question, result, created_at
        FROM claw_work_item_events WHERE item_id = $1 ORDER BY id DESC LIMIT $2`,
     [itemId, limit],
-  )).rows as Array<Record<string, unknown>>;
+  )).rows as Array<WorkItemEvent<Date>>;
 }
 
 // --- Taking on an item ----------------------------------------------------------------
 
+/** The most items one user may have waiting for a slot (`queueWhenFull`); past it the limit's refusal stands. */
+export const MAX_QUEUED_ITEMS = 20;
+/**
+ * An open item that holds a slot, and one waiting for one (`params.queued`), as SQL over `claw_work_items`. An item holds a slot when it is
+ * unfinished: not one waiting for a slot (`queued`), nor a review waiting for CI on its head to turn green before it
+ * is run again (`ci_waiting`, `review-items.ts`), which may wait a day with nothing of it running, nor one whose result was delivered
+ * and that only watches its pull request until it is merged or closed (`watching_pr`, `applyWorkerReport`).
+ */
+export const RUNNING = "board_state <> 'done' AND NOT (params ? 'queued') AND NOT (params ? 'ci_waiting') AND NOT (params ? 'watching_pr')";
+export const WAITING = "board_state <> 'done' AND params ? 'queued'";
+
 export type InsertWorkItemResult =
-  | { ok: true; itemId: string; seq: number }
-  | { ok: false; error: "too_many_active_items" | "too_many_requested_reviews" | "too_many_from_requester" | "no_assistant" };
+  /** `queued`: over the limit named, the item waits for a slot (`queueWhenFull`) and nothing of it may run yet. */
+  | { ok: true; itemId: string; seq: number; queued?: QueueReason }
+  | { ok: false; error: QueueReason | "no_assistant" };
+
+/** The limit an item waits on, or is refused over: `too_many_in_request` is a review past the first ten its request starts at once. */
+export type QueueReason = "too_many_active_items" | "too_many_requested_reviews" | "too_many_from_requester" | "too_many_in_request";
 
 /**
  * The item row and its `created` event. Must run inside the transaction that also
@@ -300,6 +397,10 @@ export type InsertWorkItemResult =
  * statement: the user's own (the per-user limit), and reviews others asked of the
  * user (`requestedBy`, the user's review-agent limits: in all, and per requester).
  * Neither can take the other's room, so what others ask never fills the user's board.
+ *
+ * With `queueWhenFull`, an item over its limit is not refused but queued (`params.queued`), up to `MAX_QUEUED_ITEMS` per user: it
+ * holds no slot, and `startQueuedReviews` (review-items.ts) starts it, oldest first, once one is free. One that would fit while others
+ * of its kind still wait is queued behind them. Queued items are counted apart from the running ones.
  */
 export async function insertWorkItem(
   q: StatementRunner,
@@ -307,39 +408,53 @@ export async function insertWorkItem(
     userId: string; title: string; workerSessionId: string; repo?: unknown; kind?: ItemKind; params?: Record<string, unknown>;
     /** Who asked for this review, when it is not the user's own. */
     requestedBy?: string | null;
+    /** Over the limit, queue the item instead of refusing it (a review item: `insertReview`). */
+    queueWhenFull?: boolean;
+    /** With `queueWhenFull`: queue it even when the limits have room, for this reason; refused for it when the queue is full. */
+    holdFor?: "too_many_in_request";
   },
 ): Promise<InsertWorkItemResult> {
-  const locked = await q.query("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [input.userId]);
+  const locked = await q.query("SELECT session_id FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [input.userId]);
   if (!locked.rowCount) return { ok: false, error: "no_assistant" };
+  const routerSessionId = String((locked.rows[0] as { session_id: string }).session_id);
   const counts = (await q.query(
-    `SELECT COUNT(*) FILTER (WHERE board_state <> 'done' AND NOT (params ? 'requested_by'))::int AS active,
-            COUNT(*) FILTER (WHERE board_state <> 'done' AND params ? 'requested_by')::int AS others,
-            COUNT(*) FILTER (WHERE board_state <> 'done' AND params->>'requested_by' = $2)::int AS requester,
+    `SELECT COUNT(*) FILTER (WHERE ${RUNNING} AND NOT (params ? 'requested_by'))::int AS active,
+            COUNT(*) FILTER (WHERE ${RUNNING} AND params ? 'requested_by')::int AS others,
+            COUNT(*) FILTER (WHERE ${RUNNING} AND params->>'requested_by' = $2)::int AS requester,
+            COUNT(*) FILTER (WHERE ${WAITING})::int AS queued,
+            COUNT(*) FILTER (WHERE ${WAITING} AND (params ? 'requested_by') = ($2::text IS NOT NULL))::int AS queued_alike,
             COALESCE(MAX(seq), 0)::int + 1 AS next
        FROM claw_work_items WHERE user_id = $1`,
     [input.userId, input.requestedBy ?? null],
-  )).rows[0] as { active: number; others: number; requester: number; next: number };
+  )).rows[0] as { active: number; others: number; requester: number; queued: number; queued_alike: number; next: number };
+  let over: "too_many_active_items" | "too_many_requested_reviews" | "too_many_from_requester" | null = null;
   if (input.requestedBy) {
     const limits = reviewAgentSettings(input.userId);
-    if (counts.others >= limits.othersMaxActive) return { ok: false, error: "too_many_requested_reviews" };
-    if (counts.requester >= limits.perRequesterMaxActive) return { ok: false, error: "too_many_from_requester" };
+    if (counts.others >= limits.othersMaxActive) over = "too_many_requested_reviews";
+    else if (counts.requester >= limits.perRequesterMaxActive) over = "too_many_from_requester";
   } else if (counts.active >= CLAW_ASSISTANT_MAX_ACTIVE_ITEMS) {
-    return { ok: false, error: "too_many_active_items" };
+    over = "too_many_active_items";
   }
+  // Behind the ones already waiting, whether or not this one would fit now: the queue starts them in order.
+  const held = input.holdFor ?? null;
+  const queue = input.queueWhenFull === true && (over !== null || held !== null || counts.queued_alike > 0) && counts.queued < MAX_QUEUED_ITEMS;
+  if ((over ?? held) && !queue) return { ok: false, error: (over ?? held)! };
+  const queued: QueueReason | null = queue ? (over ?? held ?? (input.requestedBy ? "too_many_requested_reviews" : "too_many_active_items")) : null;
+  const params = queued ? { ...(input.params ?? {}), queued: { since: new Date().toISOString(), reason: queued } } : input.params;
   const itemId = newWorkItemId();
   await q.query(
-    `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo, kind, params)
-     VALUES ($1, $2, $3, $4, 'in_progress', $5, $6::jsonb, $7, $8::jsonb)`,
+    `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo, kind, params, router_session_id)
+     VALUES ($1, $2, $3, $4, 'in_progress', $5, $6::jsonb, $7, $8::jsonb, $9)`,
     [
       itemId, input.userId, counts.next, clipOneLine(input.title, TITLE_MAX), input.workerSessionId,
-      input.repo === undefined ? null : JSON.stringify(input.repo), input.kind ?? "task", JSON.stringify(input.params ?? {}),
+      input.repo === undefined ? null : JSON.stringify(input.repo), input.kind ?? "task", JSON.stringify(params ?? {}), routerSessionId,
     ],
   );
   await q.query(
     "INSERT INTO claw_work_item_events (item_id, kind, source, generation) VALUES ($1, 'created', 'router', 0)",
     [itemId],
   );
-  return { ok: true, itemId, seq: counts.next };
+  return { ok: true, itemId, seq: counts.next, ...(queued ? { queued } : {}) };
 }
 
 // --- What only a person decides -------------------------------------------------------
@@ -347,10 +462,7 @@ export async function insertWorkItem(
 export type DecisionResult =
   | { status: "ok"; item: WorkItemView }
   | { status: "not_found" }
-  | { status: "conflict"; error: "version_mismatch" | "not_acceptable" | "item_closed" | StopRefusal; item: WorkItemView };
-
-/** Why a review item cannot be stopped: its merge is being made, or was made. Saying so is the truth; nothing is undone. */
-export type StopRefusal = "merge_in_progress" | "already_merged";
+  | { status: "conflict"; error: WorkItemDecisionError; item: WorkItemView };
 
 /** Thrown inside the stop's transaction, which it rolls back: nothing was stopped and no confirmation was denied. */
 class StopRefused extends Error {
@@ -422,6 +534,8 @@ export async function stopWorkItem(input: {
       `WITH upd AS (
          UPDATE claw_work_items
             SET board_state = 'done', outcome = 'stopped', pending_question = NULL,
+                -- Stopped, the item no longer stands delivered nor watches: a Retry starts it as any stopped item.
+                params = params - 'watching_pr' - 'delivered',
                 generation = generation + 1, closed_at = NOW(), updated_at = NOW()
           WHERE item_id = $1 AND user_id = $2 AND board_state <> 'done'
       RETURNING ${ITEM_COLUMNS}, generation
@@ -450,7 +564,14 @@ export async function stopWorkItem(input: {
   const item = itemView(current);
   if (refused) return { status: "conflict", error: refused, item };
   if (!stopped && current.outcome !== "stopped") return { status: "conflict", error: "item_closed", item };
-  await stopSessionRuns(current.worker_session_id as string);
+  // A remote item has no run of Claw's to stop: its agent's turn is cancelled on its machine, whoever pressed stop (the router's
+  // work_stop, the item's stop button). Loaded here to keep the two modules acyclic.
+  if (item.kind === "remote") {
+    const { cancelRemoteItem } = await import("./remote-items.js");
+    await cancelRemoteItem(input.userId, item.params);
+  } else {
+    await stopSessionRuns(current.worker_session_id as string);
+  }
   return { status: "ok", item };
 }
 
@@ -462,18 +583,29 @@ export async function stopWorkItem(input: {
  * instruction, so whatever it reports next, `ready` above all, describes work the
  * user has already asked to change: it is fenced out, and the run that carries the
  * instruction is the next one to be heard.
+ *
+ * With `delivered`, an item closed by delivering its result (`applyWorkerReport`, by policy) in the last DONE_WINDOW_DAYS is opened
+ * again too: replying is how the user changes a delivered result. One the user stopped, accepted themselves, or that closed longer ago
+ * stays closed. A GitHub event never passes it: news on a pull request does not reopen a closed item. The user's words take the
+ * delivered mark away (what they asked for is not delivered yet); news on a watched pull request leaves it, so a worker that only
+ * answers the news goes back to watching (`applyWorkerReport`).
  */
 export async function reopenWorkItem(
   q: StatementRunner,
   /** `source` is who sent it back: the router forwarding the user's words, or a GitHub event on a pull request it watches. */
-  input: { userId: string; itemId: string; text?: string; source?: "router" | "github" },
+  input: { userId: string; itemId: string; text?: string; source?: "router" | "github"; delivered?: boolean },
 ): Promise<WorkItemView | null> {
   const rows = (await q.query(
     `WITH upd AS (
        UPDATE claw_work_items
           SET board_state = 'in_progress', last_report_kind = 'progress', pending_question = NULL,
+              outcome = CASE WHEN board_state = 'done' THEN NULL ELSE outcome END,
+              closed_at = CASE WHEN board_state = 'done' THEN NULL ELSE closed_at END,
+              params = (CASE WHEN $4 = 'github' THEN params ELSE params - 'delivered' END) - 'watching_pr',
               generation = generation + 1, updated_at = NOW()
-        WHERE item_id = $1 AND user_id = $2 AND board_state <> 'done'
+        WHERE item_id = $1 AND user_id = $2
+          AND (board_state <> 'done'
+               OR ($5 AND outcome = 'accepted' AND params ? 'delivered' AND closed_at > NOW() - make_interval(days => $6::int)))
     RETURNING ${ITEM_COLUMNS}, generation
      ), ev AS (
        INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
@@ -481,7 +613,31 @@ export async function reopenWorkItem(
     RETURNING id
      )
      SELECT upd.* FROM upd, ev`,
-    [input.itemId, input.userId, input.text ?? null, input.source ?? "router"],
+    [input.itemId, input.userId, input.text ?? null, input.source ?? "router", input.delivered === true, DONE_WINDOW_DAYS],
   )).rows as Array<Record<string, unknown>>;
   return rows[0] ? itemView(rows[0]) : null;
+}
+
+/**
+ * Close, as delivered, an item whose delivered result kept it open watching its pull request (`watching_pr`): the pull request was
+ * merged or closed, every watch of it ended, or nothing came for a while (`github-events.ts`). By policy, like the delivery itself; the
+ * result stays the delivered one, so the user can still change it by replying (`reopenWorkItem`). False when the item no longer
+ * watches (reopened, stopped or closed meanwhile).
+ */
+export async function closeWatchedItem(q: StatementRunner, itemId: string, summary: string): Promise<boolean> {
+  const rows = (await q.query(
+    `WITH upd AS (
+       UPDATE claw_work_items
+          SET board_state = 'done', outcome = 'accepted', params = params - 'watching_pr', closed_at = NOW(), updated_at = NOW()
+        WHERE item_id = $1 AND board_state <> 'done' AND params ? 'watching_pr'
+    RETURNING item_id, generation
+     ), ev AS (
+       INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
+       SELECT item_id, 'accepted', 'policy', generation, $2 FROM upd
+    RETURNING id
+     )
+     SELECT upd.item_id FROM upd, ev`,
+    [itemId, summary],
+  )).rows;
+  return rows.length > 0;
 }

@@ -26,22 +26,25 @@ import { db, MarketplaceDb } from "../infra/db.js";
 import { nc, sc } from "../infra/nats.js";
 import { canExecuteTaskDag } from "../tasks/dags/authz.js";
 import { getTaskDag } from "../tasks/dags/db.js";
-import type { UserInfo } from "../auth/models.js";
+import { isAdmin, type UserInfo } from "../auth/models.js";
 import { MissingPlatformKeyError, stampSessionCredentials } from "../auth/session-credentials.js";
 import { withAdmissionTransaction } from "../tasks/admission.js";
 import { actingTurnRefusalFor } from "../github-review/acting-turns.js";
 import { createAppRun } from "./app-run-create.js";
 import {
-  createSingleTask, expandDag, isCreateRefusal, isTopologyRefusal,
+  createSingleTask, expandDag, isCreateRefusal, isSandboxWorkspaceRefusal, isTopologyRefusal,
   type CreateRefusal, type ExpandResult,
 } from "../tasks/dag-expander.js";
 import { getTask, listTasksByDag } from "../tasks/db.js";
 import { cancelTask, retryTask } from "../tasks/lifecycle.js";
 import { newBatchId } from "../tasks/ids.js";
-import { enrichPluginToolsInline, pluginSandboxImage } from "../marketplace/plugins.js";
+import { canViewPlugin, enrichPluginToolsInline, pluginSandboxImage } from "../marketplace/plugins.js";
 import { publicTaskRow, redactPublicJson } from "../events/redaction.js";
 import type { TaskDagDef } from "../tasks/dags/types.js";
 import type { ClawTaskRow } from "../tasks/types.js";
+import { DELETED_SESSION_TASK_READ_SEC } from "../config.js";
+import { holdPluginForAdmission, PLUGIN_NOT_EXPIRED_SQL } from "../marketplace/plugin-expiry.js";
+import { checkOverrides, hasOverrides, overrideKeys, overridesAudit, type OverrideProblem, type OverrideValues } from "../marketplace/plugin-overrides.js";
 
 /**
  * The sandbox a plugin-less single task should get.
@@ -108,6 +111,10 @@ async function stampCredentialsOr403(
  * the other thing, and gets the status that says so.
  */
 async function sendCreateRefusal(reply: FastifyReply, refusal: CreateRefusal): Promise<void> {
+  if (isSandboxWorkspaceRefusal(refusal)) {
+    await reply.status(400).send(refusal.sandboxWorkspace);
+    return;
+  }
   if (isTopologyRefusal(refusal)) {
     await reply.status(400).send({
       ok: false, error: "invalid_topology", errors: refusal.invalidTopology,
@@ -134,8 +141,22 @@ interface CreateTaskBody {
    * declares it on the template, per node or for all of them.
    */
   workspace_throwaway?: boolean;
+  /**
+   * Run-time overrides of the plugin (marketplace/plugin-overrides.ts): only keys
+   * the plugin declares overridable. A single task takes `image` and `model`; an
+   * app run (`mode: "app"`) takes those, `args` and `env`. Not with `dag_id`.
+   */
+  overrides?: unknown;
 }
 
+/**
+ * Whether the caller may use this session; `"deleted"` when it may only read what
+ * is left of a deleted one.
+ *
+ * `readDeletedSec` admits a session deleted at most that many seconds ago, for a
+ * read and nothing else; the same owner rule applies, read off the row the delete
+ * left in place.
+ */
 async function requireSessionAccess(
   req: FastifyRequest,
   reply: FastifyReply,
@@ -143,11 +164,20 @@ async function requireSessionAccess(
   write: boolean,
   ownerOnly = false,
   startsWork = false,
-): Promise<boolean> {
-  const session = (await db.query(
-    "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
-    [sessionId],
-  )).rows[0] as { user_id?: string | null } | undefined;
+  readDeletedSec = 0,
+): Promise<boolean | "deleted"> {
+  const within = write || startsWork ? 0 : readDeletedSec;
+  const session = (within > 0
+    ? await db.query(
+      `SELECT user_id, deleted_at IS NOT NULL AS deleted FROM claw_sessions
+        WHERE session_id = $1
+          AND (deleted_at IS NULL OR deleted_at > NOW() - ($2::int * INTERVAL '1 second'))`,
+      [sessionId, within],
+    )
+    : await db.query(
+      "SELECT user_id FROM claw_sessions WHERE session_id = $1 AND deleted_at IS NULL",
+      [sessionId],
+    )).rows[0] as { user_id?: string | null; deleted?: boolean } | undefined;
   if (!session) {
     reply.status(404).send({ ok: false, error: "session_not_found" });
     return false;
@@ -169,7 +199,7 @@ async function requireSessionAccess(
     reply.status(403).send({ ok: false, error: unattended });
     return false;
   }
-  return true;
+  return session.deleted ? "deleted" : true;
 }
 
 async function requireTaskAccess(
@@ -189,10 +219,37 @@ async function requireTaskAccess(
   return task;
 }
 
+/**
+ * How a task of a recently deleted session ended, and nothing it carried.
+ *
+ * A session's delete closes its runs (`cancelled`, `session_deleted`) and hides the
+ * session in the same transaction, so before this a caller that deleted a session
+ * with a run in it could never see that run's final state: the task answered 404
+ * from the moment of the delete. The prompt, input, output and the rest stay
+ * behind the delete; what is answered is the outcome.
+ */
+export function deletedSessionTaskView(row: ClawTaskRow): Record<string, unknown> {
+  // Through the same redaction as every other task answer: `error_message` is free text.
+  return redactPublicJson({
+    task_id: row.task_id,
+    session_id: row.session_id,
+    dag_root_task_id: row.dag_root_task_id,
+    mode: row.mode,
+    origin: row.origin,
+    status: row.status,
+    failure_reason: row.failure_reason,
+    error_message: row.error_message,
+    created_at: row.created_at,
+    started_at: row.started_at,
+    completed_at: row.completed_at,
+    session_deleted: true,
+  }) as Record<string, unknown>;
+}
+
 async function loadPluginRow(pluginId: number) {
   const r = await db.query(
-    `SELECT id, name, version, images, resource, tools FROM plugins
-     WHERE id = $1 AND deleted_at IS NULL`,
+    `SELECT id, name, version, images, resource, tools, overridable, owner_user_id, is_public FROM plugins
+     WHERE id = $1 AND deleted_at IS NULL AND ${PLUGIN_NOT_EXPIRED_SQL}`,
     [pluginId],
   );
   if ((r.rowCount ?? 0) === 0) return null;
@@ -235,14 +292,39 @@ type CreateTarget =
   | { dag: TaskDagDef | null; plugin: Awaited<ReturnType<typeof loadPluginRow>> }
   | { status: number; error: string };
 
+/**
+ * The plugin a request names, or null when it is gone (deleted, or past its
+ * expiry) or the caller may not see it. The two are one answer, so a private
+ * plugin's id is not an existence oracle. A plugin a DAG names goes through
+ * `loadDagPlugin` instead.
+ */
+async function loadRequestedPlugin(pluginId: number, user: UserInfo) {
+  const row = await loadPluginRow(pluginId);
+  return row && canViewPlugin(row, user.userId, isAdmin(user)) ? row : null;
+}
+
+/**
+ * The plugin a DAG names, or null when it is gone or its DAG's owner may not
+ * see it: anyone can name a plugin id when writing a DAG, and running the DAG
+ * must not hand them another owner's private plugin.
+ */
+async function loadDagPlugin(pluginId: number, dagOwner: unknown) {
+  const row = await loadPluginRow(pluginId);
+  return row && canViewPlugin(row, typeof dagOwner === "string" ? dagOwner : undefined, false) ? row : null;
+}
+
 async function resolveCreateTarget(body: CreateTaskBody, user: UserInfo): Promise<CreateTarget> {
   let dag = body.dag_id ? await getTaskDag(body.dag_id) : null;
-  let plugin = body.plugin_id ? await loadPluginRow(body.plugin_id) : null;
+  let plugin = body.plugin_id ? await loadRequestedPlugin(body.plugin_id, user) : null;
   if (!dag && plugin?.resource?.task_dag_id) {
     dag = await getTaskDag(plugin.resource.task_dag_id as string);
   }
-  if (dag && !plugin && dag.plugin_id) plugin = await loadPluginRow(dag.plugin_id);
+  if (dag && !plugin && dag.plugin_id) plugin = await loadDagPlugin(dag.plugin_id, dag.owner_user_id);
   if (body.dag_id && !dag) return { status: 404, error: "dag_not_found" };
+  if (dag && dag.plugin_id && !plugin) return { status: 404, error: "plugin_not_found" };
+  // A named plugin that is gone (deleted, or a temporary one past its expiry)
+  // or not the caller's to use is refused rather than run without its tools.
+  if (body.plugin_id && !plugin) return { status: 404, error: "plugin_not_found" };
   if (dag && !canExecuteTaskDag(dag, user)) return { status: 404, error: "dag_not_found" };
   return { dag: (dag as unknown as TaskDagDef | null) ?? null, plugin };
 }
@@ -267,8 +349,38 @@ function expandOptsFor(
   };
 }
 
+/**
+ * A single task's overrides, checked against the plugin it names. A DAG has no
+ * single sandbox or model to override, and a task with no plugin has no
+ * declaration to check against: both refuse any override rather than ignore it.
+ */
+export function checkTaskOverrides(
+  body: Pick<CreateTaskBody, "overrides" | "dag_id">,
+  target: { dag: unknown; plugin: { id: unknown; version?: unknown; images?: unknown; overridable?: unknown } | null },
+): { values: OverrideValues; audit?: Record<string, unknown> } | { problems: OverrideProblem[] } {
+  if (body.overrides === undefined || body.overrides === null) return { values: {} };
+  if (target.dag) return { problems: [{ field: "overrides", reason: "is not supported for a DAG run" }] };
+  if (!target.plugin) return { problems: [{ field: "overrides", reason: "needs a plugin_id: only a plugin declares what may be overridden" }] };
+  const checked = checkOverrides(body.overrides, target.plugin, "task");
+  if (!checked.ok) return { problems: checked.problems };
+  if (!hasOverrides(checked.values)) return { values: {} };
+  return { values: checked.values, audit: overridesAudit(checked.values, target.plugin) };
+}
+
+/** The single-task sandbox spec with a checked image override applied; a task the plugin gives no sandbox gets one for the image. */
+export function withImageOverride(
+  spec: Awaited<ReturnType<typeof singleTaskSandboxSpec>>,
+  plugin: { resource?: unknown } | null,
+  image: string | undefined,
+): Awaited<ReturnType<typeof singleTaskSandboxSpec>> {
+  if (image === undefined) return spec;
+  if (spec === "none") return { handle: "main", image, resources: plugin?.resource };
+  return { ...spec, image };
+}
+
 /** What a partially admitted batch reports about the run it stopped on. */
 function refusalReason(refusal: CreateRefusal): string {
+  if (isSandboxWorkspaceRefusal(refusal)) return refusal.sandboxWorkspace.error;
   return isTopologyRefusal(refusal) ? "invalid_topology" : refusal.reason;
 }
 
@@ -297,11 +409,22 @@ export async function registerTaskCreateRoute(app: FastifyInstance): Promise<voi
 
       const target = await resolveCreateTarget(body, user);
       if ("status" in target) return reply.status(target.status).send({ ok: false, error: target.error });
+      const overrides = checkTaskOverrides(body, target);
+      if ("problems" in overrides) {
+        return reply.status(400).send({ ok: false, error: "plugin_overrides_invalid", problems: overrides.problems });
+      }
       // Outside the transaction: a marketplace lookup is not a decision, and
       // holding the admission lock across it would serialise the fleet on it.
-      const sandboxSpec = target.dag ? undefined : await singleTaskSandboxSpec(target.plugin);
+      const sandboxSpec = target.dag
+        ? undefined
+        : withImageOverride(await singleTaskSandboxSpec(target.plugin), target.plugin, overrides.values.image);
 
       return await withAdmissionTransaction<unknown>(async (client) => {
+        // Held until commit, so the expiry sweep cannot delete it under these tasks.
+        if (target.plugin && !(await holdPluginForAdmission(client, target.plugin.id))) {
+          await reply.status(404).send({ ok: false, error: "plugin_not_found" });
+          return { commit: false, value: reply };
+        }
         // Record the caller's own credentials before anything is queued: a task
         // is dispatched long after this request has gone, and the session row is
         // the only thing that carries the submitter that far. Rolled back with
@@ -322,12 +445,21 @@ export async function registerTaskCreateRoute(app: FastifyInstance): Promise<voi
             mode: "llm",
             workspace_throwaway: body.workspace_throwaway === true,
             sandbox_spec: sandboxSpec,
+            ...(overrides.values.model ? { model: overrides.values.model } : {}),
+            ...(overrides.audit ? { metadata: { plugin_overrides: overrides.audit } } : {}),
           }, client);
         if (isCreateRefusal(created)) {
           await sendCreateRefusal(reply, created);
           return { commit: false, value: reply };
         }
         if ("task_id" in created) {
+          // Keys only: a value can be anything the plugin let the caller set.
+          if (overrides.audit) {
+            logger.info(
+              { sessionId, taskId: created.task_id, pluginId: body.plugin_id, userId: user.userId, keys: overrideKeys(overrides.values) },
+              "plugin_overrides.applied",
+            );
+          }
           return { commit: true, value: { ok: true, task_id: created.task_id } };
         }
         logger.info(
@@ -364,12 +496,17 @@ export async function registerBatchRoute(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ ok: false, error: "dag_not_found" });
     }
     const plugin = body.plugin_id
-      ? await loadPluginRow(body.plugin_id)
-      : (dag.plugin_id ? await loadPluginRow(dag.plugin_id) : null);
+      ? await loadRequestedPlugin(body.plugin_id, user)
+      : (dag.plugin_id ? await loadDagPlugin(dag.plugin_id, dag.owner_user_id) : null);
+    if ((body.plugin_id || dag.plugin_id) && !plugin) return reply.status(404).send({ ok: false, error: "plugin_not_found" });
 
     const batchId = newBatchId();
     try {
       return await withAdmissionTransaction<unknown>(async (client) => {
+        if (plugin && !(await holdPluginForAdmission(client, plugin.id))) {
+          await reply.status(404).send({ ok: false, error: "plugin_not_found" });
+          return { commit: false, value: reply };
+        }
         const outcome = await submitBatch(client, {
           user, sessionId: body.session_id!, dagId: body.dag_id!, dag: dag as unknown as TaskDagDef,
           plugin, inputs: body.inputs!, batchId,
@@ -466,9 +603,13 @@ export async function registerTaskReadRoutes(app: FastifyInstance): Promise<void
   app.get<{ Params: { taskId: string } }>(
     "/v1/tasks/:taskId",
     async (req, reply) => {
-      const row = await requireTaskAccess(req, reply, req.params.taskId, false);
-      if (!row) return reply;
-      return { ok: true, item: publicTaskRow(row) };
+      const task = await getTask(req.params.taskId);
+      if (!task) return reply.status(404).send({ ok: false, error: "not_found" });
+      const access = await requireSessionAccess(
+        req, reply, task.session_id, false, false, false, DELETED_SESSION_TASK_READ_SEC,
+      );
+      if (!access) return reply;
+      return { ok: true, item: access === "deleted" ? deletedSessionTaskView(task) : publicTaskRow(task) };
     },
   );
 

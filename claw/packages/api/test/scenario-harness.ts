@@ -58,6 +58,9 @@ CREATE TABLE claw_sessions (
   agent_status   TEXT DEFAULT 'idle',
   agent_gate_message_id TEXT,
   pending_drain_until TIMESTAMPTZ,
+  workspace_save_id TEXT,
+  workspace_save_until TIMESTAMPTZ,
+  workspace_save_task_id TEXT,
   status         TEXT DEFAULT 'active',
   -- The create route's INSERT names every one of these, so a scenario that
   -- drives it against a narrower table fails on the column rather than on the
@@ -108,6 +111,8 @@ CREATE TABLE claw_session_events (
   -- exercises nothing at all. (No backticks here: this whole schema is a
   -- template literal.)
   processed_at TIMESTAMPTZ,
+  -- Read beside processed_at by the same statement.
+  run_notification_owed JSONB,
   deleted_at   TIMESTAMPTZ,
   created_at  TIMESTAMPTZ DEFAULT NOW()
 );
@@ -198,6 +203,22 @@ CREATE TABLE resources (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   deleted_at    TIMESTAMPTZ
+);
+
+-- Locked (FOR SHARE) by a queued message that names a plugin, so the expiry
+-- sweep cannot race the insert (marketplace/plugin-expiry.ts). Only what that
+-- lock and the sweep read.
+CREATE TABLE plugins (
+  id            BIGSERIAL PRIMARY KEY,
+  name          VARCHAR(255) NOT NULL DEFAULT '',
+  version       VARCHAR(255) NOT NULL DEFAULT '',
+  owner_user_id VARCHAR(255),
+  is_public     BOOLEAN NOT NULL DEFAULT true,
+  status        VARCHAR(50) NOT NULL DEFAULT 'active',
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at    TIMESTAMPTZ,
+  expires_at    TIMESTAMPTZ
 );
 
 -- Read by injectLiveUserEnv on every claim: the vault is re-read at claim

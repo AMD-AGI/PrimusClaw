@@ -184,6 +184,54 @@ describe("mode=app task creation", { skip }, () => {
     assert.notEqual(a.json().task_id, b.json().task_id);
   });
 
+  describe("SANDBOX_ALLOWED_NAMESPACES", () => {
+    /** Run `fn` with the list set to `value`, and put the process's own back. */
+    const withList = async (value: string, fn: () => Promise<void>) => {
+      const saved = process.env.SANDBOX_ALLOWED_NAMESPACES;
+      process.env.SANDBOX_ALLOWED_NAMESPACES = value;
+      try { await fn(); } finally {
+        if (saved === undefined) delete process.env.SANDBOX_ALLOWED_NAMESPACES;
+        else process.env.SANDBOX_ALLOWED_NAMESPACES = saved;
+      }
+    };
+    const assertRefused = async (res: { statusCode: number; json: () => any; body: string }, workspace: string) => {
+      assert.equal(res.statusCode, 400, res.body);
+      assert.equal(res.json().error, "sandbox_workspace_not_allowed");
+      assert.equal(res.json().workspace, workspace);
+      assert.match(res.json().message, new RegExp(`${workspace} workspace is not one of them`));
+      assert.deepEqual(await counts(), { tasks: 0, runs: 0 }, "a refused run wrote something");
+      assert.deepEqual(asked, [], "a refused run still asked SaFE about its workspaces");
+    };
+
+    test("a run whose workspace is on the list is admitted", async () => {
+      await withList("ws-ok", async () => {
+        const res = await create("s1");
+        assert.equal(res.statusCode, 200, res.body);
+        assert.deepEqual(await counts(), { tasks: 1, runs: 1 });
+      });
+    });
+
+    test("a run whose app container's workspace is off the list is refused 400 before anything is written", async () => {
+      await withList("ws-elsewhere", async () => assertRefused(await create("s1"), "ws-ok"));
+    });
+
+    test("a run whose grant workspace (sandbox_workspace) is off the list is refused", async () => {
+      await withList("ws-ok", async () =>
+        assertRefused(await create("s1", { resources: { ...GOOD_RES, sandbox_workspace: "ws-grant" } }), "ws-grant"));
+    });
+
+    test("a run whose sandbox template names a workspace off the list is refused", async () => {
+      const manifest = { ...MANIFEST, sandbox_templates: [{ ...MANIFEST.sandbox_templates[0], workspace: "ws-tmpl" }] };
+      assert.deepEqual(validateAppManifest(manifest), [], "the fixture must be a valid manifest, or the refusal is vacuous");
+      const plugin = Number(((await q(
+        `INSERT INTO plugins (name, version, resource, owner_user_id, is_public)
+         VALUES ('tmpl-ws', '1', $1::jsonb, 'u1', true) RETURNING id`,
+        [JSON.stringify({ app: { manifest } })],
+      )).rows[0] as { id: string }).id);
+      await withList("ws-ok", async () => assertRefused(await create("s1", { plugin_id: plugin }), "ws-tmpl"));
+    });
+  });
+
   describe("idempotency", () => {
     test("the same key returns the same run and writes nothing more", async () => {
       const a = await create("s1", {}, { "idempotency-key": "key-1" });

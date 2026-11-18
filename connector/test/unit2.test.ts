@@ -4,7 +4,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import test, { describe } from "node:test";
 import { ChildRegistry, processStart } from "../src/children.js";
@@ -17,68 +16,103 @@ import { DROPPABLE_TYPES, Outbox, TOMBSTONE_MS } from "../src/outbox.js";
 import { PermissionBook, boundedInput, matchAutoAllow, normalizeOptions } from "../src/permissions.js";
 import { CommandLedger } from "../src/connector.js";
 import { SessionStore } from "../src/session-store.js";
+import { SnapshotFile, within } from "../src/statefile.js";
 import { UrlError, sleep } from "../src/util.js";
 import { FakeIdentity } from "./support/fake-identity.js";
+import { tmpdir } from "./support/tmp.js";
 
-const tmp = (p = "cc-") => fs.mkdtempSync(path.join(os.tmpdir(), p));
+const tmp = tmpdir;
 const SID = "11111111-1111-4111-8111-111111111111";
 const SID2 = "22222222-2222-4222-8222-222222222222";
 
-describe("outbox", () => {
-  test("sequence numbers continue across a restart, and unacknowledged events survive it", () => {
+describe("outbox", async () => {
+  test("sequence numbers continue across a restart, and unacknowledged events survive it", async () => {
     const dir = tmp();
     const a = new Outbox({ dir });
     assert.deepEqual([1, 2, 3].map(() => a.append(SID, "agent_message_chunk", { n: 1 }).seq), [1, 2, 3]);
     a.ack({ [SID]: 2 });
+    await a.flush();
     const b = new Outbox({ dir });
     assert.deepEqual(b.pending(10).map((e) => e.seq), [3]);
     assert.equal(b.append(SID, "turn_end", {}).seq, 4, "the next number is never one that was already used");
   });
-  test("a restart with nothing acknowledged yet (a crash) does not reuse a number either", () => {
+  test("after a restart each session's events go in their own order, whatever time each carries (a transcript entry's own time)", async () => {
+    const dir = tmp();
+    const a = new Outbox({ dir });
+    // (session 1: a step dated before the event in front of it; session 2 in between)
+    a.append(SID, "session_started", {}, 5_000);
+    a.append(SID2, "x", {}, 6_000);
+    a.append(SID, "tool_call", {}, 7_000);
+    a.append(SID, "tool_call_update", {}, 4_000);
+    a.append(SID, "agent_message_chunk", {}, 8_000);
+    await a.flush();
+    const b = new Outbox({ dir });
+    const order = b.pending(10).map((e) => [e.session_id === SID ? 1 : 2, e.seq]);
+    assert.deepEqual(order.filter(([s]) => s === 1).map(([, n]) => n), [1, 2, 3, 4]);
+    assert.deepEqual(order, [[1, 1], [2, 1], [1, 2], [1, 3], [1, 4]]);
+    // (sent in batches of two, acknowledged by the highest number stored: nothing is acknowledged before it was sent)
+    const sent: number[] = [];
+    for (let batch = b.pending(2); batch.length > 0; batch = b.pending(2)) {
+      for (const e of batch) if (e.session_id === SID) sent.push(e.seq);
+      const top: Record<string, number> = {};
+      for (const e of batch) top[e.session_id] = Math.max(top[e.session_id] ?? 0, e.seq);
+      b.ack(top);
+    }
+    assert.deepEqual(sent, [1, 2, 3, 4]);
+  });
+  test("a restart with nothing acknowledged yet (a crash) does not reuse a number either", async () => {
     const dir = tmp();
     const a = new Outbox({ dir });
     for (let i = 0; i < 3; i++) a.append(SID, "x", {});
+    await a.flush();
     const b = new Outbox({ dir });
     assert.deepEqual(b.pending(10).map((e) => e.seq), [1, 2, 3]);
     assert.equal(b.append(SID, "x", {}).seq, 4);
   });
-  test("a restart after everything was acknowledged still does not reuse a number", () => {
+  test("a restart after everything was acknowledged still does not reuse a number", async () => {
     const dir = tmp();
     const a = new Outbox({ dir });
     for (let i = 0; i < 5; i++) a.append(SID, "x", {});
     a.ack({ [SID]: 5 });
+    await a.flush();
     assert.equal(new Outbox({ dir }).append(SID, "x", {}).seq, 6);
   });
-  test("a crash that left a torn last line loses only that line", () => {
+  test("a crash that left a torn last line loses only that line", async () => {
     const dir = tmp();
     const a = new Outbox({ dir });
     a.append(SID, "x", {});
+    await a.flush();
     fs.appendFileSync(path.join(dir, `${SID}.jsonl`), '{"session_id":"x","seq":');
+    await a.flush();
     const b = new Outbox({ dir });
     assert.deepEqual(b.pending(10).map((e) => e.seq), [1]);
     assert.equal(b.append(SID, "x", {}).seq, 2);
   });
-  test("pending is in append order across sessions; ack is per session; an acknowledgement below an event keeps it", () => {
+  test("pending is in append order across sessions; ack is per session; an acknowledgement below an event keeps it", async () => {
     const o = new Outbox({ dir: tmp() });
     o.append(SID, "x", {}); o.append(SID2, "x", {}); o.append(SID, "x", {});
+    assert.deepEqual(o.pending(10), [], "none is handed out before its line is written");
+    await o.flush();
     assert.deepEqual(o.pending(2).map((e) => [e.session_id === SID ? 1 : 2, e.seq]), [[1, 1], [2, 1]]);
     o.ack({ [SID]: 1 });
     assert.deepEqual(o.pending(10).map((e) => [e.session_id === SID ? 1 : 2, e.seq]), [[2, 1], [1, 2]]);
     o.ack({ [SID2]: 0 });
     assert.equal(o.size, 2);
   });
-  test("a refused event is dropped and does not come back after a restart", () => {
+  test("a refused event is dropped and does not come back after a restart", async () => {
     const dir = tmp();
     const o = new Outbox({ dir });
     o.append(SID, "x", {}); o.append(SID, "x", {});
     o.drop(SID, 1);
+    await o.flush();
     assert.deepEqual(new Outbox({ dir }).pending(10).map((e) => e.seq), [2]);
   });
-  test("over its cap a session sheds only streaming events, never a permission request or a turn end", () => {
+  test("over its cap a session sheds only streaming events, never a permission request or a turn end", async () => {
     const o = new Outbox({ dir: tmp(), maxBytesPerSession: 4000 });
     o.append(SID, "permissionRequest", { actionId: "a", pad: "p".repeat(500) });
     for (let i = 0; i < 40; i++) o.append(SID, "agent_message_chunk", { text: "t".repeat(300) });
     o.append(SID, "turn_end", { stopReason: "end_turn" });
+    await o.flush();
     const kept = o.pending(1000).map((e) => e.type);
     assert.ok(kept.includes("permissionRequest") && kept.includes("turn_end"));
     assert.ok(kept.filter((t) => t === "agent_message_chunk").length < 40, "some chunks were shed");
@@ -88,42 +122,60 @@ describe("outbox", () => {
     for (let i = 0; i < 10; i++) p.append(SID, "permissionRequest", { actionId: String(i), pad: "p".repeat(300) });
     assert.equal(p.size, 10);
   });
-  test("shedding does not lose the high-water mark: an event shed right after it was written does not let its number come back after a restart", () => {
+  test("shedding does not lose the high-water mark: an event shed right after it was written does not let its number come back after a restart", async () => {
     const dir = tmp();
     const o = new Outbox({ dir, maxBytesPerSession: 600 });
     assert.equal(o.append(SID, "permissionRequest", { actionId: "a" }).seq, 1);
     assert.equal(o.append(SID, "agent_message_chunk", { text: "t".repeat(1000) }).seq, 2); // over the cap by itself: shed at once
+    await o.flush();
     assert.deepEqual(o.pending(10).map((e) => e.seq), [1]);
     // The log no longer holds a line numbered 2; only the saved high-water mark remembers it.
+    await o.flush();
     assert.equal(new Outbox({ dir }).append(SID, "x", {}).seq, 3);
   });
-  test("a refused event that was the newest does not let its number come back", () => {
+  test("a refused event that was the newest does not let its number come back", async () => {
     const dir = tmp();
     const o = new Outbox({ dir });
     o.append(SID, "x", {}); o.append(SID, "x", {});
     o.drop(SID, 2);
+    await o.flush();
     assert.equal(new Outbox({ dir }).append(SID, "x", {}).seq, 3);
   });
-  test("an event over the size limit keeps its type and says what happened", () => {
+  test("an event over the size limit keeps its type and says what happened", async () => {
     const o = new Outbox({ dir: tmp() });
     const ev = o.append(SID, "tool_call_update", { text: "z".repeat(70_000) });
     assert.deepEqual(ev.data, { truncated: true, original_bytes: 70_000 + '{"text":""}'.length });
   });
-  test("a closed session's events go once acknowledged, but its number is remembered: a later event for it continues the sequence", () => {
+  test("a closed session's events go once acknowledged, but its number is remembered: a later event for it continues the sequence", async () => {
     const dir = tmp();
     const o = new Outbox({ dir });
     o.append(SID, "turn_end", {});
     o.append(SID, "session_closed", {});
     o.markClosed(SID);
     o.ack({ [SID]: 2 });
+    await o.flush();
     assert.deepEqual(fs.readdirSync(dir), [`${SID}.meta.json`], "only the small tombstone is left");
     assert.equal(o.append(SID, "session_closed", { reason: "unknown_session" }).seq, 3, "not 1: the server would drop it as a duplicate");
+    await o.flush();
     assert.equal(new Outbox({ dir }).append(SID, "x", {}).seq, 4, "and the same after a restart");
   });
-  test("a tombstone is forgotten after thirty days, not before", () => {
+  test("an event appended after a record it depends on is written and handed out only once that record has settled", async () => {
+    const o = new Outbox({ dir: tmp() });
+    let release!: () => void;
+    const record = new Promise<void>((r) => { release = r; });
+    o.append(SID, "permissionRequest", { actionId: "a" }, undefined, record);
+    o.append(SID, "agent_message_chunk", { text: "after it" });
+    await sleep(50);
+    assert.deepEqual(o.pending(10), [], "neither goes before the record is on disk (they stay in order)");
+    release();
+    await o.flush();
+    assert.deepEqual(o.pending(10).map((e) => e.type), ["permissionRequest", "agent_message_chunk"]);
+  });
+  test("a tombstone is forgotten after thirty days, not before", async () => {
     const dir = tmp();
     const o = new Outbox({ dir });
     for (const id of [SID, SID2]) { o.append(id, "session_closed", {}); o.markClosed(id); o.ack({ [id]: 1 }); }
+    await o.flush();
     const old = (Date.now() - TOMBSTONE_MS - 60_000) / 1000;
     fs.utimesSync(path.join(dir, `${SID}.meta.json`), old, old);
     const again = new Outbox({ dir });
@@ -131,6 +183,157 @@ describe("outbox", () => {
     assert.equal(again.append(SID2, "x", {}).seq, 2, "the recent one is kept");
   });
 
+});
+
+describe("state files written off the event loop", () => {
+  test("asked after a failed write with nothing saved since, settled() writes again instead of waiting forever", async () => {
+    const dir = tmp();
+    const file = path.join(dir, "x.json");
+    fs.mkdirSync(`${file}.tmp`); // the temporary file cannot be written: the write fails
+    const f = new SnapshotFile(file);
+    f.save("one");
+    assert.equal(await within(f.settled(1_000), 2_000, null), false, "the write failed");
+    assert.equal(await within(f.settled(Infinity), 2_000, null), false, "asked again while the disk still fails: false, not a hang");
+    fs.rmdirSync(`${file}.tmp`);
+    assert.equal(await within(f.settled(Infinity), 2_000, null), true, "the disk answers again: the newest content is written");
+    assert.equal(fs.readFileSync(file, "utf8"), "one");
+  });
+  test("a failed write is tried again on its own, with nothing saved since and nobody asking (children.json at a quota)", async () => {
+    const dir = tmpdir();
+    const file = path.join(dir, "children.json");
+    fs.mkdirSync(`${file}.tmp`); // the temporary file cannot be written: the write fails, as with EDQUOT
+    const reports: string[] = [];
+    const f = new SnapshotFile(file, (what, info) => { if (info.error) reports.push(what); });
+    f.save("[1]");
+    assert.equal(await within(f.settled(500), 1_500, null), false, "the write failed");
+    fs.rmdirSync(`${file}.tmp`); // room again
+    const deadline = Date.now() + 5_000;
+    while (!fs.existsSync(file) && Date.now() < deadline) await sleep(50);
+    assert.equal(fs.existsSync(file) && fs.readFileSync(file, "utf8"), "[1]", "written by the retry, without another save or settled()");
+    assert.ok(reports.length >= 1);
+  });
+  test("a save and a settled() made while a retry checks the directory are written and answered at once, even when the directory is gone", async () => {
+    const dir = tmpdir();
+    const state = path.join(dir, "state");
+    fs.mkdirSync(state);
+    const file = path.join(state, "sessions.json");
+    fs.mkdirSync(`${file}.tmp`); // the first write fails
+    let checks = 0;
+    let answer: ((e?: NodeJS.ErrnoException) => void) | null = null;
+    // The retry's directory check stays pending until the test answers it.
+    const f = new SnapshotFile(file, undefined, false, () => { checks += 1; return new Promise<void>((resolve, reject) => { answer = (e) => (e ? reject(e) : resolve()); }); });
+    f.save("[1]");
+    assert.equal(await within(f.settled(500), 1_500, null), false, "the write failed");
+    const deadline = Date.now() + 5_000;
+    while (checks === 0 && Date.now() < deadline) await sleep(20);
+    assert.equal(checks, 1, "the retry is checking the directory");
+    fs.rmSync(state, { recursive: true, force: true }); // and the directory is gone
+    f.save("[2]");
+    assert.equal(await within(f.settled(Infinity), 2_000, null), true, "answered while the check is still pending");
+    assert.equal(fs.readFileSync(file, "utf8"), "[2]", "the newer content is written (its directory made again)");
+    answer!(Object.assign(new Error("gone"), { code: "ENOENT" }));
+    await sleep(50);
+    assert.equal(fs.readFileSync(file, "utf8"), "[2]");
+  });
+  test("content equal to what is on disk is not written again; newer content is, and so is the content of a write that failed", async () => {
+    const file = path.join(tmpdir(), "connector.json");
+    const f = new SnapshotFile(file, undefined, true);
+    f.save("a");
+    f.save("a"); // while the first write is under way
+    assert.equal(await f.settled(), true);
+    // A second link to the inode written: a rewrite (a new file renamed over this one) would leave it the only one.
+    const seen = `${file}.seen`;
+    fs.linkSync(file, seen);
+    for (let i = 0; i < 5; i++) f.save("a");
+    assert.equal(await f.settled(), true);
+    assert.equal(fs.statSync(seen).nlink, 2, "the same content is not written again");
+    f.save("b");
+    assert.equal(await f.settled(), true);
+    assert.equal(fs.readFileSync(file, "utf8"), "b");
+    fs.mkdirSync(`${file}.tmp`); // the next write fails
+    f.save("c");
+    assert.equal(await f.settled(500), false);
+    fs.rmdirSync(`${file}.tmp`);
+    f.save("c");
+    assert.equal(await f.settled(), true, "a failed write's content is written by the next save of it");
+    assert.equal(fs.readFileSync(file, "utf8"), "c");
+    f.close();
+  });
+  test("touch() stamps the time of a file that is on disk without writing it, and does not make one that is gone", async () => {
+    const dir = tmpdir();
+    const file = path.join(dir, "connector.json");
+    const f = new SnapshotFile(file, undefined, true);
+    f.touch(); // nothing saved yet: nothing to stamp
+    assert.equal(fs.existsSync(file), false);
+    f.save("a");
+    assert.equal(await f.settled(), true);
+    const seen = `${file}.seen`;
+    fs.linkSync(file, seen);
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(file, old, old);
+    f.touch();
+    const deadline = Date.now() + 5_000;
+    while (Date.now() - fs.statSync(seen).mtimeMs > 60_000 && Date.now() < deadline) await sleep(20);
+    assert.ok(Date.now() - fs.statSync(seen).mtimeMs < 60_000, "stamped now");
+    assert.equal(fs.statSync(seen).nlink, 2, "not written again");
+    fs.rmSync(file);
+    fs.rmSync(seen);
+    f.touch();
+    await sleep(100);
+    assert.equal(fs.existsSync(file), false, "a file that is gone is not made again");
+    f.close();
+  });
+  test("a touch() asked while a write or another stamp is under way is done once that is over, not dropped", async () => {
+    const file = path.join(tmpdir(), "connector.json");
+    const stamps: Array<() => void> = [];
+    const f = new SnapshotFile(file, undefined, true, undefined, () => new Promise<void>((resolve) => { stamps.push(resolve); }));
+    const until = async (what: string, ok: () => boolean) => {
+      const deadline = Date.now() + 5_000;
+      while (!ok() && Date.now() < deadline) await sleep(10);
+      assert.ok(ok(), what);
+    };
+    f.save("a");
+    f.touch(); // the write is under way: its data may be older than this heartbeat
+    assert.equal(stamps.length, 0);
+    assert.equal(await f.settled(), true);
+    await until("stamped once the write is over", () => stamps.length === 1);
+    f.touch(); // that stamp is still under way
+    f.touch();
+    await sleep(50);
+    assert.equal(stamps.length, 1, "one stamp at a time");
+    stamps[0]!();
+    await until("stamped again once the first stamp is over", () => stamps.length === 2);
+    stamps[1]!();
+    await sleep(50);
+    assert.equal(stamps.length, 2, "the two asked meanwhile are one stamp");
+    f.close();
+  });
+  test("one failed write of sessions.json.pending does not hold back every later event (written() settles)", async () => {
+    const dir = tmp();
+    const file = path.join(dir, "sessions.json");
+    fs.mkdirSync(`${file}.pending.tmp`);
+    const store = new SessionStore(file);
+    store.addPending(SID, "a1");
+    assert.equal(await within(store.flushed(1_000), 2_000, null), false, "the pending list could not be written");
+    fs.rmdirSync(`${file}.pending.tmp`);
+    store.put(SID, { agent_id: "fake", acp_session_id: null, cwd: dir, status: "active", mode: null, created_at: "" });
+    assert.equal(await within<boolean | null>(store.written(), 3_000, null), true, "written() settles once the disk answers");
+    assert.deepEqual(JSON.parse(fs.readFileSync(`${file}.pending`, "utf8")), [{ session_id: SID, action_id: "a1" }]);
+  });
+  test("an outbox event that waits on a record whose write failed is still written and handed out", async () => {
+    const dir = tmp();
+    const file = path.join(dir, "sessions.json");
+    fs.mkdirSync(`${file}.tmp`);
+    const store = new SessionStore(file);
+    store.put(SID, { agent_id: "fake", acp_session_id: null, cwd: dir, status: "active", mode: null, created_at: "" });
+    assert.equal(await within(store.flushed(1_000), 2_000, null), false);
+    fs.rmdirSync(`${file}.tmp`);
+    store.addPending(SID, "a1");
+    const o = new Outbox({ dir: path.join(dir, "outbox") });
+    o.append(SID, "permissionRequest", { actionId: "a1" }, undefined, store.written());
+    assert.equal(await within(o.flush().then(() => true), 3_000, false), true, "the outbox is not stuck behind the failed write");
+    assert.deepEqual(o.pending(10).map((e) => e.type), ["permissionRequest"]);
+  });
 });
 
 describe("permission book", () => {
@@ -238,13 +441,15 @@ describe("Claw client credentials", () => {
 });
 
 describe("session store: permission requests nobody answered", () => {
-  test("kept until answered, handed back once after a crash", () => {
+  test("kept until answered, handed back once after a crash", async () => {
     const file = path.join(tmp(), "sessions.json");
     const a = new SessionStore(file);
     a.addPending("s1", "a1"); a.addPending("s1", "a2"); a.addPending("s2", "b1");
     a.removePending("s1", "a1");
+    assert.equal(await a.flushed(), true);
     const b = new SessionStore(file);
     assert.deepEqual(b.takePending(), [{ session_id: "s1", action_id: "a2" }, { session_id: "s2", action_id: "b1" }]);
+    assert.equal(await b.flushed(), true);
     assert.deepEqual(new SessionStore(file).takePending(), [], "forgotten once handed back");
   });
 });
@@ -275,11 +480,12 @@ describe("command ledger", () => {
 });
 
 describe("audit log", () => {
-  test("one JSON object per line, appended 0600; a detail field can never overwrite what the record is; secrets in details are masked", () => {
+  test("one JSON object per line, appended 0600; a detail field can never overwrite what the record is; secrets in details are masked", async () => {
     const file = path.join(tmp(), "state", "audit.jsonl");
     const a = fileAudit(file, () => 1_700_000_000_000);
     a.record("auto_allow", { kind: "edit", note: "Bearer abcdefghijklmnopqrstuvwxyz0123" });
     a.record("second");
+    await a.flush?.();
     const lines = fs.readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
     assert.deepEqual(lines.map((l) => l.kind), ["auto_allow", "second"]);
     assert.equal(lines[0].ts, "2023-11-14T22:13:20.000Z");

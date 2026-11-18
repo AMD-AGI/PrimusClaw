@@ -41,3 +41,22 @@ test("email is carried when it is a non-empty string and the key is absent other
     await up.close();
   }
 });
+
+test("a SaFE that answers 5xx or 2xx-not-JSON is not remembered as a refusal: the next call reaches SaFE again", async () => {
+  let n = 0;
+  const up = await startFakeUpstream((_req, res) => {
+    n++;
+    if (n === 1) return sendJson(res, 503, { error: "restarting" });
+    if (n === 2) { res.writeHead(200, { "content-type": "text/html" }); res.end("<html>a proxy page</html>"); return; }
+    sendJson(res, 200, { id: "u-1", name: "One", roles: ["default"], virtualKey: "vk", platformKey: "pk" });
+  });
+  try {
+    const client = new SafeClient(up.url);
+    await assert.rejects(client.verifyApiKey("ak-good"), { name: "SafeUpstreamHttpError" });
+    await assert.rejects(client.verifyApiKey("ak-good"), { name: "SafeUpstreamProtocolError" });
+    assert.equal((await client.verifyApiKey("ak-good")).userId, "u-1");
+    assert.equal(n, 3);
+  } finally {
+    await up.close();
+  }
+});

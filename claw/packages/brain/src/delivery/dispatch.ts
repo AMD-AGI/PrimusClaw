@@ -227,6 +227,19 @@ async function preGateLease(
 ): Promise<Extract<Acceptance, { kind: "held" }> | null> {
   const acceptance = await deps.fatPreGate!.accept(target);
   if (acceptance.kind === "gone") {
+    // The row's ending is decided, so nothing runs. A turn that ended before its
+    // workspace save finished -- this delivery is that run back after its Brain
+    // was lost -- still owes the save's finish, which is what lets the session's
+    // next message out of the API's queue.
+    // Retried on a failure to say so: acked, nothing would say it again before
+    // the hold's time bound.
+    try {
+      await deps.onRowGone?.(target);
+    } catch (err) {
+      deps.onError(err);
+      msg.nak(5_000);
+      return null;
+    }
     msg.ack();
     return null;
   }
@@ -366,6 +379,11 @@ export interface DeliveryDeps {
   isDraining(): boolean;
   handle(msg: JsMsg): Promise<void>;
   onError(err: unknown): void;
+  /**
+   * A fat delivery whose row was already terminal, just before it is acked
+   * unrun. Optional so tests can omit it.
+   */
+  onRowGone?(request: ExecuteRequest): Promise<void>;
   /** A delivery this pod is not going to run. Optional so tests can omit it. */
   onRefuse?(kind: "surplus" | "drain"): void;
   /**

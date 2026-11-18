@@ -4,10 +4,12 @@
 nameOverride: ""
 fullnameOverride: primus-claw
 
+# Released images: docker.io/rocm/primusclaw:claw-<version>, claw-latest the newest. A build of main is
+# docker.io/primussafe/claw:<build> (--set image.registry=docker.io/primussafe,image.repository=claw,image.tag=<build>).
 image:
-  registry: docker.io/primussafe
-  repository: claw
-  tag: latest
+  registry: docker.io/rocm
+  repository: primusclaw
+  tag: claw-latest
   pullPolicy: IfNotPresent
 
 tls:
@@ -61,6 +63,12 @@ api:
   # claw/docs/platform-access.md before turning this on.
   requiredPlatformRoles: []
   port: 8200
+  # How an api pod leaves a rolling update (see api-deployment.yaml): it sleeps
+  # in preStop while it leaves the endpoints, then drains its requests and
+  # event streams for up to SHUTDOWN_DEADLINE_MS (75s). The grace period has to
+  # hold both.
+  terminationGracePeriodSeconds: 90
+  preStopSleepSeconds: 10
   # Where a client outside the cluster reaches the API, as CLAW_PUBLIC_URL --
   # "https://claw.example.com/claw-api". A2A agent cards advertise it, and the
   # ingress strips its path prefix before the API sees the request, so without
@@ -257,6 +265,12 @@ brain:
   # "false" to open one for every run, which is the switch to reach for if a
   # sandbox-dependent path turns out to have been missed.
   lazySandbox: "true"
+  # With lazySandbox on: a run the API marks as one that will use its sandbox
+  # (an assistant's worker turn) starts opening it when the run starts, beside
+  # the first model call, instead of on the first tool call. A run that never
+  # uses it gives it back at its end like any other. "false" opens every such
+  # sandbox on the first tool call again.
+  sandboxPrestart: "true"
   # Tag workspace objects with origin=workspace as they are uploaded, which is
   # what the bucket's lifecycle rules select on. An escape hatch rather than a
   # rollout gate: the tag rides on the presigned URL and needs nothing from the
@@ -454,21 +468,28 @@ secret:
   safeDefaultWorkspace: default
   sandboxWorkloadPriority: "0"
   sandboxDefaultTimeoutSeconds: "86400"
-  # Max time a sandbox may stay Pending/Creating before the message fails with
-  # reason sandbox_pending_timeout. 0 = wait forever. Default 3h.
+  # Max time a sandbox may wait for capacity -- Pending/Creating in the queue, a node being
+  # added for it, or an autoscaler that says capacity can come (an account at its per-user
+  # limit, a node being given back) -- before the message fails with reason
+  # sandbox_pending_timeout. 0 = wait forever. Default 3h.
   sandboxPendingTimeoutSeconds: "10800"
+  # How much of a request's own timeout is kept for the run: a request that names a timeout
+  # waits for capacity at most that timeout less this (and half of a timeout shorter than
+  # twice this), never past the ceiling above. Default 1h.
+  sandboxMinRunSeconds: "3600"
   # Max time a scheduled sandbox may stay not-ready (image pull, container start)
   # before the message fails with reason sandbox_start_timeout. 0 = wait forever. Default 15m.
   sandboxStartTimeoutSeconds: "900"
-  # Max time a sandbox the platform has admitted may sit with no node having taken its pod and
-  # no node being added for it (every node cordoned, down or tainted) before the message fails
+  # Max time a sandbox the platform has admitted may sit with no node having taken its pod,
+  # no node being added for it and no capacity coming for it (every node cordoned, down or
+  # tainted, no pool that serves it, a request no node fits) before the message fails
   # with reason sandbox_unschedulable, the workload is stopped, and the model is told to report it
   # rather than open another. The platform's "0/N nodes are available" or "didn't trigger
   # scale-up" text is why it is stuck, not progress; a scale-up it reports as triggered (and
   # stays in force until the autoscaler says it will not add a node), or a
   # message that keeps changing, restarts the clock. Not applied to a sandbox still in the
-  # platform's queue or one with a scale-up under way (the Pending ceiling above, or the start
-  # ceiling once NotReady), or to one that is starting (the start ceiling). Raise it, or 0 = off,
+  # platform's queue, one with a scale-up under way, or one the autoscaler says capacity can
+  # come for (the capacity ceiling above), or to one that is starting (the start ceiling). Raise it, or 0 = off,
   # if nodes scale up without the platform saying so. Default 5m.
   sandboxUnschedulableTimeoutSeconds: "300"
   # The same ceiling for multi-node GPU clusters (giving up deletes the cluster).
@@ -923,7 +944,10 @@ networkPolicy:
   # (LLM and Git over HTTPS/SSH, AMQP over TLS for Teams, ...).
   publicEgressPorts: [80, 443]
   # Excluded from "public": the private ranges, link-local (cloud metadata),
-  # carrier-grade NAT and loopback.
+  # carrier-grade NAT, loopback and Azure's host endpoint 168.63.129.16
+  # (WireServer: VM agent and extension configuration on port 80). The last is
+  # a public address that only the VM's host answers, so a pod on an Azure node
+  # would otherwise reach it as "public"; elsewhere it is an unused address.
   privateCIDRs:
     - 10.0.0.0/8
     - 172.16.0.0/12
@@ -931,8 +955,9 @@ networkPolicy:
     - 169.254.0.0/16
     - 100.64.0.0/10
     - 127.0.0.0/8
-  # Egress of the Hands pods, in each namespace they run in. Only Egress is
-  # restricted: ingress there is the workspace's business.
+    - 168.63.129.16/32
+  # Egress of the Hands pods, in each namespace they run in. Ingress is
+  # sandboxIngress below.
   sandboxEgress:
     enabled: false
     # Namespaces the sandboxes run in (secret.sandboxNamespace and every
@@ -948,3 +973,30 @@ networkPolicy:
     # Private destinations by CIDR and port, as networkPolicy.egressCIDRs.
     egressCIDRs: []
     publicEgressPorts: [80, 443, 22]
+  # Ingress of the Hands pods, in each of sandboxEgress.namespaces: only the
+  # clients listed here, on any port (the control plane proxies envd and the
+  # ports a sandbox serves). Without it every pod of the cluster can connect
+  # to a sandbox's envd directly. A client named by labels is refused for the
+  # first second or two after it starts under an engine that learns pod
+  # addresses late (kube-router); the control plane is long-lived, and
+  # fromCIDRs is the alternative where that matters. The node's own traffic
+  # (kubelet probes) is not a pod: kube-router accepts it before any policy,
+  # Calico and Cilium allow host-to-local-pod traffic by default; elsewhere
+  # add the node's pod-network gateway to fromCIDRs.
+  #
+  # In kubernetes mode the Hands pods do not carry podLabels today (the
+  # agent-sandbox router puts a request's labels on the Sandbox object, not on
+  # its pod), so neither sandbox policy selects anything there yet.
+  sandboxIngress:
+    enabled: false
+    # Also admit this release's Brain and API pods, which reach Hands directly
+    # in kubernetes mode and in safe mode unless secret.sandboxHandsViaRouter
+    # is on (true, 1 or yes) with a non-empty secret.sandboxRouterUrl.
+    # "auto": exactly then, read from secret.*; true / false: always / never.
+    # A deployment that overrides those settings through api/brain extraEnv
+    # (EXTRA_ENV_*) instead of secret.* should set this explicitly.
+    admitClaw: auto
+    fromPods:
+      - namespace: agent-sandbox-system
+        podLabels: {app: agent-sandbox-controlplane}
+    fromCIDRs: []

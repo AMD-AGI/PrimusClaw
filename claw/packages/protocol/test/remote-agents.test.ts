@@ -6,7 +6,7 @@ import test from "node:test";
 import {
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES,
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
-  parseRemoteId, parseSessionNew, sseFrame,
+  parseHiddenRequest, parseRemoteId, parseSessionNew, sseFrame, REMOTE_HIDDEN_INCLUDE, REMOTE_HIDE_LIMITS,
 } from "../src/remote-agents.js";
 
 const SID = "0f8fad5b-d9cb-469f-a165-70867728950e";
@@ -23,7 +23,7 @@ test("the timings keep a stream alive through the gateway's 180 s idle cut and s
 });
 
 test("the command set is closed, and only commands that can wait may be queued offline", () => {
-  assert.deepEqual([...REMOTE_COMMAND_TYPES], ["prompt", "cancel", "set_mode", "resume", "close", "decision"]);
+  assert.deepEqual([...REMOTE_COMMAND_TYPES], ["prompt", "cancel", "set_mode", "resume", "close", "decision", "withdraw"]);
   const needsOnline = REMOTE_COMMAND_TYPES.filter((t) => REMOTE_COMMANDS[t].needsOnline);
   assert.deepEqual(needsOnline, ["prompt", "set_mode", "resume"]);
   assert.deepEqual(REMOTE_COMMAND_TYPES.filter((t) => REMOTE_COMMANDS[t].closesSession), ["close"]);
@@ -98,6 +98,7 @@ test("event batches: the envelope refuses the batch, an event refuses only itsel
     ["seq a string", { ...ok, seq: "1" }, "invalid_seq"],
     ["type with a newline", { ...ok, type: "a\nb" }, "invalid_type"],
     ["type too long", { ...ok, type: "a".repeat(65) }, "invalid_type"],
+    ["a type only Claw writes (what the person sent)", { ...ok, type: "user_prompt" }, "reserved_type"],
     ["ts negative", { ...ok, ts: -1 }, "invalid_ts"],
     ["ts not finite", { ...ok, ts: null }, "invalid_ts"],
     ["data null", { ...ok, data: null }, "invalid_data"],
@@ -147,6 +148,18 @@ test("registration, heartbeat and session bodies", () => {
   }
 });
 
+test("a takeover is a yes or a no, and only with a reference to the session it takes over", () => {
+  const base = { connector_id: "0f8fad5b-d9cb-469f-a165-70867728950e", agent_id: "a1", cwd: "/w" };
+  const ref = "1f8fad5b-d9cb-469f-a165-70867728950e";
+  const ok = (body: Record<string, unknown>) => { const r = parseSessionNew(body); return r.ok ? r.value.takeover : r.error; };
+  assert.equal(ok({ ...base, resume_ref: ref, takeover: true }), true);
+  assert.equal(ok({ ...base, resume_ref: ref, takeover: false }), false);
+  assert.equal(ok({ ...base, resume_ref: ref }), false, "absent is no");
+  assert.equal(ok({ ...base, resume_ref: ref, takeover: null }), false);
+  assert.equal(ok({ ...base, takeover: true }), "takeover_needs_resume_ref", "there is nothing to take over without a reference");
+  for (const bad of ["true", 1, {}, ["x"]]) assert.equal(ok({ ...base, resume_ref: ref, takeover: bad }), "invalid_takeover", JSON.stringify(bad));
+});
+
 test("a heartbeat's capabilities are carried as the connector wrote them, whatever they say about approval", () => {
   const capabilities = { ask_mode: "m", modes: ["a"], unattended: true, unattended_allowed: false, protocol: 1, nested: { x: [1, { y: null }] } };
   const parsed = parseHeartbeat({ agents: [{ agent_id: "a1", kind: "k", name: "n", capabilities }] });
@@ -160,4 +173,58 @@ test("a session event's data is carried whole, so a flag a connector adds to it 
   assert.ok(parsed.ok);
   assert.deepEqual(parsed.value.events[0]!.data, data);
   assert.deepEqual(parsed.value.rejected, []);
+});
+
+test("connector versions order as semver, and a connector's status follows the minimum and the recommended version", async () => {
+  const { CONNECTOR_PACKAGE, CONNECTOR_VERSIONS, compareConnectorVersions, connectorVersionStatus } = await import("../src/remote-agents.js");
+  assert.equal(CONNECTOR_PACKAGE, "@primusclaw/connector");
+  const pairs: Array<[string, string, number | null]> = [
+    ["0.1.3", "0.1.4", -1], ["0.1.10", "0.1.9", 1], ["1.0.0", "0.99.99", 1], ["0.1.4", "v0.1.4", 0],
+    ["0.1.5-rc.1", "0.1.5", -1], ["0.1.5", "0.1.5-rc.1", 1], ["0.1.5-rc.1", "0.1.5-rc.2", -1], ["0.1.5-rc.2", "0.1.5-rc.10", -1], ["0.1.5-rc", "0.1.5-rc.1", -1],
+    ["0.1.5-1", "0.1.5-alpha", -1], ["0.1.5-beta", "0.1.5-alpha", 1], ["0.1.4+build", "0.1.4", 0],
+    ["0.1", "0.1.0", null], ["latest", "0.1.0", null], ["", "0.1.0", null],
+  ];
+  for (const [a, b, want] of pairs) assert.equal(compareConnectorVersions(a, b), want, `${a} vs ${b}`);
+  assert.ok(compareConnectorVersions(CONNECTOR_VERSIONS.minimum, CONNECTOR_VERSIONS.recommended)! <= 0, "the minimum is not above the recommended");
+  const policy = { minimum: "0.1.3", recommended: "0.1.4" };
+  const status = (v: string | null) => connectorVersionStatus(v, policy);
+  assert.deepEqual(["0.0.0-stage", "0.1.2", "0.1.3", "0.1.4-rc.1", "0.1.4", "0.2.0", null, "dev"].map(status),
+    ["unsupported", "unsupported", "outdated", "outdated", "current", "current", "unknown", "unknown"]);
+});
+
+test("a hide request: hidden a boolean first, then 1 to 50 refs of printable ASCII", () => {
+  assert.deepEqual(parseHiddenRequest({ refs: ["r1", "x".repeat(128)], hidden: true }), { ok: true, value: { refs: ["r1", "x".repeat(128)], hidden: true } });
+  assert.deepEqual(parseHiddenRequest({ refs: ["r1"], hidden: false }), { ok: true, value: { refs: ["r1"], hidden: false } });
+  for (const body of [undefined, null, [], "x", { refs: ["r1"] }, { refs: ["r1"], hidden: "true" }]) {
+    assert.deepEqual(parseHiddenRequest(body), { ok: false, error: "hidden_must_be_boolean" }, JSON.stringify(body));
+  }
+  const refs = (n: number) => Array.from({ length: n }, (_, i) => `r${i}`);
+  for (const bad of [[], "x", ["has space"], ["é"], ["x".repeat(129)], [1], refs(REMOTE_HIDE_LIMITS.maxRefs + 1)]) {
+    assert.deepEqual(parseHiddenRequest({ refs: bad, hidden: true }), { ok: false, error: "invalid_refs" }, JSON.stringify(bad).slice(0, 40));
+  }
+  assert.equal(parseHiddenRequest({ refs: refs(REMOTE_HIDE_LIMITS.maxRefs), hidden: true }).ok, true);
+  assert.equal(REMOTE_HIDDEN_INCLUDE, "include");
+});
+
+test("a terminal's session open: agent, conversation ref, folder and a title cut to one line's length", async () => {
+  const { parseTerminalSessionOpen, parseApprovalsSetting, TERMINAL_HOOK_COMMANDS } = await import("../src/remote-agents.js");
+  const ok = parseTerminalSessionOpen({ agent_id: "claude", ref: "0b1c-2d", cwd: "/home/u/repo", title: `  ${"长".repeat(100)}  ` });
+  assert.ok(ok.ok);
+  assert.deepEqual([ok.value.ref, Array.from(ok.value.title).length], ["0b1c-2d", 80]);
+  assert.deepEqual(parseTerminalSessionOpen({ agent_id: "claude", ref: "r", cwd: "/x" }), { ok: true, value: { agent_id: "claude", ref: "r", cwd: "/x", title: "" } });
+  for (const [body, error] of [
+    [null, "body_required"],
+    [{ agent_id: "bad id", ref: "r", cwd: "/x" }, "invalid_agent_id"],
+    [{ agent_id: "claude", ref: "has space", cwd: "/x" }, "invalid_ref"],
+    [{ agent_id: "claude", ref: "r".repeat(129), cwd: "/x" }, "invalid_ref"],
+    [{ agent_id: "claude", ref: "r", cwd: "" }, "invalid_cwd"],
+    [{ agent_id: "claude", ref: "r", cwd: "/x\n" }, "invalid_cwd"],
+    [{ agent_id: "claude", ref: "r", cwd: "/x", title: "a\nb" }, "invalid_title"],
+    [{ agent_id: "claude", ref: "r", cwd: "/x", title: 3 }, "invalid_title"],
+  ] as const) {
+    assert.deepEqual(parseTerminalSessionOpen(body), { ok: false, error }, JSON.stringify(body));
+  }
+  assert.deepEqual(parseApprovalsSetting({ enabled: false }), { ok: true, value: { enabled: false } });
+  assert.deepEqual(parseApprovalsSetting({ enabled: "false" }), { ok: false, error: "enabled_required" });
+  assert.deepEqual([...TERMINAL_HOOK_COMMANDS], ["decision", "close"]);
 });

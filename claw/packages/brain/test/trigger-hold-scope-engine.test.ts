@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 /**
+ * (A tool of the trigger server itself that the tool catalog does not list is held by the catalog, mcp-approval-catalog.test.ts;
+ * "a tool they do not hold" here is another server's.)
+ *
  * The API gives an owned turn the trigger tools as an MCP server whose `requires_approval` holds trigger_create and
  * trigger_cancel. With HITL_ENABLED=true that rule must hold those two and nothing else: counted as an operator's
  * approval policy, it made every call of the turn wait for a person, so a worker or doorbell turn nobody watches
@@ -56,6 +59,8 @@ async function run(tool: string, opts: { operatorPolicy?: string; trigger?: bool
     baseRequest({
       session_id: uniqueSession(),
       mcp_servers: {
+        // A server no rule and no catalog entry covers: its tool is the one "nobody holds".
+        scratch: { type: "http", url: pw.mcpUrl, token: "t" },
         ...(opts.trigger === false ? {} : { [TRIGGER_MCP_SERVER]: triggerServer }),
         ...(opts.github ? { [GITHUB_MCP_SERVER]: githubServer } : {}),
       },
@@ -80,7 +85,7 @@ test("the premise: HITL_ENABLED is on and a person can be asked", () => {
 });
 
 test("with the trigger tools on, a tool they do not hold runs without asking anyone", async () => {
-  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`);
+  const r = await run("mcp__scratch__ping");
   assert.deepEqual(r.asked, [], "nobody is asked: an unattended turn would wait here for the whole decision timeout");
   assert.equal(r.ran, 1, "the tool ran");
   assert.equal(r.modelSaw.includes("not executed"), false);
@@ -94,19 +99,19 @@ test("trigger_create is still held for the user", async () => {
 });
 
 test("an operator's own policy still makes HITL_ENABLED ask about the other tools", async () => {
-  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { operatorPolicy: "board", decision: "allow" });
-  assert.deepEqual(r.asked, [`mcp__${TRIGGER_MCP_SERVER}__ping`], "HITL_ENABLED asks once an operator policy is in play");
+  const r = await run("mcp__scratch__ping", { operatorPolicy: "board", decision: "allow" });
+  assert.deepEqual(r.asked, ["mcp__scratch__ping"], "HITL_ENABLED asks once an operator policy is in play");
   assert.equal(r.ran, 1, "and the allowed call runs");
 });
 
 test("an operator's server that only shares the trigger server's name is still a policy", async () => {
-  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { operatorPolicy: TRIGGER_MCP_SERVER, trigger: false, decision: "allow" });
-  assert.deepEqual(r.asked, [`mcp__${TRIGGER_MCP_SERVER}__ping`], "known by name and path, not by name alone");
+  const r = await run("mcp__scratch__ping", { operatorPolicy: TRIGGER_MCP_SERVER, trigger: false, decision: "allow" });
+  assert.deepEqual(r.asked, ["mcp__scratch__ping"], "known by name and path, not by name alone");
   assert.equal(r.ran, 1);
 });
 
 test("with the GitHub tools on, a tool they do not hold runs without asking anyone", async () => {
-  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { github: true });
+  const r = await run("mcp__scratch__ping", { github: true });
   assert.deepEqual(r.asked, [], "the GitHub server's hold is the platform's: it holds its own tools only");
   assert.equal(r.ran, 1);
 });
@@ -121,7 +126,7 @@ test("a GitHub write is still held for the user, and a released read runs", asyn
 });
 
 test("an operator's server named github at another path is still a policy", async () => {
-  const r = await run(`mcp__${TRIGGER_MCP_SERVER}__ping`, { operatorPolicy: GITHUB_MCP_SERVER, decision: "allow" });
-  assert.deepEqual(r.asked, [`mcp__${TRIGGER_MCP_SERVER}__ping`]);
+  const r = await run("mcp__scratch__ping", { operatorPolicy: GITHUB_MCP_SERVER, decision: "allow" });
+  assert.deepEqual(r.asked, ["mcp__scratch__ping"]);
   assert.equal(r.ran, 1);
 });

@@ -112,6 +112,7 @@ describe("assistant work items", { skip }, () => {
       assert.equal(first.body.data.created, true);
       assert.equal(second.body.data.created, false);
       assert.equal(second.body.data.session_id, first.body.data.session_id);
+      assert.equal(first.body.data.say_max_per_hour, 120, "the caller's own hourly say cap, for an evaluation run to pace under");
       const s = await rows("SELECT user_id, name, mode, model, agent_status FROM claw_sessions WHERE session_id = $1", [first.body.data.session_id]);
       assert.deepEqual(s, [{ user_id: "u1", name: "助理", mode: "claw", model: "router-small", agent_status: "idle" }]);
       assert.equal((await rows("SELECT 1 FROM claw_sessions")).length, 1);

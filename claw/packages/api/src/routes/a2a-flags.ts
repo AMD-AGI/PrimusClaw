@@ -15,6 +15,10 @@
 //   CLAW_A2A_PUSH_ALLOWED_HOSTS   hosts a webhook may name though they resolve
 //                                 to a private address; the only hosts where
 //                                 plain http is accepted
+//   CLAW_A2A_PUSH_ALLOWED_HOSTS_ONLY  only the hosts above may receive a
+//                                 notification; a public address is refused
+//                                 too (a deployment whose receivers are all
+//                                 its own)
 //   CLAW_A2A_IDENTITY_CLIENT_IDS  client ids of the upstream services whose
 //                                 identity-provider access tokens may call A2A
 // ---------------------------------------------------------------------------
@@ -36,6 +40,11 @@ export function a2aPushEnabled(): boolean {
 /** Lower-cased: a host name has no case. */
 export function a2aPushAllowedHosts(): Set<string> {
   return new Set([...listSetting("CLAW_A2A_PUSH_ALLOWED_HOSTS")].map((h) => h.toLowerCase()));
+}
+
+/** With it on, a webhook host must be named in CLAW_A2A_PUSH_ALLOWED_HOSTS, public or not. */
+export function a2aPushAllowedHostsOnly(): boolean {
+  return envBool("CLAW_A2A_PUSH_ALLOWED_HOSTS_ONLY", false);
 }
 
 export function a2aIdentityClientIds(): Set<string> {

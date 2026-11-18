@@ -13,6 +13,12 @@ export const CONNECTOR_SIDE_ROUTES = {
   heartbeat: { method: "POST", url: "/v1/remote-agents/connectors/:cid/heartbeat" },
   events: { method: "POST", url: "/v1/remote-agents/connectors/:cid/events" },
   commands: { method: "GET", url: "/v1/remote-agents/connectors/:cid/commands" },
+  /** Before carrying out a command it received late (after its machine slept or stalled): may it still run? (`store.commandLiveness`) */
+  confirm: { method: "POST", url: "/v1/remote-agents/connectors/:cid/commands/:cmd_id/confirm" },
+  /** `claw-connector logout`: a device sign-in has no credential the user-side DELETE accepts. */
+  revoke: { method: "POST", url: "/v1/remote-agents/connectors/:cid/revoke" },
+  /** A conversation open in a terminal asked for an approval: the session its approvals are carried on (`store.openTerminalSession`). */
+  terminalSessions: { method: "POST", url: "/v1/remote-agents/connectors/:cid/terminal-sessions" },
 } as const;
 
 /** `:param` matches one path segment, as the router does; anchored, so no prefix or suffix is a match. */

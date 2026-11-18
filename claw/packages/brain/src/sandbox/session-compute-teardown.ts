@@ -41,7 +41,11 @@ const logger = pino({ name: "session-compute-teardown" });
 
 /** Where the teardown's key came from, or why there is none. */
 export type CleanupCredential =
-  | { kind: "key"; platformKey: string; source: "notification" | "binding" }
+  | {
+    kind: "key"; platformKey: string; source: "notification" | "binding";
+    /** The workspace(s) the binding recorded, which a non-admin key must name to list anything. */
+    workspaces: string[];
+  }
   /** No key offered and no binding: nothing Claw created is addressable. */
   | { kind: "no_handle" }
   /** A binding exists (or could not be read) and no key reaches it. */
@@ -58,7 +62,18 @@ export async function resolveCleanupCredential(
   offeredKey: string,
 ): Promise<CleanupCredential> {
   const offered = offeredKey.trim();
-  if (offered) return { kind: "key", platformKey: offered, source: "notification" };
+  if (offered) {
+    // The caller's key decides who asks; the binding still says where to look. Read best-effort: a store
+    // that cannot be read leaves the lookup unscoped, which is what this did before workspaces were named.
+    let workspaces: string[] = [];
+    try {
+      const found = await readSessionBinding(getHandsKv(), sessionId);
+      if (found) workspaces = bindingWorkspaces(found.value);
+    } catch (err) {
+      logger.warn({ err: String(err), sessionId }, "session.cleanup_binding_unreadable");
+    }
+    return { kind: "key", platformKey: offered, source: "notification", workspaces };
+  }
   let found: Awaited<ReturnType<typeof readSessionBinding>>;
   try {
     found = await readSessionBinding(getHandsKv(), sessionId);
@@ -74,16 +89,39 @@ export async function resolveCleanupCredential(
     // A binding that is not JSON is still a binding: something may be behind it.
   }
   return key
-    ? { kind: "key", platformKey: key, source: "binding" }
+    ? { kind: "key", platformKey: key, source: "binding", workspaces: bindingWorkspaces(found.value) }
     : { kind: "no_key", binding: "present" };
+}
+
+/** The workspace a binding recorded its sandbox in (`namespace`), as a list; empty when it names none. */
+function bindingWorkspaces(raw: string): string[] {
+  try {
+    const ns = (JSON.parse(raw) as { namespace?: unknown }).namespace;
+    return typeof ns === "string" && ns.trim() ? [ns.trim()] : [];
+  } catch {
+    return [];
+  }
 }
 
 export interface SessionComputeTeardownDeps {
   /** Whether this deployment provisions through SaFE at all. */
   multiNodeAvailable: () => boolean;
   /** The provider's session-scoped destroy. */
-  destroyForSession: (sessionId: string, opts: { platformKey: string }) => Promise<SessionDestroyResult>;
+  destroyForSession: (sessionId: string, opts: { platformKey: string; workspaces: string[] }) => Promise<SessionDestroyResult>;
+  /** Waits between lookup retries; injected by tests. */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/**
+ * The waits before each repeat of a teardown whose lookup failed.
+ *
+ * A lookup that fails has enumerated nothing, so nothing was deleted and repeating it is safe. It is
+ * repeated here because nothing else may: a session with no `hands.<sid>` binding has nothing to park,
+ * so the idle sweeps that finish a parked teardown never see it, and the one notification is the only
+ * chance its workloads get. Short, because a SaFE blip clears in seconds and this holds the one replica
+ * the teardown was delivered to.
+ */
+export const LOOKUP_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000];
 
 /**
  * Remove everything on the platform that a deleted session owns.
@@ -98,8 +136,18 @@ export async function destroySessionCompute(
   if (!deps.multiNodeAvailable()) return { complete: true, found: 0, deleted: 0 };
   const credential = await resolveCleanupCredential(sessionId, offeredKey);
   switch (credential.kind) {
-    case "key":
-      return deps.destroyForSession(sessionId, { platformKey: credential.platformKey });
+    case "key": {
+      const opts = { platformKey: credential.platformKey, workspaces: credential.workspaces };
+      const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+      let result = await deps.destroyForSession(sessionId, opts);
+      for (const delay of LOOKUP_RETRY_DELAYS_MS) {
+        if (result.complete || result.reason !== "lookup_failed") break;
+        logger.warn({ sessionId, retryInMs: delay }, "session.cleanup_lookup_retry");
+        await sleep(delay);
+        result = await deps.destroyForSession(sessionId, opts);
+      }
+      return result;
+    }
     case "no_handle":
       logger.info({ sessionId }, "session.cleanup_nothing_addressable");
       return { complete: true, found: 0, deleted: 0 };

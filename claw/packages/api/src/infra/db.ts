@@ -9,6 +9,9 @@ import { ensureA2aPushSchema } from "../notifications/a2a-push-schema.js";
 import { ensureNotificationSchema } from "../notifications/schema.js";
 import { ensureRemoteAgentSchema } from "../remote-agents/schema.js";
 import { ensureGithubReviewSchema } from "../github-review/store.js";
+import { lockBoundedMigrationClient, type MigrationLockPolicy } from "./migration-guard.js";
+import { normalizeOverridable } from "../marketplace/plugin-overrides.js";
+import { isTemporaryPublicViolation, requestedPluginExpiry, temporaryPublicError } from "../marketplace/plugin-expiry.js";
 import { terminalTicketsSchemaSql } from "../terminal/schema.js";
 import pino from "pino";
 import {
@@ -86,6 +89,15 @@ const commonPoolConfig: pg.PoolConfig = {
       ? { rejectUnauthorized: false }
       : undefined,
 };
+
+/**
+ * A connection of its own, outside both pools, for a session that is held for the life of the process: a `LISTEN`
+ * (`remote-agents/wake-relay.ts`), which a pool would hand to someone else or close as idle. The same server, SSL and
+ * keepalives as the pools; the caller connects it, watches its `error` and `end`, and ends it.
+ */
+export function dedicatedClient(): pg.Client {
+  return new pg.Client(commonPoolConfig);
+}
 
 // Main pool: all reads and business writes. Capped and env-overridable so ops
 // can tune each replica against the server's max_connections budget.
@@ -261,8 +273,242 @@ if (DB_SCHEMA) {
   lockPool.on("connect", setSearchPath);
 }
 
+// A failover leaves connections on the server that stopped being the primary.
+//
+// Patroni demotes the old leader in place: its backends are terminated
+// (57P01), and for a moment the Service can still route a new connection to it
+// while it comes back up as a replica. Such a connection is healthy as far as
+// the socket goes -- it answers every SELECT -- and refuses every write with
+// 25006 for as long as it lives. `pool.query` destroys the client a statement
+// failed on, but a transaction that failed was rolled back cleanly and its
+// client went back to the pool, still on the replica, to fail the next
+// transaction too; and the idle clients next to it were never asked at all.
+// Seen on a switchover: every replica logged 25006 from the scheduler, the
+// outbox, the event consumer and the assistant's tools at once.
+//
+// So the first failover error any statement meets -- or any idle connection,
+// which a switchover terminates -- is taken as news about the whole pool, not
+// about that one client: every connection opened before it is dropped, the
+// idle ones when they are next checked out (whoever checks them out: every
+// `connect()` of either pool goes through the check) and the held ones when
+// they are released, and the statement that met it is retried once on a new
+// connection when running it twice is the same as running it once: Postgres
+// said it never ran, or it only reads. And a new connection of either pool is
+// not handed out until the server it reached says it is the primary: for a
+// few seconds the Service can still route one to the demoted server, which
+// grants advisory locks as readily as any other -- a lock taken there fences
+// nothing -- and refuses every write.
+
+/** SQLSTATEs, and socket error codes, that mean this connection is not on the primary any more, or the server is going away under it. */
+const FAILOVER_SQLSTATES = new Set([
+  "25006", // read_only_sql_transaction: the server is a replica now
+  "57P01", // admin_shutdown: a switchover terminated the backend
+  "57P02", // crash_shutdown
+  "57P03", // cannot_connect_now: shutting down or starting up
+  "08000", "08001", "08003", "08004", "08006", // connection_exception and its kinds
+  "ECONNRESET", "EPIPE", "ETIMEDOUT", // the socket went: what a server that went away without a word looks like
+]);
+
+/**
+ * Of those, the ones where the statement provably did not take effect: refused
+ * by a read-only server, or never let in. A 57P01 or a dropped socket can land
+ * after a COMMIT took effect and before its answer, so those are not retried.
+ */
+const NOT_RUN_SQLSTATES = new Set(["25006", "57P03"]);
+
+/** A Postgres or socket error that means the connection is not, or soon will not be, on the primary. */
+export function isFailoverError(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null | undefined;
+  if (!e || typeof e !== "object") return false;
+  if (typeof e.code === "string" && FAILOVER_SQLSTATES.has(e.code)) return true;
+  return typeof e.message === "string" && /^Connection terminated/.test(e.message);
+}
+
+/** A failover error Postgres raised before the statement could take effect, so running it again is safe whatever it was. */
+export function failedBeforeRunning(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  return typeof code === "string" && NOT_RUN_SQLSTATES.has(code);
+}
+
+/** Where a statement that only reads may start. */
+const READ_STATEMENT = /^\s*(?:select|with|values|table|show)\b/i;
+/**
+ * Words a statement that only reads does not contain: a write, a lock, a sequence draw, a notification, a call into
+ * code that may do any of those. Matched anywhere in the text, inside a string or a column name too, so a read that
+ * happens to say one of them is not retried: a missed retry costs one error, a wrong one runs a write twice.
+ */
+const NOT_ONLY_A_READ =
+  /\b(?:insert|update|delete|merge|truncate|copy|call|do|into|lock|notify|listen|nextval|setval|set_config|pg_advisory\w*|pg_try_advisory\w*|pg_notify|pg_terminate_backend|pg_cancel_backend|lo_\w+|dblink\w*|txid_current\w*|pg_current_xact_id\w*)\b/i;
+
+/**
+ * A single statement that only reads, so running it twice is the same as running it once: the one kind sent again
+ * after a failover error that can come after a statement took effect (57P01, a dropped socket). Judged from the text,
+ * and anything it cannot tell is not one.
+ */
+export function isIdempotentStatement(text: string): boolean {
+  return READ_STATEMENT.test(text) && !text.includes(";") && !NOT_ONLY_A_READ.test(text);
+}
+
+/** How long a retry after a failover waits, so the Service has moved to the new primary. */
+export const FAILOVER_RETRY_DELAY_MS = envInt("PG_FAILOVER_RETRY_DELAY_MS", 1000, { min: 0 });
+
+let failoverGeneration = 0;
+const clientGeneration = new WeakMap<pg.ClientBase, number>();
+
+/** Whether this client was connected before the last failover this process saw. A client it never tagged is not. */
+function isStale(client: pg.ClientBase): boolean {
+  const born = clientGeneration.get(client);
+  return born !== undefined && born < failoverGeneration;
+}
+
+/**
+ * Record that a failover happened: every connection either pool holds now is
+ * from before it. Safe to call for each error of a burst; each call only makes
+ * the connections opened since the previous one stale too.
+ */
+export function noteFailover(err: unknown): void {
+  failoverGeneration += 1;
+  logger.warn({ code: (err as { code?: unknown })?.code, generation: failoverGeneration }, "db.failover_detected");
+  for (const watcher of [...failoverWatchers]) {
+    try {
+      watcher();
+    } catch (watcherErr) {
+      logger.error({ err: watcherErr }, "db.failover_watcher_failed");
+    }
+  }
+}
+
+const failoverWatchers = new Set<() => void>();
+
+/**
+ * A failover this process noticed after `client` connected, as an error naming it; undefined when there was none.
+ *
+ * For a holder of something that lives on one server -- an advisory lock -- whose connection may still be up: a
+ * failover noticed on any other connection says the server this one reached may have stopped being the primary, and a
+ * lock held there fences nothing on the new one, where another replica can take the same lock. A connection that is
+ * gone is `connectionLost`; this is the one still standing on a server the rest of the process has left. Stays set:
+ * the generation only goes up.
+ */
+export function failoverSince(client: pg.ClientBase): Error | undefined {
+  if (!isStale(client)) return undefined;
+  return new Error(
+    `a database failover was noticed after this connection was made (connection generation ${clientGeneration.get(client)}, now ${failoverGeneration})`,
+  );
+}
+
+/** Be told each time a failover is noticed (`noteFailover`). Returns an unsubscribe. A watcher that throws is logged. */
+export function onFailover(watcher: () => void): () => void {
+  failoverWatchers.add(watcher);
+  return () => failoverWatchers.delete(watcher);
+}
+
+/**
+ * Connections whose server said, when they were first checked out, that it is not in recovery. A connection stays on
+ * the server it reached, and a primary that is demoted ends its connections, so once is enough.
+ */
+const onPrimary = new WeakSet<pg.ClientBase>();
+/** How many connections a checkout tries, a retry delay apart, while they all reach a server in recovery. */
+const PRIMARY_CHECKOUT_ATTEMPTS = 10;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+type ConnectCallback = (err: Error | undefined, client?: pg.PoolClient, done?: (release?: unknown) => void) => void;
+
+/**
+ * Every `connect()` of `p`, whoever calls it (`pool.query` included), hands out a client connected since the last
+ * failover: one from before it is destroyed instead, and the next one taken, until a current one comes (a new
+ * connection is current, so this ends). A client is also asked, the first time it is handed out, whether its server is
+ * in recovery, and one that is is destroyed and another tried after a pause.
+ */
+function checkoutsCurrent(p: pg.Pool): void {
+  const connectAny = p.connect.bind(p) as () => Promise<pg.PoolClient>;
+  const connectCurrent = async (): Promise<pg.PoolClient> => {
+    for (let standby = 0; ;) {
+      const client = await connectAny();
+      if (isStale(client)) {
+        client.release(new Error("connected before a failover"));
+        continue;
+      }
+      if (onPrimary.has(client)) return client;
+      let inRecovery: boolean;
+      try {
+        inRecovery = (await client.query("SELECT pg_is_in_recovery() AS r")).rows[0].r === true;
+      } catch (err) {
+        client.release(err as Error);
+        throw err;
+      }
+      // A failover noticed while the question was out makes this a connection from before it, whatever it answered.
+      if (isStale(client)) {
+        client.release(new Error("connected before a failover"));
+        continue;
+      }
+      if (!inRecovery) {
+        onPrimary.add(client);
+        return client;
+      }
+      client.release(new Error("connected to a server in recovery"));
+      standby += 1;
+      if (standby >= PRIMARY_CHECKOUT_ATTEMPTS) {
+        throw Object.assign(new Error("every connection reached a server in recovery"), { code: "25006" });
+      }
+      logger.warn({ attempt: standby }, "db.connection_reached_standby");
+      await sleep(FAILOVER_RETRY_DELAY_MS);
+    }
+  };
+  (p as unknown as { connect: (cb?: ConnectCallback) => Promise<pg.PoolClient> | undefined }).connect = (cb?: ConnectCallback) => {
+    const current = connectCurrent();
+    if (!cb) return current;
+    current.then((client) => cb(undefined, client, (release) => client.release(release as Error | boolean | undefined)), (err: Error) => cb(err));
+    return undefined;
+  };
+}
+
+for (const p of [pool, lockPool]) {
+  p.on("connect", (client) => {
+    clientGeneration.set(client, failoverGeneration);
+    // A switchover terminates idle and held connections alike, and that is often the first anyone hears of it.
+    client.on("error", (err) => { if (isFailoverError(err)) noteFailover(err); });
+  });
+  // A client from before the failover is closed as it is released, so the pool
+  // removes it instead of handing it out again (`_release` drops a client that
+  // is ending). Covers every holder.
+  p.on("release", (_err, client) => {
+    if (isStale(client)) client.end().catch(() => {});
+  });
+}
+checkoutsCurrent(pool);
+checkoutsCurrent(lockPool);
+
+/**
+ * One statement on the main pool. A statement that met a failover error marks
+ * the pool's connections stale; one that Postgres refused before it ran, or
+ * one that only reads, is sent once more, on a connection made since, after a
+ * pause long enough for the Service to point at the new primary.
+ */
+async function query(text: string, params?: unknown[]): Promise<pg.QueryResult> {
+  try {
+    return await pool.query(text, params);
+  } catch (err) {
+    if (!isFailoverError(err)) throw err;
+    noteFailover(err);
+    if (!failedBeforeRunning(err) && !isIdempotentStatement(text)) throw err;
+    logger.warn({ code: (err as { code?: unknown }).code }, "db.failover_retry");
+    await sleep(FAILOVER_RETRY_DELAY_MS);
+    const client = await pool.connect();
+    try {
+      const result = await client.query(text, params);
+      client.release();
+      return result;
+    } catch (retryErr) {
+      if (isFailoverError(retryErr)) noteFailover(retryErr);
+      client.release(retryErr as Error);
+      throw retryErr;
+    }
+  }
+}
+
 export const db = {
-  query: (text: string, params?: unknown[]) => pool.query(text, params),
+  query,
   pool,
   lockPool,
 };
@@ -284,9 +530,43 @@ export type Querier = (text: string, params?: unknown[]) => Promise<pg.QueryResu
  * failed, because a connection that may still have a transaction open would
  * otherwise be handed to the next caller, whose first statement joins it.
  */
-export async function inTransaction<T>(run: (query: Querier) => Promise<T>): Promise<T> {
+export async function inTransaction<T>(
+  run: (query: Querier) => Promise<T>,
+  opts: { retryOnFailover?: boolean } = {},
+): Promise<T> {
+  try {
+    return await transactionOnce(run);
+  } catch (err) {
+    // Only for a caller that said `run` may run twice: the database is as it was (Postgres refused the statement
+    // before it ran, or the connection went before COMMIT was sent, and the transaction rolled back), but what `run`
+    // did besides is not ours to know.
+    if (!opts.retryOnFailover || !neverCommitted(err)) throw err;
+    logger.warn({ code: (err as { code?: unknown }).code }, "db.failover_retry");
+    await sleep(FAILOVER_RETRY_DELAY_MS);
+    return transactionOnce(run);
+  }
+}
+
+/**
+ * Failover errors a transaction met before its COMMIT was sent. Whatever the error, such a transaction did not take
+ * effect: the server rolls back a transaction whose connection it ends, and one that is still there is rolled back
+ * here. A failover error on the COMMIT itself is not one of them: the COMMIT may have taken effect before the answer
+ * was lost.
+ */
+const rolledBackByFailover = new WeakSet<object>();
+
+/**
+ * Whether a failover error that ended a transaction proves it did not take effect: Postgres refused a statement before
+ * it ran, or the error came before the COMMIT was sent. An error on the COMMIT itself proves nothing either way.
+ */
+export function neverCommitted(err: unknown): boolean {
+  return failedBeforeRunning(err) || (typeof err === "object" && err !== null && rolledBackByFailover.has(err));
+}
+
+async function transactionOnce<T>(run: (query: Querier) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   let broken = false;
+  let committing = false;
   try {
     try {
       // Inside the catch that rolls back, because a `BEGIN` that failed on the
@@ -294,9 +574,17 @@ export async function inTransaction<T>(run: (query: Querier) => Promise<T>): Pro
       // is careful not to hand on.
       await client.query("BEGIN");
       const result = await run((text, params) => client.query(text, params));
+      committing = true;
       await client.query("COMMIT");
       return result;
     } catch (err) {
+      // A connection on a server that is no longer the primary rolls back
+      // cleanly and would go back to the pool to fail the next transaction too.
+      if (isFailoverError(err)) {
+        noteFailover(err);
+        broken = true;
+        if (!committing) rolledBackByFailover.add(err as object);
+      }
       await client.query("ROLLBACK").catch((rollbackErr: unknown) => {
         broken = true;
         logger.warn({ err: (rollbackErr as Error)?.message }, "db.rollback_failed");
@@ -545,6 +833,34 @@ async function readIndexValidity(
 }
 
 /**
+ * Whether another backend may be building the index `name` right now, read from `pg_stat_progress_create_index`.
+ * Exported for tests. Asked only on the deferred path (`deferToBuildsElsewhere`), never for a required index.
+ *
+ * Asked only about an index that exists and is not valid, which a concurrent build has already entered in the
+ * catalog and reported as its `index_relid` (both happen in its first transaction, before anyone else can see the
+ * entry), so a build this role can read counts only when it is that index, on that index's table. A build by a
+ * role whose progress this one may not read shows NULL for both, so nothing says which index it is: it counts
+ * (leaving a performance index's leftover until the next start costs a slower query, dropping a live build of it
+ * costs the whole build), which is exactly why no required index asks this.
+ */
+export async function indexBuildInProgress(q: StatementRunner, name: string): Promise<boolean> {
+  const r = await q.query(
+    `WITH target AS (
+       SELECT c.oid, i.indrelid FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         JOIN pg_index i ON i.indexrelid = c.oid
+        WHERE c.relname = $1 AND n.nspname = CURRENT_SCHEMA())
+     SELECT 1 FROM pg_stat_progress_create_index p, target t
+      WHERE p.pid <> pg_backend_pid()
+        AND p.datid = (SELECT oid FROM pg_database WHERE datname = current_database())
+        AND ((p.index_relid IS NULL AND p.relid IS NULL)
+          OR (p.index_relid = t.oid AND p.relid = t.indrelid))`,
+    [name],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
+/**
  * One stored row per application progress event (hosting design 5.7): the
  * forwarding is at least once, so the same (session, app run, producer epoch,
  * CloudEvents id) can be published again under a new stream sequence. Exported so a test builds
@@ -570,8 +886,9 @@ export const APP_EVENT_DEDUP_SQL = `DELETE FROM claw_session_events a
     AND a.id > b.id`;
 
 /** The app-event unique index, repairing stored repeats first if they are what stops it. */
-export function buildAppEventIndex(client: pg.PoolClient): Promise<void> {
+export function buildAppEventIndex(client: pg.ClientBase, opts: ConcurrentIndexOptions = {}): Promise<void> {
   return ensureConcurrentIndexOrWarn(client, "uq_session_events_app_event", APP_EVENT_UNIQUE_INDEX_SQL, {
+    ...opts,
     onUniqueViolation: async () => { await client.query(APP_EVENT_DEDUP_SQL); },
   });
 }
@@ -757,10 +1074,17 @@ function queueAccrualSql(out: string[]): void {
 /** `onUniqueViolation` repairs the rows that stop a UNIQUE build (23505); the build is then tried once more. */
 export interface ConcurrentIndexOptions {
   onUniqueViolation?: () => Promise<void>;
+  /**
+   * Leave an INVALID index alone while another backend may be building it (`indexBuildInProgress`), instead of
+   * dropping and rebuilding it. Only for the performance-only indexes {@link buildDeferredIndexes} builds, where a
+   * leftover kept until the next start costs a slower query. Never for an index `assertSchema` requires: there a
+   * leftover kept is a replica that refuses to serve, so those keep the drop and rebuild.
+   */
+  deferToBuildsElsewhere?: boolean;
 }
 
 async function ensureConcurrentIndex(
-  client: pg.PoolClient,
+  client: pg.ClientBase,
   name: string,
   createSql: string,
   opts: ConcurrentIndexOptions = {},
@@ -771,6 +1095,13 @@ async function ensureConcurrentIndex(
   const readValidity = () => readIndexValidity(client, name);
   let existing = await readValidity();
   if (existing.rowCount && existing.rows[0].indisvalid) return;
+  if (existing.rowCount && opts.deferToBuildsElsewhere && await indexBuildInProgress(client, name)) {
+    // Not a leftover: another backend is building it right now (a replica, a release job, an operator). Dropping
+    // it would throw that build away, and building it here would only wait behind it; the next start finds it
+    // valid, or a real leftover if that build died.
+    logger.info({ index: name }, "db.concurrent_index_build_in_progress_elsewhere");
+    return;
+  }
   if (existing.rowCount) {
     // Interrupted concurrent builds leave an INVALID index that IF NOT EXISTS
     // would skip forever. Remove only that unusable object before rebuilding.
@@ -860,7 +1191,7 @@ async function ensureConcurrentIndex(
  * to reconcile and try again rather than to give up.
  */
 export async function ensureConcurrentIndexOrWarn(
-  client: pg.PoolClient,
+  client: pg.ClientBase,
   name: string,
   createSql: string,
   opts: ConcurrentIndexOptions = {},
@@ -908,7 +1239,7 @@ export async function ensureConcurrentIndexOrWarn(
  * by the next boot.
  */
 export async function dropSupersededIndexWhenReplaced(
-  client: pg.PoolClient,
+  client: pg.ClientBase,
   superseded: string,
   replacement: string,
 ): Promise<void> {
@@ -1128,9 +1459,22 @@ export async function ensureChatTurnClaimIndex(client: pg.PoolClient): Promise<v
   logger.error({ attempts: CHAT_TURN_INDEX_ATTEMPTS }, "db.chat_turn_index_attempts_exhausted");
 }
 
+/**
+ * How long one startup DDL statement may wait for its table lock, and how often
+ * it tries. See `infra/migration-guard.ts`: without a bound, a statement queued
+ * behind one open transaction holds up every query on that table, the serving
+ * replicas' included, for as long as that transaction lasts.
+ */
+export const MIGRATION_LOCK_POLICY: MigrationLockPolicy = {
+  lockTimeoutMs: envInt("PG_MIGRATION_LOCK_TIMEOUT_MS", 3_000, { min: 1 }),
+  attempts: envInt("PG_MIGRATION_LOCK_ATTEMPTS", 10, { min: 1 }),
+  backoffMs: 500,
+  maxBackoffMs: 4_000,
+};
+
 /** Run schema migrations on startup. */
 export async function initDb(): Promise<void> {
-  const client = await pool.connect();
+  const client = lockBoundedMigrationClient(await pool.connect(), MIGRATION_LOCK_POLICY);
   try {
     await client.query(`SET statement_timeout = ${MIGRATION_STATEMENT_TIMEOUT_MS}`);
     await client.query("SELECT pg_advisory_lock($1)", [SCHEMA_MIGRATION_LOCK_ID]);
@@ -1169,6 +1513,16 @@ export async function initDb(): Promise<void> {
         data        JSONB DEFAULT '{}'::jsonb,
         created_at  TIMESTAMPTZ DEFAULT NOW(),
         deleted_at  TIMESTAMPTZ
+      )
+    `);
+
+    // One row per one-time data migration that has finished, so a start that
+    // finds its row skips the pass instead of re-reading a table to find out
+    // there is nothing left to do (events/legacy-event-ids.ts).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_schema_markers (
+        name     TEXT PRIMARY KEY,
+        done_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
 
@@ -1220,6 +1574,13 @@ export async function initDb(): Promise<void> {
     await addCol("effort", "TEXT");
     // Until when a drain of the session's queue is under way (`sessions/drain-claim.ts`). NULL: none is.
     await addCol("pending_drain_until", "TIMESTAMPTZ");
+    // The workspace save the session's last turn left running, and until when its next turn waits for it in the queue
+    // rather than on Brain's workspace lock (`sessions/save-hold.ts`). NULL: none.
+    await addCol("workspace_save_id", "TEXT");
+    await addCol("workspace_save_until", "TIMESTAMPTZ");
+    // The run whose save that is: its sandbox is not reclaimed and its lease renewal is not refused as terminal while the
+    // save runs, though its row is already closed (`sessions/save-hold.ts`). NULL: none.
+    await addCol("workspace_save_task_id", "TEXT");
     // When the session was last archived, which is what SESSION_RETENTION_DAYS
     // counts from (sessions/retention.ts). NULL for one archived before this
     // column existed, which retention reads as its updated_at instead.
@@ -1384,8 +1745,25 @@ export async function initDb(): Promise<void> {
       )
     `);
     await client.query("CREATE INDEX IF NOT EXISTS idx_memory_events_entry ON claw_memory_events(user_id, entry_id)");
+    // What each entry cites (memory/links.ts, E242): another entry of the same user by number (`name` empty) or by the name it
+    // wrote (`name`), joined to the entry that name names now or dangling (`to_kind = 'title'`). Kept by the server from what the
+    // entry says, and resolved again on every write of the user's; an entry's rows go with it.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_memory_links (
+        user_id     TEXT NOT NULL,
+        from_id     INT NOT NULL REFERENCES claw_memory_entries(id) ON DELETE CASCADE,
+        rel         TEXT NOT NULL CHECK (rel IN ('cites', 'derived_from')),
+        name        TEXT NOT NULL DEFAULT '',
+        to_kind     TEXT NOT NULL CHECK (to_kind IN ('memory', 'title')),
+        to_id       TEXT NOT NULL,
+        created_by  TEXT NOT NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, from_id, rel, name, to_kind, to_id)
+      )
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_memory_links_to ON claw_memory_links(user_id, to_kind, to_id)");
 
-    // Per-user opt-in for long-term memory. No row means off.
+    // Per-user choice of long-term memory. No row means the deployment's default (CLAW_MEMORY_DEFAULT_ON, off unless set).
     await client.query(`
       CREATE TABLE IF NOT EXISTS claw_user_memory_prefs (
         user_id     TEXT PRIMARY KEY,
@@ -1457,6 +1835,72 @@ export async function initDb(): Promise<void> {
     await client.query("ALTER TABLE claw_skills ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_skills_user ON claw_skills(user_id, status)");
     await client.query("CREATE INDEX IF NOT EXISTS idx_skills_name ON claw_skills(skill_name, user_id, version DESC)");
+    // Personal skills (marketplace/skill-service.ts). enabled: a disabled skill is kept and not used. origin: where
+    // the skill came from (chat, worker, api, import, auto), for audit and trust; `source` stays the evolution
+    // logic's. content_sha: SKILL.md and every supporting file, what a cached copy is keyed by. last_used_at: the
+    // last time a turn read the skill (last_accessed is when it was offered). invocation: auto, listed to the model;
+    // manual, used only when the user names it.
+    for (const ddl of [
+      "ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE",
+      "ADD COLUMN IF NOT EXISTS origin TEXT CHECK (origin IN ('chat', 'worker', 'api', 'import', 'auto'))",
+      "ADD COLUMN IF NOT EXISTS content_sha TEXT",
+      "ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ",
+      "ADD COLUMN IF NOT EXISTS invocation TEXT NOT NULL DEFAULT 'auto' CHECK (invocation IN ('auto', 'manual'))",
+    ]) {
+      await client.query(`ALTER TABLE claw_skills ${ddl}`);
+    }
+    // What happened to each personal skill, for audit: who (actor), in which session, which version. A refused write
+    // records why and where (file, line, kind), never what it carried.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_skill_events (
+        id          BIGSERIAL PRIMARY KEY,
+        user_id     TEXT NOT NULL,
+        skill_name  TEXT NOT NULL,
+        version     INT,
+        op          TEXT NOT NULL CHECK (op IN ('draft', 'create', 'update', 'disable', 'enable', 'delete', 'restore', 'rollback', 'refused')),
+        actor       TEXT NOT NULL CHECK (actor IN ('user_cmd', 'model_confirmed', 'model', 'api', 'import', 'auto')),
+        session_id  TEXT,
+        detail      JSONB NOT NULL DEFAULT '{}',
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_skill_events_skill ON claw_skill_events(user_id, skill_name, created_at)");
+    // A skill drafted from a conversation, waiting for the user to confirm it. Not a claw_skills row: a name there has
+    // one row whose version moves in place, so a pending row would collide with it. Deleted after 24 hours.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_skill_drafts (
+        id             TEXT PRIMARY KEY,
+        user_id        TEXT NOT NULL,
+        skill_name     TEXT NOT NULL,
+        description    TEXT NOT NULL DEFAULT '',
+        content        TEXT NOT NULL,
+        files          JSONB NOT NULL DEFAULT '[]',
+        replaces       TEXT,
+        request_quote  TEXT,
+        origin         TEXT NOT NULL CHECK (origin IN ('chat', 'worker', 'api', 'import', 'auto')),
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_skill_drafts_user ON claw_skill_drafts(user_id, created_at)");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_skill_drafts_created ON claw_skill_drafts(created_at)");
+    // A change to a personal skill that the user can take back for a while (`undoSkillChange`): what it was before (`previous`, for an
+    // update the whole skill, for a delete when it was deleted) and what it is after, so an undo applies only to the skill as the change
+    // left it. Kept a week.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS claw_skill_changes (
+        id             TEXT PRIMARY KEY,
+        user_id        TEXT NOT NULL,
+        skill_name     TEXT NOT NULL,
+        op             TEXT NOT NULL CHECK (op IN ('create', 'update', 'delete', 'disable', 'enable')),
+        version_after  INT,
+        sha_after      TEXT,
+        previous       JSONB,
+        session_id     TEXT,
+        created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        undone_at      TIMESTAMPTZ
+      )
+    `);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_skill_changes_user ON claw_skill_changes(user_id, skill_name, created_at)");
 
     // Soft-delete support
     const addDeleted = async (table: string) => {
@@ -1476,21 +1920,10 @@ export async function initDb(): Promise<void> {
     // processed_at marks completion: NULL = pending, NOT NULL = handleComplete done.
     await client.query("ALTER TABLE claw_session_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ DEFAULT NULL").catch(() => {});
     await client.query("CREATE INDEX IF NOT EXISTS idx_events_unprocessed ON claw_session_events(event) WHERE processed_at IS NULL AND deleted_at IS NULL").catch(() => {});
-
-    // An application's progress event is forwarded at least once (hosting design
-    // 5.7); the consumer stores it once per (session, app run, CloudEvents id).
-    //
-    // CONCURRENTLY, like idx_events_session_recent below: a plain build takes SHARE
-    // on the table the event-consumer writes for every Brain event. And not fatal:
-    // a build that fails (a lock or statement timeout) is logged and the API starts
-    // without it; a build stopped by repeats already stored deletes the later copies
-    // (keeping the earliest) and builds again, so the degraded mode ends; an INVALID
-    // leftover of a killed build is dropped before the build. Until the index is valid the
-    // consumer's bare `ON CONFLICT DO NOTHING` de-duplicates nothing, so a repeated
-    // app event is stored twice, which is the degraded mode and not an outage.
-    // A killed or failed build leaves an INVALID index that IF NOT EXISTS then
-    // skips; dropping only that leftover lets the next boot retry.
-    await buildAppEventIndex(client);
+    // A processed completion whose run notification (`run.completed` / `run.failed`) could not be recorded: what it
+    // still owes, written by the same statement as `processed_at`, and cleared once recorded. The event is redelivered
+    // until then (events/consumer.ts, `processCompletionEvent`).
+    await client.query("ALTER TABLE claw_session_events ADD COLUMN IF NOT EXISTS run_notification_owed JSONB DEFAULT NULL").catch(() => {});
 
     // The turn a completion produced, named by the message that asked for it.
     //
@@ -1580,15 +2013,6 @@ export async function initDb(): Promise<void> {
       `CREATE INDEX IF NOT EXISTS idx_sessions_cleanup_oldest
          ON claw_sessions(deleted_at) WHERE cleanup_state = 'pending'`,
     ).catch(() => {});
-    // The retention purge's walk over deleted sessions (sessions/retention.ts),
-    // in exactly its keyset order, so each page is an index range read from the
-    // cursor rather than a scan and sort of every deleted session.
-    await ensureConcurrentIndexOrWarn(
-      client,
-      "idx_sessions_deleted_walk",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sessions_deleted_walk
-         ON claw_sessions(deleted_at, session_id) WHERE deleted_at IS NOT NULL`,
-    );
     // Sessions deleted before this existed had their cleanup attempted exactly
     // once, inside the request, and whatever failed there was logged and left.
     // The objects of those sessions are still in the bucket, which is the leak
@@ -1614,22 +2038,6 @@ export async function initDb(): Promise<void> {
     await sealPlaintextSessionCredentials(client).then(
       (n) => { if (n > 0) logger.info({ sessions: n }, "db.session_credentials_sealed"); },
       (err) => logger.warn({ err: (err as Error)?.message }, "db.session_credentials_seal_failed"),
-    );
-
-    // Per-session recency lookup. The sweeper's stuck-session reaper asks
-    // "has this session emitted an event lately", which without this index is a
-    // scan of the whole event table per candidate row.
-    //
-    // CONCURRENTLY so the first build does not take SHARE and block INSERT:
-    // the event-consumer writes this table for every Brain event, and a lock
-    // here is a conversation that stops producing tokens. Each statement in
-    // this function commits on its own, which is what CONCURRENTLY requires.
-    // A killed build leaves an INVALID index that IF NOT EXISTS then skips;
-    // dropping only that leftover lets the next boot retry.
-    await ensureConcurrentIndexOrWarn(
-      client,
-      "idx_events_session_recent",
-      "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_session_recent ON claw_session_events(session_id, created_at DESC)",
     );
 
     // E2: skill sub-files (multi-file skill support).
@@ -1731,6 +2139,8 @@ export async function initDb(): Promise<void> {
       await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS max_runs INT");
       await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS runs INT NOT NULL DEFAULT 0");
       await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS item_id TEXT");
+      // What a firing does (`triggers/store.ts` TRIGGER_ACTIONS): start a run with the prompt, or say the owner's brief.
+      await client.query("ALTER TABLE claw_triggers ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'run'");
       await client.query("CREATE INDEX IF NOT EXISTS idx_triggers_owner ON claw_triggers(owner_user_id)");
       await client.query("CREATE INDEX IF NOT EXISTS idx_triggers_due ON claw_triggers(next_fire_at) WHERE enabled AND paused_reason IS NULL");
       await client.query(`
@@ -1808,13 +2218,20 @@ export async function initDb(): Promise<void> {
         images JSONB NOT NULL DEFAULT '[]',
         tools JSONB NOT NULL DEFAULT '[]',
         resource JSONB NOT NULL DEFAULT '{}',
+        -- What a launch may override without a new plugin (marketplace/plugin-overrides.ts).
+        -- '{}' is nothing, which is what every row written before the column means.
+        overridable JSONB NOT NULL DEFAULT '{}',
         owner_user_id VARCHAR(255),
         author VARCHAR(255),
         is_public BOOLEAN NOT NULL DEFAULT true,
         status VARCHAR(50) NOT NULL DEFAULT 'active',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        deleted_at TIMESTAMPTZ
+        deleted_at TIMESTAMPTZ,
+        -- A temporary plugin: soft-deleted by the sweeper after this time
+        -- (marketplace/plugin-expiry.ts). NULL is permanent.
+        expires_at TIMESTAMPTZ,
+        CONSTRAINT plugins_temporary_not_public CHECK (expires_at IS NULL OR is_public = false)
       )
     `);
     await client.query(
@@ -1854,6 +2271,18 @@ export async function initDb(): Promise<void> {
     // serve different clients and must not be conflated.
     await client.query(
       `ALTER TABLE plugins ADD COLUMN IF NOT EXISTS anthropic_agent_version INT NOT NULL DEFAULT 1`,
+    ).catch(() => {});
+    await client.query(
+      `ALTER TABLE plugins ADD COLUMN IF NOT EXISTS overridable JSONB NOT NULL DEFAULT '{}'::jsonb`,
+    ).catch(() => {});
+    await client.query(`ALTER TABLE plugins ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`).catch(() => {});
+    // Fails harmlessly (duplicate_object) once the constraint exists.
+    await client.query(
+      `ALTER TABLE plugins ADD CONSTRAINT plugins_temporary_not_public CHECK (expires_at IS NULL OR is_public = false)`,
+    ).catch(() => {});
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_plugins_expires_at ON plugins(expires_at)
+        WHERE expires_at IS NOT NULL AND deleted_at IS NULL`,
     ).catch(() => {});
     // Schema v2 cleanup: drop legacy V1 array column. No rollback path back
     // to V1 — V2 only uses ``resource`` (object).
@@ -2011,46 +2440,6 @@ export async function initDb(): Promise<void> {
        WHERE lease_expires_at IS NOT NULL
          AND status IN ('preparing','running','cancelling')`,
     ).catch(() => {});
-    await ensureConcurrentIndexOrWarn(
-      client,
-      "idx_tasks_platform_facts_pending_v3",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v3
-         ON claw_tasks(
-           platform_facts_next_retry_at ASC NULLS FIRST,
-           completed_at ASC,
-           task_id ASC
-         )
-       WHERE status = 'failed'
-         AND failure_reason IN (
-           'brain_timeout','worker_lost','sandbox_workload_terminal','sandbox_pending_timeout',
-           'sandbox_timed_out','sandbox_exited_before_ready','sandbox_gone',
-           'sandbox_status_unreadable','sandbox_health_failed','sandbox_bootstrap_failed',
-           'sandbox_start_timeout'
-         )
-         AND platform_facts_resolved_at IS NULL`,
-    );
-    // The names this one replaced, removed once the replacement is provably
-    // there. Safe to remove at all because each version strictly widens the one
-    // before: identical key columns in identical order, and a failure-reason
-    // `IN` list that only grows (v2 added eight reasons and dropped
-    // `sandbox_workload_id IS NOT NULL` from the predicate; v3 adds
-    // `sandbox_start_timeout`). Every row an older version indexed is a row v3
-    // indexes, and its predicate implies v3's, so a pod still running older code
-    // has its narrower scan served by v3 throughout a rolling upgrade rather
-    // than falling back to a sequential one.
-    //
-    // The retention rule below still holds for the indexes it names; what it
-    // refuses is an *unguarded* drop, and the guard is what these calls add.
-    await dropSupersededIndexWhenReplaced(
-      client,
-      "idx_tasks_platform_facts_pending",
-      "idx_tasks_platform_facts_pending_v3",
-    );
-    await dropSupersededIndexWhenReplaced(
-      client,
-      "idx_tasks_platform_facts_pending_v2",
-      "idx_tasks_platform_facts_pending_v3",
-    );
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_workspace ON claw_tasks(workspace_id) WHERE workspace_id IS NOT NULL",
     ).catch(() => {});
@@ -2163,29 +2552,6 @@ export async function initDb(): Promise<void> {
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_batch ON claw_tasks(batch_id) WHERE batch_id IS NOT NULL",
     ).catch(() => {});
-    // GET /v1/runs?state=terminal&since= -- partial on the three terminal
-    // statuses and ordered by the exact keyset cursor. The task id is the stable
-    // tiebreaker when one statement completes many rows at the same timestamp.
-    await ensureConcurrentIndexOrWarn(
-      client,
-      "idx_tasks_terminal_completed_task_v2",
-      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_terminal_completed_task_v2
-         ON claw_tasks(completed_at DESC NULLS LAST, task_id DESC)
-       WHERE status IN ('completed','failed','cancelled')`,
-    );
-    // Older variants are intentionally retained during this rolling upgrade.
-    // The hazard is specifically an *unguarded* drop: the create above is
-    // issued through a wrapper that swallows a raised build, so a drop that
-    // merely follows it in program order can run after nothing was built and
-    // leave the route with no ordered index.
-    //
-    // `dropSupersededIndexWhenReplaced` is how a variant here stops being
-    // retained -- it reads the replacement back from `pg_index` and drops only
-    // against a valid one -- and the platform-facts pair above has been moved
-    // onto it. This index and `idx_tasks_occupying` have not: each needs its
-    // own check that the newer predicate really does subsume the older, since
-    // the guard protects the ordering and not the claim that the replacement
-    // covers every row the old index did.
     await client.query(
       "CREATE INDEX IF NOT EXISTS idx_tasks_plugin ON claw_tasks(plugin_id) WHERE plugin_id IS NOT NULL",
     ).catch(() => {});
@@ -2408,6 +2774,201 @@ export async function initDb(): Promise<void> {
   }
 }
 
+/**
+ * Advisory lock id held by the one replica building {@link buildDeferredIndexes}. Same namespace as the ids
+ * above; never reuse it.
+ */
+export const DEFERRED_INDEX_LOCK_ID = 8_264_179_233_004;
+
+/**
+ * The indexes {@link initDb} does not wait for: performance only, built `CONCURRENTLY` over tables that are large
+ * in production (`claw_session_events`, `claw_tasks`, `claw_sessions`). Run once after the server listens, in the
+ * background (index.ts).
+ *
+ * Why not in initDb: initDb runs before `listen`, so nothing answers the startup probe while it does. A concurrent
+ * build scans its table twice and waits out every older transaction, so on a large table it outlives the probe's
+ * window; the pod is killed mid-build, the next one finds the INVALID leftover, drops it and starts again from
+ * nothing, and the build never finishes. Here the replica serves while the index is built, and every query these
+ * indexes serve works without them, only slower. The indexes a request's correctness needs (the unique ones
+ * `assertSchema` checks) stay in initDb.
+ *
+ * One replica at a time: the others find {@link DEFERRED_INDEX_LOCK_ID} taken and leave it to the holder (a
+ * replica that started together with it, or one still building from an earlier start), so no replica drops an
+ * index another one is building. A build started outside this process -- by hand, by a release job, by a replica
+ * of an older version that still builds in initDb -- does not take that lock, and {@link ensureConcurrentIndex}
+ * leaves an index alone while `pg_stat_progress_create_index` shows a build in progress on its table.
+ *
+ * On its own connection, outside the pools: the hold can last as long as the slowest build, and a pooled client
+ * would keep the pool from ending at shutdown. Answers whether this replica ran the builds or another one holds them.
+ */
+export async function buildDeferredIndexes(): Promise<"built" | "held_elsewhere"> {
+  const client = dedicatedClient();
+  client.on("error", (err) => logger.warn({ err }, "db.deferred_indexes_connection_lost"));
+  await client.connect();
+  try {
+    // The schema the pools serve (they set it on connect, above); a bare client would build in the default one.
+    if (DB_SCHEMA) await client.query(`SET search_path TO "${DB_SCHEMA}"`);
+    await client.query(`SET statement_timeout = ${MIGRATION_STATEMENT_TIMEOUT_MS}`);
+    const got = (await client.query("SELECT pg_try_advisory_lock($1) AS got", [DEFERRED_INDEX_LOCK_ID])).rows[0]?.got === true;
+    if (!got) {
+      logger.info("db.deferred_indexes_held_elsewhere");
+      return "held_elsewhere";
+    }
+    try {
+      await buildDeferredIndexesOn(client);
+    } finally {
+      await client.query("SELECT pg_advisory_unlock($1)", [DEFERRED_INDEX_LOCK_ID]).catch(() => {});
+    }
+    logger.info("db.deferred_indexes_done");
+    return "built";
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+async function buildDeferredIndexesOn(client: pg.ClientBase): Promise<void> {
+  const DEFERRED: ConcurrentIndexOptions = { deferToBuildsElsewhere: true };
+    // An application's progress event is forwarded at least once (hosting design
+    // 5.7); the consumer stores it once per (session, app run, CloudEvents id).
+    //
+    // CONCURRENTLY, like idx_events_session_recent below: a plain build takes SHARE
+    // on the table the event-consumer writes for every Brain event. And not fatal:
+    // a build that fails (a lock or statement timeout) is logged and the API starts
+    // without it; a build stopped by repeats already stored deletes the later copies
+    // (keeping the earliest) and builds again, so the degraded mode ends; an INVALID
+    // leftover of a killed build is dropped before the build. Until the index is valid the
+    // consumer's bare `ON CONFLICT DO NOTHING` de-duplicates nothing, so a repeated
+    // app event is stored twice, which is the degraded mode and not an outage.
+    // A killed or failed build leaves an INVALID index that IF NOT EXISTS then
+    // skips; dropping only that leftover lets the next boot retry.
+    await buildAppEventIndex(client, DEFERRED);
+
+    // The retention purge's walk over deleted sessions (sessions/retention.ts),
+    // in exactly its keyset order, so each page is an index range read from the
+    // cursor rather than a scan and sort of every deleted session.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_sessions_deleted_walk",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sessions_deleted_walk
+         ON claw_sessions(deleted_at, session_id) WHERE deleted_at IS NOT NULL`,
+      DEFERRED,
+    );
+
+    // Per-session recency lookup. The sweeper's stuck-session reaper asks
+    // "has this session emitted an event lately", which without this index is a
+    // scan of the whole event table per candidate row.
+    //
+    // CONCURRENTLY so the first build does not take SHARE and block INSERT:
+    // the event-consumer writes this table for every Brain event, and a lock
+    // here is a conversation that stops producing tokens. Each statement in
+    // this function commits on its own, which is what CONCURRENTLY requires.
+    // A killed build leaves an INVALID index that IF NOT EXISTS then skips;
+    // dropping only that leftover lets the next boot retry.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_events_session_recent",
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_session_recent ON claw_session_events(session_id, created_at DESC)",
+      DEFERRED,
+    );
+
+    // The chat notices of saved memories, by memory id: deleting or undoing an entry removes the title from the
+    // notices that announced it (memory/service.ts, ERASE_NOTICE_TITLES_SQL). They are a sliver of this table, and
+    // without this index that update reads every event -- a sequential scan of the whole table, or of every event
+    // of the user's sessions, either of which outlives the request's statement timeout on a large deployment.
+    // Text, as `->>` returns it, so that no stored value can make the index expression raise on an insert.
+    // CONCURRENTLY and not fatal, for the reasons given above.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_events_memory_saved",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_memory_saved
+         ON claw_session_events ((data->>'memory_id')) WHERE event = 'memory_saved'`,
+      DEFERRED,
+    );
+
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_tasks_platform_facts_pending_v3",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_platform_facts_pending_v3
+         ON claw_tasks(
+           platform_facts_next_retry_at ASC NULLS FIRST,
+           completed_at ASC,
+           task_id ASC
+         )
+       WHERE status = 'failed'
+         AND failure_reason IN (
+           'brain_timeout','worker_lost','sandbox_workload_terminal','sandbox_pending_timeout',
+           'sandbox_timed_out','sandbox_exited_before_ready','sandbox_gone',
+           'sandbox_status_unreadable','sandbox_health_failed','sandbox_bootstrap_failed',
+           'sandbox_start_timeout'
+         )
+         AND platform_facts_resolved_at IS NULL`,
+      DEFERRED,
+    );
+    // The names this one replaced, removed once the replacement is provably
+    // there. Safe to remove at all because each version strictly widens the one
+    // before: identical key columns in identical order, and a failure-reason
+    // `IN` list that only grows (v2 added eight reasons and dropped
+    // `sandbox_workload_id IS NOT NULL` from the predicate; v3 adds
+    // `sandbox_start_timeout`). Every row an older version indexed is a row v3
+    // indexes, and its predicate implies v3's, so a pod still running older code
+    // has its narrower scan served by v3 throughout a rolling upgrade rather
+    // than falling back to a sequential one.
+    //
+    // The retention rule below still holds for the indexes it names; what it
+    // refuses is an *unguarded* drop, and the guard is what these calls add.
+    await dropSupersededIndexWhenReplaced(
+      client,
+      "idx_tasks_platform_facts_pending",
+      "idx_tasks_platform_facts_pending_v3",
+    );
+    await dropSupersededIndexWhenReplaced(
+      client,
+      "idx_tasks_platform_facts_pending_v2",
+      "idx_tasks_platform_facts_pending_v3",
+    );
+
+    // GET /v1/runs?state=terminal&since= -- partial on the three terminal
+    // statuses and ordered by the exact keyset cursor. The task id is the stable
+    // tiebreaker when one statement completes many rows at the same timestamp.
+    await ensureConcurrentIndexOrWarn(
+      client,
+      "idx_tasks_terminal_completed_task_v2",
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tasks_terminal_completed_task_v2
+         ON claw_tasks(completed_at DESC NULLS LAST, task_id DESC)
+       WHERE status IN ('completed','failed','cancelled')`,
+      DEFERRED,
+    );
+    // Older variants are intentionally retained during this rolling upgrade.
+    // The hazard is specifically an *unguarded* drop: the create above is
+    // issued through a wrapper that swallows a raised build, so a drop that
+    // merely follows it in program order can run after nothing was built and
+    // leave the route with no ordered index.
+    //
+    // `dropSupersededIndexWhenReplaced` is how a variant here stops being
+    // retained -- it reads the replacement back from `pg_index` and drops only
+    // against a valid one -- and the platform-facts pair above has been moved
+    // onto it. This index and `idx_tasks_occupying` have not: each needs its
+    // own check that the newer predicate really does subsume the older, since
+    // the guard protects the ordering and not the claim that the replacement
+    // covers every row the old index did.
+}
+
+/**
+ * "Newest version first", in SQL: the first three dot-separated parts compared
+ * by their leading digits (a missing or non-numeric part is 0), then the most
+ * recently updated, then the highest id. The order `latestRowByVersion`
+ * (marketplace/plugins.ts) uses to pick the version an upsert extends, for
+ * version parts that fit a JavaScript number.
+ */
+const versionPart = (n: number) =>
+  `COALESCE(NULLIF(substring(split_part(version, '.', ${n}) from '^[0-9]+'), '')::numeric, 0)`;
+export const PLUGIN_VERSION_ORDER =
+  `${versionPart(1)} DESC, ${versionPart(2)} DESC, ${versionPart(3)} DESC, updated_at DESC, id DESC`;
+
+/** What a plugin listing covers; see `listPluginsRepo`. */
+export type PluginListScope = "visible" | "mine" | "public" | "all";
+export const PLUGIN_LIST_SCOPES: readonly PluginListScope[] = ["visible", "mine", "public", "all"];
+
 /** Row shapes from tools/plugins/resources (JSONB columns parsed). */
 export type JsonObject = Record<string, unknown>;
 
@@ -2569,13 +3130,26 @@ export const MarketplaceDb = {
     return (r.rows[0] as JsonObject) ?? null;
   },
 
-  async pluginInsert(payload: JsonObject): Promise<JsonObject> {
+  /**
+   * `opts.inheritExpiresAt` is the expiry a new version takes from its source
+   * when the request names none; it is not bounded like a requested one.
+   */
+  async pluginInsert(payload: JsonObject, opts: { inheritExpiresAt?: Date | null } = {}): Promise<JsonObject> {
+    const requested = requestedPluginExpiry(payload);
+    const expiresAt = requested !== undefined ? requested : (opts.inheritExpiresAt ?? null);
+    // A temporary plugin is private unless the request says otherwise, and
+    // saying otherwise is refused (the CHECK constraint is the backstop).
+    let isPublic = payload.is_public ?? true;
+    if (expiresAt) {
+      if (payload.is_public === true) throw temporaryPublicError();
+      isPublic = false;
+    }
     // V2 writes `resource` (object). Legacy `resources` (array) column is
     // intentionally not written here so V1 can keep its data untouched.
     const r = await db.query(
       `INSERT INTO plugins (
-        name, description, version, images, tools, resource, owner_user_id, author, is_public, status
-      ) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7,$8,$9,$10) RETURNING *`,
+        name, description, version, images, tools, resource, owner_user_id, author, is_public, status, overridable, expires_at
+      ) VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7,$8,$9,$10,$11::jsonb,$12) RETURNING *`,
       [
         payload.name,
         payload.description ?? "",
@@ -2585,10 +3159,14 @@ export const MarketplaceDb = {
         JSON.stringify(payload.resource ?? {}),
         payload.owner_user_id ?? null,
         payload.author ?? null,
-        payload.is_public ?? true,
+        isPublic,
         payload.status ?? "active",
+        JSON.stringify(normalizeOverridable(payload.overridable)),
+        expiresAt,
       ],
-    );
+    ).catch((e: unknown) => {
+      throw isTemporaryPublicViolation(e) ? temporaryPublicError() : e;
+    });
     return r.rows[0] as JsonObject;
   },
 
@@ -2606,6 +3184,9 @@ export const MarketplaceDb = {
     if ("images" in patch) add("images", JSON.stringify(patch.images ?? []));
     if ("tools" in patch) add("tools", JSON.stringify(patch.tools ?? []));
     if ("resource" in patch) add("resource", JSON.stringify(patch.resource ?? {}));
+    if ("overridable" in patch) add("overridable", JSON.stringify(normalizeOverridable(patch.overridable)));
+    const expiry = requestedPluginExpiry(patch);
+    if (expiry !== undefined) add("expires_at", expiry);
     if ("owner_user_id" in patch) add("owner_user_id", patch.owner_user_id);
     if ("author" in patch) add("author", patch.author);
     if ("is_public" in patch) add("is_public", patch.is_public);
@@ -2617,7 +3198,9 @@ export const MarketplaceDb = {
     const r = await db.query(
       `UPDATE plugins SET ${sets.join(", ")} WHERE id = $${i} AND deleted_at IS NULL RETURNING *`,
       vals,
-    );
+    ).catch((e: unknown) => {
+      throw isTemporaryPublicViolation(e) ? temporaryPublicError() : e;
+    });
     return (r.rows[0] as JsonObject) ?? null;
   },
 
@@ -2874,6 +3457,14 @@ export const MarketplaceDb = {
     owner?: string;
     viewerUserId?: string;
     isAdmin: boolean;
+    /**
+     * Which plugins a listing covers (routes/plugins.ts `scope`): `visible` is
+     * public plus the viewer's own, `mine` the viewer's own, `public` the public
+     * ones, `all` every plugin (admins only; the route refuses anyone else).
+     * Absent keeps the older rule: an admin sees everything, anyone else
+     * `visible`.
+     */
+    scope?: PluginListScope;
     includeDeleted: boolean;
     nameExact?: string;
     nameContains?: string;
@@ -2899,8 +3490,18 @@ export const MarketplaceDb = {
       conds.push(`owner_user_id = ${p()}`);
       args.push(params.owner);
     }
-    if (!params.isAdmin) {
-      const uid = params.viewerUserId || "";
+    const uid = params.viewerUserId || "";
+    const scope: PluginListScope = params.scope ?? (params.isAdmin ? "all" : "visible");
+    if (scope === "all" && !params.isAdmin) throw new Error("scope=all is for admins");
+    if (scope === "mine") {
+      // No viewer means nothing is theirs.
+      if (uid) {
+        conds.push(`owner_user_id = ${p()}`);
+        args.push(uid);
+      } else conds.push("false");
+    } else if (scope === "public") {
+      conds.push("is_public = true");
+    } else if (scope === "visible") {
       if (uid) {
         conds.push(`(is_public = true OR owner_user_id = ${p()})`);
         args.push(uid);
@@ -2913,11 +3514,24 @@ export const MarketplaceDb = {
       conds.push(`name ILIKE ${p()}`);
       args.push(`%${params.nameContains.trim()}%`);
     }
+    // Collapsed, a plugin is one entry: the latest active version of an
+    // (owner, name). Names are not owned -- two users may each publish "alpha"
+    // -- so a name alone would let one user's higher version replace another's
+    // plugin. Without an explicit status filter only active rows compete, so a
+    // disabled newer version never hides the one that runs.
+    if (params.latestPerName && !params.status) conds.push("status = 'active'");
     const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
     const sortCol = params.sortField === "updated_at" ? "updated_at" : "created_at";
     const ord = params.sortOrder === "asc" ? "ASC" : "DESC";
+    // `version_count` is counted over the same rows (window functions run
+    // before DISTINCT ON): the versions of that (owner, name) this listing
+    // covers. A deleted row (admins, include_deleted) sorts after every live
+    // one, so it is the entry only when nothing of the plugin is live.
     const baseFrom = params.latestPerName
-      ? `(SELECT DISTINCT ON (name) * FROM plugins ${where} ORDER BY name, ${sortCol} DESC, id DESC) t`
+      ? `(SELECT DISTINCT ON (owner_user_id, name) *,
+                 COUNT(*) OVER (PARTITION BY owner_user_id, name)::int AS version_count
+           FROM plugins ${where}
+          ORDER BY owner_user_id, name, (deleted_at IS NOT NULL), ${PLUGIN_VERSION_ORDER}) t`
       : `(SELECT * FROM plugins ${where}) t`;
     const cnt = await db.query(`SELECT COUNT(*)::int AS c FROM ${baseFrom}`, args);
     const total = (cnt.rows[0] as { c: number }).c;
@@ -2929,6 +3543,35 @@ export const MarketplaceDb = {
       args,
     );
     return { rows: data.rows as JsonObject[], total };
+  },
+
+  /**
+   * Every version of one plugin -- one (owner, name), since names are not
+   * owned -- that the viewer may see, newest first by the version order
+   * `upsertPlugin` uses. Deleted rows are left out unless asked for.
+   */
+  async listPluginVersions(params: {
+    name: string;
+    ownerUserId: string | null;
+    viewerUserId?: string;
+    isAdmin: boolean;
+    includeDeleted: boolean;
+  }): Promise<JsonObject[]> {
+    const conds = ["name = $1", "owner_user_id IS NOT DISTINCT FROM $2"];
+    const args: unknown[] = [params.name, params.ownerUserId];
+    if (!params.includeDeleted) conds.push("deleted_at IS NULL");
+    if (!params.isAdmin) {
+      if (params.viewerUserId) {
+        conds.push("(is_public = true OR owner_user_id = $3)");
+        args.push(params.viewerUserId);
+      } else conds.push("is_public = true");
+    }
+    const r = await db.query(
+      `SELECT id, name, version, status, is_public, owner_user_id, author, created_at, updated_at, deleted_at, expires_at
+         FROM plugins WHERE ${conds.join(" AND ")} ORDER BY ${PLUGIN_VERSION_ORDER}`,
+      args,
+    );
+    return r.rows as JsonObject[];
   },
 
   async listResourcesRepo(params: {

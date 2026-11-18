@@ -1,0 +1,258 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * How an API pod leaves a rolling update without taking requests with it.
+ *
+ * There was no SIGTERM handling at all: Node's default exited the process the
+ * moment the signal arrived, so every request in flight, every SSE stream and
+ * every internal MCP call on the pod was reset, and the pod's grace period was
+ * never used. The order here is the one Kubernetes needs:
+ *
+ *   1. The pod is already out of the Service's endpoints by the time SIGTERM
+ *      arrives, because the chart's preStop sleeps first. From here on the pod
+ *      also reports itself not ready (`/ready`), and every response carries
+ *      `Connection: close`, so a client holding a keep-alive socket to it
+ *      reconnects -- to another replica -- for its next request instead of
+ *      sending it into a socket about to close.
+ *   2. Event streams are told to reconnect: an SSE `retry:` field and the end of
+ *      the response, which every EventSource-style client answers by opening
+ *      the stream again, resuming from its last event id. Streams never end on
+ *      their own, so without this the drain below would wait for the deadline.
+ *      Not an MCP call's answer, which streamable HTTP also sends as an event
+ *      stream (`answersOneCall`): it ends by itself once the tool has answered,
+ *      and ending it first throws that answer away. The tool has done its work
+ *      by then; the caller hears nothing and waits out its own timeout
+ *      (2026-11-07 07:14Z: a review handed over in 0.4 s, and the router waited
+ *      60 s for an answer that this step had cut off). It is waited for in 3,
+ *      like any request in flight.
+ *   3. The server stops accepting and waits for the requests it has to finish.
+ *   4. Background consumers and pools are closed: a NATS drain hands the
+ *      unacknowledged messages back for another replica instead of leaving them
+ *      to time out, and the PG pools end so no transaction is cut mid-flight.
+ *
+ * Everything is bounded by `deadlineMs`, a few seconds inside the pod's grace
+ * period, so a request that never finishes costs an exit code rather than a
+ * SIGKILL.
+ */
+import type { ServerResponse, OutgoingHttpHeaders } from "node:http";
+
+export interface ShutdownLogger {
+  info: (obj: Record<string, unknown>, msg: string) => void;
+  warn: (obj: Record<string, unknown>, msg: string) => void;
+}
+
+export interface ShutdownStep {
+  name: string;
+  run: () => Promise<unknown>;
+}
+
+export interface GracefulShutdownOptions {
+  logger: ShutdownLogger;
+  /** Overall budget from the signal to exit. */
+  deadlineMs: number;
+  /** Extra time to keep serving after the signal, before closing (0 behind a preStop sleep). */
+  delayMs: number;
+  /** Stop accepting and wait for in-flight requests (Fastify's `close`). */
+  closeServer: () => Promise<void>;
+  /** After the server: consumers, NATS, pools. Each is bounded by what is left of the deadline. */
+  steps: ShutdownStep[];
+  exit: (code: number) => void;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** The SSE frame a closing pod sends before ending a stream: reconnect in one second. */
+export const SSE_RECONNECT_FRAME = "retry: 1000\n\n";
+
+function headerValue(headers: unknown, name: string): string | undefined {
+  if (!headers || typeof headers !== "object") return undefined;
+  if (Array.isArray(headers)) {
+    for (let i = 0; i + 1 < headers.length; i += 2) {
+      if (String(headers[i]).toLowerCase() === name) return String(headers[i + 1]);
+    }
+    return undefined;
+  }
+  for (const [k, v] of Object.entries(headers as OutgoingHttpHeaders)) {
+    if (k.toLowerCase() === name) return Array.isArray(v) ? v.join(",") : String(v);
+  }
+  return undefined;
+}
+
+/**
+ * An event stream that is the answer to one MCP call, not a subscription: streamable HTTP answers a POST of JSON-RPC with an event
+ * stream that the server ends once every request in it is answered, and the MCP specification has every such POST accept both
+ * `application/json` and `text/event-stream`. A subscription is a GET (`routes/events.ts`, an MCP server's own GET stream), or a POST
+ * that accepts only the event stream (A2A's `message/stream`), and has no end of its own.
+ */
+export function answersOneCall(res: ServerResponse): boolean {
+  const req = (res as ServerResponse & { req?: { method?: string; headers?: Record<string, unknown> } }).req;
+  if (req?.method !== "POST") return false;
+  const accept = String(req.headers?.accept ?? "").toLowerCase();
+  return accept.includes("application/json") && accept.includes("text/event-stream");
+}
+
+export class GracefulShutdown {
+  private state: "serving" | "draining" | "closing_streams" = "serving";
+  private readonly streams = new Set<ServerResponse>();
+  /** MCP calls answered as event streams (`answersOneCall`): waited for, never ended early. */
+  private readonly calls = new Set<ServerResponse>();
+  private started = false;
+  private readonly closingCtl = new AbortController();
+
+  /**
+   * Aborted just before the open event streams are ended. A route whose clients understand a frame of their own
+   * (the remote-agents command stream's `event: reconnect`) writes it from a listener: the listeners run before the
+   * `retry:` frame and the end, so that frame is the last thing such a client reads before the stream ends.
+   */
+  get closing(): AbortSignal {
+    return this.closingCtl.signal;
+  }
+
+  constructor(private readonly opts: GracefulShutdownOptions) {}
+
+  /** True from the signal on: readiness fails and responses ask for a new connection. */
+  get draining(): boolean {
+    return this.state !== "serving";
+  }
+
+  get openStreams(): number {
+    return this.streams.size;
+  }
+
+  /**
+   * Called for every response before anything is written. Watches for an event
+   * stream being opened -- by a hijacked route writing its own head or by a
+   * normal reply with the header set -- and remembers it until it closes.
+   */
+  watchResponse(res: ServerResponse): void {
+    const originalWriteHead = res.writeHead;
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this;
+    res.writeHead = function patchedWriteHead(this: ServerResponse, ...args: unknown[]) {
+      const headers = typeof args[1] === "object" ? args[1] : args[2];
+      const type = headerValue(headers, "content-type") ?? String(res.getHeader("content-type") ?? "");
+      if (self.draining) {
+        // Replace whatever the route asked for: a keep-alive promise made by a
+        // pod that is about to close is the one the client must not believe.
+        if (headers && typeof headers === "object" && !Array.isArray(headers)) {
+          for (const k of Object.keys(headers)) if (k.toLowerCase() === "connection") delete (headers as Record<string, unknown>)[k];
+          (headers as Record<string, unknown>).Connection = "close";
+        } else if (!res.headersSent) {
+          res.setHeader("Connection", "close");
+        }
+      }
+      const out = (originalWriteHead as (...a: unknown[]) => ServerResponse).apply(this, args);
+      if (/text\/event-stream/i.test(type)) self.trackStream(res);
+      return out;
+    } as typeof res.writeHead;
+  }
+
+  private trackStream(res: ServerResponse): void {
+    if (answersOneCall(res)) {
+      this.calls.add(res);
+      res.once("close", () => this.calls.delete(res));
+      if (this.draining) this.closeAfterAnswer(res);
+      return;
+    }
+    if (this.state === "closing_streams") {
+      // Opened after the streams were told to go: tell this one too.
+      setImmediate(() => this.endStream(res));
+      return;
+    }
+    this.streams.add(res);
+    res.once("close", () => this.streams.delete(res));
+  }
+
+  /**
+   * Its connection is let go once the answer is out: its head was written while serving, so it promised keep-alive, and the server's
+   * close would wait out the idle timeout for it.
+   */
+  private closeAfterAnswer(res: ServerResponse): void {
+    // Read now: a finished response lets go of its socket.
+    const socket = res.socket;
+    const release = () => { try { socket?.end(); } catch { /* already gone */ } };
+    if (res.writableFinished) release();
+    else res.once("finish", release);
+  }
+
+  private endStream(res: ServerResponse): void {
+    try {
+      if (!res.writableEnded) {
+        res.write(SSE_RECONNECT_FRAME);
+        res.end();
+      }
+    } catch { /* the client is already gone */ }
+    this.streams.delete(res);
+  }
+
+  /** Install once; a second signal while shutting down is ignored. */
+  install(proc: NodeJS.Process = process): void {
+    const handler = (sig: string) => { void this.begin(sig); };
+    proc.once("SIGTERM", () => handler("SIGTERM"));
+    proc.once("SIGINT", () => handler("SIGINT"));
+  }
+
+  async begin(signal: string): Promise<void> {
+    if (this.started) return;
+    this.started = true;
+    const { logger, deadlineMs, delayMs } = this.opts;
+    const sleep = this.opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    const startedAt = Date.now();
+    const left = () => Math.max(0, deadlineMs - (Date.now() - startedAt));
+    let exited = false;
+    const exit = (code: number) => {
+      if (exited) return;
+      exited = true;
+      this.opts.exit(code);
+    };
+    const deadline = setTimeout(() => {
+      logger.warn({ signal, openStreams: this.streams.size, deadlineMs }, "api.shutdown.deadline_exceeded");
+      exit(1);
+    }, deadlineMs);
+    deadline.unref?.();
+
+    this.state = "draining";
+    logger.info({ signal, delayMs, deadlineMs, openStreams: this.streams.size }, "api.shutdown.draining");
+    if (delayMs > 0) await sleep(delayMs);
+
+    this.state = "closing_streams";
+    try { this.closingCtl.abort(); } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : String(err) }, "api.shutdown.closing_listener_failed");
+    }
+    const streams = [...this.streams];
+    for (const res of streams) this.endStream(res);
+    for (const res of this.calls) this.closeAfterAnswer(res);
+    logger.info({ signal, streams: streams.length, calls: this.calls.size }, "api.shutdown.streams_closed");
+
+    // Clean means every request the server had was answered. A server that
+    // had to be abandoned at the deadline cut some off, and says so in its exit
+    // code whichever of the two timers noticed first. The steps after it are
+    // housekeeping: their failures are logged, not reported as lost work.
+    const served = await bounded("server", this.opts.closeServer(), left(), logger);
+    for (const step of this.opts.steps) {
+      await bounded(step.name, step.run(), left(), logger);
+    }
+    clearTimeout(deadline);
+    logger.info({ signal, served, elapsedMs: Date.now() - startedAt }, "api.shutdown.complete");
+    exit(served ? 0 : 1);
+  }
+}
+
+async function bounded(name: string, work: Promise<unknown>, ms: number, logger: ShutdownLogger): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      work,
+      new Promise<void>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${name} did not finish in ${ms}ms`)), ms);
+        timer.unref?.();
+      }),
+    ]);
+    return true;
+  } catch (err) {
+    logger.warn({ step: name, err: err instanceof Error ? err.message : String(err) }, "api.shutdown.step_failed");
+    return false;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}

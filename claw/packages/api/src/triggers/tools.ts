@@ -15,7 +15,7 @@ import { readTrustedSessionCredentials } from "../auth/session-credentials.js";
 import { sessionWithholdsSandboxKeys } from "../github-review/session-tools.js";
 import { CLAW_ASSISTANT_ENABLED, CLAW_DEPLOY_MODE, TRIGGER_MIN_INTERVAL_MINUTES } from "../config.js";
 import { db } from "../infra/db.js";
-import { deleteTrigger, insertTrigger, listTriggers, parseTriggerInput, sealTriggerCredentials } from "./store.js";
+import { deleteTrigger, insertTrigger, listTriggers, parseTriggerInput, sealTriggerCredentials, triggerView } from "./store.js";
 import type { TriggerTokenClaims } from "./token.js";
 
 export { ToolRefused };
@@ -31,19 +31,10 @@ async function turnOwner(claims: TriggerTokenClaims): Promise<string> {
   return userId;
 }
 
-/** What the model is told about a trigger: never its sealed credential. */
-function view(row: Record<string, unknown>): Record<string, unknown> {
-  const { trigger_id, name, prompt, schedule, timezone, paused_reason, next_fire_at, last_fire_at, ends_at, max_runs, runs, item_id } = row;
-  return {
-    trigger_id, name, prompt, schedule, timezone, next_fire_at, last_fire_at,
-    until: ends_at ?? null, max_runs: max_runs ?? null, runs, item_id: item_id ?? null,
-    state: paused_reason ? `paused: ${String(paused_reason)}` : "active",
-  };
-}
-
 export async function triggerCreate(claims: TriggerTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
   const userId = await turnOwner(claims);
-  const parsed = parseTriggerInput(args);
+  // A worker's trigger runs its prompt: a brief is said through the assistant, which is the router's to set up.
+  const parsed = parseTriggerInput({ ...args, action: undefined });
   if (!parsed.ok) throw new ToolRefused("invalid_arguments", parsed.error);
   const session = (await db.query("SELECT config FROM claw_sessions WHERE session_id = $1", [claims.sid])).rows[0] as
     { config: unknown } | undefined;
@@ -62,7 +53,7 @@ export async function triggerCreate(claims: TriggerTokenClaims, args: Record<str
   );
   if (!row) throw new ToolRefused("trigger_limit_reached", "the user has as many scheduled tasks as allowed: cancel one first");
   return {
-    ok: true, trigger: view(row),
+    ok: true, trigger: triggerView(row),
     delivery: itemId
       ? "Each run wakes you on this item with the prompt; report its result as usual."
       : "Each run starts a new conversation as the user; its result reaches them through their notifications.",
@@ -71,7 +62,7 @@ export async function triggerCreate(claims: TriggerTokenClaims, args: Record<str
 
 export async function triggerList(claims: TriggerTokenClaims): Promise<Record<string, unknown>> {
   const userId = await turnOwner(claims);
-  return { ok: true, min_interval_minutes: TRIGGER_MIN_INTERVAL_MINUTES, triggers: (await listTriggers(userId)).map(view) };
+  return { ok: true, min_interval_minutes: TRIGGER_MIN_INTERVAL_MINUTES, triggers: (await listTriggers(userId)).map(triggerView) };
 }
 
 export async function triggerCancel(claims: TriggerTokenClaims, args: { trigger_id: string }): Promise<Record<string, unknown>> {

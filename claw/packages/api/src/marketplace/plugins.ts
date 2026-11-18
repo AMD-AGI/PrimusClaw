@@ -19,7 +19,8 @@ import path from "node:path";
 import pino from "pino";
 import { S3_API_ENDPOINT, S3_PLUGINS_BUCKET } from "../config.js";
 import { MarketplaceDb, type JsonObject } from "../infra/db.js";
-import { getS3Client } from "../infra/s3-client.js";
+import { getS3Client, S3_LIST_PAGE_KEYS } from "../infra/s3-client.js";
+import { storedOverridable } from "./plugin-overrides.js";
 import {
   AccessDeniedError,
   BadGatewayError,
@@ -28,6 +29,7 @@ import {
   NotConfiguredError,
   NotFoundError,
   PluginDuplicateError,
+  PluginNameTakenError,
   ToolDuplicateError,
   ToolVersionDuplicateError,
   UpsertConflictError,
@@ -166,26 +168,27 @@ function rowMatchingVersion(rows: JsonObject[], ver: string): JsonObject | null 
   return null;
 }
 
+/** A row's `updated_at` (else `created_at`) as epoch ms; 0 when absent or unparseable. */
+function rowTimeMs(x: JsonObject): number {
+  const v = x.updated_at ?? x.created_at;
+  const ms = v instanceof Date ? v.getTime() : typeof v === "string" || typeof v === "number" ? new Date(v).getTime() : NaN;
+  return Number.isFinite(ms) ? ms : 0;
+}
+
 /**
- * Row with max (semver tuple, ``updated_at``/``created_at`` string, ``id``) — Python ``_latest_row_by_version``.
+ * Row with max (semver tuple, ``updated_at``/``created_at`` time, ``id``) — Python ``_latest_row_by_version``.
+ * The time is compared as a time: pg returns a Date, whose string form sorts by weekday name.
  */
-function latestRowByVersion(rows: JsonObject[]): JsonObject {
+export function latestRowByVersion(rows: JsonObject[]): JsonObject {
   if (!rows.length) throw new BadRequestError("rows must not be empty");
   let top = rows[0]!;
-  const key = (x: JsonObject): [number, number, number, string, number] => [
-    ...versionSortTuple(x.version),
-    String(x.updated_at ?? x.created_at ?? ""),
-    Number(x.id ?? 0),
-  ];
   const cmp = (a: JsonObject, b: JsonObject): number => {
-    const ka = key(a);
-    const kb = key(b);
     const byVer = compareVersion(a.version, b.version);
     if (byVer !== 0) return byVer;
-    const ta = ka[3];
-    const tb = kb[3];
-    if (ta !== tb) return ta < tb ? -1 : ta > tb ? 1 : 0;
-    return ka[4] - kb[4];
+    const ta = rowTimeMs(a);
+    const tb = rowTimeMs(b);
+    if (ta !== tb) return ta - tb;
+    return Number(a.id ?? 0) - Number(b.id ?? 0);
   };
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i]!;
@@ -321,6 +324,7 @@ export async function formatPluginRow(r: JsonObject, enrichRefs = false): Promis
     images: Array.isArray(r.images) ? r.images : [],
     tools,
     resource,
+    overridable: storedOverridable(r.overridable),
     owner_user_id: r.owner_user_id,
     author: r.author,
     is_public: r.is_public ?? true,
@@ -328,6 +332,27 @@ export async function formatPluginRow(r: JsonObject, enrichRefs = false): Promis
     created_at: formatTs(r.created_at),
     updated_at: formatTs(r.updated_at),
     deleted_at: r.deleted_at ? formatTs(r.deleted_at) : null,
+    // A temporary plugin's expiry (marketplace/plugin-expiry.ts); null is permanent.
+    expires_at: r.expires_at ? formatTs(r.expires_at) : null,
+    // Only on a collapsed listing row: how many versions of this name the caller can see.
+    ...(r.version_count !== undefined && r.version_count !== null ? { version_count: Number(r.version_count) } : {}),
+  };
+}
+
+/** One entry of `GET /v1/plugins/:id/versions`: enough to pick a version, then address it by id. */
+export function formatPluginVersionRow(r: JsonObject): JsonObject {
+  return {
+    id: Number(r.id),
+    name: r.name,
+    version: r.version,
+    status: r.status ?? "active",
+    is_public: r.is_public ?? true,
+    owner_user_id: r.owner_user_id,
+    author: r.author,
+    created_at: formatTs(r.created_at),
+    updated_at: formatTs(r.updated_at),
+    deleted_at: r.deleted_at ? formatTs(r.deleted_at) : null,
+    expires_at: r.expires_at ? formatTs(r.expires_at) : null,
   };
 }
 
@@ -345,6 +370,18 @@ export async function getViewablePlugin(
   const row = await MarketplaceDb.pluginGetById(pluginId, false);
   if (!row || !canViewPlugin(row, userId, admin)) return null;
   return formatPluginRow(row, true);
+}
+
+/**
+ * Whether a new launch may name this plugin: it exists, is not deleted, is not
+ * a temporary plugin past its expiry, and the user may see it. One answer for
+ * all four, so a private plugin's id is not an existence oracle.
+ */
+export async function pluginLaunchable(pluginId: number, userId: string | undefined, admin: boolean): Promise<boolean> {
+  const row = await MarketplaceDb.pluginGetById(pluginId, false);
+  if (!row || !canViewPlugin(row, userId, admin)) return false;
+  const expires = row.expires_at ? new Date(row.expires_at as string | Date).getTime() : NaN;
+  return !(Number.isFinite(expires) && expires <= Date.now());
 }
 
 /**
@@ -611,7 +648,7 @@ async function upsertPluginOnce(
   }
   const source = latestRowByVersion(rows);
   if (!sameActorOwner(actingUserId, source.owner_user_id) && !isAdmin) {
-    throw new UpsertPermissionError();
+    throw new PluginNameTakenError(name);
   }
   if (rowsMatchVersion(rows, ver)) {
     const match = rowMatchingVersion(rows, ver);
@@ -653,14 +690,14 @@ export async function upsertPlugin(
 
 function pluginInplaceUpdates(payload: JsonObject): JsonObject {
   const out: JsonObject = {};
-  for (const k of ["name", "description", "version", "images", "tools", "resource", "owner_user_id", "author", "is_public", "status"]) {
+  for (const k of ["name", "description", "version", "images", "tools", "resource", "overridable", "owner_user_id", "author", "is_public", "status", "expires_at", "ttl_seconds"]) {
     if (k in payload) out[k] = payload[k];
   }
   return out;
 }
 
 function pluginNewVersionOverrides(payload: JsonObject): JsonObject | null {
-  const keys = ["description", "images", "tools", "resource", "owner_user_id", "author", "is_public", "status"];
+  const keys = ["description", "images", "tools", "resource", "overridable", "owner_user_id", "author", "is_public", "status", "expires_at", "ttl_seconds"];
   const out: JsonObject = {};
   for (const k of keys) {
     if (k in payload) out[k] = payload[k];
@@ -684,15 +721,19 @@ export async function createPluginNewVersion(
     images: src.images ?? [],
     tools: src.tools ?? [],
     resource: src.resource ?? {},
+    overridable: storedOverridable(src.overridable),
     owner_user_id: src.owner_user_id,
     author: src.author,
     is_public: coalesceIsPublic(src.is_public),
     status: src.status ?? "active",
   };
   if (overrides) Object.assign(payload, overrides);
+  // A new version of a temporary plugin is temporary until the same instant,
+  // unless the request names its own expiry (or null for none).
+  const inheritExpiresAt = src.expires_at ? new Date(src.expires_at as string | Date) : null;
   for (let attempt = 0; attempt < UPSERT_CONCURRENCY_RETRIES; attempt++) {
     try {
-      return await MarketplaceDb.pluginInsert(payload);
+      return await MarketplaceDb.pluginInsert(payload, { inheritExpiresAt });
     } catch (e) {
       if (!isPgUniqueViolation(e)) throw e;
       const existing = await MarketplaceDb.pluginActiveByNameAndVersion(
@@ -811,6 +852,7 @@ async function s3ListKeysUnderPrefix(prefix: string): Promise<string[]> {
         Bucket: S3_PLUGINS_BUCKET,
         Prefix: prefix,
         ContinuationToken,
+        MaxKeys: S3_LIST_PAGE_KEYS,
       }),
     );
     for (const o of out.Contents ?? []) {

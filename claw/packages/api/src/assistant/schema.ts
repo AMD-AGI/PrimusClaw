@@ -68,12 +68,22 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   // When the item's worker was first shown the user's memory beyond the item (the index, or an entry recalled): its session
   // keeps what it read from run to run, so from then on it never answers on GitHub without asking (`memory-tools.ts`).
   await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS memory_reached_at TIMESTAMPTZ");
+  // The assistant session the item was started from (`insertWorkItem`): what the system says about the item on its own (the silent
+  // sweep's fallback, an answer said whole) goes there, and only to the user's current session when that one was deleted
+  // (`needsYouMessage`, outbound.ts). Null on an item made before the column, and on a remote item.
+  await client.query("ALTER TABLE claw_work_items ADD COLUMN IF NOT EXISTS router_session_id TEXT");
   // One open review of a pull request at a time, whoever asked: two sessions reviewing it could both write to it.
   // GitHub's names are not case sensitive, and neither is this.
   await client.query(
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_open_review_pr ON claw_work_items(
        lower(params->'pr'->>'owner'), lower(params->'pr'->>'repo'), (params->'pr'->>'number'))
      WHERE kind = 'review' AND board_state <> 'done'`,
+  );
+  // Delivered results' items that stay open watching their pull request (`watching_pr`), which the GitHub poll looks over each pass
+  // (`closeEndedWatches`).
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_work_items_watching_pr ON claw_work_items(updated_at)
+     WHERE params ? 'watching_pr' AND board_state <> 'done'`,
   );
   // The reviews a person asked of others, which their own assistant lists read-only (`requester-view.ts`) on every turn.
   await client.query(
@@ -126,12 +136,28 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_assistant_says_user ON claw_assistant_says(user_id, created_at DESC)",
   );
+  // The assistant session the say was shown in, recorded once its event was published there while the session was still there (null:
+  // none). A say shown there told a user who has no channel that carries it, and the silent sweep does not say it again (`silent-sweep.ts`).
+  await client.query("ALTER TABLE claw_assistant_says ADD COLUMN IF NOT EXISTS session_id TEXT");
+  // A say stored while no subscription of its user took its type: what a receiver would have been sent, kept so that the user's next
+  // subscription is sent it as it was (`resendUnreachedSays`). Null for every say an outbox row carried.
+  await client.query("ALTER TABLE claw_assistant_says ADD COLUMN IF NOT EXISTS unsent_payload JSONB");
   // At most one system fallback per time an item needed the user. Ordinary says
   // are not limited: the assistant may speak about one item more than once.
   await client.query(
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_says_fallback
        ON claw_assistant_says(item_id, item_attention_seq) WHERE fallback`,
   );
+
+  // How far an item's delivered files have been announced (`deliveries.ts`): through the report event `event_id`. A report whose
+  // announcement failed (the store did not answer) is newer than this, and the sweep announces its files again.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_work_item_delivery_checks (
+      item_id     TEXT PRIMARY KEY,
+      event_id    BIGINT NOT NULL,
+      checked_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
 
   // GitHub events for work items (`github-events.ts`): which pull request an item watches, what was seen on it,
   // and what the item's worker answered. Used only while CLAW_ASSISTANT_GITHUB_EVENTS is on.
@@ -170,6 +196,12 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_work_item_subscriptions_due ON claw_work_item_subscriptions(polled_at) WHERE state = 'active'",
   );
+  // The pull request's branches as its last read saw them: a release-gate fixture (`github-mcp/fixtures.ts`) is told by them, and is
+  // left out of the brief.
+  await client.query("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS head_ref TEXT");
+  await client.query("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS base_ref TEXT");
+  // When the branches were last read, by a poll or by the one backfill of watches the polls no longer read (`backfillSubscriptionRefs`).
+  await client.query("ALTER TABLE claw_work_item_subscriptions ADD COLUMN IF NOT EXISTS refs_read_at TIMESTAMPTZ");
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_work_item_github_events (
       -- gh:<subscription>:<kind>:<GitHub's id>: the same comment read twice is the same row.
@@ -253,10 +285,27 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_assistant_messages_received ON claw_assistant_messages(received_at)",
   );
+  // The chat surfaces a user has written to their assistant from, each with when it was last: what a proactive message (one no
+  // message of theirs started) is routed by (`notifications/surfaces.ts`). Written with each message (`recordAssistantMessage`) and,
+  // unlike the messages, kept: the surface they used last is still the one to reach them on after a quiet week.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_surfaces (
+      user_id         TEXT NOT NULL,
+      surface         TEXT NOT NULL,
+      last_inbound_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, surface)
+    )
+  `);
+  // The items the turn answering the message looked into (`work_recall`, `tools.ts`): a say about how one of them is going is refused
+  // until the turn has.
+  await client.query("ALTER TABLE claw_assistant_messages ADD COLUMN IF NOT EXISTS recalled_items TEXT[] NOT NULL DEFAULT '{}'");
+  // Set when the turn answering a message that came with a key (no attended_via) was refused something only the person may do
+  // (`not_attended`): the router's say of that turn carries `needs_identity`, so the channel offers the person to confirm their identity.
+  await client.query("ALTER TABLE claw_assistant_messages ADD COLUMN IF NOT EXISTS identity_refused_at TIMESTAMPTZ");
   // A review the person asked of someone else that the router handed to their channel (`review_start`, `review_for_other`): written in
-  // the transaction that queues the handoff, and read by `POST /v1/assistant/reviews` when the channel starts it. Whatever the channel
-  // sends, a review of these pull requests by this reviewer for this person then waits for the reviewer's confirmation before it merges
-  // (`merge_needs_confirmation`), merges at all only if the person's message asked for a merge, and is started from one handoff once.
+  // the transaction that queues the handoff, and read by `POST /v1/assistant/reviews` when the channel starts it with its id. Whatever the
+  // channel sends, such a review merges at all only if the person's message asked for a merge, and is started from one handoff once; how it
+  // merges is the reviewer's own review setting's, as for any review asked of them.
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_assistant_review_handoffs (
       handoff_id       TEXT PRIMARY KEY,
@@ -272,6 +321,81 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
   await client.query(
     "CREATE INDEX IF NOT EXISTS idx_assistant_review_handoffs_pair ON claw_assistant_review_handoffs(user_id, reviewer_user_id, created_at)",
   );
+  // The router turn that handed it over (the person's message it answered): the channel answers that message about the review itself, in
+  // one message, so the turn says nothing more (`say`, `deliverUnsaidAnswer`). Null on a handoff written before this column.
+  await client.query("ALTER TABLE claw_assistant_review_handoffs ADD COLUMN IF NOT EXISTS message_id TEXT");
+
+  // A write the router proposed and the user confirms with one press (`schedules.ts`): creating or cancelling a scheduled task.
+  // Nothing is done until the user answers; the row is the card's meaning and its one-time use.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_confirmations (
+      confirmation_id TEXT PRIMARY KEY,
+      user_id         TEXT NOT NULL,
+      -- The router session and the turn that proposed it.
+      session_id      TEXT NOT NULL,
+      message_id      TEXT NOT NULL,
+      -- trigger_create | trigger_cancel
+      kind            TEXT NOT NULL,
+      params          JSONB NOT NULL,
+      -- The same proposal twice in one turn is one card.
+      dedupe_key      TEXT NOT NULL UNIQUE,
+      -- pending | done | denied | expired | failed
+      status          TEXT NOT NULL DEFAULT 'pending',
+      result          JSONB,
+      -- button | command
+      decided_via     TEXT,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at      TIMESTAMPTZ NOT NULL,
+      decided_at      TIMESTAMPTZ
+    )
+  `);
+  await client.query("CREATE INDEX IF NOT EXISTS idx_assistant_confirmations_user ON claw_assistant_confirmations(user_id, status)");
+
+  // Jobs the assistant watches for the user (`job-watch.ts`), and each change of state it saw. Used only while
+  // CLAW_ASSISTANT_JOB_EVENTS is on.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_job_watches (
+      id               BIGSERIAL PRIMARY KEY,
+      user_id          TEXT NOT NULL,
+      -- workload (a SaFE workload) | run (a run of the user's in this deployment)
+      source           TEXT NOT NULL,
+      target           TEXT NOT NULL,
+      label            TEXT NOT NULL,
+      -- The language the user asked in: what they are told is in it.
+      lang             TEXT NOT NULL DEFAULT 'en',
+      last_state       TEXT,
+      -- How many changes of state were seen: the next one's number, so each is told once.
+      transitions      INT NOT NULL DEFAULT 0,
+      -- active | ended
+      state            TEXT NOT NULL DEFAULT 'active',
+      -- finished | not_found | user
+      end_reason       TEXT,
+      polled_at        TIMESTAMPTZ,
+      last_error       TEXT,
+      failing_since    TIMESTAMPTZ,
+      failure_reported BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ended_at         TIMESTAMPTZ
+    )
+  `);
+  await client.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_job_watches_active
+       ON claw_assistant_job_watches(user_id, source, target) WHERE state = 'active'`,
+  );
+  await client.query("CREATE INDEX IF NOT EXISTS idx_assistant_job_watches_due ON claw_assistant_job_watches(polled_at) WHERE state = 'active'");
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_assistant_job_events (
+      -- job:<watch>:<transition number>
+      event_id   TEXT PRIMARY KEY,
+      watch_id   BIGINT NOT NULL,
+      user_id    TEXT NOT NULL,
+      from_state TEXT,
+      to_state   TEXT NOT NULL,
+      detail     TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await client.query("CREATE INDEX IF NOT EXISTS idx_assistant_job_events_user ON claw_assistant_job_events(user_id, created_at)");
   await ensureObserveSchema(client);
 }
 

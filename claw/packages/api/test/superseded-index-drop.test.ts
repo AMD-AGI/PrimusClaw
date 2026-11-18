@@ -228,7 +228,7 @@ test("the retention comment no longer tells a reader every older variant is kept
   // the comment rather than from the call three statements above it.
   const rule = SRC.slice(
     SRC.indexOf("// Older variants are intentionally retained"),
-    SRC.indexOf("idx_tasks_plugin"),
+    SRC.indexOf("covers every row the old index did"),
   );
   assert.match(rule, /dropSupersededIndexWhenReplaced/,
     "the comment has to name the mechanism that now removes one");

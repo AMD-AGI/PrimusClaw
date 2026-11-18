@@ -112,16 +112,16 @@ async function inlineData(hands: HandsClient, real: string, size: number, signal
   return data && Buffer.from(data, "base64").length === size ? data : null;
 }
 
-export async function deliverFile(
-  hands: HandsClient,
-  ctx: DeliverContext,
-  input: Record<string, unknown>,
-  signal?: AbortSignal,
-): Promise<DeliverOutcome> {
-  const file = workspaceFilePath(input.path);
+/** The file a `deliver_file` path names, as the sandbox resolves it: a regular file under /workspace, with its size. */
+export type WorkspaceFile = { ok: true; file: string; real: string; size: number } | { ok: false; error: string };
+
+/**
+ * Resolve `rawPath` as `deliver_file` does: a path under /workspace, existing, a regular file, and still under /workspace once its
+ * links are followed (`real`, the path every later read and copy uses).
+ */
+export async function workspaceFile(hands: HandsClient, rawPath: unknown, signal?: AbortSignal): Promise<WorkspaceFile> {
+  const file = workspaceFilePath(rawPath);
   if (!file) return { ok: false, error: "Error: path must name a file under /workspace." };
-  const captionIn = typeof input.caption === "string" ? input.caption.replace(/\s+/g, " ").trim() : "";
-  const caption = captionIn.slice(0, CAPTION_MAX);
 
   // What the file is, and where it really is: a link under /workspace may point anywhere in the sandbox, and Hands
   // reads whatever the path it is given resolves to, so the resolved path is checked and is what gets copied.
@@ -138,7 +138,20 @@ export async function deliverFile(
     return { ok: false, error: `Error: ${file} resolves to a file outside /workspace; deliver a file in the workspace.` };
   }
   if (!stat[1].startsWith("regular")) return { ok: false, error: `Error: ${file} is a ${stat[1]}, not a file. Deliver one file (zip a directory first).` };
-  const size = Number(stat[2]);
+  return { ok: true, file, real, size: Number(stat[2]) };
+}
+
+export async function deliverFile(
+  hands: HandsClient,
+  ctx: DeliverContext,
+  input: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<DeliverOutcome> {
+  const found = await workspaceFile(hands, input.path, signal);
+  if (!found.ok) return found;
+  const { file, real, size } = found;
+  const captionIn = typeof input.caption === "string" ? input.caption.replace(/\s+/g, " ").trim() : "";
+  const caption = captionIn.slice(0, CAPTION_MAX);
   if (size > ctx.maxBytes) {
     return { ok: false, error: `Error: ${file} is ${size} bytes; at most ${ctx.maxBytes} can be delivered. Compress or split it.` };
   }

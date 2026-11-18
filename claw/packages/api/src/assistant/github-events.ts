@@ -6,8 +6,8 @@
  * worker without anybody mentioning it.
  *
  * Watching is a small deterministic loop, not a model. Every `CLAW_ASSISTANT_GITHUB_POLL_SEC` it reads each
- * watched pull request with its owner's own GitHub token (the `GH_TOKEN` of their env vault, the credential the
- * `github` tools already use), keeps what is new since the subscription began, and stores each thing once, under
+ * watched pull request with its owner's own GitHub token, the credential the `github` tools use (the `GH_TOKEN` of
+ * their env vault, else the account they bound with `/github bind` while CLAW_GITHUB_MCP_BINDING_ENABLED is on), keeps what is new since the subscription began, and stores each thing once, under
  * an id GitHub's own id decides: a comment read twice, by two replicas or two polls, is one row. The events of an
  * item are then put on its worker's queue as one message, in the same transaction that marks them delivered, and
  * the worker is started. The model only judges what to do about them.
@@ -37,7 +37,7 @@ import {
 import { redactSecrets } from "@claw/utils";
 import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { readGithubMcpSettings } from "../github-mcp/settings.js";
-import { loadGithubToken } from "../github-mcp/mcp.js";
+import { resolveGithubToken, type ResolveBinding } from "../github-mcp/mcp.js";
 import { CLAW_WRITE_MARK } from "../github-mcp/tools.js";
 import { GithubClient, GithubError, parsePrRef, repoPath, type PrRef } from "../github-review/github.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
@@ -46,11 +46,15 @@ import { TOOL_NAME_PREFIX } from "./prompts.js";
 import { ingestReport } from "./reports.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, ToolRefused } from "./tools.js";
-import { canAccept, reopenWorkItem, resolveWorkItem, type WorkReport } from "./work-items.js";
+import { canAccept, closeWatchedItem, reopenWorkItem, resolveWorkItem, type WorkReport } from "./work-items.js";
 
 const logger = pino({ name: "assistant-github-events" });
 
 export const GITHUB_EVENT_PREFIX = "[github_event]";
+/** What `pr_reply` tells the worker with a posted answer: how its report names it. */
+export const POSTED_NOTE = "Posted as the user under the automatic replies they turned on for this pull request. In your report say so "
+  + "with the link (in Chinese: 已按你开启的自动回复以你的身份回复了 <link>); it did not wait for approval, and never say it did or will.";
+
 /** What every answer `pr_reply` posts ends with: how a retry finds an answer that landed (with the author it was posted as). */
 export const REPLY_MARKER_PREFIX = "<!-- claw-reply:";
 export const replyMarker = (eventId: string): string => `${REPLY_MARKER_PREFIX}${eventId} -->`;
@@ -59,6 +63,11 @@ const markersIn = (text: string): string[] => [...text.matchAll(/<!-- claw-reply
 /** An answer names its own event and no other: a marker in what the model wrote (quoted from a stranger, say) would make another event look answered. */
 const withoutMarkers = (text: string): string => text.split(REPLY_MARKER_PREFIX).join("<!-- quoted-claw-reply:");
 
+/**
+ * A delivered result's item that watches its pull request (`watching_pr`) closes, as delivered, after this many days with nothing new on
+ * it, or as soon as it watches nothing any more (`closeEndedWatches`).
+ */
+export const WATCH_IDLE_DAYS = 7;
 /** The subscription starts this much before it was made: the two clocks may disagree, and a comment just before is the reason to subscribe. */
 const SINCE_MARGIN_SEC = 120;
 /** At most this many deliveries to one item in `WAKE_WINDOW` (Comma's limit); the rest wait in the table, they are not dropped. */
@@ -118,14 +127,29 @@ export function githubEventsEnabled(): boolean {
 
 /** What leaves the process, behind a seam: the owner's token and GitHub itself. */
 export const githubEventPorts: {
-  loadToken: (userId: string) => Promise<string | null>;
+  /**
+   * The owner's GitHub token for `purpose`, as the `github` tools resolve it (`resolveGithubToken`): `GH_TOKEN`, else their
+   * `/github bind` binding when bindings are on; null when they have neither (or the binding ran out). Throws when the identity
+   * provider cannot be asked: that is not knowing, never "no token".
+   */
+  loadToken: (userId: string, purpose: string) => Promise<string | null>;
   apiUrl: () => string;
   fetchImpl: typeof fetch | undefined;
+  /** Whether a binding counts (`CLAW_GITHUB_MCP_BINDING_ENABLED`), and how one is read: seams for a test. */
+  binding: () => boolean;
+  resolveBinding: ResolveBinding | undefined;
 } = {
-  loadToken: (userId) => loadGithubToken(db, userId),
+  loadToken: async (userId, purpose) => (await resolveGithubToken(db, userId, {
+    binding: githubEventPorts.binding(), purpose, resolve: githubEventPorts.resolveBinding,
+  })).token,
   apiUrl: () => readGithubMcpSettings().apiUrl,
   fetchImpl: undefined,
+  binding: () => readGithubMcpSettings().binding,
+  resolveBinding: undefined,
 };
+
+/** What a token is asked for, in the identity provider's audit trail of a binding. */
+const PURPOSE = { poll: "github_events:poll", reply: "github_events:pr_reply", watch: "github_events:auto_watch" } as const;
 
 const github = (token: string): GithubClient =>
   new GithubClient({ token, apiUrl: githubEventPorts.apiUrl(), fetchImpl: githubEventPorts.fetchImpl });
@@ -269,24 +293,107 @@ export async function listSubscriptions(userId: string, itemId: string): Promise
  * when the subscription is not the caller's (or not there).
  */
 export async function endSubscription(userId: string, itemId: string, subId: number): Promise<SubscriptionView | null> {
+  return inTransaction((query) => endSubscriptionIn(query, userId, itemId, subId));
+}
+
+/** `endSubscription` inside the caller's transaction. */
+async function endSubscriptionIn(query: Querier, userId: string, itemId: string, subId: number): Promise<SubscriptionView | null> {
+  const row = (await query(
+    `UPDATE claw_work_item_subscriptions
+        SET state = 'ended', end_reason = COALESCE(end_reason, 'user'), ended_at = COALESCE(ended_at, NOW()), reply_allowed = FALSE
+      WHERE id = $1 AND item_id = $2 AND user_id = $3
+      RETURNING *`,
+    [subId, itemId, userId],
+  )).rows[0] as Record<string, any> | undefined;
+  if (!row) return null;
+  // What was read and not yet delivered (held by the wake limit, say) is not delivered after the user stopped watching.
+  await query(
+    `UPDATE claw_work_item_github_events SET dropped_at = NOW(), drop_reason = 'subscription_ended'
+      WHERE sub_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
+    [subId],
+  );
+  return subscriptionView(row);
+}
+
+/** What the router is told after automatic replies alone were turned off: the item still watches. */
+const AUTO_REPLY_OFF_NOTE = "Automatic replies are off: the item still watches the pull request, and each answer on GitHub now waits for "
+  + "the user's approval. Tell the user so in one line.";
+
+/** What the router is told after a stop from the chat; the words to tell the user are its own, in their language. */
+const UNSUBSCRIBED_NOTE = "Stopped: new comments, reviews and failed CI on it no longer reach the item, and nothing more is answered on GitHub "
+  + "as the user. Tell the user in one line that you stopped watching it (and automatic replies, where they were on).";
+
+/**
+ * `work_unsubscribe`: the user, in the chat, stops an item watching a pull request (别再自动回复 #381 了, stop watching that PR). It
+ * ends the watch the way the route's DELETE does, so automatic replies end with it. Only taking away, so the router may do it on the
+ * user's word; it never starts anything. With `pr` alone, every active watch of that pull request by any of the user's items;
+ * with `item_id` alone, every watch of that item; with both, that one. `pr` may be a bare number (#381): the user's watched pull
+ * request of that number. With `auto_reply_only` the watches go on and only their automatic replies end (`reply: false`).
+ */
+export async function workUnsubscribe(
+  claims: AssistantTokenClaims, args: { item_id?: string; pr?: string; auto_reply_only?: boolean },
+): Promise<{ ok: true; ended: Array<{ sub_id: number; item_id: string; pr: string; auto_reply_was_on: boolean }>; still_watching: boolean; note: string }> {
+  if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
+  const itemArg = typeof args.item_id === "string" && args.item_id.trim() ? args.item_id.trim() : null;
+  const prArg = typeof args.pr === "string" && args.pr.trim() ? args.pr.trim() : null;
+  if (!itemArg && !prArg) throw new ToolRefused("invalid_arguments", "name the item (item_id), the pull request (pr), or both");
+  const bare = prArg ? /^#?(\d{1,9})$/.exec(prArg) : null;
+  const ref = prArg && !bare ? parsePrRef(prArg) : null;
+  if (prArg && !bare && !ref) throw new ToolRefused("invalid_pr", "name the pull request as owner/repo#123, its https://github.com URL, or #123");
+  const number = bare ? Number(bare[1]) : ref?.number ?? null;
+  const owner = (await db.query("SELECT user_id FROM claw_assistants WHERE session_id = $1", [claims.sid])).rows[0] as
+    { user_id: string } | undefined;
+  if (!owner) throw new ToolRefused("turn_not_live", "this session is not an assistant");
   return inTransaction(async (query) => {
-    const row = (await query(
-      `UPDATE claw_work_item_subscriptions
-          SET state = 'ended', end_reason = COALESCE(end_reason, 'user'), ended_at = COALESCE(ended_at, NOW()), reply_allowed = FALSE
-        WHERE id = $1 AND item_id = $2 AND user_id = $3
-        RETURNING *`,
-      [subId, itemId, userId],
-    )).rows[0] as Record<string, any> | undefined;
-    if (!row) return null;
-    // What was read and not yet delivered (held by the wake limit, say) is not delivered after the user stopped watching.
-    await query(
-      `UPDATE claw_work_item_github_events SET dropped_at = NOW(), drop_reason = 'subscription_ended'
-        WHERE sub_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
-      [subId],
-    );
-    return subscriptionView(row);
+    if ((await assertLiveRun(query, claims)).userId !== owner.user_id) throw new ToolRefused("turn_not_live", "the session changed hands");
+    let itemId: string | null = null;
+    if (itemArg) {
+      const found = await resolveWorkItem(query, owner.user_id, itemArg, { forUpdate: true });
+      if (!found.ok) throw new ToolRefused(found.error, found.message);
+      itemId = found.item.item_id;
+    }
+    const rows = (await query(
+      `SELECT id, item_id, reply_allowed, owner, repo, number FROM claw_work_item_subscriptions
+        WHERE user_id = $1 AND state = 'active' AND ($2::text IS NULL OR item_id = $2)
+          AND ($3::text IS NULL OR (lower(owner) = lower($3) AND lower(repo) = lower($4)))
+          AND ($5::int IS NULL OR number = $5)
+        ORDER BY id FOR UPDATE`,
+      [owner.user_id, itemId, ref?.owner ?? null, ref?.repo ?? null, number],
+    )).rows as Array<{ id: number | string; item_id: string; reply_allowed: boolean; owner: string; repo: string; number: number }>;
+    const named = [...new Set(rows.map((r) => prName(r).toLowerCase()))];
+    if (bare && named.length > 1) {
+      throw new ToolRefused("ambiguous_pr", `#${bare[1]} is more than one watched pull request (${named.join(", ")}): name it as owner/repo#${bare[1]}`);
+    }
+    if (!rows.length) {
+      throw new ToolRefused("not_watching", itemId
+        ? `that item watches no${number !== null ? " such" : ""} pull request now: nothing to stop`
+        : "none of the user's items watches that pull request now: nothing to stop");
+    }
+    const ended: Array<{ sub_id: number; item_id: string; pr: string; auto_reply_was_on: boolean }> = [];
+    if (args.auto_reply_only === true) {
+      for (const r of rows) {
+        const row = (await query(
+          "UPDATE claw_work_item_subscriptions SET reply_allowed = FALSE WHERE id = $1 RETURNING *", [r.id],
+        )).rows[0] as Record<string, any>;
+        ended.push({ sub_id: Number(row.id), item_id: row.item_id, pr: prName(row), auto_reply_was_on: r.reply_allowed === true });
+      }
+      return { ok: true as const, ended, still_watching: true, note: AUTO_REPLY_OFF_NOTE };
+    }
+    for (const r of rows) {
+      const view = await endSubscriptionIn(query, owner.user_id, r.item_id, Number(r.id));
+      if (view) ended.push({ sub_id: view.sub_id, item_id: view.item_id, pr: view.pr, auto_reply_was_on: r.reply_allowed === true });
+    }
+    return { ok: true as const, ended, still_watching: false, note: UNSUBSCRIBED_NOTE };
   });
 }
+
+/**
+ * What the router is told of a watch whose automatic replies the user turned on themselves (the button on the item's card): the
+ * worker answers as them, at once, with no card. Said so the router never promises an approval that will not come.
+ */
+export const AUTO_REPLY_ON = "The user turned on automatic replies for it themselves: the worker answers new comments on the pull "
+  + "request as the user right away, with no approval card. Never say an answer waits for their approval; they can turn it off "
+  + "at any time (work_unsubscribe, or the button on the item's card).";
 
 /**
  * `work_subscribe`: the router has an item watch a pull request. Read-only: it never allows answers without asking, whatever the call
@@ -309,13 +416,79 @@ export async function workSubscribe(
     return {
       ok: true, sub_id: sub.sub_id, item_id: sub.item_id, pr: sub.pr, reply_allowed: sub.reply_allowed, created: sub.created,
       note: sub.reply_allowed
-        ? "New comments, reviews and failed CI on it now go to the item's worker, which may answer on the pull request."
+        ? `New comments, reviews and failed CI on it now go to the item's worker. ${AUTO_REPLY_ON}`
         : "New comments, reviews and failed CI on it now go to the item's worker. Its answers on GitHub wait for the user's approval unless the user allows automatic answers themselves.",
     };
   } catch (err) {
     if (err instanceof SubscriptionRefused) throw new ToolRefused(err.code === "not_found" ? "item_not_found" : err.code, err.message);
     throw err;
   }
+}
+
+/** At most this many pull requests a new item watches by itself: a brief listing more is about something else than each of them. */
+export const AUTO_WATCH_MAX = 3;
+const TOKEN_MAX = 300;
+const PR_URL = /^https:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9_.-]+)\/pull\/(\d{1,9})(?:[/?#].*)?$/i;
+const PR_SHORT = /^([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9_.-]+)#(\d{1,9})$/;
+
+/**
+ * The pull requests a text names in full, as a link or as owner/repo#123, in order, each once (GitHub's names are not case sensitive).
+ * The text is cut into words first and each word is matched from its start, so a long text costs one pass.
+ */
+export function pullRequestsNamedIn(text: string): PrRef[] {
+  const out: PrRef[] = [];
+  const seen = new Set<string>();
+  for (const raw of text.split(/[\s<>()[\]{}"'`,;，。、；：（）]+/)) {
+    const word = raw.replace(/[.:!?！？]+$/, "");
+    if (!word || word.length > TOKEN_MAX) continue;
+    const m = PR_URL.exec(word) ?? PR_SHORT.exec(word);
+    const ref = m ? parsePrRef(`${m[1]}/${m[2]}#${m[3]}`) : null;
+    if (!ref) continue;
+    const key = prName(ref).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ref);
+  }
+  return out;
+}
+
+/**
+ * A new task item about a pull request watches it from the start: the pull requests its title and brief name in full (at most
+ * `AUTO_WATCH_MAX`; with more, none). It is `work_subscribe` done by Claw, read-only as that is (answers on GitHub still wait for the
+ * user), and best effort: what could not be watched is returned with its reason, and the item stands either way. Not for a user
+ * whose GitHub token the loop cannot read: their watch could only fail, and after ten minutes put the item in front of them as
+ * blocked for a reason that is not the work's (`no_github_token`, returned for the router to say).
+ */
+export async function watchNamedPullRequests(
+  userId: string, itemId: string, texts: readonly string[],
+): Promise<{ watching: string[]; not_watched: Array<{ pr: string; error: string }> }> {
+  const out = { watching: [] as string[], not_watched: [] as Array<{ pr: string; error: string }> };
+  if (!githubEventsEnabled()) return out;
+  const refs = pullRequestsNamedIn(texts.join("\n"));
+  if (!refs.length || refs.length > AUTO_WATCH_MAX) return out;
+  let token: string | null;
+  try {
+    token = await githubEventPorts.loadToken(userId, PURPOSE.watch);
+  } catch (err) {
+    logger.warn({ itemId, errorClass: (err as Error)?.constructor?.name }, "assistant.github_auto_watch_token_unknown");
+    out.not_watched.push(...refs.map((ref) => ({ pr: prName(ref), error: "github_unavailable" })));
+    return out;
+  }
+  if (!token) {
+    out.not_watched.push(...refs.map((ref) => ({ pr: prName(ref), error: "no_github_token" })));
+    return out;
+  }
+  for (const ref of refs) {
+    try {
+      const sub = await subscribeItem({ userId, item: itemId, pr: prName(ref) });
+      out.watching.push(sub.pr);
+    } catch (err) {
+      if (!(err instanceof SubscriptionRefused)) throw err;
+      out.not_watched.push({ pr: prName(ref), error: err.code });
+    }
+  }
+  if (out.watching.length) logger.info({ itemId, prs: out.watching }, "assistant.github_auto_watch");
+  return out;
 }
 
 // --- Reading GitHub ---------------------------------------------------------------------
@@ -406,6 +579,8 @@ export interface PullRequestRead {
   writers: ReadonlySet<string>;
   /** Authors whose permission the owner's token may not see (GitHub wants push access to tell): held back, and the owner told. */
   unverifiable: ReadonlySet<string>;
+  /** The pull request's head and base branches, as GitHub answered: what tells a release-gate fixture. */
+  refs?: { head: string | null; base: string | null };
 }
 
 /**
@@ -510,7 +685,8 @@ export async function readPullRequestEvents(
     const json = got.json as { role_name?: unknown; permission?: unknown } | null;
     if (TRUSTED_PERMISSIONS.has(String(json?.role_name ?? "")) || TRUSTED_PERMISSIONS.has(String(json?.permission ?? ""))) writers.add(author);
   }
-  return { events, closed, readUpTo, login: me, writers, unverifiable };
+  const ref = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+  return { events, closed, readUpTo, login: me, writers, unverifiable, refs: { head: ref(pr?.head?.ref), base: ref(pr?.base?.ref) } };
 }
 
 export const eventIdOf = (subId: number, e: Pick<GithubEvent, "kind" | "githubId">): string => `gh:${subId}:${e.kind}:${e.githubId}`;
@@ -654,7 +830,7 @@ async function recordReadFailure(sub: Subscription, code: string): Promise<void>
   const out = await fileWatchReport(sub, {
     kind: "blocked",
     summary: `GitHub has not been readable for ${prName(sub)} for over ${Math.round(READ_FAILURE_REPORT_SEC / 60)} minutes (${code}), so new comments and CI results on it are not reaching this item.`,
-    question: "Should I keep watching (after the GitHub token GH_TOKEN is fixed), or stop watching this pull request?",
+    question: "Should I keep watching (after the GitHub token GH_TOKEN or the /github bind connection is fixed), or stop watching this pull request?",
   });
   // A newer run moved the item on, or a result waits for the user: tried again at the next poll, against the item as it is then.
   if (out === "applied") {
@@ -673,7 +849,13 @@ export async function pollSubscription(sub: Subscription): Promise<{ stored: num
     );
     return { stored: 0, unverifiable: 0 };
   }
-  const token = await githubEventPorts.loadToken(sub.user_id);
+  let token: string | null;
+  try {
+    token = await githubEventPorts.loadToken(sub.user_id, PURPOSE.poll);
+  } catch {
+    await recordReadFailure(sub, "github_unavailable");
+    return { stored: 0, unverifiable: 0 };
+  }
   if (!token) {
     await recordReadFailure(sub, "no_github_token");
     return { stored: 0, unverifiable: 0 };
@@ -696,6 +878,11 @@ export async function pollSubscription(sub: Subscription): Promise<{ stored: num
   } finally {
     const seen = rate();
     if (seen && seen.remaining < seen.limit * RATE_FLOOR_SHARE) await deferUser(sub.user_id, seen.resetAt);
+  }
+  // Best effort: the branches only tell the brief what to leave out, and a failure to keep them never holds back the events read.
+  if (read.refs && (read.refs.head !== null || read.refs.base !== null)) {
+    await db.query("UPDATE claw_work_item_subscriptions SET head_ref = $2, base_ref = $3, refs_read_at = NOW() WHERE id = $1", [sub.id, read.refs.head, read.refs.base])
+      .catch((err) => logger.warn({ subId: sub.id, err: (err as Error)?.message }, "github_events.refs_not_kept"));
   }
   return storeEvents(sub, read);
 }
@@ -741,12 +928,15 @@ export function formatGithubEvents(events: readonly PendingEvent[]): string {
     for (const l of `${where}${e.body ?? ""}`.split(/\r\n|\r|\n/)) lines.push(`   > ${l}`);
   });
   lines.push("");
-  const replyable = events.some((e) => e.reply_allowed);
+  const auto = [...new Set(events.filter((e) => e.reply_allowed).map((e) => prName(e)))];
+  const asking = [...new Set(events.filter((e) => !e.reply_allowed).map((e) => prName(e)))];
+  const askFirst = " Answering on the pull request needs the user's approval for each comment (the github tools ask for it); do not try another way.";
   lines.push(
     "Decide for each event whether it needs anything within this item's task, and do it."
-    + (replyable
-      ? ` To answer on the pull request, call ${TOOL_NAME_PREFIX}pr_reply(event_id, body): it posts as the user, at most once per event, and only where the user allowed it.`
-      : " Answering on the pull request needs the user's approval for each comment (the github tools ask for it); do not try another way.")
+    + (auto.length
+      ? ` To answer on ${auto.join(", ")}, call ${TOOL_NAME_PREFIX}pr_reply(event_id, body): it posts as the user, at most once per event, and only where the user allowed it. The user turned on automatic replies on ${auto.length > 1 ? "these pull requests" : "this pull request"} themselves, so an answer there goes out at once with no approval card; when you report, say plainly that you answered as the user under the automatic replies they turned on and give the answer's link (in Chinese: 已按你开启的自动回复以你的身份回复了 <link>), and never say such an answer waits for or needed approval.`
+        + (asking.length ? ` On ${asking.join(", ")} automatic replies are off:${askFirst}` : "")
+      : askFirst)
     + ` When you are done and nothing needs the user, finish with ${TOOL_NAME_PREFIX}report(kind="waiting", summary) so the item keeps watching; report ready only for a new result the user should check.`,
   );
   return lines.join("\n");
@@ -757,12 +947,15 @@ export function formatGithubEvents(events: readonly PendingEvent[]): string {
  * item's events are dropped with the reason and its subscriptions end; an item past its wake limit keeps them for later. Returns the
  * session to start, if any.
  */
-export async function deliverItemEvents(itemId: string): Promise<"delivered" | "dropped" | "limited" | "held" | "nothing" | "not_queued"> {
+export async function deliverItemEvents(itemId: string): Promise<"delivered" | "dropped" | "limited" | "held" | "closed" | "nothing" | "not_queued"> {
   const out = await inTransaction(async (query) => {
     const q = { query };
     const item = (await query(
-      "SELECT item_id, user_id, kind, board_state, last_report_kind, worker_session_id FROM claw_work_items WHERE item_id = $1 FOR UPDATE", [itemId],
-    )).rows[0] as { item_id: string; user_id: string; kind: string; board_state: string; last_report_kind: string | null; worker_session_id: string } | undefined;
+      `SELECT item_id, user_id, kind, board_state, last_report_kind, worker_session_id, params ? 'watching_pr' AS watching
+         FROM claw_work_items WHERE item_id = $1 FOR UPDATE`, [itemId],
+    )).rows[0] as {
+      item_id: string; user_id: string; kind: string; board_state: string; last_report_kind: string | null; worker_session_id: string; watching: boolean;
+    } | undefined;
     const pending = (await query(
       `SELECT e.event_id, e.kind, e.author, e.url, e.body, e.path, e.line, s.owner, s.repo, s.number, s.reply_allowed
          FROM claw_work_item_github_events e JOIN claw_work_item_subscriptions s ON s.id = e.sub_id
@@ -794,14 +987,47 @@ export async function deliverItemEvents(itemId: string): Promise<"delivered" | "
     // The pull request closing (merged, most often by the user) is no reason to take back a result the user has not judged yet: it is
     // kept, and reaches the worker with the next news or once the user sends the item back. Accepted, the item ends and it is dropped.
     // Asked of everything waiting, not of this batch: closings older than a comment fill a batch by themselves.
-    if (canAccept(item) && !(await query(
+    const onlyClosing = async (): Promise<boolean> => !(await query(
       `SELECT 1 FROM claw_work_item_github_events
         WHERE item_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL AND kind <> 'pr_closed' LIMIT 1`,
       [itemId],
-    )).rowCount) return { status: "held" as const };
-    // A result waiting for the user is no longer the one to accept once there is news on the pull request. An item in progress is left
-    // alone: its running turn keeps its generation, and the next turn reads these.
-    if (item.board_state === "needs_you") {
+    )).rowCount;
+    if (canAccept(item) && await onlyClosing()) return { status: "held" as const };
+    // A delivered result that only watches its pull request (`watching_pr`): the pull request closing, merged most often, is the end of
+    // it. Once the last of its watches has ended so, the item closes as delivered, nothing reaches the worker, and its watches end with
+    // it. While another pull request of it is still watched, the item keeps watching that one, and the closing is only recorded.
+    if (item.watching && await onlyClosing()) {
+      const left = (await query(
+        "SELECT owner, repo, number FROM claw_work_item_subscriptions WHERE item_id = $1 AND state = 'active' ORDER BY id", [itemId],
+      )).rows as Array<{ owner: string; repo: string; number: number }>;
+      if (left.length) {
+        await query(
+          `UPDATE claw_work_item_github_events SET dropped_at = NOW(), drop_reason = 'still_watching'
+            WHERE item_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
+          [itemId],
+        );
+        await query(
+          "UPDATE claw_work_items SET params = params || jsonb_build_object('watching_pr', $2::jsonb) WHERE item_id = $1",
+          [itemId, JSON.stringify(left.map((s) => prName(s)))],
+        );
+        return { status: "dropped" as const };
+      }
+      await closeWatchedItem(q, itemId, [...new Set(pending.map((e) => `${prName(e)}: ${e.body ?? "closed"}`))].join("; "));
+      await query(
+        `UPDATE claw_work_item_github_events SET dropped_at = NOW(), drop_reason = 'item_closed'
+          WHERE item_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
+        [itemId],
+      );
+      await query(
+        "UPDATE claw_work_item_subscriptions SET state = 'ended', end_reason = 'item_closed', ended_at = NOW() WHERE item_id = $1 AND state = 'active'",
+        [itemId],
+      );
+      return { status: "closed" as const };
+    }
+    // A result waiting for the user is no longer the one to accept once there is news on the pull request, and a delivered one that
+    // watches it is worked on again: a comment or failed CI there makes the next version. An item in progress is left alone: its running
+    // turn keeps its generation, and the next turn reads these.
+    if (item.board_state === "needs_you" || item.watching) {
       await reopenWorkItem(q, {
         userId: item.user_id, itemId, source: "github",
         text: `GitHub: ${pending.length} new event${pending.length === 1 ? "" : "s"} on ${[...new Set(pending.map(prName))].join(", ")}`,
@@ -868,7 +1094,103 @@ export async function deliverPendingEvents(): Promise<number> {
  * the same pull request at once), read them, then deliver whatever is stored and not yet delivered, including what an earlier turn
  * could not.
  */
+/** How many watches one backfill pass reads the branches of. */
+const REFS_BACKFILL_BATCH = 20;
+
+/**
+ * The branches of watches that no poll will read any more (ended before polls kept them, #511; an active one's own poll keeps them) and whose news a weekly brief still
+ * shows: read once each, with their owner's token, so the brief can tell a release-gate fixture (`brief.ts`). A watch is claimed by
+ * setting `refs_read_at` before it is read, across replicas, and never claimed again, read or not: after the first passes
+ * following a release there is nothing left to claim, and no GitHub call is made. The subscription holds no title to tell one by.
+ */
+export async function backfillSubscriptionRefs(batch: number = REFS_BACKFILL_BATCH): Promise<number> {
+  const claimed = (await db.query(
+    `UPDATE claw_work_item_subscriptions s SET refs_read_at = NOW()
+      WHERE s.id IN (
+        SELECT id FROM claw_work_item_subscriptions c
+         WHERE c.state <> 'active' AND c.refs_read_at IS NULL AND c.head_ref IS NULL AND c.base_ref IS NULL
+           AND EXISTS (SELECT 1 FROM claw_work_item_github_events e WHERE e.sub_id = c.id AND e.created_at > NOW() - INTERVAL '7 days')
+         ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED)
+      RETURNING s.id, s.user_id, s.owner, s.repo, s.number`,
+    [batch],
+  )).rows as Array<{ id: string | number; user_id: string; owner: string; repo: string; number: number }>;
+  let read = 0;
+  for (const s of claimed) {
+    try {
+      const token = await githubEventPorts.loadToken(s.user_id, PURPOSE.poll);
+      if (!token) continue;
+      const pr = (await watchedGithub(token).gh.get<any>(repoPath({ owner: s.owner, repo: s.repo }, `/pulls/${Number(s.number)}`))).json ?? {};
+      const ref = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+      await db.query("UPDATE claw_work_item_subscriptions SET head_ref = $2, base_ref = $3 WHERE id = $1", [s.id, ref(pr?.head?.ref), ref(pr?.base?.ref)]);
+      read += 1;
+    } catch (err) {
+      logger.warn({ subId: s.id, err: (err as Error)?.message }, "github_events.refs_backfill_failed");
+    }
+  }
+  return read;
+}
+
+/** This process's backfill pass, while one runs: started beside a poll pass, never awaited by it. */
+let backfilling: Promise<void> | null = null;
+
+/** Settles when this process has no backfill pass running (for tests, and a clean shutdown). */
+export function refsBackfillIdle(): Promise<void> {
+  return backfilling ?? Promise.resolve();
+}
+
+/**
+ * Delivered results' items that watch their pull request (`watching_pr`) and should not any more: every watch of theirs ended (the
+ * user stopped it, or it ended without a closing event left to deliver), or nothing changed on them for `WATCH_IDLE_DAYS`. Each closes
+ * as delivered. One with news still to deliver is left to `deliverItemEvents`. Returns how many closed.
+ */
+export async function closeEndedWatches(idleDays: number = WATCH_IDLE_DAYS): Promise<number> {
+  // Over `claw_work_items w`, $1 the idle days.
+  const ended = `w.params ? 'watching_pr' AND w.board_state <> 'done'
+        AND (NOT EXISTS (SELECT 1 FROM claw_work_item_subscriptions s WHERE s.item_id = w.item_id AND s.state = 'active')
+             OR w.updated_at < NOW() - make_interval(days => $1::int))
+        AND NOT EXISTS (SELECT 1 FROM claw_work_item_github_events e WHERE e.item_id = w.item_id AND e.delivered_at IS NULL AND e.dropped_at IS NULL)`;
+  const due = (await db.query(
+    `SELECT w.item_id FROM claw_work_items w WHERE ${ended} ORDER BY w.updated_at LIMIT 100`, [idleDays],
+  )).rows as Array<{ item_id: string }>;
+  let closed = 0;
+  for (const { item_id } of due) {
+    try {
+      const done = await inTransaction(async (query) => {
+        // Asked again under the item's lock: news stored, or a reopen, since the read above keeps it open.
+        const still = (await query(
+          `SELECT EXISTS (SELECT 1 FROM claw_work_item_subscriptions s WHERE s.item_id = w.item_id AND s.state = 'active') AS watching
+             FROM claw_work_items w WHERE w.item_id = $2 AND ${ended} FOR UPDATE OF w`,
+          [idleDays, item_id],
+        )).rows[0] as { watching: boolean } | undefined;
+        if (!still) return false;
+        const ok = await closeWatchedItem(
+          { query }, item_id, still.watching ? `nothing new on its pull request for ${idleDays} days` : "it no longer watches a pull request",
+        );
+        if (ok) {
+          await query(
+            "UPDATE claw_work_item_subscriptions SET state = 'ended', end_reason = 'item_closed', ended_at = NOW() WHERE item_id = $1 AND state = 'active'",
+            [item_id],
+          );
+        }
+        return ok;
+      });
+      if (done) closed += 1;
+    } catch (err) {
+      logger.warn({ err, itemId: item_id }, "assistant.github_watch_close_failed");
+    }
+  }
+  if (closed) logger.info({ closed }, "assistant.github_watches_closed");
+  return closed;
+}
+
 export async function pollDueSubscriptions(intervalSec: number = CLAW_ASSISTANT_GITHUB_POLL_SEC): Promise<{ polled: number; stored: number; delivered: number }> {
+  // Beside the pass, not before it: its reads of ended watches (up to 20, each up to GitHub's timeout) never hold back the polling and
+  // delivery of active ones. One at a time per process.
+  if (!backfilling) {
+    backfilling = backfillSubscriptionRefs()
+      .then(() => undefined, (err) => logger.warn({ err: (err as Error)?.message }, "github_events.refs_backfill_failed"))
+      .finally(() => { backfilling = null; });
+  }
   const due = (await db.query(
     `UPDATE claw_work_item_subscriptions s SET polled_at = NOW()
       WHERE s.id IN (
@@ -895,6 +1217,7 @@ export async function pollDueSubscriptions(intervalSec: number = CLAW_ASSISTANT_
     }
   }
   const delivered = await deliverPendingEvents();
+  await closeEndedWatches().catch((err: unknown) => logger.warn({ err }, "assistant.github_watch_close_failed"));
   // Comments held back that the owner has not been told about: this poll's, and those of a poll whose question could not be asked
   // then (a result was waiting for the user). After delivering: news delivered with it would otherwise send the item straight back to
   // work, and the question with it.
@@ -1018,7 +1341,7 @@ const definitelyNotWritten = (err: unknown): boolean =>
 export async function prReply(
   claims: AssistantTokenClaims,
   args: { event_id: string; body: string },
-): Promise<{ ok: true; status: "posted" | "already_posted"; url: string | null }> {
+): Promise<{ ok: true; status: "posted" | "already_posted"; url: string | null; note: string }> {
   if (claims.role !== "worker") throw new ToolRefused("not_allowed", `this tool is for the worker, not the ${claims.role}`);
   const body = String(args.body ?? "").trim();
   if (!body) throw new ToolRefused("invalid_arguments", "pr_reply needs a body");
@@ -1064,7 +1387,7 @@ export async function prReply(
     )).rows[0] as { attempt: number; created_at: Date };
     return { target: { ...t, sub_id: Number(t.sub_id), number: Number(t.number) } as ReplyTarget, attempt: Number(claimed.attempt), createdAt: claimed.created_at, retry: prior !== undefined };
   });
-  if ("done" in step) return { ok: true, status: "already_posted", url: step.done ?? null };
+  if ("done" in step) return { ok: true, status: "already_posted", url: step.done ?? null, note: POSTED_NOTE };
 
   const { target, attempt, createdAt, retry } = step;
   const release = () => db.query(
@@ -1074,11 +1397,17 @@ export async function prReply(
     "UPDATE claw_work_item_pr_replies SET state = 'posted', url = $2, comment_id = $3, posted_at = NOW() WHERE event_id = $1",
     [eventId, url, commentId],
   );
-  const token = await githubEventPorts.loadToken(target.user_id);
+  let token: string | null;
+  try {
+    token = await githubEventPorts.loadToken(target.user_id, PURPOSE.reply);
+  } catch {
+    if (!retry) await release();
+    throw new ToolRefused("github_unavailable", "the user's GitHub account could not be read just now; call again in a minute");
+  }
   if (!token) {
     // Nothing was sent by this attempt; an earlier one that may have been is still looked for by the next.
     if (!retry) await release();
-    throw new ToolRefused("no_github_token", "the user keeps no GitHub token (GH_TOKEN), so nothing can be posted");
+    throw new ToolRefused("no_github_token", "the user has no GitHub token (GH_TOKEN) and no GitHub account bound with /github bind, so nothing can be posted");
   }
   // What the owner keeps (the env vault the worker's sandbox is given, and the token answers are posted with) never leaves in an answer,
   // whatever a comment talked the worker into writing; nor does anything shaped like a credential.
@@ -1109,13 +1438,13 @@ export async function prReply(
       const found = await findPosted(gh, token, target, createdAt);
       if (found !== null) {
         await posted(found.url, found.id);
-        return { ok: true, status: "already_posted", url: found.url };
+        return { ok: true, status: "already_posted", url: found.url, note: POSTED_NOTE };
       }
     }
     const answer = await gh.request<any>("POST", replyPath(target).post, { body: { body: `${withoutMarkers(body)}\n\n${replyMarker(eventId)}` } });
     const url = typeof answer.json?.html_url === "string" ? answer.json.html_url : null;
     await posted(url, answer.json?.id == null ? null : String(answer.json.id));
-    return { ok: true, status: "posted", url };
+    return { ok: true, status: "posted", url, note: POSTED_NOTE };
   } catch (err) {
     if (definitelyNotWritten(err)) {
       await release();

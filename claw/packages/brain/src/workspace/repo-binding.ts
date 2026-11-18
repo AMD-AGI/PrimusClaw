@@ -88,6 +88,8 @@ export interface RepoBinding {
   state: RepoState;
   /** Why `state` is "failed". */
   failure: string | null;
+  /** Failed because this run has no sandbox at all, so nothing can set the tree up. */
+  noSandbox?: true;
   /** Current branch of the working tree; null when detached or unknown. */
   branch: string | null;
   head: string | null;
@@ -433,6 +435,26 @@ function emptyBinding(url: string, requestedBranch: string | null, path: string)
 }
 
 /**
+ * The binding of a run that cannot have a sandbox: the platform refused one
+ * (`reason` is what the person is told, see `sandboxWorkspaceForbiddenText`).
+ * Nothing is set up and nothing can be, but the run goes on: what the user asked
+ * may not need the repository, and the model is told why it is not there.
+ */
+export function repoWithoutSandbox(raw: unknown, reason: string, options: { root?: string } = {}): RepoBinding {
+  const root = (options.root ?? "/workspace").replace(/\/+$/, "");
+  const parsed = parseSessionRepo(raw);
+  const repo: SessionRepo | null = parsed.ok ? parsed.repo : null;
+  const name = repo ? sessionRepoDirName(repo) : null;
+  const b = repo && name
+    ? emptyBinding(repo.url, repo.branch ?? null, `${root}/${name}`)
+    : emptyBinding("(not accepted)", null, root);
+  b.failure = `this run has no sandbox: ${reason.replace(/[.\s]+$/, "")}`;
+  b.noSandbox = true;
+  logger.warn({ url: b.url }, "repo.binding_no_sandbox");
+  return b;
+}
+
+/**
  * Set the bound repository up in the sandbox. Never throws: the result says what
  * happened, including that it did not work.
  */
@@ -560,7 +582,9 @@ export function renderRepoBlock(b: RepoBinding, listedSkills = 0): string {
   const branchAsked = b.requestedBranch ? `, branch ${b.requestedBranch}` : "";
   if (b.state === "failed") {
     lines.push(`- This session is bound to ${b.url}${branchAsked}, but setting up the working tree failed: ${b.failure ?? "unknown reason"}.`);
-    lines.push(`- ${b.path} is not ready. Tell the user what failed and, if it can be fixed from here, retry with git yourself (git is set to ask the \`gh\` CLI for credentials; never put a token in a URL or a command).`);
+    lines.push(b.noSandbox
+      ? `- ${b.path} is not there, and no tool that needs a sandbox (bash, files, git) can be used in this run. Do what the user asked without them where you can; where the repository is needed, tell the user why it is not available.`
+      : `- ${b.path} is not ready. Tell the user what failed and, if it can be fixed from here, retry with git yourself (git is set to ask the \`gh\` CLI for credentials; never put a token in a URL or a command).`);
     return lines.join("\n");
   }
   const how = b.state === "cloned" ? "cloned just now" : b.state === "adopted" ? "the repository attached to the files already there" : "already there";

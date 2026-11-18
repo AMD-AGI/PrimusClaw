@@ -24,8 +24,15 @@ import { CLAW_ASSISTANT_ATTENDED_TTL_SEC } from "../config.js";
 import { classifyAttendedCaller } from "../github-review/attended.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
 import type { DecidedVia } from "../github-review/store.js";
+import { redactStoredText, redactStoredValue } from "@claw/utils";
 import { db, type Querier } from "../infra/db.js";
 import { stopTurnRuns } from "../tasks/chat-run.js";
+import { messageSurface, recordSurfaceUsed } from "../notifications/surfaces.js";
+import { assistantNameOf } from "./assistant-name.js";
+import { timeZoneOf } from "./now.js";
+import { isChosenLanguage, type ChosenLanguage } from "./language.js";
+
+export { ASSISTANT_NAME_MAX, ASSISTANT_NAME_WORDS_MAX, assistantNameOf } from "./assistant-name.js";
 import { WORK_EVENT_PREFIX } from "./prompts.js";
 
 const logger = pino({ name: "assistant-inbound" });
@@ -52,13 +59,125 @@ export interface ChannelAction { name: string; usage?: string; summary?: string 
  */
 export const CHANNEL_HANDOFFS = ["review_for_other"] as const;
 export type ChannelHandoff = (typeof CHANNEL_HANDOFFS)[number];
+/**
+ * A file the person sent with the message, which the channel has already put in the assistant's session
+ * (`POST /v1/sessions/:id/upload`). `path` is where that upload stored it, relative to the session's `.uploads/` (as the upload
+ * answered it), and it is the only thing Claw reads the file by: always below this session's own `.uploads/`, so a channel cannot
+ * name anything else. The name, type and size are what the channel says, for the model to read.
+ */
+export interface ChannelFile { path: string; name: string; media_type?: string; size?: number }
+/** At most this many files of one message are taken (a channel that sends more has its first ones read). */
+export const CONTEXT_FILES_MAX = 10;
+const FILE_PATH_MAX = 300;
+
+/**
+ * The agent session on one of the person's machines that the chat this message came from is attached to (`channel_context.attached`,
+ * as a chat channel sends it): what the person types in that chat goes to that session, and only a message addressed to the
+ * assistant (or one sent on their behalf) comes here. `phase`: `watching` when the session only watches a conversation open in a
+ * terminal (read-only), else `attached`. The words are the channel's (its connector's and agent's names): grounding, never instructions.
+ */
+export interface ChannelAttached {
+  session_id: string;
+  connector?: string;
+  agent?: string;
+  agent_id?: string;
+  cwd?: string;
+  phase: "watching" | "attached";
+  busy: boolean;
+  conversation?: string;
+  /**
+   * Where the chat box goes while attached (the channel's `/agent mode card|chat`): `card`, the chat box stays with the assistant and the
+   * session card's own text box (or a reply quoting that card) goes to the session; `chat`, what is typed goes to the session. Absent:
+   * not said (a client from before it), read as `chat`.
+   */
+  chat_box?: "card" | "chat";
+}
+
+function parseAttached(raw: unknown): ChannelAttached | null | undefined {
+  if (raw === null) return null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const a = raw as Record<string, unknown>;
+  const sessionId = str(a.session_id);
+  if (!sessionId) return undefined;
+  const opt = (k: string, v: string | undefined) => (v ? { [k]: v } : {});
+  return {
+    session_id: sessionId,
+    ...opt("connector", str(a.connector)), ...opt("agent", str(a.agent)), ...opt("agent_id", str(a.agent_id)), ...opt("cwd", str(a.cwd)),
+    phase: a.phase === "watching" ? "watching" : "attached",
+    busy: a.busy === true,
+    ...opt("conversation", str(a.conversation)),
+    ...(a.chat_box === "card" || a.chat_box === "chat" ? { chat_box: a.chat_box } : {}),
+  };
+}
+
+/**
+ * How the message reached the chat it came from, when not typed there by the person (`channel_context.via`). `on_behalf`: the channel
+ * posted it into the person's own chat for them (the client's on-behalf endpoint, their coordinator's review request) and
+ * then handed it on as typed. Stored with the message so that what counts the person's own messages (a client's daily failure mining) can
+ * count these apart. A label the channel gives, kept to this closed set: it is read for counting only and widens nothing a turn may do.
+ */
+export const CHANNEL_VIAS = ["on_behalf"] as const;
+export type ChannelVia = (typeof CHANNEL_VIAS)[number];
+
 export interface ChannelContext {
+  /**
+   * The chat surface the message came from (`teams`, `slack`, ...): a reply of the turn answering it goes back there, and the
+   * person's proactive messages go to the surface they wrote from last (`notifications/surfaces.ts`). Absent: Teams.
+   */
   channel?: string;
+  /** How the message reached the chat (`ChannelVia`); absent: typed there, or not said. */
+  via?: ChannelVia;
   channel_message_id?: string;
   people: ChannelPerson[];
   actions: ChannelAction[];
   repos: string[];
   handoffs: ChannelHandoff[];
+  /** The files sent with the message (`ChannelFile`); empty when none were. */
+  files: ChannelFile[];
+  /** The session the chat is attached to (`ChannelAttached`); null: the channel says it is attached to none; absent: not said. */
+  attached?: ChannelAttached | null;
+  /**
+   * The language the person chose to be answered in, in the channel (its `/lang zh|en`); absent: they chose none (`/lang auto`, or a
+   * channel from before it), and the language is read from what they write (`language.ts`). The sender's own choice, in a group as well.
+   */
+  reply_language?: ChosenLanguage;
+  /**
+   * The name the client's people call the assistant by in this channel (its display name, `assistantNameOf`); absent: the client
+   * names none, and the assistant is told of itself without a name. Claw names no client itself: a name is only ever the client's.
+   */
+  assistant_name?: string;
+  /** The person's IANA time zone as their chat has it (`timeZoneOf`); absent: the chat names none (`now.ts` takes the default). */
+  timezone?: string;
+}
+
+/**
+ * A file's upload path as Claw reads it: relative to `.uploads/`, no `..` or empty segment, no backslash or control character, no
+ * leading slash. Null for anything else, which names no file.
+ */
+export function uploadPathOf(raw: unknown): string | null {
+  if (typeof raw !== "string" || !raw || raw.length > FILE_PATH_MAX) return null;
+  if (/[\u0000-\u001f\u007f\\]/.test(raw)) return null;
+  return raw.split("/").some((s) => s === "" || s === "." || s === "..") ? null : raw;
+}
+
+function parseFiles(raw: unknown): ChannelFile[] {
+  const files: ChannelFile[] = [];
+  const seen = new Set<string>();
+  for (const f of objects(raw)) {
+    const path = uploadPathOf(f.path);
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    const name = str(f.name) ?? path.slice(path.lastIndexOf("/") + 1).slice(0, CONTEXT_STRING_MAX);
+    const mediaType = str(f.media_type);
+    const size = typeof f.size === "number" && Number.isSafeInteger(f.size) && f.size >= 0 ? f.size : undefined;
+    files.push({
+      path, name,
+      ...(mediaType && /^[\w.+-]+\/[\w.+-]+$/.test(mediaType) ? { media_type: mediaType.toLowerCase() } : {}),
+      ...(size !== undefined ? { size } : {}),
+    });
+    if (files.length >= CONTEXT_FILES_MAX) break;
+  }
+  return files;
 }
 
 export type AttendedVia = { kind: "person" } | { kind: "service"; client_id: string; act_sub: string };
@@ -98,10 +217,52 @@ export function parseChannelContext(raw: unknown): ChannelContext {
   const handoffs = CHANNEL_HANDOFFS.filter((h) => Array.isArray(c.handoffs) && c.handoffs.includes(h));
   const channel = str(c.channel);
   const channelMessageId = str(c.channel_message_id);
+  const attached = parseAttached(c.attached);
+  const via = CHANNEL_VIAS.find((v) => v === c.via);
+  const assistantName = assistantNameOf(c.assistant_name);
+  const timezone = timeZoneOf(c.timezone);
   return {
-    ...(channel ? { channel } : {}), ...(channelMessageId ? { channel_message_id: channelMessageId } : {}),
-    people, actions, repos, handoffs,
+    ...(channel ? { channel } : {}), ...(via ? { via } : {}), ...(channelMessageId ? { channel_message_id: channelMessageId } : {}),
+    people, actions, repos, handoffs, files: parseFiles(c.files),
+    ...(attached !== undefined ? { attached } : {}),
+    ...(isChosenLanguage(c.reply_language) ? { reply_language: c.reply_language } : {}),
+    ...(assistantName ? { assistant_name: assistantName } : {}),
+    ...(timezone ? { timezone } : {}),
   };
+}
+
+/**
+ * What the channel told of the chat, as of the turn answering `messageId`: the language the person chose to be answered in
+ * (`ChannelContext.reply_language`; nothing said is no choice, `/lang auto` included), the channel the message came through
+ * (`ChannelContext.channel`; undefined when it names none) and the name the client calls the assistant by there
+ * (`ChannelContext.assistant_name`; undefined when it names none). All from that message's row; a turn that answers no message of
+ * theirs (a worker's report woke the assistant), or whose message has no row, follows their latest message to it.
+ */
+export async function turnChannelTold(
+  q: Querier, sessionId: string, messageId: string | null,
+): Promise<{ chosen: ChosenLanguage | null; channel: string | undefined; assistantName: string | undefined }> {
+  const select = "SELECT channel_context->>'reply_language' AS chosen, channel_context->>'channel' AS channel, "
+    + "channel_context->>'assistant_name' AS assistant_name FROM claw_assistant_messages WHERE session_id = $1";
+  type Row = { chosen: unknown; channel: unknown; assistant_name?: unknown };
+  let row: Row | undefined = messageId
+    ? (await q(`${select} AND message_id = $2`, [sessionId, messageId])).rows[0] as Row | undefined
+    : undefined;
+  row ??= (await q(`${select} ORDER BY received_at DESC LIMIT 1`, [sessionId])).rows[0] as Row | undefined;
+  const chosen = row?.chosen;
+  const channel = row?.channel;
+  return {
+    chosen: isChosenLanguage(chosen) ? chosen : null,
+    channel: typeof channel === "string" && channel ? channel : undefined,
+    assistantName: assistantNameOf(row?.assistant_name),
+  };
+}
+
+/**
+ * The language the person chose to be answered in, as of the turn answering `messageId` (`turnChannelTold`). Null: no choice, and
+ * the language is read from their words.
+ */
+export async function chosenReplyLanguage(q: Querier, sessionId: string, messageId: string | null): Promise<ChosenLanguage | null> {
+  return (await turnChannelTold(q, sessionId, messageId)).chosen;
 }
 
 /**
@@ -121,7 +282,9 @@ export function decidedViaOf(via: AttendedVia): DecidedVia | null {
 
 /**
  * Write down a message the user sent to their own assistant, inside the transaction that accepts it. Nothing for any
- * other session: the row is what makes a router turn able to act, and only a router turn reads it.
+ * other session: the row is what makes a router turn able to act, and only a router turn reads it. The words and the channel's
+ * context are stored with credential-shaped content masked (`redactStoredText`, `redactStoredValue`); the turn's prompt is the
+ * queued message, which is not.
  */
 export async function recordAssistantMessage(tx: PoolClient, m: {
   sessionId: string; messageId: string; userId: string; userName?: string; content: string; attendedVia: AttendedVia | null; context: ChannelContext;
@@ -131,7 +294,7 @@ export async function recordAssistantMessage(tx: PoolClient, m: {
      SELECT $1, $2, $3, $7, $4, $5::jsonb, $6::jsonb
       WHERE EXISTS (SELECT 1 FROM claw_assistants WHERE session_id = $1 AND user_id = $3)
      ON CONFLICT (session_id, message_id) DO NOTHING`,
-    [m.sessionId, m.messageId, m.userId, m.content, m.attendedVia ? JSON.stringify(m.attendedVia) : null, JSON.stringify(m.context),
+    [m.sessionId, m.messageId, m.userId, redactStoredText(m.content).text, m.attendedVia ? JSON.stringify(m.attendedVia) : null, JSON.stringify(redactStoredValue(m.context)),
       m.userName?.slice(0, CONTEXT_STRING_MAX) || null],
   );
   if (inserted.rowCount) {
@@ -139,6 +302,9 @@ export async function recordAssistantMessage(tx: PoolClient, m: {
       `DELETE FROM claw_assistant_messages WHERE session_id = $1 AND received_at < NOW() - $2::interval`,
       [m.sessionId, MESSAGE_RETENTION],
     );
+    // The surface it came from (a channel that names none is Teams): where the person is reached when no message of theirs started
+    // what is said (`preferredSurfaces`).
+    await recordSurfaceUsed((text, params) => tx.query(text, params), m.userId, messageSurface(m.context.channel));
   }
 }
 
@@ -180,6 +346,28 @@ export async function turnMessage(q: Querier, sessionId: string, messageId: stri
 }
 
 /**
+ * The turn answering this message was refused something only the person may do because the message came with a key, not with a
+ * confirmed identity (`not_attended`). Only such a message is marked (attended_via NULL), so a say of the turn can tell the channel to
+ * offer the person to confirm their identity once (`needs_identity`).
+ */
+export async function markIdentityRefused(q: Querier, sessionId: string, messageId: string): Promise<void> {
+  await q(
+    `UPDATE claw_assistant_messages SET identity_refused_at = NOW()
+      WHERE session_id = $1 AND message_id = $2 AND attended_via IS NULL AND identity_refused_at IS NULL`,
+    [sessionId, messageId],
+  );
+}
+
+/** Whether the turn answering this message was refused for want of a confirmed identity ({@link markIdentityRefused}). */
+export async function identityRefused(q: Querier, sessionId: string, messageId: string): Promise<boolean> {
+  const row = (await q(
+    "SELECT 1 AS x FROM claw_assistant_messages WHERE session_id = $1 AND message_id = $2 AND identity_refused_at IS NOT NULL",
+    [sessionId, messageId],
+  )).rows[0];
+  return row !== undefined;
+}
+
+/**
  * The turn answering this message has read text a worker or a page wrote (`work_recall`). The person's say covers what
  * they wrote, not what the model read afterwards, so the turn stops acting for them (`attendedTurn` refuses).
  */
@@ -192,9 +380,10 @@ export async function markUntrustedRead(q: Querier, sessionId: string, messageId
 
 /**
  * A user's message takes priority over a worker's report: stop the router turn that is reading a report so the
- * message queued behind it runs now. The report is not lost: it is on the item, which the next turn's list shows, and
- * an item that needs the user and was not announced is the silent sweep's. A turn that answers the user is never
- * stopped for another of their messages.
+ * message queued behind it runs now. The report is not lost: it is on the item, which the next turn's list shows; an
+ * answer the stopped turn did not say is said by the system when the turn ends (`tellUnsaidAnswers`), and an item that
+ * needs the user and was not announced is the silent sweep's. A turn that answers the user is never stopped for another
+ * of their messages.
  */
 export async function preemptReportTurn(sessionId: string): Promise<boolean> {
   const turn = (await db.query(

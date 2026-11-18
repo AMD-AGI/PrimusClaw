@@ -13,8 +13,8 @@ controlplane:
   enabled: true
   replicas: 1
   image:
-    repository: primussafe/agent-sandbox-controlplane
-    tag: latest                       # override per-release: --set controlplane.image.tag=<yyyymmddhhmm>
+    repository: docker.io/rocm/primusclaw
+    tag: agent-sandbox-controlplane-latest  # a release pins agent-sandbox-controlplane-<version>
     pullPolicy: IfNotPresent
   ports:
     router: 8080
@@ -35,7 +35,7 @@ controlplane:
   config:
     leaderElect: true
     extensions: true
-    envdInjectorImage: "primussafe/agent-sandbox-envd-injector:latest"
+    envdInjectorImage: "docker.io/rocm/primusclaw:agent-sandbox-envd-injector-latest"
     auditEnabled: true
     auditRetentionDays: 30
     sandboxImageRegistry: ""
@@ -57,30 +57,55 @@ controlplane:
     # image (built with EXTRA_CA_CERT_URLS) and fails the same way if it is empty.
     sandboxExtraCAConfigMap: ""
     sandboxExtraCARequired: false
-    # Identity provider introspection client. introspectUrl alone checks the
-    # /v1 caller credential when router.config.enableAuth is true.
-    # Identity provider keys on the E2B API are enabled when
-    # introspectUrl and ownerPolicyConfigMap are both set. The client Secret
-    # holds client_id and client_secret; the identity provider creates that
-    # Secret once in this namespace and does not rotate it. The ConfigMap key
-    # policy.json holds the owner quota policy.
-    # The policy is read at startup: a ConfigMap change needs a rollout restart.
+    # Identity provider introspection client. introspectUrl checks the /v1
+    # caller credential when router.config.enableAuth is true, and checks
+    # identity keys on the E2B API. The client Secret holds client_id and
+    # client_secret; the identity provider creates that Secret once in this
+    # namespace and does not rotate it.
+    # ownerPolicyConfigMap names a ConfigMap whose key policy.json holds the
+    # owner quota and template policy: the templates identity keys may use,
+    # and the quotas. It is used only when introspectUrl is set. Without it,
+    # identity keys get 503 owner_policy_not_applied on the E2B API; a rejected
+    # policy gives 500 owner_policy_invalid.
+    # Every replica reloads the ConfigMap every 15 seconds and applies a changed
+    # policy. A system-admin manages its templates through
+    # /v1/admin/owner-policy/templates, which rewrites the ConfigMap.
     # The policy role must match the role of existing owner records.
     # A quota field left out keeps the built-in value; one left out of an owners
     # entry comes from the default or admin quota of that user.
     identity:
       introspectUrl: ""
-      # tokenUrl is the identity provider token endpoint. It is used only with
-      # identity keys: an identity-key create exchanges the caller's key there
-      # for an assertion bound to the Workload (RFC 8693, requested_token_type
-      # jwt) and copies it onto the Workload. assertionAudience and
-      # assertionDetailType are its aud and authorization_details type; they
-      # match the admission constraint.
+      # tokenUrl is the identity provider token endpoint. An identity-key sandbox
+      # exchanges the caller's key there for an assertion. With attestWorkloads,
+      # every sandbox create does, using the caller's key or the grant's platform
+      # key (RFC 8693, requested_token_type jwt). Off by default. Turn this on
+      # before rbac.workspaceSAR, and turn SaFE sandbox.admission on last.
+      # assertionAudience and assertionDetailType are its aud and
+      # authorization_details type; they match the admission constraint.
       tokenUrl: ""
+      attestWorkloads: false
       assertionAudience: "agent-sandbox-admission"
       assertionDetailType: "agent-sandbox-workload"
       clientSecret: "agent-sandbox-identity-client"
       ownerPolicyConfigMap: ""
+    # Workspace and platform permission come from SubjectAccessReview on the
+    # identity subject once workspaceSAR is true. Until then the platform role is
+    # read from the token and from the SaFE User, and the workspaces listed on the
+    # SaFE User decide workspace use. Turn this on after identity.attestWorkloads,
+    # and turn SaFE sandbox.admission on last.
+    # subjectPrefix is prepended to the identity user id and to each identity
+    # group (RBAC_SUBJECT_PREFIX); it must not be empty when workspaceSAR is true
+    # and must match the prefix SaFE uses for its RBAC projection. The platform
+    # ClusterRoles of this chart are bound to
+    # Group <subjectPrefix><adminGroup> and <subjectPrefix><viewerGroup>.
+    # adminGroup and viewerGroup are the identity group names, without the prefix.
+    # A builtin identity has no Group subjects, so those bindings apply when SaFE
+    # projects external groups. subjectPrefix must equal SaFE rbac.subject_prefix.
+    rbac:
+      subjectPrefix: "primus:"
+      adminGroup: system-admin
+      viewerGroup: system-admin-readonly
+      workspaceSAR: false
   # Graceful drain on rollout or eviction, in Kubernetes order:
   #  1. preStop sleeps preStopSleepSeconds while the Pod, already terminating,
   #     is removed from the Service endpoints and the gateway stops routing to
@@ -139,7 +164,9 @@ router:
     maxConcurrentRequests: 1000
     # false leaves the Router and Workload Manager with NO auth middleware at
     # all — not a weaker check, none. Set true in production; it requires
-    # controlplane.config.identity.introspectUrl and its client Secret.
+    # controlplane.config.identity.introspectUrl and its client Secret; the
+    # process exits when they are missing. controlplane.config.identity.attestWorkloads
+    # additionally requires controlplane.config.identity.tokenUrl.
     enableAuth: false
     # true makes a cluster Router accept /v1 only as invocations forwarded by the
     # managing Router and refuse the E2B control plane, which the managing
@@ -149,7 +176,6 @@ router:
     # SANDBOX_UPSTREAM_PUBLIC_KEY is set only on a cluster Router in multi-cluster
     # mode; a single-cluster deployment leaves it unset.
     upstreamOnly: ""
-    safeApiUrl: ""                # grant identity check (SAFE_API_URL); not used for /v1 auth
     # Label selector (kubectl -l syntax) of the namespaces the Router and the
     # Workload Manager serve, e.g. "example.com/sandbox=enabled". A request for
     # a namespace that does not match gets 403 namespace_not_admitted (not 404,
@@ -160,9 +186,12 @@ router:
     # When set, the chart grants get/list/watch on namespaces, and the Router
     # reports not-ready until its namespace cache has synced.
     # Label every namespace clients use, including the implicit ones: a sandbox
-    # created without a namespace goes to the release namespace, while a
-    # template created without one goes to "default". If clients rely on
-    # either default, label that namespace too, or their requests get 403.
+    # created without a namespace goes to the release namespace, and a template
+    # created without one goes to "default". With caller auth, every non-admin
+    # template is stored in the release namespace with a workspace label, so
+    # the release namespace must match the selector or those creates get 403
+    # namespace_not_admitted. If clients rely on a default, label that
+    # namespace too.
     namespaceSelector: ""
   # Optional Ingress with ONE static Prefix path to the Router Service, so a
   # new workspace needs a namespace label rather than a new Ingress path.
@@ -178,6 +207,39 @@ router:
     host: ""                      # empty = match any host
     path: /v1/namespaces/         # must start with /v1/namespaces/ (the chart refuses anything wider)
     annotations: {}
+  # Public E2B routes on an existing host. Rendered with the release, so a
+  # helm upgrade publishes them. Paths are absolute: E2B does not use a prefix.
+  # Each path must be one of the defaults below or a path under one.
+  # /v1/templates requires router.config.enableAuth and
+  # router.config.namespaceSelector. Through it an authenticated non-admin
+  # creates private templates for its SaFE workspaces, stored in the release
+  # namespace, which must therefore match the selector; host-level fields and
+  # dockerfile builds need system-admin, as do public templates.
+  publicIngress:
+    enabled: false
+    name: agent-sandbox-public
+    className: higress
+    hosts: []
+    paths:
+      - /sandboxes
+      - /v2/sandboxes
+      - /files
+      - /api/files
+      - /process.Process
+      - /filesystem.Filesystem
+      - /v1/templates
+    annotations:
+      higress.io/route-priority: "100"
+      higress.io/ignore-path-case: "false"
+      higress.io/proxy-body-size: "0"
+      higress.io/proxy-buffering: "off"
+      higress.io/proxy-read-timeout: "3600"
+      higress.io/proxy-send-timeout: "3600"
+      higress.io/timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-body-size: "0"
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
   extraEnv: []
 
 # ── Workload Manager (merged into controlplane; only config/extraEnv are consumed) ──
@@ -185,7 +247,6 @@ workloadmanager:
   config:
     # Mirrors router.config.enableAuth (the control plane copies it at startup).
     enableAuth: false
-    safeApiUrl: ""
     gcInterval: 15s
     defaultTTL: 24h
   extraEnv: []

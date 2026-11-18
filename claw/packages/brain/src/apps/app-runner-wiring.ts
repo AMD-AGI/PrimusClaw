@@ -13,21 +13,27 @@ import {
 import { appMcpSeams } from "./app-mcp.js";
 import { httpAppRunStore, type AppRunRecord, type AppRunStore } from "./app-run-store.js";
 import { createEventTailer } from "./event-tailer.js";
+import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import {
-  appSandboxInstance, ensureAppSandbox, findLiveAppSandboxes, readSandboxNodeName,
+  appSandboxInstance, appSandboxNamespace, createAppReaderSandbox, ensureAppSandbox, findLiveAppSandboxes, readSandboxNodeName,
+  workspaceUserDataRoots,
 } from "./app-sandbox.js";
+import { isKubernetesMode } from "../config.js";
 
 export function realAppSandbox(store: AppRunStore): AppSandboxOps {
   return {
-    ensure: (run) => ensureAppSandbox(run, {
+    ensure: (run, opts) => ensureAppSandbox(run, {
       recordWorkloadId: async (runId, workloadId) => { await store.patch(runId, { sandbox_workload_id: workloadId }); },
-    }),
+    }, opts),
+    reader: (run, opts) => createAppReaderSandbox(run, {}, opts),
     instance: appSandboxInstance,
     status: (inst) => getSafeWorkloadProvider().get(inst),
     exec: (inst, command, timeout, opts) => getSafeWorkloadProvider().exec(inst, command, timeout, undefined, opts),
     stop: (inst) => getSafeWorkloadProvider().stop(inst),
-    liveIds: async (runId, platformKey) => (await findLiveAppSandboxes(runId, platformKey)).map((w) => w.id),
+    liveIds: async (run, platformKey) => (await findLiveAppSandboxes(run.runId, platformKey, appSandboxNamespace(run))).map((w) => w.id),
     nodeName: (workloadId, platformKey) => readSandboxNodeName(workloadId, platformKey),
+    // Kubernetes mode has no SaFE workspace to read, and nothing is derived there.
+    userDataRoots: async (run, platformKey) => (isKubernetesMode() ? { roots: [] } : workspaceUserDataRoots(appSandboxNamespace(run), platformKey)),
   };
 }
 
@@ -47,7 +53,7 @@ export type AppEventPublisher = (sessionId: string, event: Record<string, unknow
 export function publicLastExit(exit: AppRunRecord["last_exit"]): Record<string, unknown> | null {
   if (!exit) return null;
   const out: Record<string, unknown> = {};
-  for (const key of ["at", "cause", "final", "returncode", "stop_reason", "error"] as const) {
+  for (const key of ["at", "cause", "final", "returncode", "stop_reason", "error", "platform_losses"] as const) {
     if (exit[key] !== undefined) out[key] = exit[key];
   }
   return out;
@@ -88,5 +94,16 @@ export function createAppRunner(runId: string, platformKey: string, claimCount: 
   const sandbox = realAppSandbox(store);
   return new AppRunner(runId, platformKey, {
     store, sandbox, claimCount, grant: boundGrant, seams: { ...eventForwardingSeams(store, sandbox, publish), ...boundSeams },
+    sessionDeleted: sessionWasDeleted,
   });
+}
+
+/**
+ * The deletion tombstone, as the dispatcher reads it: this replica's memory of a
+ * cleanup notification first, then the durable bucket a takeover Brain has to ask.
+ * Imported when asked, because the dispatcher imports the task runner that imports this.
+ */
+async function sessionWasDeleted(sessionId: string): Promise<boolean> {
+  if (isSessionDeletedLocally(sessionId)) return true;
+  return (await import("../tasks/dispatch.js")).sessionWasDeleted(sessionId);
 }

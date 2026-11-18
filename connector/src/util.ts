@@ -41,11 +41,17 @@ export interface Logger {
   error(msg: string, extra?: Record<string, unknown>): void;
 }
 
+let writeLogLine: (line: string) => void = (l) => { process.stderr.write(l + "\n"); };
+/** Where {@link logLine} writes: the command line sets a writer that survives a log file it cannot write (logsink.ts). */
+export function setLogLine(w: (line: string) => void): void { writeLogLine = w; }
+/** One line of the connector's own log (stderr). */
+export const logLine = (line: string): void => writeLogLine(line);
+
 /** One line per record on stderr; the connector's own log, never an adapter's. */
 export const stderrLogger = (quiet = false): Logger => {
   const w = (level: string) => (msg: string, extra?: Record<string, unknown>) => {
     if (quiet && level === "info") return;
-    process.stderr.write(`${new Date().toISOString()} ${level} ${msg}${extra ? " " + JSON.stringify(extra) : ""}\n`);
+    logLine(`${new Date().toISOString()} ${level} ${msg}${extra ? " " + JSON.stringify(extra) : ""}`);
   };
   return { info: w("info"), warn: w("warn"), error: w("error") };
 };
@@ -68,3 +74,17 @@ export function secureUrl(raw: string, what: string): string {
   }
   return raw.replace(/\/+$/, "");
 }
+
+/**
+ * Whether a command may still act, asked when it is about to (connector.ts `gateFor`): `run` at once on the usual path, or Claw's
+ * answer after a stall. `drop`: refused, and reported already; the caller only counts the command as handled. `keep`: no answer
+ * because the connector is stopping; the command is neither run nor counted as handled, so the next run gets it again.
+ */
+export type Verdict = "run" | "drop" | "keep";
+export type MayRun = () => Verdict | Promise<Verdict>;
+
+/** `mayRun`'s answer, awaited only when it is one to wait for: the usual path asks nothing and waits for no I/O. */
+export const verdictOf = async (mayRun: MayRun): Promise<Verdict> => {
+  const r = mayRun();
+  return typeof r === "string" ? r : await r;
+};

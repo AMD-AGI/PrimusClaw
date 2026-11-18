@@ -31,15 +31,17 @@ import {
 import { identityClient } from "../auth/identity.js";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
-import { CLAW_GITHUB_REVIEW_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_REVIEW_MODEL, CLAW_GITHUB_REVIEW_ENABLED, MEMORY_LLM_MODEL } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
+import { callLlmText } from "../llm/client.js";
 import { parseActingAs } from "./acting-as.js";
 import { classifyAttendedCaller } from "./attended.js";
-import { mergeNeedsConfirmationOf, reviewOnlyOf, reviewTargetOf } from "./review-target.js";
+import { mergeRulesOf, reviewTargetOf } from "./review-target.js";
 import { SECTIONS } from "./pages.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
 import { HOLD_GUIDANCE } from "./risk.js";
+import { latestPrSummary, PR_SUMMARY_MAX_CJK, PR_SUMMARY_MAX_OTHER } from "./pr-summary.js";
 import {
   REVIEW_MODES, getConfirmation, getReviewMode, listConfirmations, setReviewMode, type ConfirmationStatus, type DecidedVia, type Queryable, type ReviewMode,
 } from "./store.js";
@@ -67,6 +69,10 @@ const JUDGEMENT = z.object({
   + "the evidence in gh_pr_get's `risk`; `hard_holds` there hold whatever you say. When the acting user's "
   + "`review_mode` is `fully_auto` (their own setting), only `repo_holds`, what the repository itself requires, hold"
   + ". " + HOLD_GUIDANCE);
+const PR_SUMMARY = z.string().optional().describe(
+  "One plain sentence of what this pull request does, as you read it in the diff (not your verdict, not the title copied): at most about "
+  + `${PR_SUMMARY_MAX_CJK} Chinese or ${PR_SUMMARY_MAX_OTHER} English characters, in the language you write your answer in (the language of the person who asked). `
+  + "It is shown with your conclusion to the person who asked and on the acting user's confirmation; a longer one is cut");
 
 function toResult(outcome: ToolOutcome): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
   return { content: [{ type: "text" as const, text: outcome.text }], ...(outcome.isError ? { isError: true } : {}) };
@@ -116,11 +122,20 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor,
       head_sha: z.string().describe("The head_sha from gh_pr_get; a pull request that has moved is refused"),
       event: z.enum(["COMMENT", "REQUEST_CHANGES", "APPROVE"]),
       body: z.string().describe("The review summary, a few sentences"),
+      pr_summary: PR_SUMMARY,
       risk_flags: FLAGS,
       risk_judgement: JUDGEMENT,
       comments: z.array(z.object({
         path: z.string(), line: z.number().int(), side: z.enum(["RIGHT", "LEFT"]).optional(), body: z.string(),
+        existing_code: z.string().optional().describe("The line or few lines of the head the comment is about, copied exactly: they place it when the line number is off"),
       })).max(30).optional().describe("Inline comments; each must be on a line the diff shows"),
+      non_blocking: z.array(z.object({
+        path: z.string(), line: z.number().int().nullable().optional(), body: z.string(),
+        existing_code: z.string().optional().describe("The code of the head the note is about, copied exactly"),
+      })).max(30).optional().describe("Non-blocking suggestions and open questions, one each: they are listed under the review body, not posted inline"),
+      coverage: z.array(z.object({
+        path: z.string(), status: z.enum(["reviewed", "skipped"]), note: z.string().optional(),
+      })).max(3000).optional().describe("A conclusion for every file in coverage.required of gh_pr_get: reviewed, or skipped with the reason in note (deep review)"),
     },
     async (a) => toResult(await service.submitReview(actor, a)),
   );
@@ -136,6 +151,7 @@ export function buildReviewToolServer(service: GithubReview, actor: ReviewActor,
       pr: z.string().describe(PR_HELP),
       head_sha: z.string().describe("The head_sha from gh_pr_get"),
       method: z.enum(["squash", "merge", "rebase"]).optional().describe("Default: the repository's first allowed method, squash first"),
+      pr_summary: PR_SUMMARY,
       risk_flags: FLAGS,
       risk_judgement: JUDGEMENT,
     },
@@ -168,6 +184,10 @@ function newGithubReview(settings: () => GithubReviewSettings, database: Queryab
   return new GithubReview({
     settings, db: database, sessionStopped: reviewSessionStopped,
     ...reviewItemServiceDeps(),
+    // The independent finding check runs on the review's own model, on behalf of the person who asked for the review.
+    completeFindingCheck: (call, signal, requesterUserId) => callLlmText(requesterUserId, call.prompt, {
+      system: call.system, model: CLAW_ASSISTANT_REVIEW_MODEL || MEMORY_LLM_MODEL, maxTokens: 16_000, signal,
+    }),
     resolveCredential: async (req) => {
       const client = identityClient();
       if (!client) throw new IdentityUnavailableError("credential", "not_configured");
@@ -224,6 +244,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
   reviewItemPorts.checkPullRequest = (actor, ref) => service.checkPullRequest(actor, ref);
   // And ask whether the acting user lets others act for them, when a review is asked of them and before each of its turns.
   reviewItemPorts.delegationOf = typeof service.delegationOf === "function" ? (actor, requester) => service.delegationOf(actor, requester) : null;
+  reviewItemPorts.followPullRequest = typeof service.followPullRequest === "function" ? (f) => service.followPullRequest(f) : null;
 
   app.all("/v1/internal/github-review/mcp", async (req, reply) => {
     const header = String(req.headers.authorization ?? "");
@@ -258,7 +279,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     const continuation = reviewItemsEnabled() ? await reviewContinuationOf(claims.sessionId).catch(() => null) : null;
     const mcp = buildReviewToolServer(service, {
       sessionId: claims.sessionId, requesterUserId: claims.requesterUserId, actorUserId: claims.actorUserId, requesterLabel: label, reviewTarget: target.target,
-      reviewOnly: reviewOnlyOf(row.config), mergeNeedsConfirmation: mergeNeedsConfirmationOf(row.config),
+      ...mergeRulesOf(row.config),
     }, { resolvable: continuation?.findings.some((f) => f.thread_id !== null && !f.resolved) === true });
     // Stateless, like the platform's own MCP endpoint: one server and transport per request.
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as unknown as () => string });
@@ -277,12 +298,22 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     const q = (req.query ?? {}) as { session_id?: string; status?: string };
     const status = q.status === undefined ? "pending" : q.status;
     if (!CONFIRMATION_STATUSES.has(status)) return refuse(reply, 400, "status is not valid");
-    const items = (await listConfirmations(database, user.userId, {
+    const rows = await listConfirmations(database, user.userId, {
       sessionId: typeof q.session_id === "string" && q.session_id ? q.session_id : undefined, status: status as ConfirmationStatus,
-    })).map((c) => ({
+    });
+    // The sentence of what the pull request does that the session gave with its review or merge call of THAT pull request, read per
+    // confirmation (a listing is a few rows): the card that asks the acting user shows it beside the verdict. A session that acted on
+    // several pull requests never lends one's sentence to another's card. A read that fails leaves it out, never the listing.
+    const summaries = new Map<string, string | null>();
+    for (const c of rows) {
+      const key = JSON.stringify([c.sessionId, c.repo.toLowerCase(), c.pr]);
+      if (!summaries.has(key)) summaries.set(key, await latestPrSummary(database, c.sessionId, c.repo, c.pr).catch(() => null));
+    }
+    const items = rows.map((c) => ({
       id: c.id, kind: c.kind, review: c.review, repo: c.repo, pr: c.pr, title: c.title, author: c.author, head_sha: c.headSha, reasons: c.reasons, checks: c.checks,
       actor_user_id: c.actorUserId, requester_user_id: c.requesterUserId, session_id: c.sessionId, expires_at: c.expiresAt, status: c.status,
       decided_by: c.decidedBy, decided_via: c.decidedVia,
+      pr_summary: summaries.get(JSON.stringify([c.sessionId, c.repo.toLowerCase(), c.pr])) ?? null,
     }));
     return { ok: true, items, data: { items } };
   });

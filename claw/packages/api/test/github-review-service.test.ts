@@ -14,7 +14,7 @@
  *   S  one review, once, on lines the diff shows
  *   M  the merge gates: CI, threads, GitHub's own state, approval
  *   C  high risk: a merge waits for the acting user, once, on that commit
- *   W  the dry-run switch, rate limits and the request budget
+ *   W  the dry-run switch, rate limits and the request budget (which the server's own calls never count against)
  *   I  the identity provider failing, and the audit trail
  *   T  the token: nowhere it should not be
  */
@@ -22,6 +22,7 @@ import assert from "node:assert/strict";
 import test, { after, afterEach, beforeEach, describe, mock } from "node:test";
 import { IdentityCredentialRefusedError } from "@claw/utils";
 import { LEGACY_RUN_MARKER_PREFIX } from "../src/github-review/legacy-names.js";
+import { MAX_PENDING_CONFIRMATIONS } from "../src/github-review/service.js";
 import { HEAD } from "./support/fake-github.js";
 import { PR, REQUESTER_TOKEN, TOKEN, closeShared, credential, directory, down, expired, ownApproval, readSection, reviewEnv, reviewedHead, subAgentEnded, unbound, type ReviewEnv } from "./support/review-env.js";
 
@@ -541,7 +542,11 @@ describe("M the merge gates", () => {
       ["required check never reported", () => { e.gh.checkRuns = [{ name: "lint", status: "completed", conclusion: "success" }]; }],
       ["no check at all", () => { e.gh.checkRuns = []; e.gh.statuses = []; e.gh.rules = []; }],
       ["rules unreadable", () => { e.gh.rulesStatus = 404; }],
-      ["a failing status next to a green check", () => { e.gh.statuses = [{ context: "ci/other", state: "failure" }]; }],
+      ["a failing status next to a green check, where the rules require nothing", () => { e.gh.statuses = [{ context: "ci/other", state: "failure" }]; e.gh.rules = []; }],
+      ["a failing required check next to a failing one that is not required", () => {
+        e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "failure" }]; e.gh.statuses = [{ context: "codecov/patch", state: "failure" }];
+      }],
+      ["a check not required that has not finished", () => { e.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "success" }, { name: "e2e", status: "queued", conclusion: null }]; }],
     ];
     for (const [name, arrange] of cases) {
       e = await reviewEnv(); allowed();
@@ -551,6 +556,40 @@ describe("M the merge gates", () => {
       assert.equal(reason(o), "ci_not_green", name);
       assert.equal(e.gh.writes.length, 0, name);
     }
+  });
+
+  test("M3b a failed check the base branch does not require is advisory: GitHub's UNSTABLE for it merges, as GitHub would (Primus-SaFE#873, codecov/patch)", async () => {
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.statuses = [{ context: "codecov/patch", state: "failure" }];
+    e.gh.graphql.mergeStateStatus = "UNSTABLE";
+    const o = await merge();
+    assert.equal(reason(o), "merged", JSON.stringify(o.body));
+    assert.equal(puts().length, 1);
+    // Where only the classic branch protection requires something (the rulesets nothing), a failure it does not require is advisory too.
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.rules = [];
+    e.gh.branch = { protected: true, protection: { required_status_checks: { enforcement_level: "non_admins", contexts: ["test"], checks: [] } } };
+    e.gh.statuses = [{ context: "codecov/patch", state: "failure" }];
+    e.gh.graphql.mergeStateStatus = "UNSTABLE";
+    assert.equal(reason(await merge()), "merged");
+    // A check only the classic branch protection requires is not advisory (the rulesets read does not see it), nor is any failure when
+    // that protection cannot be read.
+    for (const arrange of [
+      () => { e.gh.branch = { protected: true, protection: { required_status_checks: { enforcement_level: "non_admins", contexts: ["codecov/patch"], checks: [] } } }; },
+      () => { e.gh.branchStatus = 404; },
+    ]) {
+      e = await reviewEnv({}, { approved: true }); allowed();
+      e.gh.statuses = [{ context: "codecov/patch", state: "failure" }];
+      e.gh.graphql.mergeStateStatus = "UNSTABLE";
+      arrange();
+      assert.equal(reason(await merge()), "ci_not_green");
+      assert.equal(puts().length, 0);
+    }
+    // UNSTABLE with nothing advisory to explain it is still not a merge state this reads as open.
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.graphql.mergeStateStatus = "UNSTABLE";
+    assert.equal(reason(await merge()), "merge_state_not_clean");
+    assert.equal(puts().length, 0);
   });
 
   test("M4 unresolved review threads stop the merge, and so do more threads than could be read", async () => {
@@ -614,6 +653,69 @@ describe("M the merge gates", () => {
     const o = await merge();
     assert.equal(reason(o), "not_mergeable");
     assert.equal(o.isError, true);
+  });
+
+  test("M8b GitHub's 405 \"Base branch was modified\" (another merge landed a moment before) is retried after 1 s and then 2 s, the same head and method each time; a third one, or any other 405, is reported as not_mergeable", async () => {
+    const moved = { status: 405, message: "Base branch was modified. Review and try the merge again." };
+    const other = { status: 405, message: "Pull Request is not mergeable" };
+    // [name, what the merges answer in order, expected reason, merge requests made, waits]
+    const cases: Array<[string, Array<{ status: number; message: string }>, string, number, number[]]> = [
+      ["moved once, then merged", [moved, { status: 200, message: "" }], "merged", 2, [1000]],
+      ["moved twice, then merged", [moved, moved, { status: 200, message: "" }], "merged", 3, [1000, 2000]],
+      ["moved three times: refused after two retries", [moved, moved, moved, { status: 200, message: "" }], "not_mergeable", 3, [1000, 2000]],
+      ["another 405 is not retried", [other, { status: 200, message: "" }], "not_mergeable", 1, []],
+    ];
+    for (const [name, answers, expected, requests, waits] of cases) {
+      e.gh.graphql.mergeStateStatus = "CLEAN";
+      e.gh.reviews = [ownApproval(e.actor.sessionId)];
+      e.gh.mergeAnswers = [...answers];
+      e.gh.calls.length = 0;
+      e.sleeps.length = 0;
+      await e.sql("DELETE FROM claw_github_audit WHERE tool <> 'gh_pr_get'");
+      const o = await merge();
+      assert.equal(reason(o), expected, `${name}: ${o.text}`);
+      assert.equal(puts().length, requests, name);
+      for (const put of puts()) assert.deepEqual(put.body, { sha: HEAD, merge_method: "squash" }, name);
+      assert.deepEqual(e.sleeps, waits, name);
+    }
+  });
+
+  test("M8c a merge refused on GitHub's merge state records that state on its audit row (DIRTY: a conflict only the author resolves); a merge made records none", async () => {
+    e.gh.graphql.mergeStateStatus = "DIRTY";
+    approvedHere();
+    const o = await merge();
+    assert.equal(reason(o), "merge_state_not_clean", o.text);
+    const row = async () => (await e.sql("SELECT result, detail, merge_state FROM claw_github_audit WHERE tool = 'gh_pr_merge' ORDER BY id DESC LIMIT 1"))[0];
+    assert.deepEqual({ ...(await row()) }, { result: "refused", detail: "merge_state_not_clean", merge_state: "DIRTY" });
+    e.gh.graphql.mergeStateStatus = "CLEAN";
+    assert.equal(reason(await merge()), "merged");
+    assert.deepEqual({ ...(await row()) }, { result: "ok", detail: "merged", merge_state: null });
+  });
+
+  test("M8d GitHub's 403 for a pull request that changes a CI workflow file, with a token that has no `workflow` scope, is its own refusal: merge it by hand on GitHub, not bind again; any other 403 is still github_error", async () => {
+    const workflow = "refusing to allow an OAuth App to create or update workflow `.github/workflows/tests.yml` without `workflow` scope";
+    const row = async () => (await e.sql("SELECT result, detail FROM claw_github_audit WHERE tool = 'gh_pr_merge' ORDER BY id DESC LIMIT 1"))[0];
+    e.gh.graphql.mergeStateStatus = "CLEAN";
+    approvedHere();
+    e.gh.mergeAnswers = [{ status: 403, message: workflow }];
+    const o = await merge();
+    assert.equal(o.isError, true, o.text);
+    assert.equal(reason(o), "github_workflow_scope_missing", o.text);
+    assert.match(String(o.body.message), /changes CI workflow files/);
+    assert.match(String(o.body.message), /merged by hand on GitHub/);
+    assert.match(String(o.body.message), /do not suggest binding GitHub again/);
+    assert.equal(o.body.github_status, 403);
+    assert.match(String(o.body.github_message), /without `workflow` scope/);
+    assert.equal(puts().length, 1, "not retried");
+    assert.deepEqual({ ...(await row()) }, { result: "refused", detail: "github_workflow_scope_missing" });
+    // A GitHub App says `workflows` permission: the same refusal.
+    e.gh.mergeAnswers = [{ status: 403, message: "refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission" }];
+    assert.equal(reason(await merge()), "github_workflow_scope_missing");
+    // Another 403 is not this one.
+    e.gh.mergeAnswers = [{ status: 403, message: "Resource not accessible by integration" }];
+    const other = await merge();
+    assert.equal(reason(other), "github_error", other.text);
+    assert.deepEqual({ ...(await row()) }, { result: "refused", detail: "github_error" });
   });
 
   test("M16 GitHub works the merge state out after the approval a person's allow made, not at once: UNKNOWN, and BLOCKED while the review does not count yet, are waited for, a few seconds at most; the merge is made when it settles, and not otherwise", async () => {
@@ -1107,9 +1209,9 @@ describe("C high risk waits for the acting user", () => {
     assert.deepEqual(await pending(), []);
   });
 
-  test("C10 one acting user is not asked about more than ten merges at once", async () => {
+  test("C10 one acting user is not asked about more than MAX_PENDING_CONFIRMATIONS (30) merges at once", async () => {
     e.configure({ CLAW_GITHUB_REQUESTS_PER_SESSION: "1000" });
-    for (let n = 1; n <= 10; n++) {
+    for (let n = 1; n <= MAX_PENDING_CONFIRMATIONS; n++) {
       const sha = n.toString(16).padStart(2, "0").repeat(20);
       e.gh.pr.head = { ...e.gh.pr.head, sha };
       e.gh.graphql.headRefOid = sha;
@@ -1121,7 +1223,7 @@ describe("C high risk waits for the acting user", () => {
     e.gh.graphql.headRefOid = sha;
     await reviewedHead(e, { head: sha });
     assert.equal(reason(await merge({ head_sha: sha })), "too_many_pending_confirmations");
-    assert.equal((await pending()).length, 10);
+    assert.equal((await pending()).length, MAX_PENDING_CONFIRMATIONS);
     assert.equal(e.gh.writes.length, 0);
   });
 
@@ -1336,6 +1438,49 @@ describe("W dry run, limits and the budget", () => {
     const calls = e.gh.calls.length;
     await get();
     assert.equal(e.gh.calls.length, calls);
+  });
+
+  test("W3b the server's own follow-ups and the check before the first turn never count against the session's budget", async () => {
+    e = await reviewEnv({ CLAW_GITHUB_REQUESTS_PER_SESSION: "5" });
+    const { sessionRequestCount } = await import("../src/github-review/store.js");
+    const ref = { owner: "AMD-AGI", repo: "demo", number: 7 };
+    // The review item's sweep follows the pull request, as production does, far past the session's budget (a review item open for hours
+    // is followed hundreds of times), and the check made before the session's first turn is audited in it too.
+    for (let i = 0; i < 4; i += 1) {
+      const f = await e.service.followPullRequest({ sessionId: e.actor.sessionId, ref, actingUserId: "u-bob", requesterUserId: "u-alice", mergeByRequester: false });
+      assert.equal(f.body.status, "open", JSON.stringify(f.body));
+    }
+    assert.equal((await e.service.checkPullRequest(e.actor, ref)).isError, false);
+    const [server] = await e.sql(
+      "SELECT SUM(github_requests)::int AS n, BOOL_OR(budgeted) AS any_budgeted FROM claw_github_audit WHERE session_id = $1 AND tool IN ('gh_pr_follow', 'gh_pr_check')", [e.actor.sessionId]);
+    assert.ok(server.n > 5, `the server's own calls made ${server.n} requests`);
+    assert.equal(server.any_budgeted, false, "each is written as not held to the budget");
+    assert.equal(await sessionRequestCount(e.db, e.actor.sessionId), 0);
+    // So the session's own first read still has its whole budget, and the budget still holds for what the session itself asks.
+    const first = await get();
+    assert.equal(first.isError, false, first.text);
+    const own = await sessionRequestCount(e.db, e.actor.sessionId);
+    assert.ok(own >= 5, `the session's own read: ${own} requests`);
+    assert.equal(reason(await get()), "request_budget_exhausted");
+    // Rows written before the budget was marked on them (null): the server's follow-ups and checks are still left out, by name, and
+    // every other call still counts.
+    await e.sql("UPDATE claw_github_audit SET budgeted = NULL WHERE session_id = $1", [e.actor.sessionId]);
+    assert.equal(await sessionRequestCount(e.db, e.actor.sessionId), own);
+    await e.sql("UPDATE claw_github_audit SET budgeted = TRUE WHERE session_id = $1 AND tool = 'gh_pr_follow'", [e.actor.sessionId]);
+    assert.ok(await sessionRequestCount(e.db, e.actor.sessionId) > own + 5, "the control: counted, the follow-ups alone are past the budget");
+  });
+
+  test("W3c a person's answer to a held write is not held to the session's budget, and its requests do not count against it", async () => {
+    e = await reviewEnv({ CLAW_GITHUB_REQUESTS_PER_SESSION: "400" });
+    allowed();
+    const { sessionRequestCount } = await import("../src/github-review/store.js");
+    const before = await sessionRequestCount(e.db, e.actor.sessionId);
+    const r = await heldThenAllowed();
+    assert.equal(r.body.status, "merged", r.text);
+    const rows = await e.sql("SELECT tool, budgeted, github_requests FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_pr_merge' ORDER BY id", [e.actor.sessionId]);
+    assert.deepEqual(rows.map((x) => x.budgeted), [true, false], "the held call is the session's; the answer is the person's");
+    assert.ok(rows[1].github_requests > 0);
+    assert.equal(await sessionRequestCount(e.db, e.actor.sessionId), before + rows[0].github_requests);
   });
 
   test("W4 so many reviews of one repository at once; the rest wait", async () => {

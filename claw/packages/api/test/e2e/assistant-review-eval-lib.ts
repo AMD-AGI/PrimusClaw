@@ -22,6 +22,8 @@ import {
   approvalCommand, confirmationRef, mentionsNumber, modelGrounded, parsePrs, prGrounded, repoGrounded, typedActionCommand,
 } from "../../src/assistant/review-tools.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
+import { detectLanguage } from "../../src/assistant/language.js";
+import { commandLanguage } from "../../src/assistant/typed-commands.js";
 import type { Block, Llm, Message, ModelResponse, ToolSchema } from "./assistant-router-eval-lib.js";
 import { promptFor, userTurn } from "./assistant-router-eval-lib.js";
 import type { ExpectedCall, ReviewEvalCase } from "./assistant-review-eval-cases.js";
@@ -59,6 +61,8 @@ export function systemFor(c: ReviewEvalCase): string {
     people: c.attended === false ? [] : c.people ?? [],
     actions: c.attended === false ? [] : c.actions ?? [],
     repos: c.attended === false ? [] : c.repos ?? [],
+    // (the commands to type in the language of the case's message, as `applySessionRoleToTask` gives them)
+    commands: commandLanguage(c.text ? detectLanguage(c.text) : null),
   })}`;
 }
 
@@ -79,8 +83,14 @@ export function standIn(c: ReviewEvalCase) {
   return (tool: string, input: Record<string, any>): Omit<Call, "tool" | "input"> => {
     if (ACTING.has(tool) && c.attended === false) return refuse("not_attended");
     const text = c.text;
+    const stateOf = (pr: string) => c.github?.[pr] ?? { state: "open" as const, draft: false };
     switch (tool) {
       case "say": case "work_recall": return ok();
+      case "pr_state": {
+        let prs;
+        try { prs = parsePrs(input.prs); } catch (err) { return refuse((err as { code: string }).code); }
+        return ok({ prs: prs.map((p) => { const pr = `${p.owner}/${p.repo}#${p.number}`; return { pr, ...stateOf(pr) }; }) });
+      }
       case "work_create": return ok({ item_id: "kwi_evalnew", seq: 99 });
       case "work_send": {
         const seq = seqOf(input.item_id);
@@ -102,6 +112,9 @@ export function standIn(c: ReviewEvalCase) {
           if (!repoGrounded(text, pr, c.repos ?? [], [])) return refuse("repo_not_grounded");
           if (!KNOWN_REPOS.has(`${pr.owner}/${pr.repo}`.toLowerCase())) return refuse("pr_check_failed", "github_not_found: no such repository");
         }
+        // The real tool reads each one again and refuses a merged or closed one, before it asks anything about the reviewer.
+        const ended = prs.map((p) => `${p.owner}/${p.repo}#${p.number}`).filter((pr) => stateOf(pr).state !== "open");
+        if (ended.length) return refuse(ended.some((pr) => stateOf(pr).state === "merged") ? "already_merged" : "already_closed", `${ended.join(", ")}: nothing was started`);
         if (input.model && !modelGrounded(text, input.model)) return refuse("model_not_in_message");
         if (input.reviewer && input.reviewer !== SELF) {
           const person = (c.people ?? []).find((p) => p.user_id === input.reviewer);
@@ -213,10 +226,12 @@ export function matches(call: Call, e: ExpectedCall): boolean {
   return true;
 }
 
-/** The writes that went through equal one of the accepted sets exactly: the same calls, no more. */
+/** The writes that went through equal one of the accepted sets exactly: the same calls, no more; and nothing in `notCalled` was called. */
 export function scoreReviewCase(c: ReviewEvalCase, t: ReviewTrace): { ok: boolean; writes: Call[] } {
   const writes = t.calls.filter((x) => WRITES.has(x.tool) && !x.refused);
   if (t.error) return { ok: false, writes };
+  // A tool the case says must not be called fails it even when the call was refused.
+  if (c.notCalled?.length && t.calls.some((x) => c.notCalled!.includes(x.tool))) return { ok: false, writes };
   const ok = [c.expect, ...(c.also ?? [])].some((want) => {
     if (want.length !== writes.length) return false;
     const left = [...writes];

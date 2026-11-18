@@ -1,0 +1,85 @@
+{
+ "about": "typed_line(text, lang) after the fix: the prompt typed at the shared terminal, shown whole, credentials masked, quoted, with markdown links/images and tags made inert: '](' -> ']\\u200b(', '<' -> '\\u2039', '>' -> '\\u203a', applied after masking and before quoting; then a zero-width space after the colon of every `://`, so the chat's rich text does not make a bare address a link (codex r1 on the internal pull request). First generated from the TS port, the http(s) step added in Python: the TS port must follow it. Generated from the TS port (personal-agent/packages/core/src/remote-view/lines.ts typedLine, commit 70ca34f3).",
+ "cases": [
+  {
+   "input": "fix it",
+   "lang": "en",
+   "expected": "🖥 **Typed in the terminal:**\n\n> fix it"
+  },
+  {
+   "input": "fix it",
+   "lang": "zh",
+   "expected": "🖥 **终端里输入：**\n\n> fix it"
+  },
+  {
+   "input": "fix it\n\nnow",
+   "lang": "en",
+   "expected": "🖥 **Typed in the terminal:**\n\n> fix it\n>\n> now"
+  },
+  {
+   "input": "fix it\n\nnow",
+   "lang": "zh",
+   "expected": "🖥 **终端里输入：**\n\n> fix it\n>\n> now"
+  },
+  {
+   "input": "[Open](https://attacker.example)",
+   "lang": "en",
+   "expected": "🖥 **Typed in the terminal:**\n\n> [Open]​(https:​//attacker.example)"
+  },
+  {
+   "input": "[Open](https://attacker.example)",
+   "lang": "zh",
+   "expected": "🖥 **终端里输入：**\n\n> [Open]​(https:​//attacker.example)"
+  },
+  {
+   "input": "see ![x](https://e.example/p.png) and <a href=x>y</a>",
+   "lang": "en",
+   "expected": "🖥 **Typed in the terminal:**\n\n> see ![x]​(https:​//e.example/p.png) and ‹a href=x›y‹/a›"
+  },
+  {
+   "input": "see ![x](https://e.example/p.png) and <a href=x>y</a>",
+   "lang": "zh",
+   "expected": "🖥 **终端里输入：**\n\n> see ![x]​(https:​//e.example/p.png) and ‹a href=x›y‹/a›"
+  },
+  {
+   "input": "token sk-EXAMPLE-abcdef0123456789abcdef0123456789 [link](http://e)",
+   "lang": "en",
+   "expected": "🖥 **Typed in the terminal:**\n\n> token [hidden] [link]​(http:​//e)"
+  },
+  {
+   "input": "token sk-EXAMPLE-abcdef0123456789abcdef0123456789 [link](http://e)",
+   "lang": "zh",
+   "expected": "🖥 **终端里输入：**\n\n> token [hidden] [link]​(http:​//e)"
+  },
+  {
+   "input": "  two lines\r\n<b>bold</b>  ",
+   "lang": "en",
+   "expected": "🖥 **Typed in the terminal:**\n\n> two lines\n> ‹b›bold‹/b›"
+  },
+  {
+   "input": "  two lines\r\n<b>bold</b>  ",
+   "lang": "zh",
+   "expected": "🖥 **终端里输入：**\n\n> two lines\n> ‹b›bold‹/b›"
+  },
+  {
+   "input": "修复一下 [链接](https://e.example)",
+   "lang": "en",
+   "expected": "🖥 **Typed in the terminal:**\n\n> 修复一下 [链接]​(https:​//e.example)"
+  },
+  {
+   "input": "修复一下 [链接](https://e.example)",
+   "lang": "zh",
+   "expected": "🖥 **终端里输入：**\n\n> 修复一下 [链接]​(https:​//e.example)"
+  },
+  {
+   "input": "a ] (b) and [c] stay as text",
+   "lang": "en",
+   "expected": "🖥 **Typed in the terminal:**\n\n> a ] (b) and [c] stay as text"
+  },
+  {
+   "input": "a ] (b) and [c] stay as text",
+   "lang": "zh",
+   "expected": "🖥 **终端里输入：**\n\n> a ] (b) and [c] stay as text"
+  }
+ ]
+}

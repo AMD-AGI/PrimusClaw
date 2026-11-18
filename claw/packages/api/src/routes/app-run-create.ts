@@ -54,7 +54,7 @@ export async function createAppRun(
   req: FastifyRequest,
   sessionId: string,
   user: UserInfo,
-  body: { plugin_id?: unknown; input?: unknown; resources?: unknown },
+  body: { plugin_id?: unknown; input?: unknown; resources?: unknown; overrides?: unknown },
 ): Promise<AppRunOutcome> {
   // First of all: with app runs off, `claw_app_runs` and its columns may not exist
   // (the schema guard allows that), so a keyed request must not read the cache or

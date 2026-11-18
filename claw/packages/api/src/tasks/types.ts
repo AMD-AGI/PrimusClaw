@@ -77,6 +77,10 @@ export type FailureReason =
   | "deps_failed"
   | "external_timeout"
   | "sandbox_create_failed"
+  /** The platform refused the account a workload in the sandbox's workspace (SaFE 403); not retried. */
+  | "sandbox_workspace_forbidden"
+  /** The sandbox's workspace is not one the deployment isolates (SANDBOX_ALLOWED_NAMESPACES); not retried. */
+  | "sandbox_workspace_not_allowed"
   | "sandbox_died"
   | "sandbox_handle_missing"
   | "brain_timeout"

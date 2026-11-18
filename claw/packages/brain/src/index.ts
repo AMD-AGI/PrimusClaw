@@ -38,7 +38,7 @@ import {
   BRAIN_BUNDLED_HANDS_BINARY,
   BRAIN_VERSION,
   BRAIN_REGISTRY_BUCKET, BRAIN_REGISTRY_TTL_MS, BRAIN_TOMBSTONES_BUCKET,
-  LOCK_REFRESH_INTERVAL_MS,
+  LOCK_REFRESH_INTERVAL_MS, TASK_LOCK_DEAD_HOLDER_MS,
   MULTI_NODE_IDLE_RECLAIM_MS, MULTI_NODE_SWEEPER_INTERVAL_MS,
   BRAIN_CHECKPOINTS_BUCKET, BRAIN_CHECKPOINTS_TTL_MS,
   LLM_API_STYLE,
@@ -67,6 +67,7 @@ import {
 import { getMultiNodeProvider, multiNodeAvailable } from "./sandbox/multi-node/factory.js";
 import type { SessionDestroyResult } from "./sandbox/multi-node/types.js";
 import { destroySessionCompute } from "./sandbox/session-compute-teardown.js";
+import { installSessionCleanupSubscribers } from "./sandbox/session-cleanup-subscriber.js";
 import {
   destroyHands, parkForIdleReclaim, releaseLocalHandsState,
   startMultiNodeSweeper, startSandboxSweeper,
@@ -76,8 +77,9 @@ import { abortRunsOfDeletedSession, interruptRunsAt } from "./tasks/interrupt.js
 import { markSessionDeleted } from "./infra/deleted-sessions.js";
 import {
   bindTaskLockKv, lockContentionNakMs, lockExpiresBetweenRenewals,
+  lockSelfFenceMs, lockSelfFenceTooTight,
 } from "./tasks/lock.js";
-import { bindTaskRunnerDeps } from "./tasks/runner.js";
+import { bindTaskRunnerDeps, settleEndedTurnOfGoneRow } from "./tasks/runner.js";
 import { handleTask, bindTaskDispatchKv, inflightTasks, handleClaimedRequest, isFinishOnlyDelivery } from "./tasks/dispatch.js";
 import { claimNextRun } from "./clients/run-claim.js";
 import { flushPendingRetries } from "./delivery/doorbell-delivery.js";
@@ -98,6 +100,8 @@ import {
 import { startWatchdog } from "./infra/watchdog.js";
 import { registerAdminCheckpointRoutes } from "./routes/admin.js";
 import { bindBrainAppGrant } from "./apps/app-grant.js";
+import { reclaimPreviousIncarnation } from "./tasks/previous-incarnation.js";
+import { installProcessGuards } from "./infra/process-guards.js";
 import { DrainState, versionDrainAction } from "./infra/drain-state.js";
 
 const logger = pino({ name: "brain" });
@@ -133,8 +137,16 @@ let consumerIter: { stop: () => void } | null = null;
 
 // ===== Signal handlers =====
 
-function installSignalHandlers(): void {
-  const handler = (sig: string) => {
+/**
+ * Stop taking work, hand every run on this pod back, and exit with `exitCode`.
+ *
+ * Reached from SIGTERM/SIGINT (exit 0) and from an uncaught exception (exit 1,
+ * see installProcessGuards): either way the runs here are aborted with the
+ * SIGTERM reason, which checkpoints them and releases their claims and locks,
+ * so another replica resumes them in seconds rather than after their leases
+ * and the reaper's grace have run out.
+ */
+function beginShutdown(sig: string, exitCode = 0): void {
     // Guards re-entry into *shutdown* only. Testing the shared drain flag here
     // is what let a version-drained pod skip its own SIGTERM handling.
     if (!drainState.beginShutdown()) return;
@@ -166,17 +178,37 @@ function installSignalHandlers(): void {
       } catch (err) {
         logger.warn({ err, signal: sig }, "brain.drain.release_deferred_failed");
       }
-      try { await nc.drain(); } catch { /* ignore */ }
+      try { await nc?.drain(); } catch { /* ignore */ }
       logger.info({
         signal: sig,
         drainedSessions: activeSessions.length,
+        exitCode,
       }, "brain.drain.complete");
-      process.exit(0);
+      process.exit(exitCode);
     });
-  };
+}
 
-  process.once("SIGTERM", () => handler("SIGTERM"));
-  process.once("SIGINT", () => handler("SIGINT"));
+/**
+ * How long an exit forced by an uncaught exception may spend handing runs back.
+ * A SIGTERM has the pod's grace period behind it; this has nothing, and a
+ * process that has already thrown once may hang in its own drain.
+ */
+const FATAL_DRAIN_DEADLINE_MS = 60_000;
+
+function installSignalHandlers(): void {
+  process.once("SIGTERM", () => beginShutdown("SIGTERM"));
+  process.once("SIGINT", () => beginShutdown("SIGINT"));
+}
+
+function installFaultGuards(): void {
+  installProcessGuards({
+    log: logger,
+    count: (kind) => metrics.onProcessFault(kind),
+    onFatal: () => {
+      setTimeout(() => process.exit(1), FATAL_DRAIN_DEADLINE_MS).unref();
+      beginShutdown("uncaughtException", 1);
+    },
+  });
 }
 
 /**
@@ -457,6 +489,29 @@ function validateStartupConfig(): void {
     );
   }
 
+  // A dead-holder takeover reads "not rewritten for this long" as "gone", so the
+  // window has to hold several renewals: at fewer than three, one slow write
+  // under a healthy run looks like a death to the brain the API handed the run.
+  if (TASK_LOCK_DEAD_HOLDER_MS > 0 && TASK_LOCK_DEAD_HOLDER_MS < LOCK_REFRESH_INTERVAL_MS * 3) {
+    logger.error(
+      { deadHolderMs: TASK_LOCK_DEAD_HOLDER_MS, refreshIntervalMs: LOCK_REFRESH_INTERVAL_MS },
+      "startup.dead_holder_window_too_short (TASK_LOCK_DEAD_HOLDER_MS must be at least "
+      + "3 x LOCK_REFRESH_INTERVAL_MS, or a live holder's lock can be taken over)",
+    );
+  }
+
+  // A holder cut off from NATS and the API stops at its self-fence, one refresh
+  // interval before the takeover above may happen (tasks/lock.ts
+  // lockSelfFenceMs). Below two renewals that fence would stop healthy runs on
+  // a single slow write.
+  if (lockSelfFenceTooTight()) {
+    logger.error(
+      { deadHolderMs: TASK_LOCK_DEAD_HOLDER_MS, selfFenceMs: lockSelfFenceMs(), refreshIntervalMs: LOCK_REFRESH_INTERVAL_MS },
+      "startup.lock_self_fence_too_tight (TASK_LOCK_DEAD_HOLDER_MS - LOCK_REFRESH_INTERVAL_MS must be at least "
+      + "2 x LOCK_REFRESH_INTERVAL_MS)",
+    );
+  }
+
   // A lease is the row's evidence that this pod is still here, and the evidence
   // is only as good as the number of chances it gets to arrive. Below three
   // renewals per lease a single slow API call expires the lease of a healthy
@@ -604,6 +659,7 @@ async function startTaskDelivery(jsm: JetStreamManager): Promise<DeliveryResiden
     // A fat chat delivery holds a durable SQL lease before it queues for a
     // slot, so a Stop reaches it through the row while nothing else can.
     fatPreGate: createFatPreGate({ emit: (sessionId, evt) => emitter.emit(sessionId, evt) }),
+    onRowGone: (request) => settleEndedTurnOfGoneRow(request),
     handle: (m) => handleTask(m),
     onError: (err) => logger.error({ err }, "task.unhandled"),
     onRefuse: (kind) => {
@@ -650,10 +706,19 @@ function installInterruptSubscriber(): void {
   })();
 }
 
-async function cleanupSession(sid: string, payload: Uint8Array): Promise<void> {
+/** Every replica: the session is gone, so stop its runs here and let go of this process's hold on its sandbox. */
+async function forgetDeletedSession(sid: string): Promise<void> {
   markSessionDeleted(sid);
-  await abortRunsOfDeletedSession(sid);
+  try {
+    await abortRunsOfDeletedSession(sid);
+  } finally {
+    releaseLocalHandsState(sid);
+    logger.info({ sessionId: sid }, "session.deleted_forgotten_locally");
+  }
+}
 
+/** One replica (the queue group's pick): remove what the session owns on the platform. */
+async function teardownDeletedSession(sid: string, payload: Uint8Array): Promise<void> {
   const offeredKey = decodeCleanupPayload(payload.length ? sc.decode(payload) : "").platformKey ?? "";
   let complete = false;
   let failureReason: SessionCleanupIncompleteReason | undefined;
@@ -674,7 +739,6 @@ async function cleanupSession(sid: string, payload: Uint8Array): Promise<void> {
     failureReason = "threw";
     logger.error({ err, sessionId: sid }, "session.cleanup_failed");
   } finally {
-    releaseLocalHandsState(sid);
     if (!complete) {
       await parkForIdleReclaim(sid);
       metrics.onSessionCleanupIncomplete(failureReason ?? "unknown");
@@ -687,14 +751,12 @@ async function cleanupSession(sid: string, payload: Uint8Array): Promise<void> {
 }
 
 function installCleanupSubscriber(): void {
-  const clnSub = nc.subscribe("cleanup.*");
-  (async () => {
-    for await (const msg of clnSub) {
-      const parts = msg.subject.split(".");
-      const sid = parts[parts.length - 1];
-      await cleanupSession(sid, msg.data);
-    }
-  })();
+  installSessionCleanupSubscribers({
+    subscribe: (subject, opts) => nc.subscribe(subject, opts),
+    forget: forgetDeletedSession,
+    teardown: teardownDeletedSession,
+    onError: (err, sessionId, half) => logger.error({ err, sessionId, half }, "session.cleanup_handler_failed"),
+  });
 }
 
 /**
@@ -839,6 +901,8 @@ async function startHttpServer(deliveryResidency: DeliveryResidency): Promise<vo
 }
 
 async function main(): Promise<void> {
+  // Before anything can leave a promise behind: see installProcessGuards.
+  installFaultGuards();
   // First, and before any connection: see `proveKeepaliveCapacity`. A pod that
   // refuses its own configuration must refuse it while it is still holding
   // nothing.
@@ -846,6 +910,10 @@ async function main(): Promise<void> {
   // Off unless IDENTITY_CLIENT_ENABLED is set; nothing in Brain uses it yet.
   startIdentityClient(logger);
   const jsm = await initializeInfrastructure();
+  // After the lock bucket is bound and before the first claim: see
+  // previous-incarnation.ts. Nothing this process holds can be released here,
+  // because it holds nothing yet.
+  await reclaimPreviousIncarnation();
   const deliveryResidency = await startTaskDelivery(jsm);
   installSignalHandlers();
   installInterruptSubscriber();

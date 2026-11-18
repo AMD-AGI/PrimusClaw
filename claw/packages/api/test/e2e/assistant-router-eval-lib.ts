@@ -308,7 +308,12 @@ class StubBackend {
         if (detail === "summary") return { ...this.ok({ ok: true, item: summary, note }), ref };
         if (detail === "reports") return { ...this.ok({ ok: true, item: summary, note, reports: item.recall.reports }), ref };
         if (detail === "worker_tail") return { ...this.ok({ ok: true, item: summary, note, worker_tail: item.recall.workerTail }), ref };
-        return { ...this.refuse("invalid_arguments", "detail is summary, reports or worker_tail"), ref };
+        if (detail === "live") {
+          // The worker's last step, as the real tool shows a run's steps (`workerLive`): its words, with their time.
+          const latest = item.recall.workerTail ? [{ at: "2026-11-06T09:59:00.000Z", said: item.recall.workerTail.replace(/^assistant: /, "") }] : [];
+          return { ...this.ok({ ok: true, item: summary, note, as_of: "2026-11-06T10:00:00.000Z", run: null, latest }), ref };
+        }
+        return { ...this.refuse("invalid_arguments", "detail is summary, reports, worker_tail or live"), ref };
       }
       default:
         return this.refuse("unknown_tool", `no tool named ${short}`);

@@ -69,7 +69,14 @@ export interface SandboxSpecCreate {
    * fails the message with reason `sandbox_pending_timeout` if it never starts.
    */
   timeout?: number;
-  /** Extra env vars baked into the sandbox at create time. */
+  /**
+   * Extra env vars baked into the sandbox at create time. Stored in the SaFE
+   * workload, whose env SaFE returns to every caller allowed to read it: a
+   * name or value that looks like a credential is withheld from the workload
+   * and reaches the sandbox only at bootstrap (and an app only with its start
+   * command), so it is not there for an image entrypoint. Put no secret here
+   * under another name.
+   */
   env?: Record<string, string>;
   /** Extra labels merged into the SaFE workload (Sweeper consistency keys). */
   labels?: Record<string, string>;
@@ -269,6 +276,22 @@ export type RunPhase = "executing" | "waiting";
 /** Why a run is not executing. Waits are the whole reason A2 exists. */
 export type RunWaitReason = "approval" | "background_command";
 
+/**
+ * One of the user's personal skills as a turn is told of it (`ExecuteRequest.user_skills`). The text is not here: the
+ * API answers it for the turn (`POST /v1/internal/skills/read` with the session, the turn, `name` and `content_sha`).
+ */
+export interface UserSkillManifestEntry {
+  name: string;
+  version: number;
+  description: string;
+  /** `auto`: listed to the model. `manual`: used only when the user names it. */
+  invocation: "auto" | "manual";
+  /** SKILL.md and every supporting file; changes whenever any of them does. */
+  content_sha: string;
+  /** Where the skill came from (`chat`, `worker`, `api`, `import`, `auto`); null for one stored before it was kept. */
+  origin: "chat" | "worker" | "api" | "import" | "auto" | null;
+}
+
 /** Brain task execution request (Backend Dispatcher → Brain HTTP). */
 export interface ExecuteRequest {
   // ── Task identity ─────────────────────────────────────────────────────
@@ -402,9 +425,58 @@ export interface ExecuteRequest {
    * `sources` or `allow_after` may be called for the rest of the run; any other is refused by Brain before it is run. Entries are
    * written like `tools_allowlist` (an exact name, or a prefix ending in `*`). The API sets it on an assistant's router turn that has
    * read-only tools: after it has read such a result, the turn no longer acts for the user (no review, setting or memory write).
+   * `clean_failures`: the sources whose failures are said in Claw's own words only (fixed text, numbers, and the call's own
+   * arguments; never a status text, body, error message, certificate field or redirect target a remote sent): a call of one of
+   * these that failed read nothing and does not mark the run. A failure of any other source marks it. A call of one of these that
+   * threw is told to the model as having failed, without the thrown message.
+   * Under this rule the results earlier runs got from `sources` are not replayed from `history`: each is replaced with a fixed
+   * placeholder, so what one turn read is not in context in the next, which can act.
    * Absent: no such rule.
    */
-  read_taint?: { sources: string[]; allow_after: string[] };
+  read_taint?: { sources: string[]; allow_after: string[]; clean_failures?: string[] };
+  /**
+   * Citations (`citations.ts`). Brain keeps every source this run's lookups returned: a `web_search` result's pages, a page
+   * `web_fetch` read whole, and what a server named in `source_servers` lists under `_meta["claw/sources"]` of a result (only a
+   * server the API adds itself counts: `isPlatformMcpServer`). A call of a tool named in `tools` (exact names) has its `sources`
+   * argument (addresses, the i-th standing for `[i+1]` in its text) looked up there; the entries found go to that tool in the MCP
+   * request's `_meta["claw/sources"]`, what was dropped in `_meta["claw/sources_dropped"]`. The arguments are sent as the model wrote
+   * them. The API sets it on an assistant's router turn (`CLAW_ASSISTANT_CITATIONS`), for its `say`. Absent: nothing is kept or sent.
+   * A page `web_fetch` read is kept only when a search or a trusted server of the run returned its address first, or it is one of
+   * `user_urls`, the addresses the user wrote in the message the turn answers: reading a page confirms a source, it never adds one.
+   * `link_servers` names servers whose results are JSON objects that carry their own page as `html_url` (Gitea's, for the agent
+   * board), each with the address prefix its pages have: an `html_url` of a top-level object of such a result that starts with that
+   * prefix is kept, as a source of kind `board`. Nothing else of the result is read for addresses.
+   */
+  cite?: { tools: string[]; source_servers?: string[]; user_urls?: string[]; link_servers?: Record<string, string> };
+  /**
+   * The tools whose `text` is a report checked against its own sources before the call goes on (a worker's `deliver_text`, by exact
+   * name): every source its numbered citations name is opened with the run's `web_fetch`, a statement no opened source supports is
+   * marked unverified, and only the checked text is delivered (Brain, `tools/cite-check.ts`). A text with no numbered citations
+   * and list of sources is passed on unchanged.
+   *
+   * `revise`: when more than `unverified_ratio` of the report's cited statements are unverified, the call is refused with the
+   * statements marked, nothing delivered, so the writer corrects them and delivers again; at most `rounds` times a run (Brain caps
+   * it at 2), after which the delivery is made whatever the check finds (`tools/cite-revise.ts`). Absent: delivered at once.
+   */
+  cite_check?: { tools: string[]; revise?: { rounds: number; unverified_ratio: number } };
+  /**
+   * The lookups of this run whose results are log text, by exact tool name (`mcp__<server>__<tool>`), each with the argument
+   * that says how many lines or entries it returns (`tail_lines`, `limit`; empty for a read that counts nothing but may carry log
+   * text, such as a container's termination message). For such a call Brain lowers that argument to `lines` (and sets it when
+   * the call names none), masks credential-shaped text in the answer (`redactLogSecrets` of @claw/utils) before
+   * the model, an event or a log line sees it, and keeps only the last `chars` characters of an answer that is plain text
+   * (`brain/src/tools/log-reads.ts`). The API sets it on an assistant's router turn that has such reads. Absent, or unreadable:
+   * results are as the tools answered.
+   */
+  log_reads?: { tools: Record<string, string>; lines: number; chars: number };
+  /**
+   * Images the person sent with the message this run answers, shown to the model with the prompt, in this order. Each is a path
+   * relative to the session's own files (`.uploads/<path>`, as `POST /v1/sessions/:id/upload` stored it): Brain reads it from the
+   * session's object-store prefix and nowhere else, and shows it only when its bytes are a whole PNG, JPEG, GIF or WebP of at most
+   * IMAGE_MAX_BYTES (images.ts); one it cannot show is named in a line instead. The API sets it on an assistant's router turn, which
+   * has no sandbox to `read` an image in. Absent: the prompt is text, as before.
+   */
+  prompt_images?: string[];
 
   // ── Legacy chat fields (Phase 4 removes; do not use in new task code) ─
   /** @deprecated Use `sandbox_spec.image`. Kept for legacy chat NATS path. */
@@ -428,11 +500,17 @@ export interface ExecuteRequest {
    */
   memory_enabled?: boolean;
   /**
-   * Whether the API keeps skills the agent saves (CLAW_SKILL_EVOLUTION_ENABLED).
-   * Anything but `true` means Brain neither offers nor runs save_skill and the
-   * *_skill_file tools: the API would drop what they write.
+   * Whether the platform writes skills on its own (CLAW_SKILL_AUTO_EVOLUTION_ENABLED). Brain reads it only from an
+   * API that predates `user_skills_enabled`, which used this field for what that one says now.
    */
   skill_evolution_enabled?: boolean;
+  /**
+   * Whether the API keeps the skills this turn saves (CLAW_USER_SKILLS_ENABLED, and only in the user's own
+   * conversation). Anything but `true` means Brain neither offers nor runs save_skill and the *_skill_file tools:
+   * the API would drop what they write. Absent means an API that predates the field: `skill_evolution_enabled`
+   * decides instead.
+   */
+  user_skills_enabled?: boolean;
   system_append?: string;
   rules_text?: string;
   model?: string;
@@ -442,6 +520,28 @@ export interface ExecuteRequest {
    * from the session's `effort`, which its creator chose (`POST /v1/sessions`, `PATCH /v1/sessions/:id`).
    */
   effort?: ReasoningEffort;
+  /**
+   * Tools (by full name) whose `text` argument is published while the model writes it: a `toolTextDelta` event (`tool`,
+   * `actionId`, `text` so far) at most every few hundred milliseconds per call, top-level loop only. An assistant router's `say`,
+   * so a channel can show the words before the turn's step ends. The call runs as before; a delta is a preview, not the message.
+   * Absent: none.
+   */
+  stream_tool_text?: string[];
+  /**
+   * A tool (by full name) under which the top-level loop's own text, outside any tool call, is published while the model writes it: a
+   * `toolTextDelta` event of that tool with `source: "text"`, throttled as `stream_tool_text` is, until the run first calls that tool.
+   * When a tool call follows the text in the same model turn, a `toolTextVoid` (`reason: "tool_call"`, `source: "text"`) takes it back
+   * and no more of the run's text is published. An assistant router's turn that ends in plain text, which the API says for it: a channel
+   * can show its words as they come, as it does for a say. Absent: none.
+   */
+  stream_text_as?: string;
+  /**
+   * True: when the top-level loop uses its last allowed turn without ending (`max_turns`), the model is asked once more for a reply in
+   * text only, with what it found so far, as a sub-agent always is at its cap. An assistant router's turn, whose plain text reaches the
+   * person (the API delivers it as the turn's answer) where a run that ran out of turns would otherwise leave them with nothing.
+   * Absent: the top-level loop ends at its cap as it always did.
+   */
+  report_at_turn_cap?: boolean;
   /**
    * "5m": the rolling prompt-cache markers of this run's turns (sub-agents included) are written for five minutes, the anchor keeps
    * Brain's `LLM_CACHE_TTL`. For a run nobody waits on between turns; absent, every marker is written at `LLM_CACHE_TTL`. The API sets it
@@ -474,6 +574,15 @@ export interface ExecuteRequest {
     description?: string;
     files?: Array<{ path: string; content: string; is_binary?: boolean }>;
   }>;
+  /**
+   * The user's personal skills this turn may use: name, version, description (at most 300 characters), invocation,
+   * fingerprint and origin of each, most recently used first, and none of their text. Brain lists the `auto` ones to
+   * the model and reads a skill only when it is used, from the API (`POST /v1/internal/skills/read`, keyed by
+   * `content_sha`); a `manual` one is used only when the user names it. Sent only on a turn of the user's own
+   * conversation (CLAW_USER_SKILLS_ENABLED; never on a review, an observer's or router's turn, a session that acts
+   * as a user, or a group chat). Absent: none. Separate from `skills`, which is what a caller passes explicitly.
+   */
+  user_skills?: UserSkillManifestEntry[];
   /** AgentHooks attached to this task (see brain/src/agent/hooks.ts). */
   hooks?: {
     pre?: Array<{ type: "tool"; name: string; args: Record<string, unknown> }>;
@@ -511,6 +620,22 @@ export interface ExecuteRequest {
   plugin_tools?: unknown[] | null;
   /** Tool name allow-list applied on top of plugin_tools (script-mode hardening). */
   tools_allowlist?: string[];
+  /**
+   * `true`: this run will almost certainly use its sandbox, so Brain starts opening it when the run starts, beside the first model
+   * call, instead of when the first tool asks for it. A run that then never asks gives it back the way any run does at its end (parked
+   * for the session's next message, or reclaimed if it was still being created). Brain ignores it where it opens the sandbox up front
+   * anyway, where `tools_allowlist` leaves no sandbox tool, and when its own `BRAIN_SANDBOX_PRESTART` is off. The API sets it on an
+   * assistant's worker turns. Absent, or anything but `true`: the sandbox opens on the first tool call, as before the field.
+   */
+  sandbox_prestart?: boolean;
+  /**
+   * How long, in milliseconds, this run waits for a person's decision on a held tool call or for the answer to an
+   * `ask_user_question`, in place of Brain's `HITL_DECISION_TIMEOUT_MS` and `ASK_USER_QUESTION_TIMEOUT_MS`; the
+   * `timeout_ms` of the request it announces says the same. The API sets it on the turns of an assistant's work item,
+   * whose person is told on a channel and may not be looking. Absent, or not a whole number from 1000 to 86400000:
+   * Brain's own settings, as before the field existed.
+   */
+  decision_wait_ms?: number;
   /** Pass-through MCP server configs (resolved at admission time). */
   mcp_servers?: Record<string, Record<string, unknown>>;
 
@@ -552,6 +677,14 @@ export interface PendingSkill {
   description?: string;
   /** Optional sub-files passed in one call (rare — usually added separately). */
   files?: Array<{ path: string; content: string; is_binary?: boolean }>;
+  /**
+   * The user's own words asking for this to be saved as a skill, copied exactly; absent when the model saves it on its own. The API saves
+   * at once only when they are the user's (from a message the user sent) and do ask for a skill; anything else is kept as a draft the
+   * user confirms first (`events/consumer.ts`).
+   */
+  request_quote?: string;
+  /** `manual`: used only when the user names it, never listed to the model. Absent keeps what the skill had (`auto` for a new one). */
+  invocation?: "auto" | "manual";
 }
 
 /** Sub-file mutation from add_skill_file / update_skill_file / remove_skill_file tools. */
@@ -666,6 +799,12 @@ export interface ExecuteResult {
   abortReason?: AbortReason;
   /** Free-form error explanation when `abortReason` is `error` / `wait_external` / ... */
   failureReason?: string;
+  /**
+   * What happened, for a person, when `failureReason` is a code: for a run whose
+   * sandbox the platform could not provide, the reason it gave. Stored as the run's
+   * `error_message`.
+   */
+  failureMessage?: string;
   /** Carried through for wait_external resume: which step name caused the wait. */
   waitExternalId?: string;
 }
@@ -698,6 +837,14 @@ export const TRIGGER_MCP_SERVER = "schedules";
 export const TRIGGER_MCP_PATH = "/v1/internal/trigger-mcp";
 export const GITHUB_MCP_SERVER = "github";
 export const GITHUB_MCP_PATH = "/v1/internal/github/mcp";
+/**
+ * The reads of the GitHub tools whose answer is a list (`api/src/github-mcp/tools.ts`), and how many characters such an answer
+ * may take. The tools fit a list into that many, and say how many matches there are and how many they show; Brain keeps an
+ * answer of one of them whole up to it (`truncateToolResult`), where any other result is cut to its head and its tail at a few
+ * thousand characters. A list cut in its middle loses items with nothing to say which: "my open pull requests" answered 15 of 22.
+ */
+export const GITHUB_LIST_TOOLS: readonly string[] = ["issue_search", "pr_list", "issue_list", "repo_list", "code_search"];
+export const GITHUB_LIST_MAX_CHARS = 20_000;
 const PLATFORM_MCP_PATHS: Readonly<Record<string, string>> = {
   [TRIGGER_MCP_SERVER]: TRIGGER_MCP_PATH,
   [GITHUB_MCP_SERVER]: GITHUB_MCP_PATH,

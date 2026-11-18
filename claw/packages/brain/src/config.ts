@@ -831,6 +831,29 @@ export const LOCK_REFRESH_INTERVAL_MS = envInt(
 );
 
 /**
+ * How long a run's `lock.<key>` may go unrenewed before a brain that has been
+ * handed the same run by the API may take the lock over.
+ *
+ * A brain lost with its node is never restarted under its pod name, so the
+ * previous-incarnation hand-back cannot happen, and without this its runs
+ * waited for the entry to age out of the registry bucket (BRAIN_REGISTRY_TTL_MS,
+ * five minutes) on top of the API's reaper grace: eleven minutes on
+ * 2026-11-06. The takeover needs both halves to agree that the holder is gone:
+ * the API requeued the run only after the holder's lease went unrenewed for its
+ * TTL plus DOORBELL_DEAD_LEASE_GRACE_SEC, and this pod finds the lock -- for
+ * that very run -- not rewritten for this long, about six missed renewals at
+ * the default interval. A live holder that is merely cut off from NATS keeps
+ * renewing its lease over HTTP, so the API never hands its run out; one cut
+ * off from the API keeps renewing its lock, so this pod never takes it.
+ *
+ * The API's requeue must not come before this, or the first claim finds the
+ * lock still too fresh and has to defer; the API's defaults (lease 45 s,
+ * heartbeat 15 s, grace 30 s) requeue no earlier than 60 s after the last
+ * renewal the holder could have made. Zero turns the takeover off.
+ */
+export const TASK_LOCK_DEAD_HOLDER_MS = envInt("TASK_LOCK_DEAD_HOLDER_MS", 60_000, { min: 0 });
+
+/**
  * Deletion tombstones live apart from the registry because the two want
  * opposite TTLs: `lock.<key>` should expire quickly so a dead worker's claim is
  * released, while a tombstone has to outlive everything that could still ask
@@ -918,6 +941,18 @@ export const RUN_LEASE_TTL_MS = envInt(
  * fall back to if a sandbox-dependent path turns out to have been missed.
  */
 export const BRAIN_LAZY_SANDBOX = envBool("BRAIN_LAZY_SANDBOX", true);
+
+/**
+ * Honour `ExecuteRequest.sandbox_prestart`: a run the API marks as one that
+ * will use its sandbox (an assistant's worker turn) starts opening it when the
+ * run starts, so the pod comes up while the first model call is running instead
+ * of after it. A run that never asks for it after all gives it back at its end
+ * like any other: a ready sandbox is parked for the session's next message, and
+ * one still being created is reclaimed. Only a lazily opened run is affected,
+ * and only one whose tool list has a sandbox tool. Set to 0 to open every such
+ * sandbox on the first tool call again.
+ */
+export const BRAIN_SANDBOX_PRESTART = envBool("BRAIN_SANDBOX_PRESTART", true);
 
 // Post-task idle reclaim window. After GET /api/jobs is empty and the
 // workload is Running, Brain waits this long from quiescedAt then CAS-es
@@ -1075,12 +1110,35 @@ export const SANDBOX_POLL_TIMEOUT_MS = envInt("SANDBOX_POLL_TIMEOUT_MS", 60 * 60
 // single-node (SafeWorkloadProvider) and multi-node clusters. Independent of the
 // unreadable backstop above (which only fires when SaFE stops answering). Set to
 // 0 to queue forever. Stored in ms; configured in seconds like the sibling above.
+// The sandbox a run opens (SafeWorkloadProvider, not hosted applications or
+// multi-node clusters) also uses it, on a clock of its own, for a dispatched
+// workload while the platform reports a node being added for it
+// (`TriggeredScaleUp`), or says capacity can come (an account at the scheduler's
+// per-user limit, a node being given back); see WorkloadWaitOptions.scaleUpTimeoutMs.
+// For that sandbox the ceiling is also bounded by the run: a request that names its
+// own timeout waits at most that timeout less SANDBOX_MIN_RUN_SECONDS (see
+// `capacityWaitTimeoutMs` in sandbox/safe-workload-provider.ts).
 //
 // Task and DAG runs carry a renewable API-side lease, so this Pending ceiling
 // does not have to fit under BRAIN_TASK_TIMEOUT_SEC. That timeout now covers
 // only a row that never receives its first lease renewal; once Brain is alive,
 // the lease is its liveness signal and this setting remains provisioning policy.
 export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECONDS", 3 * 60 * 60) * 1000;
+
+// How much of a request's own timeout is kept for the run when its sandbox has to
+// wait for capacity. A request that names a timeout (`timeout`, in seconds) waits
+// for capacity -- queued, a node being added, or an autoscaler that says capacity
+// can come -- for at most that timeout less this much, and never past
+// SANDBOX_PENDING_TIMEOUT_SECONDS above; a timeout shorter than twice this keeps
+// half of it for the run. A request with no timeout waits on the ceiling above alone.
+//
+// Why the request bounds it: the queue is not free time for the run. SaFE starts a
+// sandbox's lifetime (the request's timeout plus an hour to stop in) when it
+// admits the workload, so a wait after admission comes out of the run's own time,
+// and a caller that gave the run a timeout gives up on it once that timeout has
+// passed, whether or not the sandbox ever started. Waiting longer than that buys a
+// sandbox nobody will use. Stored in seconds.
+export const SANDBOX_MIN_RUN_SECONDS = envInt("SANDBOX_MIN_RUN_SECONDS", 60 * 60, { min: 0 });
 
 // Maximum duration of a SINGLE continuous "dispatched but not ready" wait: the
 // workload has left Pending (it was scheduled) and is still short of ready --
@@ -1094,13 +1152,16 @@ export const SANDBOX_PENDING_TIMEOUT_MS = envInt("SANDBOX_PENDING_TIMEOUT_SECOND
 // that is still pulling. Without this the wait ended only at the workload's own
 // timeout, hours later, with the user's Stop doing nothing (it is also honoured
 // now, see waitForWorkloadReady). The clock RESETS if the workload falls back to
-// Pending. Set it above the slowest legitimate image pull for the deployment.
+// Pending. For the sandbox a run opens it also does not run while the platform
+// reports a node being added for it (`TriggeredScaleUp`): that wait is on
+// SANDBOX_PENDING_TIMEOUT_SECONDS. Multi-node clusters keep their own start ceiling
+// (MULTI_NODE_START_TIMEOUT_SECONDS) throughout. Set it above the slowest legitimate image pull for the deployment.
 // 0 waits indefinitely. Stored in ms; configured in seconds like the siblings.
 export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 15 * 60) * 1000;
 
 // Maximum duration a sandbox the platform has ADMITTED may sit with nothing having
-// taken its pod -- no node has acknowledged it -- and no node being added for it,
-// before the message fails terminally with reason `sandbox_unschedulable`, the
+// taken its pod -- no node has acknowledged it -- no node being added for it, and
+// no capacity coming for it, before the message fails terminally with reason `sandbox_unschedulable`, the
 // workload is stopped, and the model is told to report it rather than open
 // another. That is what a sandbox that no node will run looks like (every node
 // cordoned, down or tainted for other workloads): waiting longer does not change
@@ -1124,10 +1185,20 @@ export const SANDBOX_START_TIMEOUT_MS = envInt("SANDBOX_START_TIMEOUT_SECONDS", 
 // healthy start (image pull, container boot) takes; that keeps its own, longer
 // ceiling above. It does NOT cover a workload still in the platform's queue (a
 // queue moves, and for a GPU sandbox can be hours), nor an admitted one with a
-// node being added (which can take longer than this): those keep the ceilings of
-// their phase, SANDBOX_PENDING_TIMEOUT_SECONDS while Pending and
-// SANDBOX_START_TIMEOUT_SECONDS once the platform reports it NotReady, and the
-// user is told why they are waiting. A cluster whose nodes scale up without the
+// node being added (which can take longer than this), nor an admitted one the
+// autoscaler will not add a node for yet for a reason that ends on its own (every
+// account it buys nodes as is at the scheduler's per-user limit, a node is still
+// being given back, the pool is at its limit and releases an idle node, a purchase
+// in backoff; the list is CAPACITY_WAIT_PHRASES in sandbox/workload-stall.ts), the
+// normal state of a burst GPU pool: all three are waits for capacity
+// and run on SANDBOX_PENDING_TIMEOUT_SECONDS, whichever phase the platform reports
+// (a sandbox being given a node is often NotReady already; that wait is clocked
+// from the first read of the scale-up), never on SANDBOX_START_TIMEOUT_SECONDS;
+// the user is told why they are waiting. When the
+// autoscaler refuses (`NotTriggerScaleUp`) for a reason no wait settles (no pool
+// serves the workspace, the pod fits no node of a pool, more nodes at once than a
+// pool may hold), this limit applies, and the reason it gives is passed on, with
+// its identifiers taken out. A cluster whose nodes scale up without the
 // platform saying so should raise this or set 0. Applies to the sandbox a run
 // opens, not to hosted applications or multi-node clusters.
 // Stored in ms; configured in seconds like the siblings. Default 5 minutes. 0
@@ -1273,6 +1344,14 @@ export const CALLBACK_MAX_DELAY_MS = envInt("CALLBACK_MAX_DELAY_MS", 30000);
 // Periodically `exec` a no-op inside each active Hands sandbox to refresh
 // lastActivity so SaFE doesn't GC the pod mid-LLM-call. Set <=0 to disable.
 export const SANDBOX_KEEPALIVE_INTERVAL_SEC = envInt("SANDBOX_KEEPALIVE_INTERVAL_SEC", 60);
+// How long a new sandbox waits for the fleet count to become readable again
+// before admission refuses it. A sweep that could not read the fleet whole
+// marks the roster stale until the next one reads it clean, which is at most
+// one keepalive interval away; refusing at once turned that interval into a
+// failed task. Default: one interval plus 15s. 0 refuses at once.
+export const SANDBOX_ADMISSION_STALE_WAIT_MS = envInt(
+  "SANDBOX_ADMISSION_STALE_WAIT_MS", (Math.max(0, SANDBOX_KEEPALIVE_INTERVAL_SEC) + 15) * 1000, { min: 0 },
+);
 // Consecutive ping failures after which a sandbox is auto-evicted (destroy the
 // sandbox; the in-flight task is NOT aborted -- that would cancel DAG siblings
 // sharing the session, so a task parked in an MCP call to this sandbox unblocks
@@ -1644,6 +1723,21 @@ export function openAiBaseUrlFellBack(): boolean {
 }
 
 
+// --- MCP connections (clients/mcp-pool.ts) ---
+// Keep a run's MCP connections open after it ends and reuse them for the same user's next turn, keyed by the user, the
+// server's name and its whole spec (credentials included): two users never share one. false: every turn opens and closes its own.
+export const MCP_POOL_ENABLED = envBool("MCP_POOL_ENABLED", true);
+// A pooled connection nobody used for this long is closed.
+export const MCP_POOL_IDLE_MS = envInt("MCP_POOL_IDLE_MS", 600_000, { min: 1_000 });
+// How long a turn waits for its MCP servers (connected side by side) before the model is called. A server not ready by
+// then is left out of that turn, said to the model, logged as mcp_client.connect_deferred, and keeps connecting for the
+// next turn. 0: wait for every server however long it takes.
+export const MCP_CONNECT_BUDGET_MS = envInt("MCP_CONNECT_BUDGET_MS", 2_000, { min: 0 });
+// How long a turn waits for a server it cannot work without (`connectPlatformMcp`'s `required`): the review tools of a review
+// session, whose turn has nothing else to do. A cold connection can take longer than MCP_CONNECT_BUDGET_MS, and a review run
+// without its tools ends having done nothing. Never shorter than MCP_CONNECT_BUDGET_MS. 0: wait for it however long it takes.
+export const MCP_REQUIRED_CONNECT_BUDGET_MS = envInt("MCP_REQUIRED_CONNECT_BUDGET_MS", 30_000, { min: 0 });
+
 // --- LLM streaming timeouts (SSE-style response body) ---
 // Aligned to LiteLLM gateway's read=600s to avoid client-side aborts that
 // the upstream proxy would still consider in-flight. Long prefill on big
@@ -1665,7 +1759,7 @@ export const FETCH_BODY_IDLE_TIMEOUT_MS = envInt("FETCH_BODY_IDLE_TIMEOUT_MS", 6
 export const FETCH_TOTAL_TIMEOUT_MS = envInt("FETCH_TOTAL_TIMEOUT_MS", 600_000);
 
 // --- Web Search ---
-export type WebSearchProviderType = "anthropic" | "tavily" | "brave" | "serper" | "disabled";
+export type WebSearchProviderType = "anthropic" | "tavily" | "brave" | "serper" | "duckduckgo" | "disabled";
 export const WEB_SEARCH_PROVIDER = env("WEB_SEARCH_PROVIDER", "disabled") as WebSearchProviderType;
 export const WEB_SEARCH_FALLBACK = env("WEB_SEARCH_FALLBACK", "");
 export const WEB_SEARCH_MAX_USES = envInt("WEB_SEARCH_MAX_USES", 8);
@@ -1690,6 +1784,9 @@ export const WEB_FETCH_DOMAIN_DENYLIST = env("WEB_FETCH_DOMAIN_DENYLIST", "");
 export const WEB_FETCH_TIMEOUT_MS = envInt("WEB_FETCH_TIMEOUT_MS", 60_000);
 export const WEB_FETCH_SUMMARIZE = envBool("WEB_FETCH_SUMMARIZE", true);
 export const WEB_FETCH_SUMMARIZE_MODEL = env("WEB_FETCH_SUMMARIZE_MODEL", "claude-3-5-haiku-latest");
+// The model that judges a research report's citations before it is delivered (`tools/cite-check.ts`). Blank (the default): the one
+// that summarizes fetched pages, WEB_FETCH_SUMMARIZE_MODEL. A judge that is too strict marks supported findings unverified.
+export const CITE_CHECK_MODEL = env("CITE_CHECK_MODEL", "");
 export const WEB_FETCH_CACHE_TTL_MS = envInt("WEB_FETCH_CACHE_TTL_MS", 15 * 60 * 1000);
 export const WEB_FETCH_CACHE_MAX_BYTES = envInt("WEB_FETCH_CACHE_MAX_BYTES", 50 * 1024 * 1024);
 
@@ -1796,6 +1893,31 @@ export const BASH_FOREGROUND_MAX_SEC = envInt(
   // which the MCP client treats as already expired. Refused so a typo shows up
   // at startup instead of as every bash call failing on its first tick.
   { min: 1 },
+);
+
+/**
+ * How long a drain (SIGTERM) lets a tool call that is already in flight finish
+ * before it is cut, in milliseconds.
+ *
+ * The handover argument above ("every foreground command the previous owner
+ * started has ended") was only true by killing the command: the drain aborted
+ * every run at once, Hands killed the command with its request, and the run
+ * resumed on another replica told the call was interrupted. The model then said
+ * so in the chat and ran the command again -- on 2026-11-07 one legacy chat turn
+ * was cut twice by one brain rollout and ran its command three times. Letting
+ * the call finish puts its real result in the turn journal, and the resumed run
+ * answers it from there, so the model never learns of the restart.
+ *
+ * The foreground ceiling plus 20 s of transport slack, held at 180 s: with the
+ * SIGTERM path's own budget (about 93 s, SIGTERM_PENDING_SYNC_WAIT_MS) it fits
+ * inside the chart's 300 s terminationGracePeriodSeconds. A call that is still
+ * running then is cut as before. Zero restores the old behaviour.
+ */
+export const SIGTERM_TOOL_GRACE_MS = envInt(
+  "SIGTERM_TOOL_GRACE_MS",
+  Math.min((BASH_FOREGROUND_MAX_SEC + 20) * 1000, 180_000),
+  // (180 s at most: with the SIGTERM path's own ~93 s and the preStop, more would outlast the 300 s grace)
+  { min: 0, max: 180_000 },
 );
 
 /**
@@ -1914,6 +2036,16 @@ export const PROGRESSIVE_SKILLS_ENABLED = envBool("PROGRESSIVE_SKILLS_ENABLED", 
 // placeholders, as always. On: in the system message, so the user's message is the last thing the model reads and the
 // hints are part of the cached prefix. Affects every session; switch it on only after an evaluation shows no regression.
 export const SKILL_HINTS_IN_SYSTEM = envBool("SKILL_HINTS_IN_SYSTEM", false);
+// A canary for SKILL_HINTS_IN_SYSTEM: comma-separated user ids whose turns put the hints in the system message while the
+// flag is off for everyone else, so the change can be measured on one identity on a live deployment before it is switched
+// on for all. Empty (default): nobody. With SKILL_HINTS_IN_SYSTEM on it changes nothing.
+export const SKILL_HINTS_IN_SYSTEM_USERS: ReadonlySet<string> = new Set(
+  env("SKILL_HINTS_IN_SYSTEM_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
+/** Whether this user's turn puts the skill and MCP hints in the system message: the flag, or the user is in the canary list. */
+export function skillHintsInSystemFor(userId: string | undefined): boolean {
+  return SKILL_HINTS_IN_SYSTEM || (!!userId && SKILL_HINTS_IN_SYSTEM_USERS.has(userId));
+}
 // Budget for the downloaded skill files (plugin skills and marketplace tool_ids
 // skills) Brain keeps in memory between turns, so a skill version is fetched once
 // per process instead of once per turn (see tools/skill-cache.ts). Counted as

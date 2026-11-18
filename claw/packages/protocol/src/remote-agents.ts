@@ -59,10 +59,86 @@ export const REMOTE_AGENT_TIMING = {
   watchdogMs: 75_000,
 } as const;
 
+/** The npm package the connector is published as; its command is `claw-connector`. */
+export const CONNECTOR_PACKAGE = "@primusclaw/connector";
+
+/**
+ * Which connector versions a server takes. Below `minimum` a connector still registers and is listed (so its owner
+ * sees why), but no new session is started on it (`409 connector_outdated`); below `recommended` it works and its
+ * owner is told to upgrade. A server may move both with `CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION` and
+ * `CLAW_REMOTE_AGENTS_RECOMMENDED_CONNECTOR_VERSION`. 0.1.3 is the first release with `service install`; 0.1.4 names
+ * the prompt every `turn_end` ends, without which an assistant item stays in progress after its last instruction.
+ */
+export const CONNECTOR_VERSIONS = { minimum: "0.1.3", recommended: "0.1.4" } as const;
+
+/** `current`: at least the recommended version; `outdated`: works, upgrade; `unsupported`: below the minimum; `unknown`: no readable version. */
+export type ConnectorVersionStatus = "current" | "outdated" | "unsupported" | "unknown";
+
+const SEMVER_RE = /^v?(\d{1,9})\.(\d{1,9})\.(\d{1,9})(?:-([0-9A-Za-z.-]{1,64}))?(?:\+[0-9A-Za-z.-]{1,64})?$/;
+
+/** A version's `[major, minor, patch, prerelease]`, or null when it is no `x.y.z`. */
+function semver(v: string): [number, number, number, string | null] | null {
+  const m = SEMVER_RE.exec(v.trim());
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3]), m[4] ?? null] : null;
+}
+
+/** Two prerelease tags in semver's order: identifier by identifier, numbers numerically and below words, a shorter prefix first. */
+function comparePrerelease(a: string, b: string): number {
+  const x = a.split(".");
+  const y = b.split(".");
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    // (read once into locals: a consumer compiling this file with noUncheckedIndexedAccess sees them narrowed)
+    const xi = x[i];
+    const yi = y[i];
+    if (xi === undefined) return -1;
+    if (yi === undefined) return 1;
+    const nx = /^\d+$/.test(xi);
+    const ny = /^\d+$/.test(yi);
+    if (nx && ny) { const d = Number(xi) - Number(yi); if (d) return d < 0 ? -1 : 1; continue; }
+    if (nx !== ny) return nx ? -1 : 1;
+    if (xi !== yi) return xi < yi ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Compares two `x.y.z` versions as semver orders them (a prerelease sorts before its release; build metadata is ignored). Null when
+ * either is not a version.
+ */
+export function compareConnectorVersions(a: string, b: string): number | null {
+  const x = semver(a);
+  const y = semver(b);
+  if (!x || !y) return null;
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return (x[i] as number) < (y[i] as number) ? -1 : 1;
+  if (x[3] === y[3]) return 0;
+  if (x[3] === null) return 1;
+  if (y[3] === null) return -1;
+  return comparePrerelease(x[3], y[3]);
+}
+
+/** Where `version` stands against `policy`. A connector that reports no version, or one that is no `x.y.z`, is `unknown`: it is not refused. */
+export function connectorVersionStatus(
+  version: string | null | undefined, policy: { minimum: string; recommended: string } = CONNECTOR_VERSIONS,
+): ConnectorVersionStatus {
+  if (!version) return "unknown";
+  const toMin = compareConnectorVersions(version, policy.minimum);
+  if (toMin === null) return "unknown";
+  if (toMin < 0) return "unsupported";
+  const toRec = compareConnectorVersions(version, policy.recommended);
+  return toRec !== null && toRec < 0 ? "outdated" : "current";
+}
+
 /** Event types the server itself acts on; every other type is stored and relayed as is. */
 export const REMOTE_EVENT_PERMISSION_REQUEST = "permissionRequest";
 export const REMOTE_EVENT_PERMISSION_RESOLVED = "permission_resolved";
 export const REMOTE_EVENT_SESSION_CLOSED = "session_closed";
+/**
+ * What the person sent a session (a `prompt` command), written by Claw itself when it queues the prompt: `{text, cmd_id, cmd_seq,
+ * client, by: "claw"}` with a negative `seq`. An agent's events carry only its own side, so without it a window opened on the
+ * session elsewhere (another device, the web page beside a Teams chat) shows answers to questions it cannot see. A connector may
+ * not post it: a frame of this type is always Claw's account of what was sent.
+ */
+export const REMOTE_EVENT_USER_PROMPT = "user_prompt";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AGENT_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
@@ -201,6 +277,7 @@ export function parseEventBatch(body: unknown): Parsed<RemoteEventBatch> {
     if (!sessionId) return refuse("invalid_session_id");
     if (!Number.isSafeInteger(raw.seq) || (raw.seq as number) < 1) return refuse("invalid_seq");
     if (typeof raw.type !== "string" || !LABEL_RE.test(raw.type)) return refuse("invalid_type");
+    if (raw.type === REMOTE_EVENT_USER_PROMPT) return refuse("reserved_type");
     if (typeof raw.ts !== "number" || !Number.isFinite(raw.ts) || raw.ts < 0 || raw.ts > 8.64e15) return refuse("invalid_ts");
     if (!isObject(raw.data)) return refuse("invalid_data");
     if (jsonBytes(raw.data) > REMOTE_AGENT_LIMITS.maxEventBytes) return refuse("event_too_large");
@@ -220,6 +297,11 @@ export interface RemoteSessionNew {
    * only one that knows what it means.
    */
   resume_ref: string | null;
+  /**
+   * With `resume_ref`: the person confirmed that whatever holds that session open on the machine (a terminal) is to be
+   * ended so that this session can continue it. Without it a session held open elsewhere is only watched, read-only.
+   */
+  takeover: boolean;
 }
 
 export function parseSessionNew(body: unknown): Parsed<RemoteSessionNew> {
@@ -242,7 +324,126 @@ export function parseSessionNew(body: unknown): Parsed<RemoteSessionNew> {
     if (typeof body.resume_ref !== "string" || !OPAQUE_ID_RE.test(body.resume_ref)) return fail("invalid_resume_ref");
     resumeRef = body.resume_ref;
   }
-  return { ok: true, value: { connector_id: connectorId, agent_id: body.agent_id, cwd: body.cwd, mode, resume_ref: resumeRef } };
+  if (body.takeover !== undefined && body.takeover !== null && typeof body.takeover !== "boolean") return fail("invalid_takeover");
+  const takeover = body.takeover === true;
+  if (takeover && !resumeRef) return fail("takeover_needs_resume_ref");
+  return { ok: true, value: { connector_id: connectorId, agent_id: body.agent_id, cwd: body.cwd, mode, resume_ref: resumeRef, takeover } };
+}
+
+/**
+ * Approvals a terminal asks for, carried to the phone (`POST /v1/remote-agents/connectors/:cid/terminal-sessions`).
+ *
+ * A coding agent its person started in their own terminal asks there before it runs a command, edits a file, leaves plan mode or
+ * puts a multiple-choice question. A connector whose hook sees such a prompt opens (or finds) one session per terminal conversation
+ * (`ref`, the agent's own conversation id) and posts each prompt on it as a `permissionRequest`, with
+ * `data.origin` {@link REMOTE_ORIGIN_TERMINAL_HOOK}; the owner answers it as any other, with a `decision`. The terminal keeps its own
+ * prompt: whichever answer comes first is the one the agent takes, and the connector says which (`permission_resolved.by`).
+ *
+ * Such a session carries nothing else: no prompt, no turn, no mode. It is not one of the sessions a user opens, so it neither counts
+ * against {@link REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser} nor is closed to make room for one.
+ */
+export const REMOTE_ORIGIN_TERMINAL_HOOK = "terminal_hook";
+
+/** The only commands a terminal-hook session takes: an answer, and closing it. */
+export const TERMINAL_HOOK_COMMANDS: readonly RemoteCommandType[] = ["decision", "close"];
+
+export const TERMINAL_SESSION_LIMITS = {
+  /** Terminal-hook sessions one user may open per minute, across their machines (a new terminal conversation opens one). */
+  opensPerMinute: 30,
+  /** Characters of a session's title (the conversation's name, or the start of its first prompt). */
+  maxTitleChars: 80,
+} as const;
+
+/** A conversation ref as a connector names it, and nothing else. */
+const TERMINAL_REF_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+
+export interface RemoteTerminalSessionOpen {
+  agent_id: string;
+  /** The agent's own id of the conversation open in the terminal. */
+  ref: string;
+  cwd: string;
+  /** The conversation's name, or the start of its first prompt; empty when the connector has neither. */
+  title: string;
+}
+
+export function parseTerminalSessionOpen(body: unknown): Parsed<RemoteTerminalSessionOpen> {
+  if (!isObject(body)) return fail("body_required");
+  if (typeof body.agent_id !== "string" || !AGENT_ID_RE.test(body.agent_id)) return fail("invalid_agent_id");
+  if (typeof body.ref !== "string" || !TERMINAL_REF_RE.test(body.ref)) return fail("invalid_ref");
+  if (typeof body.cwd !== "string" || body.cwd.length < 1 || body.cwd.length > 4096 || /[\u0000-\u001f\u007f]/u.test(body.cwd)) {
+    return fail("invalid_cwd");
+  }
+  let title = "";
+  if (body.title !== undefined && body.title !== null) {
+    if (typeof body.title !== "string" || /[\u0000-\u001f\u007f]/u.test(body.title)) return fail("invalid_title");
+    title = Array.from(body.title.trim()).slice(0, TERMINAL_SESSION_LIMITS.maxTitleChars).join("");
+  }
+  return { ok: true, value: { agent_id: body.agent_id, ref: body.ref, cwd: body.cwd, title } };
+}
+
+/** The owner's switch for approvals from terminals (`GET`/`PUT /v1/remote-agents/approvals`). On unless they turned it off. */
+export function parseApprovalsSetting(body: unknown): Parsed<{ enabled: boolean }> {
+  if (!isObject(body) || typeof body.enabled !== "boolean") return fail("enabled_required");
+  return { ok: true, value: { enabled: body.enabled } };
+}
+
+/**
+ * Hiding conversations of a machine from its owner's lists (`POST /v1/remote-agents/connectors/:cid/hidden`), and the
+ * listing that leaves them out (`GET /v1/remote-agents/connectors`, `?hidden=include` to list them too). Nothing on the
+ * machine changes: only which of the conversations it reports (`capabilities.resumable`) the owner's lists show.
+ */
+export const REMOTE_HIDE_LIMITS = {
+  /** Conversation refs one request names, at least one. */
+  maxRefs: 50,
+  /** A ref as the machine reported it: printable ASCII, no space. */
+  maxRefChars: 128,
+} as const;
+
+/** The value of `?hidden=` that lists the hidden conversations too, each marked `hidden: true`. */
+export const REMOTE_HIDDEN_INCLUDE = "include";
+
+const HIDE_REF_RE = new RegExp(`^[\\x21-\\x7e]{1,${REMOTE_HIDE_LIMITS.maxRefChars}}$`);
+
+/** The body of a hide (or, `hidden: false`, show again). */
+export interface RemoteHiddenRequest {
+  refs: string[];
+  hidden: boolean;
+}
+
+/** Why a conversation was not hidden: a process has it open (or a session holds it), or the machine does not report it now. */
+export type RemoteHideRefusalReason = "live" | "unknown_conversation";
+
+export interface RemoteHideRefusal {
+  ref: string;
+  reason: RemoteHideRefusalReason;
+}
+
+/** The answer of a hide or show (`data`): the refs that changed, and the ones refused with why. */
+export interface RemoteHidden {
+  changed: string[];
+  refused: RemoteHideRefusal[];
+}
+
+/** One conversation of `capabilities.resumable` as the owner's listing returns it: as the machine reported it, marked when hidden. */
+export type RemoteResumableListed = Record<string, unknown> & { hidden?: true };
+
+/**
+ * What the listing makes of an agent's `capabilities` once its owner hid any of its conversations: the conversations left
+ * (`?hidden=include`: all of them, the hidden ones marked) and how many are hidden. Absent while nothing of it is hidden.
+ */
+export interface RemoteHiddenCapabilities {
+  resumable: RemoteResumableListed[];
+  hidden_count: number;
+}
+
+/** A hide request as the route takes it: `hidden` a boolean, then 1 to 50 refs of printable ASCII. */
+export function parseHiddenRequest(body: unknown): Parsed<RemoteHiddenRequest> {
+  const fields = isObject(body) ? body : {};
+  if (typeof fields.hidden !== "boolean") return fail("hidden_must_be_boolean");
+  const refs = Array.isArray(fields.refs) ? (fields.refs as unknown[]) : null;
+  if (!refs || refs.length === 0 || refs.length > REMOTE_HIDE_LIMITS.maxRefs) return fail("invalid_refs");
+  if (!refs.every((r): r is string => typeof r === "string" && HIDE_REF_RE.test(r))) return fail("invalid_refs");
+  return { ok: true, value: { refs, hidden: fields.hidden } };
 }
 
 /**
@@ -253,7 +454,7 @@ export function parseSessionNew(body: unknown): Parsed<RemoteSessionNew> {
  * remote shell, so a type that is not listed is refused at the server and
  * dropped (and audited) at the connector.
  */
-export const REMOTE_COMMAND_TYPES = ["prompt", "cancel", "set_mode", "resume", "close", "decision"] as const;
+export const REMOTE_COMMAND_TYPES = ["prompt", "cancel", "set_mode", "resume", "close", "decision", "withdraw"] as const;
 export type RemoteCommandType = (typeof REMOTE_COMMAND_TYPES)[number];
 
 export interface RemoteCommandSpec {
@@ -302,6 +503,18 @@ export const REMOTE_COMMANDS: Record<RemoteCommandType, RemoteCommandSpec> = {
   },
   resume: {
     needsOnline: true,
+    closesSession: false,
+    parse: () => ({ ok: true, value: {} }),
+    audit: () => ({}),
+  },
+  /**
+   * Take back the prompts that have not started (waiting for a terminal to be free, or queued behind a running turn): each is refused
+   * by name (`withdrawn`). Nothing that runs is touched: no Escape into a terminal, no cancel of the turn, no permission answered. A
+   * chat that lets a session go while its message still waits sends it (a connector says it can with the agent capability
+   * `withdraw`); safe to deliver late, like a cancel.
+   */
+  withdraw: {
+    needsOnline: false,
     closesSession: false,
     parse: () => ({ ok: true, value: {} }),
     audit: () => ({}),

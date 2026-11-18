@@ -108,3 +108,29 @@ test("a configured multi-node start ceiling still ends the wait, deleting the cl
   );
   assert.ok(seen.includes("DELETE"));
 });
+
+test("a multi-node cluster the platform is adding nodes for is not given up on, however long they take", { timeout: 10_000 }, async (t) => {
+  // NotReady with TriggeredScaleUp on the workload for five hours, after nearly three hours in
+  // the queue, then Running. The sandbox's 3-hour ceiling for a node being added is opt-in and
+  // this path does not opt in: with its start ceiling at the default (indefinite) and the queue
+  // ceiling set to the sandbox default, nothing ends the wait and the cluster is not deleted.
+  const queued = new Response(JSON.stringify({ phase: "Pending", queuePosition: 1, message: "In queue - insufficient resources, no amd.com/gpu available" }), { status: 200 });
+  const scaling = JSON.stringify({
+    phase: "NotReady", queuePosition: 0, pods: [{ podId: "mn-msg-rayjob-head", phase: "Pending" }],
+    message: "In queue - waiting for scale-up - Scheduling is blocked due to non-empty scheduling gates"
+      + " - TriggeredScaleUp: pod triggered scale-up: job 271406 queued in pool 3ae370df-d658-462b-a935-b319be80a2c0",
+  });
+  let polls = 0;
+  const queuePolls = 10_700_000 / 5000;
+  const seen = recordSafe(t, (m) => {
+    if (m === "DELETE") return new Response("", { status: 204 });
+    polls++;
+    if (polls <= queuePolls) return queued.clone();
+    return polls > queuePolls + 3600
+      ? new Response(JSON.stringify({ phase: "Running", pods: [] }), { status: 200 })
+      : new Response(scaling, { status: 200 });
+  });
+  const detail = await wait({ deps: { pendingTimeoutMs: 10_800_000 } });
+  assert.equal(detail.phase, "Running");
+  assert.ok(!seen.includes("DELETE"), "the cluster must not be deleted");
+});

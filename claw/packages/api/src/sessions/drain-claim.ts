@@ -23,6 +23,7 @@
  */
 import pino from "pino";
 import { db, type StatementRunner } from "../infra/db.js";
+import { workspaceSaveHeldSql } from "./save-hold.js";
 
 const logger = pino({ name: "pending-drain-claim" });
 
@@ -87,6 +88,7 @@ async function takeClaim(q: StatementRunner, sessionId: string): Promise<string 
   const r = await q.query(
     `UPDATE claw_sessions SET pending_drain_until = clock_timestamp() + make_interval(secs => $2)
       WHERE session_id = $1 AND deleted_at IS NULL AND agent_status <> 'running' AND NOT ${DRAIN_UNDER_WAY_SQL}
+        AND NOT ${workspaceSaveHeldSql()}
       RETURNING pending_drain_until::text AS claim`,
     [sessionId, CLAIM_SECONDS],
   );

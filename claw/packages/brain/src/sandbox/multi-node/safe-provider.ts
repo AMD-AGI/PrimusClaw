@@ -31,7 +31,7 @@ import {
 } from "./prompt-flags.js";
 import { multiNodeWorkloadName } from "../workload-naming.js";
 import { gpuWorkspaceFor } from "../workspace-select.js";
-import { SandboxProvisionTerminalError } from "../errors.js";
+import { SandboxProvisionTerminalError, assertSandboxWorkspaceAllowed } from "../errors.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES, waitForWorkloadReady, type WorkloadWaitDeps } from "../workload-wait.js";
 import { parseWorkloadListPage, type WorkloadRef } from "./workload-parse.js";
 import {
@@ -136,7 +136,105 @@ interface SessionWorkloadPage {
  * `primus-claw/session-id` label selector used to have. SaFE matches the env
  * value exactly (jsonb `->> key = value`), so no other session can be returned.
  */
-async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<SessionWorkloadPage> {
+/** A workload list SaFE answered with something other than 200. */
+class WorkloadListRefused extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/**
+ * The workspaces to list a session's workloads in, as given: trimmed, deduplicated, empty names dropped.
+ *
+ * SaFE lists workloads across workspaces only for an admin key. Any other key -- every ordinary user, and
+ * the service identities Claw runs for (sa-eval-bot, sa-release-gate, dispatron-service) -- is answered 403
+ * unless the request names a workspace the key may read, so an unscoped list made every non-admin session's
+ * teardown `lookup_failed` and parked it for good. The workspaces come from what the session recorded
+ * (its `hands.<sid>` binding's namespace), and are asked only after the unscoped list is refused.
+ */
+export function sessionWorkspaces(workspaces: readonly (string | null | undefined)[] | undefined): string[] {
+  const out: string[] = [];
+  for (const w of workspaces ?? []) {
+    const name = typeof w === "string" ? w.trim() : "";
+    if (name && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * The workspaces SaFE says the key's user belongs to (`GET /api/v1/users/self`, `workspaces[].id`).
+ *
+ * Throws when SaFE will not say: an unknown membership is not an empty one, and a teardown that read it as
+ * empty would call a session clean without having looked anywhere.
+ */
+async function keyWorkspaces(apiKey: string): Promise<string[]> {
+  const resp = await safeFetch("/api/v1/users/self", { apiKey });
+  if (resp.status !== 200) {
+    throw new WorkloadListRefused(resp.status, `users/self failed: HTTP ${resp.status} ${JSON.stringify(resp.body).slice(0, 300)}`);
+  }
+  const list = resp.body && typeof resp.body === "object" ? (resp.body as { workspaces?: unknown }).workspaces : undefined;
+  if (!Array.isArray(list)) {
+    throw new WorkloadListRefused(resp.status, `users/self named no workspace list: ${JSON.stringify(resp.body).slice(0, 300)}`);
+  }
+  return sessionWorkspaces(list.map((w) => {
+    const id = w && typeof w === "object" ? (w as { id?: unknown }).id : undefined;
+    return typeof id === "string" ? id : undefined;
+  }));
+}
+
+/**
+ * Every workload a session owns: the unscoped list when the key may read it, else one walk per workspace
+ * the session recorded -- or, when it recorded none, per workspace the key's user belongs to. A walk that
+ * fails fails the whole lookup: a teardown that read one workspace and not the other must not call the
+ * session clean.
+ *
+ * The key's own workspaces are asked for because a session does not always record one. Its `hands.<sid>`
+ * binding names the sandbox's workspace, but a session that never started a sandbox (a connector session, a
+ * session deleted the moment it was created) or whose binding was already removed has none -- and a
+ * non-admin key's unscoped list is always 403, so every such delete by an ordinary user or a service
+ * identity used to end `lookup_failed` and log `session.cleanup_incomplete_parked`, with nothing to park.
+ * A key can only have created workloads in a workspace its user may use, so those workspaces are the whole
+ * of where this session's workloads can be; a user who belongs to none owns none, which is a finished
+ * teardown with nothing found rather than a failed one.
+ */
+async function findSessionWorkloads(
+  sessionId: string,
+  apiKey: string,
+  workspaces?: readonly (string | null | undefined)[],
+): Promise<SessionWorkloadPage> {
+  // The unscoped list first: a key that may read it (an admin's) sees every workspace, including one the
+  // binding does not name, exactly as before. Only its 403 -- the answer every other key gets -- moves the
+  // lookup to the named workspaces.
+  try {
+    return await findSessionWorkloadsIn(sessionId, apiKey, undefined);
+  } catch (err) {
+    if (!(err instanceof WorkloadListRefused) || err.status !== 403) throw err;
+  }
+  // The recorded workspaces when there are any, as before; the key's own only when the session recorded none.
+  const recorded = sessionWorkspaces(workspaces);
+  const scopes = recorded.length ? recorded : await keyWorkspaces(apiKey);
+  const items: WorkloadRef[] = [];
+  let incomplete = false;
+  let reason: SessionWorkloadPage["reason"];
+  for (const workspaceId of scopes) {
+    const page = await findSessionWorkloadsIn(sessionId, apiKey, workspaceId);
+    for (const ref of page.items) if (!items.some((r) => r.id === ref.id)) items.push(ref);
+    if (page.incomplete) {
+      incomplete = true;
+      // "Could not be read" says more than "read, but short", so it wins the label.
+      if (reason !== "lookup_failed") reason = page.reason;
+    }
+  }
+  return incomplete ? { items, incomplete, reason } : { items, incomplete: false };
+}
+
+async function findSessionWorkloadsIn(
+  sessionId: string,
+  apiKey: string,
+  workspaceId: string | undefined,
+): Promise<SessionWorkloadPage> {
   const items: WorkloadRef[] = [];
   let reported = 0;
   for (let page = 0; page < SESSION_MAX_PAGES; page++) {
@@ -152,9 +250,13 @@ async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<
       limit: String(SESSION_PAGE_SIZE),
       offset: String(page * SESSION_PAGE_SIZE),
     });
+    if (workspaceId) query.set("workspaceId", workspaceId);
     const resp = await safeFetch(`/api/v1/workloads?${query}`, { apiKey });
     if (resp.status !== 200) {
-      throw new Error(`workloads list failed: HTTP ${resp.status} ${JSON.stringify(resp.body).slice(0, 300)}`);
+      throw new WorkloadListRefused(
+        resp.status,
+        `workloads list failed${workspaceId ? ` in ${workspaceId}` : ""}: HTTP ${resp.status} ${JSON.stringify(resp.body).slice(0, 300)}`,
+      );
     }
     // A 200 whose body is not a workload list hands us nothing to act on and
     // proves nothing about the session. Reported as incomplete rather than
@@ -164,7 +266,7 @@ async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<
     const parsed = parseWorkloadListPage(resp.body);
     if (!parsed) {
       logger.warn(
-        { sessionId, page, body: JSON.stringify(resp.body).slice(0, 300) },
+        { sessionId, workspaceId, page, body: JSON.stringify(resp.body).slice(0, 300) },
         "mn.safe_list_unrecognised",
       );
       return { items, incomplete: true, reason: "lookup_failed" };
@@ -180,7 +282,7 @@ async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<
       const short = items.length < reported;
       if (short) {
         logger.warn(
-          { sessionId, addressable: items.length, reported },
+          { sessionId, workspaceId, addressable: items.length, reported },
           "mn.safe_list_incomplete",
         );
       }
@@ -188,7 +290,7 @@ async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<
     }
   }
   logger.warn(
-    { sessionId, pages: SESSION_MAX_PAGES, collected: items.length, reported },
+    { sessionId, workspaceId, pages: SESSION_MAX_PAGES, collected: items.length, reported },
     "mn.safe_list_page_cap",
   );
   return { items, incomplete: true, reason: "list_truncated" };
@@ -207,12 +309,14 @@ async function findSessionWorkloads(sessionId: string, apiKey: string): Promise<
  * @param sessionId Session whose clusters should be reclaimed.
  * @param apiKey SaFE key of the session's owner.
  * @param messageId When set, delete only this cluster workload id.
+ * @param workspaces Where the session's workloads were recorded (see `sessionWorkspaces`).
  * @returns How many clusters were deleted.
  */
 export async function reclaimIdleSessionClusters(
   sessionId: string,
   apiKey: string,
   messageId?: string,
+  workspaces?: readonly (string | null | undefined)[],
 ): Promise<number> {
   const scoped = (messageId ?? "").trim();
   if (scoped) {
@@ -226,7 +330,7 @@ export async function reclaimIdleSessionClusters(
     // Unverified means not deleted. A cluster left behind costs GPUs until the
     // workload's own timeout; deleting something this session does not own
     // costs work nobody asked to end.
-    const { items, incomplete } = await findSessionWorkloads(sessionId, apiKey);
+    const { items, incomplete } = await findSessionWorkloads(sessionId, apiKey, workspaces);
     const named = items.find((ref) => ref.id === scoped);
     if (!named || !CLUSTER_KINDS.has(named.kind)) {
       logger.warn(
@@ -251,7 +355,7 @@ export async function reclaimIdleSessionClusters(
   // A shortfall is not worth reporting here. It cannot hide a running cluster
   // from this sweep -- the walk above pages through everything non-terminal, so
   // what is missing is an entry with no id, which no caller could delete anyway.
-  const { items } = await findSessionWorkloads(sessionId, apiKey);
+  const { items } = await findSessionWorkloads(sessionId, apiKey, workspaces);
   let deleted = 0;
   for (const ref of items) {
     if (!CLUSTER_KINDS.has(ref.kind)) continue;
@@ -328,6 +432,9 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     // placed in the GPU workspace, the same rule a single-node GPU sandbox follows.
     const namespace = gpuWorkspaceFor(request.workspace_id);
     if (!namespace) throw new Error("multi-node request requires workspace_id");
+    // The cluster runs the run's code too, and is created before the Hands sandbox
+    // that would otherwise be the first to ask: same list, same refusal.
+    assertSandboxWorkspaceAllowed(namespace);
     const apiKey = (opts?.platformKey ?? request.platform_key ?? "").trim();
     if (!apiKey) throw new Error("multi-node request requires a SaFE platform key in safe mode");
     if (!SAFE_API_URL.trim()) throw new Error("SAFE_API_URL is not configured");
@@ -464,7 +571,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     }
     let page: SessionWorkloadPage;
     try {
-      page = await findSessionWorkloads(sessionId, key);
+      page = await findSessionWorkloads(sessionId, key, opts?.workspaces);
     } catch (e) {
       // Nothing was enumerated, so there is nothing to act on.
       logger.warn({ err: String(e), sessionId }, "mn.safe_lookup_failed");

@@ -16,7 +16,7 @@ export interface CommentableLines {
   left: Set<number>;
 }
 
-const HUNK_RE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+export const HUNK_RE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
 
 export function commentableLines(patch: string | undefined | null): CommentableLines {
   const out: CommentableLines = { right: new Set(), left: new Set() };

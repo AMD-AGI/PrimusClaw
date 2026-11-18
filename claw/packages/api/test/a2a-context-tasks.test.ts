@@ -183,6 +183,22 @@ describe("the A2A context/task model", { skip }, () => {
       assert.equal(user.length, 1, "the turn is in the transcript");
     });
 
+    test("the turn reaches Brain as the caller wrote it, and the stored UserMessage has its credentials masked", async () => {
+      // Assembled from pieces so no scanner reads this file as holding a credential.
+      const key = `ak-${"Q7w8E9r0T1y2".repeat(4)}`;
+      const text = `deploy with ${key} and password=Hunter2xyz`;
+      const r = await send(text);
+      assert.ok(r.task, r.body);
+      const payload = executes.find((e) => e.subject === "tasks.execute")!.payload as Record<string, unknown>;
+      assert.equal(payload.prompt, text, "the model is given the words as written");
+      const run = (await query("SELECT session_id FROM claw_tasks WHERE task_id = $1", [r.task.id])).rows[0] as { session_id: string };
+      const stored = (await query(
+        "SELECT data FROM claw_session_events WHERE session_id = $1 AND event = 'UserMessage'", [run.session_id],
+      )).rows as Array<{ data: { data: { content: Array<{ text: string }> } } }>;
+      assert.equal(stored.length, 1);
+      assert.equal(stored[0]!.data.data.content[0]!.text, "deploy with <redacted> and password=<redacted>");
+    });
+
     test("a contextId the caller names is the one used", async () => {
       const r = await send("hello", { contextId: "ctx-mine" });
       assert.equal(r.task?.contextId, "ctx-mine");

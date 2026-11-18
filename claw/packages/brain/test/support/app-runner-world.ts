@@ -65,6 +65,8 @@ export class World {
   rec: AppRunRecord;
   /** workload id -> phase */
   workloads = new Map<string, "running" | "terminal" | "absent">();
+  /** What SaFE says about a terminal workload: its stable reason, and whether a disruption took it. */
+  endings = new Map<string, { reason?: string; disrupted?: boolean }>();
   /** shared storage */
   files = new Map<string, string>();
   /** `${workload}:${pid}` of live application processes */
@@ -74,6 +76,10 @@ export class World {
   execs: ExecRecord[] = [];
   starts: StartRecord[] = [];
   created: string[] = [];
+  /** Reader sandboxes made (what they are made with is app-sandbox.ts's, tested in app-sandbox.test.ts). */
+  readers: Array<{ id: string }> = [];
+  /** Fail the next N reader creates. */
+  failReader = 0;
   stopped: string[] = [];
   /** The fake clock when each sandbox was stopped, in the same order as `stopped`. */
   stoppedAt: number[] = [];
@@ -141,9 +147,13 @@ export class World {
     if (exit !== undefined) this.files.set(`${STATE_DIR}/exit.json`, typeof exit === "string" ? exit : JSON.stringify(exit));
   }
 
-  /** SaFE says the workload is gone: its processes with it. */
-  killWorkload(wl: string, phase: "terminal" | "absent"): void {
+  /**
+   * SaFE says the workload is gone: its processes with it. `ending` is what SaFE says
+   * about a terminal one; none is a terminal workload with no reason named.
+   */
+  killWorkload(wl: string, phase: "terminal" | "absent", ending: { reason?: string; disrupted?: boolean } = {}): void {
     this.workloads.set(wl, phase);
+    this.endings.set(wl, ending);
     for (const key of [...this.procs]) if (key.startsWith(`${wl}:`)) this.procs.delete(key);
   }
 
@@ -179,7 +189,8 @@ export class World {
 
   sandbox: AppSandboxOps = {
     ensure: async (run) => {
-      const live = [...this.workloads].filter(([, p]) => p === "running").map(([id]) => id);
+      // A reader carries its run under another env key, so the run's own lookup never finds it.
+      const live = [...this.workloads].filter(([id, p]) => p === "running" && !this.isReader(id)).map(([id]) => id);
       if (live.length > 0) {
         const id = live[live.length - 1]!;
         return { instance: this.inst(id), workloadId: id, created: false };
@@ -190,18 +201,34 @@ export class World {
       await this.store.patch(run.runId, { sandbox_workload_id: id });
       return { instance: this.inst(id), workloadId: id, created: true };
     },
+    reader: async () => {
+      if (this.failReader > 0) { this.failReader -= 1; throw new Error("reader could not be created"); }
+      const id = `rd-${this.readers.length + 1}`;
+      this.workloads.set(id, "running");
+      this.readers.push({ id });
+      return { instance: this.inst(id), workloadId: id, created: true };
+    },
     instance: (_run, id) => this.inst(id),
     status: async (inst) => {
       const phase = this.workloads.get(inst.id) ?? "absent";
-      return phase === "running"
-        ? { running: true, healthy: true, state: "running" }
-        : { running: false, healthy: false, state: phase };
+      if (phase === "running") return { running: true, healthy: true, state: "running" };
+      const ending = phase === "terminal" ? this.endings.get(inst.id) ?? {} : {};
+      return {
+        running: false, healthy: false, state: phase,
+        ...(ending.reason ? { reason: ending.reason } : {}),
+        ...(ending.disrupted ? { disrupted: true } : {}),
+      };
     },
     exec: async (inst, command, _timeout, opts) => this.exec(inst.id, command, opts),
     stop: async (inst) => { this.stopped.push(inst.id); this.stoppedAt.push(this.clock); this.killWorkload(inst.id, "terminal"); },
-    liveIds: async () => [...this.workloads].filter(([, p]) => p === "running").map(([id]) => id),
+    liveIds: async () => [...this.workloads].filter(([id, p]) => p === "running" && !this.isReader(id)).map(([id]) => id),
     nodeName: async () => "node-7",
   };
+
+  isReader(id: string): boolean { return this.readers.some((r) => r.id === id); }
+
+  /** Readers that were made and never stopped. */
+  liveReaders(): string[] { return this.readers.map((r) => r.id).filter((id) => this.workloads.get(id) === "running"); }
 
   private inst(id: string): SandboxInstance {
     return { provider: "safe-workload", id, sandboxName: id, namespace: "ws-1", handsBaseUrl: "", platformKey: "pk" };
@@ -218,13 +245,15 @@ export class World {
     const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
     const dir = STATE_DIR;
 
-    if (command.includes("USER_DATA_PATH") && command.includes("printf %s")) {
-      return this.stateDirExit === null ? ok(dir) : { exitCode: this.stateDirExit, stdout: "", stderr: "" };
-    }
+    // Before the expansion's shape: a file write also reads USER_DATA_PATH, to choose the mode.
     if (command.includes("base64 -d")) {
       const path = /> '([^']+)'\.tmp/.exec(command)![1]!;
       this.files.set(path, Buffer.from(opts!.env!.CLAW_FILE_B64!, "base64").toString("utf8"));
       return ok();
+    }
+    // The start command carries the USER_DATA_PATH derivation too (it exports it to the application).
+    if (command.includes("USER_DATA_PATH") && command.includes("printf %s") && !command.includes("setsid")) {
+      return this.stateDirExit === null ? ok(dir) : { exitCode: this.stateDirExit, stdout: "", stderr: "" };
     }
     if (command.includes("kill -KILL")) {
       const want = /= '([^']*)'/.exec(command)![1]!;

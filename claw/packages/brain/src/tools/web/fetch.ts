@@ -10,6 +10,7 @@
  * every hop) because Brain runs inside a cluster with no egress allowlist.
  */
 
+import type { AxiosResponse } from "axios";
 import { LRUCache } from "lru-cache";
 import pino from "pino";
 import dns from "node:dns";
@@ -29,7 +30,8 @@ import {
 } from "../../config.js";
 import { isPreapprovedHost } from "./preapproved.js";
 import { summarizeContent, MAX_MARKDOWN_LENGTH } from "./summarize.js";
-import type { WebToolContext } from "./types.js";
+import type { WebToolContext, WebToolOutcome } from "./types.js";
+import { webSource } from "../citations.js";
 
 const logger = pino({ name: "web-fetch" });
 
@@ -111,7 +113,73 @@ export function isBlockedAddress(ip: string): boolean {
 /** Names that only mean something inside a cluster or a host, refused before any lookup. */
 const INTERNAL_NAME_RE = /(?:^|\.)(?:localhost|local|internal|svc|home\.arpa)$/i;
 
-type Resolve = (
+/** The guard refused an address: one a name resolved to, or an IP literal. Its message is for the log (`WebFetchFailure`). */
+class BlockedAddressError extends Error {}
+
+/**
+ * A failed fetch, said in this file's own words. `text` is what the model is told, and it is built from fixed phrases, numbers
+ * (an HTTP status, a limit), and the host the model itself asked for, and from nothing else: no status text, body or header a
+ * server sent (a Location included), no certificate field, no address a name resolved to, no part of a redirect target. A
+ * failed call counts as having read nothing (`WebToolOutcome`), so its text must hold nothing anyone else wrote. The error it
+ * stands for is `cause`, for the log.
+ */
+export class WebFetchFailure extends Error {
+  constructor(readonly text: string, options?: { cause?: unknown }) {
+    super(text, options);
+    this.name = "WebFetchFailure";
+  }
+}
+
+/** Errors whose `code` names what went wrong, each in fixed words. Any other is "the request failed". */
+const FAILURE_BY_CODE: Record<string, string> = {
+  EAI_AGAIN: "the DNS lookup did not complete",
+  ECONNREFUSED: "the connection was refused",
+  ECONNRESET: "the connection was reset",
+  EPIPE: "the connection was reset",
+  EHOSTUNREACH: "the host is unreachable",
+  ENETUNREACH: "the network is unreachable",
+  ETIMEDOUT: "timed out",
+  ECONNABORTED: "timed out",
+  ERR_CANCELED: "cancelled",
+  ERR_TLS_CERT_ALTNAME_INVALID: "the server's TLS certificate is not for this host",
+  CERT_HAS_EXPIRED: "the server's TLS certificate has expired",
+  CERT_NOT_YET_VALID: "the server's TLS certificate is not valid yet",
+  DEPTH_ZERO_SELF_SIGNED_CERT: "the server's TLS certificate is not trusted",
+  SELF_SIGNED_CERT_IN_CHAIN: "the server's TLS certificate is not trusted",
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE: "the server's TLS certificate is not trusted",
+  UNABLE_TO_GET_ISSUER_CERT: "the server's TLS certificate is not trusted",
+  UNABLE_TO_GET_ISSUER_CERT_LOCALLY: "the server's TLS certificate is not trusted",
+  CERT_UNTRUSTED: "the server's TLS certificate is not trusted",
+  CERT_REVOKED: "the server's TLS certificate is revoked",
+  ERR_BAD_RESPONSE: "the response could not be read (too large, or malformed)",
+};
+
+/**
+ * What a request that threw is told as (`WebFetchFailure`): by the error's class, its HTTP status or its code, never by its
+ * message, which can carry what the server sent (a certificate's names, an address). `host` is the host the model asked for,
+ * or null on a hop after a redirect, whose host came from a Location header.
+ */
+function requestFailure(err: unknown, host: string | null): string {
+  const chain = [err, (err as { cause?: unknown } | null)?.cause];
+  if (chain.some((e) => e instanceof BlockedAddressError)) {
+    return `SSRF: ${host ?? "a redirect target"} resolves to a blocked address (private, internal or reserved)`;
+  }
+  const e = err as { code?: unknown; response?: { status?: unknown; headers?: Record<string, unknown> } } | null;
+  if (e?.response?.headers?.["x-proxy-error"] === "blocked-by-allowlist") {
+    return "EGRESS_BLOCKED — the URL is blocked by the egress proxy allowlist";
+  }
+  const status = e?.response?.status;
+  if (typeof status === "number" && Number.isInteger(status)) {
+    return `fetch failed — ${host ? "the server" : "a redirect target"} answered HTTP ${status}`;
+  }
+  const code = typeof e?.code === "string" ? e.code : "";
+  if (code === "ENOTFOUND") return `DNS resolution failed for ${host ?? "a redirect target"}`;
+  if (code.startsWith("HPE_")) return "fetch failed — the server's response could not be parsed";
+  const said = Object.hasOwn(FAILURE_BY_CODE, code) ? FAILURE_BY_CODE[code] : "the request failed";
+  return `fetch failed — ${host ? "" : "on a redirect target, "}${said}`;
+}
+
+export type Resolve = (
   hostname: string,
   options: dns.LookupAllOptions,
   callback: (err: NodeJS.ErrnoException | null, addresses: dns.LookupAddress[]) => void,
@@ -134,7 +202,7 @@ export function guardedLookup(resolve: Resolve = dns.lookup as unknown as Resolv
       if (err) return callback(err, "", 0);
       const blocked = addresses.find((a) => isBlockedAddress(a.address));
       if (blocked) {
-        return callback(new Error(`SSRF: ${hostname} resolves to blocked address ${blocked.address}`), "", 0);
+        return callback(new BlockedAddressError(`SSRF: ${hostname} resolves to blocked address ${blocked.address}`), "", 0);
       }
       if (addresses.length === 0) {
         return callback(Object.assign(new Error(`ENOTFOUND ${hostname}`), { code: "ENOTFOUND" }), "", 0);
@@ -149,7 +217,7 @@ export function guardedLookup(resolve: Resolve = dns.lookup as unknown as Resolv
 function literalAddressCheck(hostname: string): void {
   const bare = hostname.replace(/^\[|\]$/g, "");
   if (net.isIP(bare) && isBlockedAddress(bare)) {
-    throw new Error(`SSRF: address ${bare} is in a blocked range`);
+    throw new BlockedAddressError(`SSRF: address ${bare} is in a blocked range`);
   }
 }
 
@@ -192,15 +260,62 @@ function isSameHost(a: URL, b: URL): boolean {
 
 // ── HTML → Markdown conversion ──
 
-type TurndownLike = new (opts: Record<string, string>) => { turndown: (html: string) => string };
+interface TurndownNode { nodeName: string; getAttribute?: (name: string) => string | null }
+type TurndownLike = new (opts: Record<string, string>) => {
+  turndown: (html: string) => string;
+  addRule: (key: string, rule: { filter: (node: TurndownNode) => boolean; replacement: (content: string, node: TurndownNode) => string }) => void;
+};
 let TurndownCtor: TurndownLike | null = null;
 
-async function htmlToMarkdown(html: string): Promise<string> {
+/** The most values of one condition key `showCondition` names before it says how many more there are. */
+const SHOW_COND_VALUES_MAX = 12;
+/** The longest `data-show-cond` read; a longer one adds nothing. */
+const SHOW_COND_MAX_CHARS = 4096;
+/**
+ * The elements a condition is written for: those Turndown has no rule of its own for, so writing the note loses nothing of the
+ * element's own Markdown (a list item's bullet, a heading's #, a link's address, a code fence would be lost otherwise).
+ */
+const SHOW_COND_NODES = new Set(["TD", "TH", "TR", "TABLE", "TBODY", "THEAD", "DIV", "SPAN", "SECTION"]);
+const BLOCK_NODES = new Set(["DIV", "TABLE", "TBODY", "THEAD", "TR", "SECTION"]);
+/** A key or value as plain words: whitespace collapsed, anything but letters, digits and . _ - + : / dropped. */
+const plainWord = (v: string, max: number): string => v.replace(/\s+/g, " ").replace(/[^\p{L}\p{N}._\-+:/ ]/gu, "").trim().slice(0, max);
+
+/**
+ * What a page's `data-show-cond` (rocm-docs selectors: a cell or block shown only for some GPUs, OS families or versions) says, as
+ * text, or null. A page that picks what to show by script is flattened to every variant at once; without this, a reader cannot tell
+ * which row belongs to which choice (parity R2: Rocky Linux 9 read as an MI355X distribution when the page shows it for MI300X only).
+ */
+export function showCondition(raw: string | null | undefined): string | null {
+  if (!raw || raw.length > SHOW_COND_MAX_CHARS) return null;
+  let cond: unknown;
+  try { cond = JSON.parse(raw); } catch { return null; }
+  if (!cond || typeof cond !== "object" || Array.isArray(cond)) return null;
+  const parts: string[] = [];
+  for (const [key, values] of Object.entries(cond as Record<string, unknown>).slice(0, 4)) {
+    if (!Array.isArray(values)) continue;
+    const vs = values.slice(0, SHOW_COND_VALUES_MAX * 4).filter((v): v is string | number => typeof v === "string" || typeof v === "number")
+      .map((v) => plainWord(String(v), 60)).filter((v) => v !== "");
+    if (!vs.length) continue;
+    const more = vs.length > SHOW_COND_VALUES_MAX ? `, +${vs.length - SHOW_COND_VALUES_MAX} more` : "";
+    const k = plainWord(key, 30);
+    if (k) parts.push(`${k}: ${vs.slice(0, SHOW_COND_VALUES_MAX).join(", ")}${more}`);
+  }
+  return parts.length ? `(shown only for ${parts.join("; ")})` : null;
+}
+
+export async function htmlToMarkdown(html: string): Promise<string> {
   if (!TurndownCtor) {
     const mod = await import("turndown");
     TurndownCtor = (mod.default ?? mod) as TurndownLike;
   }
   const td = new TurndownCtor({ headingStyle: "atx", codeBlockStyle: "fenced" });
+  td.addRule("showCondition", {
+    filter: (node) => SHOW_COND_NODES.has(node.nodeName) && !!showCondition(node.getAttribute?.("data-show-cond")),
+    replacement: (content, node) => {
+      const note = showCondition(node.getAttribute?.("data-show-cond"))!;
+      return BLOCK_NODES.has(node.nodeName) ? `\n\n${note}\n${content}\n\n` : ` ${note} ${content} `;
+    },
+  });
   return td.turndown(html);
 }
 
@@ -263,6 +378,10 @@ interface FetchResult {
   redirectInfo?: string;
 }
 
+/**
+ * Fetch `startUrl`, following redirects to the same host. Every failure is thrown as a `WebFetchFailure`, whose text names at
+ * most the host the model asked for: a hop after a redirect is "a redirect target", since its address came from the server.
+ */
 export async function fetchWithRedirects(
   startUrl: URL,
   maxBytes: number,
@@ -278,35 +397,40 @@ export async function fetchWithRedirects(
 
   try {
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-      literalAddressCheck(current.hostname);
-
-      const resp = await axios.get(current.toString(), {
-        httpAgent,
-        httpsAgent,
-        // A proxy would resolve the name itself and the guard above would never see it.
-        proxy: false,
-        maxRedirects: 0,
-        maxContentLength: maxBytes,
-        responseType: "arraybuffer",
-        timeout: WEB_FETCH_TIMEOUT_MS,
-        headers: { "User-Agent": USER_AGENT },
-        signal,
-        validateStatus: (s: number) => s < 400 || (s >= 300 && s < 400),
-      });
+      let resp: AxiosResponse<ArrayBuffer>;
+      try {
+        literalAddressCheck(current.hostname);
+        resp = await axios.get(current.toString(), {
+          httpAgent,
+          httpsAgent,
+          // A proxy would resolve the name itself and the guard above would never see it.
+          proxy: false,
+          maxRedirects: 0,
+          maxContentLength: maxBytes,
+          responseType: "arraybuffer",
+          timeout: WEB_FETCH_TIMEOUT_MS,
+          headers: { "User-Agent": USER_AGENT },
+          signal,
+          validateStatus: (s: number) => s < 400 || (s >= 300 && s < 400),
+        });
+      } catch (err: unknown) {
+        throw new WebFetchFailure(requestFailure(err, hop === 0 ? startUrl.hostname : null), { cause: err });
+      }
 
       if (resp.status >= 300 && resp.status < 400) {
+        // Not the header's text, nor any part of the address it names: what a server sends never reaches a failure's text.
         const location = resp.headers.location;
-        if (!location) throw new Error(`Redirect ${resp.status} without Location header`);
+        if (!location) throw new WebFetchFailure(`fetch failed — a redirect (HTTP ${resp.status}) came without a Location header`);
 
         let next: URL;
-        try { next = new URL(location, current.toString()); }
-        catch { throw new Error(`Invalid redirect URL: ${location}`); }
+        try { next = new URL(String(location), current.toString()); }
+        catch { throw new WebFetchFailure("fetch failed — a redirect named an invalid URL in its Location header"); }
 
         if (next.protocol !== "https:" && next.protocol !== "http:") {
-          throw new Error(`Redirect to unsupported protocol: ${next.protocol}`);
+          throw new WebFetchFailure("fetch failed — a redirect named a protocol other than http or https");
         }
         if (next.username || next.password) {
-          throw new Error("Redirect URL must not contain credentials");
+          throw new WebFetchFailure("fetch failed — a redirect named a URL with credentials in it");
         }
 
         if (!isSameHost(current, next)) {
@@ -339,7 +463,7 @@ export async function fetchWithRedirects(
       };
     }
 
-    throw new Error(`Too many redirects (>${MAX_REDIRECTS})`);
+    throw new WebFetchFailure(`fetch failed — too many redirects (more than ${MAX_REDIRECTS})`);
   } finally {
     httpAgent.destroy();
     httpsAgent.destroy();
@@ -349,9 +473,20 @@ export async function fetchWithRedirects(
 // ── WebFetchService ──
 
 export class WebFetchService {
-  constructor(private ctx: WebToolContext) {}
+  /** `resolve`: the name lookup the connection's guard asks (`guardedLookup`); the system's by default. */
+  constructor(private ctx: WebToolContext, private resolve?: Resolve) {}
 
-  async execute(input: Record<string, unknown>): Promise<string> {
+  /**
+   * A failure before any page was read (the URL refused, the address refused, the name unresolved, the request failed) is marked
+   * in `outcome`, and its text is in this file's own words: fixed phrases, a number, and the URL the model gave
+   * (`WebFetchFailure`). What a page sent is never marked, a redirect to another host or a content type it named included: it
+   * is text a server chose, and a failed call counts as having read nothing (`WebToolOutcome`).
+   */
+  async execute(input: Record<string, unknown>, outcome?: WebToolOutcome): Promise<string> {
+    const fail = (text: string): string => {
+      if (outcome) outcome.isError = true;
+      return text;
+    };
     const url = input.url as string;
     const prompt = (input.prompt as string) ?? "";
     const maxBytes = Math.min(
@@ -359,35 +494,41 @@ export class WebFetchService {
       WEB_FETCH_MAX_BYTES,
     );
     const raw = !!(input.raw as boolean);
+    const part = pagePart(input);
 
     let parsed: URL;
     try { parsed = validateUrl(url); }
     catch (err: unknown) {
-      return `Error: ${err instanceof Error ? err.message : String(err)}`;
+      return fail(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     if (isDomainBlocked(parsed.hostname)) {
-      return `Error: domain ${parsed.hostname} is blocked by WEB_FETCH_DOMAIN_DENYLIST`;
+      return fail(`Error: domain ${parsed.hostname} is blocked by WEB_FETCH_DOMAIN_DENYLIST`);
     }
+
+    // The page this call read whole, as a source (`tools/citations.ts`, which keeps it only where it confirms an address the turn
+    // already had): only a page it returned, never a redirect it reported, an error or content it would not read.
+    const read = (finalUrl: string): void => {
+      const source = outcome && webSource(finalUrl);
+      if (outcome && source) outcome.sources = [source];
+    };
 
     const ck = cacheKey(parsed.toString(), raw ? "raw" : "", raw);
     const cached = cache.get(ck);
     if (cached && !prompt) {
-      return buildOutput(cached.finalUrl, cached.statusCode, cached.contentType, cached.body.length, cached.body, false);
+      read(cached.finalUrl);
+      const shown = selectPart(cached.body, part);
+      return buildOutput(cached.finalUrl, cached.statusCode, cached.contentType, cached.body.length, shown.text, false, undefined, shown.note);
     }
 
     let result: FetchResult;
     try {
-      result = await fetchWithRedirects(parsed, maxBytes, this.ctx.signal);
+      result = await fetchWithRedirects(parsed, maxBytes, this.ctx.signal, this.resolve);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("SSRF")) return `Error: ${msg}`;
-      if (msg.includes("ENOTFOUND")) return `Error: DNS resolution failed for ${parsed.hostname}`;
-      if (msg.includes("EGRESS_BLOCKED") || (err as any)?.response?.headers?.["x-proxy-error"] === "blocked-by-allowlist") {
-        return `Error: EGRESS_BLOCKED — the URL is blocked by the egress proxy allowlist`;
-      }
-      logger.warn({ url, err: msg }, "web_fetch_failed");
-      return `Error: fetch failed — ${msg}`;
+      // The error's own message (a certificate's names, an address, what a server sent) goes to the log only.
+      const cause = err instanceof WebFetchFailure ? err.cause : err;
+      logger.warn({ url, err: cause instanceof Error ? cause.message : String(cause) }, "web_fetch_failed");
+      return fail(`Error: ${err instanceof WebFetchFailure ? err.text : "fetch failed — the request failed"}`);
     }
 
     if (result.redirectInfo) return result.redirectInfo;
@@ -409,6 +550,8 @@ export class WebFetchService {
       content = bodyStr;
     }
 
+    read(result.finalUrl);
+
     // Cache the fetched/decoded content (not summarized)
     cache.set(ck, {
       body: content,
@@ -424,6 +567,10 @@ export class WebFetchService {
         "Use the configured browser/Playwright MCP tool to inspect it.";
     }
 
+    // The part of the page asked for (`find`, `offset`), and what the reader is told about the rest. A page larger than one answer
+    // is read in parts: the part that holds a word, or from an offset on, instead of its first part only.
+    const shown = selectPart(content, part, WEB_FETCH_SUMMARIZE && prompt && !raw ? MAX_MARKDOWN_LENGTH : WEB_FETCH_MAX_OUTPUT_CHARS);
+
     // Fast path: preapproved markdown, no prompt, small enough
     if (
       !prompt &&
@@ -432,8 +579,9 @@ export class WebFetchService {
       isPreapprovedHost(parsed.hostname, parsed.pathname) &&
       content.length < MAX_MARKDOWN_LENGTH
     ) {
-      return buildOutput(result.finalUrl, result.statusCode, ct, result.body.length, content, false) + jsWarning;
+      return buildOutput(result.finalUrl, result.statusCode, ct, result.body.length, shown.text, false, undefined, shown.note) + jsWarning;
     }
+    content = shown.text;
 
     // Summarize if enabled and prompt is set
     let summarized = false;
@@ -454,8 +602,71 @@ export class WebFetchService {
       }
     }
 
-    return buildOutput(result.finalUrl, result.statusCode, ct, result.body.length, content, summarized, prompt) + jsWarning;
+    return buildOutput(result.finalUrl, result.statusCode, ct, result.body.length, content, summarized, prompt, shown.note) + jsWarning;
   }
+}
+
+// ── Reading a large page in parts ──
+
+/** Around each place `find` matches, this much of the page before and after it is shown. */
+export const FIND_CONTEXT_CHARS = 1500;
+/** At most this many places are shown for one `find`. */
+export const FIND_MAX_MATCHES = 20;
+
+export interface PagePart { offset: number; find: string }
+
+/** What a call asks to read of a page: from `offset` (a character of the converted page), or around each match of `find`. */
+export function pagePart(input: Record<string, unknown>): PagePart {
+  const n = Number(input.offset);
+  const offset = Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  const find = typeof input.find === "string" ? input.find.trim().slice(0, 200) : "";
+  return { offset, find };
+}
+
+/**
+ * The part of `content` a call reads, at most `max` characters, and a note that says what part it is and how to read the rest. With
+ * `find`: the text around each place it appears (case-insensitive), joined where they overlap, in page order; none found is said, with
+ * the page's length. Otherwise: `max` characters from `offset`. A page that fits whole, read from its start, has no note.
+ *
+ * The feature-gate page of Kubernetes converts to several hundred thousand characters; its first 50,000 end in the letter C, so
+ * `SchedulerQueueingHints` could not be read at all and the answer was given from a blog post (2026-11-06 parity run, R1).
+ */
+export function selectPart(content: string, part: PagePart, max: number = WEB_FETCH_MAX_OUTPUT_CHARS): { text: string; note: string } {
+  const total = content.length;
+  if (part.find) {
+    const hay = content.toLowerCase();
+    const needle = part.find.toLowerCase();
+    const spans: Array<[number, number]> = [];
+    let matches = 0;
+    for (let at = hay.indexOf(needle); at >= 0 && matches < FIND_MAX_MATCHES; at = hay.indexOf(needle, at + needle.length)) {
+      matches += 1;
+      const span: [number, number] = [Math.max(0, at - FIND_CONTEXT_CHARS), Math.min(total, at + needle.length + FIND_CONTEXT_CHARS)];
+      const last = spans.at(-1);
+      if (last && span[0] <= last[1]) last[1] = span[1];
+      else spans.push(span);
+    }
+    if (!matches) {
+      return { text: "", note: `"${part.find}" does not appear on this page (${total} characters). Read it with offset, or find another word.` };
+    }
+    let text = "";
+    let shownUpTo = 0;
+    for (const [a, b] of spans) {
+      const piece = `[characters ${a}-${b} of ${total}]\n${content.slice(a, b)}\n\n`;
+      if (text.length + piece.length > max) break;
+      text += piece;
+      shownUpTo = b;
+    }
+    if (!text) text = `[characters ${spans[0][0]}-${spans[0][0] + max} of ${total}]\n${content.slice(spans[0][0], spans[0][0] + max)}`;
+    const more = matches >= FIND_MAX_MATCHES || shownUpTo < spans.at(-1)![1] ? " There may be more matches: narrow find, or read on with offset." : "";
+    return { text, note: `Showing the page around ${matches} match${matches > 1 ? "es" : ""} of "${part.find}" (the page has ${total} characters).${more}` };
+  }
+  const start = Math.min(part.offset, total);
+  const end = Math.min(total, start + max);
+  if (start === 0 && end === total) return { text: content, note: "" };
+  const rest = end < total
+    ? ` Call web_fetch again with offset=${end} to read on, or with find set to a word of the part you need.`
+    : " That is the end of the page.";
+  return { text: content.slice(start, end), note: `Showing characters ${start}-${end} of ${total}.${rest}` };
 }
 
 // ── Build output header ──
@@ -468,6 +679,7 @@ function buildOutput(
   content: string,
   summarized: boolean,
   prompt?: string,
+  part = "",
 ): string {
   let header = `URL: ${url}\nStatus: ${statusCode}\nContent-Type: ${contentType}\nLength: ${byteLength} bytes`;
   if (byteLength > WEB_FETCH_MAX_BYTES) {
@@ -476,6 +688,7 @@ function buildOutput(
   if (summarized) {
     header += `\nSummarized: yes (${WEB_FETCH_SUMMARIZE_MODEL}, prompt="${(prompt ?? "").slice(0, 80)}")`;
   }
+  if (part) header += `\nPart: ${part}`;
   header += "\n---\n";
 
   let body = content;

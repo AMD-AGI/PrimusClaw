@@ -33,6 +33,19 @@ export function isSandboxTool(name: string): boolean {
 }
 
 /**
+ * Whether a run whose tool list is `allows` can reach a sandbox at all: through a
+ * tool the sandbox runs, a sub-agent (`task`, which runs on its parent's sandbox),
+ * or `deliver_file`, which reads the file it delivers out of the sandbox. A run
+ * whose list leaves none of them -- an assistant's router turn, cut to MCP tools --
+ * has nothing a sandbox opened for it could be used by.
+ */
+export function allowsSandboxUse(allows: (toolName: string) => boolean): boolean {
+  if (allows("task") || allows("deliver_file")) return true;
+  for (const name of HANDS_TOOLS) if (allows(name)) return true;
+  return false;
+}
+
+/**
  * Hard ceiling on any single MCP call, when the tool has no shorter limit.
  *
  * Exists so a half-dead sandbox -- TCP up, MCP server hung -- cannot hold a run

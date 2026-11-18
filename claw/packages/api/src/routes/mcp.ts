@@ -25,6 +25,7 @@ import {
 import { safeAuthorizationOf } from "../auth/caller-auth.js";
 import { buildHyperloomPrompt, buildGeakPrompt } from "../workbenches/prompt-builders.js";
 import pino from "pino";
+import { sandboxWorkspaceRefusal } from "../tasks/sandbox-workspaces.js";
 
 const logger = pino({ name: "mcp" });
 
@@ -265,6 +266,10 @@ function createMcpServer(app: FastifyInstance, authHeader: string, safeAuthoriza
       workspace_id: z.string().optional().describe("Target K8s namespace for sandbox"),
     },
     async (params) => {
+      // Asked before the session is created: the message route would refuse this
+      // workspace too, but only after the session row exists.
+      const refusedWorkspace = sandboxWorkspaceRefusal([params.workspace_id]);
+      if (refusedWorkspace) throw new Error(refusedWorkspace.message);
       const createResp = await api("POST", "/v1/sessions", {
         name: params.session_name,
         agent_id: params.agent_id,

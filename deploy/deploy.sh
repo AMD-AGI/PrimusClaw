@@ -67,8 +67,8 @@ Common env:
 
 Sandbox env:
   SANDBOX_NAMESPACE=agent-sandbox-system
-  SANDBOX_IMAGE_REGISTRY=docker.io/primussafe/
-  SANDBOX_IMAGE_TAG=latest
+  SANDBOX_IMAGE_TAG=latest            # the release docker.io/rocm/primusclaw:agent-sandbox-{controlplane,envd-injector}-<tag>
+  SANDBOX_IMAGE_REGISTRY=<prefix>     # optional; images of your own, <prefix>agent-sandbox-controlplane:<tag> and so on
   SAFE_API_URL=https://<safe-api>       # required unless --insecure-sandbox
   SANDBOX_EGRESS_ENABLED=true
   SANDBOX_EGRESS_EXTRA_BLOCKED_CIDRS=10.0.0.0/8,192.168.0.0/16
@@ -87,8 +87,8 @@ LiteLLM env (deployed AFTER Claw so it can reuse Claw's PGO database):
 
 Claw env:
   CLAW_NAMESPACE=<NAMESPACE>          # defaults to $NAMESPACE
-  CLAW_REGISTRY=docker.io/primussafe
-  CLAW_TAG=<tag>                      # optional; default "latest" (pulled from CLAW_REGISTRY)
+  CLAW_TAG=<tag>                      # optional; default the release docker.io/rocm/primusclaw:claw-latest (claw-<version> pins one)
+  CLAW_REGISTRY=<registry>            # optional; an image of your own, <registry>/claw:<tag> (CLAW_TAG then defaults to latest)
   LLM_API_STYLE=anthropic|openai      # explicit Brain wire protocol
   PG_SSL_NO_VERIFY=true               # keep api's PG connection encrypted but skip
                                       # server-cert validation; required against a
@@ -280,10 +280,10 @@ NAMESPACE="${NAMESPACE:-primus-claw}"
 CLAW_NAMESPACE="${CLAW_NAMESPACE:-$NAMESPACE}"
 LITELLM_NAMESPACE="${LITELLM_NAMESPACE:-$CLAW_NAMESPACE}"
 SANDBOX_NAMESPACE="${SANDBOX_NAMESPACE:-agent-sandbox-system}"
-SANDBOX_IMAGE_REGISTRY="${SANDBOX_IMAGE_REGISTRY:-docker.io/primussafe/}"
+SANDBOX_IMAGE_REGISTRY="${SANDBOX_IMAGE_REGISTRY:-}"
 SANDBOX_IMAGE_TAG="${SANDBOX_IMAGE_TAG:-latest}"
-CLAW_REGISTRY="${CLAW_REGISTRY:-docker.io/primussafe}"
-CLAW_TAG="${CLAW_TAG:-${TAG:-latest}}"
+CLAW_REGISTRY="${CLAW_REGISTRY:-}"
+CLAW_TAG="${CLAW_TAG:-${TAG:-}}"
 DOMAIN="${DOMAIN:-${LITELLM_INGRESS_HOST:-}}"
 if [ "$DEPLOY_LITELLM" = "true" ]; then
   LITELLM_API_BASE="${LITELLM_API_BASE:-http://${LITELLM_NAME:-litellm}.${LITELLM_NAMESPACE}.svc.cluster.local:4000/v1}"
@@ -302,8 +302,8 @@ if [ "$YES" != "true" ] && [ "$DRY_RUN" != "true" ]; then
 This command will mutate the current Kubernetes cluster.
 
 Context:          $(kubectl config current-context 2>/dev/null || echo '<unknown>')
-Sandbox:          $DEPLOY_SANDBOX (namespace=$SANDBOX_NAMESPACE image=${SANDBOX_IMAGE_REGISTRY}agent-sandbox-controlplane:$SANDBOX_IMAGE_TAG)
-Claw:             $DEPLOY_CLAW (namespace=$CLAW_NAMESPACE registry=$CLAW_REGISTRY tag=$CLAW_TAG)
+Sandbox:          $DEPLOY_SANDBOX (namespace=$SANDBOX_NAMESPACE image=$([ -n "$SANDBOX_IMAGE_REGISTRY" ] && echo "${SANDBOX_IMAGE_REGISTRY}agent-sandbox-controlplane:$SANDBOX_IMAGE_TAG" || echo "docker.io/rocm/primusclaw:agent-sandbox-controlplane-$SANDBOX_IMAGE_TAG"))
+Claw:             $DEPLOY_CLAW (namespace=$CLAW_NAMESPACE registry=${CLAW_REGISTRY:-docker.io/rocm (release)} tag=${CLAW_TAG:-default})
 LiteLLM:          $DEPLOY_LITELLM (namespace=$LITELLM_NAMESPACE name=${LITELLM_NAME:-litellm}, db=$([ -n "${LITELLM_DATABASE_URL:-}" ] && echo provided || echo 'auto-discover PGO'))
 
 Re-run with --yes to execute, or --dry-run to preview.
@@ -323,9 +323,9 @@ configure_claw_llm_interactive
 if [ "$DEPLOY_SANDBOX" = "true" ]; then
   sandbox_env=(
     "NAMESPACE=$SANDBOX_NAMESPACE"
-    "IMAGE_REGISTRY=$SANDBOX_IMAGE_REGISTRY"
     "IMAGE_TAG=$SANDBOX_IMAGE_TAG"
   )
+  [ -n "$SANDBOX_IMAGE_REGISTRY" ] && sandbox_env+=("IMAGE_REGISTRY=$SANDBOX_IMAGE_REGISTRY")
   if [ "$INSECURE_SANDBOX" = "true" ]; then
     sandbox_env+=("ALLOW_INSECURE_NO_AUTH=true")
   else
@@ -359,9 +359,9 @@ if [ "$DEPLOY_CLAW" = "true" ]; then
 
   claw_env=(
     "NAMESPACE=$CLAW_NAMESPACE"
-    "REGISTRY=$CLAW_REGISTRY"
     "DOMAIN=$DOMAIN"
   )
+  [ -n "$CLAW_REGISTRY" ] && claw_env+=("REGISTRY=$CLAW_REGISTRY")
   [ -n "$CLAW_TAG" ] && claw_env+=("TAG=$CLAW_TAG")
   [ -n "${STORAGE_CLASS:-}" ] && claw_env+=("STORAGE_CLASS=$STORAGE_CLASS")
   [ -n "${LLM_API_STYLE:-}" ]          && claw_env+=("LLM_API_STYLE=$LLM_API_STYLE")

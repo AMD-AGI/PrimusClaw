@@ -23,17 +23,19 @@
  * to run, so a worker that was ever shown more than its item's entries (`memoryReached`) never answers unasked (`prReply`).
  */
 import pino from "pino";
-import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_MEMORY_TOOLS } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_MEMORY_TOOLS, CLAW_MEMORY_TURN_RECALL, CLAW_MEMORY_TURN_RECALL_USERS } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
-  buildMemoryCatalogue, forgetMemory, getMemoryPreference, listMemories, memoriesOfItem, memoryAvailable, memoryPorts, recallMemory, undoMemory,
+  buildMemoryCatalogue, citationsOf, expandAlongLinks, forgetMemory, getMemoryPreference, listMemories, memoriesForMessage, memoriesOfItem, memoryAvailable, memoryPorts, recallMemory, undoMemory,
   updateMemory, writeMemory, type MemoryActor, type MemoryRow, type WriteResult,
 } from "../memory/service.js";
 import {
-  ITEM_MEMORY_INTRO, ROUTER_MEMORY_OFF, ROUTER_MEMORY_PREAMBLE, ROUTER_MEMORY_PROMPT, WORKER_MEMORY_PREAMBLE, renderItemMemories,
+  ITEM_MEMORY_INTRO, ROUTER_MEMORY_OFF, ROUTER_MEMORY_PREAMBLE, ROUTER_MEMORY_PROMPT, WORKER_MEMORY_PREAMBLE, renderItemMemories, renderTurnRecall, fitTurnRecall, TURN_RECALL_MAX_ENTRIES,
 } from "./prompts.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
+import type { ChosenLanguage } from "./language.js";
+import { commandLanguageOf, typedCommand, type CommandLanguage } from "./typed-commands.js";
 import { resolveWorkItemNow } from "./work-items.js";
 
 const logger = pino({ name: "assistant-memory" });
@@ -53,6 +55,8 @@ export interface AttendedMessage {
   userId: string;
   content: string;
   receivedAt: Date;
+  /** The language the person chose in their channel (`ChannelContext.reply_language`), when they chose one. */
+  replyLanguage?: ChosenLanguage;
 }
 
 /** The ways out of this module, so a test can stand in for one turn's answer. */
@@ -64,7 +68,10 @@ export const memoryToolPorts = {
    */
   attended: async (q: Querier, claims: AssistantTokenClaims): Promise<AttendedMessage> => {
     const turn = await attendedTurn(q, claims);
-    return { userId: turn.userId, content: turn.message.content, receivedAt: new Date(turn.message.receivedAt) };
+    return {
+      userId: turn.userId, content: turn.message.content, receivedAt: new Date(turn.message.receivedAt),
+      ...(turn.message.context.reply_language ? { replyLanguage: turn.message.context.reply_language } : {}),
+    };
   },
 };
 
@@ -157,11 +164,13 @@ async function announce(sessionId: string, r: Extract<WriteResult, { ok: true }>
   }).catch((err) => logger.warn({ err: (err as Error)?.message, sessionId }, "assistant.memory_notice_publish_failed"));
 }
 
-function written(r: Extract<WriteResult, { ok: true }>): Record<string, unknown> {
+/** What a save or an update answers: the undo command in the language of the message that asked for it (`typed-commands.ts`). */
+function written(r: Extract<WriteResult, { ok: true }>, lang: CommandLanguage): Record<string, unknown> {
   if (r.op === "existing") return { ok: true, id: r.id, op: r.op, title: r.title, note: `already remembered as #${r.id}; nothing new was stored` };
+  const undo = typedCommand("undo", r.id, lang);
   return {
-    ok: true, id: r.id, op: r.op, title: r.title,
-    note: `${r.op === "update" ? "updated" : "remembered"} as #${r.id}: tell the user in one line, with #${r.id}, and that they can say 撤销 #${r.id} to undo it`,
+    ok: true, id: r.id, op: r.op, title: r.title, undo,
+    note: `${r.op === "update" ? "updated" : "remembered"} as #${r.id}: tell the user in one line, with #${r.id}, and that they can say ${undo} to undo it`,
   };
 }
 
@@ -243,7 +252,7 @@ export async function memorySave(claims: AssistantTokenClaims, args: Record<stri
   const r = await writeMemory(userId, args, actorOf(claims, message, args.evidence_quote), { workItemId, guard: stillActing(claims, userId) });
   if (!r.ok) refused(r);
   await announce(claims.sid, r);
-  return written(r);
+  return written(r, await commandLanguageOf(message.content, undefined, message.replyLanguage ?? null));
 }
 
 export async function memoryUpdate(claims: AssistantTokenClaims, args: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -253,7 +262,7 @@ export async function memoryUpdate(claims: AssistantTokenClaims, args: Record<st
   const r = await updateMemory(userId, id, args, actorOf(claims, message, args.evidence_quote), { guard: stillActing(claims, userId) });
   if (!r.ok) refused(r);
   await announce(claims.sid, r);
-  return written(r);
+  return written(r, await commandLanguageOf(message.content, undefined, message.replyLanguage ?? null));
 }
 
 export async function memoryForget(claims: AssistantTokenClaims, args: { id?: unknown }): Promise<Record<string, unknown>> {
@@ -324,6 +333,35 @@ export async function routerMemoryParts(userId: string, sessionId: string): Prom
     if (!(await getMemoryPreference(userId))) return { prompt: ROUTER_MEMORY_OFF, entries: "" };
     const catalogue = await buildMemoryCatalogue(userId, { preamble: ROUTER_MEMORY_PREAMBLE, boundItems: await boundItemLabels(userId) });
     return { prompt: ROUTER_MEMORY_PROMPT, entries: catalogue?.text ?? "## Long-term Memory\n(no entries yet)" };
+  });
+}
+
+export interface TurnRecallSettings { all: boolean; users: ReadonlySet<string> }
+
+/** Who has the turn's recall (`CLAW_MEMORY_TURN_RECALL`, `CLAW_MEMORY_TURN_RECALL_USERS`). */
+export const turnRecallSettings: TurnRecallSettings = { all: CLAW_MEMORY_TURN_RECALL, users: CLAW_MEMORY_TURN_RECALL_USERS };
+
+/** Whether this user's router turns recall their memory for the message before the model answers. */
+export function memoryTurnRecallOn(userId: string | null | undefined, settings: TurnRecallSettings = turnRecallSettings): boolean {
+  return settings.all || (!!userId && settings.users.has(userId));
+}
+
+/**
+ * The router turn's recall: the user's entries the message is about, in full (`memoriesForMessage`, `renderTurnRecall`), or
+ * null. Asked only where the turn is shown the user's index (`routerMemoryParts` gave entries), so it reaches no further than the
+ * index and memory_recall already do: this user's own entries, in a session their memory serves, with their memory on. A failed
+ * read costs the turn its recall, never the turn (`orNothing`).
+ */
+export async function routerTurnRecall(userId: string, sessionId: string, message: string): Promise<{ text: string; ids: number[] } | null> {
+  if (!message.trim()) return null;
+  return orNothing("turn_recall", sessionId, async () => {
+    const rows = await memoriesForMessage(userId, message);
+    if (!rows.length) return null;
+    // What the matched entries' links reach, two hops at most (E242): a chain's second entry seldom shares the message's words.
+    const linked = await expandAlongLinks(userId, rows, TURN_RECALL_MAX_ENTRIES - rows.length);
+    const entries = fitTurnRecall([...rows, ...linked.map((l) => ({ ...l.row, via: l.via }))]);
+    const ids = entries.map((e) => e.id);
+    return { text: renderTurnRecall(entries, await citationsOf(userId, ids)), ids };
   });
 }
 

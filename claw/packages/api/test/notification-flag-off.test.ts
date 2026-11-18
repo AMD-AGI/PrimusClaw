@@ -42,9 +42,15 @@ describe("notifications flag off", { skip }, () => {
 
 test("the completion handler reaches the outbox only behind the flag, and the worker starts only behind it", () => {
   const consumer = readFileSync(new URL("../src/events/consumer.ts", import.meta.url), "utf8");
-  assert.match(consumer, /if \(CLAW_NOTIFICATIONS_ENABLED && !interrupted && endedRunIds\.length\) \{\s*try \{\s*await completionPorts\.recordRunFinished/);
+  assert.match(consumer, /if \(CLAW_NOTIFICATIONS_ENABLED && !interrupted && endedRunIds\.length\) \{\s*const notice: RunFinished = \{[\s\S]*?\n {4}\};\s*try \{\s*await completionPorts\.recordRunFinished\(notice\)/);
+  // The retry of a notification a processed completion still owes: behind the same flag.
+  assert.match(consumer, /const owed = CLAW_NOTIFICATIONS_ENABLED \? owedRunNotice\(/);
   const index = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
-  assert.match(index, /if \(CLAW_NOTIFICATIONS_ENABLED\) startNotificationWorker\(\)/);
+  // Started through startup/background.ts, whose `notification_worker` is `when: flags.notifications`.
+  assert.match(index, /\n {4}notification_worker: \(\) => startNotificationWorker\(\),\n/);
+  assert.match(index, /\n {4}notifications: CLAW_NOTIFICATIONS_ENABLED,\n/);
+  const background = readFileSync(new URL("../src/startup/background.ts", import.meta.url), "utf8");
+  assert.match(background, /notification_worker: flags\.notifications,/);
   const db = readFileSync(new URL("../src/infra/db.ts", import.meta.url), "utf8");
   assert.match(db, /if \(CLAW_NOTIFICATIONS_ENABLED\) await ensureNotificationSchema\(client\)/);
 });

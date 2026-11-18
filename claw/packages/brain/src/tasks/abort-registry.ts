@@ -21,6 +21,20 @@
 export const activeAbort = new Map<string, AbortController>();
 
 /**
+ * Drop the controller filed under `lockKey`, if it is still `ctrl`.
+ *
+ * A run's exit must not clear the key unconditionally: once a Stop has
+ * force-released a run that ignored it (tasks/interrupt.ts), the next run of the
+ * same key may already be filed here, and a late exit of the first run would
+ * delete the second one's controller -- after which no interrupt can find it.
+ * Callers that do not know which run they are clearing for pass no `ctrl` and
+ * get the unconditional delete.
+ */
+export function clearActiveAbort(lockKey: string, ctrl?: AbortController): void {
+  if (ctrl === undefined || activeAbort.get(lockKey) === ctrl) activeAbort.delete(lockKey);
+}
+
+/**
  * The other names a running task answers to.
  *
  * A gate key says which runs may overlap; it is not an address. Those were the
@@ -68,7 +82,7 @@ export function gracefulStopRemainingMs(ctrl: AbortController, now: number = Dat
 
 const lockKeysByAddress = new Map<string, Set<string>>();
 const lockKeysBySessionEnd = new Map<string, Set<string>>();
-const addressesByLockKey = new Map<string, { named: string[]; sessionEnd: string[] }>();
+const addressesByLockKey = new Map<string, { named: string[]; sessionEnd: string[]; owner?: object }>();
 
 function addTo(index: Map<string, Set<string>>, address: string, lockKey: string): void {
   const keys = index.get(address) ?? new Set<string>();
@@ -89,17 +103,24 @@ function addTo(index: Map<string, Set<string>>, address: string, lockKey: string
  * Undefined and duplicate names are dropped, as is the gate key itself: it is
  * already an address by virtue of being the map key, and storing it twice would
  * only give resolveAbortTargets two ways to say the same thing.
+ *
+ * `owner` is the run's controller. Registering replaces whatever the key had:
+ * a new run of a key starts only once the previous one has let go of it, and
+ * the previous run's names must not go on reaching the new one. With an owner,
+ * {@link forgetRunAddresses} leaves the entry alone for any other run.
  */
 export function registerRunAddresses(
   lockKey: string,
   addresses: Array<string | undefined>,
   sessionEnd: Array<string | undefined> = [],
+  owner?: object,
 ): void {
+  forgetRunAddresses(lockKey);
   const clean = (list: Array<string | undefined>) => [...new Set(list.filter((a): a is string => !!a && a !== lockKey))];
   const named = clean(addresses);
   const ending = clean(sessionEnd);
   if (!named.length && !ending.length) return;
-  addressesByLockKey.set(lockKey, { named, sessionEnd: ending });
+  addressesByLockKey.set(lockKey, owner === undefined ? { named, sessionEnd: ending } : { named, sessionEnd: ending, owner });
   for (const address of named) addTo(lockKeysByAddress, address, lockKey);
   for (const address of ending) addTo(lockKeysBySessionEnd, address, lockKey);
 }
@@ -113,15 +134,22 @@ export function registerRunAddresses(
 export function registerRunAddressesFor(
   lockKey: string,
   request: { mode?: string; task_id?: string; session_id: string; dag_root_task_id?: string },
+  owner?: object,
 ): void {
-  if (request.mode === "app") registerRunAddresses(lockKey, [request.task_id], [request.session_id]);
-  else registerRunAddresses(lockKey, [request.session_id, request.dag_root_task_id]);
+  if (request.mode === "app") registerRunAddresses(lockKey, [request.task_id], [request.session_id], owner);
+  else registerRunAddresses(lockKey, [request.session_id, request.dag_root_task_id], [], owner);
 }
 
-/** Forget a finished run's addresses. Safe to call for a run that had none. */
-export function forgetRunAddresses(lockKey: string): void {
+/**
+ * Forget a finished run's addresses. Safe to call for a run that had none.
+ *
+ * With `owner`, only that run's: an entry another run of the key registered
+ * since (see {@link clearActiveAbort} for how that happens) is left in place.
+ */
+export function forgetRunAddresses(lockKey: string, owner?: object): void {
   const entry = addressesByLockKey.get(lockKey);
   if (!entry) return;
+  if (owner !== undefined && entry.owner !== undefined && entry.owner !== owner) return;
   addressesByLockKey.delete(lockKey);
   for (const [index, list] of [[lockKeysByAddress, entry.named], [lockKeysBySessionEnd, entry.sessionEnd]] as const) {
     for (const address of list) {

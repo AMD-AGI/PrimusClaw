@@ -51,6 +51,9 @@ export class FakeGithub {
   statuses: Array<{ context: string; state: string }> = [];
   rules: unknown = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }];
   rulesStatus = 200;
+  /** `GET /branches/{branch}`: the classic branch protection, here requiring no check (as both public repositories this serves have it). */
+  branch: unknown = { protected: true, protection: { enabled: true, required_status_checks: { enforcement_level: "off", contexts: [], checks: [] } } };
+  branchStatus = 200;
   graphql: Record<string, any> = {
     id: "PR_kwDOdemo7", mergeStateStatus: "CLEAN", mergeable: "MERGEABLE", reviewDecision: "APPROVED", headRefOid: HEAD, isMergeQueueEnabled: false,
     isInMergeQueue: false, mergeQueueEntry: null,
@@ -66,6 +69,8 @@ export class FakeGithub {
   /** directory path -> entries. */
   dirs: Record<string, Array<{ name: string; type: string }>> = {};
   mergeStatus = 200;
+  /** What the next merges answer, in order, before `mergeStatus` takes over: a test of a refusal GitHub gives only once or twice. */
+  mergeAnswers: Array<{ status: number; message: string }> = [];
   /** What the `enqueuePullRequest` mutation answers with when it goes through: the entry GitHub returns, or null for an answer without one. */
   enqueueEntry: Record<string, any> | null = { id: "MQE_kwDOdemo1", position: 3, state: "QUEUED" };
   /** A GraphQL error message for the mutation (the answer is 200 with `errors`), as GitHub gives when it refuses to queue; null to let it through. */
@@ -162,9 +167,15 @@ export class FakeGithub {
     }
     if (/\/commits\/[0-9a-f]{40}\/check-runs$/.test(p)) return json(200, { total_count: this.checkRuns.length, check_runs: this.checkRuns });
     if (/\/commits\/[0-9a-f]{40}\/status$/.test(p)) return json(200, { total_count: this.statuses.length, state: "success", statuses: this.statuses });
+    if (/^\/repos\/[^/]+\/[^/]+\/branches\/[^/]+$/.test(p)) return this.branchStatus === 200 ? json(200, this.branch) : json(this.branchStatus, { message: "nope" });
     if (/\/rules\/branches\//.test(p)) return this.rulesStatus === 200 ? json(200, this.rules) : json(this.rulesStatus, { message: "nope" });
     if (/\/issues\/\d+\/comments$/.test(p)) return json(200, this.issueComments);
     if (/\/pulls\/\d+\/comments$/.test(p)) return json(200, this.reviewComments);
+    const oneReview = /\/pulls\/\d+\/reviews\/(\d+)$/.exec(p);
+    if (oneReview && method === "GET") {
+      const r = this.reviews.find((x) => String(x.id) === oneReview[1]);
+      return r ? json(200, r) : json(404, { message: "Not Found" });
+    }
     if (/\/pulls\/\d+\/reviews$/.test(p)) {
       if (method === "GET") {
         const per = Number(call.query.per_page ?? 30);
@@ -180,6 +191,8 @@ export class FakeGithub {
       return json(200, review);
     }
     if (/\/pulls\/\d+\/merge$/.test(p) && method === "PUT") {
+      const next = this.mergeAnswers.shift();
+      if (next) return next.status === 200 ? json(200, { sha: "m".repeat(40), merged: true, message: "Pull Request successfully merged" }) : json(next.status, { message: next.message });
       if (this.mergeStatus !== 200) return json(this.mergeStatus, { message: this.mergeStatus === 409 ? "Head branch was modified" : "Not mergeable" });
       return json(200, { sha: "m".repeat(40), merged: true, message: "Pull Request successfully merged" });
     }

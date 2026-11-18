@@ -62,6 +62,13 @@ export interface TerminalView extends TerminalFacts {
    * that ran and broke. The sandbox-provisioning codes are what tell them apart.
    */
   failure_reason: string;
+  /**
+   * What happened, for a person, when the run recorded more than its code: for a
+   * run whose sandbox the platform could not provide, the platform's reason
+   * (`could not be scheduled: ...`, `still waiting for capacity after ...`). `""`
+   * when nothing more was recorded.
+   */
+  failure_message: string;
 }
 
 export interface RunView {

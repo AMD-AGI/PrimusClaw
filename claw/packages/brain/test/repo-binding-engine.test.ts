@@ -12,6 +12,8 @@
  *      prompt is the one `buildPrompt` has always produced
  *   E3 a clone that fails does not fail the run: the model is told what failed
  *   E4 a sandbox that cannot be opened fails the run, as it does for any turn that needs one
+ *   E7 ...unless the platform has no sandbox for the run at all (an account refused the
+ *      workspace): the turn runs, and the model is told why the repository is not there
  *   E5 the user's GH_TOKEN, present on the request, is in no command, no prompt, no log line
  *   E6 buildPrompt: the block survives a very long user prompt and sits before the session context
  */
@@ -23,6 +25,7 @@ import { startWorld, baseRequest } from "./support/platform-defaults-world.js";
 const world = await startWorld();
 const { AgentEngine } = await import("../src/agent/engine.js");
 const { buildPrompt } = await import("../src/agent/prompt.js");
+const { SandboxProvisionTerminalError, SANDBOX_WORKSPACE_FORBIDDEN } = await import("../src/sandbox/errors.js");
 test.after(async () => { await world.close(); });
 
 const URL = "https://github.com/example-org/example-repo";
@@ -56,7 +59,7 @@ function bindingHands(o: Opts = {}) {
 
 type Hands = ReturnType<typeof bindingHands>;
 
-async function run(over: Record<string, unknown>, o: Opts = {}, attachFails = false, signal?: AbortSignal) {
+async function run(over: Record<string, unknown>, o: Opts = {}, attachFails: boolean | (() => Error) = false, signal?: AbortSignal) {
   let attached = 0;
   const sawLlmRequests: number[] = [];
   const hands = bindingHands(o);
@@ -65,6 +68,7 @@ async function run(over: Record<string, unknown>, o: Opts = {}, attachFails = fa
       attached++;
       // How many times the model had been asked when the sandbox was opened.
       sawLlmRequests.push(world.llmBodies.length);
+      if (typeof attachFails === "function") throw attachFails();
       if (attachFails) throw new Error("no capacity for a sandbox");
       return hands as never;
     },
@@ -148,6 +152,17 @@ test("E3 a clone that fails does not fail the run: the model is told what failed
 test("E4 a sandbox that cannot be opened fails the run, as it does for any turn that needs one", async () => {
   await assert.rejects(() => run({ repo: { url: URL } }, {}, true), /no capacity for a sandbox/);
   assert.equal(world.llmBodies.length, 0, "and the model was never asked");
+});
+
+test("E7 an account the platform refuses a sandbox: the turn runs, and the model is told why the repository is not there", async () => {
+  const refusal = "You do not have a CPU sandbox workspace yet: your account may not start sandboxes in the global-cpu workspace.";
+  const r = await run({ repo: { url: URL, branch: "main" } }, {}, () => new SandboxProvisionTerminalError(SANDBOX_WORKSPACE_FORBIDDEN, refusal));
+  assert.equal(r.result.finalText, "done", "the turn ran");
+  assert.equal(r.attached, 1);
+  assert.equal(r.hands.commands.length, 0, "nothing reached a sandbox");
+  const text = userText(r.body);
+  assert.ok(text.includes(`- This session is bound to ${URL}, branch main, but setting up the working tree failed: this run has no sandbox: ${refusal.replace(/\.$/, "")}.`), text);
+  assert.ok(text.includes("- /workspace/example-repo is not there, and no tool that needs a sandbox (bash, files, git) can be used in this run."), text);
 });
 
 test("E5 the user's GH_TOKEN, on the request, is in no command, no prompt, no log line", async () => {

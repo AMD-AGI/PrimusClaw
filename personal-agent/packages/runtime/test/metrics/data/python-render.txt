@@ -1,0 +1,192 @@
+# HELP clawy_security_events_total Security events logged by the worker, by event and category.
+# TYPE clawy_security_events_total counter
+clawy_security_events_total{event="approval_answered"} 1
+clawy_security_events_total{event="key_unlinked",reason="rejected"} 0
+clawy_security_events_total{event="link_attempt",outcome="wrong"} 1
+clawy_security_events_total{event="link_lockout",scope="global"} 0
+clawy_security_events_total{event="link_lockout",scope="user"} 0
+clawy_security_events_total{event="merge_confirmed",outcome="confirmed"} 1
+clawy_security_events_total{event="rate_limited",scope="user",reason="concurrency_limit"} 0
+clawy_security_events_total{event="rate_limited",scope="user",reason="user_limit"} 1
+clawy_security_events_total{event="token_rejected",scope="global",outcome="failure",reason="expired"} 1
+# HELP clawy_inbound_handled_total Inbound messages handled (completed or abandoned).
+# TYPE clawy_inbound_handled_total counter
+clawy_inbound_handled_total 3
+# HELP clawy_inbound_failed_total Inbound messages whose handler failed and that were abandoned for redelivery.
+# TYPE clawy_inbound_failed_total counter
+clawy_inbound_failed_total 1
+# HELP clawy_inbound_handle_ms_total Milliseconds spent handling inbound messages, summed.
+# TYPE clawy_inbound_handle_ms_total counter
+clawy_inbound_handle_ms_total 267
+# HELP clawy_inbound_lag_max_ms Longest time a message handled in the last 60 seconds waited in the inbound queue.
+# TYPE clawy_inbound_lag_max_ms gauge
+clawy_inbound_lag_max_ms 5000
+# HELP clawy_inbound_limited_total Messages and tasks refused by a per-user limit, by reason.
+# TYPE clawy_inbound_limited_total counter
+clawy_inbound_limited_total{reason="concurrency_limit"} 1
+clawy_inbound_limited_total{reason="user_limit"} 1
+# HELP clawy_event_handle_seconds Seconds from receiving a Claw event to having sent it to the chat, by event type.
+# TYPE clawy_event_handle_seconds histogram
+clawy_event_handle_seconds_bucket{type="approval.requested",le="0.5"} 0
+clawy_event_handle_seconds_bucket{type="approval.requested",le="1"} 0
+clawy_event_handle_seconds_bucket{type="approval.requested",le="2"} 0
+clawy_event_handle_seconds_bucket{type="approval.requested",le="3"} 0
+clawy_event_handle_seconds_bucket{type="approval.requested",le="5"} 0
+clawy_event_handle_seconds_bucket{type="approval.requested",le="10"} 0
+clawy_event_handle_seconds_bucket{type="approval.requested",le="30"} 0
+clawy_event_handle_seconds_bucket{type="approval.requested",le="60"} 0
+clawy_event_handle_seconds_bucket{type="approval.requested",le="+Inf"} 1
+clawy_event_handle_seconds_sum{type="approval.requested"} 65
+clawy_event_handle_seconds_count{type="approval.requested"} 1
+clawy_event_handle_seconds_bucket{type="work_item.needs_you",le="0.5"} 0
+clawy_event_handle_seconds_bucket{type="work_item.needs_you",le="1"} 0
+clawy_event_handle_seconds_bucket{type="work_item.needs_you",le="2"} 0
+clawy_event_handle_seconds_bucket{type="work_item.needs_you",le="3"} 0
+clawy_event_handle_seconds_bucket{type="work_item.needs_you",le="5"} 0
+clawy_event_handle_seconds_bucket{type="work_item.needs_you",le="10"} 0
+clawy_event_handle_seconds_bucket{type="work_item.needs_you",le="30"} 0
+clawy_event_handle_seconds_bucket{type="work_item.needs_you",le="60"} 0
+clawy_event_handle_seconds_bucket{type="work_item.needs_you",le="+Inf"} 0
+clawy_event_handle_seconds_sum{type="work_item.needs_you"} 0
+clawy_event_handle_seconds_count{type="work_item.needs_you"} 0
+clawy_event_handle_seconds_bucket{type="assistant.say",le="0.5"} 1
+clawy_event_handle_seconds_bucket{type="assistant.say",le="1"} 1
+clawy_event_handle_seconds_bucket{type="assistant.say",le="2"} 1
+clawy_event_handle_seconds_bucket{type="assistant.say",le="3"} 1
+clawy_event_handle_seconds_bucket{type="assistant.say",le="5"} 1
+clawy_event_handle_seconds_bucket{type="assistant.say",le="10"} 2
+clawy_event_handle_seconds_bucket{type="assistant.say",le="30"} 2
+clawy_event_handle_seconds_bucket{type="assistant.say",le="60"} 2
+clawy_event_handle_seconds_bucket{type="assistant.say",le="+Inf"} 2
+clawy_event_handle_seconds_sum{type="assistant.say"} 7.423
+clawy_event_handle_seconds_count{type="assistant.say"} 2
+clawy_event_handle_seconds_bucket{type="assistant.action",le="0.5"} 0
+clawy_event_handle_seconds_bucket{type="assistant.action",le="1"} 0
+clawy_event_handle_seconds_bucket{type="assistant.action",le="2"} 0
+clawy_event_handle_seconds_bucket{type="assistant.action",le="3"} 0
+clawy_event_handle_seconds_bucket{type="assistant.action",le="5"} 0
+clawy_event_handle_seconds_bucket{type="assistant.action",le="10"} 0
+clawy_event_handle_seconds_bucket{type="assistant.action",le="30"} 0
+clawy_event_handle_seconds_bucket{type="assistant.action",le="60"} 0
+clawy_event_handle_seconds_bucket{type="assistant.action",le="+Inf"} 0
+clawy_event_handle_seconds_sum{type="assistant.action"} 0
+clawy_event_handle_seconds_count{type="assistant.action"} 0
+clawy_event_handle_seconds_bucket{type="run.completed",le="0.5"} 0
+clawy_event_handle_seconds_bucket{type="run.completed",le="1"} 0
+clawy_event_handle_seconds_bucket{type="run.completed",le="2"} 0
+clawy_event_handle_seconds_bucket{type="run.completed",le="3"} 0
+clawy_event_handle_seconds_bucket{type="run.completed",le="5"} 0
+clawy_event_handle_seconds_bucket{type="run.completed",le="10"} 0
+clawy_event_handle_seconds_bucket{type="run.completed",le="30"} 0
+clawy_event_handle_seconds_bucket{type="run.completed",le="60"} 0
+clawy_event_handle_seconds_bucket{type="run.completed",le="+Inf"} 0
+clawy_event_handle_seconds_sum{type="run.completed"} 0
+clawy_event_handle_seconds_count{type="run.completed"} 0
+clawy_event_handle_seconds_bucket{type="run.failed",le="0.5"} 0
+clawy_event_handle_seconds_bucket{type="run.failed",le="1"} 0
+clawy_event_handle_seconds_bucket{type="run.failed",le="2"} 0
+clawy_event_handle_seconds_bucket{type="run.failed",le="3"} 0
+clawy_event_handle_seconds_bucket{type="run.failed",le="5"} 0
+clawy_event_handle_seconds_bucket{type="run.failed",le="10"} 0
+clawy_event_handle_seconds_bucket{type="run.failed",le="30"} 0
+clawy_event_handle_seconds_bucket{type="run.failed",le="60"} 0
+clawy_event_handle_seconds_bucket{type="run.failed",le="+Inf"} 0
+clawy_event_handle_seconds_sum{type="run.failed"} 0
+clawy_event_handle_seconds_count{type="run.failed"} 0
+clawy_event_handle_seconds_bucket{type="other",le="0.5"} 1
+clawy_event_handle_seconds_bucket{type="other",le="1"} 1
+clawy_event_handle_seconds_bucket{type="other",le="2"} 1
+clawy_event_handle_seconds_bucket{type="other",le="3"} 1
+clawy_event_handle_seconds_bucket{type="other",le="5"} 1
+clawy_event_handle_seconds_bucket{type="other",le="10"} 1
+clawy_event_handle_seconds_bucket{type="other",le="30"} 1
+clawy_event_handle_seconds_bucket{type="other",le="60"} 1
+clawy_event_handle_seconds_bucket{type="other",le="+Inf"} 1
+clawy_event_handle_seconds_sum{type="other"} 0.5
+clawy_event_handle_seconds_count{type="other"} 1
+# HELP clawy_event_to_chat_seconds Seconds from when Claw says an event happened to having sent it to the chat, by event type.
+# TYPE clawy_event_to_chat_seconds histogram
+clawy_event_to_chat_seconds_bucket{type="approval.requested",le="0.5"} 1
+clawy_event_to_chat_seconds_bucket{type="approval.requested",le="1"} 1
+clawy_event_to_chat_seconds_bucket{type="approval.requested",le="2"} 1
+clawy_event_to_chat_seconds_bucket{type="approval.requested",le="3"} 1
+clawy_event_to_chat_seconds_bucket{type="approval.requested",le="5"} 1
+clawy_event_to_chat_seconds_bucket{type="approval.requested",le="10"} 1
+clawy_event_to_chat_seconds_bucket{type="approval.requested",le="30"} 1
+clawy_event_to_chat_seconds_bucket{type="approval.requested",le="60"} 1
+clawy_event_to_chat_seconds_bucket{type="approval.requested",le="+Inf"} 1
+clawy_event_to_chat_seconds_sum{type="approval.requested"} 0
+clawy_event_to_chat_seconds_count{type="approval.requested"} 1
+clawy_event_to_chat_seconds_bucket{type="work_item.needs_you",le="0.5"} 0
+clawy_event_to_chat_seconds_bucket{type="work_item.needs_you",le="1"} 0
+clawy_event_to_chat_seconds_bucket{type="work_item.needs_you",le="2"} 0
+clawy_event_to_chat_seconds_bucket{type="work_item.needs_you",le="3"} 0
+clawy_event_to_chat_seconds_bucket{type="work_item.needs_you",le="5"} 0
+clawy_event_to_chat_seconds_bucket{type="work_item.needs_you",le="10"} 0
+clawy_event_to_chat_seconds_bucket{type="work_item.needs_you",le="30"} 0
+clawy_event_to_chat_seconds_bucket{type="work_item.needs_you",le="60"} 0
+clawy_event_to_chat_seconds_bucket{type="work_item.needs_you",le="+Inf"} 0
+clawy_event_to_chat_seconds_sum{type="work_item.needs_you"} 0
+clawy_event_to_chat_seconds_count{type="work_item.needs_you"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.say",le="0.5"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.say",le="1"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.say",le="2"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.say",le="3"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.say",le="5"} 1
+clawy_event_to_chat_seconds_bucket{type="assistant.say",le="10"} 1
+clawy_event_to_chat_seconds_bucket{type="assistant.say",le="30"} 1
+clawy_event_to_chat_seconds_bucket{type="assistant.say",le="60"} 1
+clawy_event_to_chat_seconds_bucket{type="assistant.say",le="+Inf"} 1
+clawy_event_to_chat_seconds_sum{type="assistant.say"} 4.2
+clawy_event_to_chat_seconds_count{type="assistant.say"} 1
+clawy_event_to_chat_seconds_bucket{type="assistant.action",le="0.5"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.action",le="1"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.action",le="2"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.action",le="3"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.action",le="5"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.action",le="10"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.action",le="30"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.action",le="60"} 0
+clawy_event_to_chat_seconds_bucket{type="assistant.action",le="+Inf"} 0
+clawy_event_to_chat_seconds_sum{type="assistant.action"} 0
+clawy_event_to_chat_seconds_count{type="assistant.action"} 0
+clawy_event_to_chat_seconds_bucket{type="run.completed",le="0.5"} 0
+clawy_event_to_chat_seconds_bucket{type="run.completed",le="1"} 0
+clawy_event_to_chat_seconds_bucket{type="run.completed",le="2"} 0
+clawy_event_to_chat_seconds_bucket{type="run.completed",le="3"} 0
+clawy_event_to_chat_seconds_bucket{type="run.completed",le="5"} 0
+clawy_event_to_chat_seconds_bucket{type="run.completed",le="10"} 0
+clawy_event_to_chat_seconds_bucket{type="run.completed",le="30"} 0
+clawy_event_to_chat_seconds_bucket{type="run.completed",le="60"} 0
+clawy_event_to_chat_seconds_bucket{type="run.completed",le="+Inf"} 0
+clawy_event_to_chat_seconds_sum{type="run.completed"} 0
+clawy_event_to_chat_seconds_count{type="run.completed"} 0
+clawy_event_to_chat_seconds_bucket{type="run.failed",le="0.5"} 0
+clawy_event_to_chat_seconds_bucket{type="run.failed",le="1"} 0
+clawy_event_to_chat_seconds_bucket{type="run.failed",le="2"} 0
+clawy_event_to_chat_seconds_bucket{type="run.failed",le="3"} 0
+clawy_event_to_chat_seconds_bucket{type="run.failed",le="5"} 0
+clawy_event_to_chat_seconds_bucket{type="run.failed",le="10"} 0
+clawy_event_to_chat_seconds_bucket{type="run.failed",le="30"} 0
+clawy_event_to_chat_seconds_bucket{type="run.failed",le="60"} 0
+clawy_event_to_chat_seconds_bucket{type="run.failed",le="+Inf"} 0
+clawy_event_to_chat_seconds_sum{type="run.failed"} 0
+clawy_event_to_chat_seconds_count{type="run.failed"} 0
+clawy_event_to_chat_seconds_bucket{type="other",le="0.5"} 1
+clawy_event_to_chat_seconds_bucket{type="other",le="1"} 1
+clawy_event_to_chat_seconds_bucket{type="other",le="2"} 1
+clawy_event_to_chat_seconds_bucket{type="other",le="3"} 1
+clawy_event_to_chat_seconds_bucket{type="other",le="5"} 1
+clawy_event_to_chat_seconds_bucket{type="other",le="10"} 1
+clawy_event_to_chat_seconds_bucket{type="other",le="30"} 1
+clawy_event_to_chat_seconds_bucket{type="other",le="60"} 1
+clawy_event_to_chat_seconds_bucket{type="other",le="+Inf"} 1
+clawy_event_to_chat_seconds_sum{type="other"} 0
+clawy_event_to_chat_seconds_count{type="other"} 1
+# HELP clawy_files_dropped_total Files a user sent that did not reach Claw, by where they were dropped.
+# TYPE clawy_files_dropped_total counter
+clawy_files_dropped_total{path="assistant"} 0
+clawy_files_dropped_total{path="remote_agent"} 0
+clawy_files_dropped_total{path="review"} 3
+clawy_files_dropped_total{path="session"} 0
+clawy_files_dropped_total{path="unreadable"} 0

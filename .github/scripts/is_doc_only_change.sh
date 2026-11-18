@@ -42,7 +42,7 @@ self_test() {
   for p in \
     .github/CODEOWNERS \
     .github/workflows/tests-coverage.yml \
-    memory/memory-service/src/x.py \
+    deploy/litellm/prompt_cache_hook.py \
     LICENSE/nested \
     claw/README.ts; do
     if is_doc_only_path "$p"; then

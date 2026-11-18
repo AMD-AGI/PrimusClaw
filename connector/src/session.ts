@@ -19,19 +19,25 @@
  * event that names its mode also says whether it is `unattended`, so a phone always shows it.
  */
 import path from "node:path";
-import type { AttachSupport } from "./attach.js";
+import { TranscriptTail, isIdleStatus, unwrapPasted, type AttachSupport, type TranscriptUpdate } from "./attach.js";
 import type { Audit } from "./audit.js";
-import { AdapterProcess, type AcpParams, type AdapterHooks } from "./adapter.js";
+import { ECHO_WAIT_MS, TerminalInput, TerminalInputUnseen, TerminalNotSubmitted, actsAsCommand, cleanInput, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
+import { createHash } from "node:crypto";
+import { AdapterProcess, AuthenticateFailed, isAuthRequiredError, type AcpParams, type AdapterHooks } from "./adapter.js";
 import type { ChildRegistry } from "./children.js";
 import type { AgentConfig, ConnectorConfig } from "./config.js";
+import { claudeSessionMeta } from "./claude-mode.js";
+import { hintFor, withHint } from "./hints.js";
 import {
   PermissionBook, boundedInput, matchAutoAllow, normalizeOptions, type OfferedOption,
 } from "./permissions.js";
 import { redactDeep } from "./redact.js";
 import type { SessionStore } from "./session-store.js";
-import { errMessage, isObject, sleep, truncateBytes, type Logger } from "./util.js";
+import { errMessage, isObject, sleep, truncateBytes, verdictOf, type Logger, type MayRun } from "./util.js";
 
-export type Emit = (sessionId: string, type: string, data: Record<string, unknown>) => void;
+/** `after`: the event is written (and posted) only once that has settled, e.g. the record it depends on is on disk. */
+/** `at`: when it happened, ms since the epoch (a transcript entry's own time); absent, when it is emitted. */
+export type Emit = (sessionId: string, type: string, data: Record<string, unknown>, after?: Promise<unknown>, at?: number) => void;
 
 export interface SessionTiming {
   /** A session with no activity for this long loses its adapter process (the session itself stays and resumes on demand). */
@@ -42,9 +48,73 @@ export interface SessionTiming {
   modeConfirmMs: number;
   /** An attach session reads the registry this often while its own agent is starting or running a turn, to see a terminal that opens the conversation meanwhile. */
   twinWatchMs: number;
+  /** A read-only session (a conversation open in a terminal) reads its transcript for new lines this often. */
+  spectateMs: number;
+  /** ... and looks this often whether the terminal still has it open; once it has not, the read-only session ends. */
+  spectateCheckMs: number;
+  /** One look at a session's folder or root may take this long before it is `root_unavailable` (a stalled network mount). */
+  rootCheckMs: number;
+  /** How long a new session waits for an adapter that reports its sign-in to say which one it is. */
+  authWaitMs: number;
+  /** How long a takeover waits for the terminal it ended to exit (the transcript's quiet, `recentWriteMs`, is waited on top). */
+  takeoverWaitMs: number;
+  /**
+   * A message for a terminal whose process cannot be told to hold the conversation still (its Claude Code says nothing of it), or
+   * whose box holds someone's half-typed text, or whose screen is scrolled back, waits this long, then is refused
+   * (`terminal_state_unknown`, `terminal_busy`). Whether that Claude Code is busy is never waited on, nor a question on its screen
+   * (one in the pane it types into is waited out however long it is up, even while the question hides what proves a process whose
+   * registry row is torn; one on a process nothing else proves is told, and waits this long).
+   */
+  terminalWaitMs: number;
+  /** A message typed into a terminal must show up in its transcript within this long, or its turn ends `terminal_input_unconfirmed`. */
+  terminalEchoMs: number;
+  /** A typed message's turn also ends once the terminal has said it is idle for this long (a turn stopped with Esc writes no end). */
+  terminalIdleMs: number;
+  /**
+   * A terminal whose Claude Code says it is idle but whose screen is not its input box (a screen this connector cannot read:
+   * another program, a layout it does not know) is read again for this long, then the message is refused (`terminal_screen_unknown`)
+   * instead of waiting `terminalWaitMs`. A Claude Code that says it is working or waiting, or whose word cannot be read, keeps that wait.
+   */
+  terminalScreenWaitMs: number;
+  /**
+   * How long a message pasted into a terminal's box may take to show there before it is given up (`terminal_input_unseen`): a busy
+   * Claude Code draws a paste late. The phone is told it waits after ECHO_SLOW_MS (terminal-input.ts).
+   */
+  terminalShowMs: number;
 }
 
-export const DEFAULT_SESSION_TIMING: SessionTiming = { idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000 };
+/**
+ * How often a conversation open in a terminal has its transcript read for new lines: what the agent does there reaches the phone
+ * within this (a read is one stat of the file when nothing was written, and only what is new otherwise).
+ */
+export const SPECTATE_MS = 250;
+
+/**
+ * When a transcript entry happened, for its event: the time Claude Code wrote on it, unless it has none or one that is later than
+ * now (a clock that moved back): then the event is dated when it is sent, as every other event is.
+ */
+export function entryTime(at: number | undefined, now = Date.now()): number | undefined {
+  return at !== undefined && Number.isFinite(at) && at > 0 && at <= now ? at : undefined;
+}
+
+export const DEFAULT_SESSION_TIMING: SessionTiming = {
+  idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000, spectateMs: SPECTATE_MS, spectateCheckMs: 5_000,
+  rootCheckMs: 10_000, authWaitMs: 3_000, takeoverWaitMs: 15_000, terminalWaitMs: 10 * 60_000, terminalEchoMs: 20_000, terminalIdleMs: 5_000, terminalScreenWaitMs: 30_000,
+  terminalShowMs: ECHO_WAIT_MS,
+};
+
+/**
+ * Why a command to a read-only session is refused: the conversation is open in a terminal, and a second writer would fork
+ * its transcript. The session shows what the terminal does and takes no input.
+ */
+export const READ_ONLY_REASON = "read_only_live_session";
+/** Why a mode change or a decision for a conversation that is typed into in its terminal is refused: the terminal owns those. */
+export const TERMINAL_OWNS_REASON = "terminal_session";
+/** What a terminal that typed messages wait for is doing, as the queue notice says it. */
+const WAIT_WHY: Record<Exclude<Readiness, { ready: true }>["why"] | "other" | "unknown", string> = {
+  typing: "terminal_typing", screen: "terminal_screen", copy_mode: "terminal_scrolled", gone: "terminal_gone", dialog: "terminal_dialog", other: "terminal_switched",
+  unknown: "terminal_state_unknown",
+};
 
 export interface SessionEnv {
   config: ConnectorConfig;
@@ -67,8 +137,16 @@ export class SessionRefusal extends Error {
   constructor(readonly reason: string, message?: string) { super(message ?? reason); }
 }
 
+/** Why Claude Code leaves `bypassPermissions` out of its modes, for the log line of a refused session (claude-mode.ts). */
+const BYPASS_HINT = ` (Claude Code offers it to root only with IS_SANDBOX set, and never when permissions.disableBypassPermissionsMode is "disable"; "claw-connector doctor" names the fix)`;
+
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024;
 const MAX_QUEUED_PROMPTS = 5;
+/** How long after the Esc that stopped a message's turn the box is watched for Claude Code to put the message back. */
+const OWN_TAKE_BACK_MS = 3_000;
+/** How long a prompt waits for an entry the agent is still writing to the transcript to be complete: 8 × 250 ms. */
+const PARTIAL_ENTRY_TRIES = 8;
+const PARTIAL_ENTRY_WAIT_MS = 250;
 const PERMISSION_WARNING_RE = /canUseTool will not be invoked/i;
 
 export class Session {
@@ -96,15 +174,93 @@ export class Session {
   /** The transcript's size when this connector last left it (see {@link preflight}). */
   private transcriptMark: number | null = null;
   /**
+   * The program (`entrypoint`) the transcript names for what this connector's own agent wrote in its last turn, so that
+   * what the same agent writes on its own between turns is told from a terminal's (see {@link preflight}). Null until
+   * the agent has taken a turn, and again when it is discarded.
+   */
+  private ownWriter: string | null = null;
+  /** The background tasks the agent started (their ids), so that only their notifications count as its own. */
+  private ownTasks = new Set<string>();
+  /**
    * Another process was seen holding the conversation open while this connector's own agent was running a turn on
    * it. That agent's memory then lacks whatever the process wrote, and the transcript's size cannot say so (see
    * {@link watchTwins}): the agent is discarded before the next prompt. Cleared when an agent is started afresh.
    */
   private twinSeen = false;
   private turnRunning = false;
-  private queue: Array<{ text: string; cmdId: string | null; started: () => void }> = [];
+  /**
+   * The connector is going away (stopped, or restarted by its supervisor) and will come back. What this process cannot
+   * finish is left recorded for the next run instead of being ended here: the running turn (no `turn_end`), its waiting
+   * permission requests (still pending), and the prompts queued behind it (not counted as handled, so Claw delivers them
+   * again). See {@link SessionManager.recover}.
+   */
+  private stopping = false;
+  /**
+   * Prompts that reached the agent and are not yet counted as handled or dropped ({@link handledOnceRecorded}, and the
+   * terminal's equivalent). A stopping connector waits for them ({@link recorded}) before it writes connector.json for the
+   * last time: counted after that write, a prompt whose turn is recorded would be both ended by the next run and sent to
+   * it again.
+   */
+  private readonly recording = new Set<Promise<unknown>>();
+  private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun }> = [];
   private launching: Promise<void> | null = null;
   private idle: NodeJS.Timeout | undefined;
+  /**
+   * The conversation is open in a terminal: this session only reads its transcript and shows it (see {@link spectate}).
+   * No adapter is ever started for it, and every command that would write is refused.
+   */
+  readOnly = false;
+  /**
+   * Set when the terminal that has the conversation open is a tmux pane of this user's: then a message sent to the session is
+   * typed into that terminal (terminal-input.ts) and the reply is read from the transcript as for a watch. The session is
+   * still {@link readOnly} here (no agent is started, nothing else writes), but not to Claw: it takes prompts.
+   */
+  private terminal: TerminalInput | null = null;
+  private terminalQueue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun }> = [];
+  private terminalTurn: {
+    cmdId: string | null; cmdSeq: number | null; text: string; sentAt: number; seen: boolean; idleSince: number | null; done: () => void;
+    /** Claude Code queued it (it was submitted while a turn ran): it is taken in at that turn's next step, or once the turn ends. */
+    queued?: boolean;
+    /** The keys are being typed, Enter not yet gone (a question on the screen may hold it): the echo is not waited for yet. */
+    typing?: boolean;
+    /** Its text went into the box: only from then on can the transcript show it (the same words before are someone else's). */
+    pasted?: boolean;
+    /** An Enter went to the box after its text: from then on the next prompt the terminal records is taken as this message's. */
+    entered?: boolean;
+    /** A prompt the terminal recorded after the Enter in words that do not match: taken as this message's if none matches in time. */
+    candidate?: boolean;
+    /** How the turn of that prompt ended, when it ended before the prompt was taken as this message's. */
+    candidateEnd?: "end_turn" | "cancelled";
+    /**
+     * Taken as this message's without its words matching what was typed (a prompt the terminal recorded after the Enter, and none that
+     * matched by the echo wait's end): its turn is followed and ends as any other, said `input_unconfirmed` on its end, never as a failure.
+     */
+    uncertain?: boolean;
+    /**
+     * It started a turn of its own in the terminal (its prompt is the turn's, submitted at an idle prompt). Only such a turn is the
+     * phone's to stop with Esc; one that went through Claude Code's queue (taken into a running turn, or out of the queue after it)
+     * is not told apart from the person's for certain, and is left alone.
+     */
+    own?: boolean;
+    /** The keys are going (or went) to the terminal: from here on it is the terminal's turn, which a withdraw leaves alone. */
+    keys?: boolean;
+    /** Counts its prompt as handled (idempotent): a withdraw that takes the turn back before its keys go calls it itself. */
+    started?: () => void;
+    /**
+     * What the phone was told of the message waiting for the terminal's running turn (`terminal_working`): `slow` (the paste is
+     * drawn late), then `held` once Claude Code's own queue has it. Each is said at most once.
+     */
+    toldWorking?: "slow" | "held";
+  } | null = null;
+  private terminalPumping = false;
+  /** The box is being watched for a stopped message Claude Code may put back ({@link watchOwn}): nothing is typed meanwhile. */
+  private takingBack: Promise<void> | null = null;
+  /** Whether this session recorded once that its terminal's Claude Code version is not one measured for `busy` (it waits as before). */
+  private terminalRestoring: Promise<void> | null = null;
+  private tail: TranscriptTail | null = null;
+  private tailTimer: NodeJS.Timeout | undefined;
+  private lastTerminalCheck = 0;
+  private checkingTerminal = false;
   private readonly book: PermissionBook;
 
   constructor(readonly id: string, readonly agent: AgentConfig, cwd: string, private readonly env: SessionEnv, acpId: string | null = null, mode: string | null = null) {
@@ -125,8 +281,8 @@ export class Session {
 
   // --- helpers -----------------------------------------------------------------
 
-  private emit(type: string, data: Record<string, unknown>): void {
-    this.env.emit(this.id, type, data);
+  private emit(type: string, data: Record<string, unknown>, after?: Promise<unknown>, at?: number): void {
+    this.env.emit(this.id, type, data, after, at);
   }
 
   private audit(kind: string, detail: Record<string, unknown> = {}): void {
@@ -141,7 +297,10 @@ export class Session {
   }
 
   get pendingCount(): number { return this.book.size; }
-  get busy(): boolean { return this.turnRunning || this.queue.length > 0 || this.book.size > 0; }
+  get busy(): boolean { return this.turnRunning || this.queue.length > 0 || this.book.size > 0 || this.terminalTurn !== null || this.terminalQueue.length > 0; }
+
+  /** Whether what is sent to this session is typed into the terminal that has it open. */
+  get typesIntoTerminal(): boolean { return this.terminal !== null; }
 
   /** Whether `mode` may be selected from a phone. */
   modeAllowed(mode: string): boolean {
@@ -154,7 +313,7 @@ export class Session {
   }
 
   private shownModes(): Array<ModeInfo & { unattended: boolean }> {
-    return this.modes.filter((m) => this.modeAllowed(m.id)).map((m) => ({ ...m, unattended: !this.agent.askingModes.includes(m.id) }));
+    return this.modes.filter((m) => this.modeAllowed(m.id)).map((m) => ({ ...m, unattended: !this.agent.askingModes.includes(m.id), ...(this.agent.readOnlyModes.includes(m.id) ? { read_only: true } : {}) }));
   }
 
   // --- starting ----------------------------------------------------------------
@@ -171,9 +330,10 @@ export class Session {
       return this.refuse(e);
     }
     if (this.closed) return;
-    this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString() });
+    // `unused`: a new conversation of this connector's own making that no message has reached yet (see neverPrompted).
+    this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString(), unused: true });
     this.audit("session_started", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
-    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
+    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended }, this.env.store.written());
     this.announced = true;
     this.touch();
   }
@@ -182,9 +342,26 @@ export class Session {
    * `session.new` that names a session which already exists: resume it in the ask mode. The twin check runs inside
    * the launch (so it also runs again whenever a recycled adapter comes back), and a refusal closes the session.
    */
-  async attach(requestedMode: string | null, title: string): Promise<void> {
+  async attach(requestedMode: string | null, title: string, takeover = false): Promise<void> {
     if (requestedMode && !this.agent.safeModes.includes(requestedMode) && !this.agent.allowUnsafeModes) {
       return this.refuse(new SessionRefusal("mode_not_allowed", `mode ${requestedMode} needs approval = "never" for this agent (or allow_unsafe_modes) on this machine`));
+    }
+    // A conversation a terminal has open now is not taken over: it is watched, read-only, for as long as the terminal has
+    // it. Unless the person confirmed a takeover: then the terminal's process is ended first (`AttachSupport.endHolders`).
+    const support = this.env.attach.get(this.agent.id);
+    let tookOver = false;
+    if (support && this.acpId) {
+      const verdict = await support.check(this.acpId, { transcript: false });
+      if (!verdict.ok && verdict.reason === "session_live") {
+        if (!takeover) return this.spectate(support, title, verdict.detail, await support.terminalPane(this.acpId));
+        const ended = await support.endHolders(this.acpId, { waitMs: this.env.timing.takeoverWaitMs });
+        if (!ended.ok) {
+          this.audit("takeover_refused", { reason: ended.reason, detail: ended.detail.slice(0, 300) });
+          return this.refuse(new SessionRefusal(ended.reason, ended.detail));
+        }
+        this.audit("terminal_ended", { acp_session_id: this.acpId, pids: ended.ended, detail: verdict.detail.slice(0, 300) });
+        tookOver = true;
+      }
     }
     if (requestedMode) this.targetMode = requestedMode;
     try {
@@ -195,8 +372,487 @@ export class Session {
     if (this.closed) return;
     this.env.store.put(this.id, { agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: this.currentMode, created_at: new Date().toISOString() });
     this.audit("session_attached", { cwd: this.cwd, mode: this.currentMode, unattended: this.unattended, acp_session_id: this.acpId });
-    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended });
+    this.emit("session_started", { acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true, ...(tookOver ? { took_over: true } : {}), modes: this.shownModes(), currentMode: this.currentMode, unattended: this.unattended }, this.env.store.written());
     this.touch();
+  }
+
+  // --- read-only: a conversation open in a terminal ------------------------------------
+
+  /**
+   * Show a conversation that a terminal has open without taking it over. Nothing is started: the transcript the terminal
+   * writes is read from its end (`TranscriptTail`, read-only) and each new line goes out as the update an adapter would
+   * have sent, scrubbed like every other event, marked `read_only`. What was there just before is sent first, marked
+   * `replay`. Prompts, mode changes and decisions are refused (`read_only_live_session`) and never reach anything that
+   * could write to the transcript. When the terminal no longer has the conversation open the session ends
+   * (`terminal_closed`): taking it over then is a new session, through the full check.
+   */
+  private async spectate(support: AttachSupport, title: string, detail: string, pane: { ok: true; pane: PaneRef } | { ok: false; why: string }): Promise<void> {
+    this.readOnly = true;
+    if (pane.ok) this.terminal = new TerminalInput(pane.pane, tmuxRunner(this.agent.attach?.tmux ?? "tmux", pane.pane.socket), this.env.timing.terminalShowMs);
+    // The terminal's permission mode now, as its footer names it (null when the screen does not say): the chat tells the person
+    // when a message from the phone will run without asking (`MODES_THAT_DO_NOT_ASK`).
+    let terminalMode: string | null = null;
+    if (this.terminal) { try { const r = await this.terminal.readiness(); terminalMode = r.ready ? r.mode : null; } catch { /* unread */ } }
+    if (this.closed) return;
+    this.tail = new TranscriptTail(() => (this.acpId ? support.transcriptPath(this.acpId) : null));
+    const backlog = this.tail.backlog();
+    this.env.store.put(this.id, {
+      agent_id: this.agent.id, acp_session_id: this.acpId, cwd: this.cwd, status: "active", mode: null, read_only: true,
+      ...(pane.ok ? { terminal_input: true } : {}), created_at: new Date().toISOString(),
+    });
+    if (pane.ok) {
+      this.audit("session_terminal_input", { cwd: this.cwd, acp_session_id: this.acpId, pid: pane.pane.pid, pane: pane.pane.pane, terminal_mode: terminalMode, detail: detail.slice(0, 300) });
+      // Not read-only: what is sent is typed into the terminal. The terminal keeps its own mode; it is not the phone's to set.
+      // (a process whose registry row cannot be read is known to hold the conversation only while its screen shows the box: said, so
+      // the chat can say once that a restart of it makes it known again)
+      const unreadable = support.rowUnreadable(pane.pane.pid);
+      this.emit("session_started", {
+        acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true,
+        live_terminal: true, input: "terminal", modes: [], currentMode: null, terminal_mode: terminalMode,
+        ...(unreadable ? { registry_row_unreadable: true } : {}),
+      });
+    } else {
+      this.audit("session_spectating", { cwd: this.cwd, acp_session_id: this.acpId, detail: detail.slice(0, 300), why_not_typed: pane.why.slice(0, 300) });
+      this.emit("session_started", {
+        acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true,
+        read_only: true, read_only_reason: "session_live", read_only_why: pane.why.slice(0, 200), modes: [], currentMode: null, unattended: false,
+      });
+    }
+    this.announced = true;
+    for (const u of backlog) this.emitTranscript(u, true);
+    this.followTail(support);
+  }
+
+  /** After a restart: a session that was read-only is again, from the transcript's end (what was sent before is not sent twice). */
+  restoreSpectate(typed = false): void {
+    this.readOnly = true;
+    const support = this.env.attach.get(this.agent.id);
+    if (!support) return;
+    // One that typed into its terminal does again, once the pane is proven again; until then (or if it cannot be) a message is refused.
+    if (typed && this.acpId) {
+      this.terminalRestoring = support.terminalPane(this.acpId).then((pane) => {
+        if (pane.ok && !this.closed) this.terminal = new TerminalInput(pane.pane, tmuxRunner(this.agent.attach?.tmux ?? "tmux", pane.pane.socket), this.env.timing.terminalShowMs);
+        else if (!pane.ok) this.audit("terminal_input_lost", { why: pane.why.slice(0, 300) });
+      }).finally(() => { this.terminalRestoring = null; });
+    }
+    this.tail = new TranscriptTail(() => (this.acpId ? support.transcriptPath(this.acpId) : null));
+    this.tail.fromEnd();
+    this.followTail(support);
+  }
+
+  private followTail(support: AttachSupport): void {
+    this.lastTerminalCheck = Date.now();
+    const tick = () => {
+      if (this.closed || !this.tail) return;
+      for (const u of this.tail.poll()) this.emitTranscript(u, false);
+      this.watchTerminalTurn(support);
+      if (!this.checkingTerminal && Date.now() - this.lastTerminalCheck >= this.env.timing.spectateCheckMs) void this.checkTerminal(support);
+    };
+    this.tailTimer = setInterval(tick, this.env.timing.spectateMs);
+    this.tailTimer.unref?.();
+  }
+
+  /** Is the conversation still open somewhere else? The cheap look first; only a look that finds nothing asks every source. */
+  private async checkTerminal(support: AttachSupport): Promise<void> {
+    if (!this.acpId) return;
+    this.checkingTerminal = true;
+    try {
+      this.lastTerminalCheck = Date.now();
+      if (support.peek(this.acpId, null)?.twin) return;
+      const verdict = await support.check(this.acpId, { transcript: false });
+      // Only a clear "nobody has it" ends the watch: a check that could not be made is not one.
+      if (verdict.ok && !this.closed) {
+        for (const u of this.tail?.poll() ?? []) this.emitTranscript(u, false);
+        await this.close("terminal_closed");
+      }
+    } finally {
+      this.checkingTerminal = false;
+    }
+  }
+
+  private emitTranscript(u: TranscriptUpdate, replay: boolean): void {
+    const turn = replay ? null : this.terminalTurn;
+    if (u.type === "turn_done" || u.type === "turn_interrupted") {
+      const how = u.type === "turn_done" ? "end_turn" : "cancelled";
+      if (turn?.seen) this.endTerminalTurn(how);
+      // (the turn of a prompt kept in mind ended before the echo wait did: if that prompt is taken as the message's, so is this end)
+      else if (turn?.candidate) turn.candidateEnd = how;
+      return;
+    }
+    // What Claude Code did with a message submitted while a turn ran: queued it (taken: the echo), took it into that turn (its start
+    // here), or handed the queue back to the terminal's box (withdrawn there). Never sent on: the phone sees the turn's own lines.
+    if (u.type === "queued" || u.type === "queued_taken" || u.type === "queue_withdrawn") {
+      if (!turn || turn.seen || !turn.pasted) return;
+      const said = String(u.update.text ?? "");
+      if (u.type === "queued" && echoOf(said, turn.text)) {
+        turn.queued = true;
+        this.tellWorking(turn, true);
+      }
+      else if (u.type === "queued_taken" && echoOf(said, turn.text)) turn.seen = true;
+      else if (u.type === "queue_withdrawn" && turn.queued) this.endTerminalTurn("error", "terminal_input_withdrawn");
+      return;
+    }
+    if (u.type === "user_message_chunk" && turn) {
+      const said = String((u.update.content as { text?: unknown } | undefined)?.text ?? "");
+      // The message typed for the phone comes back as the terminal's own prompt: it is that turn's start, not news.
+      // (its own turn only when it was submitted straight, not through Claude Code's queue: there an identical prompt the person
+      // queued before it could be the one that came out first, and its turn is the person's)
+      if (turn.pasted && !turn.seen && echoOf(said, turn.text)) { turn.seen = true; turn.own = !turn.queued; return; }
+      // (taken already, uncertain, for a prompt that came before it: this one, matching, is the message's after all)
+      if (turn.uncertain && echoOf(said, turn.text)) {
+        turn.uncertain = false;
+        turn.own = !turn.queued;
+        this.audit("terminal_input_confirmed_late", { cmd_id: turn.cmdId });
+        return;
+      }
+      // (several queued prompts can come out of Claude Code's queue as one: a queued message is in it, never its own turn)
+      if (turn.pasted && !turn.seen && turn.queued && wholeLinesOf(said, turn.text)) { turn.seen = true; return; }
+      // A prompt the terminal records after the Enter in words that do not match (a paste Claude Code recorded in a shape this
+      // connector does not know, or the person's own): kept in mind. Should none match by the end of the echo wait, the message is
+      // taken as gone in with it (watchTerminalTurn), uncertain, rather than ended as unconfirmed while the terminal answers it; one
+      // that matches meanwhile is the message's, whatever came before it. Shown as it was recorded either way (the phone sees what
+      // went in). (A message Claude Code holds queued is never given up at the echo wait's end, so this never decides for it.)
+      if (turn.entered && !turn.seen) turn.candidate = true;
+    }
+    const text = u.type === "agent_message_chunk" ? String((u.update.content as { text?: unknown } | undefined)?.text ?? "") : "";
+    if (text && this.env.config.dropMessagePatterns.some((re) => re.test(text))) return;
+    const data = limitStrings(redactDeep({ sessionId: this.acpId, update: u.update }) as Record<string, unknown>, MAX_TOOL_OUTPUT_BYTES);
+    this.emit(u.type, { ...data, ...(this.terminal ? {} : { read_only: true }), ...(replay ? { replay: true } : {}) }, undefined, entryTime(u.at));
+  }
+
+  // --- typing into the terminal ------------------------------------------------------------
+
+  /**
+   * A message for a conversation open in a tmux pane: typed into the terminal at once, one at a time, whatever Claude Code is doing
+   * there (a running turn queues it, as one the person at the terminal types). It waits only while it could not be typed safely: the
+   * box holds someone's half-typed text, the screen is scrolled back, or a question or a menu is on it (an Enter there would answer
+   * it). While it waits the phone is told once why (`terminal_input_queued`).
+   */
+  private enqueueTerminal(text: string, cmdId: string | null, cmdSeq: number | null, started: () => void, mayRun?: MayRun): void {
+    if (this.terminalQueue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts", cmdSeq); return started(); }
+    this.terminalQueue.push({ text, cmdId, cmdSeq, started, mayRun });
+    void this.pumpTerminal();
+  }
+
+  private async pumpTerminal(): Promise<void> {
+    if (this.terminalPumping) return;
+    this.terminalPumping = true;
+    try {
+      while (this.terminalQueue.length && !this.closed) {
+        const next = this.terminalQueue[0]!;
+        const refused = (reason: string, detail = "", extra: Record<string, unknown> = {}) => {
+          this.terminalQueue.shift();
+          next.started();
+          this.audit("terminal_input_refused", { reason, detail: detail.slice(0, 300), cmd_id: next.cmdId, ...extra });
+          this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq, extra);
+          this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, ...extra });
+        };
+        const text = cleanInput(next.text);
+        if (!text.trim()) { refused("empty_prompt"); continue; }
+        // `!` or `/` first would run a shell command or a slash command there, not ask the agent: never typed.
+        if (actsAsCommand(text)) { refused("terminal_command_refused"); continue; }
+        if (this.terminalRestoring) await this.terminalRestoring;
+        // (a message just stopped may still come back into the box: it is taken out before anything else is put in)
+        if (this.takingBack) await this.takingBack;
+        const term = this.terminal;
+        if (!term) { refused("terminal_input_unavailable"); continue; }
+        let told = "";
+        // (what the question on the screen asks, as last told: a new question is told again)
+        let toldDialog: string | null = null;
+        // (whether the holder was looked at anew since a question went away)
+        let reproved = false;
+        let ready = false;
+        // Typed in any permission mode (the terminal's owner chose it); the mode is recorded with what was typed.
+        // Since when the screen has been one this connector cannot read (no input box, and no question it knows), and since when
+        // Claude Code has said nothing of the process (it cannot be told that the process still holds this conversation).
+        let unreadableSince: number | null = null;
+        let heldSince: number | null = null;
+        let refusal: string | null = null;
+        while (!this.closed && this.terminalQueue[0] === next) {
+          // Not whether Claude Code is busy (a running turn queues what is typed): only that the process is still the one on this
+          // conversation, and that its screen can take the keys without anything on it answering to them.
+          const status = this.holderStatus(term);
+          let why: string;
+          let dialog: string | null = null;
+          // (a question on a screen whose process nothing proves, and whose registry row is not the torn one: bounded)
+          let blindDialog = false;
+          if (status === "other") { told = WAIT_WHY.other; break; }   // (the terminal is on another conversation now, or gone)
+          if (status === null) {
+            // Nothing says the process holds this conversation still. A question on its screen hides the box, and with it the name a
+            // process whose row cannot be read is proven by (`provenBlindHold`): one on the pane this session types into, in the
+            // process proven at the start, is waited out as the question it is, never typed into (nothing is typed while the holder
+            // is not proven: `sameHolder` below). Anything else on the screen is still a state this connector cannot tell. Only a
+            // process whose row is there but cannot be read has its question waited out however long it is up; one whose row says
+            // nothing else of it (no row yet, another pid, no status) is told the question but waits terminalWaitMs, as before.
+            const r = await term.readiness();
+            if (!r.ready && r.why === "dialog") { why = WAIT_WHY.dialog; dialog = r.dialog; } else why = WAIT_WHY.unknown;
+            blindDialog = why === WAIT_WHY.dialog && this.env.attach.get(this.agent.id)?.rowUnreadable(term.ref.pid) !== true;
+            // (the question gone: its box shows the conversation's name again, and the proof is made anew at once, not at the next
+            // heartbeat's look)
+            if (why === WAIT_WHY.dialog) reproved = false;
+            else if (told === WAIT_WHY.dialog && !reproved) {
+              reproved = true;
+              if (await this.env.attach.get(this.agent.id)?.refreshBlind()) continue;
+            }
+          } else {
+            // (`unread`: Claude Code's row for that process cannot be read, but the process is proven to hold this conversation)
+            const r = await term.readiness();
+            if (r.ready) { ready = true; break; }
+            why = WAIT_WHY[r.why];
+            if (r.why === "dialog") dialog = r.dialog;
+            if (r.why === "gone") { told = why; break; }
+          }
+          // A typed-in, scrolled-back or questioning terminal is waited for (the phone is told it is queued); one that cannot be read
+          // is not, nor one whose process cannot be told to be this conversation's.
+          if (why === WAIT_WHY.screen) {
+            unreadableSince ??= Date.now();
+            if (Date.now() - unreadableSince >= this.env.timing.terminalScreenWaitMs) { refusal = "terminal_screen_unknown"; told = why; break; }
+          } else {
+            unreadableSince = null;
+          }
+          // (someone's half-typed text in the box, or a screen scrolled back, held for as long as terminalWaitMs: refused then, as
+          // before; a question on the screen is waited out however long it is up, unless nothing proves the process: `blindDialog`)
+          if (why === WAIT_WHY.unknown || blindDialog || why === WAIT_WHY.typing || why === WAIT_WHY.copy_mode) {
+            heldSince ??= Date.now();
+            if (Date.now() - heldSince >= this.env.timing.terminalWaitMs) { refusal = why === WAIT_WHY.unknown || blindDialog ? "terminal_state_unknown" : "terminal_busy"; told = why; break; }
+          } else {
+            heldSince = null;
+          }
+          if (why !== told || (why === WAIT_WHY.dialog && dialog !== toldDialog)) {
+            told = why;
+            toldDialog = dialog;
+            this.emit("terminal_input_queued", { reason: why, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length, ...this.waitDetail(term, why, dialog) });
+          }
+          await sleep(Math.max(200, Math.min(1_000, this.env.timing.spectateMs * 5)));
+        }
+        if (this.closed || this.terminalQueue[0] !== next) continue;   // closed, or dropped by a cancel
+        if (refusal) { refused(refusal, told); continue; }
+        if (!ready) { refused(told === WAIT_WHY.gone ? "terminal_gone" : "terminal_switched", told); continue; }
+        // Still live (connector.ts `gateFor`: Claw is asked if the connector stalled since the message came): if not, it was
+        // reported as refused already and is only dropped here.
+        const verdict = next.mayRun ? await verdictOf(next.mayRun) : "run";
+        // Stopping: left unhandled, as `shutdown` leaves the queue, so Claw delivers it again to the next run.
+        if (verdict === "keep") break;
+        if (verdict === "drop") {
+          if (this.terminalQueue[0] === next) this.terminalQueue.shift();
+          next.started();
+          continue;
+        }
+        if (this.closed || this.terminalQueue[0] !== next) continue;
+        // Asked again just before the keys go: the same process, still on this conversation, still idle.
+        if (!this.sameHolder(term)) { refused("terminal_switched", "the terminal changed just before typing"); continue; }
+        this.terminalQueue.shift();
+        const finished = new Promise<void>((resolve) => {
+          // (`typing` from the start: until its text went in, no echo is waited for, so a wait below never ends it as unconfirmed)
+          this.terminalTurn = { cmdId: next.cmdId, cmdSeq: next.cmdSeq, text, sentAt: Date.now(), seen: false, idleSince: null, done: resolve, started: next.started, typing: true };
+        });
+        // At most once: the turn is recorded and the prompt counted as handled BEFORE the keys go, so a restart in between
+        // ends this turn (`connector_restarted`, SessionManager.recover) instead of Claw delivering it again and the terminal
+        // getting it twice. A person's terminal gets a message once or not at all.
+        const startedAt = new Date().toISOString();
+        this.env.store.beginTurn({ session_id: this.id, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, started_at: startedAt });
+        this.env.store.patch(this.id, { used_at: startedAt });
+        const recorded = await this.tracked(this.env.store.flushed(2_000).then((ok) => { next.started(); return ok; }));
+        const turn = this.terminalTurn;
+        // Everything asked again after that wait, right before the keys go: a cancel or a close meanwhile, a record that did not
+        // reach the disk (a restart could not end this turn), and the terminal itself (someone may have started typing, a menu may
+        // be open now). Each ends the turn by name and types nothing.
+        const giveUp = (reason: string | null, extra: Record<string, unknown> = {}) => {
+          const mine = this.terminalTurn === turn;
+          if (mine) this.terminalTurn = null;
+          // (Going away: the record stays, and the next run ends this turn by name.)
+          if (!this.stopping) this.env.store.endTurn(this.id);
+          // (A turn taken from here meanwhile, by a withdraw or a cancel, was already answered for by name: not a second time.)
+          if (reason === null || !mine) return;
+          this.audit("terminal_input_refused", { reason, cmd_id: next.cmdId, ...extra });
+          this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq, extra);
+          this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, ...extra });
+        };
+        if (this.closed || this.stopping || !turn || this.terminalTurn !== turn) { giveUp(null); continue; }
+        if (!recorded) { giveUp("terminal_input_failed"); continue; }
+        // One whose row cannot be read is proven again here, after every wait above: a `/clear` or `/resume` there meanwhile leaves
+        // the old task folder open while the new conversation's empty box shows, so a proof that is not fresh is no proof (codex r1).
+        if (this.holderStatus(term) === "unread" && !(await this.env.attach.get(this.agent.id)?.refreshBlind())) {
+          giveUp("terminal_busy");
+          continue;
+        }
+        // (the screen read again after that wait: someone typing, a question or a scroll meanwhile is waited out as above, not typed over)
+        let again = await term.readiness();
+        const screenBy = Date.now() + this.env.timing.terminalScreenWaitMs;
+        // (someone typing or a screen scrolled back: as long as before the turn was recorded, then refused by name, terminal_busy)
+        const heldBy = Date.now() + this.env.timing.terminalWaitMs;
+        let held = false;
+        while (!again.ready && again.why !== "gone" && !this.closed && this.terminalTurn === turn && this.sameHolder(term)) {
+          if (again.why === "screen" && Date.now() >= screenBy) break;
+          if ((again.why === "typing" || again.why === "copy_mode") && Date.now() >= heldBy) { held = true; break; }
+          await sleep(200);
+          again = await term.readiness();
+        }
+        if (!again.ready && again.why === "gone") { giveUp("terminal_gone"); continue; }
+        if (!this.sameHolder(term)) { giveUp("terminal_switched"); continue; }
+        if (held && this.terminalTurn === turn && !this.closed) { giveUp("terminal_busy"); continue; }
+        if (!again.ready && this.terminalTurn === turn && !this.closed) { giveUp("terminal_screen_unknown"); continue; }
+        if (this.closed || this.terminalTurn !== turn) { giveUp(null); continue; }   // (closed, cancelled or withdrawn meanwhile)
+        turn.keys = true;
+        turn.typing = true;
+        try {
+          // (a question that shows after the text went in holds the Enter until it is gone; the phone is told why it waits)
+          await term.type(text, {
+            onDialog: (dialog) => this.emit("terminal_input_queued", { reason: WAIT_WHY.dialog, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length + 1, ...this.waitDetail(term, WAIT_WHY.dialog, dialog) }),
+            stillWanted: () => !this.closed && !this.stopping && this.terminalTurn === turn && this.sameHolder(term),
+            submitted: () => turn.seen || turn.queued === true,
+            onPaste: () => { turn.pasted = true; },
+            onSubmit: () => { turn.entered = true; },
+            // (a busy terminal draws the paste late: the phone is told the message waits there)
+            onSlow: () => this.tellWorking(turn, false),
+          });
+          turn.typing = false;
+          turn.sentAt = Date.now();
+        } catch (e) {
+          // (taken from here meanwhile, by a cancel or a withdraw, and answered for there: not a second time)
+          if (this.terminalTurn !== turn) continue;
+          // (refused because its Enter did not submit it: its text, still in the box, was taken out there and then, TerminalInput.type)
+          if (e instanceof TerminalNotSubmitted && e.takenOut) this.audit("terminal_own_text_cleared", { why: "refused", cmd_id: next.cmdId, length: text.length });
+          this.terminalTurn = null;
+          this.env.store.endTurn(this.id);
+          // (`TerminalNotSubmitted`: typed, but the screen did not let Enter go; no key was sent after the text, which stays in the box,
+          // unless the Enters went and did not submit it: then its text, read to be still exactly in the box, was taken out.
+          // `TerminalInputUnseen`: the box never showed the paste, however long it was waited for; said by a reason of its own)
+          const reason = e instanceof TerminalInputUnseen ? "terminal_input_unseen" : "terminal_input_failed";
+          this.audit("terminal_input_refused", { reason, detail: errMessage(e).slice(0, 300), cmd_id: next.cmdId });
+          this.rejectCommand("prompt", next.cmdId, reason, next.cmdSeq);
+          this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: next.cmdId, cmd_seq: next.cmdSeq });
+          continue;
+        }
+        // What was typed is the person's own message; the trail keeps its size and a digest, not the words.
+        this.audit("terminal_input", {
+          acp_session_id: this.acpId, pid: term.ref.pid, pane: term.ref.pane, cmd_id: next.cmdId, terminal_mode: again.ready ? again.mode : null, length: text.length,
+          lines: text.split("\n").length, sha256: createHash("sha256").update(text).digest("hex").slice(0, 16),
+        });
+        await finished;
+      }
+    } finally {
+      this.terminalPumping = false;
+    }
+  }
+
+  /**
+   * What a queue notice says beside its reason: what the question on the screen asks (`dialog`, {@link dialogSummary}: one short
+   * line, paths cut and credentials masked), and that the terminal's process has a registry row that cannot be read
+   * (`registry_row_unreadable`: the chat says once that restarting it with `claude --resume` makes it known again).
+   */
+  private waitDetail(term: TerminalInput, why: string, dialog: string | null): Record<string, unknown> {
+    const unreadable = (why === WAIT_WHY.dialog || why === WAIT_WHY.unknown) && this.env.attach.get(this.agent.id)?.rowUnreadable(term.ref.pid) === true;
+    return { ...(why === WAIT_WHY.dialog && dialog ? { dialog } : {}), ...(unreadable ? { registry_row_unreadable: true } : {}) };
+  }
+
+  /**
+   * Whether the terminal's process is still the one proven to hold this conversation (whatever it is doing there): Claude Code's row
+   * names it, or it is proven so without one (`unread`).
+   */
+  private sameHolder(term: TerminalInput): boolean {
+    const status = this.holderStatus(term);
+    return status !== null && status !== "other";
+  }
+
+  /** What Claude Code says the terminal's process is doing with this conversation (see `AttachSupport.holderStatus`). */
+  private holderStatus(term: TerminalInput): string | null {
+    return this.env.attach.get(this.agent.id)?.holderStatus(term.ref.pid, this.acpId ?? "", term.ref.procStart) ?? null;
+  }
+
+  /** The typed message's turn, from the tick: it must show up in the transcript, and it ends when the terminal says it is idle again. */
+  private watchTerminalTurn(support: AttachSupport): void {
+    const turn = this.terminalTurn;
+    if (!turn || !this.terminal) return;
+    const now = Date.now();
+    if (!turn.seen) {
+      // (the terminal went on to another conversation, or its process is gone: nothing there will take it in now)
+      if (!turn.typing && support.holderStatus(this.terminal.ref.pid, this.acpId ?? "", this.terminal.ref.procStart) === "other") {
+        this.endTerminalTurn("error", "terminal_switched");
+        return;
+      }
+      // (queued by Claude Code: it waits for the running turn, however long; still being typed: not sent yet)
+      if (!turn.queued && !turn.typing && now - turn.sentAt >= this.env.timing.terminalEchoMs) {
+        if (!turn.candidate) { this.endTerminalTurn("error", "terminal_input_unconfirmed"); return; }
+        // (a prompt came after the Enter and none matched: taken as this message's, uncertain; never its own turn to stop with Esc,
+        // as it may be the person's)
+        turn.seen = true;
+        turn.uncertain = true;
+        turn.own = false;
+        this.audit("terminal_input_uncertain", { cmd_id: turn.cmdId });
+        // (its turn already ended, and nothing else may end it now: a terminal whose state cannot be read waits for that end alone)
+        if (turn.candidateEnd) this.endTerminalTurn(turn.candidateEnd);
+      }
+      return;
+    }
+    const status = support.holderStatus(this.terminal.ref.pid, this.acpId ?? "", this.terminal.ref.procStart);
+    if (status === "other") { this.endTerminalTurn("end_turn"); return; }
+    // (`unread`: nothing says it is idle; the transcript's own end of the turn, `turn_done`, ends it)
+    if (isIdleStatus(status)) {
+      turn.idleSince ??= now;
+      if (now - turn.idleSince >= this.env.timing.terminalIdleMs) this.endTerminalTurn("end_turn");
+    } else {
+      turn.idleSince = null;
+    }
+  }
+
+  /**
+   * The phone's message waits for the turn the terminal is running (`terminal_input_queued`, `terminal_working`): said when the
+   * busy terminal draws the paste late, and when Claude Code's queue takes it (`held: "terminal"`: it is in Claude Code's queue
+   * now, taken in at that turn's next step or once it ends; only the terminal can take it back from there). Each at most once, and
+   * nothing after `held`.
+   */
+  private tellWorking(turn: NonNullable<Session["terminalTurn"]>, held: boolean): void {
+    if (this.terminalTurn !== turn || turn.toldWorking === "held" || (turn.toldWorking === "slow" && !held)) return;
+    turn.toldWorking = held ? "held" : "slow";
+    this.emit("terminal_input_queued", {
+      reason: "terminal_working", cmd_id: turn.cmdId, cmd_seq: turn.cmdSeq, queued: this.terminalQueue.length + 1, ...(held ? { held: "terminal" } : {}),
+    });
+  }
+
+  private endTerminalTurn(stopReason: string, error?: string): void {
+    const turn = this.terminalTurn;
+    if (!turn) return;
+    this.terminalTurn = null;
+    // (Not when the connector is going away: the record is left for the next run, which ends the turn by name.)
+    if (!this.stopping) this.env.store.endTurn(this.id);
+    const uncertain = turn.uncertain ? { input_unconfirmed: true } : {};
+    this.audit("terminal_turn_end", { stop_reason: stopReason, ...(error ? { error } : {}), ...uncertain, cmd_id: turn.cmdId });
+    this.emit("turn_end", { stopReason, ...(error ? { error } : {}), ...uncertain, cmd_id: turn.cmdId, cmd_seq: turn.cmdSeq });
+    turn.done();
+  }
+
+  /**
+   * Watch the box for a message of the phone's own and take it out (only while the box holds exactly that text and no question shows,
+   * TerminalInput.takeBack), for OWN_TAKE_BACK_MS right after the Esc that stopped its turn: Claude Code puts a message whose turn was
+   * stopped before any answer back into the box. The next message waits for the watch, so a message with the same words is never
+   * taken for it. Nothing is looked for after that: the box is the person's.
+   */
+  private watchOwn(term: TerminalInput, text: string, cmdId: string | null, why: "stopped"): void {
+    const watch: Promise<void> = this.takeBackOwn(term, text, cmdId, why).finally(() => {
+      if (this.takingBack === watch) this.takingBack = null;
+    });
+    this.takingBack = watch;
+  }
+
+  private async takeBackOwn(term: TerminalInput, text: string, cmdId: string | null, why: string): Promise<void> {
+    if (await term.takeBack(text, OWN_TAKE_BACK_MS).catch(() => false)) {
+      this.audit("terminal_own_text_cleared", { why, cmd_id: cmdId, length: text.length });
+    }
+  }
+
+  /** The queued typed messages are dropped: each is refused by name (`cancelled`, or the reason given). */
+  private dropTerminalQueue(reason: string): void {
+    const q = this.terminalQueue;
+    this.terminalQueue = [];
+    for (const item of q) { item.started(); this.rejectCommand("prompt", item.cmdId, reason, item.cmdSeq); }
+  }
+
+  /** The process is stopping: the transcript is no longer followed (the session itself stays recorded, read-only). */
+  stopTail(): void {
+    clearInterval(this.tailTimer);
+    this.tailTimer = undefined;
+    this.tail = null;
   }
 
   /** Start (or restart) the adapter and bring the ACP session up in a verified mode. One at a time. */
@@ -285,21 +941,34 @@ export class Session {
     this.modeSeen = [];
     try {
       if (how === "new") {
-        const res = await adapter.request("session/new", { cwd: this.cwd, mcpServers: [] });
+        const res = await this.signedIn(adapter, () => adapter.request("session/new", { cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }));
         if (typeof res.sessionId !== "string") throw new SessionRefusal("adapter_protocol", "session/new returned no session id");
         this.acpId = res.sessionId;
         this.absorb(res);
+        await this.refuseSignedOut(adapter);
       } else {
         if (!this.acpId) throw new SessionRefusal("adapter_cannot_resume", "no adapter session to resume");
         const caps = adapter.caps.sessionCapabilities as AcpParams | undefined;
-        if (caps?.resume) {
-          // `resume` does not replay the history, and the adapter's own settings apply again: the mode is re-locked below.
-          this.absorb(await adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [] }));
-        } else if (adapter.caps.loadSession) {
-          this.replaying = true;
-          try { this.absorb(await adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [] })); } finally { this.replaying = false; }
-        } else {
-          throw new SessionRefusal("adapter_cannot_resume", "the adapter can neither resume nor load a session");
+        try {
+          if (caps?.resume) {
+            // `resume` does not replay the history, and the adapter's own settings apply again: the mode is re-locked below.
+            this.absorb(await this.signedIn(adapter, () => adapter.request("session/resume", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) })));
+          } else if (adapter.caps.loadSession) {
+            this.replaying = true;
+            try { this.absorb(await this.signedIn(adapter, () => adapter.requestUnbounded("session/load", { sessionId: this.acpId, cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }))); } finally { this.replaying = false; }
+          } else {
+            throw new SessionRefusal("adapter_cannot_resume", "the adapter can neither resume nor load a session");
+          }
+        } catch (e) {
+          if (!this.neverPrompted(e)) throw e;
+          // Opened and never sent a message: the agent wrote nothing yet (Claude keeps a conversation only from its first
+          // message), so there is nothing to resume and nothing to lose. A fresh one takes its place, in the same folder.
+          const res = await this.signedIn(adapter, () => adapter.request("session/new", { cwd: this.cwd, mcpServers: [], ...claudeSessionMeta(this.agent) }));
+          if (typeof res.sessionId !== "string") throw new SessionRefusal("adapter_protocol", "session/new returned no session id");
+          this.audit("session_recreated", { was: this.acpId, now: res.sessionId, why: errMessage(e).slice(0, 200) });
+          this.acpId = res.sessionId;
+          this.absorb(res);
+          this.env.store.patch(this.id, { acp_session_id: this.acpId });
         }
       }
       await this.enforceMode(this.targetMode);
@@ -308,6 +977,46 @@ export class Session {
       await this.dropAdapter();
       throw e instanceof SessionRefusal ? e : mapAdapterError(e);
     }
+  }
+
+  /**
+   * `open` (a `session/new`), signing the adapter in first when it needs that and can do it by itself: an adapter that
+   * answers "Authentication required" and offers an `api-key` method, while its environment holds a key it reads
+   * (codex-acp: OPENAI_API_KEY or CODEX_API_KEY), is told to `authenticate` with it and asked once more. Without this a
+   * Codex agent set up with only an API key never opened a session. The key itself is never sent: the adapter reads
+   * its own environment. (codex-acp then keeps the key in its auth.json, as `codex login --with-api-key` does.)
+   */
+  private async signedIn(adapter: AdapterProcess, open: () => Promise<AcpParams>): Promise<AcpParams> {
+    try {
+      return await adapter.openSignedIn({ ...process.env, ...this.agent.env }, open, (method) => this.audit("agent_authenticate", { method }));
+    } catch (e) {
+      if (e instanceof AuthenticateFailed) throw new SessionRefusal("agent_auth_required", e.message);
+      throw e;
+    }
+  }
+
+  /**
+   * An adapter that reports its sign-in (claude-agent-acp) and says there is none: the session would open, say it is
+   * ready and fail at its first message with "Authentication required". A new session is refused now instead, with the
+   * fix. A session that already exists (resumed after an idle recycle or a restart) is not: its prompts say why and it
+   * stays, so it carries on once someone signs in on the machine.
+   */
+  private async refuseSignedOut(adapter: AdapterProcess): Promise<void> {
+    const st = await adapter.waitAuthStatus(this.env.timing.authWaitMs);
+    if (st?.kind === "none") throw new SessionRefusal("agent_auth_required", `the agent reports that it is not signed in${st.label ? ` (${st.label})` : ""}`);
+  }
+
+  /**
+   * The adapter cannot find the conversation to resume, and this session's record says it was started new by this
+   * connector and never had a message (`unused`). Any other failure, a used or taken-over session, or a record that does
+   * not say (written by an older version), keeps its error.
+   */
+  private neverPrompted(e: unknown): boolean {
+    if (this.agent.attach || e instanceof SessionRefusal) return false;
+    // Only a record that says so: one written before this was kept, or a takeover, may well have had messages.
+    const rec = this.env.store.get(this.id);
+    if (rec?.unused !== true || rec.used_at) return false;
+    return /not found|no (?:such )?(?:session|conversation)/i.test(errMessage(e));
   }
 
   /** Take the modes and the mode config option out of a `session/new|resume|load` answer. */
@@ -338,7 +1047,7 @@ export class Session {
   private async enforceMode(mode: string): Promise<void> {
     const a = this.adapter;
     if (!a || !this.acpId) throw new SessionRefusal("adapter_gone");
-    if (this.modes.length && !this.modes.some((m) => m.id === mode)) throw new SessionRefusal("mode_unavailable", `the adapter offers no mode ${mode}`);
+    if (this.modes.length && !this.modes.some((m) => m.id === mode)) throw new SessionRefusal("mode_unavailable", `the adapter offers no mode ${mode}${mode === "bypassPermissions" ? BYPASS_HINT : ""}`);
     this.enforcing = true;
     this.modeSeen = [];
     try {
@@ -368,7 +1077,9 @@ export class Session {
       } catch { /* fall through to notifications */ }
     }
     const deadline = Date.now() + this.env.timing.modeConfirmMs;
-    while (Date.now() < deadline) {
+    // Not past the end of the session or of its adapter (refused meanwhile, or killed by a stop): nothing can confirm a
+    // mode then, and a look that went on would end the opening, and the command, long after the run that took it.
+    while (Date.now() < deadline && !this.closed && this.adapter === a) {
       const last = this.modeSeen[this.modeSeen.length - 1];
       if (last !== undefined) return last;
       await sleep(25);
@@ -397,6 +1108,7 @@ export class Session {
 
   /** `set_mode`: a user-chosen mode, only from the allowed list, always read back. */
   async setMode(modeId: string, cmdId: string | null): Promise<void> {
+    if (this.readOnly) return this.rejectCommand("set_mode", cmdId, this.terminal ? TERMINAL_OWNS_REASON : READ_ONLY_REASON);
     if (!this.adapter) await this.ensureAdapter();
     if (!this.modeAllowed(modeId)) return this.rejectCommand("set_mode", cmdId, "mode_not_allowed");
     if (this.modes.length && !this.modes.some((m) => m.id === modeId)) return this.rejectCommand("set_mode", cmdId, "mode_unavailable");
@@ -448,7 +1160,8 @@ export class Session {
     this.adapter = null;
     const hadTurn = this.turnRunning;
     const cancelled = this.book.cancelAll();
-    for (const actionId of cancelled) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "adapter_exit" });
+    // Going away: the next run closes these cards (by connector_restart) and knows the turn was waiting on them.
+    if (!this.stopping) for (const actionId of cancelled) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "adapter_exit" });
     if (!this.closed) this.audit("adapter_exited", { code: info.code, signal: info.signal, during_turn: hadTurn });
   }
 
@@ -503,19 +1216,24 @@ export class Session {
     }
     return this.askPerson(options, {
       tool: str(toolCall.title, 200), kind: str(toolCall.kind, 64), input: boundedInput(toolCall.rawInput), toolCallId: str(toolCall.toolCallId, 128),
-    }, (optionId) => (optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }));
+    }, (optionId) => (optionId === null ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId } }), true);
   }
 
   /** Put a question on the phone and wait for the answer, a cancel or the timeout. `shape` turns the answer into what the adapter expects. */
-  private askPerson(options: OfferedOption[], info: Record<string, unknown>, shape: (optionId: string | null) => AcpParams): Promise<AcpParams> {
+  private askPerson(options: OfferedOption[], info: Record<string, unknown>, shape: (optionId: string | null) => AcpParams, permission = false): Promise<AcpParams> {
     return new Promise<AcpParams>((resolve) => {
       const p = this.book.open(options, (actionId) => redactDeep({ actionId, ...info, options, timeout_ms: this.book.ttl }) as Record<string, unknown>, (optionId) => {
-        this.env.store.removePending(this.id, p.actionId);
+        if (!this.stopping) {
+          this.env.store.removePending(this.id, p.actionId);
+          if (this.book.size === 0) this.env.store.markWaiting(this.id, false);
+        }
         resolve(shape(optionId));
       });
       this.env.store.addPending(this.id, p.actionId);
+      this.env.store.markWaiting(this.id, true, permission);
       this.audit("permission_requested", { action_id: p.actionId, tool: info.tool, tool_kind: info.kind, options: options.map((o) => o.optionId) });
-      this.emit("permissionRequest", p.payload);
+      // Shown once the card is on record: a crash after that closes it on the next run (`takePending`).
+      this.emit("permissionRequest", p.payload, this.env.store.written());
     });
   }
 
@@ -579,18 +1297,46 @@ export class Session {
    * the session closed): only then does the connector count the command as handled, so a restart before that
    * delivers it again instead of losing it.
    */
-  enqueuePrompt(text: string, cmdId: string | null, started: () => void = () => {}): void {
-    if (this.closed) { this.rejectCommand("prompt", cmdId, "session_closed"); return started(); }
-    if (this.queue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts"); return started(); }
-    this.queue.push({ text, cmdId, started });
+  enqueuePrompt(text: string, cmdId: string | null, started: () => void = () => {}, cmdSeq: number | null = null, mayRun?: MayRun): void {
+    if (this.closed) { this.rejectCommand("prompt", cmdId, "session_closed", cmdSeq); return started(); }
+    if (this.readOnly && (this.terminal || this.terminalRestoring)) return this.enqueueTerminal(text, cmdId, cmdSeq, started, mayRun);
+    if (this.readOnly) {
+      // Never queued, never sent: what the person typed does not reach the conversation the terminal is writing.
+      this.audit("prompt_refused", { reason: READ_ONLY_REASON });
+      this.rejectCommand("prompt", cmdId, READ_ONLY_REASON, cmdSeq);
+      this.emit("turn_end", { stopReason: "error", error: READ_ONLY_REASON, read_only: true, cmd_id: cmdId, cmd_seq: cmdSeq });
+      return started();
+    }
+    if (this.queue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts", cmdSeq); return started(); }
+    this.queue.push({ text, cmdId, cmdSeq, started, mayRun });
     if (!this.turnRunning) void this.pump();
   }
 
-  /** Prompts that will now never run (the process is being stopped): they count as handled. */
-  dropQueued(): void {
+  /** Prompts that will now never run here: they count as handled, unless (`keep`) the connector is only restarting and the next run should get them again. */
+  dropQueued(keep = false): void {
     const q = this.queue;
     this.queue = [];
-    for (const item of q) item.started();
+    if (!keep) for (const item of q) item.started();
+  }
+
+  /** Resolves once every prompt that reached the agent is counted as handled or dropped (see {@link recording}). */
+  async recorded(): Promise<void> {
+    while (this.recording.size) await Promise.allSettled([...this.recording]);
+  }
+
+  /** `p`, tracked in {@link recording} until it settles. */
+  private tracked<T>(p: Promise<T>): Promise<T> {
+    this.recording.add(p);
+    void p.finally(() => this.recording.delete(p)).catch(() => undefined);
+    return p;
+  }
+
+  /** The connector is about to stop its adapters and will come back: see {@link stopping}. */
+  shutdown(): void {
+    this.stopping = true;
+    this.dropQueued(true);
+    // Not counted as handled: Claw delivers the messages that were waiting for the terminal again after the restart.
+    this.terminalQueue = [];
   }
 
   private async pump(): Promise<void> {
@@ -599,7 +1345,14 @@ export class Session {
     try {
       while (this.queue.length && !this.closed) {
         const next = this.queue.shift()!;
-        await this.runTurn(next.text, next.started, next.cmdId);
+        // Still live as it reaches the agent (connector.ts `gateFor`): asked of Claw only if the connector stalled since the
+        // prompt came. Refused, it was reported already and is only counted as handled here.
+        const verdict = next.mayRun ? await verdictOf(next.mayRun) : "run";
+        // Stopping: back at the front and not counted as handled (as `shutdown` keeps the queue), so the next run gets it again.
+        if (verdict === "keep") { this.queue.unshift(next); break; }
+        if (verdict === "drop") { next.started(); continue; }
+        if (this.closed) { this.rejectCommand("prompt", next.cmdId, "session_closed", next.cmdSeq); next.started(); break; }
+        await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq);
       }
     } finally {
       this.turnRunning = false;
@@ -607,14 +1360,16 @@ export class Session {
     }
   }
 
-  private async runTurn(text: string, started: () => void, cmdId: string | null): Promise<void> {
+  /** Every `turn_end` of the turn names its prompt: `cmd_id`, and `cmd_seq` (a number, which no credential scrub ever masks). */
+  private async runTurn(text: string, started: () => void, cmdId: string | null, cmdSeq: number | null): Promise<void> {
     if (this.agent.attach) {
       const refused = await this.preflight();
       if (refused) {
         started();
         this.audit("prompt_refused", { reason: refused.reason, detail: refused.detail.slice(0, 300) });
-        this.rejectCommand("prompt", cmdId, refused.reason);
-        this.emit("turn_end", { stopReason: "error", error: refused.reason });
+        this.rejectCommand("prompt", cmdId, refused.reason, cmdSeq);
+        this.emit("turn_end", { stopReason: "error", error: refused.reason, cmd_id: cmdId, cmd_seq: cmdSeq });
+        this.env.store.endTurn(this.id); // (a turn carried on after a restart that could not start again ends here)
         return;
       }
     }
@@ -622,30 +1377,67 @@ export class Session {
       await this.ensureAdapter();
     } catch (e) {
       started();
-      this.emit("turn_end", { stopReason: "error", error: e instanceof SessionRefusal ? e.reason : "adapter_unavailable" });
+      const reason = e instanceof SessionRefusal ? e.reason : "adapter_unavailable";
+      const hint = hintFor(reason, this.agent);
+      this.emit("turn_end", { stopReason: "error", error: reason, ...(hint ? { hint } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });
+      this.env.store.endTurn(this.id);
+      // Not signed in (yet): the session stays, and the next message tries again once someone has signed in there.
+      if (reason === "agent_auth_required") return;
       return this.refuse(e);
     }
     const a = this.adapter!;
     this.audit("turn_started", { length: text.length });
     const support = this.agent.attach && this.acpId ? this.env.attach.get(this.agent.id) : undefined;
+    const turnFrom = support ? support.transcriptSize(this.acpId!) : null;
     const watch = support ? this.watchTwins(support, this.acpId!) : null;
     try {
       const reply = a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });
-      started();
+      const now = new Date().toISOString();
+      // Recorded before the prompt counts as handled: from here a restart finds this turn instead of losing it.
+      this.env.store.beginTurn({ session_id: this.id, cmd_id: cmdId, cmd_seq: cmdSeq, started_at: now });
+      this.env.store.patch(this.id, { used_at: now, unused: false });
+      void this.tracked(this.handledOnceRecorded(started, now));
       const res = await reply;
       const usage = isObject(res.usage) ? res.usage : undefined;
-      this.emit("turn_end", { stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}) });
+      this.endTurn({ stopReason: typeof res.stopReason === "string" ? res.stopReason : "end_turn", ...(usage ? { usage } : {}), cmd_id: cmdId, cmd_seq: cmdSeq });
     } catch (e) {
-      this.audit("turn_failed", { error: errMessage(e) });
-      this.emit("turn_end", { stopReason: "error", error: errMessage(e).slice(0, 300) });
+      if (!this.stopping) this.audit("turn_failed", { error: errMessage(e) });
+      const r = mapAdapterError(e);
+      if (r.reason === "agent_auth_required") {
+        // Signed out since the session opened (an expired login): say so with the fix, and start the agent afresh for
+        // the next message, so a sign-in done on the machine meanwhile is picked up.
+        this.endTurn({ stopReason: "error", error: r.reason, message: errMessage(e).slice(0, 300), hint: hintFor(r.reason, this.agent), cmd_id: cmdId, cmd_seq: cmdSeq });
+        if (this.adapter === a) await this.dropAdapter();
+      } else {
+        this.endTurn({ stopReason: "error", error: errMessage(e).slice(0, 300), cmd_id: cmdId, cmd_seq: cmdSeq });
+      }
     } finally {
       // At once, before the look at who holds the conversation open: the test below it for a terminal that writes
       // next is the size, and it must start from the turn's end, not from a moment later.
-      this.markTranscript();
+      this.markTranscript(turnFrom);
       if (watch) {
         if (this.closed) watch.stop();
         else if (await watch.finish()) this.twinSeen = true;
       }
+    }
+  }
+
+  /**
+   * The turn record is written off the event loop, so the prompt counts as handled (and the heartbeat's cursor passes
+   * it) only once the record has landed. Either the next run finds the turn (and ends or carries it on), or it is sent
+   * the prompt again; never neither, and never both:
+   * - the record landed: handled;
+   * - the turn ended (its record gone or replaced) or the session closed: handled, the record no longer matters;
+   * - the connector stops before the record landed: the record is dropped and the prompt left unhandled, so the next
+   *   run is sent it again instead of also finding this turn;
+   * - otherwise (a stalled disk, a failed write) it asks again every second; a failed write is tried again each time.
+   */
+  private async handledOnceRecorded(started: () => void, startedAt: string): Promise<void> {
+    for (;;) {
+      if (await this.env.store.flushed(1_000)) return started();
+      if (this.closed || this.env.store.turn(this.id)?.started_at !== startedAt) return started();
+      if (this.stopping) { this.env.store.endTurn(this.id); return; }
+      await sleep(1_000);
     }
   }
 
@@ -681,7 +1473,16 @@ export class Session {
     if (live && this.transcriptMark !== null) {
       const now = support.transcriptSize(ref);
       if (now !== null && now !== this.transcriptMark) {
-        this.audit("transcript_changed", { was: this.transcriptMark, now });
+        // The agent itself writes between turns too: a background task it started finishes, and it takes a turn of its own
+        // to answer it. That is in its memory, and nobody else holds the conversation open (the check above): it is kept.
+        const grown = await this.ownGrowth(support, ref, this.transcriptMark);
+        if (grown.by === "self") {
+          this.audit("transcript_grew_by_agent", { was: this.transcriptMark, now: grown.size });
+          this.transcriptMark = grown.size;
+          for (const id of grown.tasks) this.ownTasks.add(id);
+          return null;
+        }
+        this.audit("transcript_changed", { was: this.transcriptMark, now, why: grown.why });
         await this.dropAdapter();
         return this.preflight();
       }
@@ -689,9 +1490,41 @@ export class Session {
     return null;
   }
 
-  /** What size the transcript is as this connector leaves it: after it starts the session and after every turn. */
-  private markTranscript(): void {
-    if (this.agent.attach && this.acpId) this.transcriptMark = this.env.attach.get(this.agent.id)?.transcriptSize(this.acpId) ?? null;
+  /**
+   * Who wrote what the transcript gained since `mark`, while this connector's own agent was idle (see
+   * {@link classifyAppended}). An entry still being written is waited for, briefly; one that is not done by then is not the
+   * agent's for certain.
+   */
+  private async ownGrowth(support: AttachSupport, ref: string, mark: number): Promise<{ by: "self"; size: number; tasks: string[] } | { by: "other"; why: string }> {
+    for (let i = 0; ; i++) {
+      const r = support.appendedSince(ref, mark, { entrypoint: this.ownWriter, tasks: this.ownTasks });
+      if (r === null) return { by: "other", why: "the transcript shrank, or grew by more than is read" };
+      if (r.by !== "partial") return r;
+      if (i >= PARTIAL_ENTRY_TRIES) return { by: "other", why: "an entry that is still being written" };
+      await sleep(PARTIAL_ENTRY_WAIT_MS);
+    }
+  }
+
+  /** The turn is over: say so and forget it. Not while the connector is going away: the next run ends or continues it. */
+  private endTurn(data: Record<string, unknown>): void {
+    if (this.stopping) return;
+    this.emit("turn_end", data);
+    this.env.store.endTurn(this.id);
+  }
+
+  /**
+   * What size the transcript is as this connector leaves it: after it starts the session and after every turn. After a
+   * turn (`turnFrom`: the size it started at), also which program the transcript names for what the agent wrote in it.
+   */
+  private markTranscript(turnFrom: number | null = null): void {
+    if (!this.agent.attach || !this.acpId) return;
+    const support = this.env.attach.get(this.agent.id);
+    this.transcriptMark = support?.transcriptSize(this.acpId) ?? null;
+    if (turnFrom !== null && support && this.transcriptMark !== null) {
+      const turn = support.ownTurn(this.acpId, turnFrom, this.transcriptMark);
+      this.ownWriter = turn?.entrypoint ?? null;
+      for (const id of turn?.tasks ?? []) this.ownTasks.add(id);
+    }
   }
 
   /** A recycled (or crashed) adapter comes back on demand. */
@@ -705,10 +1538,19 @@ export class Session {
   /** `resume`: bring the session back. A live adapter is NOT asked to resume (that would reset its mode); the mode is re-asserted instead. */
   async resume(cmdId: string | null): Promise<void> {
     if (this.closed) return this.rejectCommand("resume", cmdId, "session_closed");
+    if (this.readOnly) {
+      // Nothing to bring back: a read-only session runs no agent. Say that it is still there, and still read-only.
+      this.emit("session_resumed", this.terminal
+        ? { acp_session_id: this.acpId, live_terminal: true, input: "terminal", modes: [], currentMode: null }
+        : { acp_session_id: this.acpId, read_only: true, modes: [], currentMode: null, unattended: false });
+      return;
+    }
     try {
       if (this.adapter && !this.adapter.exited) await this.enforceMode(this.targetMode);
       else await this.launch("resume");
     } catch (e) {
+      // Not signed in (yet): the resume is refused with the fix and the session stays, as for a prompt.
+      if (e instanceof SessionRefusal && e.reason === "agent_auth_required") return this.rejectCommand("resume", cmdId, e.reason);
       return this.refuse(e);
     }
     this.audit("session_resumed", { mode: this.currentMode, unattended: this.unattended });
@@ -716,16 +1558,71 @@ export class Session {
     this.touch();
   }
 
-  /** `cancel`: stop the turn, drop what was queued, answer every waiting permission request `cancelled`. */
-  async cancel(): Promise<void> {
-    const queued = this.queue.length;
+  /**
+   * `withdraw`: take back the prompts that have not started, and nothing else. The ones waiting for the terminal to be free (never
+   * typed) and the ones queued behind a running turn are each refused by name (`withdrawn`, with its `cmd_id` and `cmd_seq`); a turn
+   * that runs (typed into the terminal, or in the adapter) goes on untouched: no Escape, no session/cancel, no permission answered.
+   * A chat that lets the session go while its message still waits sends this, so the person's terminal is never interrupted.
+   */
+  withdraw(): void {
+    let terminal = this.terminalQueue.length;
+    if (terminal) this.dropTerminalQueue("withdrawn");
+    // A message taken off the queue whose keys have not gone yet (its turn is recorded first, then the terminal is read once more):
+    // still the phone's, so it is taken back too. The pump sees its turn is gone right before typing and types nothing.
+    const pending = this.terminalTurn;
+    if (pending && !pending.keys) {
+      this.terminalTurn = null;
+      if (!this.stopping) this.env.store.endTurn(this.id);
+      this.rejectCommand("prompt", pending.cmdId, "withdrawn", pending.cmdSeq);
+      // Counted as handled now, before the withdraw itself is: after a restart Claw must not deliver it again with the withdraw
+      // already behind the cursor (the pump would type it). `started` is the manager's once-only `handled`.
+      pending.started?.();
+      pending.done();
+      terminal += 1;
+    }
+    const dropped = this.queue.map((q) => [q.cmdId, q.cmdSeq] as const);
     this.dropQueued();
+    for (const [cmdId, cmdSeq] of dropped) this.rejectCommand("prompt", cmdId, "withdrawn", cmdSeq);
+    this.audit("withdrawn", { queued_dropped: terminal + dropped.length, terminal: terminal > 0 });
+  }
+
+  /**
+   * `cancel`: stop the turn, drop what was queued, answer every waiting permission request `cancelled`. Each prompt dropped
+   * unrun is refused by name (`command_rejected`, reason `cancelled`, with its `cmd_id` and `cmd_seq`): it never gets a `turn_end`.
+   */
+  async cancel(): Promise<void> {
+    if (this.readOnly && (this.terminal || this.terminalQueue.length)) {
+      const queued = this.terminalQueue.length;
+      this.dropTerminalQueue("cancelled");
+      const running = this.terminalTurn;
+      // Esc only for a turn the phone's message started itself, as the person at the terminal would stop it. Not while the message
+      // is still being put in (a question on the screen may be the person's, and Esc would deny it: the wait just ends, and any text
+      // already in the box stays there), nor while Claude Code holds it queued or took it into a turn already running (the turn is
+      // the person's: the phone stops following it, and the message, if still queued, is Claude Code's to run).
+      // (`own` is set only once the transcript shows its prompt starting a turn: by then it was submitted, whatever the typing still checks)
+      const interrupt = running?.own === true;
+      const term = this.terminal;
+      if (interrupt && term) await term.interrupt().catch(() => undefined);
+      this.audit("cancelled", { turn_running: running !== null, queued_dropped: queued, terminal: true, interrupted: interrupt });
+      // Stopped before any answer came, Claude Code puts the message back into its box (2.1.327): the phone asked to stop it, so it is
+      // taken out again, not left there to be read as someone typing (every later message would wait behind it). Set before the turn
+      // ends, so the next message waits for it: one with the same words must not be taken for the stopped one and cleared.
+      if (interrupt && term && running) this.watchOwn(term, running.text, running.cmdId, "stopped");
+      if (running) this.endTerminalTurn("cancelled");
+      else this.emit("turn_end", { stopReason: "cancelled", cmd_id: null, cmd_seq: null });
+      return;
+    }
+    const dropped = this.queue.map((q) => [q.cmdId, q.cmdSeq] as const);
+    const queued = dropped.length;
+    this.dropQueued();
+    for (const [cmdId, cmdSeq] of dropped) this.rejectCommand("prompt", cmdId, "cancelled", cmdSeq);
     const wasRunning = this.turnRunning;
     if (wasRunning && this.adapter && this.acpId) await this.adapter.notify("session/cancel", { sessionId: this.acpId }).catch(() => undefined);
     for (const actionId of this.book.cancelAll()) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "cancel" });
     this.audit("cancelled", { turn_running: wasRunning, queued_dropped: queued });
-    // A running turn ends with its own `turn_end` (stopReason cancelled). With none running, say so once.
-    if (!wasRunning) this.emit("turn_end", { stopReason: "cancelled" });
+    // A running turn ends with its own `turn_end` (stopReason cancelled, naming its prompt). With none running, say so once,
+    // naming no prompt: it ended none.
+    if (!wasRunning) this.emit("turn_end", { stopReason: "cancelled", cmd_id: null, cmd_seq: null });
   }
 
   // --- ending ----------------------------------------------------------------------------
@@ -740,6 +1637,8 @@ export class Session {
   private async dropAdapter(): Promise<void> {
     const a = this.adapter;
     this.adapter = null;
+    this.ownWriter = null;
+    this.ownTasks.clear();
     if (a) await a.kill();
   }
 
@@ -748,6 +1647,9 @@ export class Session {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.idle);
+    this.dropTerminalQueue("session_closed");
+    if (this.terminalTurn) this.endTerminalTurn("error", reason === "terminal_closed" ? "terminal_closed" : "session_closed");
+    this.stopTail();
     this.dropQueued();
     for (const actionId of this.book.cancelAll()) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: reason });
     const a = this.adapter;
@@ -755,29 +1657,29 @@ export class Session {
     await this.dropAdapter();
     this.env.store.patch(this.id, { status: "closed" });
     this.audit("session_closed", { reason });
-    this.emit("session_closed", { reason });
+    this.emit("session_closed", withHint({ reason }, this.agent));
   }
 
   /** A session that cannot be opened (or kept safe) is closed with the reason, never left half-open. */
   private async refuse(e: unknown): Promise<void> {
+    // Already closed (refused while it was opening): the opening's own failure that follows is not a second refusal.
+    if (this.closed) return;
     const r = e instanceof SessionRefusal ? e : mapAdapterError(e);
     this.env.log.warn("session refused", { session: this.id, reason: r.reason, message: r.message });
     this.audit("session_refused", { reason: r.reason, message: r.message.slice(0, 300) });
     await this.close(r.reason);
   }
 
-  rejectCommand(type: string, cmdId: string | null, reason: string): void {
+  /** A command refused; a prompt's refusal names it by `cmd_seq` too, as its turn_end would. */
+  rejectCommand(type: string, cmdId: string | null, reason: string, cmdSeq: number | null = null, extra: Record<string, unknown> = {}): void {
     this.audit("command_rejected", { type, cmd_id: cmdId, reason });
-    this.emit("command_rejected", { type, cmd_id: cmdId, reason });
+    this.emit("command_rejected", withHint({ type, cmd_id: cmdId, reason, ...(cmdSeq !== null ? { cmd_seq: cmdSeq } : {}), ...extra }, this.agent));
   }
 }
 
 function mapAdapterError(e: unknown): SessionRefusal {
   const message = errMessage(e);
-  if (/authentication required|auth_required|not logged in|login required/i.test(message) || (isObject(e) && (e as { code?: unknown }).code === -32000)) {
-    return new SessionRefusal("agent_auth_required", message);
-  }
-  return new SessionRefusal("adapter_error", message);
+  return new SessionRefusal(isAuthRequiredError(e) ? "agent_auth_required" : "adapter_error", message);
 }
 
 function str(v: unknown, max: number): string {
@@ -794,4 +1696,28 @@ export function limitStrings<T>(value: T, max: number): T {
     return out as T;
   }
   return value;
+}
+
+/** The same message, as Claude Code records what was typed: whitespace at the ends and inside runs does not count. */
+/**
+ * Whether `text` is in `joined` as whole lines (several prompts Claude Code took out of its queue as one): its lines, each trimmed, are
+ * a run of `joined`'s lines. A part of someone else's line is not it.
+ */
+export function wholeLinesOf(joined: string, text: string): boolean {
+  const lines = (x: string) => x.replace(/\r\n?/g, "\n").split("\n").map((l) => l.trim());
+  const have = lines(joined);
+  const want = lines(text.trim());
+  for (let i = 0; i + want.length <= have.length; i++) if (want.every((w, j) => have[i + j] === w)) return true;
+  return false;
+}
+
+/**
+ * Whether `said`, a prompt as the terminal's transcript records it, is `text`, the message as it was pasted: compared once both are
+ * read alike. Each `<pasted_content>` block Claude Code put in place of a paste is its text again, line breaks are `\n` whatever
+ * wrote them, the characters are in one Unicode form (NFC), invisible format characters (zero-width spaces and joiners, a byte-order
+ * mark) are gone, and every run of white space (Claude Code draws a tab as spaces) is one space.
+ */
+export function echoOf(said: string, text: string): boolean {
+  const norm = (t: string) => unwrapPasted(t.replace(/\r\n?/g, "\n")).normalize("NFC").replace(/[\u200b-\u200d\u2060\ufeff]/g, "").replace(/\s+/g, " ").trim();
+  return norm(said) === norm(text);
 }

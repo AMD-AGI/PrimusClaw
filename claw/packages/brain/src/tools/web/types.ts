@@ -58,6 +58,22 @@ export interface SearchHit {
   snippet?: string;
 }
 
+/**
+ * Filled by a web tool with whether it failed: the router's `RouteOutcome`. Set only for a failure whose text is entirely the
+ * tool's own words (fixed phrases, numbers, and what the model itself asked for), never for one that carries anything a remote
+ * server or a search backend sent (a status text, a body, an error message, a certificate field, a redirect target), since a
+ * failed call counts as having read nothing (`ReadTaint`).
+ */
+export interface WebToolOutcome {
+  isError: boolean;
+  /**
+   * What the call read, as sources (`tools/citations.ts`): the pages a search answered with, the page a fetch read whole. Set only
+   * by this code, from what it parsed, never from the text it returns. Each one a `CiteSource`, in the type the router's
+   * `RouteOutcome` takes them in, which also holds what an MCP server listed.
+   */
+  sources?: unknown[];
+}
+
 /** Provider interface — each backend implements this. */
 export interface WebSearchProvider {
   readonly name: string;

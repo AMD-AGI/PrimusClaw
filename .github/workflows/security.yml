@@ -36,9 +36,12 @@ on:
     - cron: "17 3 * * 1"
   workflow_dispatch:
 
+# One run per pull request: a new head cancels the previous head's run.
+# Every other event (push to main or deploy/**, tags, schedules, manual runs)
+# gets a group of its own, so it is never cancelled or replaced.
 concurrency:
-  group: security-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -51,7 +54,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        project: [claw]
+        project: [claw, connector, personal-agent]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -63,11 +66,35 @@ jobs:
       # actually hold: high and critical fail. Moderate and below print but do
       # not block, otherwise one unfixable transitive advisory wedges every PR
       # in the repo and the gate gets switched off wholesale.
+      # The one way past a high or critical advisory is an entry in
+      # personal-agent/scripts/audit-gate.ts: one advisory, development
+      # dependencies only (one in the production tree still fails), with an
+      # expiry date after which it fails again.
       - name: Audit
-        working-directory: ${{ matrix.project }}
         run: |
-          npm audit --audit-level=moderate || true
-          npm audit --audit-level=high
+          (cd "${{ matrix.project }}" && npm audit --audit-level=moderate) || true
+          node personal-agent/scripts/audit-gate.ts "${{ matrix.project }}"
+
+  # Third-party licences: every package a project installs for production must carry a licence compatible with the
+  # repository's MIT licence (personal-agent/scripts/license-check.ts: copyleft, unknown or missing fails). It reads
+  # package-lock.json only, so it needs no install and takes seconds.
+  npm-licenses:
+    name: npm licences (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [claw, connector, personal-agent]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: claw/.nvmrc
+
+      - name: Licences of the production dependencies
+        run: node personal-agent/scripts/license-check.ts "${{ matrix.project }}/package-lock.json" --list
 
   govulncheck:
     name: govulncheck (Sandbox)
@@ -100,13 +127,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Extras follow what each image installs, so the audited set is the
-          # set that ships: memory-service's Dockerfile installs `.[storage]`,
-          # which is where fastapi, uvicorn and asyncpg come from.
-          - package: memory/memory-service
-            extras: "[storage]"
-          - package: memory/knowledge-worker
-            extras: ""
           - package: sandbox/sdk-python
             extras: ""
     steps:
@@ -116,8 +136,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Audits what a fresh install resolves to, not the declared ranges. All
-      # three packages pin lower bounds only, so the resolved set is what a user
+      # Audits what a fresh install resolves to, not the declared ranges. The
+      # package pins lower bounds only, so the resolved set is what a user
       # actually receives and is therefore the set worth checking.
       #
       # The resolution happens in a throwaway virtualenv and the audit runs

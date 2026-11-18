@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/pkg/api"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/audit"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	log "sigs.k8s.io/agent-sandbox/pkg/logx"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -82,7 +83,7 @@ const (
 	// userIDLabelKey stores the verified user ID as a Label on the Sandbox object.
 	// Labels support K8s selector queries (e.g. kubectl get sandboxes -l user.id=uid-123).
 	// Following SaFE convention: userId → Label (no special chars, queryable).
-	userIDLabelKey = "runtime.agent-sandbox.io/user.id"
+	userIDLabelKey = grant.TemplateUserLabel
 
 	// userNameAnnotationKey stores the user display name as an Annotation.
 	// Annotations have no character restrictions — safe for names with commas (e.g. "Last, First").

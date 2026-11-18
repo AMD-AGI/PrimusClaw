@@ -3,27 +3,26 @@
 
 /** A connector wired to a FakeClaw and a fake ACP adapter, on a temporary home. */
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ClawClient } from "../../src/claw-client.js";
 import { parseConfig, type ConnectorConfig } from "../../src/config.js";
 import { Connector, type ConnectorTiming, type RunResult } from "../../src/connector.js";
 import { KeyTokenProvider, type TokenProvider } from "../../src/credentials.js";
-import { fileAudit } from "../../src/audit.js";
+import type { Report } from "../../src/doctor.js";
+import { fileAudit, type Audit } from "../../src/audit.js";
+import { redactDeep } from "../../src/redact.js";
 import { auditFile, resolveDirs, type Dirs } from "../../src/paths.js";
-import { silentLogger } from "../../src/util.js";
+import { silentLogger, type Logger } from "../../src/util.js";
 import { FakeClaw } from "./fake-claw.js";
+import { onCleanup, tmpdir } from "./tmp.js";
+import { FAST } from "./timing.js";
 
 export const ADAPTER = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-adapter.mjs");
 export const FAKE_CLAUDE = path.join(path.dirname(fileURLToPath(import.meta.url)), "fake-claude.mjs");
 
-export const tmpdir = (p = "cc-"): string => fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), p)));
-
-export const FAST: Partial<ConnectorTiming> = {
-  heartbeatMs: 150, watchdogMs: 700, batchMs: 15, backoffMinMs: 20, backoffMaxMs: 150, pausePollMs: 40,
-  idleMs: 60_000, permissionTtlMs: 60_000, modeConfirmMs: 250,
-};
+export { tmpdir, onCleanup, onExitSync } from "./tmp.js";
+export { FAST } from "./timing.js";
 
 /** An agent made from the claude-attach preset, with a stand-in `claude` command and a Claude config directory of its own. */
 export interface AttachOptions {
@@ -35,6 +34,11 @@ export interface AttachOptions {
   cliMode?: string;
   /** Use this command instead of the stand-in. */
   cli?: string;
+  /**
+   * The tmux command a message to a conversation open in a tmux pane is typed with. By default one that does not exist: a
+   * test run from inside a person's tmux must never reach their panes (its processes inherit that tmux's variables).
+   */
+  tmux?: string;
 }
 
 export interface HarnessOptions {
@@ -49,6 +53,10 @@ export interface HarnessOptions {
   /** Make the first agent a preset's (the stand-in adapter still runs), and give the modes the phone may select. */
   preset?: string;
   safeModes?: string[];
+  /** The kind of the agents (default "example"; "cursor" makes them agents Cursor's approval hooks are filed under). */
+  kind?: string;
+  /** The second agent's root (default: the same work directory as the first). */
+  secondRoots?: [string];
   /** A second agent, "fake2", on the same stand-in adapter; this is the rest of its table (for example `approval = "never"`). */
   secondToml?: string;
   timing?: Partial<ConnectorTiming>;
@@ -58,6 +66,10 @@ export interface HarnessOptions {
   token?: string;
   tokens?: TokenProvider;
   start?: boolean;
+  /** The connector's health checks (doctor.ts); absent: none. */
+  health?: () => Promise<Report>;
+  /** Where the connector logs (default: nowhere). */
+  log?: Logger;
 }
 
 export class Harness {
@@ -76,6 +88,8 @@ export class Harness {
   static async create(o: HarnessOptions = {}): Promise<Harness> {
     const h = new Harness();
     h.claw = o.claw ?? (await FakeClaw.start());
+    // Stopped before the file's temporary directories (its home among them) are removed.
+    onCleanup(() => h.close());
     h.dirs = resolveDirs({ CLAW_CONNECTOR_HOME: o.home ?? tmpdir() } as NodeJS.ProcessEnv);
     h.work = o.work ?? tmpdir("cc-work-");
     h.fakeLog = path.join(h.dirs.state, "fake-adapter.log");
@@ -89,7 +103,7 @@ export class Harness {
       fs.writeFileSync(h.liveFile, JSON.stringify(o.attach.live ?? []));
       const wrapper = path.join(h.attachDir, "claude");
       fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_CLAUDE)} "$@"\n`, { mode: 0o755 });
-      attachToml = `preset = "claude-attach"\nattach_cli = ${JSON.stringify(o.attach.cli ?? wrapper)}`;
+      attachToml = `preset = "claude-attach"\nattach_cli = ${JSON.stringify(o.attach.cli ?? wrapper)}\ntmux_cli = ${JSON.stringify(o.attach.tmux ?? "/nonexistent/tmux-for-tests")}`;
       Object.assign(attachEnv, {
         CLAUDE_CONFIG_DIR: h.attachDir, FAKE_CLAUDE_LIVE: h.liveFile, FAKE_CLAUDE_LOG: h.cliLog, FAKE_CLAUDE_MODE: o.attach.cliMode ?? "ok",
         FAKE_SESSIONS: JSON.stringify(o.attach.sessions),
@@ -100,13 +114,13 @@ export class Harness {
     const agent = (id: string, askMode: string, extra: string) => `
 [[agents]]
 id = ${JSON.stringify(id)}
-${o.attach && id === "fake" ? "" : 'kind = "example"'}
+${o.attach && id === "fake" ? "" : `kind = ${JSON.stringify(o.kind ?? "example")}`}
 name = "Fake agent"
 ${id === "fake" && o.preset ? `preset = ${JSON.stringify(o.preset)}\n` : ""}command = ${JSON.stringify(process.execPath)}
 args = [${JSON.stringify(ADAPTER)}]
 ask_mode = ${JSON.stringify(askMode)}
 safe_modes = ${JSON.stringify(id === "fake" && o.safeModes ? o.safeModes : ["default", "plan"])}
-roots = [${JSON.stringify(h.work)}]
+roots = [${JSON.stringify(id === "fake2" && o.secondRoots ? o.secondRoots[0] : h.work)}]
 ${id === "fake" ? attachToml : ""}
 ${extra}
 [agents.env]
@@ -123,9 +137,16 @@ ${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, {
   /** (Re)build the connector object on the same home, as after a restart. */
   connect(o: HarnessOptions = {}): void {
     const client = new ClawClient({ server: this.claw.url, tokens: o.tokens ?? new KeyTokenProvider(o.token ?? "good-token"), requestTimeoutMs: 3000 });
+    // The trail is written to its file as in production (off the event loop, so a moment later); `audit()` reads the
+    // same records, as they were made, at once.
+    const file = fileAudit(auditFile(this.dirs));
+    const audit: Audit = {
+      record: (kind, detail = {}) => { file.record(kind, detail); this.auditRecords.push({ ...redactDeep(detail), kind }); },
+      flush: () => file.flush?.() ?? Promise.resolve(),
+    };
     this.connector = new Connector({
-      config: this.config, dirs: this.dirs, client, server: this.claw.url, audit: fileAudit(auditFile(this.dirs)), log: silentLogger,
-      version: "test", timing: { ...FAST, ...(o.timing ?? {}) },
+      config: this.config, dirs: this.dirs, client, server: this.claw.url, audit, log: o.log ?? silentLogger,
+      version: "test", timing: { ...FAST, ...(o.timing ?? {}) }, health: o.health,
     });
   }
 
@@ -143,10 +164,15 @@ ${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, {
     return (await this.running) ?? "stopped";
   }
 
-  async close(): Promise<void> {
-    await this.stop().catch(() => undefined);
-    await this.claw.close();
+  /** Stop the connector and the stand-in Claw; a second call waits for the first. */
+  close(): Promise<void> {
+    this.closing ??= (async () => {
+      await this.stop().catch(() => undefined);
+      await this.claw.close();
+    })();
+    return this.closing;
   }
+  private closing: Promise<void> | null = null;
 
   /** A session created and started, resolved when `session_started` or `session_closed` arrives. */
   async newSession(cwd: string = this.work, mode?: string, agent = "fake"): Promise<string> {
@@ -188,9 +214,11 @@ ${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, {
     try { return fs.readFileSync(this.fakeLog, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
   }
 
+  /** Every audit record this harness's connectors made, across restarts, oldest first. */
   audit(): any[] {
-    try { return fs.readFileSync(auditFile(this.dirs), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
+    return [...this.auditRecords];
   }
+  private readonly auditRecords: any[] = [];
 
   messages(sid: string): string[] {
     return this.claw.eventsOf(sid, "agent_message_chunk").map((e) => e.data.update.content.text);

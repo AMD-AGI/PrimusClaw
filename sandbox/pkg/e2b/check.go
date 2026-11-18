@@ -7,19 +7,27 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
+	"sigs.k8s.io/agent-sandbox/pkg/envd/e2b/envdversion"
 	"sigs.k8s.io/agent-sandbox/pkg/grant"
 )
 
 const (
 	defaultTimeoutSec  int64 = 300
 	defaultPendingWait       = 15 * time.Minute
-	envdVersion              = "0.1.0"
-	defaultListLimit         = 100
+	// maxPendingTimeoutSec is the largest caller pending wait, one day.
+	maxPendingTimeoutSec int64 = 24 * 60 * 60
+	defaultListLimit           = 100
 )
+
+// envdVersion is the envd version reported on create and connect. It is the
+// version the EnvD of this tree serves, so the SDK enables exactly the features
+// EnvD implements (envdversion.Gates).
+const envdVersion = envdversion.Version
 
 const metadataPrefix = "agent-sandbox.io/"
 
@@ -38,6 +46,10 @@ const sameNodeMetadata = metadataPrefix + "same-node"
 // avoidNodesMetadata lists nodes the workload prefers not to run on.
 const avoidNodesMetadata = metadataPrefix + "avoid-nodes"
 
+// pendingTimeoutMetadata is the caller's pending wait in seconds. It replaces
+// the template pendingTimeoutSec for this create.
+const pendingTimeoutMetadata = metadataPrefix + "pending-timeout"
+
 // workspaceMetadata selects the SaFE workspace of an identity-key sandbox.
 const workspaceMetadata = metadataPrefix + "workspace"
 
@@ -54,6 +66,7 @@ const scopeAll = "all"
 var callerMetadataKeys = map[string]struct{}{
 	"idempotency-key": {},
 	"avoid-nodes":     {},
+	"pending-timeout": {},
 	"priority":        {},
 	"workspace":       {},
 }
@@ -98,6 +111,10 @@ type resolvedTemplate struct {
 	Outputs      []string
 	AcceptedEnvs []string
 	Pending      time.Duration
+	// Workspace is the SaFE workspace the template names, empty when it names none.
+	Workspace string
+	// User marks a user template from the template API rather than the grant list.
+	User bool
 }
 
 // resolveTemplate matches an expanded name, or a short name with one expansion.
@@ -142,7 +159,22 @@ func resolveTemplate(snap grant.Snapshot, role, requested string) (resolvedTempl
 	if len(matches) > 1 {
 		return resolvedTemplate{}, grant.Op(http.StatusForbidden, "template_not_allowed", requested+" matches more than one gpu size")
 	}
-	return resolvedTemplate{}, grant.Op(http.StatusForbidden, "template_not_allowed", requested)
+	return resolvedTemplate{}, grant.TemplateNotFound(requested)
+}
+
+// pendingWait is the time a create waits for the sandbox to run: the caller's
+// pending-timeout metadata in seconds when set, else the template wait.
+func pendingWait(template time.Duration, raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return template, nil
+	}
+	sec, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || sec <= 0 || sec > maxPendingTimeoutSec {
+		return 0, grant.Op(http.StatusBadRequest, "invalid_sandbox",
+			pendingTimeoutMetadata+" must be a whole number of seconds from 1 to "+strconv.FormatInt(maxPendingTimeoutSec, 10))
+	}
+	return time.Duration(sec) * time.Second, nil
 }
 
 func resolvedFrom(id, alias string, gpus int32, body specBody) resolvedTemplate {
@@ -159,6 +191,7 @@ func resolvedFrom(id, alias string, gpus int32, body specBody) resolvedTemplate 
 		Outputs:      body.Outputs,
 		AcceptedEnvs: body.AcceptedEnvs,
 		Pending:      pending,
+		Workspace:    strings.TrimSpace(body.Workspace),
 	}
 }
 
@@ -193,6 +226,7 @@ type specBody struct {
 	Inputs            []string `json:"inputs"`
 	Outputs           []string `json:"outputs"`
 	PendingTimeoutSec int64    `json:"pendingTimeoutSec"`
+	Workspace         string   `json:"workspace"`
 }
 
 func parseSpec(spec string) (specBody, error) {

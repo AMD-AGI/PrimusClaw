@@ -3,15 +3,16 @@
 
 /** The subcommands, run through `main` against a temporary home, a stand-in identity service and a stand-in Claw. */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test, { describe } from "node:test";
-import { main, EXIT, type Ctx } from "../src/commands.js";
+import { main, COMMANDS, EXIT, type Ctx } from "../src/commands.js";
+import { withThreadPool } from "../src/service.js";
 import { PRESETS, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
-import { credentialsFile, identityFile, pauseFile, resolveDirs, type Dirs } from "../src/paths.js";
+import { credentialsFile, identityFile, identityKeepFile, pauseFile, resolveDirs, type Dirs } from "../src/paths.js";
 import { sleep } from "../src/util.js";
 import { FakeClaw } from "./support/fake-claw.js";
 import { FakeIdentity } from "./support/fake-identity.js";
@@ -42,8 +43,18 @@ ${agentEnv ? `[agents.env]\n${agentEnv}\n` : ""}`);
 const seedIdentity = (dirs: Dirs, server: string, id = "stored-connector", revoked = false) => {
   fs.mkdirSync(dirs.state, { recursive: true });
   fs.writeFileSync(identityFile(dirs), JSON.stringify({ server, connector_id: id, cursor: 0, handled: [], ...(revoked ? { revoked: true } : {}) }), { mode: 0o600 });
+  fs.writeFileSync(identityKeepFile(dirs), JSON.stringify({ server, connector_id: id }), { mode: 0o600 });
 };
 const storedId = (dirs: Dirs): any => JSON.parse(fs.readFileSync(identityFile(dirs), "utf8"));
+/** Drains the FIFO named by its argument for as long as it lives: every writer that opens it gets its write through. */
+const DRAIN = "const fs = require('node:fs'); for (;;) { try { fs.readFileSync(process.argv[1]); } catch { process.exit(0); } }";
+/** The adapters children.json records, once it records any (it is written off the event loop, a moment after the start). */
+const recordedAdapters = (home: string): number[] | undefined => {
+  try {
+    const pids = JSON.parse(fs.readFileSync(path.join(home, "state", "children.json"), "utf8")).map((r: any) => r.pid as number);
+    return pids.length ? pids : undefined;
+  } catch { return undefined; }
+};
 
 describe("claw-connector commands", () => {
   test("no command and an unknown one are usage errors; version and help work", async () => {
@@ -54,8 +65,50 @@ describe("claw-connector commands", () => {
     assert.match(u.errText(), /unknown command/);
     const v = ctx(home);
     assert.equal(await main(["--version"], v.c), EXIT.ok);
-    assert.equal(v.text(), "0.1.2");
+    assert.equal(v.text(), "0.2.3");
     assert.equal(await main(["--help"], ctx(home).c), EXIT.ok);
+  });
+
+  // Derived from the command table, so a command added later is covered without touching this test.
+  const commandNames = Object.keys(COMMANDS);
+  test("every subcommand answers -h and --help with its own help, exit 0, and does nothing else", async () => {
+    assert.ok(commandNames.length >= 14, `the command table lists ${commandNames.length} commands`);
+    for (const name of commandNames) {
+      for (const flag of ["--help", "-h"]) {
+        // Also after other arguments, e.g. `hooks install --help` or `pair CODE --server URL -h`.
+        for (const argv of [[name, flag], [name, "install", "--json", flag]]) {
+          const home = tmpdir();
+          const r = ctx(home, { stdin: async () => { throw new Error(`${argv.join(" ")} read stdin`); } });
+          assert.equal(await main(argv, r.c), EXIT.ok, `${argv.join(" ")}: ${r.errText()}`);
+          assert.equal(r.errText(), "", argv.join(" "));
+          assert.ok(r.text().startsWith(`Usage: claw-connector ${name}`), `${argv.join(" ")} printed ${JSON.stringify(r.text().slice(0, 80))}`);
+          assert.deepEqual(fs.readdirSync(home), [], `${argv.join(" ")} wrote into the connector home`);
+        }
+      }
+      const h = ctx(tmpdir());
+      assert.equal(await main(["help", name], h.c), EXIT.ok);
+      assert.ok(h.text().startsWith(`Usage: claw-connector ${name}`), `help ${name}`);
+    }
+    // The overall help lists every command meant for people, each at the start of its entry.
+    const all = ctx(tmpdir());
+    assert.equal(await main(["--help"], all.c), EXIT.ok);
+    for (const [name, c] of Object.entries(COMMANDS)) {
+      const listed = all.text().split("\n").some((l) => l === `  ${name}` || l.startsWith(`  ${name} `));
+      assert.equal(listed, !c.hidden, `overall help and ${name}`);
+    }
+    // After `--` a "--help" is an argument, not a request for help: `stop -- --help` is a usage error.
+    assert.equal(await main(["stop", "--", "--help"], ctx(tmpdir()).c), EXIT.usage);
+  });
+
+  test("an unknown option is a usage error (exit 2) for every subcommand, with that command's usage", async () => {
+    for (const name of commandNames) {
+      const home = tmpdir();
+      const r = ctx(home, { stdin: async () => { throw new Error(`${name} read stdin`); } });
+      assert.equal(await main([name, "--no-such-option"], r.c), EXIT.usage, `${name}: ${r.errText()}`);
+      assert.match(r.errText(), /usage: claw-connector/i, name);
+      assert.equal(r.text(), "", name);
+      assert.deepEqual(fs.readdirSync(home), [], `${name} --no-such-option wrote into the connector home`);
+    }
   });
 
   test("init writes a sample once and never overwrites it; the sample is a valid file once its root exists", async () => {
@@ -107,8 +160,11 @@ describe("claw-connector commands", () => {
       else assert.doesNotMatch(a.text(), /not enabled/);
       // The file as written, not as the owner might edit it: the agents the command says run without asking are exactly the ones
       // that are on and unattended in it (the message once listed agents the file leaves commented out).
-      const written = loadWritten(home);
-      assert.deepEqual(written.map((x) => x.id), ["claude"], "only Claude is on in the sample");
+      const all = loadWritten(home);
+      // Claude brings the agent that lists the conversations already on the machine, with Claude's own approval setting.
+      assert.deepEqual(all.map((x) => x.id), ["claude", "claude-sessions"], "only Claude is on in the sample (and its existing conversations)");
+      assert.deepEqual([all[1]!.kind, all[1]!.unattended, all[1]!.attach], ["attach", all[0]!.unattended, { cli: "claude", tmux: "tmux" }]);
+      const written = all.filter((x) => x.id !== "claude-sessions");
       assert.deepEqual(written.filter((x) => x.unattended).map((x) => x.id), unattended);
       assert.deepEqual(/no per-step approval for: ([a-z, ]+)\./.exec(a.text())?.[1]?.split(", ") ?? [], unattended);
     });
@@ -237,17 +293,18 @@ describe("claw-connector commands", () => {
   test("run needs a config with agents and a sign-in, and refuses a credentials file others can read", async () => {
     const home = tmpdir();
     const work = tmpdir("w-");
+    // Each is exit 78: a supervisor must not restart a run that only a person can fix.
     const a = ctx(home);
-    assert.equal(await main(["run"], a.c), EXIT.failure);
+    assert.equal(await main(["run"], a.c), EXIT.needsPerson);
     assert.match(a.errText(), /agents\.toml/);
     writeConfig(home, work);
     const b = ctx(home);
-    assert.equal(await main(["run"], b.c), EXIT.failure);
+    assert.equal(await main(["run"], b.c), EXIT.needsPerson);
     assert.match(b.errText(), /not signed in/);
     await main(["login", "--server", "http://127.0.0.1:1", "--key", "k"], ctx(home).c);
     fs.chmodSync(credentialsFile(b.c.dirs), 0o644);
     const d = ctx(home);
-    assert.equal(await main(["run"], d.c), EXIT.failure);
+    assert.equal(await main(["run"], d.c), EXIT.needsPerson);
     assert.match(d.errText(), /readable by other users/);
   });
 
@@ -272,6 +329,8 @@ describe("claw-connector commands", () => {
       assert.equal(JSON.parse(fs.readFileSync(path.join(home, "config", "credentials.json"), "utf8")).refresh_token, "refresh-1");
       const sid = claw.newSession("fake", work);
       await claw.until("started", () => claw.eventsOf(sid, "session_started")[0]);
+      // children.json is written off the event loop: a moment after the adapter started.
+      await claw.until("the adapter on record", () => recordedAdapters(home));
       const s = ctx(home);
       await main(["status", "--json"], s.c);
       const st = JSON.parse(s.text());
@@ -380,15 +439,21 @@ describe("claw-connector commands", () => {
       await runOnce();
       const id = claw.connectorId;
       assert.equal(claw.registered, 1);
-      // A new sign-in (the refresh token expired, say) and a sign-out followed by a sign-in both keep the row.
-      assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
-      assert.equal(await main(["logout"], ctx(home).c), EXIT.ok);
+      // A new sign-in (the refresh token expired, say) keeps the row.
       assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
       claw.heartbeats.length = 0;
       await runOnce();
       assert.equal(claw.registered, 1, "no second registration: the stored row is still alive");
       assert.equal(claw.connectorId, id);
       assert.equal(storedId(resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv)).connector_id, id);
+      // A sign-out revokes it (a revoked row is not counted against the limit), and the next sign-in registers anew.
+      assert.equal(await main(["logout"], ctx(home).c), EXIT.ok);
+      assert.equal(claw.revokedIds.has(id), true);
+      assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+      claw.heartbeats.length = 0;
+      await runOnce();
+      assert.equal(claw.registered, 2);
+      assert.notEqual(claw.connectorId, id);
     } finally {
       connector?.stop();
       await running;
@@ -436,16 +501,20 @@ describe("claw-connector commands", () => {
         seedIdentity(a.c.dirs, "https://x.example", "stored-connector", revoked);
         assert.equal(await main(["login", "--server", "https://x.example", "--key", "k"], ctx(home).c), EXIT.ok);
         assert.equal(fs.existsSync(identityFile(a.c.dirs)), !revoked, `login --key, revoked=${revoked}`);
+        assert.equal(fs.existsSync(identityKeepFile(a.c.dirs)), !revoked, `login --key keeps or forgets connector-id.json with it, revoked=${revoked}`);
         // device path
         id.interval = 0.01;
         id.pollScript = ["ok"];
         seedIdentity(a.c.dirs, "https://x.example", "stored-connector", revoked);
         assert.equal(await main(["login", "--server", "https://x.example", "--identity-url", id.url], ctx(home).c), EXIT.ok);
         assert.equal(fs.existsSync(identityFile(a.c.dirs)), !revoked, `login device, revoked=${revoked}`);
-        // logout
+        assert.equal(fs.existsSync(identityKeepFile(a.c.dirs)), !revoked, `login device keeps or forgets connector-id.json with it, revoked=${revoked}`);
+        // logout, with Claw out of reach: a revoked row needs nothing of it; a live one cannot be revoked, so its id stays
         seedIdentity(a.c.dirs, "https://x.example", "stored-connector", revoked);
-        assert.equal(await main(["logout"], ctx(home).c), EXIT.ok);
+        const offline = (async () => { throw new Error("offline"); }) as typeof fetch;
+        assert.equal(await main(["logout"], ctx(home, { fetch: offline }).c), revoked ? EXIT.ok : EXIT.failure);
         assert.equal(fs.existsSync(identityFile(a.c.dirs)), !revoked, `logout, revoked=${revoked}`);
+        assert.equal(fs.existsSync(identityKeepFile(a.c.dirs)), !revoked, `logout keeps or forgets connector-id.json with it, revoked=${revoked}`);
         if (!revoked) assert.equal(storedId(a.c.dirs).connector_id, "stored-connector");
       }
     } finally { await id.close(); }
@@ -483,7 +552,7 @@ describe("claw-connector commands", () => {
       await claw.until("the separate process to be online", () => claw.online && claw.heartbeats.length > 0, 20_000);
       const sid = claw.newSession("fake", work);
       await claw.until("started", () => claw.eventsOf(sid, "session_started")[0]);
-      const adapters = JSON.parse(fs.readFileSync(path.join(home, "state", "children.json"), "utf8")).map((r: any) => r.pid);
+      const adapters: number[] = await claw.until("the adapter on record", () => recordedAdapters(home));
       assert.equal(adapters.length, 1);
       const s = ctx(home);
       assert.equal(await main(["stop"], s.c), EXIT.ok);
@@ -493,6 +562,61 @@ describe("claw-connector commands", () => {
       assert.notEqual(processStart(bystander.pid!), null, "a process that was not recorded is untouched");
     } finally {
       for (const p of [child, bystander]) { try { process.kill(-p.pid!, "SIGKILL"); } catch { /* gone */ } }
+      await claw.close();
+    }
+  });
+
+  test("a state directory that stops answering stops no heartbeat: events wait for the disk and go once it answers", async () => {
+    // A FIFO nobody reads blocks whoever opens it to write, as a stalled network disk blocks a write: connector.json's,
+    // sessions.json's (records and running turns) and children.json's temporary files, the audit trail, the adapter log and
+    // the session's outbox log all become one (seven stuck calls: more than libuv's default four threads). Before, the first blocked write froze the
+    // whole process (heartbeat included) until the disk came back.
+    const claw = await FakeClaw.start();
+    const home = tmpdir();
+    const work = tmpdir("w-");
+    writeConfig(home, work);
+    await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c);
+    const here = path.dirname(new URL(import.meta.url).pathname);
+    const tsx = path.join(here, "..", "node_modules", ".bin", "tsx");
+    const child = spawn(tsx, [path.join(here, "support", "run-fast.ts")], { env: withThreadPool({ ...process.env, CLAW_CONNECTOR_HOME: home }), stdio: "ignore", detached: true });
+    const readers: Array<ReturnType<typeof spawn>> = [];
+    // Made beside the file and renamed over it: the running connector may write the file again between a remove and
+    // a mkfifo (the outbox log, while the session starts), which made mkfifo fail with EEXIST.
+    const fifo = (file: string) => {
+      const tmp = `${file}.fifo`;
+      const r = spawnSync("mkfifo", ["-m", "600", tmp]);
+      assert.equal(r.status, 0, `mkfifo ${tmp}: ${r.stderr}`);
+      fs.renameSync(tmp, file);
+    };
+    try {
+      await claw.until("online", () => claw.online && claw.heartbeats.length > 0, 20_000);
+      const sid = claw.newSession("fake", work);
+      await claw.until("started", () => claw.eventsOf(sid, "session_started")[0], 10_000);
+      const state = path.join(home, "state");
+      const log = fs.readdirSync(path.join(state, "outbox")).find((n) => n.endsWith(".jsonl"))!;
+      const blocked = ["connector.json.tmp", "sessions.json.tmp", "sessions.json.turns.tmp", "children.json.tmp", "audit.jsonl", path.join("logs", "adapter-fake.log"), path.join("outbox", log)]
+        .map((f) => path.join(state, f));
+      for (const f of blocked) fifo(f);
+
+      claw.issue("prompt", sid, { text: "say stuck" });
+      // A second session meanwhile: its record, its adapter's pid and its log all wait on the disk.
+      claw.newSession("fake", work);
+      const before = claw.heartbeats.length;
+      await sleep(2_000);
+      const during = claw.heartbeats.length - before;
+      assert.ok(during >= 8, `heartbeats went on while the disk did not answer: ${during} in 2 s at 100 ms`);
+      assert.ok(claw.online, "the command stream is still open");
+      assert.equal(claw.eventsOf(sid, "turn_end").length, 0, "the turn's events wait until their lines are written");
+
+      // The disk answers again (each FIFO drained by a reader from now on): the events go. (An event waits for the record
+      // it depends on, so the session record and the others must answer too, as they would on a disk that came back.)
+      for (const f of blocked) {
+        // A reader with no shell: each read blocks until a writer opens the FIFO, then the next waits for the next writer.
+        readers.push(spawn(process.execPath, ["-e", DRAIN, f], { stdio: "ignore", detached: true }));
+      }
+      await claw.until("the turn's end, once the disk answers", () => claw.eventsOf(sid, "turn_end")[0], 10_000);
+    } finally {
+      for (const p of [child, ...readers]) { try { process.kill(-p.pid!, "SIGKILL"); } catch { /* gone */ } }
       await claw.close();
     }
   });
@@ -511,7 +635,7 @@ describe("claw-connector commands", () => {
       const sid = claw.newSession("fake", work);
       await claw.until("started", () => claw.eventsOf(sid, "session_started")[0]);
       const run = JSON.parse(fs.readFileSync(path.join(home, "state", "connector.pid"), "utf8"));
-      const adapters: number[] = JSON.parse(fs.readFileSync(path.join(home, "state", "children.json"), "utf8")).map((r: any) => r.pid);
+      const adapters: number[] = await claw.until("the adapter on record", () => recordedAdapters(home));
       process.kill(run.pid, "SIGKILL"); // no cleanup runs: the adapter is left behind
       await sleep(300);
       assert.notEqual(processStart(adapters[0]!), null, "the adapter outlived its connector");
@@ -525,21 +649,156 @@ describe("claw-connector commands", () => {
     }
   });
 
-  test("logout revokes the refresh token at the identity service and deletes the sign-in, and keeps a live connector id", async () => {
-    const id = await FakeIdentity.start();
-    try {
+  describe("logout revokes the connector at Claw before it deletes the sign-in", () => {
+    const deviceCreds = (dirs: Dirs, server: string, identityUrl: string, refresh: string) => {
+      fs.mkdirSync(path.dirname(credentialsFile(dirs)), { recursive: true });
+      fs.writeFileSync(credentialsFile(dirs), JSON.stringify({ v: 1, server, kind: "device", identity_url: identityUrl, client_id: "claw-connector", refresh_token: refresh, saved_at: "" }), { mode: 0o600 });
+    };
+
+    test("a key: the row is revoked with the user-side DELETE, then the sign-in and the stored id are deleted", async () => {
+      const claw = await FakeClaw.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+        seedIdentity(a.c.dirs, claw.url, claw.connectorId);
+        assert.equal(await main(["logout"], a.c), EXIT.ok);
+        assert.deepEqual(claw.revocations, [{ method: "DELETE", id: claw.connectorId, auth: "Bearer good-token" }]);
+        assert.equal(claw.revoked, true, "Claw sends the row nothing more");
+        assert.match(a.text(), new RegExp(`revoked connector ${claw.connectorId}[^]*signed out`));
+        assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
+        assert.equal(fs.existsSync(identityFile(a.c.dirs)), false, "a revoked row is forgotten, so the next run registers anew");
+      } finally { await claw.close(); }
+    });
+
+    test("a device sign-in: the row is revoked on the connector-side route with a fresh access token, then the rotated refresh token is revoked", async () => {
+      const claw = await FakeClaw.start();
+      const id = await FakeIdentity.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        id.refreshTokens.add("r9");
+        claw.tokens.add("access-1");
+        deviceCreds(a.c.dirs, claw.url, id.url, "r9");
+        seedIdentity(a.c.dirs, claw.url, claw.connectorId);
+        assert.equal(await main(["logout"], a.c), EXIT.ok, a.errText());
+        assert.deepEqual(claw.revocations, [{ method: "POST", id: claw.connectorId, auth: "Bearer access-1" }]);
+        assert.equal(claw.revoked, true);
+        // The refresh to get the access token rotated r9 into refresh-1: the live one is what must be revoked.
+        assert.deepEqual(id.revokedTokens, ["refresh-1"]);
+        assert.equal(id.refreshTokens.size, 0, "no refresh token of this sign-in is left alive");
+        assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
+        assert.equal(fs.existsSync(identityFile(a.c.dirs)), false);
+      } finally { await claw.close(); await id.close(); }
+    });
+
+    test("Claw unreachable: signed out here, told the row is alive and how to revoke it, exit not 0, and the key is never printed", async () => {
+      const claw = await FakeClaw.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+        seedIdentity(a.c.dirs, claw.url, claw.connectorId);
+        claw.unavailable = 10;
+        assert.equal(await main(["logout"], a.c), EXIT.failure);
+        assert.equal(claw.revoked, false);
+        assert.doesNotMatch(a.text(), /signed out$/m, "it does not claim a clean sign-out");
+        assert.match(a.errText(), new RegExp(`signed out on this machine, but connector ${claw.connectorId} was NOT revoked at Claw`));
+        assert.ok(a.errText().includes(`curl -fsS -X DELETE -H "Authorization: Bearer <your Claw API key>" ${claw.url}/v1/remote-agents/connectors/${claw.connectorId}`), a.errText());
+        assert.doesNotMatch(a.text() + a.errText(), /good-token/);
+        assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false, "the sign-in is deleted all the same");
+        assert.equal(storedId(a.c.dirs).connector_id, claw.connectorId, "the live row's id is kept, so a later sign-in reuses it");
+      } finally { await claw.close(); }
+    });
+
+    test("a device sign-in and a Claw from before the connector-side route: not revoked, said so, exit not 0; the sign-in is still revoked", async () => {
+      const claw = await FakeClaw.start();
+      const id = await FakeIdentity.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        claw.revokeRoute = false;
+        id.refreshTokens.add("r9");
+        claw.tokens.add("access-1");
+        claw.tokens.add("access-2");
+        deviceCreds(a.c.dirs, claw.url, id.url, "r9");
+        seedIdentity(a.c.dirs, claw.url, claw.connectorId);
+        assert.equal(await main(["logout"], a.c), EXIT.failure);
+        assert.equal(claw.revoked, false);
+        assert.match(a.errText(), /was NOT revoked at Claw \(.*401 authentication_required\)/);
+        assert.equal(id.refreshTokens.size, 0, "the sign-in itself is revoked");
+        assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
+        assert.equal(storedId(a.c.dirs).connector_id, claw.connectorId);
+      } finally { await claw.close(); await id.close(); }
+    });
+
+    test("a row stored for another server than this sign-in's: no credential is sent to either server, said so, exit not 0", async () => {
+      const a = await FakeClaw.start();
+      const b = await FakeClaw.start();
+      const id = await FakeIdentity.start();
+      try {
+        for (const kind of ["key", "device"] as const) {
+          const home = tmpdir();
+          const c = ctx(home);
+          // Signed in to A and ran there; then signed in to B.
+          assert.equal(await main(["login", "--server", a.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+          seedIdentity(c.c.dirs, a.url, a.connectorId);
+          if (kind === "key") {
+            b.tokens.add("key-b");
+            assert.equal(await main(["login", "--server", b.url, "--key", "key-b"], ctx(home).c), EXIT.ok);
+          } else {
+            id.refreshTokens.add("rb");
+            deviceCreds(c.c.dirs, b.url, id.url, "rb");
+          }
+          a.requests.length = 0;
+          b.requests.length = 0;
+          assert.equal(await main(["logout"], c.c), EXIT.failure, kind);
+          assert.deepEqual(a.requests, [], `${kind}: nothing reached A, so B's credential was not handed to it`);
+          assert.deepEqual(b.requests, [], `${kind}: nor B, which never had this row`);
+          assert.equal(a.revoked, false);
+          assert.match(c.errText(), new RegExp(`connector ${a.connectorId} was NOT revoked at Claw \\(it was registered at ${a.url}, but this sign-in is for ${b.url}`));
+          assert.ok(c.errText().includes(`${a.url}/v1/remote-agents/connectors/${a.connectorId}`), c.errText());
+          assert.doesNotMatch(c.text() + c.errText(), /key-b|good-token|access-/);
+          assert.equal(storedId(c.c.dirs).connector_id, a.connectorId);
+          assert.equal(fs.existsSync(credentialsFile(c.c.dirs)), false);
+        }
+      } finally { await a.close(); await b.close(); await id.close(); }
+    });
+
+    test("a row Claw already revoked (or never had for this account) is reported and forgotten, and is a clean sign-out", async () => {
+      const claw = await FakeClaw.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+        seedIdentity(a.c.dirs, claw.url, claw.connectorId);
+        claw.revoke();
+        assert.equal(await main(["logout"], a.c), EXIT.ok);
+        assert.match(a.text(), /no live connector[^]*signed out/);
+        assert.equal(fs.existsSync(identityFile(a.c.dirs)), false);
+      } finally { await claw.close(); }
+    });
+
+    test("no sign-in left but a live row stored: told it is alive and how to revoke it, exit not 0", async () => {
       const home = tmpdir();
       const a = ctx(home);
-      fs.mkdirSync(path.join(home, "config"), { recursive: true });
-      id.refreshTokens.add("r9");
-      fs.writeFileSync(credentialsFile(a.c.dirs), JSON.stringify({ v: 1, server: "https://x.example", kind: "device", identity_url: id.url, client_id: "claw-connector", refresh_token: "r9", saved_at: "" }), { mode: 0o600 });
-      seedIdentity(a.c.dirs, "https://x.example");
-      assert.equal(await main(["logout"], a.c), EXIT.ok);
-      assert.equal(storedId(a.c.dirs).connector_id, "stored-connector", "signing out leaves the connector row alone, so the next sign-in reuses it");
-      assert.deepEqual(id.revokedTokens, ["r9"]);
-      assert.equal(id.refreshTokens.has("r9"), false);
-      assert.equal(fs.existsSync(credentialsFile(a.c.dirs)), false);
-    } finally { await id.close(); }
+      seedIdentity(a.c.dirs, "https://claw.example/claw-api", "stored-connector");
+      assert.equal(await main(["logout"], a.c), EXIT.failure);
+      assert.match(a.errText(), /stored-connector was NOT revoked at Claw \(this machine is not signed in\)/);
+      assert.match(a.errText(), /https:\/\/claw\.example\/claw-api\/v1\/remote-agents\/connectors\/stored-connector/);
+    });
+
+    test("nothing registered: nothing to revoke at Claw, and a clean sign-out", async () => {
+      const claw = await FakeClaw.start();
+      try {
+        const home = tmpdir();
+        const a = ctx(home);
+        assert.equal(await main(["login", "--server", claw.url, "--key", "good-token"], ctx(home).c), EXIT.ok);
+        assert.equal(await main(["logout"], a.c), EXIT.ok);
+        assert.deepEqual(claw.revocations, []);
+        assert.equal(a.text(), "signed out");
+      } finally { await claw.close(); }
+    });
   });
 });
 
@@ -554,36 +813,130 @@ describe("init and hooks: the Claude Code session hooks", () => {
     return Object.values<any>(doc.hooks ?? {}).flatMap((groups) => groups.flatMap((g: any) => g.hooks.map((h: any) => h.command as string)));
   };
 
-  test("init installs the hooks into the Claude config directory, once, and says so; run again it changes nothing", async () => {
+  const standApproval = (): string => { const f = path.join(tmpdir("cc-hookbin-"), "approval-hook.js"); fs.writeFileSync(f, "// stand-in\n"); return f; };
+  const sessionCmds = (dir: string) => hookCommands(dir).filter((c) => c.includes("terminal-hook.js") && c.includes(`--dir '${dir}'`));
+  const approvalCmds = (dir: string) => hookCommands(dir).filter((c) => c.includes("approval-hook.js") && c.includes(`--dir '${dir}'`));
+  const mineSettings = () => JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "mine.sh" }] }] } }, null, 2);
+
+  test("init with nobody to ask leaves Claude Code's settings alone and prints the command that would add the hooks", async () => {
     const home = tmpdir();
     const dir = claudeDir(home);
-    fs.writeFileSync(settings(dir), JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "mine.sh" }] }] } }, null, 2));
-    const script = stand();
-    const a = ctx(home, { hookScript: script });
+    const mine = mineSettings();
+    fs.writeFileSync(settings(dir), mine);
+    const a = ctx(home, { hookScript: stand(), approvalHookScript: standApproval() });
     assert.equal(await main(["init"], a.c), EXIT.ok);
-    assert.match(a.text(), /installed the Claude Code session hooks in .*settings\.json/);
-    const cmds = hookCommands(dir);
-    assert.equal(cmds.filter((c) => c.includes("terminal-hook.js") && c.includes(`--dir '${dir}'`)).length, 2);
-    assert.ok(cmds.includes("mine.sh"), "the user's own hook is still there");
+    assert.ok(fs.existsSync(path.join(home, "config", "agents.toml")), "the sample is still written");
+    assert.equal(fs.readFileSync(settings(dir), "utf8"), mine, "settings.json byte for byte as it was");
+    assert.match(a.text(), /did not add the Claude Code hooks to .*settings\.json \(no terminal to ask in\).*claw-connector hooks install --approvals/);
+    assert.doesNotMatch(a.text(), /Add them\?|approval hooks:/, "nothing is offered to nobody");
+    const bare = tmpdir();
+    const bareDir = claudeDir(bare);
+    assert.equal(await main(["init"], ctx(bare, { hookScript: stand(), approvalHookScript: standApproval() }).c), EXIT.ok);
+    assert.equal(fs.existsSync(settings(bareDir)), false, "and no settings.json is created where there was none");
+  });
+
+  test("init at a terminal asks once, default yes: no leaves the settings alone, Enter installs the session and approval hooks; run again it neither asks nor changes anything", async () => {
+    const home = tmpdir();
+    const dir = claudeDir(home);
+    fs.writeFileSync(settings(dir), mineSettings());
+    const before = fs.readFileSync(settings(dir), "utf8");
+    const script = stand();
+    const approvalScript = standApproval();
+    const asked: Array<[string, boolean | undefined]> = [];
+    const no = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q, d) => { asked.push([q, d]); return false; } });
+    assert.equal(await main(["init"], no.c), EXIT.ok);
+    assert.equal(asked.length, 1);
+    assert.deepEqual(asked[0], ["Add them? [Y/n] ", true], "one question, and Enter means yes");
+    assert.match(no.text(), /session hooks \(SessionStart, SessionEnd\)/);
+    assert.match(no.text(), /approval hooks: a question Claude Code asks in a terminal .* also comes to your chat; the terminal keeps asking and the first answer wins/);
+    assert.equal(fs.readFileSync(settings(dir), "utf8"), before);
+    assert.match(no.text(), /did not add the Claude Code hooks to .*settings\.json\. .*claw-connector hooks install --approvals/);
+    // Enter: the stand-in answers with the question's default.
+    const enter = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q, d) => { asked.push([q, d]); return d ?? false; } });
+    assert.equal(await main(["init"], enter.c), EXIT.ok);
+    assert.equal(asked.length, 2);
+    assert.match(enter.text(), /installed the Claude Code session hooks in .*settings\.json/);
+    assert.match(enter.text(), /installed the approval hooks in .*settings\.json: questions Claude Code asks in a terminal also go to your chat/);
+    assert.equal(sessionCmds(dir).length, 2);
+    assert.equal(approvalCmds(dir).length, 6, "PermissionRequest, PostToolUse, PostToolUseFailure, UserPromptSubmit, Stop, SessionEnd");
+    assert.ok(approvalCmds(dir).every((c) => c.includes(`--socket '${path.join(enter.c.dirs.state, "approvals.sock")}'`)), "they talk to this connector's socket");
+    assert.ok(hookCommands(dir).includes("mine.sh"), "the user's own hook is still there");
     assert.equal(JSON.parse(fs.readFileSync(settings(dir), "utf8")).model, "opus");
     const bytes = fs.readFileSync(settings(dir), "utf8");
-    const b = ctx(home, { hookScript: script });
-    assert.equal(await main(["init"], b.c), EXIT.ok);
-    assert.match(b.text(), /already exists/);
-    assert.match(b.text(), /session hooks are already in/);
+    const again = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q, d) => { asked.push([q, d]); return false; } });
+    assert.equal(await main(["init"], again.c), EXIT.ok);
+    assert.equal(asked.length, 2, "hooks of ours already there are not asked about again");
+    assert.match(again.text(), /session hooks are already in/);
+    assert.match(again.text(), /approval hooks are already in/);
     assert.equal(fs.readFileSync(settings(dir), "utf8"), bytes);
   });
 
-  test("init --no-hooks leaves Claude Code alone; with no Claude directory it says how to do it later and creates nothing", async () => {
+  test("a setup from before, with the session hooks only: kept up to date, the approval hooks offered alone at a terminal and never added without one", async () => {
     const home = tmpdir();
     const dir = claudeDir(home);
-    const a = ctx(home, { hookScript: stand() });
+    fs.writeFileSync(settings(dir), mineSettings());
+    const script = stand();
+    const approvalScript = standApproval();
+    assert.equal(await main(["hooks", "install"], ctx(home, { hookScript: script }).c), EXIT.ok);
+    const sessionOnly = fs.readFileSync(settings(dir), "utf8");
+    // No terminal: nothing new is added, and it says how.
+    const quiet = ctx(home, { hookScript: script, approvalHookScript: approvalScript });
+    assert.equal(await main(["init"], quiet.c), EXIT.ok);
+    assert.equal(fs.readFileSync(settings(dir), "utf8"), sessionOnly, "settings.json as it was");
+    assert.match(quiet.text(), /did not add the approval hooks to .*\(no terminal to ask in\)\. Without them, a question it asks waits for you at that terminal only; to add them: claw-connector hooks install --approvals/);
+    assert.match(quiet.text(), /session hooks are already in/);
+    // A terminal: only the approval hooks are offered.
+    const asked: string[] = [];
+    const no = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q) => { asked.push(q); return false; } });
+    assert.equal(await main(["init"], no.c), EXIT.ok);
+    assert.equal(asked.length, 1);
+    assert.doesNotMatch(no.text(), /session hooks \(SessionStart/, "what is there already is not offered again");
+    assert.match(no.text(), /approval hooks: a question/);
+    assert.equal(fs.readFileSync(settings(dir), "utf8"), sessionOnly);
+    const yes = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async () => true });
+    assert.equal(await main(["init"], yes.c), EXIT.ok);
+    assert.equal(sessionCmds(dir).length, 2);
+    assert.equal(approvalCmds(dir).length, 6);
+    assert.ok(hookCommands(dir).includes("mine.sh"));
+  });
+
+  test("init --hooks installs both sets without asking; --no-approval-hooks leaves the approval hooks out; --hooks with --no-hooks is a usage error", async () => {
+    const home = tmpdir();
+    const dir = claudeDir(home);
+    const a = ctx(home, { hookScript: stand(), approvalHookScript: standApproval(), ask: async () => assert.fail("--hooks must not ask") });
+    assert.equal(await main(["init", "--hooks"], a.c), EXIT.ok);
+    assert.match(a.text(), /installed the Claude Code session hooks/);
+    assert.match(a.text(), /installed the approval hooks/);
+    assert.equal(sessionCmds(dir).length, 2);
+    assert.equal(approvalCmds(dir).length, 6);
+    const only = tmpdir();
+    const onlyDir = claudeDir(only);
+    const o = ctx(only, { hookScript: stand(), approvalHookScript: standApproval(), ask: async () => assert.fail("--hooks must not ask") });
+    assert.equal(await main(["init", "--hooks", "--no-approval-hooks"], o.c), EXIT.ok);
+    assert.equal(sessionCmds(onlyDir).length, 2);
+    assert.equal(approvalCmds(onlyDir).length, 0);
+    const asked = tmpdir();
+    const askedDir = claudeDir(asked);
+    const q = ctx(asked, { hookScript: stand(), approvalHookScript: standApproval(), ask: async () => true });
+    assert.equal(await main(["init", "--no-approval-hooks"], q.c), EXIT.ok);
+    assert.doesNotMatch(q.text(), /approval hooks/, "--no-approval-hooks: they are not even offered");
+    assert.equal(sessionCmds(askedDir).length, 2);
+    assert.equal(approvalCmds(askedDir).length, 0);
+    const both = ctx(tmpdir(), { hookScript: stand() });
+    assert.equal(await main(["init", "--hooks", "--no-hooks"], both.c), EXIT.usage);
+    assert.match(both.errText(), /contradict/);
+  });
+
+  test("init --no-hooks leaves Claude Code alone; with no Claude directory and no Claude Code installed it says how to do it later and creates nothing", async () => {
+    const home = tmpdir();
+    const dir = claudeDir(home);
+    const a = ctx(home, { hookScript: stand(), ask: async () => assert.fail("--no-hooks must not ask") });
     assert.equal(await main(["init", "--no-hooks"], a.c), EXIT.ok);
     assert.equal(fs.existsSync(settings(dir)), false);
     const other = tmpdir();
     const b = ctx(other, { hookScript: stand() });
     assert.equal(await main(["init"], b.c), EXIT.ok);
-    assert.match(b.text(), /no Claude Code directory at .*claude hooks install|no Claude Code directory at .*hooks install/s);
+    assert.match(b.text(), /Claude Code is not installed here \(no claude on PATH\), so its hooks were not added; once you install it, run: claw-connector hooks install --approvals/);
     assert.equal(fs.existsSync(path.join(other, "claude-config")), false);
   });
 
@@ -592,7 +945,7 @@ describe("init and hooks: the Claude Code session hooks", () => {
     const dir = claudeDir(home);
     fs.writeFileSync(settings(dir), "{ not json");
     const a = ctx(home, { hookScript: stand() });
-    assert.equal(await main(["init"], a.c), EXIT.ok);
+    assert.equal(await main(["init", "--hooks"], a.c), EXIT.ok);
     assert.ok(fs.existsSync(path.join(home, "config", "agents.toml")));
     assert.match(a.errText(), /hooks: .*not valid JSON/);
     assert.equal(fs.readFileSync(settings(dir), "utf8"), "{ not json");
@@ -601,7 +954,7 @@ describe("init and hooks: the Claude Code session hooks", () => {
   test("a source checkout that was not built has no hook script: init says so and still succeeds", async () => {
     const home = tmpdir();
     claudeDir(home);
-    const a = ctx(home);
+    const a = ctx(home, { ask: async () => true });
     assert.equal(await main(["init"], a.c), EXIT.ok);
     assert.match(a.errText(), /terminal-hook\.js does not exist/);
   });
@@ -670,9 +1023,17 @@ describe("init and hooks: the Claude Code session hooks", () => {
     const j = ctx(home, { hookScript: stand() });
     assert.equal(await main(["hooks", "install"], j.c), EXIT.ok);
     assert.equal(hookCommands(dflt).length, 2);
-    // a directory that does not exist, not named explicitly, is not invented
+    // a directory that does not exist, not named explicitly, is not invented while Claude Code is not installed
     const k = ctx(tmpdir(), { hookScript: stand() });
     assert.equal(await main(["hooks", "install"], k.c), EXIT.failure);
-    assert.match(k.errText(), /no Claude Code directory .*--config-dir/);
+    assert.match(k.errText(), /no Claude Code directory .*Claude Code is not installed here .*--config-dir/);
+    assert.equal(fs.existsSync(path.join(k.c.env.CLAUDE_CONFIG_DIR!)), false);
+    // installed but never run (claude on PATH, no directory yet): made, with the hooks in it, as pair makes it
+    const bin = tmpdir("bin-");
+    fs.writeFileSync(path.join(bin, "claude"), "#!/bin/sh\n", { mode: 0o755 });
+    const fresh = tmpdir();
+    const m = ctx(fresh, { hookScript: stand(), env: { PATH: bin, CLAUDE_CONFIG_DIR: path.join(fresh, "claude-config") } });
+    assert.equal(await main(["hooks", "install"], m.c), EXIT.ok, m.errText());
+    assert.equal(hookCommands(path.join(fresh, "claude-config")).length, 2);
   });
 });

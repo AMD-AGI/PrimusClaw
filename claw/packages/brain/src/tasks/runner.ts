@@ -14,7 +14,7 @@ import {
   type RecreateHandsResult,
 } from "../agent/index.js";
 import type { TurnPool } from "../agent/agent-loop.js";
-import type { NatsEmitter } from "../events/emitter.js";
+import { EmitStoodDownError, type NatsEmitter } from "../events/emitter.js";
 import {
   HandsClient, isHandsNetworkError,
   type OutstandingReconciliation, type ReclaimCause,
@@ -23,14 +23,15 @@ import {
   syncWorkspaceToS3, syncWorkspaceFromS3, syncUploadsFromS3, archiveRunToS3, copyS3Prefix, syncLeftSnapshot,
   TRANSCRIPT_PREFIX,
 } from "../workspace/s3-uploader.js";
-import { invalidateSyncManifest } from "../workspace/sync-delta.js";
+import { invalidateSyncManifest, isRestoreHeldInProcess, releaseRestoreHold, withoutAddresses } from "../workspace/sync-delta.js";
 import { syncWorkspace, restoreWorkspace } from "../workspace/sync.js";
 import { SIGTERM_PROBE_TIMEOUT_SEC, gitReportKey, type GitReport } from "../workspace/git-dirs.js";
+import { cutDrainedCalls } from "../agent/drain-shield.js";
 import {
   workspaceSyncSemaphore,
   workspaceSigtermSyncSemaphore,
 } from "../workspace/sync-semaphore.js";
-import { isRetryable } from "../infra/retry.js";
+import { isRetryable, retryableNakMs } from "../infra/retry.js";
 import { unregisterSandbox, markHandsIdle } from "../sandbox/keepalive.js";
 import { attributionOf } from "../sandbox/attribution.js";
 import { markRetryPending } from "./retry-pending.js";
@@ -48,12 +49,14 @@ import {
   S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, S3_API_ENDPOINT,
   BRAIN_WORKSPACE_SNAPSHOT_ENABLED,
   RETRY_PENDING_KEEPALIVE_GRACE_SEC,
-  TASK_MAX_DELIVER, BRAIN_LAZY_SANDBOX,
+  TASK_MAX_DELIVER, BRAIN_LAZY_SANDBOX, BRAIN_SANDBOX_PRESTART,
   RUN_LEASE_HEARTBEAT_MS, RUN_LEASE_TTL_MS,
   LOCK_REFRESH_INTERVAL_MS,
   SANDBOX_HANDS_RESTART_ENABLED,
 } from "../config.js";
 import { ensureHands } from "../sandbox/ensure-hands.js";
+import { parseToolAllowlist } from "../tools/allowlist.js";
+import { allowsSandboxUse, isSandboxTool } from "../tools/hands.js";
 import { isMultiNodeRequest } from "../sandbox/multi-node/prompt-flags.js";
 import { applyReviewProfileBackstop, reviewTurnBudgetRefusal } from "../agent/review-profile.js";
 import { gpuWorkspaceFor } from "../sandbox/workspace-select.js";
@@ -68,7 +71,10 @@ import type { ContainerProbeVerdict, HandsProbeEntry } from "../sandbox/containe
 import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
-import { provisionTerminalOf, sandboxFailureOf, sandboxUnavailableOf } from "../sandbox/errors.js";
+import {
+  SANDBOX_CAPACITY_FAILURE_REASONS, SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf,
+  sandboxFailureOf, sandboxUnavailableOf,
+} from "../sandbox/errors.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
 import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
@@ -81,17 +87,18 @@ import {
   AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postAppFinishHandOver, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
-import { taskSubject, type RunTimeReport } from "@claw/protocol";
+import { taskSubject, type RunTimeReport, RUN_FAILURE_MESSAGE_FIELD, RUN_FAILURE_REASON_FIELD, WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_ID_FIELD, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD, type WorkspaceSaveFinishedEvent, type WorkspaceSaveOutcome } from "@claw/protocol";
 import { randomUUID } from "node:crypto";
 import { declareFinalReport } from "../delivery/doorbell-delivery.js";
 import { settleClaimedRun } from "../clients/run-claim.js";
 import { beginRun, endRun, phaseOf, runTimeOf } from "./run-phase.js";
 import { resolveRunIdentity, type RunIdentity, taskIdFromLease } from "./run-identity.js";
 import {
-  activeAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isUserCancelReason,
+  clearActiveAbort, markGracefulStop, LEASE_LOST_ABORT_REASON, SIGTERM_ABORT_REASON, isUserCancelReason,
   DEADLINE_EXCEEDED_ABORT_REASON, RUN_ROW_TERMINAL_ABORT_REASON,
 } from "./abort-registry.js";
-import { pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
+import { transientNatsErrorIn } from "../infra/nats-transient.js";
+import { lockPastSelfFence, pickRunScope, pickShellRun, refreshTaskLock, releaseTaskLock } from "./lock.js";
 import {
   redactEgressPayload, redactPersistedEvent, type RuntimeSecrets,
 } from "../events/redaction.js";
@@ -114,6 +121,13 @@ const sc = StringCodec();
  * step finishes, which is always written at once.
  */
 const SCRIPT_PROGRESS_REFRESH_MS = 5 * 60 * 1000;
+
+/**
+ * How often a run checks, locally, whether it has passed its lock's self-fence.
+ * Small against the refresh interval the fence keeps in hand, so the check's own
+ * granularity cannot eat that margin.
+ */
+export const SELF_FENCE_CHECK_MS = 1_000;
 
 /**
  * The v4 seal key, decoded once.
@@ -254,6 +268,135 @@ async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteReque
 }
 
 /**
+ * The record that a run's turn has already ended on the session.
+ *
+ * `exec_complete` goes out before the workspace is saved (see `finalizeSuccess`),
+ * and the API admits the session's next turn once it has the completion and the
+ * save's finish. A run that stops after its completion and before its ack -- a
+ * SIGTERM that outlasts the save, a pod lost, a lease lost -- is redelivered, and
+ * running that turn again would answer it twice and race the turn after it. So
+ * the completion is recorded first, with what the Backend handoff needs, and a
+ * redelivery that finds the record finishes the turn instead of running it
+ * (`finishEndedTurn`).
+ */
+export function endedTurnKey(sessionId: string, messageId: string): string {
+  return `turn-ended.${sessionId}.${messageId}`;
+}
+
+interface EndedTurn {
+  /** The completion as published (redacted), published again by a redelivery. */
+  completion?: Record<string, unknown>;
+  result: ExecuteResult;
+  run_time?: RunTimeReport;
+  /** The save announced on the completion, which the redelivery reports over. */
+  save_id?: string;
+}
+
+/**
+ * A delivery refused because its row is already terminal: if it is a run whose
+ * turn ended before its workspace save finished (the Brain saving was lost),
+ * report that save over, so the API lets the session's next message out of its
+ * queue now rather than when the hold runs out. Nothing is run or published
+ * besides; the row's ending was decided by whoever closed it.
+ */
+export async function settleEndedTurnOfGoneRow(request: ExecuteRequest): Promise<void> {
+  const sessionId = request.session_id;
+  const messageId = request.message_id || "";
+  if (!sessionId || !messageId) return;
+  const { kvCkpt, emitter } = getDeps();
+  const key = endedTurnKey(sessionId, messageId);
+  const entry = await kvCkpt.get(key);
+  if (!entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return;
+  let ended: EndedTurn | null = null;
+  try {
+    ended = JSON.parse(sc.decode(entry.value)) as EndedTurn;
+  } catch (err) {
+    logger.error({ err, sessionId, messageId }, "task.ended_turn_unreadable");
+  }
+  if (ended?.save_id) {
+    const finished: WorkspaceSaveFinishedEvent = {
+      type: WORKSPACE_SAVE_EVENT, phase: "finished", outcome: "failed",
+      reason: "run_stopped_during_save", save_id: ended.save_id, message_id: messageId,
+    };
+    await emitter.emit(sessionId, { ...finished });
+  }
+  await kvCkpt.delete(key).catch(() => {});
+  logger.warn({ sessionId, messageId, saveId: ended?.save_id }, "task.ended_turn_settled_on_gone_row");
+}
+
+/**
+ * Finish a turn whose completion an earlier delivery already published, without
+ * running it again: publish the completion again (the API skips a second one),
+ * report its save over, hand the result to Backend, ack.
+ *
+ * The save is not retried. It is reported `failed`, so the API stops holding the
+ * session's next message for it, and the files are where they were -- in the
+ * sandbox, for the next turn's save to upload.
+ */
+async function finishEndedTurn(
+  msg: JsMsg,
+  request: ExecuteRequest,
+  sessionId: string,
+  messageId: string,
+  lockKey: string,
+  run?: AbortController,
+): Promise<boolean> {
+  if (!messageId) return false;
+  const { kvCkpt, emitter } = getDeps();
+  const key = endedTurnKey(sessionId, messageId);
+  let entry;
+  try {
+    entry = await kvCkpt.get(key);
+  } catch (err) {
+    // Not knowing whether the turn already ended is not a reason to run it again.
+    logger.error({ err, sessionId, messageId }, "task.ended_turn_lookup_failed");
+    msg.nak(5_000);
+    clearActiveAbort(lockKey, run);
+    await fx().releaseTaskLock(lockKey, run).catch(() => {});
+    return true;
+  }
+  if (!entry || entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return false;
+  let ended: EndedTurn;
+  try {
+    ended = JSON.parse(sc.decode(entry.value)) as EndedTurn;
+  } catch (err) {
+    logger.error({ err, sessionId, messageId }, "task.ended_turn_unreadable");
+    await kvCkpt.delete(key).catch(() => {});
+    return false;
+  }
+  try {
+    // Again, in case the earlier delivery stopped between the record and the
+    // publish: the API handles one completion per turn and skips the rest.
+    if (ended.completion) await emitter.emit(sessionId, ended.completion);
+    if (ended.save_id) {
+      const finished: WorkspaceSaveFinishedEvent = {
+        type: WORKSPACE_SAVE_EVENT, phase: "finished", outcome: "failed",
+        reason: "run_stopped_during_save", save_id: ended.save_id, message_id: messageId,
+      };
+      await emitter.emit(sessionId, { ...finished }).catch((err: unknown) => {
+        logger.warn({ err, sessionId, messageId }, "task.ended_turn_save_event_failed");
+      });
+    }
+    await deliverAgentDone(kvCkpt, request, ended.result, ended.run_time);
+    await ackAndClearCallback(msg, kvCkpt, request);
+    await kvCkpt.delete(key).catch((err) => {
+      logger.warn({ err, sessionId, messageId }, "task.ended_turn_cleanup_failed");
+    });
+    logger.warn(
+      { sessionId, messageId, deliveryCount: msg.info.deliveryCount, saveId: ended.save_id },
+      "task.ended_turn_not_rerun",
+    );
+  } catch (err) {
+    logger.error({ err, sessionId, messageId }, "task.ended_turn_finish_failed");
+    msg.nak(5_000);
+  } finally {
+    clearActiveAbort(lockKey, run);
+    await fx().releaseTaskLock(lockKey, run).catch(() => {});
+  }
+  return true;
+}
+
+/**
  * Which row and which generation a completion is reporting for.
  *
  * The generation belongs to the delivery rather than to any one phase of it,
@@ -262,8 +405,13 @@ async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteReque
  * a completion carrying a generation the row never handed out would close a
  * row this run does not own.
  */
-function runIdentity(request: ExecuteRequest): ExecCompleteRunIdentity {
-  const runClaim = currentFatDelivery()?.runClaim;
+function runIdentity(request: ExecuteRequest, claimedGeneration?: number): ExecCompleteRunIdentity {
+  // A claimed doorbell holds the generation its claim minted, outside any fat
+  // delivery context. Carried so the API closes the row only while that claim
+  // is still the row's: a completion from a holder that stood down (a lost
+  // lease, the lock's self-fence) and was succeeded by another claim no longer
+  // matches, however late the event arrives.
+  const runClaim = currentFatDelivery()?.runClaim ?? claimedGeneration;
   // A fat payload published by an API that predates the field carries no
   // `task_id`, only the lease URL -- and the URL names the row, which is why
   // `resolveRunIdentity` already reads it. Without the same fallback here such
@@ -484,6 +632,8 @@ export interface TaskRunnerSideEffects {
   /** Publish a task message again, as a new message on the same subject. */
   republishTask: (subject: string, data: Uint8Array) => Promise<void>;
   refreshTaskLock: typeof refreshTaskLock;
+  /** Local, no I/O: whether this run must stop before another brain may take its lock. */
+  lockPastSelfFence: typeof lockPastSelfFence;
   releaseTaskLock: typeof releaseTaskLock;
   flushTranscript: typeof flushTranscript;
   /** Constructing the client is itself a seam: it opens an MCP transport. */
@@ -522,6 +672,7 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
     await getDeps().emitter.nc.jetstream().publish(subject, data);
   },
   refreshTaskLock,
+  lockPastSelfFence,
   releaseTaskLock,
   // Hoisted function declaration: the binding exists before this const runs.
   flushTranscript,
@@ -586,6 +737,17 @@ interface TaskCheckpoint extends CheckpointState {
  * the same entry when a run comes back. The three places that build this prefix
  * (here, workspace-reaper, admin-routes) have to agree; a drift is silent.
  */
+/**
+ * The stable `reason` a `workspace_sync_failed` or `workspace_restore_failed`
+ * event carries for an error: the two failures every workspace transfer meets
+ * named as such, anything else by its error class.
+ */
+function workspaceTransferFailureReason(e: unknown, errMsg: string): string {
+  if (isHandsNetworkError(e)) return "sandbox_unreachable";
+  if (/Payload Too Large|BODY_TOO_LARGE|413/i.test(errMsg)) return "payload_too_large";
+  return (e as { constructor?: { name?: string } })?.constructor?.name ?? "Error";
+}
+
 function checkpointKey(sessionId: string, messageId: string): string {
   // A trailing empty token is not a legal NATS subject, so a run with no
   // message id gets an explicit placeholder instead of `task-ckpt.<sid>.`.
@@ -606,13 +768,28 @@ function checkpointS3Prefix(userId: string, sessionId: string, messageId: string
  * e32c683c-9809-40c1-a1a7-0cee3565465b. Keep vendor request_id in the
  * surfaced text so support can still trace upstream incidents.
  */
-function classifyTaskFailure(rawMsg: string): {
+function classifyTaskFailure(rawMsg: string, err?: unknown): {
   reason: string;
   userText: string;
 } {
   const msg = String(rawMsg || "");
   const reqIdMatch = msg.match(/"request_id"\s*:\s*"(req_[A-Za-z0-9_]+)"/);
   const reqIdSuffix = reqIdMatch ? ` (vendor request_id: ${reqIdMatch[1]})` : "";
+
+  // Before every message pattern below: a NatsError's message is the bare word
+  // "TIMEOUT", which the timeout pattern would read as the model timing out.
+  // It is Claw's own event bus or lock store that did not answer, the model was
+  // never involved, and saying otherwise sends whoever reads the reason to the
+  // wrong system. Normally such an error is retried rather than reaching here;
+  // this is what a run that used up its retries on one says. Wrapped ones too:
+  // the sandbox layer's own sentence around a KV TIMEOUT reads "(TIMEOUT)" and
+  // would be filed as the model's by the pattern below.
+  if (transientNatsErrorIn(err)) {
+    return {
+      reason: "infra_transient",
+      userText: "Claw's internal messaging was briefly unavailable and the run could not continue. Please retry.",
+    };
+  }
 
   // First, because the sentence below mentions a deadline and would otherwise
   // be classified as an upstream timeout -- telling the user to retry a run
@@ -674,6 +851,9 @@ function classifyRetryableReason(err: unknown): string {
   const msg = String(e?.message || err || "");
   const causeMsg = String(e?.cause?.message || "");
   const causeCode = String(e?.cause?.code || "");
+  // First, for the reason classifyTaskFailure gives: "TIMEOUT" is a NatsError's
+  // whole message, and the line below would file it as the model's.
+  if (transientNatsErrorIn(err)) return "nats_transient";
   if (e?.name === "APIConnectionTimeoutError" || /timeout|deadline/i.test(msg)) return "llm_connection_timeout";
   if (e?.name === "APIConnectionError" || /connection error|fetch failed/i.test(msg)) return "llm_connection_error";
   if (typeof e?.status === "number") return `http_${e.status}`;
@@ -860,6 +1040,7 @@ async function replayPendingCallback(
   msg: JsMsg,
   request: ExecuteRequest,
   lockKey: string,
+  run?: AbortController,
 ): Promise<boolean> {
   if (!request.task_id) return false;
   const { kvCkpt } = getDeps();
@@ -870,15 +1051,39 @@ async function replayPendingCallback(
   } catch (err) {
     logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_lookup_failed");
     msg.nak(5_000);
-    activeAbort.delete(lockKey);
-    await fx().releaseTaskLock(lockKey).catch(() => {});
+    clearActiveAbort(lockKey, run);
+    await fx().releaseTaskLock(lockKey, run).catch(() => {});
     return true;
   }
   if (!entry) return false;
 
+  // A cleared outbox is no pending callback. NATS KV answers a key deleted by
+  // ackAndClearCallback with its delete marker (operation DEL/PURGE, empty
+  // value) rather than null, and the marker stays until the bucket's TTL. It
+  // says an earlier execution of this task_id delivered its callback, not that
+  // this delivery's did: a script task that returned wait_external is put back
+  // to queued and published again under the same task_id to run from step 0,
+  // and an app run's finish is handed to a new Brain the same way. Either is a
+  // fresh execution, exactly as when the key was never written.
+  if (entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return false;
+
+  let stored: ExecuteResult & { run_time?: RunTimeReport };
   try {
-    const { run_time: runTime, ...result } = JSON.parse(sc.decode(entry.value)) as
-      ExecuteResult & { run_time?: RunTimeReport };
+    stored = JSON.parse(sc.decode(entry.value)) as ExecuteResult & { run_time?: RunTimeReport };
+  } catch (err) {
+    // deliverAgentDone writes only JSON, so this entry holds no result that can
+    // be replayed, and retrying cannot make it parse. Drop it and run this
+    // delivery as if nothing was pending, rather than failing every delivery
+    // until the message is poisoned.
+    logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_unreadable");
+    await kvCkpt.delete(key).catch((e) => {
+      logger.warn({ err: e, taskId: request.task_id }, "task.agent_done_outbox_cleanup_failed");
+    });
+    return false;
+  }
+
+  try {
+    const { run_time: runTime, ...result } = stored;
     await fx().postAgentDone(request, result, runTime);
     await ackAndClearCallback(msg, kvCkpt, request);
     logger.info({ taskId: request.task_id }, "task.agent_done_replayed");
@@ -886,8 +1091,8 @@ async function replayPendingCallback(
     logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_failed");
     msg.nak(5_000);
   } finally {
-    activeAbort.delete(lockKey);
-    await fx().releaseTaskLock(lockKey).catch(() => {});
+    clearActiveAbort(lockKey, run);
+    await fx().releaseTaskLock(lockKey, run).catch(() => {});
   }
   return true;
 }
@@ -966,8 +1171,8 @@ async function maybeRunSandboxlessTask(
   } finally {
     // Drop the in-process abort handle and release the per-task lock so
     // the next DAG step (or unrelated task) can be picked up immediately.
-    activeAbort.delete(lockKey);
-    await fx().releaseTaskLock(lockKey).catch(() => {});
+    clearActiveAbort(lockKey, abortCtrl);
+    await fx().releaseTaskLock(lockKey, abortCtrl).catch(() => {});
   }
   return true;
 }
@@ -987,10 +1192,11 @@ export async function refuseUnsupportedMode(
   request: ExecuteRequest,
   sessionId: string,
   lockKey: string,
+  run?: AbortController,
 ): Promise<boolean> {
   if (request.mode === undefined || request.mode === "llm" || request.mode === "script" || request.mode === "app") return false;
   logger.error({ sessionId, taskId: request.task_id, mode: request.mode }, "task.mode_not_implemented");
-  await refuseBeforeRun(msg, request, lockKey, unsupportedModeReason(request.mode));
+  await refuseBeforeRun(msg, request, lockKey, unsupportedModeReason(request.mode), run);
   return true;
 }
 
@@ -1004,16 +1210,19 @@ export async function refuseReviewWithoutTurnBudget(
   request: ExecuteRequest,
   sessionId: string,
   lockKey: string,
+  run?: AbortController,
 ): Promise<boolean> {
   const why = reviewTurnBudgetRefusal(request);
   if (why === null) return false;
   logger.error({ sessionId, taskId: request.task_id, maxTurns: request.max_turns ?? null }, "task.review_without_turn_budget_refused");
-  await refuseBeforeRun(msg, request, lockKey, why);
+  await refuseBeforeRun(msg, request, lockKey, why, run);
   return true;
 }
 
 /** Fail a task that is not to run at all, with the reason, and let go of it. */
-async function refuseBeforeRun(msg: JsMsg, request: ExecuteRequest, lockKey: string, failureReason: string): Promise<void> {
+async function refuseBeforeRun(
+  msg: JsMsg, request: ExecuteRequest, lockKey: string, failureReason: string, run?: AbortController,
+): Promise<void> {
   const { kvCkpt } = getDeps();
   try {
     await deliverAgentDone(kvCkpt, request, {
@@ -1037,8 +1246,8 @@ async function refuseBeforeRun(msg: JsMsg, request: ExecuteRequest, lockKey: str
       throw err;
     }
   } finally {
-    activeAbort.delete(lockKey);
-    await fx().releaseTaskLock(lockKey).catch(() => {});
+    clearActiveAbort(lockKey, run);
+    await fx().releaseTaskLock(lockKey, run).catch(() => {});
   }
 }
 
@@ -1062,6 +1271,46 @@ type PostTaskParkOutcome = RunEndedParkOutcome | "no_sandbox";
  * back in `run_claim` beside this token rather than folding it in here.
  */
 export type RunClaim = { claimCount: number } | null;
+
+/**
+ * Whether a run that opens its sandbox lazily starts opening it as soon as it
+ * starts (`ExecuteRequest.sandbox_prestart`): only when the API asked for it, the
+ * deployment allows it, and the run's tool list leaves it a tool that can reach a
+ * sandbox -- a run cut to MCP tools has nothing that would use one. Exported for
+ * its test; `enabled` is BRAIN_SANDBOX_PRESTART.
+ */
+export function wantsSandboxPrestart(
+  request: ExecuteRequest,
+  enabled: boolean = BRAIN_SANDBOX_PRESTART,
+): boolean {
+  if (!enabled || request.sandbox_prestart !== true) return false;
+  const allowlist = parseToolAllowlist(request.tools_allowlist);
+  return !allowlist || allowsSandboxUse((name) => allowlist.allows(name));
+}
+
+/**
+ * Whether the attempts a checkpoint records had a sandbox to lose: a workspace
+ * sync was taken, or a tool that only runs in a sandbox -- a sandbox tool, a
+ * sub-agent (`task`, which runs on its parent's sandbox) or `deliver_file` --
+ * succeeded. Exported for its test.
+ *
+ * Successes, not attempts, when the checkpoint says which: a call whose sandbox
+ * could not be opened is still counted as an attempt, and an account the platform
+ * refuses a sandbox records one for every such call -- which is exactly the run
+ * that must not be made to open one before it can continue. A checkpoint written
+ * before successes were recorded has only the attempts, and is read by them.
+ */
+export function checkpointUsedSandbox(
+  ckpt: Pick<CheckpointState, "tool_calls_by_name" | "tool_ok_by_name"> & { has_workspace_sync?: boolean },
+): boolean {
+  if (ckpt.has_workspace_sync) return true;
+  const counts = ckpt.tool_ok_by_name ?? ckpt.tool_calls_by_name ?? {};
+  return Object.entries(counts).some(([name, n]) =>
+    (n ?? 0) > 0 && (isSandboxTool(name) || name === "task" || name === "deliver_file"));
+}
+
+/** Why a prestarted open was given up: the run ended without anything asking for its sandbox. */
+const PRESTART_UNUSED_REASON = new Error("sandbox_prestart_unused");
 
 class TaskRunner {
   // Injected singletons (bound once via bindTaskRunnerDeps in main()).
@@ -1126,6 +1375,7 @@ class TaskRunner {
   private readonly transcriptStartedAt: number;
 
   private keepAlive!: ReturnType<typeof setInterval>;
+  private selfFence?: ReturnType<typeof setInterval>;
   private cancelDeadline: () => void = () => {};
   private readonly transcriptLog: Array<Record<string, unknown>> = [];
 
@@ -1288,7 +1538,39 @@ class TaskRunner {
   // Read from KV before any provisioning and consumed by the sandbox attach,
   // which may happen much later than the read on a deferred run.
   private pendingResumeCkpt: TaskCheckpoint | null = null;
+  /**
+   * The checkpointed conversation went to the engine before any sandbox was
+   * opened (`resumeWithoutSandbox`). A sandbox opened later in the run restores
+   * /workspace as any resume does, but the conversation is the engine's by then,
+   * so `resolveResumeState` neither replaces it nor adds to it.
+   */
+  private resumeHandedOver = false;
   private handsAttach: Promise<HandsClient> | null = null;
+  /**
+   * Whether anything in this run has asked for its sandbox: the up-front open, or
+   * a tool, a sub-agent or the engine's own setup through `attachHands`.
+   *
+   * Separate from whether a sandbox is open, because a prestarted one
+   * (`prestartSandbox`) is open before anything asks, and may never be asked for.
+   * Until it is, it holds nothing of this run's -- no file the run wrote, no shell
+   * it started -- so every path that saves or stops the run's work in its sandbox
+   * reads `workHands()`, which is null until this is set, and finds what a lazy
+   * run that never opened one finds.
+   */
+  private sandboxClaimed = false;
+  /**
+   * The main agent has said this run's turn is over (`ResultMessage`). A run the
+   * user stops before that says it itself (`handleUserInterrupt`): the session's
+   * stream forwards no `exec_complete`, so without it a client following the
+   * stream never sees the turn end.
+   */
+  private turnEndAnnounced = false;
+  /**
+   * The open started ahead of the first tool call, while it may still be the
+   * run's only open: its abort, which gives that open up, and its settlement,
+   * which never rejects. See `prestartSandbox` and `retireUnclaimedPrestart`.
+   */
+  private prestart: { abort: AbortController; settled: Promise<void> } | null = null;
   /**
    * Why this run cannot have a sandbox, once opening one has ended on one of
    * SANDBOX_UNAVAILABLE_REASONS. Every later attempt to open it is refused with
@@ -1372,14 +1654,18 @@ class TaskRunner {
     this.platformKey = request.platform_key || "";
   }
 
-  private readonly onEvent = async (evt: Record<string, unknown>): Promise<void> => {
+  private readonly onEvent = async (
+    evt: Record<string, unknown>, opts: { stillMine?: () => boolean } = {},
+  ): Promise<void> => {
     const safeEvent = redactPersistedEvent(
       evt,
       runtimeSecrets(this.request, this.platformKey),
     );
     if (this.messageId) safeEvent.message_id = this.messageId;
+    if (evt.type === "ResultMessage" && !evt.subagent_id) this.turnEndAnnounced = true;
     this.transcriptLog.push({ ts: Date.now(), ...safeEvent });
-    await this.emitter.emit(this.sessionId, safeEvent);
+    if (opts.stillMine) await this.emitter.emit(this.sessionId, safeEvent, { stillMine: opts.stillMine });
+    else await this.emitter.emit(this.sessionId, safeEvent);
   };
 
   /**
@@ -1520,6 +1806,26 @@ class TaskRunner {
     }
   };
 
+  /**
+   * Persist a turn caught part-way through its tool calls (`PendingTurn`).
+   *
+   * Not skipped once the run is aborted, unlike `onCheckpoint`: a call that
+   * finished just as a drain began is the one a resumed run must be told
+   * about, or it asks the model again and the call is made twice. Skipped
+   * only once the run has settled (`taskFinished`), which is also what keeps
+   * it from landing under the SIGTERM path's own write: that path latches
+   * the flag before it reads `latestCheckpointState`, and so persists this
+   * state itself. No workspace sync: the boundary checkpoint schedules those.
+   */
+  private readonly onTurnJournal = async (state: CheckpointState): Promise<void> => {
+    if (this.taskFinished) return;
+    this.latestCheckpointState = state;
+    const written = await this.writeKvCheckpoint(state, this.currentWorkspaceInfo());
+    if (!written) {
+      throw new Error(`turn journal KV write failed at turn ${state.turns_completed}`);
+    }
+  };
+
   private readonly onCheckpoint = async (state: CheckpointState): Promise<void> => {
     if (this.abortCtrl.signal.aborted || this.taskFinished) {
       logger.debug(
@@ -1558,19 +1864,23 @@ class TaskRunner {
     // the normal-priority semaphore so a burst across sessions cannot
     // saturate shared-filesystem IO.
     const now = Date.now();
+    const workHands = this.workHands();
     if (
       WORKSPACE_PERSIST_BASE
       && this.userIdHex
-      && this.hands
+      && workHands
       && !this.pendingSync
       && now - this.lastSyncAt > WORKSPACE_SYNC_INTERVAL_MS
     ) {
       this.lastSyncAt = now;
-      const frozenHands = this.hands;
+      const frozenHands = workHands;
       const frozenUidHex = this.userIdHex;
       const turnSnapshot = state.turns_completed;
       this.pendingSync = workspaceSyncSemaphore
-        .run(() => fx().syncWorkspace(frozenHands, this.sessionId, frozenUidHex, turnSnapshot))
+        .run(async () => {
+          this.refuseSharedSyncIfHeld(frozenHands);
+          return fx().syncWorkspace(frozenHands, this.sessionId, frozenUidHex, turnSnapshot);
+        })
         .then(async (info) => {
           if (this.taskFinished || this.abortCtrl.signal.aborted) return info;
           this.lastSyncedTurn = turnSnapshot;
@@ -1909,11 +2219,12 @@ class TaskRunner {
     // most recent file state that exists anywhere, so it has to be promoted
     // first. No-ops when no snapshot was ever written.
     await this.recoverInflightCheckpoint("sandbox_rebuild");
+    // A new sandbox, whatever address it was given: a hold this process kept for
+    // an earlier one at that address is not this one's (see resolveResumeState).
+    releaseRestoreHold(newHands, this.sessionId);
     // Always rehydrate after a rebuild: the new sandbox is empty regardless
     // of whether ensureHands reused a (concurrently-revived) KV entry.
-    try { await fx().syncWorkspaceFromS3(newHands, this.sessionId, this.request.user_id || "default"); } catch (e) {
-      logger.warn({ err: e, sessionId: this.sessionId }, "s3.restore_failed_after_rebuild");
-    }
+    await this.restoreWorkspaceFromS3(newHands, this.request.user_id || "default", "after_rebuild");
     this.handsUrl = newUrl;
     this.handsToken = newToken;
     this.handsIdentity = newIdentity ?? null;
@@ -2458,12 +2769,13 @@ class TaskRunner {
     // DAG shells end with the node; conversation shells survive turns and cancellations.
     const isDagNode = !!(this.request.dag_root_task_id || this.request.dag_node_id);
     const reason: ReclaimCause | null = cause ?? (isDagNode ? "dag_node_terminal" : null);
-    if (this.shellsReaped || !reason || !this.hands) return;
+    const hands = this.workHands();
+    if (this.shellsReaped || !reason || !hands) return;
     // Names the operation this reap belongs to, so every shell it ends is
     // attributable to one decision rather than to a class of them.
     const reclaimOp = `${this.request.task_id ?? this.sessionId}:${reason}`;
     try {
-      const report = await this.hands.reapShells(reason, reclaimOp);
+      const report = await hands.reapShells(reason, reclaimOp);
       this.shellsReaped = true;
       if (report.shells.length > 0) {
         // `surviving` is the honest half: a shell that ignored both signals is
@@ -2495,18 +2807,58 @@ class TaskRunner {
   /**
    * A sandbox is provisioned before the first turn only when the run is about
    * the sandbox: script mode drives a fixed tool sequence with no model in
-   * between, a multi-node run exists to get its cluster, and a resumed run
-   * needs its /workspace rehydrated before the model sees a single message.
-   * Every other run — the ordinary chat turn — gets one the first time a tool
-   * actually asks, which for a question answered from the conversation alone
-   * never happens. That is the difference between a 20-second pod start on
-   * every "what did we decide yesterday?" and none at all.
+   * between, a multi-node run exists to get its cluster, and a resumed run whose
+   * earlier attempts used a sandbox needs its /workspace back before the model
+   * reads its own history. Every other run — the ordinary chat turn, and a
+   * resumed run that never used one — gets one the first time a tool actually
+   * asks, which for a question answered from the conversation alone never
+   * happens. That is the difference between a 20-second pod start on every
+   * "what did we decide yesterday?" and none at all.
+   *
+   * A resumed run that never used a sandbox used to open one here anyway, and an
+   * account the platform refuses a sandbox then lost a run that had never needed
+   * one: a 30-turn research task, taken over after a rollout, failed on its first
+   * step with "You do not have a CPU sandbox workspace yet".
    */
   private needsSandboxUpFront(ckpt: TaskCheckpoint | null): boolean {
     if (!BRAIN_LAZY_SANDBOX) return true;
     if (this.request.mode === "script") return true;
     if (isMultiNodeRequest(this.request)) return true;
-    return ckpt !== null;
+    return ckpt !== null && checkpointUsedSandbox(ckpt);
+  }
+
+  /**
+   * Whether a resumed run whose up-front open failed with `err` can carry on
+   * without a sandbox instead of failing: only when the open was up front for
+   * the resume alone (not a script or a cluster, which are nothing without it),
+   * and only when the platform has said it has no sandbox for this run
+   * (SANDBOX_UNAVAILABLE_REASONS). The tools that need one are then told why,
+   * as on any lazy run, and the model carries on with the rest.
+   */
+  private mayResumeWithoutSandbox(err: unknown): boolean {
+    return BRAIN_LAZY_SANDBOX
+      && this.pendingResumeCkpt !== null
+      && this.request.mode !== "script"
+      && !isMultiNodeRequest(this.request)
+      && sandboxUnavailableOf(err) !== null;
+  }
+
+  /**
+   * Hand a resumed run's checkpointed conversation to the engine without
+   * opening a sandbox. The attach would have done this in `resolveResumeState`;
+   * on a run that opens none it has to happen here, or the run starts over from
+   * the user's message and its earlier turns are lost.
+   */
+  private resumeWithoutSandbox(): void {
+    const ckpt = this.pendingResumeCkpt;
+    if (!ckpt || this.resumeCheckpoint) return;
+    this.resumeCheckpoint = ckpt;
+    this.resumeHandedOver = true;
+    logger.info(
+      { sessionId: this.sessionId, messageId: this.messageId, turns: ckpt.turns_completed,
+        has_workspace_sync: ckpt.has_workspace_sync },
+      "task.resume.without_sandbox",
+    );
   }
 
   /**
@@ -2516,9 +2868,9 @@ class TaskRunner {
    * left unset rather than blanked, so attachHands can fill it in later
    * without the two writes fighting (internal-tasks COALESCEs).
    */
-  private async startWithoutSandbox(): Promise<void> {
+  private async startWithoutSandbox(prestarting = false): Promise<void> {
     logger.info(
-      { sessionId: this.sessionId, messageId: this.messageId },
+      { sessionId: this.sessionId, messageId: this.messageId, prestarting },
       "task.sandbox_deferred",
     );
     await this.onEvent({ type: "statusUpdate", agentStatus: "running" });
@@ -2528,11 +2880,14 @@ class TaskRunner {
     // never be. Said explicitly so the two can be distinguished: `deferred`
     // is followed by `ready` if and when a tool asks for one, and by nothing
     // at all for a turn that only talks.
+    // A prestarted run says so, because what follows `deferred` differs: `ready`
+    // once the sandbox is up, whether or not a tool ever asks for it.
     await this.onEvent({
       type: "sandboxStatus",
       status: "deferred",
-      reason: "no_tool_called_yet",
-      message: "this turn has not opened a sandbox; one opens on the first tool call",
+      ...(prestarting
+        ? { reason: "opening_ahead", message: "this turn is opening a sandbox beside its first model call" }
+        : { reason: "no_tool_called_yet", message: "this turn has not opened a sandbox; one opens on the first tool call" }),
       message_id: this.messageId,
     }).catch(() => { /* a status event must not fail the run */ });
     await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
@@ -2548,6 +2903,16 @@ class TaskRunner {
    * (SANDBOX_UNAVAILABLE_REASONS), which is: see `sandboxUnavailable`.
    */
   private readonly attachHands = (): Promise<HandsClient> => {
+    this.sandboxClaimed = true;
+    return this.openOnce();
+  };
+
+  /**
+   * The open behind `attachHands`, shared with `prestartSandbox`, which opens the
+   * sandbox without asking for it. `prestart` is passed only by that one: it can
+   * give the open up, and is never fired once anything has asked.
+   */
+  private openOnce(prestart?: AbortController): Promise<HandsClient> {
     if (this.sandboxUnavailable) return Promise.reject(this.sandboxUnavailable);
     // The in-flight attach is consulted before the assigned client, because
     // openSandbox assigns `this.hands` and only then restores /workspace from
@@ -2559,14 +2924,123 @@ class TaskRunner {
     // cached and how a rebuild is not undone: `recreateHands` replaces
     // `this.hands` without coming through here, so a retained promise would keep
     // handing out the sandbox the rebuild has already destroyed.
-    this.handsAttach = this.openSandbox().catch(async (err: unknown) => {
+    this.handsAttach = this.openSandbox(prestart).catch(async (err: unknown) => {
       await this.settleUnavailableOpen(err);
       throw err;
     }).finally(() => {
       this.handsAttach = null;
     });
     return this.handsAttach;
-  };
+  }
+
+  /**
+   * The sandbox as this run's own work sees it: null until something in the run
+   * has asked for it (`sandboxClaimed`). A sandbox opened ahead of time and never
+   * used holds none of the run's files or shells, so the paths that save or stop
+   * them -- the workspace syncs and the shell reap -- skip it, as they skip a lazy
+   * run that opened none. The release at the end still finds it, through the
+   * identity the open recorded, and parks it like any other.
+   */
+  private workHands(): HandsClient | null {
+    return this.sandboxClaimed ? this.hands : null;
+  }
+
+  /**
+   * Why this run ended without the sandbox it asked for, when it did: a tool asked
+   * for one, the platform had no capacity for it (SANDBOX_CAPACITY_FAILURE_REASONS:
+   * no node took the pod, the wait for capacity ran out, it never became ready)
+   * and none was opened after. The model was told and wrote its answer
+   * without one, so the turn ends as usual; but none of the work that needed the
+   * sandbox ran, and the run is recorded as failed for that reason, with the
+   * platform's account of it, so a caller reading the run sees why rather than a
+   * clean ending with no exit code.
+   *
+   * A prestarted open that failed with nothing asking for it is not this: the run
+   * never needed the sandbox. Nor is an account the platform refuses a sandbox to:
+   * such a run carries on without one by design.
+   */
+  private provisionFailure(): { reason: string; message: string } | null {
+    if (!this.sandboxClaimed || this.hands || !this.sandboxUnavailable) return null;
+    const terminal = sandboxUnavailableOf(this.sandboxUnavailable);
+    if (!terminal || !SANDBOX_CAPACITY_FAILURE_REASONS.has(terminal.reason)) return null;
+    return { reason: terminal.reason, message: String(terminal.message ?? "").slice(0, 2000) };
+  }
+
+  /**
+   * Start opening the sandbox now, beside the first model call, rather than on the
+   * first tool call that asks for it.
+   *
+   * Only for a run the API marked as one that will use it (`wantsSandboxPrestart`)
+   * and that would otherwise open it lazily: an up-front run has opened it already.
+   * It is the same open a tool would start -- the one `attachHands` hands out -- so
+   * a tool that asks while it is in flight waits for it rather than starting a
+   * second, and a failure is not cached: it is logged here, and the next tool that
+   * asks gets a fresh attempt, exactly as after a tool's own failed open. A failure
+   * that says the platform has no sandbox for this run is latched as always
+   * (`settleUnavailableOpen`), and the tools that ask later are told that.
+   *
+   * A run that ends without asking gives it back in `retireUnclaimedPrestart`.
+   */
+  private prestartSandbox(): void {
+    const abort = new AbortController();
+    logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "task.sandbox_prestart");
+    const settled = this.openOnce(abort).then(
+      () => undefined,
+      (err: unknown) => {
+        logger.warn(
+          { err: (err as Error)?.message ?? String(err), sessionId: this.sessionId,
+            messageId: this.messageId, claimed: this.sandboxClaimed },
+          "task.sandbox_prestart_failed",
+        );
+      },
+    );
+    this.prestart = { abort, settled };
+  }
+
+  /**
+   * Settle a prestarted open that nothing in the run asked for, before the run's
+   * ending reads any sandbox state.
+   *
+   * Called once the engine has returned or thrown, so nothing will ask any more.
+   * A run whose engine did ask has an ordinary attached sandbox and nothing here
+   * applies. Otherwise the open is given up where it can be -- the wait for the
+   * workload to be scheduled and become ready, and a reuse probe -- and waited for
+   * where it cannot, so the run's ending sees one of two states and never a third
+   * in which a sandbox comes up after it:
+   *
+   *   - the open finished: the sandbox is this run's, with nothing of the run's in
+   *     it. The release parks it for the session's next message, as it parks any
+   *     run's, and the idle reclaim ends it if no message comes.
+   *   - the open did not: the workload it was creating has been stopped (the wait
+   *     reclaims what it created when it is given up), and its PENDING entry is
+   *     reaped here -- the same reap a failed run makes, gated the same way.
+   *
+   * An abort of the run itself (a cancel, a restart, a successor taking over, a
+   * deadline) has already reached the open through its signal, with the reclaim
+   * rule that abort carries, so the open is only waited for then: a restart's
+   * PENDING workload is the successor's to adopt, not this run's to reap.
+   *
+   * Never throws: it runs ahead of the run's own ending, which must not be
+   * replaced by a failure to clean up after a sandbox the run never used.
+   */
+  private async retireUnclaimedPrestart(): Promise<void> {
+    const prestart = this.prestart;
+    if (!prestart || this.sandboxClaimed) return;
+    this.prestart = null;
+    try {
+      const runAborted = this.abortCtrl.signal.aborted;
+      if (!runAborted) prestart.abort.abort(PRESTART_UNUSED_REASON);
+      await prestart.settled;
+      logger.info(
+        { sessionId: this.sessionId, messageId: this.messageId, opened: this.hands !== null,
+          workloadId: this.handsWorkloadId, runAborted },
+        "task.sandbox_prestart_unused",
+      );
+      if (!this.hands && !runAborted) await this.reapOwnPendingHands();
+    } catch (e) {
+      logger.warn({ err: e, sessionId: this.sessionId }, "task.sandbox_prestart_retire_failed");
+    }
+  }
 
   /**
    * An open that ended because the platform cannot give this run a sandbox: stop
@@ -2606,7 +3080,7 @@ class TaskRunner {
     }
   }
 
-  private async openSandbox(): Promise<HandsClient> {
+  private async openSandbox(prestart?: AbortController): Promise<HandsClient> {
     // Multi-node: provision the GPU cluster before the Hands sandbox, via
     // whichever mechanism the deploy mode dictates (see multi-node/factory.ts).
     if (isMultiNodeRequest(this.request) && !this.multiNodeContext) {
@@ -2638,9 +3112,14 @@ class TaskRunner {
     // `runRebuild` sets it too, which is now the same statement rather than a
     // deliberate re-stamp.
     this.sandboxAsked = true;
+    // A prestarted open can also be given up on its own (`retireUnclaimedPrestart`).
+    // The run's signal carries no abort reason then, which `abortReclaimsSandbox`
+    // reads as a cancel: what the wait was creating is reclaimed while the run still
+    // holds its lock, since nobody else will adopt a sandbox the run never used.
     const { handsUrl, created, token: handsToken, identity } = await fx().ensureHands(
       this.sessionId, this.request, this.platformKey, this.onEvent, this.multiNodeContext ?? undefined,
-      { signal: this.abortCtrl.signal, reclaimOnAbort: () => this.abortReclaimsSandbox(),
+      { signal: prestart ? AbortSignal.any([this.abortCtrl.signal, prestart.signal]) : this.abortCtrl.signal,
+        reclaimOnAbort: () => this.abortReclaimsSandbox(),
         attemptId: this.attempt.attemptId },
     );
     logger.info({ sessionId: this.sessionId, messageId: this.messageId, created, handsUrl }, "task.sandbox_ready");
@@ -2787,6 +3266,70 @@ class TaskRunner {
   }
 
   /**
+   * Refuse the shared-filesystem snapshot of a sandbox whose restore failed.
+   *
+   * That snapshot is what the next sandbox of the session is filled from, by a
+   * restore that succeeds and so leaves the new sandbox unheld: an incomplete
+   * /workspace written there would come back as a whole one, and that sandbox's
+   * S3 saves would prune what it lacks. Refused, the snapshot stays the last one
+   * a whole workspace wrote (or none, and the next sandbox restores from S3); a
+   * SIGTERM falls back to the S3 save, which a held sandbox makes add-only.
+   *
+   * This is this process's note; the sandbox's own note is checked by the sync
+   * command itself (`restoreHeldGuard` in workspace/sync.ts), so a check that
+   * could not be asked cannot let the snapshot through.
+   */
+  private refuseSharedSyncIfHeld(hands: HandsClient): void {
+    if (isRestoreHeldInProcess(hands, this.sessionId)) {
+      throw new Error("workspace_sync_held: this sandbox's restore failed, so its /workspace is not the session's");
+    }
+  }
+
+  /**
+   * Fill a new sandbox's /workspace from the session's S3 prefix, and say so
+   * when it could not be filled.
+   *
+   * A failure does not end the run: the turn goes on in the workspace it has.
+   * But it is not silent either. The user is told, as a `sandboxStatus`
+   * `workspace_restore_failed` event, that /workspace is missing files the
+   * session saved; and `syncWorkspaceFromS3` has already held the sandbox, so
+   * the saves that follow keep every saved file instead of deleting the ones the
+   * restore did not bring back, or replacing them with what the new sandbox
+   * started with (`holdAfterFailedRestore`). Never throws.
+   */
+  private async restoreWorkspaceFromS3(
+    hands: HandsClient, userId: string, site: "new_sandbox" | "resume_fallback" | "after_rebuild",
+  ): Promise<void> {
+    logger.info({ sessionId: this.sessionId, site }, "s3.restore_start");
+    try {
+      await fx().syncWorkspaceFromS3(hands, this.sessionId, userId);
+      metrics.onWorkspaceRestore("ok");
+      logger.info({ sessionId: this.sessionId, site }, "s3.restore_done");
+    } catch (e) {
+      const errMsg = (e as { message?: string })?.message
+        ? String((e as { message: string }).message).slice(0, 500)
+        : String(e);
+      const reason = workspaceTransferFailureReason(e, errMsg);
+      // The user is told what went wrong, never where: a sandbox's address is
+      // internal and a presigned URL is a credential.
+      const shown = withoutAddresses(errMsg);
+      metrics.onWorkspaceRestore("failed");
+      logger.warn({ err: e, sessionId: this.sessionId, site, reason }, "s3.restore_failed");
+      await this.onEvent({
+        type: "sandboxStatus",
+        status: "workspace_restore_failed",
+        reason,
+        message: "The saved workspace could not be restored, so /workspace is missing files this session saved "
+          + `(${shown}). The saved copy is kept as it was: saves from this sandbox add new files to it `
+          + "and do not delete or replace any.",
+        message_id: this.messageId,
+      }).catch((err: unknown) => {
+        logger.warn({ err, sessionId: this.sessionId }, "s3.restore_failed_event_failed");
+      });
+    }
+  }
+
+  /**
    * Plan Y v2 resume path has three modes (checkpoint-architecture-redesign
    * §5.6): sandbox_reuse (ensureHands returned created=false — KV hit +
    * /health pass — so /workspace is already intact), workspace_restore
@@ -2812,16 +3355,20 @@ class TaskRunner {
         + `continue from step ${ckpt.script.step}; its earlier steps' work went with the sandbox`,
       );
     }
+    // A sandbox just created starts with nothing held, whatever address it was
+    // given: pod IPs are reused, and a hold this process kept for an earlier
+    // sandbox of this session at the same address is not this one's. Released
+    // here, after the one way out above that restores nothing, and before every
+    // route below -- each of which restores into the new sandbox, the
+    // shared-filesystem one included, which never reaches the S3 restore's own
+    // release -- so the sandbox is held again exactly when its own restore fails.
+    if (created && this.hands) releaseRestoreHold(this.hands, this.sessionId);
     if (!ckpt) {
       // No prior progress: still run S3 baseline restore for new sandboxes
       // so any pre-Plan-Y persisted workspace materializes back into
       // /workspace (legacy chat sessions, dev mode).
       if (created) {
-        logger.info({ sessionId: this.sessionId }, "s3.restore_start");
-        try { await fx().syncWorkspaceFromS3(this.hands!, this.sessionId, this.userId); } catch (e) {
-          logger.warn({ err: e, sessionId: this.sessionId }, "s3.restore_failed");
-        }
-        logger.info({ sessionId: this.sessionId }, "s3.restore_done");
+        await this.restoreWorkspaceFromS3(this.hands!, this.userId, "new_sandbox");
       }
       this.resumeMode = "skip_no_ckpt";
     } else if (!created) {
@@ -2829,7 +3376,7 @@ class TaskRunner {
       // is already in place from the live sandbox itself. Most common
       // resume path under normal SIGTERM redelivery (≤ 10 min ack_wait,
       // sandbox idle GC at ~15 min).
-      this.resumeCheckpoint = ckpt;
+      if (!this.resumeHandedOver) this.resumeCheckpoint = ckpt;
       this.resumeMode = "sandbox_reuse";
       logger.info(
         { sessionId: this.sessionId, turns: ckpt.turns_completed,
@@ -2841,7 +3388,7 @@ class TaskRunner {
       // safe when we have a hex user id AND the prior brain marked
       // has_workspace_sync). Fall through to S3 baseline restore on any
       // failure so the user still gets the best workspace we have.
-      this.resumeCheckpoint = ckpt;
+      if (!this.resumeHandedOver) this.resumeCheckpoint = ckpt;
       let restored = false;
       if (WORKSPACE_PERSIST_BASE && this.userIdHex && ckpt.has_workspace_sync) {
         const restoreCtl = new AbortController();
@@ -2872,11 +3419,7 @@ class TaskRunner {
       if (!restored) {
         // Either no workspace_sync to restore from, or restore failed.
         // Fall back to the legacy S3 baseline restore (best-effort).
-        logger.info({ sessionId: this.sessionId }, "s3.restore_start");
-        try { await fx().syncWorkspaceFromS3(this.hands!, this.sessionId, this.userId); } catch (e) {
-          logger.warn({ err: e, sessionId: this.sessionId }, "s3.restore_failed");
-        }
-        logger.info({ sessionId: this.sessionId }, "s3.restore_done");
+        await this.restoreWorkspaceFromS3(this.hands!, this.userId, "resume_fallback");
         this.resumeMode = "no_data_turn0";
       }
     }
@@ -2913,7 +3456,8 @@ class TaskRunner {
     const resumeOutcome = classifyResumeOutcome(
       this.resumeMode, ckpt, isPartialAssistantTail, this.msg.info.deliveryCount,
     );
-    if (resumeOutcome.hint && this.resumeCheckpoint) {
+    // Not on a conversation already handed to the engine: it is the loop's now.
+    if (resumeOutcome.hint && this.resumeCheckpoint && !this.resumeHandedOver) {
       // By content, not by the prefix: other notices share it -- an unfinished
       // background start says so through the same channel -- and matching the
       // prefix would let one of those suppress this one on the next resume.
@@ -2964,7 +3508,7 @@ class TaskRunner {
       // Capture the current hands client; recreateHands may swap `hands`
       // mid-run after a sandbox rebuild, but for this checkpoint we want
       // the live reference that exists at fire time.
-      const currentHands = this.hands;
+      const currentHands = this.workHands();
       if (!currentHands) return;
       this.inflightCkptInProgress = true;
       // Fire-and-forget: never block the agent loop on checkpoint sync.
@@ -3009,9 +3553,10 @@ class TaskRunner {
           onProgress: this.onScriptProgress,
         }, this.onEvent);
       } else {
-        result = await this.engine.execute(this.request, this.onEvent, this.abortCtrl.signal, this.hands, {
+        result = await this.engine.execute(this.request, this.onEvent, this.abortCtrl.signal, this.workHands(), {
           recreateHands: this.recreateHands,
           onCheckpoint: this.onCheckpoint,
+          onTurnJournal: this.onTurnJournal,
           onCacheUse: this.onCacheUse,
           resumeCheckpoint: this.resumeCheckpoint,
           attachHands: this.attachHands,
@@ -3166,6 +3711,17 @@ class TaskRunner {
     }
   }
 
+  /**
+   * Tell the session the end-of-turn workspace save is over. Never fails the
+   * run: an event the stream refused leaves the listing saying "saving" until the
+   * mark goes stale, while a run failed for it would cost the turn.
+   */
+  private async announceWorkspaceSave(evt: WorkspaceSaveFinishedEvent): Promise<void> {
+    await this.onEvent({ ...evt }).catch((e: unknown) => {
+      logger.warn({ err: e, sessionId: this.sessionId, phase: evt.phase }, "s3.save_event_failed");
+    });
+  }
+
   private async finalizeSuccess(result: ExecuteResult): Promise<void> {
     // 4. Emit stats before completion
     await this.onEvent({
@@ -3177,117 +3733,48 @@ class TaskRunner {
       error_count: result.errorCount,
     });
 
-    // Ahead of the upload below, for the runs that reap at all: a process still
-    // writing while /workspace is read gets captured half-written, and anything
-    // it would have written after the read is lost when it is killed anyway.
-    // Stopping it first makes the snapshot the last complete state instead.
-    await this.reapBackgroundShells();
-
-    // 5. S3 upload: always sync /workspace so artifacts survive sandbox GC
-    //    and syncWorkspaceFromS3 has something to rehydrate on the next
-    //    sandbox. Failure is logged AND surfaced as a `sandboxStatus` event
-    //    (status=workspace_sync_*) so the user / monitoring can see it —
-    //    previously silent `logger.warn` was the root cause of 13% of long
-    //    sessions losing their /workspace artifacts despite a successful
-    //    `exec_complete`. Task completion still doesn't depend on object-
-    //    storage availability (event is informational, not fatal).
-    //    The optional per-message immutable archive (claw-<messageId>/) is
-    //    gated behind BRAIN_WORKSPACE_SNAPSHOT_ENABLED.
-    //    SIGTERM-checkpoint path below uses its own sync into the
-    //    checkpoint prefix and is independent of this block.
-    //    A run that never attached a sandbox has nothing here to do: no
-    //    /workspace to upload and no sandbox GC to outlive. Logged rather than
-    //    passed over silently, because "nothing was uploaded" otherwise reads
-    //    exactly like an upload that failed.
-    const hands = this.hands;
-    let syncOk = false;
-    if (!hands) {
-      logger.info(
-        { sessionId: this.sessionId, messageId: this.messageId },
-        "s3.sync_skipped_no_sandbox",
+    // The turn's end, published before the workspace is saved rather than after.
+    //
+    // The answer is final the moment the engine returns, and `exec_complete` is
+    // what sets the session idle. Saving /workspace below is bounded by nothing
+    // but the number of files in it: a review that cloned a large repository
+    // uploaded 79,353 files in 62 minutes, and for all of that time the session
+    // read `running` with the answer already on screen. Nothing the API does with
+    // `exec_complete` reads what the save writes -- deliveries are stored when
+    // `deliver_file` answers, skill files travel in the event.
+    //
+    // The session's next message still waits for the save, but in the API's
+    // queue: the completion names the save (`workspace_save_id`), the API holds
+    // the queue until that save's `workspaceSave` `finished`, and only then
+    // dispatches (api sessions/save-hold.ts). Dispatched at once, it would wait on
+    // this run's workspace lock, where its redelivery budget runs out in about an
+    // hour. What also still follows the save is the handoff to Backend
+    // (`deliverAgentDone`), so a task whose successors read its files is not
+    // reported done before they are there.
+    //
+    // The run may already have stood down: a lost lease, or the lock's
+    // self-fence, after which another brain may hold this run. A success
+    // published from here would then close the successor's row, so it is not
+    // published -- not first, and not on a retry once the stand-down arrives
+    // mid-publish. The ending is the stand-down's, as if the abort had been seen
+    // before this method was entered.
+    if (this.leaseLost) throw LEASE_LOST_ABORT_REASON;
+    // Whether the save below will run, on the completion itself: the file
+    // listing reads it to say the turn's files are still on their way, and it
+    // is stored before the session is set idle, so no read falls between them.
+    const hands = this.workHands();
+    // Named per save, not per turn: a redelivered turn keeps its message id, and
+    // the finish of an earlier attempt's save must not end this one's.
+    const saveId = !!hands && this.request.workspace_throwaway !== true ? randomUUID() : undefined;
+    const provisionFailure = this.provisionFailure();
+    if (provisionFailure) {
+      logger.warn(
+        { sessionId: this.sessionId, messageId: this.messageId, reason: provisionFailure.reason },
+        "task.ended_without_sandbox",
       );
-    } else if (this.request.workspace_throwaway === true) {
-      // The task declared its workspace throwaway -- it has already delivered
-      // its output somewhere of its own -- so this run publishes nothing. The
-      // prune is skipped with the upload, on purpose: pruning against a tree we
-      // never uploaded would delete the last durable copy of whatever an
-      // earlier, non-throwaway run of this session left in S3.
-      logger.info(
-        { sessionId: this.sessionId, messageId: this.messageId },
-        "s3.sync_skipped_workspace_throwaway",
-      );
-    } else {
-      logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "s3.sync_start");
-      let syncedGit: GitReport | undefined;
-      try {
-        const r = await fx().syncWorkspaceToS3(hands, this.sessionId, this.request.user_id || "default");
-        syncOk = !r.exhausted && !r.empty;
-        syncedGit = r.git;
-        if (r.empty) {
-          await this.onEvent({
-            type: "sandboxStatus",
-            status: "workspace_sync_empty",
-            reason: "empty_workspace",
-            message: "no files under /workspace at sync time",
-            message_id: this.messageId,
-          });
-        } else if (r.exhausted) {
-          await this.onEvent({
-            type: "sandboxStatus",
-            status: "workspace_sync_partial",
-            reason: "upload_exhausted",
-            // Out of what this sync tried to upload: files the last sync that
-            // landed already put in S3 are not attempts.
-            message: `uploaded=${r.uploaded}/${r.totalFiles - (r.unchanged ?? 0)}, failed=${r.failedCount}`,
-            message_id: this.messageId,
-          });
-        }
-      } catch (e: unknown) {
-        const errMsg = (e as { message?: string })?.message
-          ? String((e as { message: string }).message).slice(0, 500)
-          : String(e);
-        const errType = (e as { constructor?: { name?: string } })?.constructor?.name ?? "Error";
-        const reason = isHandsNetworkError(e)
-          ? "sandbox_unreachable"
-          : /Payload Too Large|BODY_TOO_LARGE|413/i.test(errMsg)
-            ? "payload_too_large"
-            : errType;
-        logger.warn({ err: e, sessionId: this.sessionId }, "s3.sync_failed");
-        await this.onEvent({
-          type: "sandboxStatus",
-          status: "workspace_sync_failed",
-          reason,
-          message: errMsg,
-          message_id: this.messageId,
-        });
-        // Recovery: if a periodic in-flight checkpoint had been written, copy
-        // it server-side back to the session prefix. This is the safety net
-        // for long sessions whose sandbox dies right at sync time — we still
-        // surface the artifacts captured at the last checkpoint window.
-        await this.recoverInflightCheckpoint("from_inflight_checkpoint");
-      }
-      // Independent of the above: a sync can land and still have left a repository
-      // behind. Outside the try on purpose: the upload succeeded, and an event the
-      // stream refused must not turn it into the failure above, whose recovery
-      // copies an older in-flight checkpoint over the files just uploaded.
-      await this.announceGitSkipped(syncedGit).catch((e: unknown) => {
-        logger.warn({ err: e, sessionId: this.sessionId }, "s3.git_skipped_event_failed");
-      });
-      if (BRAIN_WORKSPACE_SNAPSHOT_ENABLED && this.messageId && syncOk) {
-        try { await fx().archiveRunToS3(this.sessionId, this.request.user_id || "default", this.messageId); } catch (e) {
-          logger.warn({ err: e, sessionId: this.sessionId, messageId: this.messageId }, "s3.archive_failed");
-        }
-      }
-      logger.info({ sessionId: this.sessionId, messageId: this.messageId, syncOk }, "s3.sync_done");
+      result = { ...result, abortReason: "error", failureReason: provisionFailure.reason, failureMessage: provisionFailure.message };
     }
-
-    // 5b. Write execution transcript as JSONL to S3
-    await fx().flushTranscript(this.sessionId, this.request.user_id || "default", this.messageId, this.transcriptStartedAt, this.transcriptLog, {
-      turns: result.turns, elapsedMs: result.elapsedMs,
-      tokenUsage: result.tokenUsage, toolStats: result.toolStats, failed: false,
-    });
-
-    await this.onEvent({
+    const completion: Record<string, unknown> = {
       type: "exec_complete",
       session_id: this.sessionId,
       message_id: this.messageId,
@@ -3305,26 +3792,191 @@ class TaskRunner {
       skill_file_mutations: result.pendingSkillFileMutations,
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
-      ...runIdentity(this.request),
+      // The turn answered, so it is not `failed` (which is the conversation's
+      // account: the answer stands); the run is, and these say why.
+      ...(provisionFailure ? {
+        [RUN_FAILURE_REASON_FIELD]: provisionFailure.reason,
+        [RUN_FAILURE_MESSAGE_FIELD]: provisionFailure.message,
+      } : {}),
+      ...(saveId ? { [WORKSPACE_SAVE_PENDING_FIELD]: WORKSPACE_SAVE_PENDING, [WORKSPACE_SAVE_ID_FIELD]: saveId } : {}),
+      ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
+    };
+    const secrets = runtimeSecrets(this.request, this.platformKey);
+    const handoff = redactEgressPayload<ExecuteResult>(
+      this.withPlatformFacts(result),
+      secrets,
+    );
+    // Recorded before it is published, with the completion itself: a delivery of
+    // this run that comes back once the completion may be out finishes the turn
+    // (`finishEndedTurn`, which publishes the completion again -- the API takes
+    // one per turn) and does not run it again.
+    const endedKey = this.messageId ? endedTurnKey(this.sessionId, this.messageId) : null;
+    if (endedKey) {
+      const runTime = this.coverageReport()?.runTime;
+      const ended: EndedTurn = {
+        completion: redactEgressPayload<Record<string, unknown>>({ ...completion, message_id: this.messageId }, secrets),
+        result: handoff,
+        ...(runTime ? { run_time: runTime } : {}),
+        ...(saveId ? { save_id: saveId } : {}),
+      };
+      await this.kvCkpt.put(endedKey, sc.encode(JSON.stringify(ended)));
+    }
+    await this.onEvent(completion, { stillMine: () => !this.leaseLost }).catch(async (err: unknown) => {
+      if (err instanceof EmitStoodDownError) {
+        // Refused before it was published: the turn did not end, and the brain
+        // that holds the run now must run it, not skip it on this record.
+        if (endedKey) await this.kvCkpt.delete(endedKey).catch(() => {});
+        throw LEASE_LOST_ABORT_REASON;
+      }
+      throw err;
     });
-    // Persist the user-visible completion event before handing task state to
+    // Nothing from here to the handoff may end the run as a failure: the turn has
+    // ended on the session, and a failure is naked and redelivered. A step that
+    // throws is logged and the run goes on to its handoff and ack.
+    try {
+      // Ahead of the upload below, for the runs that reap at all: a process still
+      // writing while /workspace is read gets captured half-written, and anything
+      // it would have written after the read is lost when it is killed anyway.
+      // Stopping it first makes the snapshot the last complete state instead.
+      await this.reapBackgroundShells();
+
+      // 5. S3 upload: always sync /workspace so artifacts survive sandbox GC
+      //    and syncWorkspaceFromS3 has something to rehydrate on the next
+      //    sandbox. Failure is logged AND surfaced as a `sandboxStatus` event
+      //    (status=workspace_sync_*) so the user / monitoring can see it —
+      //    previously silent `logger.warn` was the root cause of 13% of long
+      //    sessions losing their /workspace artifacts despite a successful
+      //    `exec_complete`. Task completion still doesn't depend on object-
+      //    storage availability (event is informational, not fatal).
+      //    The optional per-message immutable archive (claw-<messageId>/) is
+      //    gated behind BRAIN_WORKSPACE_SNAPSHOT_ENABLED.
+      //    SIGTERM-checkpoint path below uses its own sync into the
+      //    checkpoint prefix and is independent of this block.
+      //    A run that never attached a sandbox has nothing here to do: no
+      //    /workspace to upload and no sandbox GC to outlive. Logged rather than
+      //    passed over silently, because "nothing was uploaded" otherwise reads
+      //    exactly like an upload that failed.
+      let syncOk = false;
+      if (!hands) {
+        logger.info(
+          { sessionId: this.sessionId, messageId: this.messageId },
+          "s3.sync_skipped_no_sandbox",
+        );
+      } else if (this.request.workspace_throwaway === true) {
+        // The task declared its workspace throwaway -- it has already delivered
+        // its output somewhere of its own -- so this run publishes nothing. The
+        // prune is skipped with the upload, on purpose: pruning against a tree we
+        // never uploaded would delete the last durable copy of whatever an
+        // earlier, non-throwaway run of this session left in S3.
+        logger.info(
+          { sessionId: this.sessionId, messageId: this.messageId },
+          "s3.sync_skipped_workspace_throwaway",
+        );
+      } else {
+        // The turn has already ended on the session (above), saying a save follows,
+        // so its files in the object store trail it until this is over. `finished`
+        // goes out however the save ends, so the file listing stops saying "saving"
+        // (WORKSPACE_SAVE_EVENT).
+        let saveOutcome: WorkspaceSaveOutcome = "failed";
+        try {
+          logger.info({ sessionId: this.sessionId, messageId: this.messageId }, "s3.sync_start");
+          let syncedGit: GitReport | undefined;
+          try {
+            const r = await fx().syncWorkspaceToS3(hands, this.sessionId, this.request.user_id || "default");
+            syncOk = !r.exhausted && !r.empty;
+            saveOutcome = r.empty ? "empty" : r.exhausted ? "partial" : "synced";
+            syncedGit = r.git;
+            if (r.empty) {
+              await this.onEvent({
+                type: "sandboxStatus",
+                status: "workspace_sync_empty",
+                reason: "empty_workspace",
+                message: "no files under /workspace at sync time",
+                message_id: this.messageId,
+              });
+            } else if (r.exhausted) {
+              await this.onEvent({
+                type: "sandboxStatus",
+                status: "workspace_sync_partial",
+                reason: "upload_exhausted",
+                // Out of what this sync tried to upload: files the last sync that
+                // landed already put in S3 are not attempts.
+                message: `uploaded=${r.uploaded}/${r.totalFiles - (r.unchanged ?? 0) - (r.withheld ?? 0)}, failed=${r.failedCount}`,
+                message_id: this.messageId,
+              });
+            }
+          } catch (e: unknown) {
+            const errMsg = (e as { message?: string })?.message
+              ? String((e as { message: string }).message).slice(0, 500)
+              : String(e);
+            const reason = workspaceTransferFailureReason(e, errMsg);
+            logger.warn({ err: e, sessionId: this.sessionId }, "s3.sync_failed");
+            await this.onEvent({
+              type: "sandboxStatus",
+              status: "workspace_sync_failed",
+              reason,
+              message: errMsg,
+              message_id: this.messageId,
+            });
+            // Recovery: if a periodic in-flight checkpoint had been written, copy
+            // it server-side back to the session prefix. This is the safety net
+            // for long sessions whose sandbox dies right at sync time — we still
+            // surface the artifacts captured at the last checkpoint window.
+            await this.recoverInflightCheckpoint("from_inflight_checkpoint");
+          }
+          // Independent of the above: a sync can land and still have left a repository
+          // behind. Outside the try on purpose: the upload succeeded, and an event the
+          // stream refused must not turn it into the failure above, whose recovery
+          // copies an older in-flight checkpoint over the files just uploaded.
+          await this.announceGitSkipped(syncedGit).catch((e: unknown) => {
+            logger.warn({ err: e, sessionId: this.sessionId }, "s3.git_skipped_event_failed");
+          });
+          if (BRAIN_WORKSPACE_SNAPSHOT_ENABLED && this.messageId && syncOk) {
+            try { await fx().archiveRunToS3(this.sessionId, this.request.user_id || "default", this.messageId); } catch (e) {
+              logger.warn({ err: e, sessionId: this.sessionId, messageId: this.messageId }, "s3.archive_failed");
+            }
+          }
+          logger.info({ sessionId: this.sessionId, messageId: this.messageId, syncOk }, "s3.sync_done");
+        } finally {
+          await this.announceWorkspaceSave({
+            type: WORKSPACE_SAVE_EVENT, phase: "finished", outcome: saveOutcome, save_id: saveId, message_id: this.messageId,
+          });
+        }
+      }
+
+      // 5b. Write execution transcript as JSONL to S3
+      await fx().flushTranscript(this.sessionId, this.request.user_id || "default", this.messageId, this.transcriptStartedAt, this.transcriptLog, {
+        turns: result.turns, elapsedMs: result.elapsedMs,
+        tokenUsage: result.tokenUsage, toolStats: result.toolStats, failed: false,
+      });
+    } catch (e) {
+      if (e === LEASE_LOST_ABORT_REASON) throw e;
+      logger.error(
+        { err: e, sessionId: this.sessionId, messageId: this.messageId },
+        "task.after_turn_end_failed",
+      );
+    }
+
+    // The save is the one long stretch of this method, and the run can stand
+    // down during it. The turn's end is already published, and was this run's to
+    // publish; the task is not, once another brain may hold it -- reporting it
+    // done would close that brain's row. The ending from here is the stand-down's.
+    if (this.leaseLost) throw LEASE_LOST_ABORT_REASON;
+    // The user-visible completion event is persisted before handing task state to
     // Backend. If Brain dies after the callback, outbox replay can safely skip
     // task execution without losing the session's terminal event.
-    await deliverAgentDone(
-      this.kvCkpt,
-      this.request,
-      redactEgressPayload<ExecuteResult>(
-        this.withPlatformFacts(result),
-        runtimeSecrets(this.request, this.platformKey),
-      ),
-      this.coverageReport()?.runTime,
-    );
+    await deliverAgentDone(this.kvCkpt, this.request, handoff, this.coverageReport()?.runTime);
     // Ack BEFORE logging task.completed: if the process is killed by a hot-
     // reload between the log line and msg.ack(), NATS redelivers the task after
     // ack_wait and the entire execution repeats from scratch. Since exec_complete
     // is already persisted in JetStream, the event-consumer can handle post-
     // completion logic (pending messages, summaries) even if Brain dies here.
     await this.ackTerminal();
+    if (endedKey) {
+      await this.kvCkpt.delete(endedKey).catch((e: unknown) => {
+        logger.warn({ err: e, sessionId: this.sessionId, messageId: this.messageId }, "task.ended_turn_cleanup_failed");
+      });
+    }
     logger.info({
       sessionId: this.sessionId, messageId: this.messageId, turns: result.turns, elapsedMs: result.elapsedMs,
       // A completed run always has both -- the loop that produced this result
@@ -3503,12 +4155,14 @@ class TaskRunner {
       // and its timestamp were lost for want of a workspace that did not
       // exist. Without hands there is simply nothing to sync, and
       // `sigtermSyncResult` stays "skipped", which is what it means.
-      if (this.hands && WORKSPACE_PERSIST_BASE && this.userIdHex) {
+      const workHands = this.workHands();
+      if (workHands && WORKSPACE_PERSIST_BASE && this.userIdHex) {
         try {
-          await workspaceSigtermSyncSemaphore.run(() =>
-            fx().syncWorkspace(this.hands!, this.sessionId, this.userIdHex!, ckptState.turns_completed,
-              { kind: "sigterm" }),
-          );
+          await workspaceSigtermSyncSemaphore.run(async () => {
+            this.refuseSharedSyncIfHeld(workHands);
+            return fx().syncWorkspace(workHands, this.sessionId, this.userIdHex!, ckptState.turns_completed,
+              { kind: "sigterm" });
+          });
           syncedFlag = true;
           sigtermSyncResult = "success";
           logger.info({ sessionId: this.sessionId, turns: ckptState.turns_completed },
@@ -3535,8 +4189,8 @@ class TaskRunner {
       // started. Writing to the session prefix is what the terminal path
       // already does, and it is where resolveResumeState's fall-through reads
       // from, so the resumed run finds these files.
-      if (!syncedFlag && this.hands) {
-        const hands = this.hands;
+      if (!syncedFlag && workHands) {
+        const hands = workHands;
         try {
           // The measurement of the repositories is capped like the shared-disk SIGTERM
           // sync's: with the shared disk unset, which is the default, this is the
@@ -3721,6 +4375,17 @@ class TaskRunner {
       failed: false, interrupted: true,
       turns: turnsCompleted, elapsedMs, tokenUsage, toolStats,
     });
+    // The turn's end on the session's stream. `exec_complete` below is the API's
+    // and is never forwarded to a stream's readers (routes/events.ts SKIP_EVENTS),
+    // and a stopped engine never reached its own `ResultMessage`: without this a
+    // reader -- a chat's "Thinking..." status, an A2A or MCP caller -- waits for
+    // an end that never comes. Stopped while the sandbox was still being prepared
+    // is the common case: the engine had said nothing yet. Not a success, and no
+    // text: what the turn said before the stop is already on the stream.
+    if (!this.turnEndAnnounced) {
+      await this.onEvent({ type: "ResultMessage", data: { subtype: "interrupted" } })
+        .catch((e) => logger.warn({ err: e, sessionId: this.sessionId }, "task.interrupt_result_event_failed"));
+    }
     await this.onEvent({
       type: "exec_complete",
       session_id: this.sessionId,
@@ -3766,7 +4431,7 @@ class TaskRunner {
       selected_skills: Object.keys(this.request.skills || {}),
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
-      ...runIdentity(this.request),
+      ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
     });
     await deliverAgentDone(
       this.kvCkpt,
@@ -3889,7 +4554,11 @@ class TaskRunner {
       retryPendingDeadlineMs,
       retryPendingGraceSec: RETRY_PENDING_KEEPALIVE_GRACE_SEC,
     });
-    await this.nakAfterAttempt(5000);
+    // Backed off by the attempt this was: a claimed run counts its claims, a
+    // fat delivery its deliveries.
+    await this.nakAfterAttempt(retryableNakMs(
+      this.claimed ? this.attempt.claimCount : this.msg.info.deliveryCount,
+    ));
   }
 
   private async handleFatalError(err: any): Promise<void> {
@@ -3966,9 +4635,16 @@ class TaskRunner {
     // dedicated sandboxStatus event already carries the structured reason;
     // upstream LLM failures get the new classifier so the chat panel does
     // not display a raw provider JSON body.
+    // A refused workspace is already written for the person reading it (see
+    // `sandboxWorkspaceForbiddenText`); the code prefix would only add noise.
     const taskFailure = sandboxReason
-      ? { reason: sandboxReason, userText: `Sandbox failure (${sandboxReason}): ${rawMsg.slice(0, 500)}` }
-      : classifyTaskFailure(rawMsg);
+      ? {
+        reason: sandboxReason,
+        userText: sandboxReason === SANDBOX_WORKSPACE_FORBIDDEN || sandboxReason === SANDBOX_WORKSPACE_NOT_ALLOWED
+          ? rawMsg.slice(0, 500)
+          : `Sandbox failure (${sandboxReason}): ${rawMsg.slice(0, 500)}`,
+      }
+      : classifyTaskFailure(rawMsg, err);
     const finalText = taskFailure.userText;
     // Partial progress fields. agentLoop's `result` is unavailable on the
     // failure path, so we fall back to the latest checkpoint state captured
@@ -4029,7 +4705,7 @@ class TaskRunner {
       selected_skills: Object.keys(this.request.skills || {}),
       prompt: this.request.prompt,
       delivery_count: this.msg.info.deliveryCount,
-      ...runIdentity(this.request),
+      ...runIdentity(this.request, this.claimed ? this.attempt.claimCount : undefined),
     });
     // Task DAG: tell Backend the task failed so the scheduler can cascade
     // to downstream nodes and (eventually) tear sandboxes down.
@@ -4378,6 +5054,8 @@ class TaskRunner {
         // branch -- the one that files the ending as a user interrupt -- is
         // the true account of what happened.
         if (status === "cancelling") {
+          // (a Stop during a drain cuts the call the drain was letting finish: the person asked for it to stop)
+          this.cutDrainedCalls("cancelled");
           if (this.abortCtrl.signal.aborted) return;
           logger.info(
             { sessionId: this.sessionId, messageId: this.messageId,
@@ -4394,7 +5072,8 @@ class TaskRunner {
         // the other road left this one swallowed by any earlier abort. `gone`
         // is not: the row went terminal and nobody took over, so this worker is
         // still the one holding the sandbox.
-        if (status === "superseded") this.leaseLost = true;
+        if (status === "superseded") this.noteLeaseLost();
+        if (status === "gone") this.cutDrainedCalls(RUN_ROW_TERMINAL_ABORT_REASON);
         if (!refused || this.abortCtrl.signal.aborted) return;
         logger.error(
           { sessionId: this.sessionId, messageId: this.messageId,
@@ -4436,6 +5115,22 @@ class TaskRunner {
     return timer;
   }
 
+  /**
+   * Another replica holds this run now. Recorded whatever else happened, and a
+   * call a drain is letting finish (`agent/drain-shield.ts`) is cut at once:
+   * the drain's abort came first, so the run's signal cannot carry this news.
+   * The same holds for a Stop and a terminal row (`cutDrainedCalls`).
+   */
+  private noteLeaseLost(): void {
+    this.leaseLost = true;
+    this.cutDrainedCalls(LEASE_LOST_ABORT_REASON);
+  }
+
+  /** Cut, at once, a call a drain is letting finish: the run has to stop touching the sandbox now, for `reason`. */
+  private cutDrainedCalls(reason: unknown): void {
+    if (this.abortCtrl.signal.reason === SIGTERM_ABORT_REASON) cutDrainedCalls(this.abortCtrl.signal, reason);
+  }
+
   private startDeliveryHeartbeat(): void {
     // keepAlive must be much shorter than the consumer's ack_wait to avoid
     // redelivery while a task is still making progress. That is
@@ -4449,7 +5144,7 @@ class TaskRunner {
         // news entirely, because the only trace of a lost lease was the abort
         // REASON and that slot was taken. Teardown then read the successor's
         // entry, asked whether it still held the lock, and was told yes.
-        if (yielding) this.leaseLost = true;
+        if (yielding) this.noteLeaseLost();
         if (!yielding || this.abortCtrl.signal.aborted) return;
         logger.error(
           { sessionId: this.sessionId, messageId: this.messageId, lockKey: this.lockKey, renewal },
@@ -4465,6 +5160,26 @@ class TaskRunner {
         logger.warn({ err: err?.message || String(err), sessionId: this.sessionId }, "task.kv_ttl_get_failed");
       });
     }, LOCK_REFRESH_INTERVAL_MS);
+
+    // The renewal above only reports once its write has answered, and a write
+    // to an unreachable NATS answers late or never -- while another brain may
+    // take a lock that names its run once it has gone unwritten for
+    // TASK_LOCK_DEAD_HOLDER_MS. So the deadline is also watched locally, on a
+    // timer short enough that this run stops (and runs no further tool) before
+    // that moment: `lockPastSelfFence` fires one refresh interval ahead of it,
+    // counted from when the last successful renewal was sent.
+    this.selfFence = setInterval(() => {
+      if (!fx().lockPastSelfFence(this.lockKey)) return;
+      this.noteLeaseLost();
+      if (this.abortCtrl.signal.aborted) return;
+      logger.error(
+        { sessionId: this.sessionId, messageId: this.messageId, lockKey: this.lockKey },
+        "task.lock_self_fenced",
+      );
+      metrics.onLockSelfFenced();
+      this.abortCtrl.abort(LEASE_LOST_ABORT_REASON);
+    }, SELF_FENCE_CHECK_MS);
+    this.selfFence.unref?.();
   }
 
   private async executeRun(): Promise<void> {
@@ -4497,14 +5212,35 @@ class TaskRunner {
       await this.executeAppRun();
       return;
     }
-    if (this.needsSandboxUpFront(this.pendingResumeCkpt)) {
-      await this.attachHands();
-    } else {
-      await this.startWithoutSandbox();
+    let upFront = this.needsSandboxUpFront(this.pendingResumeCkpt);
+    const prestart = !upFront && wantsSandboxPrestart(this.request);
+    if (upFront) {
+      try {
+        await this.attachHands();
+      } catch (err) {
+        if (!this.mayResumeWithoutSandbox(err)) throw err;
+        logger.warn(
+          { sessionId: this.sessionId, messageId: this.messageId, reason: sandboxUnavailableOf(err)?.reason },
+          "task.resume.sandbox_unavailable_continuing",
+        );
+        upFront = false;
+      }
+    }
+    if (!upFront) {
+      this.resumeWithoutSandbox();
+      await this.startWithoutSandbox(prestart);
     }
     await this.reconcileBackgroundStarts();
+    // After the reconciliation, which reads the session's existing sandbox binding
+    // and must not find this run's own provisioning in its place.
+    if (prestart) this.prestartSandbox();
 
-    const result = await this.executeEngine();
+    let result: ExecuteResult;
+    try {
+      result = await this.executeEngine();
+    } finally {
+      await this.retireUnclaimedPrestart();
+    }
 
     // MCP SDK 1.12 does not propagate AbortSignal through callTool.
     //
@@ -4580,7 +5316,13 @@ class TaskRunner {
       await fx().postTaskRunning(this.request, { brainId: BRAIN_ID, attempt: this.attempt });
     }
 
-    const result = await runner.run(this.abortCtrl.signal);
+    // The run's signal also cuts short a wait for the sandbox. Whether the workload
+    // being waited on is stopped there follows the same split as below: a run this
+    // Brain finishes (a cancel, the deadline, a terminal row) stops it at once; a
+    // run handed over (a drain, a lost lease) leaves it for its successor to adopt.
+    const result = await runner.run(this.abortCtrl.signal, {
+      reclaimOnAbort: () => this.stillOwnsLock() && this.abortCtrl.signal.reason !== SIGTERM_ABORT_REASON,
+    });
     if (result.kind === "ended" && finishOnly) {
       await this.settleFinishOnly();
       return;
@@ -4761,10 +5503,11 @@ class TaskRunner {
     if (outcome) metrics.onTask(outcome, (Date.now() - runStartedAt) / 1000);
     this.cancelDeadline();
     clearInterval(this.keepAlive);
+    if (this.selfFence) clearInterval(this.selfFence);
     if (leaseTimer) clearInterval(leaseTimer);
     endRun(this.runIdentity.key);
-    activeAbort.delete(this.lockKey);
-    await fx().releaseTaskLock(this.lockKey);
+    clearActiveAbort(this.lockKey, this.abortCtrl);
+    await fx().releaseTaskLock(this.lockKey, this.abortCtrl);
     await this.hands?.close().catch(() => {});
   }
 
@@ -4812,9 +5555,10 @@ export async function runHandleTask(
   // Before anything decides the run's sandbox (a multi-node cluster, the image, the workspace): a requested review keeps only its fixed
   // profile, and the prompt that holds the requester's words is not read as configuration (`agent/review-profile.ts`).
   applyReviewProfileBackstop(request);
-  if (await replayPendingCallback(msg, request, lockKey)) return;
-  if (await refuseUnsupportedMode(msg, request, sessionId, lockKey)) return;
-  if (await refuseReviewWithoutTurnBudget(msg, request, sessionId, lockKey)) return;
+  if (await replayPendingCallback(msg, request, lockKey, abortCtrl)) return;
+  if (await finishEndedTurn(msg, request, sessionId, messageId, lockKey, abortCtrl)) return;
+  if (await refuseUnsupportedMode(msg, request, sessionId, lockKey, abortCtrl)) return;
+  if (await refuseReviewWithoutTurnBudget(msg, request, sessionId, lockKey, abortCtrl)) return;
   if (await maybeRunSandboxlessTask(msg, request, sessionId, lockKey, abortCtrl)) return;
   await new TaskRunner(
     msg, request, sessionId, lockKey, messageId, userId, abortCtrl, claim,

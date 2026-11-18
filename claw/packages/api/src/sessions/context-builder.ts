@@ -62,14 +62,18 @@ export function reconstructHistory(
     const toolResults = parseJsonbArray(turn.tool_results);
 
     if (turn.role === "assistant" && (toolCalls.length || toolResults.length)) {
-      // Assistant block: text + tool_use entries.
-      const assistantContent: Array<Record<string, unknown>> = [];
-      if (turn.content) assistantContent.push({ type: "text", text: turn.content });
+      // The turn in the order it ran: each call, then what it returned, then the turn's own final text. Put together as one
+      // assistant message with the text first and every call beside it, a turn that looked something up and then answered
+      // reads as an answer written before (or beside) the lookup that answered it, and a router asked again disowned its
+      // own grounded answer ("上一条我是在查询结果返回之前就写了答案", 2026-11-07, E230 #15/#17). One call per step keeps
+      // every tool_result right after its tool_use, which is all the providers require.
+      const steps: Message[] = [];
       for (const tc of toolCalls) {
         // Stored shape from agent-loop is {type:"toolUsed", tool, actionId, status, ...}.
         // Reconstruct as {type:"tool_use", id, name, input}.
         const id = (tc as any).actionId ?? (tc as any).id;
         const name = (tc as any).tool ?? (tc as any).name;
+        if (!id || !name) continue;
         // The stored value is whatever the event carried, which is not always an
         // object: Brain's redactor used to replace the whole input with the string
         // "<redacted>" for a tool whose NAME looks like a credential field
@@ -79,26 +83,15 @@ export function reconstructHistory(
         // session fails the same way. Rows written before that was fixed are
         // still in the table, so the guarantee has to be made here, on read.
         const input = coerceToolInput((tc as any).argumentsDetail?.[name] ?? (tc as any).input);
-        if (id && name) assistantContent.push({ type: "tool_use", id, name, input });
-      }
-
-      // Build the matching user `tool_result` block.
-      const resultBlocks: Array<Record<string, unknown>> = [];
-      for (const tc of toolCalls) {
-        const id = (tc as any).actionId ?? (tc as any).id;
-        if (!id) continue;
         const matching = toolResults.find((r: any) => (r.actionId ?? r.id) === id);
         const text = matching ? (matching as any).description ?? (matching as any).content ?? "" : "";
-        resultBlocks.push({ type: "tool_result", tool_use_id: id, content: String(text) });
+        steps.push({ role: "assistant", content: [{ type: "tool_use", id, name, input }] as any });
+        steps.push({ role: "user", content: [{ type: "tool_result", tool_use_id: id, content: String(text) }] as any });
       }
-
-      // The outer loop walks turns DESC and we `reverse()` at the end. To
-      // make the final order [..., assistant_with_tool_use, user_tool_result, ...]
-      // (Anthropic requires every tool_result to immediately follow its
-      // matching tool_use), push the within-turn pair in REVERSE here:
-      // user_tool_result first, assistant block second.
-      if (resultBlocks.length) selected.push({ role: "user", content: resultBlocks as any });
-      selected.push({ role: "assistant", content: assistantContent as any });
+      if (turn.content) steps.push({ role: "assistant", content: [{ type: "text", text: turn.content }] as any });
+      // The outer loop walks turns DESC and we `reverse()` at the end: the turn's own messages go in reversed, so that
+      // they come out in the order above.
+      for (let i = steps.length - 1; i >= 0; i--) selected.push(steps[i]);
     } else {
       selected.push({ role: turn.role as Message["role"], content: turn.content });
     }

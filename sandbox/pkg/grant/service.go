@@ -9,6 +9,7 @@ import (
 	"hash/fnv"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,15 +60,20 @@ type Service struct {
 	dataKey    []byte
 	authn      Authenticator
 	attest     AttestationChecker
-	identity   IdentityChecker
-	membership MembershipChecker
+	identity   Introspector
+	authz      Authorizer
 	reclaimer  Reclaimer
 	exists     SandboxExists
 	promoter   PendingPromoter
 	record     Recorder
 	now        func() time.Time
 	owner      atomic.Pointer[ownerConfig]
+	ownerFault atomic.Bool
 	writes     grantLocks
+	// attestWorkloads is true when every Workload carries an identity assertion.
+	attestWorkloads bool
+	// reviewOwner is true when a grant-key create must review the owner's workspace.
+	reviewOwner bool
 }
 
 // grantLocks serialises the read-modify-write of one grant inside this process,
@@ -104,18 +110,23 @@ func (s *Service) SetPromoter(p PendingPromoter) {
 
 // Options configures a Service.
 type Options struct {
-	Client     ctrlclient.Client
-	Reader     ctrlclient.Reader
-	Namespace  string
-	DataKey    []byte
-	Authn      Authenticator
-	Attest     AttestationChecker
-	Identity   IdentityChecker
-	Membership MembershipChecker
-	Reclaimer  Reclaimer
-	Exists     SandboxExists
-	Record     Recorder
-	Now        func() time.Time
+	Client    ctrlclient.Client
+	Reader    ctrlclient.Reader
+	Namespace string
+	DataKey   []byte
+	Authn     Authenticator
+	Attest    AttestationChecker
+	Identity  Introspector
+	Authz     Authorizer
+	Reclaimer Reclaimer
+	Exists    SandboxExists
+	Record    Recorder
+	Now       func() time.Time
+	// AttestWorkloads is true when every Workload carries an identity assertion.
+	AttestWorkloads bool
+	// ReviewOwner is true when a grant-key create reviews the owner's workspace.
+	// A User authorizer does not set this; workspace SAR does.
+	ReviewOwner bool
 }
 
 // New returns a grant service. Client and Namespace are required.
@@ -129,18 +140,20 @@ func New(opt Options) *Service {
 		reader = opt.Client
 	}
 	return &Service{
-		client:     opt.Client,
-		reader:     reader,
-		namespace:  opt.Namespace,
-		dataKey:    opt.DataKey,
-		authn:      opt.Authn,
-		attest:     opt.Attest,
-		identity:   opt.Identity,
-		membership: opt.Membership,
-		reclaimer:  opt.Reclaimer,
-		exists:     opt.Exists,
-		record:     opt.Record,
-		now:        now,
+		client:          opt.Client,
+		reader:          reader,
+		namespace:       opt.Namespace,
+		dataKey:         opt.DataKey,
+		authn:           opt.Authn,
+		attest:          opt.Attest,
+		identity:        opt.Identity,
+		authz:           opt.Authz,
+		reclaimer:       opt.Reclaimer,
+		exists:          opt.Exists,
+		record:          opt.Record,
+		now:             now,
+		attestWorkloads: opt.AttestWorkloads,
+		reviewOwner:     opt.ReviewOwner,
 	}
 }
 
@@ -166,20 +179,16 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 	if err := s.attest.Check(req.Attestation, req); err != nil {
 		return IssueResponse{}, 0, err
 	}
-	if s.identity == nil {
-		return IssueResponse{}, 0, opErr(http.StatusServiceUnavailable, "identity_unavailable", "SaFE client is not configured")
-	}
-	userName, err := s.identity.Check(ctx, req.PlatformKey, req.Owner.UserID)
+	tok, err := s.ownerToken(ctx, req.PlatformKey, req.Owner.UserID)
 	if err != nil {
 		return IssueResponse{}, 0, err
 	}
-	if userName != "" {
-		req.Owner.UserName = userName
+	if tok.Username != "" {
+		req.Owner.UserName = tok.Username
+	} else if tok.Email != "" {
+		req.Owner.UserName = tok.Email
 	}
-	if s.membership == nil {
-		return IssueResponse{}, 0, opErr(http.StatusServiceUnavailable, "membership_unavailable", "User client is not configured")
-	}
-	if err := s.membership.Check(ctx, req.Owner.UserID, req.Owner.Workspaces); err != nil {
+	if err := s.checkWorkspaces(ctx, tok, req.Owner.Workspaces); err != nil {
 		return IssueResponse{}, 0, err
 	}
 	roles, expanded, stored, err := expandTemplates(req.Issuer.AppRunID, req.Roles, req.Templates)
@@ -450,6 +459,7 @@ func (s *Service) ReapOnce(ctx context.Context) {
 		}
 		if g.Status.State == runtimev1alpha1.GrantStateActive {
 			s.promotePending(ctx, g)
+			s.expireOverduePending(ctx, g)
 		}
 		if s.exists != nil && g.Status.State == runtimev1alpha1.GrantStateActive {
 			s.dropMissing(ctx, g)
@@ -511,6 +521,43 @@ func (s *Service) Run(ctx context.Context, every time.Duration) {
 			s.ReapOnce(ctx)
 		}
 	}
+}
+
+// expireOverduePending ends a pending sandbox whose deadline has passed and the Workload is still present.
+// The deadline is StartedAt plus PendingTimeoutSec on the grant, so it holds after a restart.
+func (s *Service) expireOverduePending(ctx context.Context, g *runtimev1alpha1.SandboxGrant) {
+	if s == nil || s.exists == nil {
+		return
+	}
+	now := s.now()
+	for _, ref := range g.Status.Sandboxes {
+		if !pendingPastDeadline(ref, now) {
+			continue
+		}
+		present, err := s.exists.Exists(ctx, SandboxRef{ID: ref.ID, Role: ref.Role, GPUs: ref.GPUs, SessionID: ref.SessionID})
+		if err != nil || !present {
+			continue
+		}
+		reason := "pending_timeout: not running after " + strconv.FormatInt(ref.PendingTimeoutSec, 10) + "s"
+		ended, err := s.ExpirePending(ctx, g.Name, ref.ID, reason)
+		if err != nil || !ended {
+			continue
+		}
+		if s.reclaimer == nil {
+			continue
+		}
+		if err := s.reclaimer.Reclaim(ctx, SandboxRef{ID: ref.ID, Role: ref.Role, GPUs: ref.GPUs, SessionID: ref.SessionID}); err != nil {
+			log.Warn("pending sandbox reclaim failed", "grant", g.Name, "sandbox", ref.ID, "error", err)
+		}
+	}
+}
+
+// pendingPastDeadline reports whether a pending sandbox has a deadline and that deadline has passed.
+func pendingPastDeadline(ref runtimev1alpha1.GrantSandboxRef, now time.Time) bool {
+	if ref.State != runtimev1alpha1.SandboxPending || ref.PendingTimeoutSec <= 0 || ref.StartedAt.IsZero() {
+		return false
+	}
+	return !now.Before(ref.StartedAt.Time.Add(time.Duration(ref.PendingTimeoutSec) * time.Second))
 }
 
 // promotePending asks the control plane to adopt a pending sandbox that is already running.

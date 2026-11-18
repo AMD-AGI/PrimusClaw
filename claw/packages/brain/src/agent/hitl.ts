@@ -99,6 +99,24 @@ export interface HitlOptions {
    * a controller that appeared for another reason must not start asking about every tool.
    */
   onlyHeld?: boolean;
+  /**
+   * How long a person is waited for, in milliseconds: the run's `decision_wait_ms` (`decisionWaitMs`), when the request
+   * carried one. Absent: `HITL_DECISION_TIMEOUT_MS`.
+   */
+  timeoutMs?: number;
+}
+
+/** The longest wait a request may ask for: a day, the same bound the API puts on the `timeout_ms` it is told. */
+export const DECISION_WAIT_MAX_MS = 24 * 3_600_000;
+const DECISION_WAIT_MIN_MS = 1_000;
+
+/**
+ * The run's own wait for a person (`ExecuteRequest.decision_wait_ms`), or `undefined` for Brain's settings: a value that
+ * is not a whole number of milliseconds from a second to a day is not believed, whatever sent it.
+ */
+export function decisionWaitMs(raw: unknown): number | undefined {
+  return typeof raw === "number" && Number.isInteger(raw) && raw >= DECISION_WAIT_MIN_MS && raw <= DECISION_WAIT_MAX_MS
+    ? raw : undefined;
 }
 
 export class HitlController {
@@ -196,10 +214,11 @@ export class HitlController {
     if (req.signal?.aborted) return { action: "deny", reason: "aborted", by: "timeout", cause: "aborted" };
     // Registered before the request is shown: an answer that arrives first
     // would otherwise find nothing pending and be dropped.
+    const waitMs = this.opts.timeoutMs ?? HITL_DECISION_TIMEOUT_MS;
     const pending = dispatcher.register({
       actionId: req.actionId,
       type: "decision",
-      timeoutMs: HITL_DECISION_TIMEOUT_MS,
+      timeoutMs: waitMs,
       signal: req.signal,
     });
     pending.catch(() => { /* consumed below; this only keeps an early failure from being unhandled */ });
@@ -215,7 +234,7 @@ export class HitlController {
         input: req.input,
         description: `${label ? `[${label}] ` : ""}${req.tool}: ${JSON.stringify(req.input).slice(0, 200)}`,
         ...(label ? { approval_label: label } : {}),
-        timeout_ms: HITL_DECISION_TIMEOUT_MS,
+        timeout_ms: waitMs,
         ts: Date.now(),
       });
     } catch (err) {

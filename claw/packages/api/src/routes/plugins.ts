@@ -4,7 +4,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { authErrorPayload, getUser } from "../auth/middleware.js";
 import { isAdmin } from "../auth/models.js";
-import { MarketplaceDb, type JsonObject } from "../infra/db.js";
+import { MarketplaceDb, PLUGIN_LIST_SCOPES, type JsonObject, type PluginListScope } from "../infra/db.js";
 import {
   AccessDeniedError,
   BadGatewayError,
@@ -14,6 +14,7 @@ import {
   NotConfiguredError,
   NotFoundError,
   PluginDuplicateError,
+  PluginNameTakenError,
   ResourceDuplicateError,
   ServiceError,
   ToolDuplicateError,
@@ -30,6 +31,7 @@ import {
   createPluginNewVersion,
   createToolNewVersion,
   formatPluginRow,
+  formatPluginVersionRow,
   formatResourceRow,
   canViewPlugin,
   ownerOrAdmin,
@@ -58,6 +60,11 @@ function mapServiceError(reply: FastifyReply, e: unknown): ReturnType<FastifyRep
   if (e instanceof ConflictError) return reply.status(409).send(authErrorPayload("conflict", e.message));
   if (e instanceof BadRequestError) return reply.status(400).send(authErrorPayload("bad_request", e.message));
   if (e instanceof BadGatewayError) return reply.status(502).send(authErrorPayload("bad_gateway", e.message));
+  // Before UpsertPermissionError, which it extends: a name owned by someone
+  // else is a collision the caller fixes by renaming, not a missing permission.
+  if (e instanceof PluginNameTakenError) {
+    return reply.status(409).send(authErrorPayload("plugin_name_taken", e.message));
+  }
   if (e instanceof UpsertPermissionError) return reply.status(403).send(authErrorPayload("forbidden", e.message));
   if (e instanceof UpsertConflictError) return reply.status(409).send(authErrorPayload("conflict", e.message));
   if (e instanceof UpsertToolTypeChangeError) {
@@ -72,6 +79,15 @@ function mapServiceError(reply: FastifyReply, e: unknown): ReturnType<FastifyRep
     return reply.status(409).send(authErrorPayload("conflict", e.message));
   }
   if (e instanceof ServiceError) return reply.status(400).send(authErrorPayload("bad_request", e.message));
+  return null;
+}
+
+/** A boolean query flag: `true`/`1`/`yes`, `false`/`0`/`no` (any case), `fallback` when absent, null otherwise. */
+export function parseListFlag(raw: string | undefined, fallback: boolean): boolean | null {
+  if (raw === undefined || raw === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (v === "true" || v === "1" || v === "yes") return true;
+  if (v === "false" || v === "0" || v === "no") return false;
   return null;
 }
 
@@ -546,12 +562,29 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
     }
   });
 
-  app.get<{ Querystring: Record<string, string | undefined> }>("/v1/plugins", async (req) => {
+  app.get<{ Querystring: Record<string, string | undefined> }>("/v1/plugins", async (req, reply) => {
     const u = getUser(req)!;
+    // `scope`: public plus the caller's own by default, for admins too; `all`
+    // (every plugin) is an admin's explicit ask.
+    const scopeRaw = String(req.query.scope ?? "").trim() || "visible";
+    if (!(PLUGIN_LIST_SCOPES as readonly string[]).includes(scopeRaw)) {
+      return reply.status(400).send(authErrorPayload("bad_request", `scope must be one of ${PLUGIN_LIST_SCOPES.join(", ")}`));
+    }
+    const scope = scopeRaw as PluginListScope;
+    if (scope === "all" && !isAdmin(u)) {
+      return reply.status(403).send(authErrorPayload("forbidden", "scope=all is for admins"));
+    }
     const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)));
     const offset = Math.max(0, Number(req.query.offset ?? 0));
     const includeDeleted = req.query.include_deleted === "true" && isAdmin(u);
-    const latestPerName = req.query.latest_per_name === "true";
+    // One entry per plugin (an owner's name: its latest active version) unless
+    // the caller asks for every row; the other versions are at
+    // GET /v1/plugins/:id/versions. On by default here, unlike the tool
+    // listings, so it is parsed strictly rather than as "anything but true".
+    const latestPerName = parseListFlag(req.query.latest_per_name, true);
+    if (latestPerName === null) {
+      return reply.status(400).send(authErrorPayload("bad_request", "latest_per_name must be true or false"));
+    }
     const nameExact = String(req.query.name_exact ?? "").trim();
     const nameFuzzy = String(req.query.name ?? "").trim();
     const { rows, total } = await MarketplaceDb.listPluginsRepo({
@@ -559,6 +592,7 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
       owner: String(req.query.owner ?? "") || undefined,
       viewerUserId: u.userId,
       isAdmin: isAdmin(u),
+      scope,
       includeDeleted,
       nameExact: nameExact || undefined,
       nameContains: nameExact ? undefined : nameFuzzy || undefined,
@@ -590,6 +624,30 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
     }
     return { ok: true, data: await formatPluginRow(row, true) };
   });
+
+  app.get<{ Params: { pluginId: string }; Querystring: Record<string, string | undefined> }>(
+    "/v1/plugins/:pluginId/versions",
+    async (req, reply) => {
+      const u = getUser(req)!;
+      const id = Number(req.params.pluginId);
+      if (!Number.isFinite(id)) return reply.status(400).send(authErrorPayload("bad_request", "invalid id"));
+      // The same answer GET /v1/plugins/:id gives for this id, so neither is an
+      // existence oracle the other is not.
+      const row = await MarketplaceDb.pluginGetById(id, false);
+      if (!row) return reply.status(404).send(authErrorPayload("not_found", "plugin not found"));
+      if (!canViewPlugin(row, u.userId, isAdmin(u))) {
+        return reply.status(403).send(authErrorPayload("access_denied", "cannot view plugin"));
+      }
+      const rows = await MarketplaceDb.listPluginVersions({
+        name: String(row.name),
+        ownerUserId: (row.owner_user_id as string | null) ?? null,
+        viewerUserId: u.userId,
+        isAdmin: isAdmin(u),
+        includeDeleted: req.query.include_deleted === "true" && isAdmin(u),
+      });
+      return { ok: true, data: { name: row.name, versions: rows.map(formatPluginVersionRow) } };
+    },
+  );
 
   const patchPlugin = async (
     req: FastifyRequest<{ Params: { pluginId: string }; Body?: JsonObject }>,

@@ -277,7 +277,8 @@ async function p1p2Scenarios() {
   // real plugin-backed agent id (plugin_<id>).
   const throwawayPluginResp = await fetch(`${BASE_URL.replace(/\/anthropic$/, "")}/v1/plugins`, {
     method: "POST", headers: { "content-type": "application/json", "x-api-key": API_KEY },
-    body: JSON.stringify({ name: `crud-test-plugin-${tag}`, version: "1.0.0" }),
+    // Temporary: if the run dies before cleaning up, the expiry sweeper does.
+    body: JSON.stringify({ name: `crud-test-plugin-${tag}`, version: "1.0.0", ttl_seconds: 24 * 60 * 60 }),
   });
   if (!throwawayPluginResp.ok) throw new Error(`failed to create throwaway plugin for CRUD tests: ${await throwawayPluginResp.text()}`);
   const throwawayPlugin = (await throwawayPluginResp.json()).data;

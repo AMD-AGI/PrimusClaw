@@ -10,24 +10,1546 @@ Notable changes to PrimusClaw. The format follows
 
 ## Versioning
 
-PrimusClaw is pre-1.0. Until a `v1.0.0` tag exists, treat every interface as
-subject to change and pin what you deploy.
+PrimusClaw publishes three things to its users, and all three are versioned
+the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
-Three things are versioned separately, and they do not currently move together:
+| Release | Tag | Current version |
+|---|---|---|
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
+| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.3 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.10.3 |
 
-| Artifact | Versioned by |
-|---|---|
-| Source | git tags (`v*`), which also trigger the image build |
-| Container images | the git tag on a tag push, otherwise `latest` plus a build timestamp |
-| Helm charts | each chart's own `version` in `Chart.yaml` |
+Every tag is a GitHub Release, and its notes are that version's release notes.
+The Teams app package (its manifest `version`) is not covered by these rules.
+
+### Which number moves
+
+Before 1.0.0:
+
+- **PATCH** for a release that fixes bugs or adds small features: prefer it.
+- **MINOR** only for a big feature or an incompatible change. Each
+  incompatible change is called out on its own in the release notes, with
+  what a deployment or a user has to do, and a MINOR release's notes say
+  which change or feature made it MINOR. Incompatible includes the protocol
+  between the connector and Claw (`claw/packages/protocol/src/remote-agents.ts`),
+  the personal agent's plugin ports (`personal-agent/packages/core/src/plugins/`)
+  and any other export of a published package, not only HTTP APIs and
+  settings.
+
+From 1.0.0 on, [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html):
+MAJOR for an incompatible change, MINOR for an addition, PATCH for a fix.
+
+How this relates to SemVer: SemVer 2.0.0 says nothing about 0.x ("anything
+may change at any time"). PrimusClaw follows the convention npm's caret
+ranges assume instead: within 0.x, MINOR plays the role of MAJOR, so
+`^0.2.3` means `>=0.2.3 <0.3.0` and a PATCH update is always safe to take,
+while a MINOR update may need you to read its notes first.
+
+### When releases are cut
+
+Changes are released in batches, not one release per change: each of Claw,
+the connector and the personal agent is cut at most once in a day's release
+window (06:00-09:00 UTC), from whatever is merged by then. An urgent fix, or
+a release the maintainers ask for, may go out at once, outside the window.
+No release, urgent or not, is cut while the nightly evaluation runs
+(18:17-20:20 UTC), whose results the release checks rely on.
+
+### What each release's notes must say
+
+- What changed, from the pull requests' descriptions (Added / Changed /
+  Fixed, as below), with each incompatible change in its own entry.
+- What it needs from the other releases. Claw names the oldest connector it
+  still serves (`minimum_version`, `CONNECTOR_VERSIONS.minimum` in the
+  protocol, today 0.1.3) and the one it recommends; the connector and the
+  personal agent name the oldest Claw a feature of theirs needs, as a
+  `claw-vX.Y.Z` tag once Claw has one.
+
+### Claw: build ids and release tags
+
+A push to `main` that changes the `claw` image's sources (`claw/packages/`,
+`claw/deploy/`, its package, TypeScript and Docker files; a Markdown-only
+change builds nothing) builds that image and pushes it under two tags:
+`latest`, and the build time in UTC+8 (`YYYYMMDDHHMM`, for example
+`202611112010`), which the image also carries as `CLAW_BUILD`. Build ids stay:
+they are how a deployment is pinned and rolled out, and they are internal
+deployment numbers, not release versions.
+
+A Claw release is a git tag `claw-vX.Y.Z` on the commit of `main` that a
+build id was built from. It does not rebuild anything: the image to deploy
+for it is that commit's build-id image, named in the release notes. Every
+production rollout of a new build id is a release and gets a tag, by the
+rules above (PATCH unless a big feature or an incompatible change makes it
+MINOR), so a user can name the version that carries a fix. Several merged
+changes go out as one rollout in the day's window.
+
+1. Find the commit of the build you are releasing (the Build workflow run
+   that pushed it logs `CLAW_BUILD in image: '<build id>'`; its `headSha` is
+   the commit).
+2. Move the entries in **[Unreleased]** below that this commit carries into
+   a new section `## [X.Y.Z] - YYYY-MM-DD`, with the build id and the
+   requirements above, and merge that to `main`.
+3. Create the release on the commit, with that section as its notes:
+   `gh release create "claw-vX.Y.Z" --target <commit> --title "Claw X.Y.Z" --notes-file notes.md`.
+
+Do not name a Claw tag `v*`: the image workflows run on any `v*` tag pushed
+to the repository, and the Build workflow then rebuilds its images under the
+tag name and pushes the `claw` image under it. `claw-v*` does not match that
+pattern.
+
+The connector and the personal agent are cut as their own READMEs describe
+([connector](connector/README.md#releasing-maintainers),
+[personal agent](personal-agent/README.md#releasing-maintainers)), with the
+version chosen by these rules.
+
+### Pinning a deployment
 
 **`latest` is the chart default and is a moving target.** For anything you
-intend to reproduce, set an explicit image tag — `--set image.tag=<tag>` — and
-record it.
+intend to reproduce, set an explicit image tag — `--set image.tag=<build id>`
+— and record it. The `claw` chart's own `version` in `Chart.yaml` versions
+the chart package (templates, default values and metadata); it is not a Claw
+release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Changed
+
+- Connector: on a paired machine whose configuration is on the container's own file system, the note on where to keep
+  it no longer names the personal agent's bot: it says to "ask the assistant in your chat for a new pairing command".
+  The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
+  The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
+- Personal agent: the worker's `inbound message` line for a Teams activity also says when the client sent the message:
+  `client_ts` (the activity's `localTimestamp`, the client's own clock with its zone offset), `server_ts` (the activity's
+  `timestamp`, or in a 1:1 chat the time its message id encodes), `client_lag_raw_ms` (the second less the first, as
+  measured) and `client_lag_ms` (the same lag, only when it lies between 0 and 24 hours; otherwise the two clocks disagree
+  and only the raw value is logged), and `client_msg_id` when the client put its own message id in `channelData`. A
+  message that reaches the bot late can now be told apart: a large `client_lag_ms` means the client held it, a small one
+  that it was sent late. Only values of a timestamp's or an id's shape are logged; never the text or who sent it
+  (#872).
+### Fixed
+
+- Assistant reviews: a merge (or an approval) that a review the assistant started for the person's own account holds for
+  them now reaches their chat as a card with a button. Until now the assistant told them to press the card's button or
+  reply `批准 #<ref>`, and no card was ever sent: only a review a chat started itself (one asked of someone else) put
+  one to the reviewer, so a person whose review mode is `high_risk_confirm` could answer only by typing the command. When
+  such a review's item comes to need its owner, each held write of its session that asks them goes out once as an
+  `assistant.say` carrying `confirm_write` (kind `github_merge` or `github_review`, with its ref and the button's label,
+  in the person's language); a new held write, such as the merge of a new head, gets its own card. The button calls
+  `POST /v1/assistant/confirmations/:id/decision`, which now makes that decision exactly as
+  `POST /v1/github-review/confirmations/:id/decision` does, for the person it asks only and with how they signed in;
+  the route is registered whenever review items are on. The personal agent draws the two kinds as the other held-write
+  cards, says how the answer ended (merged, queued, approval posted, not merged, new commits, expired, or why it was
+  refused), and gives the card back when Claw could not try it just now.
+- Connector: a message for a conversation typed into its terminal no longer gives up after 10 minutes as
+  `terminal_state_unknown` while a question of Claude Code's own (a permission prompt, such as a dangerous `rm` asked by a
+  background agent) is on that terminal's screen. When Claude Code's registry row for the process cannot be read, the
+  connector proves which conversation the process holds by the name above its input box, and a question hides the box; it now
+  looks at the pane it types into, and a question there is waited out for as long as it is up, then the messages go in, in
+  order. A question on a terminal whose process nothing proves for another reason (no row, or a row that says no status) is
+  said too, but waits `terminalWaitMs` as before. Nothing is ever typed into the question. The `terminal_input_queued` notice says what the question asks (`dialog`:
+  its title and command, such as `Bash command: rm -rf "$(echo …/build)"`, every path cut to its last part and credentials
+  masked first, so that a credential with a `/` in it is never cut into a tail that no longer looks like one, and masked whole
+  when the pane wrapped it onto two rows), and both it and `session_started` say `registry_row_unreadable: true` when the process's row cannot be read.
+- Personal agent: while a message waits for a question on the terminal, the chat says what it asks ("The terminal is
+  waiting for your confirmation: Bash command: rm -rf …", 「终端在等你确认：…」) once per question, and the floating status says
+  "Confirm there" (等你确认) instead of the bare "Waiting" (等终端). When the connector says Claude Code's registry row for the
+  terminal cannot be read, the chat says once per attach that reopening the conversation there with `claude --resume` makes
+  it recognized reliably.
+- Personal agent: a group chat switched to one of the sender's machine sessions can talk to it. With the session card as the
+  window (`REMOTE_WINDOW_DEFAULT=card`, the default), the binder's next @-message went to the assistant instead (only a reply
+  quoting the card reached the session), and every button on the group's session card answered "That button is not active
+  any more". Now each @-message of the binder goes to the session, and the card's Send, Stop, Mode, Full output and Back to
+  assistant work for the binder, as they do in a 1:1 chat. The card says how to get back: press Back to assistant, or say
+  "@bot back to the assistant". Another member's @-messages still go to the assistant, and their press on the card leaves it
+  as it was. The group's card has no Switch button and never shows the binder's lists of sessions and machines; those stay in
+  a 1:1 chat. 1:1 chats are unchanged (#855).
+- Personal agent: a chat attached to a session on a machine shows how a long turn goes while it runs. Next to the step
+  running now, the floating status (in a chat that streams, until the agent's first words) and the progress message count the
+  turn's steps by tool, for example "Working: Bash ×3, Read ×2" ("正在：Bash ×3, Read ×2"); the agent's words between steps
+  still show as they come. A turn of minutes that only ran tools used to show "Thinking…" and its step's title alone. The
+  progress message of such a turn is edited at most every 3 seconds (it was 1.5). The assistant's own turns are unchanged.
+- Personal agent: a message sent to a session that is busy with a turn in its terminal is said to be queued at once, in the
+  chat, once per message: "The session is busy: your message is queued and goes in when the current turn ends." with how to
+  take it back (press ↑ in that terminal when Claude Code's own queue holds it, else /stop); a message said to wait that
+  Claude Code's queue takes afterwards is told once more where it is now. Before, it was at most a short "Queued" line in the
+  floating status or the progress message.
+- Connector: a conversation open in a terminal is read every 250 ms (it was every second), and each event carries the time
+  Claude Code wrote on its transcript line instead of the time it was read, so the steps of one read are no longer dated as
+  one. A step names its tool in `_meta.claudeCode.toolName`, as the Claude Code ACP adapter does. When Claude Code queues a
+  message typed from the phone behind its running turn, the connector now says so once (`terminal_input_queued`, reason
+  `terminal_working`, `held: "terminal"`), also after a notice that the paste was drawn late; before, it said nothing unless
+  the paste was drawn late. After a restart, the events still to be sent go in each session's own order whatever time they
+  carry.
+- Personal agent: when Teams refuses a streamed reply's final message with 403 `ContentStreamNotAllowed` (for example
+  because the person stopped the stream in the chat), the stream is over on Teams' side and the conversation streams
+  again from the next turn. Before, the worker treated the stream as possibly still open for up to 10 minutes after it
+  opened, and every turn in that time showed no floating status: it posted a progress message, sent the answer as a new
+  message and deleted the progress message, which Teams shows as a deleted message above each answer. A final that fails
+  any other way (no answer, a timeout, a server error) still keeps the conversation off streams until Teams' 10-minute
+  limit, since that stream may still be open.
+- Personal agent: a turn that is cancelled (the chat detaches from or switches away from a running session, the machine
+  is disconnected, or the turn breaks off) no longer leaves its progress message in the chat as stale progress: it is
+  deleted, or edited down to one "Interrupted." line where the chat cannot delete it.
+- Connector: a message typed into a terminal whose prompt Claude Code records in words that do not match what was pasted is
+  no longer ended as `terminal_input_unconfirmed` while the terminal answers it. The prompt is compared once both are read
+  alike (paste blocks unwrapped, CRLF and every run of white space as one, one Unicode form, no invisible characters); and
+  when no prompt matches within the 20-second wait but the terminal recorded one after the message's Enter (and Claude Code
+  did not queue the message), that prompt is taken as the message's (until a matching one comes), so its turn and its reply
+  are followed and the turn ends as usual, with `input_unconfirmed: true` on its `turn_end`. A message with no prompt at
+  all after its Enter in that wait still ends as `terminal_input_unconfirmed`, and what the terminal does next is still
+  passed on.
+- Connector: a message the phone stopped before the session answered no longer blocks every later message. Claude Code puts
+  a prompt back into its input box when Esc stops its turn before any answer (measured on Claude Code 2.1.327), and a message
+  refused because its Enter did not submit it stays there too; the connector read that text as someone typing and held every
+  later message as `terminal_typing` for 10 minutes before refusing it. Now it takes such a message out again, only while the box holds exactly that
+  text and no question shows: right after the stop (the next message waits for that), and at the refusal itself. Text
+  anyone else typed or pasted into the box, the same words included, is waited for as before.
+- Personal agent: `terminal_input_unconfirmed` is no longer said as a turn that did not complete or a message that may not
+  have been sent. It says the terminal has not confirmed the message yet, that whatever the session answers still shows in
+  the chat, and to look at the terminal before sending it again; a connector before 0.1.22, which did not recognise a
+  pasted message of several lines, is also told to upgrade. A prompt a connector passes on in Claude Code's
+  `<pasted_content>` block is shown as the text that was pasted.
+
+## [0.5.8] - 2026-11-18
+
+Image `docker.io/primussafe/claw:202611181714` (commit f227c209), released as `docker.io/rocm/primusclaw:claw-0.5.8`. A patch
+release: sandboxes wait for capacity that can come and a run without a sandbox is recorded as failed; under `fully_auto` a
+review the assistant starts merges once it approves; results can be delivered without an Accept, behind a setting that is
+off by default. Schema: one index, `idx_work_items_watching_pr` on `claw_work_items`, created by the API at start. New
+settings, both optional with defaults: `SANDBOX_MIN_RUN_SECONDS` (Brain, default 3600) and `CLAW_ASSISTANT_AUTO_DELIVER`
+(API, default off). Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
 ### Added
+
+- Assistant: `CLAW_ASSISTANT_AUTO_DELIVER` (default off) delivers a worker's ready result without asking for an Accept. The
+  item closes as accepted by policy (an `accepted` event with source `policy`, `accepted_version` set to the delivered
+  version, `params.delivered`), the way a review item closes when it posts its review, and frees its slot at once. The router
+  is told there is nothing to accept and that a reply changes the result; the item's message carries the new
+  `delivered_version` instead of an Accept (`can_accept` is false), and the silent sweep says a delivered result nobody said,
+  as it says an answer. A result that names, in `result.refs`, a pull request the item watches keeps the item open watching it
+  (`params.watching_pr`, also on the message as `watching_pr`): it holds no slot and needs nothing, a comment, a review or
+  failed CI there still sends it back to its worker and the next ready result is delivered as the next version, a worker that
+  only answers the news (`waiting` with no question) goes back to watching, and the merge or close of the last pull request
+  it watches, the end of every watch of it, or 7 days with nothing new on it close the item as delivered. Stopping the item, a Retry, and any run
+  that starts on it end the watching (and a stop or Retry the delivered mark), so a watch never closes an item that is
+  worked on again. A watching item's sandbox gives up its
+  background work as one that waits for a person does. Off, a ready result waits for the user's Accept as before (#873).
+
+- Assistant: `work_send` reopens an item whose result was delivered by policy in the last 7 days, so a reply asking for a
+  change produces the next version of the same item. An item the user stopped, one they accepted themselves and one delivered
+  longer ago stay closed (`item_closed`) (#873).
+
+### Changed
+
+- Assistant reviews: a review the assistant's router starts or restarts with `merge=true` ("review and merge it for me")
+  for a person whose review mode is `fully_auto` now merges once the review approves, without asking them. Until now
+  every such review held its merge for the person's confirmation (the card's button or `批准 #<ref>` / `approve #<ref>`)
+  whatever their mode, on the reasoning that the router reads `merge=true` from a sentence and natural language never
+  approves a merge. A person who chose `fully_auto` has already said that nobody needs to confirm their merges, and asked
+  for a confirmation on exactly the reviews they asked for in their own words; under that mode their sentence is now
+  enough. Everything else that holds a merge still holds it: what the repository itself requires (its branch rules and
+  required checks, `confirm_merge` in `.github/claw-review.yml`), failed CI, open review threads, and an earlier approval
+  or merge of the same commit that waits for the person or that they refused. Under
+  `high_risk_confirm` (the default) nothing changes: the merge waits for the person's own confirmation, at any risk.
+  The mode is read when the review starts and stored on its item and session (`merge_needs_confirmation`, now only for
+  a mode other than `fully_auto`); the router's restart reads it again. Every review the router started is marked
+  (`config.started_by_assistant`), and one started under `fully_auto` asks for the merge after all once the person has
+  left `fully_auto`. The router's answers say how each review merges from that review's own `merge_needs_confirmation`
+  (in `review_start` and `review_restart`, and on each review in its item list), never from the mode alone; it no longer
+  says it cannot change the review mode: `review_mode_set` sets `high_risk_confirm`, and `fully_auto` is still turned on
+  only by the person, in their settings. The personal agent's review-mode card names `fully_auto`
+  "全自动合入（仓库自身要求的检查仍然生效）" / "Fully automatic merge (the repository's own requirements still apply)" and
+  says it covers reviews asked for in the chat (#874).
+
+### Fixed
+
+- Sandboxes: a sandbox that waits for capacity which can come is no longer given up on after 5 minutes. When the platform
+  has admitted a sandbox and the autoscaler is not adding a node for it yet for a reason that ends on its own (every account
+  it buys nodes as is at the scheduler's per-user limit, a node is still being given back, the pool is at its limit and
+  releases an idle node, a purchase in backoff; or the pod is held at a scheduling gate), the wait is a wait for capacity,
+  like a node being added: it runs on `SANDBOX_PENDING_TIMEOUT_SECONDS` (3 hours) and is never cut short by
+  `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS`, which used to end every GPU run that had to queue in a burst pool with
+  `sandbox_unschedulable`. The user is told what the sandbox waits for, with the autoscaler's reason. A refusal that no
+  wait settles (no pool serves the workspace, the pod fits no node of a pool, more nodes at once than a pool may hold)
+  still ends at the 5-minute limit. A request that names its own `timeout` waits for capacity at most that timeout less
+  the new `SANDBOX_MIN_RUN_SECONDS` (default 1 hour; chart value `secret.sandboxMinRunSeconds`), because SaFE counts a
+  sandbox's lifetime from admission and a wait after it is spent out of the run's own time: a 25200-second request waits
+  up to 3 hours and keeps at least 4 hours to run (#863).
+
+- Runs: a run whose sandbox the platform had no capacity for is recorded as failed. Its turn still ends with the agent's
+  answer, but `GET /v1/runs` used to report it as `exited` with no exit code and an empty `failure_reason`, so a caller
+  could not tell it from a run that finished. It is now `failed` with the provisioning code (`sandbox_unschedulable`,
+  `sandbox_pending_timeout` or `sandbox_start_timeout`), and the terminal block has a new `failure_message` field with the platform's reason (`""` when the run recorded nothing beyond
+  its code). Task and DAG runs report the same through their callback (#863).
+
+## [0.5.7] - 2026-11-17
+
+Image `docker.io/primussafe/claw:202611171700` (commit 5dcee066), released as `docker.io/rocm/primusclaw:claw-0.5.7`. A patch
+release: app runs get a `USER_DATA_PATH` where SaFE sets none and fail at once when none can be had, and the server's own
+GitHub calls no longer use up a review session's request budget. One schema change, applied by the API at start: a nullable
+`budgeted` column on `claw_github_audit`. No new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3,
+recommended 0.1.4).
+
+### Fixed
+
+- App runs: a sandbox that SaFE gave no `USER_DATA_PATH` (a workspace whose hostpath volume does not set
+  `enableUserDir`) gets one from Claw, the way SaFE derives it: `{mountPath}/users/{USER_ID}`, from the first of the
+  workspace's hostpath volumes that is mounted in the sandbox, created when missing. The state directory, the files
+  written for the app and the app's own environment all use it. A value SaFE set is never replaced. When none can be
+  derived (no such volume, no `USER_ID`) or the directory cannot be created, the run now fails at once with that reason
+  instead of spending its restarts and their backoff on the same refusal, which held the task in executing, with no
+  error, until it was cancelled. A workspace that cannot be read (SaFE unavailable) is asked again; only a refusal from
+  the sandbox ends the run; a workspace the run owner's key may not read is reported as such (for example "the
+  workspace's volumes could not be read (HTTP 403)"). An app whose `state_dir`, command and bootstrap file never name
+  `USER_DATA_PATH` is not affected: nothing is derived or checked for it, and it runs as before (#861).
+- GitHub review: the server's own calls no longer use up a review session's GitHub request budget
+  (`CLAW_GITHUB_REQUESTS_PER_SESSION`). The look at a review item's pull request every 90 seconds, the pull request check
+  made before the session's first turn and a person's answer to a held write are recorded as not held to the budget (a new
+  `budgeted` column on `claw_github_audit`; follow-ups and checks recorded before it are left out by name). A review item
+  open for hours had its budget spent by those follow-ups, so its re-run in the same session was refused at its first read.
+  A review whose session does run out of GitHub requests before it posts anything now ends as not reviewed: whoever asked
+  for it is told so and to ask again, which starts a new session, and the reviewer is no longer asked to look at it as
+  stuck. An item left waiting for the reviewer that way ends at the first sweep after the upgrade. A review that had already
+  changed the pull request before its requests ran out (it resolved review threads of the last review, or sent a review or a
+  merge) is partly done instead: the reviewer is asked to look at it, and whoever asked is told what was done (#856).
+
+## [0.5.6] - 2026-11-16
+
+Image `docker.io/primussafe/claw:202611141536` (commit f724d50b), released as `docker.io/rocm/primusclaw:claw-0.5.6`. A patch
+release: the assistant cites a project's latest GitHub release page it read; it also carries 0.5.5, which was not published
+to rocm/primusclaw. No schema change, no new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3,
+recommended 0.1.4).
+
+### Fixed
+
+- Asked for a project's latest release with its source, the assistant now links the release it read. It reads the latest
+  release at `https://github.com/<owner>/<repo>/releases/latest`, and the release page GitHub sends it to in the same
+  repository can now be cited. Before, that citation was refused, and the answer went out with no source at all. A page
+  reached any other way still cannot be cited unless a search or the user gave its address. When a citation is refused,
+  the assistant is told to search for the page and cite the result instead of dropping the source (#854).
+- From 0.5.5: asked which model it runs on, the assistant names its own model (#853).
+
+## [0.5.5] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611141305` (commit 29a12de5). It was not published as `docker.io/rocm/primusclaw:claw-0.5.5`:
+its change ships with the next release. A patch release: asked which model it runs on, the assistant names its own model. No schema change, no new setting. Connector
+requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- Asked which model it runs on (你用的什么模型), the assistant names its own model instead of saying it cannot see it: every
+  router turn is told the model it runs on (the turn's own, else the deployment's `DEFAULT_MODEL`, with the model reported for
+  the latest answer when that differs), and that the models work items and reviews run on are chosen for each of them and are
+  the workers', not its own. The router's self section is `router-self-v4` (#853).
+
+## [0.5.4] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611141122` (commit dd8d4685), released as `docker.io/rocm/primusclaw:claw-0.5.4`. A patch
+release: the assistant answers greetings and questions about itself briefly. No schema change, no new setting. Connector
+requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- The assistant answers a greeting, a thanks or a sign-off in one short line, without listing what waits for the user, and a
+  question about itself briefly: "who are you" in one to three sentences, "what can you do" or "help" with at most four
+  examples and, in Teams, a pointer to `/help` for the full list, instead of every tool and system it has. The router's
+  self section (`router-self-v3`) gives each kind a length budget; a chat app other than Teams is told of no help command (#852).
+
+## [0.5.3] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611140835` (commit 04efef14), released as `docker.io/rocm/primusclaw:claw-0.5.3`. A patch
+release: a review asked of someone else no longer wakes the reviewer when it never reached its tools or found its pull
+request already merged. No schema change. One new optional setting, `MCP_REQUIRED_CONNECT_BUDGET_MS` (Brain, default
+30000), which needs no change to take effect. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- Reviews asked of someone else: a review turn now waits for its `github_review` tools for up to
+  `MCP_REQUIRED_CONNECT_BUDGET_MS` (default 30 s, never shorter than `MCP_CONNECT_BUDGET_MS`; 0 waits however long it takes)
+  instead of the 2 s every other MCP server gets, so a cold connection no longer ends the review having done nothing. A review
+  whose turn still called no review tool is run once more by itself; if that also does nothing, the item closes and whoever
+  asked for the review is told to ask again. The reviewer is not asked to look at it (#850).
+- A review that ran again on new commits and found the pull request already merged (its approval or merge refused
+  `already_merged`) ends as accepted, and writes made on a head the review has since moved past no longer decide its state.
+  Before, a merged pull request could still be handed to the reviewer (#850).
+
+## [0.5.2] - 2026-11-14
+
+Image `docker.io/primussafe/claw:202611140544` (commit 26e87d49), released as `docker.io/rocm/primusclaw:claw-0.5.2`. A patch
+release: the assistant answers the date and weekday in the user's time zone. No schema change, no new setting. Connector
+requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- The assistant answers "what day is it" (今天星期几, 今天几号, tomorrow) in the user's time zone, not in UTC: every router
+  turn is told what now is for the user, the date, weekday and time in their zone first and UTC beside it. The zone is
+  `channel_context.timezone` when the chat sends one (an IANA name; the personal agent sends the one set with `/timezone`,
+  else the default its quiet hours use), and Asia/Shanghai otherwise. Asked after midnight in Beijing, it said the UTC
+  weekday, with the right one only in a note (#847).
+
+## [0.5.1] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611132353` (commit 7b9b4318), released as `docker.io/rocm/primusclaw:claw-0.5.1`. A patch
+release: a stated recurring format still gets its skill draft card, and the card asks for no typed approval. No schema
+change, no new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- Personal skills: a statement of how the user always works ("以后我的会议纪要都是这个格式") that the router took for a request to
+  save (`skill_save`, refused as not asked, nothing saved) no longer stops the server's draft after the turn; a save refused for what
+  the skill holds still does. A skill draft's card waiting for the user is listed to the router as answered on its card, without
+  the typed approval command, so the router no longer tells the user to type `批准 #ref` for it; the router's skills prompt
+  (`router-skills-v5`) says such a statement is never a request to save (#844).
+
+## [0.5.0] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611132114` (commit 7e25dd5a), released as `docker.io/rocm/primusclaw:claw-0.5.0`. A
+minor release, because it is incompatible for a chat client that sends no `channel_context.assistant_name`: Claw no longer
+names any client, so a question that names the assistant by a client's name is no longer recognised as being about the
+assistant until the client sends its name (#834). **Migration:** send the client's display name as
+`channel_context.assistant_name` on every message to the assistant (personal agent 0.10.0 does, from its configured bot
+name). Also: a stated way of working is drafted as a skill after the turn, and every router turn is told which skills exist
+now (#840). No schema change, no new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended
+0.1.4).
+
+### Added
+
+- `channel_context.assistant_name` on an inbound assistant message: the name a client's people call the assistant by
+  (letters, digits, spaces and `_ ' -`, at most 32 characters and 4 words; anything else, sentence punctuation
+  included, is dropped, never refused). The router is told it is that assistant, by that name quoted as a name only,
+  in its self section (`router-self-v2`), the GitHub binding line (`router-read-v17`) and the attached-chat line (#834).
+
+### Changed
+
+- **Breaking:** Claw no longer names any chat client: the assistant's prompts, the `claw_self_status` tool description,
+  comments and docs no longer carry a client's name, which collided with third-party products. A client that sends no
+  `assistant_name` gets a router told only that it is PrimusClaw's assistant, so a question that names the assistant by
+  a client's name (for example "how is <name> doing") is no longer recognised as being about the assistant itself.
+  Migration: the client sends its display name in `channel_context.assistant_name` on every message; the personal agent
+  does so from its configured bot name (#837). Until a client does, its name is not known to the router (#834).
+
+### Fixed
+
+- Personal skills (with `CLAW_USER_SKILLS_ENABLED`): a skill suggestion no longer depends on the model calling `skill_draft`.
+  When the user's message to their assistant states a way they always work ("我每次都按…写", "以后…都…", "always …",
+  "from now on …") and the turn saved and drafted nothing, the server drafts the skill from the conversation after the turn and
+  shows the same draft card (Save / Discard); nothing is saved until Save. Never in a group's conversation, never for a message
+  that was not the signed-in person's, at most one card per skill name per conversation, none for a day after a Discard there,
+  a few a day at most, and the model writing the draft may decline (#840).
+- Every router turn is told what the user's skills are now, from the database: how many (or none), which were deleted or undone
+  lately, and how many are turned off or used only when named. The router's prompt says to trust this over anything the
+  conversation said earlier, so a skill deleted earlier in the same conversation is no longer reported as existing (#840).
+
+## [0.4.5] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611131924` (commit 7e1f3ca8), released as `docker.io/rocm/primusclaw:claw-0.4.5`. A
+patch release: a skill the assistant suggests is always a draft card, and the deployment defaults name the released
+images. No schema change, no new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Changed
+
+- Deployment defaults pull the released images from `docker.io/rocm/primusclaw`: the Claw chart's image is
+  `docker.io/rocm/primusclaw:claw-latest` (was `docker.io/primussafe/claw:latest`), and `claw/deploy` without `REGISTRY`
+  pulls `docker.io/rocm/primusclaw:<TAG>` with `TAG` defaulting to `claw-latest`; with `REGISTRY` set it is
+  `$REGISTRY/claw:<TAG>` as before. A build of main stays `docker.io/primussafe/claw:<build>` (#836).
+
+### Fixed
+
+- Personal skills (with `CLAW_USER_SKILLS_ENABLED`): a skill the assistant suggests on its own is a draft card, never a question
+  in words. `say` refuses a message that asks whether to save something as a skill until the turn has called `skill_draft`
+  (whose card, with Save and Discard, is the question), and the router's prompt and the tool's description say so. A skill
+  written from a conversation may not name a skill the user deleted or undid. `skill_list` adds `deleted_lately`: each skill
+  the user had and has no longer, deleted or undone, and when, so "does this skill exist" is answered as it is (#835).
+
+## [0.4.4] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611131535` (commit ce688380). A patch release: personal skills are saved from the
+conversation, with a card to undo or edit, while `CLAW_USER_SKILLS_ENABLED` is on. Schema: the new table
+`claw_skill_changes`, added at start-up. No new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3,
+recommended 0.1.4). Personal agent 0.9.0 shows the cards and `/skills`.
+
+### Added
+
+- Personal skills are saved from the conversation (with `CLAW_USER_SKILLS_ENABLED`). When the user asks the assistant to
+  save something as a skill ("save this as a skill", 存成技能), the router saves it itself with the new tool `skill_save`,
+  quoting the user's request, which must come from the message it answers and ask for a save; the user gets a card
+  (`skill_card` on `assistant.say`) with what was saved and Undo and Edit. A skill the assistant suggests on its own
+  (`skill_draft`), or a worker's `save_skill` without the user's own request quoted (`request_quote`), is a draft: a
+  card with Save and Discard (a `skill_save` confirmation), saved only when the user presses Save, types the approval
+  command, or says yes. `skill_list`, `skill_update`, `skill_disable`, `skill_enable`, `skill_delete` and `skill_undo`
+  manage them; every change is undoable for a day (`POST /v1/users/:userId/skill-changes/:id/undo`). The same skill
+  under another name is refused as a duplicate. A secret or an instruction to override the agent is refused on every
+  path, with where it is. A skill the message names (`weekly-report`, `/report`) is given whole with the message, in a
+  router's turn and a worker's, so a `manual` skill is used. New routes for a chat's `/skills` command:
+  `GET /v1/users/:userId/skills?view=current`, `GET /v1/users/:userId/skills/:name?view=current`,
+  `POST /v1/users/:userId/skills/:name/disable|enable`, and the drafts at `/v1/users/:userId/skill-drafts`. New table
+  `claw_skill_changes`, new metric `claw_user_skill_save_total`. With the switch off nothing changes: the router's
+  request is byte for byte what it was, and the routes are as they were (#823).
+
+## [0.4.3] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611131319` (commit f44b5d0f). A patch release: a delivery link can send a signed-out
+browser to sign in (off unless `CLAW_BROWSER_SIGN_IN_URL` is set), and two dependency updates. No schema change.
+Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Added
+
+- A delivery link opened in a browser with no session can send it to sign in and back: with the new setting
+  `CLAW_BROWSER_SIGN_IN_URL` (for example `/login?redirect=`), `GET /v1/sessions/:id/deliveries/:deliveryId` that
+  carries no credential at all and whose `Accept` names `text/html` is answered 302 to that address with the link's
+  external path (the public path prefix from `CLAW_PUBLIC_URL`, else `X-Forwarded-Prefix`, included) URL-encoded at
+  the end, instead of the JSON 401. API clients, a credential that was presented and refused, and every other route
+  answer as before; unset, the default, nothing changes (#822).
+
+### Changed
+
+- Dependencies: `@hono/node-server` 2.1.5 to 2.1.8 (#817) and `hono` 4.13.13 to 4.13.18 (#820), lockfile only.
+
+## [0.4.2] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611131057` (commit 61998b05). A patch release: personal skills reach the assistant's
+router and Brain, both only while `CLAW_USER_SKILLS_ENABLED` is on; with it off, the default, nothing changes. No schema
+change, no new setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Added
+
+- The assistant's router sees the user's personal skills: with `CLAW_USER_SKILLS_ENABLED`, a router turn of the
+  user's own assistant is given, with its message, each current, enabled skill that applies on its own (name and
+  description, an imported one marked, most recently used first, at most 2000 characters), and reads one with the new
+  read-only tool `skill_read` (SKILL.md in pages with its file list, or one file). The system prompt gains a fixed
+  section only, so it stays the same from turn to turn. `skill_read` may follow a lookup and is not a `read_taint`
+  source, so a router that read a skill can still start the work. Never for an observer, a worker or a session marked
+  `config.memory: "off"`. New metrics `claw_user_skill_listed_chars`, `claw_user_skill_truncated_total` and
+  `claw_user_skill_read_total` (#809).
+- Brain uses a turn's personal skills the way it uses the platform's: listed by name and description under their own
+  heading (most recently used first; `manual` ones never listed; imported ones marked and, when loaded, wrapped as
+  a third party's text), read with `load_skill` from `POST /v1/internal/skills/read` at the fingerprint the turn was
+  told, and written into the sandbox at `.skills/.personal-skills/<name>/` only when a command names one. Of the
+  on-demand list's 8000 characters, personal skills have 3000 (and 20 entries) to themselves, the other skills fit
+  in what that leaves, and personal skills then take what the others left; one the list has no room for is still
+  loaded by name. A name means, in order: what the request itself carries (plugin, a caller's skill, a marketplace
+  tool of the turn), the personal skill, the bound repository's, the platform's default. `.personal-skills` is left
+  out of every workspace snapshot, the S3 archive included (a reserved name). A use is reported in `skills_used` at
+  the turn's version. Metrics `claw_user_skill_{listed_chars,listed_total,truncated_total,read_total,staged_total}`.
+  Not when the request lacks `user_skills_enabled`, acts as a user, or is a router's or observer's turn; off while
+  `CLAW_USER_SKILLS_ENABLED` is off, the default (#810).
+
+## [0.4.1] - 2026-11-13
+
+Image `docker.io/primussafe/claw:202611130845` (commit c125d616). A patch release: one fix. No schema change, no new
+setting. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Fixed
+
+- A review someone else asked for whose merge GitHub refused for a reason the reviewer cannot clear no longer wakes the
+  reviewer as blocked: the branch conflicts with the base (`DIRTY`: the author has to resolve it), the branch rules
+  block it (`BLOCKED`: the author or CI has to meet them), or the pull request changes a CI workflow and the reviewer's
+  GitHub authorization lacks the `workflow` scope (it has to be merged by hand on GitHub). The item stays in progress
+  and says what it waits for, and the requester is told once per head commit, with what comes next.
+  New commits run the review once more in its session; with none within 24 hours the item goes to the reviewer as
+  blocked. A refusal on a head whose wait already ended needs the reviewer. A restart drops the wait (#816).
+
+## [0.4.0] - 2026-11-12
+
+Image `docker.io/primussafe/claw:202611130054` (commit cf083e95). A MINOR release: personal skills get their own switch
+and a new storage and audit model, assistant messages return to the chat surface they came from (a new `surface` field on
+notification subscriptions), and the API gains `CLAW_API_BACKGROUND`. Schema, all additive and added at start-up:
+`claw_notification_subscriptions.surface`, `claw_assistant_surfaces`, five `claw_skills` columns, `claw_skill_events`
+and `claw_skill_drafts`. Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+Data-loss fixes: a workspace restore that failed can no longer make the next save delete the session's saved files
+(#804), and a workspace past about a thousand files is restored in batches instead of coming back empty (#805). Prompt
+change: the assistant's worker prompt is now `worker-v12` (`worker-v13` with the discipline switch on) (#813).
+
+### Added
+
+- `CLAW_API_BACKGROUND` (`on` by default, or `off`): off, the API answers HTTP and starts no background loop -- no
+  scheduler, sweeper, external resolver or run-event consumer, no evolve, upload or plugin-expiry sweep, no trigger
+  scheduler, no notification or A2A push delivery (a request's own kick included), no GitHub-event or job watch, no daily
+  session maintenance, no deferred index build or boot-time SYSTEM_ENV publish, and none of the remote agents' wake relay
+  or sweeps. For a process serving requests against a database whose other replicas run that work. Startup logs
+  `api.background_off` naming every loop skipped; any other value is refused at startup. No schema change (#807).
+- A user's personal skills reach their turns as a list, not as text: a turn of the user's own conversation carries
+  `user_skills` (name, version, description, invocation, fingerprint and origin of each skill that is active and
+  enabled; never a probation, disabled or deleted one), and Brain reads a skill only when it is used, from
+  `POST /v1/internal/skills/read` (SKILL.md and its file list, or one file; the internal token, a live chat turn of
+  the session, and the session's owner as the user). This replaces the per-turn LLM selection that put up to three
+  whole skills into `skills` (`selectSkillsForTask`, and `MAX_SELECTED_SKILLS` with it). Only the user's own
+  conversations get the list, and only they keep what a turn saves: not a group chat (`config.memory: "off"`), a
+  session that acts as a user or runs a review, an assistant router's or observer's turn, an application's run, or a
+  session that carried an A2A, task or DAG run. Brain does not use the list yet. Off while `CLAW_USER_SKILLS_ENABLED`
+  is off, the default (#806).
+
+### Changed
+
+- Personal skills have their own switch, `CLAW_USER_SKILLS_ENABLED` (off by default): a user's skills reaching their
+  turns and the skills a turn saves (`save_skill`, `*_skill_file`). Skills the platform writes on its own (pattern
+  promotion, evolution, feedback, probation) are `CLAW_SKILL_AUTO_EVOLUTION_ENABLED` (off by default); the old name
+  `CLAW_SKILL_EVOLUTION_ENABLED` still sets that one, and only that one, while the new name is unset. A deployment that
+  had `CLAW_SKILL_EVOLUTION_ENABLED=true` keeps auto-evolution and loses the user's own skills until it sets
+  `CLAW_USER_SKILLS_ENABLED=true`. Brain offers the skill-writing tools by the new request field `user_skills_enabled`
+  (from an older API, by `skill_evolution_enabled` as before), and never in a session that acts as a user; tasks, DAG
+  nodes, application runs and A2A turns are sent `false`. Every save of a user's skill, from the routes or a
+  turn, now passes one set of checks: a new name is kebab-case (`^[a-z0-9][a-z0-9-]{0,63}$`; a name stored before
+  keeps working), at most 50 skills per user and a save past that is refused (409 on the routes) instead of deleting
+  the least used one, SKILL.md at most 20000 characters (was 2000 on the routes, 5000 from a turn), a description 300,
+  a file 64 KB (was 10 KB), 20 files and 256 KB per skill (was 50 KB), no credential (the answer names the file and
+  line, never the text) and no instruction to override the agent (`scanInjection`, Chinese included). The platform's own saves are refused when full as
+  well (and past five unproven ones, where the oldest unproven skill used to be deleted), checked for length,
+  credentials and injection, kept within the per-skill limits, and audited. A refused route
+  write answers with `reason` and, for a secret or injection, `at: {file, line, kind}` beside `error`. Schema, added
+  at start-up: `claw_skills.enabled`, `origin`, `content_sha`, `last_used_at`, `invocation`, and the tables
+  `claw_skill_events` (every save, refusal, file change, rollback and delete) and `claw_skill_drafts` (unused until
+  saving from a conversation is confirmed by the user; drafts older than 24 hours are deleted daily) (#801).
+- An assistant message goes to one of a person's chat surfaces, not to every subscription they have ("return to source"):
+  a reply of a turn (and a channel action it hands over) goes back to the surface the person's message came from
+  (`channel_context.channel`; none said is `teams`), and a proactive one (an item's update, a needs-you, an approval card,
+  a scheduled or long run's end) to the surface they wrote from last. A surface with no subscription that takes the event
+  falls back to the next most recent one; a person who never wrote, or whose subscriptions all name one surface, gets it
+  on each, as before. A subscription names its surface with the new `surface` field (`POST`/`PATCH
+  /v1/notification-subscriptions`, a lowercase label; absent is `teams`); the Teams worker of the personal agent sends
+  `teams`, and an older worker, which names none, is `teams` too. Outbox, signing, retries, redelivery and the say caps
+  are unchanged. Schema: `claw_notification_subscriptions.surface` (default `'teams'`) and the new table
+  `claw_assistant_surfaces`, both added at start-up; no new setting (#787).
+- A router turn picks the assistant plugin's reply-style rule and its own wording by the chat app the message came
+  through (`channel_context.channel`): `teams-reply-style` and "In Teams people call you Clawy" for Teams, the generic
+  `chat-reply-style` and "in the chat" for any other channel. A message that names no channel (a Teams worker from
+  before it did) keeps Teams' rule and words, so nothing changes for Teams. Before a chat app other than Teams goes
+  live, add a `chat-reply-style` rule to the assistant plugin (`CLAW_ASSISTANT_PLUGIN_ID`); without it such a turn gets
+  no reply-style rule. No schema change, no new setting (#790).
+- The assistant's worker prompt (`worker-v12`; `worker-v13` with the discipline switch on) makes a GitHub write that
+  leaves the same state however often it runs (a star or unstar, a watch, a label) the first command when the task
+  asks only for it, with no read of the current state before it, and checks after the write; such a request's card
+  came at 8.5-17.7 s instead of 2.5-3.9 s. The router's `work_create` tool says its `repo` is cloned into the worker's
+  workspace first, so it is passed only when the work reads or changes that repository's files, not for API-only
+  actions (a clone took 27.8-32.3 s before the worker's first step). No schema change, no new setting (#813).
+
+### Fixed
+
+- A sandbox whose workspace could not be restored from object storage (Hands refused the download with 413, the listing
+  failed, or files were still missing after the retries) no longer lets the save after the turn delete the session's
+  saved files: such a save only adds files the saved copy does not have, and replaces and deletes nothing, for as long
+  as the sandbox lives. Before, it pruned every saved file the restore had not brought back (534 files down to 52) and
+  reported success. The failed restore is reported to the session as `sandboxStatus` `workspace_restore_failed` (reason
+  `payload_too_large`, `sandbox_unreachable` or the error class), and counted in
+  `claw_brain_workspace_restore_total{result}`. No schema change, no new setting (#804).
+- A terminal's work item title keeps the machine's and the tool's names whole and cuts what was asked after its last whole
+  word, ending in "…" (never inside an emoji or a combined character), instead of cutting the whole line at 40 characters
+  ("gpu-dev-pod-7f3k2-node-0 Claude Code：wor"); when the names leave less than 16 characters, what was asked keeps 16,
+  the word crossing them whole, and the title runs past 40. An item an older Claw titled is renamed on its next request, as
+  before. No schema change, no new setting (#792).
+- A sandbox's workspace is restored from object storage in batches Hands accepts (100 files, at most 256 KiB of file
+  list, a call), as the upload has long been sent, instead of in one call: a session past about a thousand files was
+  refused with 413 and its workspace came back empty (measured on a 3,632-file clone). A batch that fails is retried
+  alone; an unreachable sandbox still stops the restore at once. The uploads given to a reused sandbox go in the same
+  batches. Concurrent first calls on a fresh Hands client now share one connect instead of all but one failing with
+  "Already connected to a transport". No schema change, no new setting (#805).
+
+## [0.3.1] - 2026-11-12
+
+Image `docker.io/primussafe/claw:202611121517` (commit e7255a96). No schema change, no new setting. Connector requirements
+unchanged from 0.1.0.
+
+### Fixed
+
+- A question a terminal asks names the tool that asked ("Claude Code", "Codex", "Cursor", from the connector's
+  `session_started.agent`, sent by connector 0.2.0) in the work item's title, the ask message and the "many are waiting"
+  message, instead of the connector's agent id (`claude-sessions`); items opened before keep working and are renamed on
+  their next request. The notice carries it as `remote.tool` (protocol `AssistantRemoteNotice.tool`), which personal
+  agent 0.7.1 shows on the card; an older worker keeps the agent id there. The one-minute "waiting in a terminal" notice
+  says "Claude Code", not "Claude Code (existing sessions)" (#779).
+
+## [0.3.0] - 2026-11-12
+
+Image `docker.io/primussafe/claw:202611121326` (commit 86eeb027). A minor release; no schema change; new setting
+`CLAW_ASSISTANT_CHOICES` (on by default). Choice cards and the chosen reply language need personal agent 0.6.0 or later;
+an older worker ignores a say's `choices` and shows its text, which names the options, and sends no reply language. The
+per-agent notice needs connector 0.2.0; with an older connector every terminal question keeps Claude Code's wording.
+Connector requirements otherwise unchanged from 0.1.0.
+
+### Added
+
+- The assistant's `say` can put a choice to the user: `choices` carries the options (2 to 10, one plain line each) and
+  whether several may be picked, and the tool tells the model to use it whenever it asks the user to pick among options.
+  `assistant.say` and the session's `AssistantSay` event carry it as `choices`; a channel shows it as a card whose Send
+  sends what was picked as the user's next message. A choice that does not fit is left out whole and the message still
+  goes. New setting `CLAW_ASSISTANT_CHOICES` (on by default); no schema change (#765).
+- A reply language a person chose (personal agent 0.6.0+ sends it as `channel_context.reply_language`, `zh`/`en`) governs
+  the assistant's answers: the reply-language line, say's mismatch refusal, the start notice and the system's own notices
+  follow it; without a choice, the language is still read from each message. `/lang en` now also refuses an answer that is
+  Chinese with no English of its own. A message that asks for a text in a named language ("answer in English",
+  "用英文回复", a translation) still gets it (#771).
+
+### Changed
+
+- The needs-you notice of a question a terminal asks says how that agent's terminal asks, read from the connector's
+  `terminal_asks` (protocol `AssistantRemoteAsk.terminal_asks`: absent for Claude Code, `after_card` for Cursor,
+  `on_input` for Codex, sent by connector 0.2.0); Claude Code's wording is unchanged (#773).
+- The `claw` image no longer contains npm or npx (it never ran them; the image scan found six HIGH findings in the base
+  image's bundled npm) nor `packages/*/test` (#774).
+
+## [0.2.1] - 2026-11-12
+
+Image `docker.io/primussafe/claw:202611120828` (commit 0412146c). No schema change, no new setting. Connector requirements
+unchanged from 0.1.0.
+
+### Fixed
+
+- An assistant answer that tells the user to send `/agent attach <session id>` is delivered instead of being held back as
+  internal text: the UUID right after `/agent attach` is let through, like one the user wrote (only in that position). Plain
+  text whose only internal text is an id is delivered with the id replaced; any other withheld answer tells the user why
+  it was not sent, instead of asking them to say it again (#757).
+- A review asked again of a pull request whose head the same account has already reviewed, and that therefore posts
+  nothing, is no longer marked blocked with the reviewer asked to look at it: whoever asked is told why, the review waits
+  for CI on that head and runs once more when it is green, and otherwise ends as done with nothing new to post (#758).
+
+## [0.2.0] - 2026-11-11
+
+Image `docker.io/primussafe/claw:202611120713` (commit da45d1eb). A minor release: two additions to the deep GitHub review,
+nothing incompatible; new setting `CLAW_GITHUB_REVIEW_FINDING_CHECK` (on by default), no schema change. Connector
+requirements unchanged from 0.1.0.
+
+### Added
+- The deep GitHub review checks its own findings before posting them: one separate model call, which sees the change, its
+  description and the findings but not the review's reasoning, withdraws the non-blocking notes the diff contradicts, that
+  the change did not introduce, that name no wrong outcome, that repeat another or that the author would most likely leave
+  (`CLAW_GITHUB_REVIEW_FINDING_CHECK`, on by default; it fails open). Inline findings are always posted as written; the ones
+  the check doubts are reported back to the reviewer. Notes are passed to `gh_review_submit` as `non_blocking` and listed
+  under the body. Every changed file needs a conclusion in `coverage` (a missing one refuses the review, a skipped one is
+  named and stops an approval), and the instructions carry short checks for the languages the change touches (#750).
+- The deep GitHub review places each finding by the code it quotes (`existing_code`): a comment whose line number is off is
+  posted on the line the diff shows that code on, and the result names each move. A re-review no longer opens a second
+  thread where a thread of the last review is still open: that finding is said in the body (#753).
+
+## [0.1.2] - 2026-11-11
+
+Image `docker.io/primussafe/claw:202611120220` (commit 56304d8d). #752 fixes a regression #744 introduced; deploy both
+together, never #744 alone. `claw_sessions` gains `workspace_save_id`, `workspace_save_until` (#744) and
+`workspace_save_task_id` (#752), added by the API's `initDb` at startup; roll the API before Brain. Connector requirements
+unchanged from 0.1.0.
+
+### Fixed
+
+- Brain ends a turn on the session before saving the workspace: the session is idle as soon as the answer is out and the
+  save runs in the background. A message sent during the save waits in the API's queue and runs once the save ends; an
+  error after `exec_complete` no longer re-runs the turn; `/files` reports `saving` meanwhile (#744).
+- A run whose workspace save is still in progress keeps its sandbox and its lease until the save ends: the API answers
+  the saving run's lease renewals instead of refusing them as terminal, and the orphan sweep, the agent-done stop and the
+  settled-session park wait for the save. Without it, #744 lost any save that took longer than a few seconds (the sandbox
+  was destroyed mid-upload) (#752).
+
+## [0.1.1] - 2026-11-11
+
+Image `docker.io/primussafe/claw:202611112033` (commit 8566ebd5). Connector requirements unchanged from 0.1.0.
+
+### Fixed
+- A turn stopped with `/stop` while Brain was still setting it up now ends on the session's event stream: Brain emits a
+  main-agent `ResultMessage` with `subtype: "interrupted"` before `exec_complete` (the A2A stream reports it `CANCELED`), so a
+  group chat's "Thinking…" no longer stays up until the worker's turn deadline (#737).
+
+## [0.1.0] - 2026-11-11
+
+The first tagged Claw release, a baseline for what was deployed on that day; every entry below is in it. Image
+`docker.io/primussafe/claw:202611112010` (commit 21ffe4ef). Serves connectors from 0.1.3 on and recommends 0.1.4 or later
+(`CONNECTOR_VERSIONS`); answering a terminal's Claude Code questions from Teams (#706) needs connector 0.1.23 or later.
+
+### Added
+- `SANDBOX_ALLOWED_NAMESPACES` (comma or space separated; unset or empty allows every workspace, as before): the SaFE
+  workspaces a sandbox may be created in, for a deployment whose sandbox network isolation (the egress and ingress policies
+  a sandbox relies on) exists only in some workspaces. The deployment's own `SANDBOX_NAMESPACE`, `SANDBOX_CPU_NAMESPACE`
+  and `AGENT_SANDBOX_NAMESPACE` are always on it. A request naming any other workspace is refused with 400
+  `sandbox_workspace_not_allowed` (with `workspace`, `allowed` and a `message`) before anything is written: a message's or a
+  session's first message's `workspaceId`, a managed-agents session's `metadata.primus_claw.workspace_id`, a DAG node's
+  `sandbox.namespace` on `POST /v1/sessions/:id/tasks`, `/v1/batches` and workbench runs, and an application run's
+  `resources.workspace`, `resources.sandbox_workspace` and its sandbox templates' `workspace` (which is what its grant
+  allows). An A2A send's `metadata.workspace_id` is refused as invalid params, and the MCP `claw_run_pipeline` tool
+  refuses before it creates its session. Behind those, the dispatcher fails a run whose rendered sandbox lands off the
+  list (`failure_reason: sandbox_workspace_not_allowed`) before publishing it, and Brain refuses to create such a sandbox
+  or multi-node cluster (a terminal `sandbox_workspace_not_allowed`, not retried); Brain always allows the workspace it
+  falls back to itself (`SANDBOX_NAMESPACE`, or `AGENT_SANDBOX_NAMESPACE` in kubernetes mode, `default` when unset).
+  Set it on api and brain.
+- `CLAW_MEMORY_DEFAULT_ON` (default `false`): whether long-term memory is on for a user who has never turned it on or off (no
+  row in `claw_user_memory_prefs`). A user's own choice still wins either way, so one who turned memory off keeps it off, and
+  `CLAW_MEMORY_ENABLED` is still the deployment-wide switch: with it off, the default turns no one on, and `POST`/`PUT
+  /v1/users/:userId/memories` now refuse `memory_disabled` for everyone, a user whose own row says on included (before, such a
+  user could store entries that nothing would read).
+  With the default nothing changes: memory stays opt-in. The session
+  access, `GET /v1/users/:userId/memory-settings`, the REST writes and the assistant's memory all read the preference through
+  the one function that applies it.
+- `pr_summary` on `gh_review_submit` and `gh_pr_merge`: the review session's one sentence of what the pull request does, read from
+  the diff, in the language of its answer (one line, credentials masked, cut at 80 characters when Chinese and 160 otherwise). It is
+  part of the review's own output, not a model call of its own: the tools' answers carry it next to their `status`, the audit keeps it,
+  the requester view has it (`pr_summary`, null when the session gave none; not in the view the requester's router is given), and
+  `GET /v1/github-review/confirmations` lists it with each held write, so a channel shows it beside the verdict. It is read per
+  session and pull request, from calls that passed their checks only: a refused call, or one on another pull request, never lends its
+  sentence.
+- `CLAW_ASSISTANT_SAY_EVAL_USERS` (Claw user ids, comma-separated, no wildcard; default none) and
+  `CLAW_ASSISTANT_SAY_EVAL_MAX_PER_HOUR` (default 600): the evaluation identities named there have that hourly say cap instead of
+  `CLAW_ASSISTANT_SAY_MAX_PER_HOUR` (120, unchanged for everyone else). `POST /v1/assistant` answers the caller's own cap as
+  `say_max_per_hour`, and the sa-eval runner keeps its pace (`EVAL_SAY_PER_HOUR`) at least 20 under it, so a pace raised for an
+  evaluation identity is safe on a server that does not give it the higher cap (2026-11-08: the 359-case nightly spent about
+  three of its first three and a quarter hours waiting at 100 says an hour, about two says a case).
+- `CLAW_ASSISTANT_STREAM_TEXT` (`on`, default off) and `CLAW_ASSISTANT_STREAM_TEXT_USERS` (Claw user ids, the canary): a router turn's
+  own text, outside any tool call, is published as its say's preview while the model writes it (`ExecuteRequest.stream_text_as`,
+  `toolTextDelta` with `source: "text"`), so a turn that ends in plain text, which the server says for it once it ends, shows its words
+  as they come, as a say does. A tool call after the text takes it back (`toolTextVoid`, `reason: "tool_call"`); the run's first say
+  ends it. While the text shows, the server's "on it" line is not said over it; a turn whose text is then not said as its answer (it
+  failed, handed a review over, wrote internal text, met the say limit) has it taken back. Only for a turn that answers the person,
+  and only with `CLAW_ASSISTANT_STREAM_SAY` (2026-11-08, last 24 h: one router turn in ten ended in plain text; first reply p50 3.5 s
+  against 2.9 s for a turn that said).
+- The router's turn recall (`CLAW_MEMORY_TURN_RECALL`, no new switch) follows `claw_memory_links` from the entries the message
+  matched, two hops at most and both ways (what a matched entry cites, and what cites it), and says how each entry it adds was
+  reached (`found because #410 cites it`), so a chain's second and third entries reach the model though they share no word with the
+  question. One turn shows at most 8 entries and 2400 body characters in all; every hop reads only the user's own active entries
+  that are not past review.
+- `claw_memory_links`: what each memory entry cites, kept by the server from what the entry says: another entry by number
+  (`#12`) or by a name in corner brackets (「Kestrel 发布窗口」). A name no entry answers yet is kept dangling and joined to the entry
+  saved later that it names, so "the licence is in the 「Wren 许可」 entry (not recorded yet)" points at that entry once it exists;
+  a name two entries answer equally stays unjoined. Every name citation of the user is resolved again on each save, change, undo or
+  delete, so it follows an entry renamed away (back to dangling), comes undone when a later entry ties, and is never captured by an
+  entry still waiting for its owner's confirmation. `PR #12`, `issue #12` and `事项 #12` are not entry numbers. An entry made in place
+  of a close one (`force_new`) is `derived_from` it. A deleted entry takes every citation of it along, and nothing is ever joined
+  across users. The router's turn
+  recall (`CLAW_MEMORY_TURN_RECALL`) shows what each recalled entry cites (`cites #N title`); nothing else reads the links yet.
+- `CLAW_MEMORY_TURN_RECALL` (`on`, default off) and `CLAW_MEMORY_TURN_RECALL_USERS` (Claw user ids, the canary): before a router turn
+  answers, the server recalls the user's memory for their message and gives the model the entries it is about in full (at most 5,
+  `<memory-recall>`), beside the one-line index. A project's entries pushed out of a full index are then answered from memory instead
+  of being looked up on the web (E242 baseline, 15 memory-chain probes: the 6 wrong answers were turns that never called memory_recall).
+  Only the user's own active entries, only where the index is shown; not counted as reads; off leaves every turn as it was.
+- `CLAW_ASSISTANT_RESEARCH_USERS`: research reports for the named users only (Claw user ids, comma-separated; `*` is everyone)
+  while `CLAW_ASSISTANT_RESEARCH` is off, so the evaluation identities get them first.
+- Research reports with checked citations (`CLAW_ASSISTANT_RESEARCH`, off by default): the assistant hands "research X / a comparison
+  report on X and Y" to a background work item; the worker searches, reads the pages and delivers a Markdown report whose every finding
+  cites a numbered source. Before the file is stored, Brain opens every cited source with the run's own `web_fetch` and asks a small
+  model whether the page supports each finding that cites it (`ExecuteRequest.cite_check`): a finding no opened source supports is
+  marked unverified (未证实), a source that does not open is marked in the list, and the file ends with the counts. A sub-agent's
+  delivery is checked the same way, and `deliver_file` of a sandbox file that is a cited report is refused in favour of a checked
+  `deliver_text`.
+- `duckduckgo`, a web search backend that needs no key: named in `WEB_SEARCH_FALLBACK` behind `anthropic`, it answers only while the
+  native search fails (a gateway that refuses its forced tool choice), so nothing changes once the gateway accepts it.
+- A router turn that has said nothing 3.5 s after it began is told "收到，我看一下。" ("On it: looking into it now.") by the server, whatever it
+  is doing (thinking, the assistant's own tools, a slow start), not only when a lookup starts; the answer takes that line's place, so a
+  channel that edits a message shows one. Off unless `CLAW_ASSISTANT_FIRST_ACK_USERS` names the user (`*` for everyone);
+  `CLAW_ASSISTANT_FIRST_ACK_MS` sets the wait (2026-11-06 baseline: first reply p90 7.28 s, 21 turns heard only at their end). The router
+  says its quick line before `deliver_text`, `trigger_create`, `review_mode_set` and the `devenv_` tools too (`router-v19`).
+- `CLAW_ASSISTANT_ROUTE_DISCIPLINE` (`on`, default off) and `CLAW_ASSISTANT_ROUTE_DISCIPLINE_USERS` (Claw user ids, the canary): the
+  assistant answers a reply to a result it already gave (没关系, 就这样吧) with one line and starts nothing; declines in chat a request to
+  read ~/.ssh, keys or credentials whatever the reason given, and `work_create` refuses such a task; and a work item whose task changed
+  nothing outside (it delivered a file or a report) closes with its answer instead of waiting for Accept: a worker's `ready` report must
+  name what it changed (`result.refs`). Logged as router-discipline-v1 and worker-v7.
+- The connector picks up after a restart (a crash, a kill, a pod restart, `stop`, an upgrade): the turn an agent was running is kept
+  on disk, and the next run either carries it on (the agent was waiting for a person's permission for a tool call, always asks, and
+  the connector is not paused: it asks again and a new card comes, under the same prompt) or ends it with `turn_end` `error: "connector_restarted"`, so a phone stops waiting; prompts queued
+  behind it are delivered again after a supervisor's restart instead of being dropped; and each session used in the last 4 hours
+  gets one `session_recovered` event, which a chat shows as "recovered".
+- A conversation open in a terminal on your machine that has waited a minute for you (Claude Code's own "waiting": a permission or a
+  question) is pushed once through your assistant: the machine, the agent, what it waits for and the conversation's title. Answered at
+  the terminal within the minute, it is never pushed; a terminal working or finishing is never pushed. A later wait is told again once.
+- Pairing a machine from the chat with a one-time code (remote agents). `POST /v1/remote-agents/pairings` gives the signed-in person a
+  12-character code (10 minutes, one use, at most 3 live) inside one command line,
+  `npm install -g @primusclaw/connector@latest && claw-connector pair <code> --server <CLAW_PUBLIC_URL>`; running it on the machine is the
+  approval. The connector trades the code at the anonymous `POST /v1/remote-agents/pairings/claim` for a connector grant (`cpg_...`,
+  only its SHA-256 stored) that authenticates on the connector-side routes only, reaches only the connector it registered, and ends when
+  that connector is revoked (`/agent off`, logout, `DELETE .../connectors/:cid`): it then answers 401 `revoked`. The owner is told once,
+  through their assistant, which machine was paired and how to disconnect it. A grant replaces no row but its own (never another
+  machine of the owner's with the same name) and re-registers only under its own row's name; wrong claims are throttled per caller
+  (the forwarded chain with the socket address), failures only, with a bounded caller table and at
+  most 4 claims at the database at once (64 waiting, else 503 busy); at most 6 codes a minute per person by any route. New tables `claw_remote_pairings`, `claw_remote_grants`
+  (created with the remote-agents schema). The router's `devenv_pair` tool answers "连接我的开发环境" with no machine yet, "add a machine",
+  "pair my laptop" with that command line, said as given; it is never sent by devenv_send or by a report. Router prompt router-devenv-v8.
+- Connecting a machine is said with the exact commands, for every client. `GET /v1/remote-agents/setup` gives the connector's npm
+  package (`@primusclaw/connector`), the four commands (`npm install -g`, `claw-connector init`, `claw-connector login --server <this
+  API's CLAW_PUBLIC_URL> --identity-url <CLAW_CONNECTOR_IDENTITY_URL, else IDENTITY_ISSUER_URL>`, `claw-connector service install`) and
+  the same as a short text in English and Chinese. `devenv_list` with no machine connected, and a `devenv_send` refused `no_machine`,
+  carry it (`connect_a_machine`), and the router is told to give it as it is: before, it was told only that "running claw-connector
+  connects it" and composed the commands itself. Router prompt router-devenv-v5.
+- A minimum and a recommended connector version (`CONNECTOR_VERSIONS` in the protocol, 0.1.3 and 0.1.4; a server moves them with
+  `CLAW_REMOTE_AGENTS_MIN_CONNECTOR_VERSION` and `CLAW_REMOTE_AGENTS_RECOMMENDED_CONNECTOR_VERSION`). `GET /v1/remote-agents/connectors`
+  and `devenv_list` give each machine's `version_status` (`current`, `outdated`, `unsupported`, `unknown`) and, below the recommended
+  version, the `upgrade_command` (`npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service
+  install`); a heartbeat's answer carries the same (`connector_version`). Below the minimum no new session starts on it:
+  `POST /v1/remote-agents/sessions`, `devenv_send` and a pressed `devenv_send` card answer `409 connector_outdated` with the version
+  and the command, instead of a session that fails on the old connector. A connector that reports no version is not refused, and a
+  session already open on an old connector continues.
+- The assistant drives development environments from plain words end to end: `devenv_send` takes
+  `new_session` (新开一个会话在 ~/repo 里看看 opens a new session, never an idle one) and reads a folder
+  written with `~` in the home folder the agent's roots are in; the router names a session by when it was
+  last used (切到昨天那个会话), and answers 回到助理 in a chat that is already with it without running anything.
+  `test/e2e/assistant-devenv-eval.ts` measures these sentences, in Chinese and English, against the router's
+  real prompt and tools. Router prompt router-devenv-v6.
+- A development environment session is pushed only when it needs you, finishes or fails, each once: an instruction the assistant sent
+  to an agent on your machine says nothing while it works, one message when the agent waits on a permission request (`assistant.say`
+  `remote.ask`: the request with its options and when it runs out, for a channel to put to you as buttons), one when it finished, and
+  one when it failed (an error or a refusal, the machine refusing the instruction, or the session closing first, now said as an error
+  rather than as a finish). Each message carries `remote: {kind, session_id, machine, agent}` so a channel that already shows the
+  session can tell. `GET /v1/remote-agents/sessions` lists, per active session, the requests it waits on its user for (`waiting`).
+- `claw-connector doctor` checks the machine first, before its adapter check: Node.js 22+, each agent's program on PATH and on the
+  installed service's PATH, Claude Code and Codex signed in, the roots writable, the proxy variables, Claw answering and whether
+  Node trusts its certificate (`NODE_USE_SYSTEM_CA=1`, which the service now carries with `NODE_USE_ENV_PROXY`), a service and
+  something calling `keepalive.sh`; one fix per problem, exit 1 when something stops sessions (`--json`: `machine_ok`,
+  `environment`). A running connector repeats the machine checks with its own environment, in a child process (a stalled disk
+  cannot stall the connection), every 15 minutes and at once when `doctor` signals it, and reports them in each agent's
+  `capabilities.health` (docs/remote-agents.md, "Health"). The assistant's `devenv_list` passes them on as each machine's
+  `problems`, so "is my dev box OK?" and a devenv_send that cannot work are answered with the fix.
+  Router prompt router-devenv-v7.
+- Brain's `SKILL_HINTS_IN_SYSTEM_USERS` (default none): comma-separated user ids whose turns put the skill and MCP server hints in
+  the system message, as `SKILL_HINTS_IN_SYSTEM` does for everyone, so the change can be measured on one identity on a live
+  deployment before it is switched on for all. `engine.tools_resolved` logs `hintsInSystem` for each turn.
+- `CLAW_IDENTITY_TOKEN_DELEGATED_KEY_CLIENT_IDS` (default none): a delegated identity token of a named service that brings no key of
+  the person's own is exchanged once more at the identity provider, and the caller has the keys SaFE holds for the token's subject. A
+  chat service that holds no key of the person (a chat user who never linked one) then has the person's turns run on their own virtual
+  key instead of none.
+- The assistant writes text itself and hands it over with no sandbox: `deliver_text(name, text, caption?)` (router and worker) stores a
+  text file (markdown, plain text, CSV, JSON, YAML, code; at most 256 KB, redacted as a message is) as a delivery of the calling
+  session, which the user downloads from Claw's own link. A router's file reaches the user at once, a worker's with its next report.
+  The router is told that writing, drafting and translating are its own, not a work item's (`router-write-v1`).
+- `github_comment(pr, body)` (router, with the confirmation cards on): a comment the router drafted is put to the user as a card that
+  shows it whole; pressing it (or `批准 #<ref>`) posts exactly that comment as the user's GitHub account. Nothing is posted by the call,
+  and no work item or sandbox is needed to comment.
+- `web_fetch` reads a page larger than one answer in parts: `find` returns the page around each place a text appears, `offset` reads on
+  from a character; a page cut short says how long it is and the offset to read on.
+
+### Fixed
+- `@primusclaw/connector` pins its three runtime dependencies to exact versions (`@agentclientprotocol/sdk` 2.5.0, `smol-toml`
+  1.9.1, `zod` 4.6.7). They were ranges (`^`), and a published package carries no lockfile, so every install took the newest
+  matching version, one CI had never tested (it tested the lockfile's): what is installed is now what CI tested, and an upgrade is
+  an explicit change of the pin.
+- A step of a conversation open in a terminal reaches the phone while it runs again when Claude Code wrote a large line before it.
+  The connector read the transcript 256 KB per look (one look a second), so a `prompt_snapshot` attachment (0.2 MB and more) held
+  the next step back a second per 256 KB: a 5-second tool's step came after the tool had ended and the phone never showed it. One
+  look now reads everything new (up to 32 MB).
+- A message from the phone to a conversation open in a tmux terminal is typed at once, whatever Claude Code is doing there: one
+  submitted while a turn runs is queued by Claude Code itself and taken in at that turn's next step or once it ends, as one typed at
+  the terminal is. The connector no longer decides whether the terminal is busy (its registry status, whether the transcript's last
+  turn ended, `esc to interrupt` under the box, the Claude Code version): a coordinator's terminal that says `busy` for hours, with a
+  transcript too large to read (131 MB), held every message until it was refused. The one guard kept is Enter's: it goes only on a
+  screen that shows the input box holding exactly the message and no question or menu. A question that shows after the text went in
+  holds the Enter, with no key sent while it shows, and the phone is told (`terminal_input_queued` `terminal_dialog`); once it is
+  answered at the terminal the Enter goes (the text is typed again if the question emptied the box). A queued message's echo is its
+  `queue-operation` enqueue, and its turn ends with the turn that took it in (`queued_command`, or its own after the `dequeue`).
+  The message goes in as one bracketed paste and is submitted with End and Enter in one write, so a question that comes up at that
+  moment gets "No", never "Yes" (a typed `1` or a bare Enter would approve it). A phone `cancel` presses Esc only in a turn the
+  message started itself, never into a question or a turn of the person's. A message held because someone is typing in the
+  terminal (or it is scrolled back) is refused after 10 minutes as `terminal_busy` ("not sent, send it again"), also when that
+  starts right after the message was taken; it is never ended as `terminal_input_unconfirmed` before its text went in.
+  Doctor's `claude_version_unverified` is gone with the version list.
+- The assistant can tell where a public pull request stands for a person with no GitHub here when the deployment has a read-only
+  GitHub App. `pr_state` read such a pull request with no credential, which GitHub allows 60 times an hour for the deployment's whole
+  address; once that was used up every read failed (403), so a request to review pull requests merged days before was not answered as
+  merged, and "#99999" was "could not be read" rather than "does not exist". With `CLAW_GITHUB_PUBLIC_READ_APP_ID`,
+  `CLAW_GITHUB_PUBLIC_READ_INSTALLATION_ID` and `CLAW_GITHUB_PUBLIC_READ_KEY_FILE` set, those reads use an installation token of
+  that App asked for with `metadata: read` alone, and with `CLAW_GITHUB_PUBLIC_READ_REPOSITORIES` for those of the installation's
+  repositories alone, whatever more the App itself may do. A token GitHub grants with any other permission, or that reaches a repository
+  it does not say is public, is revoked, logged (`github.public_read_token_refused`) and not used. A token is kept until shortly before
+  it expires, and only a pull request or repository GitHub says is public is answered. Each `pr_state` call logs how it read
+  (`assistant.pr_state_read`, `via` app, anonymous, own or binding). A person with GitHub here is still read for as themselves;
+  without the App, reads stay anonymous, with the public page as their fallback.
+- A sandbox grant's 8-GPU template is admitted on an MI355X node. Each card was sized at 256Gi memory, so the g8 template asked
+  for 2Ti and SaFE refused it ("Resource request exceeds maximum available: memory"): the vk-mi355x flavor has 2Ti, of which SaFE
+  admits 95% (about 1.90TiB). Each card is now 224Gi, so g8 asks for 1792Gi, and eight g1 sandboxes (or four g2, two g4) now fit
+  one node together, which at 2Ti they did not. CPU (24 per card), shared memory (125Gi) and pod storage (187.5Gi) are unchanged and already fit.
+  Templates registered before the release keep their size until their grant is issued again. Deploy the sandbox control plane
+  (`agent-sandbox-controlplane`, which serves sandbox grants); Claw is unchanged.
+- The assistant no longer names a machine the user does not have. With no machine connected, `devenv_list` and `devenv_send` answered
+  with a name that was in none of their results ("之前的 dev-box-1 已离线"): it came from the router's work item list,
+  which kept a closed development environment item for a day with its machine's name after the machine was removed, and the evaluation
+  identity's assistant session is deleted between runs but its items are not. The list now leaves off a closed development
+  environment item whose machine is no longer the user's (an open one is listed with no name), the instruction cards voided because
+  their machine was revoked no longer name it, the results of `devenv_list` and `devenv_send` with no machine at all tell the router
+  to name none, and the router's prompt takes a machine's name from this turn's `devenv_list` or `devenv_send` alone.
+  Router prompt router-devenv-v14.
+- "连接我的开发机" gets the one-line pairing command whether the person's message reached the assistant signed in or with their key.
+  `devenv_pair`, and the pairing `devenv_list` and `devenv_send` make for a user with no machine, required a message sent signed in
+  (`attendedTurn`) and answered a key user with the four sign-in commands; they now require only that the turn answers the user's
+  own, recent message (not a report), as `POST /v1/remote-agents/pairings` already gives a code to any authenticated user. A turn
+  refused anything else for want of a confirmed identity (`not_attended`, such as a review as them) is noted on its message
+  (`claw_assistant_messages.identity_refused_at`, added at start-up), and its `assistant.say` carries `needs_identity`, so a channel
+  can put the identity card beside the answer. The router's prompt names 连接我的开发机, 连接开发机 and 连我的机器 as connecting a
+  machine. Router prompt router-devenv-v15.
+- The assistant tells a person the commands they can type back in the language it answers them in: approve #ref and deny #ref for a
+  card, undo #N after something is remembered, and 批准 / 拒绝 / 撤销 only in a Chinese conversation. The tool results (a memory save,
+  a scheduled task, a GitHub comment or a devenv_send instruction card put to the person), what waits for them in the router's state
+  and the refusals all spelt them in Chinese only, and the router repeated them word for word into English answers ("Say 撤销 #1343 to
+  undo it", "or reply 批准 #5ec155"). Both forms are still read whatever the language. Router prompt router-v21 (review router-v27,
+  router-memory-v3, router-proactive-v4). Router prompt router-devenv-v13.
+- `channel_context.via` on a message to the person's assistant: `on_behalf` (the only value kept; anything else is dropped) says the
+  channel posted the message into the person's own chat for them (Clawy's on-behalf endpoint, their coordinator's review request)
+  rather than their typing it. It is stored with the message (`claw_assistant_messages.channel_context`) so that what counts the
+  person's own messages can count these apart, and it widens nothing a turn may do (2026-11-08: Clawy's daily failure mining counted
+  52 "real user messages" in a day, all of them such requests).
+- A session's event stream opened without a cursor on a session longer than `SSE_HISTORY_TAIL` events sends `historyComplete`
+  and its live events again. The tail is a whole number of pages; after the last one the empty page that follows wrote
+  nothing, and the stream waited for a `drain` the earlier write had already had, so it stayed silent but for keepalives.
+  It now waits only while the response's buffer is still full.
+- A session's event stream (`GET /v1/chat/sessions/:id/messages`) no longer reads the whole history into memory on every
+  connection. Without `?after=` or `Last-Event-ID` it replays the session's last `SSE_HISTORY_TAIL` events (default 2000), and
+  the `historyComplete` marker carries `has_more: true` when older ones were left out; `?history=all` replays all of them, and
+  `?mode=replay` pages through them as JSON. The history is read and written 500 rows at a time, waiting for a slow client.
+  `after` (and `Last-Event-ID`) no longer compares ids as text, so a reconnect after `claw-9` gets `claw-10`: a `claw-<seq>`
+  cursor is followed by every stream event of a higher sequence wherever its row is (replicas can store `claw-11` before
+  `claw-10`), and by the other rows stored after it; a `claw-<seq>` the table does not hold yet is placed the same way. The Anthropic-compatible
+  `/anthropic/v1/sessions/:id/events/stream` replays the last `SSE_HISTORY_TAIL` events too (the paged list route has all of
+  them), and an A2A task's `artifacts` carry its latest 100 turn results.
+- `GET /v1/chat/sessions/:id/messages?mode=replay` reads a window of the history instead of all of it when asked: `tail=N` is
+  the last N events, `after=<event_id>&limit=N` at most N events after that one (`after` alone: at most 5000), both oldest first,
+  with `has_more` saying whether events remain beyond the window. Only those rows are read from the table, with the
+  `subagent_id` / `fold_subagents` filters applied in SQL so `tail=N` is N events the caller is shown; N is cut to 5000. `after` is
+  ordered by row, so `claw-9` is followed by `claw-10`. A bad `tail`, `limit` or `after`, or `tail` with `limit`, is a 400.
+  Without any of them the reply is the whole history, as before. A long-lived assistant session had reached 33,196 events
+  (28.6 MB), and each whole read of it cost its reader about 200 MB, which ended a 512 MiB pod.
+- A research report sent back to its writer and delivered again is judged only for what changed: the citation check keeps,
+  for its run only, the verdicts it settled (a page supports a statement, or both looks said no), keyed by source address,
+  statement text, context and how many sources it cites, and takes them as they were in the run's next check; a page whose statements are all settled is
+  not read again. On a live report the second check had cost as much as the first ($0.76 against $0.82).
+- A research report's citation check reads a table row cell by cell: each cited cell is a statement of its own, read with
+  its row label and column header and judged only against the sources it cites, never with the other cells of the row. A
+  statement citing several sources is supported when any of them supports it, and the judge is told the page need support
+  only its own part.
+- A research report's citation check looks again at what it rejects: a statement no source was found to support, whose judge
+  said no, is judged once more on that source with its own excerpt (up to 10,000 characters, the whole page when short enough);
+  supported then, it is supported. A statement whose line has fewer than 8 letters (a table row of numbers) that no source
+  supports and a judge said no to is marked "too little to check" (信息过少，未能核对) and counted apart from unverified; one no judge
+  looked at (a number with no source, a page that did not open) stays unverified. The first look reads at most
+  7,000 characters of a page. On a live 143-statement report: judge cost $0.87 by the gateway's billing, against $0.80 before.
+- A research report's citation check judges each statement with the whole line it is written in (a statement cut at a
+  mid-sentence citation was judged as a fragment), and reads only the parts of a long page that bear on the statements: the
+  paragraphs sharing the most rare words with them, each statement's best first, at most about 4k tokens a judgement (a whole
+  page was about 33k). On a 137-statement report this took the judge's input from 1.54M to 0.29M tokens. The judge's verdicts
+  are the last array of booleans in its answer, so one that reasons first is still read.
+- A research report written to a file is delivered checked: `deliver_file` of a sandbox file that is a cited report reads it whole
+  and delivers it through the run's checked `deliver_text` (a `.md` name kept, another given `.md`), instead of refusing it; one
+  larger than a text delivery (256 KB) is refused. The worker is told to write a report too long for one call to a file
+  (research-v2): written whole into one `deliver_text` call past the model's output budget, it arrived empty and the item failed.
+- The super-agent evaluation no longer grades a router turn by its server "on it" line (收到，我看一下。). A turn that ended in plain
+  text has its words said by the server just after its end, after that line; the wait after a turn's end took the line for the reply
+  and graded before the answer arrived (E242 memory-chain run, cat-memory-chain-013: line at 3.5 s, answer at 4.2 s). The wait now
+  goes on until a say of the turn other than its line, which is known by the id the server gives it.
+- A research report's citation check reaches up to 80 sources (was 40), and what it never decided is marked not checked (未核对),
+  not unverified: a source or a statement past the caps, a page or a batch the time budget ran out before. A 63-source report had
+  36 statements marked unverified only because their sources were past the old cap. `CITE_CHECK_MODEL` chooses the judge's model
+  (blank: `WEB_FETCH_SUMMARIZE_MODEL`, as before); each judgement logs its model, time and tokens (`cite_check.judge_call`).
+- A research report's citation check no longer marks whole batches unverified when its judge answers nothing: the judge has a
+  4096-token output budget (at 1024 claude-haiku-5.5 spent it thinking and replied empty), a batch with no answer is asked once more,
+  and one still unanswered is marked not checked (未核对), counted apart, logged (`cite_check.judge_no_answer`) and counted in
+  `claw_cite_check_judge_total{outcome}`; every checked statement is counted in `claw_cite_check_statements_total{verdict}`.
+- `pr_state` says a pull request number its repository does not have is `not_found` (GitHub answered 404 for the pull request and
+  read the repository), not `unknown`/`read_failed`; a 404 from a repository the person cannot read stays `unknown`. `review_start`
+  refuses such a number as `not_found`, and the router says it does not exist. Before, "请 X 帮我审 #483 和 #99999" was answered
+  "#99999: GitHub could not be read". Router review prompt router-v25.
+- The assistant answers questions about a session open in a terminal on the person's machine as it works today: one whose
+  connector types into that terminal (devenv_list `typed_into_terminal`) can be written to from the chat while the terminal keeps
+  working; one marked `read_only` can only be watched, said with what typing needs (tmux, Linux, connector 0.1.9 or newer,
+  `terminal_input` on). Before, "只能看不能发，这正常吗" was answered "watching is normal" and the shared-session request "the product
+  cannot do that, shall I file an issue". It also reads devenv_list in the turn for every question about the person's machines (how
+  many, one by name, reconnecting one's connector) instead of repeating an earlier turn's read, except which session the chat itself
+  is attached to, and never says it reconnected a connector. Router prompt router-devenv-v12.
+- A message sent while the assistant is still answering the one before it hears "收到，我看一下" 3.5 s after it came in again: the
+  first-reply line of a turn that has not begun (its message queued, or its run not yet claimed) is held back only by that line
+  itself, no longer by the answer the turn in front says meanwhile. A follow-up queued behind a slow answer heard nothing for 7.8 s.
+- The brief also leaves out a release-gate fixture whose watch ended before polls kept a pull request's branches (2026-11-08 retest:
+  "#381: 2 comments" still listed): each ended watch whose news is from the last 7 days has its branches read once with its owner's
+  token, beside the poll pass and never holding it back (`claw_work_item_subscriptions.refs_read_at`, added at api start), claimed across replicas and
+  never again; after the first passes following the release no GitHub call is made.
+- A worker's answer reaches the chat without waiting on the router (release gate run 1108021655-0c1088: the item delivered
+  `result.md`, the chat showed "delivered result.md (28 B)", the router's line said the file's first line would follow, and it came
+  only from the silent sweep five minutes later). An answer that comes with files the worker delivered is said whole by the system
+  with them, before them, as a long answer already was, and the router is told it was sent. A router turn woken to say an answer that
+  ended without saying it -- stopped for the user's next message, failed, or written in plain text -- has the system say the answer
+  at once instead of five minutes later (`claw_assistant_router_unsaid_total{outcome="report_answer"}`).
+- The brief leaves release-gate fixture pull requests out of its pull request section, told by their branches as `pr_list` tells them
+  (a weekly report said "#381: 2 comments" for the fixture on 2026-11-08); a watched pull request's head and base branches are kept
+  with its watch (`claw_work_item_subscriptions.head_ref`, `base_ref`, added at api start). The brief's pull request section also
+  counts the reviews the user asked of others over its own range (a weekly brief, the week). The router's state says its totals of
+  those reviews are of the last 24 hours, and that a week's count is the weekly brief's: "23 reviews, 22 merged" from the last 24 hours
+  was said under "this week".
+- The assistant no longer answers a partial read as if it were all of it (N8, 2026-11-07: "17 merged, only 3 open" from 20 of the merged
+  pull requests with a release-gate fixture among the open ones; "19 of the 20 merged" when 82 reviews had been handed over; the second
+  dev machine said to be unreachable when the list showed one of two). GitHub list answers that are not complete say so in `partial`, and
+  the router reads the rest (next page, `pr_list since` for a time window, which counts all of it) or says the scope in its first line,
+  with totals only from a count of the whole (router-read-v15). `pr_list` and `issue_search` leave release-gate fixture pull requests
+  out of their items and counts unless `include_fixtures`. The reviews asked of others are counted in all before the latest 20 are
+  listed. `devenv_list` lists every machine with its latest 6 sessions and the counts of all of them, and `machine` lists one machine's
+  every session.
+- A router turn that has read text Claw did not write is refused other writes with a message that no longer names `work_recall`
+  whatever it read, and, where development environments are on, says what it may still do: put the attach command of the user's own
+  session, or of an agent on their own online machine (its newest open session, or a new one when it has none), as a button, and
+  `devenv_send` as a card (`new_session: true` for a new session even when one is open).
+  After a `devenv_list`, the old wording sent the router looking for a read it never made, and it told the user it could not open a
+  session on their own machine (2026-11-07 daily gaps, N9).
+- A review asked of someone through another person's assistant is told to the reviewer in the language of the one who asked when the
+  reviewer has never written to their own assistant, instead of in the language of the item's English title ("Review+merge …"): on
+  2026-11-07 a reviewer asked in Chinese got 23 "is blocked and needs your answer" notices in English (daily gaps, N5). When such a review
+  stops because GitHub refused the merge on a conflict (merge state DIRTY), the one who asked is told too, through their own assistant and
+  in their language, that the author has to resolve the conflict; at least 17 of those 23 notices were this, and only the reviewer heard of
+  them. Once per item and head commit. The GitHub review audit row records the merge state a merge was refused on (`merge_state`).
+- A worker asked to make a write (push a branch and open a pull request, post a comment) makes it when it gets there and lets the hold
+  put it to the user on a card, instead of first reporting a question that only asks whether to make it ("Confirm I should push and
+  open the PR?"), which asked a user who had already asked for it again in words, and once more on the card after their yes (G0
+  2026-11-07 nightly, cat-items-wr-001). When it cannot make the write (no GitHub login, no write access) it reports blocked with what
+  is missing. Logged as worker-v8, and worker-v9 with `CLAW_ASSISTANT_ROUTE_DISCIPLINE`.
+- The server's "on it" line for a silent router turn (`CLAW_ASSISTANT_FIRST_ACK_USERS`) counts from when the person's message came in,
+  not from when its run opened, so a message queued behind a worker's report hears it at 3.5 s too (2026-11-07 run: cat-items-wr-006
+  queued 5.5 s, first reply 7.8 s); and a say the router started and that was refused no longer holds the line back (cat-memory-ro-001,
+  cat-items-ro-001: refused at 3.2 s, said again at 5.3 s and 5.9 s).
+- A grant's GPU hours are charged only while a sandbox runs: from the moment it first reaches running (new grant status field
+  `sandboxes[].runningAt`) to its end. A sandbox that waited in a queue, sat scheduling-gated or pulled its image and was then deleted
+  charges nothing; before, two measurement sandboxes held pending for 28 minutes spent 3354 GPU seconds of a 6-GPU-hour grant. Apply
+  the updated `sandboxgrant` CRD with the release, or the field is pruned and a running sandbox is charged from its start as before.
+- A development environment turn cut off because its connector restarted mid-turn is told on the assistant's item as an
+  interruption with what to do (send the instruction again, or say "continue"), not as the bare code `connector_restarted`.
+- A request to review or merge pull requests that are already merged, or closed, is answered from a read: the assistant first calls
+  `pr_state`, which only reads where each pull request stands (open; merged with when and its merge commit; closed with when),
+  and answers a merged or closed one itself without calling `review_start` at all; only the open ones are started. A person with no
+  GitHub here is read for as anyone is, so a public pull request's state is still found. `review_start` still refuses a merged one
+  (`already_merged`) and now a closed one too (`already_closed`).
+- A tool call whose tool answered an error (a call the platform refused, such as `review_start` answering `already_merged`, a refused
+  read, a tool that threw) is recorded with `status: "error"` (and `is_error: true`) in the session's events and stream, no longer as
+  `"success"`; the turn rebuilt for the next message still carries what that call answered.
+- An item started after the server's "on it" line is told in that line's message: the start notice takes its place (`replaces`), and
+  what the router adds after it goes to the same message, so the channel shows one message rather than the line and the notice
+  (2026-11-07 run on sa-eval-bot-8: 3 of 34 timed lines stayed beside a start notice).
+- A user whose several machines are all offline is told in Chinese to run the restart command on each of them (每台机器), not on
+  "that machine". A pairing claimed but not registered yet holds its name: two machines of one hostname claimed one after the
+  other, before either registered, no longer both get the same alternate name.
+- A card the assistant puts to the user itself (a comment drafted with `github_comment`, a scheduled task) is published to the session
+  with the turn that proposed it, so a client following the session shows it as the answer to that message.
+- "连接我的开发环境" from someone whose machines are all offline answers, in one reply, how to bring the offline machine back
+  (`claw-connector service install` on it) and the one-line pairing command for a new machine. devenv_list with every machine
+  offline now carries `connect_a_machine` with `all_offline: true`: its `text` is the restart line, then the pairing command (or,
+  where the turn may not pair, the setup commands), and its note says to give it as it is. Before, the request was read as
+  "connect that old machine" and answered only that it was still offline. The router also no longer says a machine is "still"
+  offline or "the same as last time" (上次) from a check it cannot see in this conversation. Router prompt router-devenv-v11.
+- The pairing command installs with `npm install -g --no-update-notifier`, so npm's "New major version of npm available" notice no
+  longer appears in its output, where it looked like an error.
+- A machine paired without a name of its own (the hostname) that another live machine of the person's already has is paired under
+  the hostname and its folder (or the user, in the home directory): `claw-connector pair` sends that as `alternate_name`, the claim
+  answers the name it paired under in `data.name` (numbered when that is taken too), and the connector writes it into agents.toml
+  and says so. Two folders on one machine were two machines of one name. A name chosen with `--name` or an agents.toml is kept.
+- A paired machine whose configuration is on the container's own file system is told to keep it elsewhere and then ask the chat for a
+  new pairing command, not to "run init and login again", which it never did.
+- `GET /v1/remote-agents/connectors` says of each machine whether it was connected with a pairing code (`paired`), so a client can
+  tell how to connect it again: a new pairing command, not `claw-connector login`.
+- Notifications are no longer lost when a receiver makes its subscription again or restarts. Deleting a subscription used to
+  delete every row still queued for it (`ON DELETE CASCADE`), so a receiver that deletes its old subscription and makes a new one
+  lost what was queued meanwhile; those rows are now kept and carried over, once per event, to the owner's next subscription that
+  takes their type (within the 24-hour give-up window). An assistant message about no work item, said while the user had no
+  subscription for it, is sent to the user's next subscription, once (the last 24 hours), as only a message about an item that
+  still needs the user was before. And a receiver that was down for more than about 40 seconds (a Recreate rollout) no longer hears
+  nothing for five minutes: its oldest failed row is retried every 15 seconds while the failures say it is down (connection error,
+  timeout, 5xx, 408, 429), and its first 2xx sends everything that waited behind it at once.
+- "让开发机上的 claude 跑 make test" with no machine connected answers the same one-line pairing command, not the four setup steps.
+  devenv_send refused `no_machine` because the user has no machine at all now carries in `data.connect_a_machine` the pairing made
+  for them (`commands` the one line, `text_zh` and `text_en` with it in a code block, `pairing` its minutes), under the same gate
+  as devenv_list and devenv_pair; any other turn, and where pairing is refused, still gets the setup commands. Where no pairing can
+  be made for the turn (`not_from_user`, `not_attended`, `attendance_expired`, `pairing_unavailable`, `rate_limited`), neither
+  devenv_list's note nor devenv_send's message sends the model to devenv_pair any more, and a pairing check that itself fails
+  (the database) leaves devenv_list answered with the setup commands instead of failing it. Router prompt router-devenv-v10.
+- A command that reached a connector while its process was stopped (a closed laptop: SIGSTOP) or its machine slept no longer runs
+  after the person closed the session or removed the machine. The frame waited in the socket's buffer and was read first when the
+  process ran again, so the agent ran a message the person had been told would not run. The connector now keeps a stall clock (a
+  gap of more than 5 s between one-second ticks, on the monotonic or the wall clock) and confirms every command read within 5 s
+  after a stall, and every command older than the live TTL (`issued_at`, now in every command frame), with the new connector-side
+  `POST /v1/remote-agents/connectors/:cid/commands/:cmd_id/confirm` before it runs; anything but `live` (`session_closed`,
+  `cancelled`, `expired`, `gone`, 401 `revoked`, or no answer) is dropped and reported in the session as `command_rejected` with
+  `reason: "command_not_live"`. A command read before a stall that is still waiting to act (behind a running turn, or for a
+  terminal) is confirmed when it reaches the agent. Claw deletes the queued commands that would make an agent act when it closes their session
+  (`close`, a reclaim, a revocation) and refuses a late confirmation for them (audited `command.refused_late`). `cancel`, `withdraw`
+  and `close` are never held up. The same holds when the process keeps running but the network holds the frames back (Wi-Fi drops, roaming,
+  a VPN reconnecting): every command frame carries `sent_at`, and one that took more than 3 s to arrive is confirmed, as is every
+  command read while a heartbeat is overdue and within 5 s after a late or failed heartbeat or a stream reconnect. `expired` now
+  means only "reached the connector past the live TTL" (the connector says `received_late`): a prompt received in time and queued
+  behind a turn longer than 5 minutes runs after a stall instead of being dropped. With no answer the connector asks again for up
+  to 10 minutes, the command waiting in its session, before it reports it `unconfirmed`; a Claw without the confirm route (404
+  from its router, or command frames without `sent_at`, in which case nothing is asked) leaves the command to run as before, so
+  the API and the connector ship in either order. A `set_mode`,
+  `resume` or `decision` queued before a `cancel` is no longer refused as `cancelled`, and a confirmation for an id Claw does not
+  hold writes no audit row. A `ready` that took more than 3 s also opens that window, and its clock reading is kept as an upper bound
+  for the life of the stream, so neither a held `ready` nor a link that keeps lagging makes a held frame look prompt. A `cancel`
+  or `close` never waits behind a confirmation Claw does not answer: it ends those in its session (dropped and said as
+  `cancelled` / `session_closed`), is carried out straight away, and what came before it there is dropped the same way when its
+  turn comes. A session its machine reports closed drops its queued acting commands, under the connector row's lock.
+- A prompt that reached a connector on time and queued behind a running turn no longer runs after the person closed its session
+  while the network held the stream back for less than a heartbeat (no stall, no late frame, no reconnect: nothing the connector
+  watched). A command stream that gives no frame, not even a ping, for longer than its ping interval plus 3 s now counts as network
+  trouble (audited `network_trouble`, `reason: "stream_quiet"`), so a `prompt`, `set_mode`, `resume` or `decision` waiting to act
+  then is confirmed with Claw when it is about to (`why: "network"`); the stream's `ready` now says that interval (`ping_ms`).
+  The confirmation names the command's session (`session_id`), and Claw answers `session_closed`, not `gone`, for a command it
+  deleted when that session closed, so the person sees why it did not run. A command that came on time while pings kept coming
+  still runs without a question.
+- "连接我的开发环境" with no machine connected answers the one-line pairing command, every time. devenv_list with no machine, in a
+  router turn answering a message the user sent signed in, recently, makes the pairing itself and gives it in `connect_a_machine`
+  (`commands` the one line, `text` in the user's language with it in a code block, `pairing` its minutes). Any other turn (a report,
+  a message with a key, an old one), and where pairing is refused (no `CLAW_PUBLIC_URL`, too many codes), gets the four setup
+  commands; `devenv_pair` now refuses the same turns (`not_attended`, `attendance_expired`). Before, the list always carried the four
+  setup commands and the router copied them in 5 of 7 fresh sessions instead of calling devenv_pair. Router prompt router-devenv-v9.
+- An assistant whose new lookup differs from its earlier answer says what changed since, not that the earlier answer was its mistake
+  (`router-read-v12`, and the placeholder that stands for an earlier turn's result): a pull request merged between two asks was
+  told as "上次我多算了 1 个，抱歉".
+- A long run taken over by another brain near its end (a Brain rolling update in the middle of it) is announced as a long run again:
+  its `run.completed` was measured from the claim that resumed it, which clears and restamps `started_at`, so a 70-second run
+  resumed three seconds before its end ran "three seconds" and no notification was recorded (release claw-rel-1917, 2026-11-07).
+  A run is now measured across every claim from its run-time anchor, less the time it spent queued.
+- A run's `run.completed` / `run.failed` is no longer lost when the outbox write fails at the run's end (an API drain closing
+  the database pool under it): the completion was stamped processed regardless, so its redelivery acked and the notification was
+  never recorded. What it still owes is now stored with the processed stamp, and the event is redelivered until the notification
+  is recorded -- once, by its run-derived key -- without running the rest of the completion again.
+- A connector no longer stops for good (exit 78, `needs-login.json`, offline until someone runs `login`) because Claw's sign-in
+  service was down. On 2026-11-07 09:50-10:15Z, while SaFE was failing, Claw answered a mix of no answer, 503
+  `authentication_service_unavailable` and 401 `invalid_api_key` for a key that was fine, and the connector took four 401s as a
+  deleted key. A 401 or 403 that comes while Claw is failing (no answer, 5xx, 429), or within ten minutes of it, or that is not
+  Claw's own answer (no JSON error: a gateway's page), is no longer counted and the connector keeps retrying; the same rule now
+  applies at start, so a supervisor restart into an outage is not ended by its first 401. A revocation still stops it at once.
+- The API answers 503 `authentication_service_unavailable`, not 401 `invalid_api_key` (or `invalid_cookie`), when SaFE answers
+  a key or cookie check with a 5xx or with a 2xx that is not an answer, and no longer remembers the latter as a refusal for 30 s.
+- A fresh connector install trusts the CAs the machine trusts: a Claw behind a company CA no longer fails `doctor`, `login`, `pair`
+  and `run` until `NODE_USE_SYSTEM_CA=1` is set. On Node.js 22.19+ / 24.5+ the connector adds the system store to Node's own list
+  (and `NODE_EXTRA_CA_CERTS`) before its first connection and passes `NODE_USE_SYSTEM_CA=1` to the programs it starts;
+  `NODE_USE_SYSTEM_CA=0` turns it off. When the certificate is still not trusted, `doctor` says what the connector already did and
+  names the next step (add the CA to the machine's store; on an older Node.js, upgrade or `NODE_OPTIONS=--use-system-ca`).
+- `claw-connector <command> --help` (or `-h`) prints that command's help and exits 0, for every command; before, `pair --help` and
+  `login --help` failed with "unknown option". An unknown option is a usage error (exit 2) for every command, including `login`
+  (it exited 1) and commands that take no arguments (`stop`, `pause`, `resume`, `logout`, which ignored them).
+- An assistant asked again about something it had just looked up no longer disowns its own answer ("上一条我是在查询结果返回之前就
+  写了答案，请不要采信"). A turn with tool calls was handed back to the model as one message, its final text first and every call side
+  by side, so a lookup followed by an answer read as an answer written beside (before) the lookup. History now replays each call, then
+  its result, then the turn's text, in the order they ran. The router's answer about what it can do no longer labels any part of
+  itself read-only (只读) (`router-read-v11`).
+- Asking the assistant how many nodes SaFE has no longer answers 0 for members who are not administrators. SaFE answers their
+  `node_list` without a workspace with an empty list (200, `totalCount: 0`) rather than a 403, so the answer read "no nodes" while
+  the workspaces they use have several. Brain now reads such an empty answer again per workspace of `user_self`, as it already does
+  for the 403 of `workload_list`, and says which workspaces the count covers; `limit: -1` still returns every node.
+- The brief's SaFE section works for members who are not administrators. SaFE refuses them a workload list across workspaces
+  (403), so every such brief said "SaFE 没有回答：safe_http_403". After a 403 the brief now lists the user's own workspaces and reads
+  each one (at most 20); a workspace that refuses is left out, and SaFE is unreadable only when every one refuses.
+- A machine paired from the chat (`claw-connector pair`) and then disconnected is told, wherever the connector says what to do next
+  (the revocation itself, `run` started again by the service or by hand, the supervisor's log line, `status`, `service status`,
+  `doctor`'s fix, a sign-in refused at start), to ask the
+  chat for a new pairing command and run it, instead of `claw-connector login`, which it never ran. A machine signed in with `login`
+  is still told to log in.
+- A sandbox torn down by one brain replica while another was walking the handle records no longer stops every replica
+  from starting sandboxes. The walk read the deleted record's DEL marker as an unreadable record, marked the fleet count
+  incomplete, and admission refused new sandboxes ("the fleet count it would be checked against is incomplete") until a later
+  sweep read clean, failing the user's task; replicas that start together sweep in phase, so after a rollout this happened
+  often. A deleted record is now an absent one. And a fleet count that is briefly unreadable is waited out
+  (`SANDBOX_ADMISSION_STALE_WAIT_MS`, default one keepalive interval plus 15s) before a new sandbox is refused; a refusal after
+  the wait, and a fleet genuinely at its ceiling, say in plain words what happened and that a retry later will work.
+- `claw-connector init` (`connector/`, next release) no longer merges the Claude Code session hooks into the user's Claude
+  `settings.json` without asking. At a terminal it asks first (`[y/N]`); with nobody to answer (a script, a pipe) it leaves the file
+  alone and prints `claw-connector hooks install`. `--hooks` adds them without asking, `--no-hooks` skips them.
+- The connector (`connector/`, next release) keeps its heartbeat through a stalled state directory (CephFS, NFS). Writes to
+  `connector.json`, `sessions.json`, `children.json`, the outbox, the audit trail, the adapter log and the disconnect record, the
+  pause-file check and the heartbeat's look at the Claude config directory no longer block the event loop: they run off it, one at
+  a time per file, and a write that must land is waited for a bounded time. An event is posted only once its line is written (a restart still never reuses a number), so while the
+  disk does not answer events wait and the machine stays online; the run is started with libuv's pool at 16 threads (in the
+  systemd unit, the launchd plist and the supervisor's spawn) so stuck calls cannot starve DNS. A test blocks connector.json's temporary file, the audit trail and the outbox log with FIFOs: heartbeats go on, and the
+  turn's events arrive once the disk answers. Against production Claw, a connector whose state files were blocked for 75 s stayed
+  online throughout; 0.1.4 under the same block went offline (`no_heartbeat`) and stayed stuck.
+- A user with no development environment session can connect from the assistant: `devenv_list` gives each agent on an online machine
+  its own `attach_command` (`/agent attach MACHINE/AGENT`, which attaches its open session or starts one in its first folder), the
+  attach button accepts it, and with no session anywhere and one such agent `attach_default` is that agent (`new_session: true`).
+  Before, "connect me to my dev box" with no session open had nothing to attach and nothing it could press.
+- `devenv_send` no longer chooses an agent that only takes over existing conversations (`kind: attach`) for a new session, which its
+  connector refused (`resume_ref_required`) with nothing said to the user: it is chosen only to continue its own idle session, and
+  when it is all that fits, the refusal says so (`which_agent` listing its conversations, else `no_agent`).
+  Router prompt router-devenv-v4.
+- Opening a remote session at the limit of open sessions (10) closes the user's sessions nobody is using to make room (none for half
+  an hour, no command waiting, no turn under way, no approval waiting; or nothing for a day), an offline machine's first, each with a
+  `close` to its connector and a `session.reclaimed` audit; `session_limit_reached` now means every open session is in use. Before,
+  sessions were never closed unless the user closed them, so ordinary use hit the limit in about a week. `POST
+  /v1/remote-agents/sessions` returns the closed ones as `reclaimed`.
+- A machine whose connector runs on Windows can be sent instructions from the assistant: its roots (`C:\Users\a\repo`, a share
+  `\\server\share\proj`) were dropped as not absolute, so `devenv_send` answered `no_folder` for every one of them. They are folders
+  now, and a folder asked for under one compares as Windows does (either separator, any case, a trailing separator or not) and is sent
+  as the root spells it with the root's separator; an idle session open there continues however the folder is typed. POSIX roots compare
+  exactly, as before.
+- Connector: an agent with `approval = "never"` on a machine where the connector runs as root opens its phone sessions again. Claude
+  Code offers `bypassPermissions` to root only with `IS_SANDBOX` set, so every such session was refused with `mode_unavailable`; the
+  connector now sets `IS_SANDBOX=1` for that agent's Claude adapter only, and says so when it starts. An agent whose own `env` sets
+  `IS_SANDBOX` is left as written, and `status` warns when the mode will still be missing.
+- Connector: a Claude agent that asks before every step opens its phone sessions in `default` on a machine whose own Claude
+  settings default to `bypassPermissions`; the connector tells the adapter to leave that mode out
+  (`allowDangerouslySkipPermissions: false`) instead of closing each session with `mode_not_enforced`. The start-up warning
+  about it is gone with the refusal.
+- Connector: `claw-connector doctor` (also run at the end of `init`) starts each agent's adapter, opens a session without a prompt
+  and compares the modes the adapter offers with what `agents.toml` needs, naming the fix instead of leaving it to a refused phone
+  session.
+- Connector: a supervised connector stopped by a signal that did not come from `claw-connector stop` (a bare `kill`) exits 75 and is
+  started again; before, it exited 0, which the supervisor took for a stop on purpose, and the machine stayed offline.
+- A Claw release no longer takes development environments offline. An API replica that is shutting down sends every connector
+  command stream it holds `event: reconnect` before it ends them, and keeps those connectors online (`stream_end_reason` `restart`)
+  while they open the stream on another replica, so a rolling update is neither an offline transition in
+  `claw_remote_connector_transitions` nor a reason to tell anyone; a connector that does not come back is offline once the 90 s
+  online window has passed, as before. Live releases had shown each connector offline for 2-7 s.
+- A Brain rollout no longer cuts a tool call in flight. A drain used to abort every run at once: Hands killed the foreground command
+  with its request, the run resumed on another replica told the call was interrupted, and the model said so in the chat and ran the
+  command again (one chat turn, cut twice by one rollout, ran its `sleep 90` three times and showed both explanations). A drain now
+  lets a call already in flight finish, for up to `SIGTERM_TOOL_GRACE_MS` (default the foreground ceiling plus 20 s, at most 180 s,
+  inside the chart's 300 s grace), and the resumed run continues from its recorded result. A call still running then is cut as
+  before, and the model is told not to mention the restart.
+- Development environments: an instruction accepted while a closed laptop still looked online no longer leaves its chat and its
+  assistant item waiting for hours. Five minutes on it is not delivered any more, as before (a new session too, which until now was
+  still started up to a day later), and once its machine has gone away since it was queued with nothing heard from it in that
+  session and no turn running before it, Claw ends the prompt's turn with `turn_end {error: "delivery_unconfirmed"}`: the item closes
+  as dropped and the user is told once that it may not have run. The machine's own end of it, if it comes later, still closes the
+  item with its answer. A prompt waiting behind a running turn is never ended this way.
+- A `devenv_send` card pressed after its machine registered again (a reinstall, a lost state directory, a rebuilt pod) sends the new
+  session to the machine's new registration, when exactly one of that name is online with that agent, instead of failing with
+  `no_machine`. A card that continues a session of the old registration fails with `machine_reconnected` and sends nothing; when
+  the old row is replaced on registering again, such a card is closed at once as `machine_reconnected`, while a card for a new session
+  keeps waiting (it was closed with the row before). An old row still in its reconnect grace is passed over for a newer one online.
+- A connector whose command stream has just ended without a graceful hand-over (a replica that crashed, an ingress or gateway
+  restart, a token refresh) is online for 45 s more while its heartbeat is fresh: a session asked for in that gap is queued and
+  delivered on the next stream, not refused with `connector_offline`, and the break is not recorded as an offline transition.
+- A connector revoked (`claw-connector logout`, `/agent off`, `DELETE .../connectors/:cid`) or replaced by registering again under its
+  name now ends its open sessions with a `session_closed {reason: "connector_revoked" | "machine_reconnected", by: "claw"}` of Claw's
+  own. Their queued commands were dropped with the row and their sessions closed with no event, so an assistant item whose prompt
+  was still queued stayed in progress for good and an attached chat waited for an end that could not come.
+- A connector registration refused with `connector_limit_reached` no longer replaces anything. An owner already past the limit who
+  registered again under a name whose old row was offline had that row revoked and its sessions closed, with no `session_closed`
+  said to their items or chats, and a paired machine's grant left pointing at the revoked row; the refusal now rolls all of it back.
+- Asked the same question again ("autopilot现在有几台节点" twice), the router no longer disowns its earlier answer ("上一条回答没有查证，请
+  忽略", 2026-11-06 parity run, K1). An earlier turn's lookup results are replaced in the next turn's history (a turn that has read must
+  not carry that text into one that can act), and the placeholder said only that the result was not kept: next to its own say with
+  numbers and no data under it, the model took that answer for unchecked. The placeholder now says the lookup ran and answered in its
+  turn, that the answer said after it came from it and is never to be called unchecked, and that a new answer is compared with it.
+- A router turn that answered the user and ended without its answer said is counted, by what its end did about it:
+  `claw_assistant_router_unsaid_total{outcome}` (`delivered`, `replaced_early_line`, `lost_notice`, `withheld`, `refused`,
+  `after_say`). `replaced_early_line` is the parity run's K2 (only "查一下 Autopilot 的状态。" reached the user), which was fixed but
+  not counted, so a return of it could only be found by reading transcripts.
+- A translation the user asks for is said at once, alone: `say` no longer refuses the English text a Chinese message asked for
+  (把这句翻成英文，只给译文), which cost a rewrite of about 1.4 s and put a Chinese label before it (2026-11-06 parity run, S2). A message in
+  the language the user named (翻成/译成/写成/用 X 写/X 版, translate … into X, in X) is let through; any other message in another language
+  still is refused (`router-v17`).
+- A request to review and merge pull requests that are already merged is answered with when each merged and its merge commit, and starts
+  nothing: `review_start` reads each named pull request on GitHub first, as the person (their `GH_TOKEN`, else their binding, audited
+  as a GitHub read), and refuses `already_merged` before it asks who the reviewer is or hands anything to the channel (G3: the router
+  asked who eval-reviewer was). The router calls it before asking anything (`router-v21`). `pr_get` also returns `merged_at`,
+  `merged_by`, `merge_commit` and `closed_at`.
+- "How many pull requests do I have open" is answered with the total and the pull requests themselves: `issue_search` returns
+  `refs_by_repo` (every match as `#number`, grouped by repository in `by_repo`'s order), and the router lists them from it (G1: 18 and the
+  per-repository counts, no numbers; `router-read-v9`).
+- A pull request number that does not exist is said not to exist: when a read of one (`pr_get`, `pr_reviews`, `pr_files`,
+  `review_threads_list`) gets 404 while the repository itself is readable, it answers `no_such_pull_request` with the repository's newest
+  pull request numbers, or that the number is an issue (H2: "可能不存在，也可能没有权限", with a number made up). A repository the token
+  cannot see keeps GitHub's plain 404.
+- An assistant router turn that looks something up answers through `say` again, with its sources. Beside `web_search` and
+  `web_fetch`, which have plain names, the model now and then called `say` by its short name instead of `mcp__assistant__say`; the
+  call was outside the run's tool allowlist and refused, so the answer went out as the turn's plain text, without sources, saying its
+  message tool was not available (2026-11-07 parity runs R1/R2, 3 of 3 lookup turns). Brain's agent loop now reads a call by an
+  offered MCP tool's short name as that tool (`tools/offered-name.ts`: only when exactly one offered `mcp__<server>__<name>` matches
+  and the name itself is not offered), renamed before the allowlist, hooks, approval, the router and the replayed history see it.
+- Router prompts `router-cite-v4` (a page fetched at an address the router knew is never a source, so an official page it wants
+  to cite is found with `web_search` in the first step, beside the fetch) and `router-read-v10`: a current fact (the latest version, what a version supports) is
+  read now from the source that states it, the latest version from the project's release record (stable.txt, the GitHub latest
+  release) rather than a releases page that lags it, and support from that version's own compatibility matrix.
+- A person who asks something the router answers from a lookup hears from it at once: when the turn's first web search or MCP read starts
+  and nothing has been said, the system says one short line in their language ("收到，我查一下。"), and the answer takes that line's place
+  (`CLAW_ASSISTANT_LOOKUP_ACK`, default on; 2026-11-06 nightly: first reply p90 8.4 s against a 5 s target). A router turn that spends every
+  step on lookups now answers in text at its cap (Brain `report_at_turn_cap`), and one that still ends with no word is told so once (peer
+  run bczh-202: eleven web lookups, no reply). The message saying an item waits for a write its worker holds carries the write as a card
+  (`held_write`) for a reader of the session. The router is told outright that what a worker reported is `work_recall`, that "记住…" is a
+  memory entry and never a setting, and that a daily brief or a pause is a channel action, never a scheduled task (`router-v18`,
+  `router-memory-v2`).
+- How far an item got is answered from what its job wrote at the question, not from the worker's last look at it: a worker checks a
+  long job only every minute or two, so its last tool output was up to two steps behind the log (2026-11-06 parity run, L1: "step 3/16"
+  while the log said step 5). While the item's run is going, `work_recall(item, "live")` also returns `files_now`: the tails of the
+  newest files of the worker's workspace, read from its running sandbox (never one started for it; hidden files and dependency trees
+  skipped; masked and cut), each with the time it was written, and the router answers from them with the line's time and how long ago
+  it was (`router-v16`).
+- A difference or percentage between two results is computed from the unrounded values: the router no longer subtracts the rounded
+  figures of two reports itself (2026-11-06 parity run, M2: 678.7 where the data gives 678.6) but asks the item that has the data, and
+  a worker rounds only the figure it reports (`worker-v6`).
+- An item's result is no longer said twice. The silent sweep took a say shown in the assistant session as having told nobody when the
+  user had no channel subscription, and said the result again about five minutes later, into whichever session was the user's by then
+  (2026-11-06 parity run: #119 and #120 into the session that replaced the deleted one, #121 into its own). A say whose event was
+  published to a session that is still there (`claw_assistant_says.session_id`, recorded after the publish) now tells a user with no
+  channel that takes it. What the system says about an item on its own goes to the session the item was started from
+  (`claw_work_items.router_session_id`); when the user deleted that session, once to the one they have now (made, as their next visit
+  would, when none was made yet), marked as from an earlier conversation.
+- A result whose router could not be woken is said at once, not about five minutes later by the silent sweep. A session made again after
+  the user deleted one holds no credentials until their first message in it, so the wake was refused (`assistant.wake_not_queued
+  error=no_credentials`) and only the sweep said the result (2026-11-07 parity run, v369 B-short). The system now says it with the report,
+  in its own words and under the sweep's id, so it is still said once. When the user has spoken in the new session, the router is told
+  the item came from an earlier conversation, and its message about the item starts with （之前的对话里开始的事项）, as the system's own
+  does (v369 B-talk: said with no marker).
+- A follow-up that starts a new item ("去掉 cancelled 再算一次") no longer leaves its worker without the file the user sent earlier: a new item
+  gets a copy of the files the user sent in the last 24 hours of the conversation (`files_from_earlier_messages`), the router is told
+  they will go with it, and it forwards a follow-up to the item that did the work while that item is open (`router-v15`).
+- A write a worker holds for its person is no longer put to them before what was found: the worker reports what it found first
+  (`worker-v5`), that report is said to the person ahead of the request, and the request says what the write would do in plain words
+  (the comment it would post, whole) in the person's language, never as the tool's name alone. A comment the router drafts itself is
+  put on its card after the answers the user asked for (`router-write-v2`).
+- How far an item got is read now, not estimated: `work_recall(item, "live")` shows the worker's last steps with their times (a log's
+  latest lines included), and a `say` that names an item still in progress, in a turn answering the user, is refused until that turn
+  looked at the item.
+- A NATS timeout that reaches a brain run wrapped in another error (the sandbox layer's `hands KV is unavailable` and DAG-binding
+  write failures keep the `NatsError` as `cause`) is retried like a bare one instead of ending the run for good, and is reported as
+  `infra_transient` rather than `upstream_timeout` when its retries run out. A retryable failure now waits 5 s, 10 s, 20 s, 40 s,
+  then 60 s per attempt (was a flat 5 s), so a stall spends the delivery budget over the time it lasts.
+- A development environment item no longer stays in progress after its last instruction ended when two stops came in quick
+  succession and a turn finished on its own as the first was on its way. The connector (`connector/`, next release) names the
+  prompt each `turn_end` ends (`data.cmd_seq` and `data.cmd_id`; `null` for the end of a cancel that found nothing running) and
+  refuses by name each prompt a cancel drops from its queue (`command_rejected`, reason `cancelled`). Claw keeps the command
+  numbers of an item's open prompts (`open_cmd_seqs`; a number, which the credential masking of events never changes, unlike a
+  client's `Idempotency-Key` in a `cmd_id`) and ends exactly the prompt named; a turn's end that names a prompt the item does not
+  have open ends nothing. The end a cancel brings ends every prompt still open that was sent before it, so a prompt whose turn's end
+  never came (the connector restarted mid-turn) ends with the next stop. A connector that does not send `cmd_seq` is counted as before.
+- A router turn that said only a line that it was on it ("查一下 Autopilot 的状态。") before its lookup answered, and then wrote its
+  answer as plain text, no longer leaves the person with that line alone: the completion skipped the text because the turn had
+  spoken. When the turn's stored `toolUsed` events show that every say that went out came before its last lookup ended (answered or
+  failed), the text is delivered as its answer, once, and takes the line's place (`replaces`, #360)
+  (`assistant.unsaid_answer_after_early_say`). The plugin's `teams-reply-style` rule reaches the router under a heading that keeps
+  it to how a say's text looks: its line asking for a line between tool calls is the Teams sessions', not the router's.
+- A worker that left what the user asked for in its last words (after a one-line report, or with no report) no longer loses it: final
+  words of 1200 characters or more that no report of the run held are delivered as `item-<n>-reply.md`.
+- A `say` whose `[n]` lost its source (the page was fetched at an address no lookup returned) is refused with what to do, instead of
+  reaching the user as a number that links nowhere; a turn that ended in plain text is said without its bare `[n]`.
+- The router answers a list item by item from the result (`owner/repo#number`), gives numbers exactly as returned (no estimates), and
+  never tells the user an earlier answer was unchecked (`router-read-v8`).
+- A review item's pull request is followed after its turn (`gh_pr_follow`, the review items' sweep, at most every 90 s per item):
+  merged or closed on GitHub ends the item and closes what its session still held for the reviewer's answer. For a review asked of
+  someone else that may merge, the requester's own GitHub account merges their pull request once the reviewer's approval of the head
+  is on GitHub, CI is green, no thread is open and the merge state is CLEAN, instead of waiting for the reviewer to confirm a held
+  merge; the held merge closes as merged by the requester. One acting user may now be asked about 30 writes at once (was 10).
+- `claw-connector logout` (`connector/`, next release) revokes this machine's connector at Claw before it deletes the sign-in. It
+  said "signed out" and left the connector row alive: still the user's connector, and instructions sent to it waited for the next
+  sign-in on that machine. With a key it calls `DELETE /v1/remote-agents/connectors/:cid`; with a device sign-in, whose access token
+  the user side refuses, the new connector-side `POST /v1/remote-agents/connectors/:cid/revoke` (the same revocation, for any of the
+  caller's connectors). When the row cannot be revoked (Claw unreachable, the sign-in already refused, a Claw without the new route),
+  the sign-in is still deleted, `logout` says the connector is not revoked, prints the `curl` that revokes it, keeps its id, and
+  exits 1.
+- Remote connector presence over time: every change of a connector's presence is recorded, the connector list gives
+  `last_seen_at`, `offline_since` and `offline_reason` (`auth_expired`, `no_heartbeat`), and a connector offline for 5 minutes
+  is reported once to its owner through their assistant with when it was last seen and the command that brings it back, then
+  once more when it is back. The seconds-long breaks a Claw release causes are never reported.
+- The assistant router's `say` takes an optional `suggested` (`CLAW_ASSISTANT_SUGGESTED_REPLIES`, default on): up to three short
+  replies the user is likely to send next. They are checked (one plain line of at most 30 code points each, no address, markup, slash
+  command or internal text, none twice; one that does not fit is left out and never refuses the message) and carried by
+  `assistant.say` and the session's `AssistantSay` as `suggested_replies`, for a channel to show as buttons that send them.
+- Citations of the agent board: `CLAW_ASSISTANT_CITE_LINK_SERVERS` (`agent-board=https://host/board/`, default none) names plugin
+  read servers whose JSON results carry their own pages as `html_url`; a router turn that reads one sends them as
+  `ExecuteRequest.cite.link_servers`, and Brain keeps the `html_url` of each top-level result object under that prefix as a source of
+  the new kind `board`. A `say` that cited a board issue it had read lost the source before (no lookup of the turn had returned it).
+- The router's read section says what it can do, from the tool catalog (`router-read-v7`): reads at once; every write of its
+  servers, GitHub's and anything needing code or a run through a work item whose worker asks the user before each write; never
+  "read-only", and never a system failure (a sandbox that would not start, a 403) as a limit.
+- The assistant's week: `GET /v1/assistant/brief?range=week` and the router's `brief(range: "week")` put together the last seven
+  days (items that ended and how, pull requests merged or closed with their links, SaFE workloads that succeeded and failed), for a
+  weekly report written from what Claw holds. The router can schedule a brief through the same confirmation card as any trigger
+  (`trigger_create` with `action: "brief"`, no prompt), and a brief trigger whose schedule fires at most weekly says the week.
+- `CLAW_ASSISTANT_JOB_HTTP_SOURCES`: kinds of job the deployment adds to `job_watch`, each read over HTTP with the user's own
+  platform key (the URL names the job with `{id}`; dotted paths pick its state, a line about it and, optionally, its owner; listed
+  end states end the watch). Only https, or plain http to an in-cluster `.svc` host, is taken.
+- Three GitHub writes, each held for the user's decision like every write of the `github` server: `checks_rerun_failed` (run
+  again the failed jobs of a GitHub Actions workflow run; `checks_list` now gives a job's `run_id`), `pr_request_reviewers` (people
+  and teams) and `labels_set` (the whole list of an issue's or pull request's labels). None is a router read.
+- An assistant's router turn diagnoses a failure itself: of the assistant plugin's servers it is offered SaFE's `workload_logs`,
+  `workload_events`, `workload_pod_logs`, `workload_pod_containers`, `node_pod_logs`, `node_reboot_logs`, `cluster_logs` and
+  `flavor_avail`, and the agent board's `notification_read` and `milestone_read`; the user's scheduled tasks (`trigger_list` of
+  the turn's own `schedules` server, kept only when this API minted its bearer for this turn's session, message and run); and the plugin's
+  `teams-reply-style` rule. Its log reads go to Brain as the new `ExecuteRequest.log_reads` (each read's line-counting
+  argument, empty for `workload_pod_containers`, which counts nothing but whose termination messages can hold a log's end):
+  Brain asks for at most 40 lines or entries, masks credential-shaped text in the answer before the model, an event or a log
+  line sees it (new `redactLogSecrets` of @claw/utils: `redactSecrets`; values after a credential's name, where an unquoted
+  value runs to its line's end, or to the closing quote of the string its name is in, and no separator or bracket ends it; Kubernetes environment variables named like a credential; armored private keys, OpenPGP ones
+  included, and a key whose BEGIN line the tail cut off, from its first base64 line), and keeps the last 6000 characters of a
+  plain-text answer.
+- Work on the user's development environments is on their work item list (`kind = 'remote'`, one item per remote session, written
+  by Claw from the session's prompts and its connector's events), so "did the one I just ran finish?" is answered from the list,
+  for a prompt typed into an attached chat (told to nobody) as for one the assistant sent (told once when it ends or waits for an
+  approval). New router tool `devenv_send` puts an instruction for an agent on one of the user's own machines to them as a card
+  (held write kind `devenv_send`, showing the text, the machine, the session and the folder): nothing is sent from the turn, even
+  one answering their own signed-in message; it is sent only when they press the card or reply `批准 #ref`, which then picks the
+  machine, continues an idle session or opens one, and files the item. `why_card` says `confirm_first`, or why the turn could not
+  act anyway; with cards off it is refused (`cards_off`). The agent's answer and its tools' titles stay off the router's item list
+  (`work_recall` reads them and marks the turn). `work_send` refuses these items, `work_stop` and the item's stop button cancel the
+  agent's turn, and the silent sweep skips them. Router prompt router-devenv-v3.
+- An assistant router turn answers about the user's development environments itself: `devenv_list` (where
+  `CLAW_REMOTE_AGENTS_ENABLED` is on) lists their own machines (online, last seen, version, agents) and every agent session on them
+  (open through Claw, or the agent's own conversation a connector offers to take over) with its state, folder, last activity, a
+  label and the command that attaches the chat to it; `detail: "activity"` adds what each one is doing in the agent's words.
+  Either read marks the turn as having read untrusted text; such a turn may still put the attach command of one of the user's own
+  sessions to them as a button, and nothing else. The router prompt treats 开发环境 / dev box / my machine as the connector, never as
+  a SaFE workspace, and "connect me to it" as `channel_action` with that attach command. Only the caller's rows are read.
+- Citations for the assistant router's answers, behind `CLAW_ASSISTANT_CITATIONS` (default off). The router writes [1], [2] in its
+  `say` and names each number's address in `say`'s new `sources` argument; the new `ExecuteRequest.cite` makes Brain keep the sources
+  the turn's own lookups returned (`web_search` hits and what the API's GitHub server lists in its results' `_meta["claw/sources"]`:
+  pull requests, issues, repositories, files, and checks on GitHub's own pages; a page `web_fetch` read whole only confirms one of
+  those or an address the user wrote in the message, `cite.user_urls`, and never adds a source) and send `say` only the entries that
+  match, in the MCP request's `_meta`, where the model cannot write; an address no lookup returned is dropped and counted. The API
+  checks them again (numbers cited in the text, none in a text that can make a link of its own as CommonMark with GitHub's
+  autolinks reads it, escapes resolved; http(s) addresses without credentials or anything redaction would mask; titles cut to one
+  plain line of 80 code points with markup, addresses and hidden characters removed) and the `assistant.say` payload and
+  `AssistantSay` event carry them as `sources: [{ n, url, title, kind }]`. The text is never changed, so a streamed say stays a
+  prefix of the message, and a `sources` argument of the wrong type is read as none rather than refusing the say. New counter
+  `claw_assistant_say_sources_total{outcome}` (`cited`, `dropped_not_in_turn`, `dropped_invalid`, `dropped_over_cap`,
+  `unreferenced`, `suppressed_link_text`).
+- The assistant takes the files a person sends and hands back the files and long answers its work produces. A channel uploads the
+  files to the assistant's session and names them beside the message (`channel_context.files`: `path` below `.uploads/`, `name`,
+  `media_type`, `size`; at most 10, only paths inside the session's own uploads). The router turn that answers the message is told what
+  came and is shown the images itself: the new `prompt_images` field of the execute request names them, and Brain reads them from the
+  session's uploads and sends them with the prompt as image blocks (whole PNG, JPEG, GIF or WebP up to 3.5 MB, at most 4 and 6 MiB of base64 together; the checks
+  are now one module, `@claw/protocol` `images.ts`, shared with Hands' `read`; the OpenAI wire sends them as image parts). Every item
+  the turn starts or instructs (`work_create`, `work_send`) gets a server-side copy of every file in its worker's session before its
+  message is queued (the copies side by side, under one 10 s deadline), and the worker is told where; a copy the store refused or
+  that was not done by the deadline is answered as `files_not_attached`. A worker's
+  `deliver_file` reaches the user: after a report that says something (any kind but progress), at a worker run's end and from the
+  assistant sweep, each delivered file still downloadable is announced once, oldest first, as an `assistant.say` in the system's words
+  carrying `files` (`item_id`, `session_id`, `id`, `name`, `size`, `content_type`, a small image inline) for a channel to draw as a
+  download; a report records how far its files were announced in the new table `claw_work_item_delivery_checks`, so a store that did
+  not answer is retried by the sweep, and a file's message that neither a channel's outbox nor the session holds is published
+  again. A delivered file's name is said inside a code span and redacted as the message's text is. Long answers are said whole: `say`
+  takes up to 9000 characters (the router is still asked for about 600 unless the user needs more), an `answer` report up to 8800
+  (other kinds stay at 600), and an answer longer than 600 is sent to the user whole by the system at once (stored for sending in the
+  report's own transaction, and only then is the router told it was sent); a plain-text router ending is cut only past 9000. The super-agent evaluation sends a turn's `files` as a channel does and grades
+  `delivers` and `style.min_chars`.
+- Quicker assistant router turns. A router turn can ask for low reasoning effort (`CLAW_ASSISTANT_ROUTER_EFFORT`: low | medium |
+  high | `default`, the default, for the model's own; set `low` where the router runs on a reasoning model such as Claude; a session
+  that chose an effort keeps it), and its `say` is published while the model writes it (`CLAW_ASSISTANT_STREAM_SAY`, default on): the
+  new `ExecuteRequest.stream_tool_text` names tools whose `text` argument Brain streams (Anthropic `eager_input_streaming`, Claude
+  models only) and publishes as `toolTextDelta` events (`tool`, `actionId`, the text so far, at most every 400 ms per call, top-level
+  loop only). The call itself still runs when the step is whole; the deltas are a preview for
+  whoever follows the session live and are not stored. The router's read-only lookups (`read_taint.sources`) now run side by side
+  within a step, as Brain's sandbox reads do.
+- An assistant's work item whose worker holds a write for its person's decision, or asks them with `ask_user_question`, now reaches
+  that person and waits for them (`assistant/holds.ts`). The item moves to needs_you with what it waits for as its question (and a
+  new attention), and the request goes out as an `approval.requested` with `source: "assistant_item"`, the item, and for a question
+  the questions, to each subscription that lists the type and the new `assistant_item` source (not in the default set; the
+  subscription routes accept it). With no such subscription the item's needs-you message goes at once, not after the silent sweep's
+  wait, and a request a channel took counts as that message, so the sweep does not repeat it. The decision, the answer, or the end
+  of the wait (`decisionResult`, the question's result) puts the item back in progress, as does the end of the run that waited (an
+  aborted wait sends no decision; the assistant sweep releases one whose run ended unseen). A worker's sub-agents can wait at once:
+  the item records each request (`params.holds`) and goes back to work only when the last is over, and a request whose end arrived
+  first holds nothing. The router's turn is shown what waits
+  ("Waiting for you in work items"), which only the person answers. Worker turns carry the new `ExecuteRequest.decision_wait_ms`
+  (`CLAW_ASSISTANT_DECISION_WAIT_SEC`, default 3600, 0 keeps Brain's settings), which Brain uses for that run's approval and
+  question waits and announces as their `timeout_ms`. Before, nobody was told and the item said "in progress" until Brain refused the
+  call after `HITL_DECISION_TIMEOUT_MS`. The super-agent evaluation runner answers such a request through the same routes (`hold`).
+- The assistant acts later on its own. With `CLAW_TRIGGER_TOOLS_ENABLED` (and triggers and the assistant on) the router has
+  `trigger_list`, and `trigger_create` / `trigger_cancel`, which create and cancel nothing themselves: the write is stored as a
+  confirmation (new table `claw_assistant_confirmations`, 24 hours) and put to the user as a card (`assistant.say` with
+  `confirm_write`: its id, short ref, kind and button label; the session's `AssistantSay` event now carries `confirm_write` and
+  `confirm_action` too). The user's press is `POST /v1/assistant/confirmations/:id/decision` (`allow` | `deny`), taken as a held
+  merge's answer is: from their own sign-in, or from a service listed in `CLAW_GITHUB_REVIEW_DECISION_CLIENT_IDS` answering for them,
+  never from a key; or their whole signed-in message `批准 #<ref>` / `拒绝 #<ref>` through `confirmation_answer`. The write happens in
+  the transaction that closes the card, so one card does it once; the answer says when the trigger first runs. `GET
+  /v1/assistant/confirmations` lists open cards. A router turn proposes only while answering a message of the user's, before it has
+  read anything untrusted.
+- The user's brief: `GET /v1/assistant/brief?lang=&timezone=` puts it together without a model from their items, the pull requests
+  their items watch and what happened on them, the runs and approvals Claw notified them about and the writes waiting for them, the
+  jobs the assistant watches, and their SaFE workloads read with their own key (failed in the last day, pending over 30 minutes,
+  running). Every section is there; one that could not be read says "could not check". The router reads it with `brief` (with the
+  schedule tools; the turn no longer acts for the user afterwards). A trigger may now have `action: "brief"`
+  (new column `claw_triggers.action`, default `run`): it fires without a run, saying the brief through the owner's assistant once per
+  planned time (recorded as `delivered`; refused at creation without the assistant).
+- An item whose title or brief names pull requests in full (a link or `owner/repo#123`, at most three) watches them from the start, as
+  `work_subscribe` would (read-only), when the loop can read the user's GitHub token; `work_create` answers `watching` or
+  `not_watched` with the reason (`no_github_token` without one).
+- Job watches, behind `CLAW_ASSISTANT_JOB_EVENTS` (default off; `CLAW_ASSISTANT_JOB_POLL_SEC` 30, `CLAW_ASSISTANT_JOB_MAX_WATCHES`
+  20): the router's `job_watch` (a SaFE workload of the user's own, read with their key, or a run of theirs), `job_watch_list` and
+  `job_unwatch`.
+  A loop modelled on the GitHub events loop claims due watches, writes each change of state once (new tables
+  `claw_assistant_job_watches`, `claw_assistant_job_events`) and tells the user in their language; an ended job ends its watch, a gone
+  one says so, and one unreadable for ten minutes says so once.
 - Model choice for the assistant's items, behind `CLAW_ASSISTANT_MODEL_CHOICE` (`on` | off, default off; needs `CLAW_ASSISTANT_ENABLED`
   and a non-empty `CLAW_ASSISTANT_MODELS`, the allow-list as `name=label,...`). One function decides an item's model: the model the
   message asked for, else the payer's own review default (reviews), else their own default, else the deployment's default for the kind
@@ -49,9 +1571,9 @@ record it.
   once after the same grounding, and the router is answered `handed_off`. A channel that does not declare it, or a user with no
   subscription to `assistant.action`, gets the `acting_as_credentials_required` refusal as before. The handoff is recorded
   (`claw_assistant_review_handoffs`) and its id handed over (`review.handoff_id`); `POST /v1/assistant/reviews` takes it back as
-  `handoff_id` and reads the record, not the body: such a review merges only once the reviewer confirms the merge, only reviews when the
-  router read no merge, and starts once per handoff; a request for a handed-over pull request without the id is held the same. The
-  reviewer must be named in the person's message, not only listed by the channel (`reviewer_not_named`).
+  `handoff_id` and reads the record, not the body: such a review only reviews when the router read no merge, and starts once per
+  handoff; when it may merge, it merges as the reviewer's own review mode says. The reviewer must be named in the person's message, not
+  only listed by the channel (`reviewer_not_named`).
 - Archived sessions can be deleted on a schedule: `SESSION_RETENTION_DAYS` (default 0, off) makes the API's daily
   maintenance delete a session that many days after it was archived, through the same commit as a user's delete (queued
   messages dropped, turns, events and summaries stamped deleted) with its S3 workspace and checkpoint prefixes removed by
@@ -61,7 +1583,7 @@ record it.
   good the stamped rows of sessions deleted more than that many days ago. `SESSION_RETENTION_BATCH` (default 500) bounds
   each pass; `SESSION_RETENTION_DRY_RUN=true` only logs the counts (`session_retention.dry_run`). Archiving now records
   `claw_sessions.archived_at` (a new nullable column; a session archived before it existed counts from `updated_at`).
-- A review asked of someone else (`POST /v1/assistant/reviews` with `acting_as` naming another person) is that person's: their item, their session sealed with their own keys (brought as `x-acting-as-token` and `x-acting-as-api-key`), their quota; their delegation switch is asked at creation and before every queued turn; the session runs with a fixed review profile and, on SaFE, a sandbox in `SANDBOX_CPU_NAMESPACE` created with `useWorkspaceStorage: false`; the requester sees four facts only. `POST /v1/sessions` refuses `requested_by`, `sandbox_profile`, `requester_note` and `acting_as` naming anyone but the caller (a deployment with `CLAW_ASSISTANT_REVIEW_ITEMS` off has no way to ask a review of someone else). New settings `CLAW_REVIEW_FOR_OTHERS_*`. The assistant's `review_start` refuses a review by someone else (`acting_as_credentials_required`; the user is sent to the review agent named by `CLAW_GITHUB_REVIEW_AGENT_NAME`); the requester's assistant lists the reviews they asked of others read-only (four facts), and `work_recall` / `work_stop` act on them with only those facts in the answer. A review the assistant's router starts or restarts merges nothing by itself, whatever its `merge` says: its session (`config.merge_needs_confirmation`, kept by every restart) holds its merge, and an approval GitHub's auto-merge or merge queue would turn into one, for the acting user's confirmation whatever the risk and review mode, made only from the card's button or `批准 #<ref>` / `approve #<ref>`; while auto-merge is on or the pull request is in the merge queue, such a session (and a review-only one) resolves no thread (`gh_thread_resolve` answers `auto_merge_on`).
+- A review asked of someone else (`POST /v1/assistant/reviews` with `acting_as` naming another person) is that person's: their item, their session sealed with their own keys (brought as `x-acting-as-token` and `x-acting-as-api-key`), their quota; their delegation switch is asked at creation and before every queued turn; the session runs with a fixed review profile and, on SaFE, a sandbox in `SANDBOX_CPU_NAMESPACE` created with `useWorkspaceStorage: false`; the requester sees four facts only. `POST /v1/sessions` refuses `requested_by`, `sandbox_profile`, `requester_note` and `acting_as` naming anyone but the caller (a deployment with `CLAW_ASSISTANT_REVIEW_ITEMS` off has no way to ask a review of someone else). New settings `CLAW_REVIEW_FOR_OTHERS_*`. The assistant's `review_start` refuses a review by someone else (`acting_as_credentials_required`; the user is sent to the review agent named by `CLAW_GITHUB_REVIEW_AGENT_NAME`); the requester's assistant lists the reviews they asked of others read-only (four facts), and `work_recall` / `work_stop` act on them with only those facts in the answer. A review the assistant's router starts or restarts merges nothing by itself, whatever its `merge` says: its session (`config.merge_needs_confirmation`, kept by every restart) holds its merge, and an approval GitHub's auto-merge or merge queue would turn into one, for the acting user's confirmation whatever the risk and review mode, made only from the card's button or `批准 #<ref>` / `approve #<ref>`; while auto-merge is on or the pull request is in the merge queue, such a session (and a review-only one) resolves no thread (`gh_thread_resolve` answers `auto_merge_on`). (Later changed: such a review for a person whose review mode is `fully_auto` merges once it approves, since that person has already said nobody needs to confirm their merges; see the assistant reviews entry under Unreleased.)
 - The user's long-term memory in the assistant, behind `CLAW_ASSISTANT_MEMORY_TOOLS` (`on` | `off`, default off; needs
   `CLAW_ASSISTANT_ENABLED` and `CLAW_MEMORY_ENABLED`, and the user's own opt-in). A router turn is shown the one-line
   index and offered `memory_recall`, `memory_save`, `memory_update`, `memory_forget` and `memory_undo`; each write acts only
@@ -443,6 +1965,104 @@ record it.
   `run` warn per agent when the machine's Claude Code settings default to `bypassPermissions` (user `settings.json` or the
   managed settings file) and the agent has no `approval = "never"`, so every session of that agent would be closed with
   `mode_not_enforced`. Before, such a machine showed online and nothing said so before the first session (#247).
+- `@primusclaw/connector` 0.1.4: every `turn_end` of a prompt's turn names the prompt it ends (`cmd_seq`, `cmd_id`), so a
+  development environment item no longer stays `in_progress` after its last instruction when stops and turn ends cross (#365);
+  `claw-connector logout` revokes the connector at the Claw it registered with before it deletes the sign-in, and exits 1 with
+  the remedy when it cannot (#367).
+- `@primusclaw/connector` 0.1.5: on `event: reconnect` (a Claw replica shutting down for a release) the connector opens its command
+  stream again at once, without the reconnect backoff and without waiting for the end of the response a gateway may hold (up to the
+  75 s watchdog before); `disconnects.jsonl` records it as `server_closed` / `restart`. A second such frame within 5 s takes the
+  usual backoff, so a release never becomes a burst of reconnects.
+- `@primusclaw/connector` 0.1.6: `claw-connector doctor` checks the machine first (Node version, the agents' programs on the PATH the
+  service sees, whether Claude and Codex are signed in, writable roots, proxy variables, a Claw certificate Node does not trust, the
+  keep-alive) with one fix per problem, then opens a session on each agent's adapter; a running connector re-checks every 15 minutes
+  and reports the result with each agent's health, which the chat shows; `service install` also carries `NODE_USE_SYSTEM_CA` and
+  `NODE_USE_ENV_PROXY` (#416). After a restart (a crash, a kill, a pod or supervisor restart, an upgrade) a connector carries on
+  a turn that was waiting for a tool approval and shows its card again (an agent that always asks, not paused, offline for less than
+  the card's lifetime), ends any other running turn with `connector_restarted`, keeps the prompts that were queued, and says
+  `session_recovered` for a session used in the last 4 h (#419).
+- `@primusclaw/connector` 0.1.7: `claw-connector pair <code> --server <url>` signs a machine in with a one-time code from the chat
+  (#421); setup no longer touches a network mount that may hang, the npm install of the adapters runs without the agents' keys,
+  and a session that never received a message survives a connector restart (#435). (0.1.6, as published, also carried #430 and #425.)
+- `@primusclaw/connector` 0.1.8: `init` asks before writing Claude hooks and a stalled state directory no longer stops the heartbeat
+  (#401); a paired machine that was disconnected is told to pair again (#437); a conversation open in a terminal can be taken over
+  once the person confirms (#423, connector part); a fresh install trusts the machine's CA store without `NODE_USE_SYSTEM_CA` (#443);
+  every command answers `-h`/`--help` and an unknown option exits 2 (#440); a crash that damages `connector.json` no longer
+  registers the machine as a new connector (#446).
+- `@primusclaw/connector` 0.1.9: a message from the chat can be typed into a conversation open in a tmux terminal instead of
+  only watching it (#451, connector part), and a tmux client that exits before reading that input fails the run instead of
+  crashing the connector on EPIPE (#473); a 401 during Claw's auth outage no longer stops the connector for good (#453); `doctor`
+  checks that an API-key Codex agent is signed in, as its sessions open (#462).
+- `@primusclaw/connector` 0.1.10: a prompt from the chat can be typed into a local tmux terminal even when the shared Claude
+  directory keeps session rows of another pid domain (#487); the agent's own writes between turns no longer refuse the next
+  prompt as `recently_written` (#472); `pair` on a hostname that is already another of the person's machines pairs under the
+  hostname and the agents' folder, and a paired machine's service hint asks the chat for a new pairing command (#477, connector
+  part).
+- `@primusclaw/connector` 0.1.11: a log or state file that cannot be written (a full quota, `EDQUOT`) no longer stops the
+  connector (#496); `withdraw` takes back a message from the chat that has not started and never touches what runs (#494); a
+  closed session stops reading its mode back at once, and `run` waits up to 10 s for commands it has accepted before it exits
+  (#497).
+- `@primusclaw/connector` 0.1.12: a command held in the socket through a stall (a laptop lid closed, a network gap) is confirmed
+  with Claw before it runs, so a prompt the chat has since withdrawn or let go is not run late (#469, connector part; needs Claw
+  with #469, live since :202611080318).
+- `@primusclaw/connector` 0.1.13: a command waiting behind a turn is confirmed with Claw when the stream missed its pings (a
+  short network hold), and a prompt for a session closed meanwhile is refused as `session_closed` (#503, connector part; needs
+  Claw with #503, live since :202611080436); an unchanged connector.json is no longer rewritten (and flushed) after every
+  heartbeat (its modification time is still set), so on a slow disk a session's start no longer queues behind those durable
+  writes (#527).
+- `@primusclaw/connector` 0.1.14: a phone message to a conversation open in a terminal is typed in any permission mode
+  (manual, plan, accept edits, auto, don't ask, bypass permissions), and `session_started.terminal_mode` names the mode so the
+  chat can say when a message runs without asking; a conversation with a name (`/rename`) is typed into at once (its name in the
+  rule above the input box made the connector wait 10 minutes and refuse it as `terminal_busy`); a screen that is not Claude
+  Code's input box is refused in 30 s as `terminal_screen_unknown` (#555). In a container, `claw-connector service install`
+  restarts a running supervisor so an edited agents.toml or environment takes effect, and an ended supervisor that PID 1 never
+  reaps is no longer taken for a running one (#549).
+- `@primusclaw/connector` 0.1.15: a running Claude Code whose registry row (`sessions/<pid>.json`) cannot be read (an empty file a
+  lost write left) no longer makes the conversations in its folder look free: they are reported `unknown`, not `idle`, so no
+  client offers to take one over, and a takeover or new attach there is refused (`twin_check_failed`, naming the process and the
+  file); a session this connector already holds goes on. The scan is shared and time-limited, and `doctor` warns
+  (`claude_registry_row_unreadable`) with the fix: send anything in that terminal (#572).
+- `@primusclaw/connector` 0.1.16: a terminal at its prompt with background shells running (Claude Code's `shell` status) is
+  typed into like an idle one, instead of a message waiting 10 minutes and being refused. Enter is sent only on a screen that
+  shows the input box holding exactly the typed text, no question or menu, and no running turn, so a phone's message never
+  answers a permission question; otherwise the text stays in the box and the message is refused (#626).
+- `@primusclaw/connector` 0.1.17: a running Claude Code whose registry row is torn (Claude Code never writes it again) has the
+  conversation it holds proven where it can be, instead of every conversation of its folder staying "unknown": it keeps that
+  conversation's task folder open, the conversation was written since the process started, its own tmux pane names it in the rule
+  above its input box, and no other conversation of the folder written since may share that name. That conversation is then listed
+  live with Connect and typed into (gated on its screen); the rest of the folder can be taken over or hidden. Any doubt (an unnamed
+  conversation, a file or folder that cannot be read, a scan that does not answer in time) leaves it as before (#612).
+- `@primusclaw/connector` 0.1.18: a terminal whose Claude Code says `busy` only because background agents run (its main turn
+  idle) takes a phone's message, instead of the message waiting and being refused: for Claude Code versions measured to behave so
+  (2.1.285, 2.1.319, 2.1.321, 2.1.322), when the transcript says the last main turn ended with no message still queued and the
+  screen shows an empty box with no `esc to interrupt`, on two looks; the transcript is checked again right before the Enter, and
+  the Enter guard of 0.1.16 applies. Any other version, or any doubt, waits as before; doctor reports an unmeasured version
+  (`claude_version_unverified`) (#632).
+- `@primusclaw/connector` 0.1.19: a phone's message to a conversation open in a tmux terminal is typed in at once, whatever Claude
+  Code is doing there; one submitted while a turn runs is queued by Claude Code itself (no busy judgement, no version list, no
+  10-minute cap for a busy terminal). The one guard: the message goes in as a bracketed paste and is submitted with End+Enter in
+  one write only on a screen that shows the box holding exactly it and no question or menu, so a question that comes up at that
+  moment gets "No", never "Yes"; a question on the screen is waited out and the phone is told (`terminal_dialog`). Cancel presses
+  Esc only into a turn the message started itself and takes a cancelled message's own text out of the box again. Claude Code's
+  prompt suggestion in the box is not someone typing (#648).
+- `@primusclaw/connector` 0.1.20: a message held because someone is typing in the terminal (or it is scrolled back) ends as
+  `terminal_busy` ("not sent, send it again"), never as `terminal_input_unconfirmed` before its text went in (#671); a terminal
+  step written after a large transcript line (Claude Code's `prompt_snapshot`) reaches the phone while it runs, read on the first
+  look instead of 256 KB a second (#674).
+- `@primusclaw/connector` 0.1.21: its runtime dependencies are pinned to exact versions (`@agentclientprotocol/sdk` 2.5.0,
+  `smol-toml` 1.9.1, `zod` 4.6.7), so an install gets what CI tested instead of the newest version a range allowed (#684, with the
+  SDK bump of #652).
+- `@primusclaw/connector` 0.1.22: a terminal session attached to the phone shows only what a person typed there; entries Claude
+  Code writes itself (task notifications, cross-session and sub-agent messages, reminders, compacted-conversation summaries,
+  slash-command lines) are no longer shown as typed in the terminal. A message of several lines, pasted as `[Pasted text #1]`, is
+  confirmed instead of ending as `terminal_input_unconfirmed`; a long message whose input-box row ends two columns short of the
+  rule is submitted instead of refused; the terminal tests stop their tmux servers (#698).
+- `@primusclaw/connector` 0.1.23: opt-in approval hooks (`claw-connector hooks install --approvals`) put the questions a Claude
+  Code session started in a terminal asks (a command, an edit, leaving plan mode, a multiple-choice question) on the owner's phone
+  as cards while the terminal keeps asking, first answer wins; nothing changes until they are installed (#706). A conversation run
+  by the connector's own adapter is no longer reported as open in a terminal, so its permission card on the phone no longer
+  produces a "waiting for you in a terminal" notice (#714). A message typed into a busy terminal is watched for up to 20 s instead
+  of 3 s, the phone is told after 3 s that it waits, and one never shown is refused as `terminal_input_unseen` (#721).
 - `claw-connector`: an owner can let an agent run without per-step approval, like in their own terminal.
   `approval = "never"` on an `[[agents]]` table (or `claw-connector init --approval never`, `--approval claude=never`)
   starts that agent's sessions in its no-approval mode (Claude `bypassPermissions`, Codex `agent-full-access`,
@@ -520,6 +2140,58 @@ record it.
   `--`, with literal pathspecs and without its optional index lock. See `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
+- The turn recall reads at most `CLAW_MEMORY_MAX_ENTRIES` entries (pinned, then newest; past-review ones left out in the query) and shows
+  an entry's body up to what a write may store (500 characters) instead of 400.
+- Brain: a turn's MCP servers are connected side by side instead of one after another, and the connections are kept for the same
+  user's next turn (new `clients/mcp-pool.ts`) instead of being opened from nothing (initialize, then tools/list) on every turn. A
+  kept connection is keyed by the user, the server's name and a hash of its whole spec, credentials and headers included, so two
+  users never share one and a changed credential is a new connection; a run without a user opens and closes its own as before.
+  When its tools were last listed more than 30 s ago a turn lists them again beside it, without waiting (it is offered them as last
+  listed), and a failed listing reopens the connection; a call answered 404 (session gone) is sent again on a new connection, a failure is answered from memory for 30 s, and a connection unused for
+  `MCP_POOL_IDLE_MS` (default 600000) is closed. A turn waits at most `MCP_CONNECT_BUDGET_MS` (default 2000) for its servers: one
+  not ready by then is left out of that turn (said to the model like an unreachable one, logged as `mcp_client.connect_deferred`)
+  and keeps connecting, and the next turn offers it. `MCP_POOL_ENABLED=false` turns the pool off. The Streamable HTTP client no
+  longer opens the standalone GET stream for server-initiated messages, which Brain never read; an SSE connection is not kept.
+  One slow server (SaFE's, 4-6 s at times) had held every assistant turn's first word behind it.
+- Brain: a streamed `say`'s text (`toolTextDelta`) that arrives inside the 400 ms interval is published when the interval ends,
+  and whatever is still unpublished when the model's turn ends is published before the call runs. The last delta of a call is now
+  always its whole text; a text written inside one interval had been a single delta of its first fragment.
+- Assistant: a review the router hands to the user's chat (`handed_off`) is answered there in one message, by the chat that starts
+  it: the router says nothing about it. From the handoff on, a `say` in that turn is refused (`handed_off`), and neither the turn's
+  plain text nor a notice that it failed is delivered for it; the handoff record keeps the turn's `message_id` (new column on
+  `claw_assistant_review_handoffs`). `POST /v1/assistant/reviews` and the restart route answer each created item's `review_only`, and
+  `merge_needs_confirmation` when its merge waits for the acting user's own confirmation whatever their review mode, so a channel tells
+  the person how the merge is made from what was started (`router-v12`).
+- Assistant: a review handed to the user's chat merges as the reviewer's own review mode says, as a review asked of them in the chat
+  does: it is no longer held for the reviewer's confirmation whatever their mode (`fully_auto` merges, `high_risk_confirm` asks for
+  high-risk writes). A request that leaves `handoff_id` out is an ordinary request again: an earlier handoff of the same pull request no
+  longer holds it or makes it review-only.
+- The assistant router answers sooner, in the user's language, and names items the user can recognise (router prompt `router-v10`,
+  read section `router-read-v5`, review prompt `router-v13`). `work_create` tells the user at once that the item started, with its
+  number and title (a system message in Chinese or English, not counted against the say limit, sent with the item and the turn's
+  message id; not in another language, where the router says it, nor in a turn that handed a review to the person's channel); its
+  result says `announced`, and the router no longer repeats it. `say` also refuses an item number said without its title (`#6、#8`;
+  `bare_item_number`, naming what to write instead; a pull request's, issue's, run's or another repository's number is not an
+  item's, nor is the item the message is sent with) and a message plainly in another language than the turn's `[Reply language]`
+  (`reply_language`): an answer to a Chinese message with no Chinese character in it once the user's item titles are set aside. The
+  other way is left to the prompt: an English sentence may quote a Chinese title of anything, and a Japanese answer may be all kanji. A router turn whose model answered nothing (Brain's empty-turn failure, which is how a declined request
+  arrives) is told to the user as a request it cannot help with, not as one that did not go through. Every router turn that answers
+  the user logs `assistant.router_turn_timing` (first and final reply in ms from the message, replies, the system's own replies,
+  items started). The prompt now has the router put a one-line acknowledgement beside its first lookups, make a step's lookups at
+  once, start work a worker can find its way in (and send a request that fits an open item to it) and ask first only when a guess
+  would act on the wrong target, make every write and all sandbox work an item, use
+  work_recall for how far an item got and the memory and channel tools for what they are for, read GitHub only with its `github`
+  tools, search a research question again in other words before answering with the best candidate, answer a failed lookup from
+  another read or say it plainly (no longer by starting a work item), and never give the system's own failures as an answer.
+- An assistant's worker turn starts opening its sandbox when the turn starts, beside its first model call, instead of on its
+  first tool call: the API marks worker turns with the new `ExecuteRequest.sandbox_prestart`, and Brain honours it behind
+  `BRAIN_SANDBOX_PRESTART` (chart `brain.sandboxPrestart`, default on) for a run that opens its sandbox lazily and whose tool list
+  has a sandbox tool. The first tool that asks joins the open already under way. A turn that never asks gives the sandbox back by
+  the ordinary ending: a ready one is parked for the session's next message (and its untouched workspace is not uploaded), one
+  still being created is given up, its workload stopped and its PENDING entry reaped, before the turn reports. Router, observer
+  and ordinary chat turns are unchanged. Brain also reads a provisioning workload's status every second for the first 20 s of
+  the wait, then backs off to every 5 s, instead of every 5 s throughout; a run of 404s must still span 55 s before the
+  workload is given up as gone.
 - Assistant: the router's `say` refuses a message that shows the user internal text (a tool name, the `[work_event]` marker,
   an `item_id`, a run id, or an id of the UUID form the user did not write in the message the turn answers) with
   `internal_text`, and the router is told to name an item by its number and title (`router-v7`); a turn that ends in plain text
@@ -595,7 +2267,26 @@ record it.
   `PROGRESSIVE_SKILLS_ENABLED`, plugin skills are listed by name and description
   like the platform defaults instead of being inlined.
 
+### Removed
+- The Python memory plane under `memory/` (`claw-memory-service` and `knowledge-worker`), its image build, Helm chart, release
+  checks, CI suites and API docs. Claw's long-term memory has been the API's own store since the remote backend was frozen,
+  no deployment runs either service, and the knowledge base it used to co-host now lives outside this repository. With it go
+  `MEMORY_BACKEND` / `MEMORY_SERVICE_URL` (a deployment that still sets `MEMORY_BACKEND=remote` now gets the built-in store
+  when `CLAW_MEMORY_ENABLED` is on, instead of memory being off) and the unused `claw/packages/api/src/memory/storage-client.ts`.
+  The required `test` check now runs the remaining Python suite, `deploy/litellm/tests`.
+
 ### Security
+- What the API stores of a conversation now has credentials masked before it is written: session events (`claw_session_events`,
+  as the event consumer, the message route and the A2A route write them), conversation turns (`claw_conversation_turns`) and the
+  words an assistant's router turn answers (`claw_assistant_messages`). The new `redactStoredText` / `redactStoredValue`
+  (`@claw/utils`) add to `redactSecrets` a SaFE API key (`ak-...`), a short `Bearer` token with a digit in it, an armored private
+  key, and a value written after a credential's name (`password=`, `"api_key": "..."`, `token: ...`), leaving code, placeholders and
+  sentences alone (`password = getPassword()`, `password: string`, `${DB_PASSWORD}`, `"Enter your password"`). Identifier fields
+  (`id`, `*_id`, `*Id`: `message_id`, `tool_use_id`, `actionId`, ...) holding one token are stored as they are, whatever their shape,
+  since readers match stored rows on them (a 64-hex A2A `messageId` is not a credential). Only the stored copy
+  is masked: the turn's prompt reaches Brain as written, and a router turn run again on the fallback model is given its prompt as the
+  model first was when that prompt is the stored message. Later turns read their history from the masked rows. Rows written before
+  this change are not rewritten.
 - Claw works with a sandbox Router that runs with `--enable-auth`. With `SANDBOX_ROUTER_AUTH_ENABLED` on, every Hands
   request that goes through the Router's port proxy (`SANDBOX_HANDS_VIA_ROUTER`) presents the sandbox owner's platform key
   in `Authorization`: Brain's MCP client, health checks, shell records and the sweeper, and the API's changes view and
@@ -731,6 +2422,109 @@ record it.
   write the KV bucket could have one run replay another's conversation.
 
 ### Fixed
+- The assistant router speaks once per turn: a later `say` of a turn takes the place of the turn's first message instead of being a
+  second one (`assistant.say` payload and `AssistantSay` event `replaces`, the first say's id, and `turn_message_id` on a router say's
+  payload; matched through the delivery, so only with notifications on). A quick "查一下" is replaced by the answer, and a correction is
+  the whole message again, never "更正上一条…" beside it. A channel that no longer has that message shows the new one on its own, and a
+  turn that hands a review over carries only the last of them in `held_says`.
+- Each thing that waits for the user (a write held for confirmation, a scheduled task's card, what a worker holds) is marked
+  `told` in the router's state once a message the user can still see (not dropped, not replaced by a later say of its turn) named it
+  (its ref) or, for a hold, was about its item under the hold's attention; the router brings it up on its own at most once, instead of ending every reply with the same reminder.
+- The router compares a repeated question's answer with its last one and says what changed and why, and tells a requester they can
+  stop a review they asked someone else to do (handed off or not) with `work_stop` and its item_id (router-v14, review router-v18).
+- A user whose account may not create workloads in the workspace Claw starts their sandbox in (today: anyone not a member of
+  the CPU workspace, the first time an assistant item or Teams message needs a sandbox) no longer sees SaFE's raw 403 body,
+  with their internal user id and the platform error code, as `Sandbox failure (sandbox_create_failed): Create Hands failed: HTTP
+  403 {...}`. The run now fails with `sandbox_workspace_forbidden` and a sentence naming the workspace and the next step (ask a
+  SaFE administrator to add the account); the body stays in the Brain log. The refusal is terminal, and a lazy sandbox is not
+  opened again in the same turn. `GET /v1/me` gains `sandbox.cpu` (`{ workspaceId, available, reason?: "no_access" }`) when
+  `SANDBOX_CPU_NAMESPACE` is set, so a client can tell an account that has no CPU sandbox workspace before it is refused.
+- A work item's worker whose item waits for a person (`needs_you`) or is `done` no longer keeps its sandbox for background work: past
+  `WAITING_ITEM_SANDBOX_RELEASE_SECONDS` (API, default 900) of quiet with nothing queued, the orphan sweep stops it, and the next turn
+  starts a fresh one. A review session's leftover test Postgres had held global-cpu sandboxes for up to two hours behind held merges.
+- Brain: deleting a session owned by a non-admin key (every ordinary user, and service identities such as `sa-eval-bot`,
+  `sa-release-gate` and `dispatron-service`) no longer stops at `cleanup_incomplete_parked`. The session-scoped SaFE workload
+  list named no workspace, which SaFE answers with 403 for any key that is not an admin's, so teardown read it as
+  `mn.safe_lookup_failed`. When the unscoped list is refused with 403, teardown and the multi-node idle sweep now list in
+  the workspace the session recorded (its `hands.<sid>` binding's `namespace`), one list per workspace when there are several;
+  a key that may read the unscoped list (an admin's) keeps reaching every workspace.
+- The assistant router sees each person a message names with their address and other handles beside their user id (`People in
+  this message`), so it can pick one of two people with the same name from the reply that names them (`确认 Wei, Lei (weil2)`).
+- The sandbox's E2B file API takes an absolute path as that path. `files.write('/tmp/x')` wrote `<workspace>/tmp/x`, so a
+  command reading `/tmp/x` found nothing, and a process `cwd` of `/tmp` ran in `<workspace>/tmp`. An unsealed sandbox's file calls
+  run under the uid its commands get, so the mapping bounded nothing; they now follow E2B (absolute paths as given, relative ones
+  under the workspace, responses name the absolute path). A sealed sandbox keeps its grant's workspace-rooted paths (`/in` is
+  `<workspace>/in`), and a sealed path that would leave the workspace is refused with `permission_denied` "path escapes the
+  sandbox root". Ships in the envd injector image.
+- The GitHub list reads (`issue_search`, `pr_list`, `issue_list`, `repo_list`, `code_search`) answer the whole list a question
+  asks for: `{ total_count, shown, complete, next_page?, items }`, pages of 50 by default (up to 100), and an answer of at most
+  `GITHUB_LIST_MAX_CHARS` that Brain keeps whole (any other result is still cut to its head and tail at 6000 characters, which
+  is how "my 22 open pull requests" was answered with about 15). `pr_list` takes `state: merged` (only merged ones, most
+  recently merged first; "the 3 latest merged" was read in creation order and named one merged before another), orders
+  `closed` by when each closed, and takes `author`. A search narrowed with `repo:`, `org:` or `user:` that GitHub refuses
+  (422, for some fine-grained tokens) says to list the repository with `pr_list` or `issue_list` instead.
+- A tool call whose result was the tool's own error is marked `is_error: true` on its `toolUsed` result event; its `status`
+  is still `success`. A failed GitHub read was recorded as one that read something, and the evaluation counted it so.
+- An app run cancelled while its sandbox is still being created, typically by its session being deleted seconds after
+  the run was submitted, no longer leaves that sandbox running until its workload timeout. The run's signal now reaches
+  the sandbox ensure: no create is sent once it has fired, and the wait for a workload that exists (one whose create was
+  already under way included) ends at once. A wait cut short by a cancel, the deadline or a terminal row stops the
+  workload; one cut short by a drain or a lost lease leaves it for the next holder.
+  Before, the wait ran on until the workload was Running (minutes, for a queued one), and the finish that followed came
+  after the run's lease had expired, was refused (`not_holder`) and stopped nothing. As a backstop, the sweeper now moves
+  a run whose task was closed before the run reached `finishing` (`provisioning`, `starting`, `running`, `restarting`)
+  to `finishing` once the task's lease has been gone, and the task closed, for `LEASE_LOST_GRACE_SEC`, so the existing
+  finish-only dispatch stops its sandboxes and revokes its grant (`sweeper.abandoned_app_runs_to_finishing`); a finish
+  that fails every one of its bounded hand-overs is left for an operator, as before.
+- An assistant message no channel can carry is no longer silent: one stored with no notification subscription for its type is counted
+  (`claw_assistant_say_unreachable_total{type}`) and logged as `assistant.say_unreachable` with the user and the item, once per user
+  per clock hour across replicas. The silent sweep takes a message as told only when it was delivered or has an outbox row still queued
+  and not failed, so a fallback stored while nothing could carry it no longer counts; once a subscription takes its type, the sweep sends it. A subscription
+  created or changed to take `assistant.say` or `work_item.needs_you` is sent, once, the newest unreached message of each item that still
+  needs its owner.
+- A receiver's `410 Gone` drops that outbox row at once (`last_status = http_410`) and is not counted against the subscription, so a
+  receiver that cannot reach one of a user's conversations no longer gets that user's subscription disabled.
+- A leader lock held on a connection made before a failover this process noticed is lost (`LeadershipLostError`, the lease, the
+  stall alarm): the demoted server may still answer it, but its lock fences nothing on the new primary.
+- Session retention can no longer spend a place of the day that a user's own delete took: every session deletion takes one advisory
+  lock, and retention asks the day's count again under it before each deletion.
+- A revoked connector grant is refused within `CLAW_CONNECTOR_TOKEN_INTROSPECT_MAX_AGE_SECONDS` (default 5; was up to the identity
+  client's 30-second cache). The identity client's `introspect` takes a per-call `maxAgeMs`.
+- A database failover no longer leaves the API on the old primary, and no longer costs the assistant's replies. A
+  switchover demotes the old primary in place, and a connection still on it answers every read and refuses every write
+  (`25006`): `inTransaction` handed such a connection back to the pool after a clean rollback, to fail the next
+  transaction too. The first failover error (`25006`, `57P01`-`57P03`, a `08` connection error or a dropped socket) now
+  marks every connection opened before it stale (so does an idle connection the switchover terminates): idle ones are
+  dropped as they are checked out, by any caller of either pool's `connect()` or `query()`, held ones as they are
+  released. A new connection of either pool is handed out only once its server says it is not in recovery (asked once
+  per connection), because for a few seconds the Service can route one to the demoted server, which refuses every write
+  and grants advisory locks that fence nothing. A statement is sent once more on a new connection, after `PG_FAILOVER_RETRY_DELAY_MS` (default 1000), when
+  running it twice is the same as running it once: Postgres refused it before it ran (`25006`, `57P03`), or it only
+  reads. A transaction that says it may run twice is retried the same way, and also when its connection went before
+  its `COMMIT` was sent; every way the assistant stores a message says so. A message whose `COMMIT` took effect but
+  whose answer the failover lost (a `say`, the cap's notice, a system notice, a needs-you message) is looked up,
+  announced and reported as stored; one not found then, or that cannot be looked up, is looked up again in the
+  background over the next minute and announced once found (an error on the `COMMIT` proves nothing either way), and a
+  `say` like that is reported as
+  `say_outcome_unknown`, and the Router ends the turn with the words instead of saying them again (they are delivered
+  only if the turn has not spoken). So the only `say` that faults is one that was not stored; it tells the Router the
+  message was not delivered and to call `say` again. Delivering a Router turn's unsaid answer is tried three times
+  before it is given up, instead of once.
+- A reply the assistant's hourly cap (`CLAW_ASSISTANT_SAY_MAX_PER_HOUR`) refused is no longer dropped without a word.
+  The model's `say` was refused, and so was delivering what it wrote instead, and the user heard nothing for as long as
+  the cap held. The first refusal in an hour now tells the user, in their language, that replies are paused and to try
+  again later (a notice in the system's words, not counted against the cap; at most one an hour, by the database's
+  clock and under the user's say lock, so a client that keeps writing at the cap gets one notice and not one per
+  message; a notice that failed to be stored is tried again in the background); the model is told the message was not delivered
+  and not to call `say` again in the turn; and every refusal is counted in `claw_assistant_say_rate_limited_total`, by
+  whether the user was sent the notice.
+- `SESSION_RETENTION_BATCH` is now a daily limit across replicas: every replica runs the maintenance pass a minute
+  after it boots, and each pass deleted a whole batch of its own, so a rollout of four replicas deleted four batches
+  (16,535 sessions in an hour with a batch of 5000) and left the cleanup sweeper hours behind. Each hold of the
+  retention lock now deletes at most the batch less the archived sessions deleted in the last 24 hours. The next
+  day's pass, which starts 24 hours after the last and so a little before the last day's deletions leave that window,
+  waits for them and deletes as they leave instead of ending with nothing deleted (which would have made it a batch
+  every other day); it waits only when they start leaving within two hours, so a replica booted mid-day does not.
 - Deleting a session that has no `hands.<sid>` binding and no key on its cleanup notification -- every session the
   retention pass deletes, and every sweeper replay of a delete that already finished -- is a finished teardown with
   nothing to address (`session.cleanup_nothing_addressable`), not `no_platform_key`. Claw holds no handle to anything

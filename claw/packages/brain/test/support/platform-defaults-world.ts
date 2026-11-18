@@ -10,8 +10,8 @@
  */
 import http from "node:http";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tmpDir } from "../../../utils/test/tmp-dirs.js";
 import type { AddressInfo } from "node:net";
 import AdmZip from "adm-zip";
 
@@ -36,6 +36,11 @@ export interface World {
   /** Every request path the marketplace saw, in order. */
   paths: string[];
   script(turns: Turn[]): void;
+  /**
+   * Answers a POST to the API's internal routes (INTERNAL_BACKEND_URL is this server): given the path and the parsed
+   * body, returns the status and JSON body. Unset: 404.
+   */
+  internal?: (path: string, body: Record<string, unknown>, headers: http.IncomingHttpHeaders) => { status: number; body: unknown };
   close(): Promise<void>;
 }
 
@@ -98,6 +103,19 @@ export async function startWorld(defaultsFile?: object): Promise<World> {
       setTimeout(() => res.end(t.zip), t.delayMs ?? 0);
       return;
     }
+    if (url.startsWith("/v1/internal/") && req.method === "POST") {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        let parsed: Record<string, unknown> = {};
+        try { parsed = JSON.parse(body || "{}"); } catch { /* left empty */ }
+        const out = world.internal ? world.internal(url, parsed, req.headers) : { status: 404, body: { ok: false, error: "not_found" } };
+        res.statusCode = out.status;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(out.body));
+      });
+      return;
+    }
     if (url.includes("/v1/messages")) {
       let body = "";
       req.on("data", (c) => (body += c));
@@ -119,7 +137,7 @@ export async function startWorld(defaultsFile?: object): Promise<World> {
   process.env.ANTHROPIC_API_KEY = "test-key";
   process.env.WEB_SEARCH_PROVIDER = "disabled";
   if (defaultsFile) {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claw-pd-test-"));
+    const dir = tmpDir("claw-pd-test-");
     const f = path.join(dir, "defaults.json");
     fs.writeFileSync(f, JSON.stringify(defaultsFile));
     process.env.PLATFORM_DEFAULTS_FILE = f;

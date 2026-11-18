@@ -21,7 +21,7 @@ import { db, type StatementRunner } from "../infra/db.js";
 /** The review tools' server; `session-tools.ts` names it for the turn under the same name. */
 export const GITHUB_REVIEW_SERVER_NAME = "github_review";
 
-export const REVIEW_PROFILE_SANDBOX_TOOLS: readonly string[] = ["read", "glob", "grep", "ls", "bash", "bash_output", "kill_shell", "task", "todo_write"];
+export const REVIEW_PROFILE_SANDBOX_TOOLS: readonly string[] = ["read", "glob", "grep", "ls", "bash", "bash_output", "wait", "kill_shell", "task", "todo_write"];
 export const REVIEW_PROFILE_GITHUB_TOOLS = `mcp__${GITHUB_REVIEW_SERVER_NAME}__*`;
 
 /** What a review asked of another person may use: the review tools, and the sandbox's tools only where there is a sandbox for it. */
@@ -39,7 +39,7 @@ export function reviewSandboxAvailable(): boolean {
 }
 
 /** Fields of a task that carry the owner's own choices or belongings, none of which a requested review gets. */
-const OWNER_FIELDS = ["skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "workspace_id", "topology", "agent_hooks", "rules_text"] as const;
+const OWNER_FIELDS = ["skills", "user_skills", "tool_ids", "plugin_id", "plugin_tools", "user_env", "workspace_id", "topology", "agent_hooks", "rules_text"] as const;
 
 /**
  * A turn of a requested review that has no turn left: it is not sent. Brain reads `max_turns` 0 (or none) as no limit at all, so a review
@@ -70,6 +70,7 @@ export function applyReviewProfile(task: Record<string, unknown>, maxTurns: numb
   for (const field of OWNER_FIELDS) delete task[field];
   task.memory_enabled = false;
   task.skill_evolution_enabled = false;
+  task.user_skills_enabled = false;
   task.sandbox_profile = "review";
   task.max_turns = maxTurns;
 }

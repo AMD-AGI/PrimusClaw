@@ -1,0 +1,34 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "primusclaw": "turn_stop",
+       "turn": "turn-1"
+      },
+      "style": "destructive",
+      "title": "Stop",
+      "type": "Action.Execute",
+      "verb": "primusclaw.turn_stop"
+     }
+    ],
+    "body": [
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "⏹️ Working on your message. Tap Stop to stop it.",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

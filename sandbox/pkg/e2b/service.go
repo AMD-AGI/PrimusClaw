@@ -86,24 +86,34 @@ func New(opt Options) *Service {
 // grantKeyPrefix marks a key issued by the grant API.
 const grantKeyPrefix = "e2b_"
 
-// caller is the grant and role an API key resolves to. user is the SaFE User
-// read during lookup, or nil when it was not read.
+// IsGrantKey reports whether key was issued by the grant API. Such keys are
+// resolved in the cluster and are never sent to the identity provider.
+func IsGrantKey(key string) bool {
+	return strings.HasPrefix(key, grantKeyPrefix)
+}
+
+// caller is the grant and role an API key resolves to. groups are the
+// identity groups of an identity-key owner.
 type caller struct {
 	grantID string
 	role    string
 	owner   bool
 	userID  string
+	groups  []string
 	admin   bool
-	user    *grant.OwnerUser
+	token   identity.Token
 }
 
 // lookup resolves a grant key, or introspects any other key and returns the owner quota record.
 // The owner record is created or updated only when write is set; otherwise a missing
 // record leaves grantID empty.
 func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller, error) {
-	if s.identity == nil || strings.HasPrefix(apiKey, grantKeyPrefix) {
+	if s.identity == nil || IsGrantKey(apiKey) {
 		grantID, role, err := s.grants.LookupKey(ctx, apiKey)
 		return caller{grantID: grantID, role: role}, err
+	}
+	if err := s.grants.OwnerReady(); err != nil {
+		return caller{}, err
 	}
 	token, err := s.identity.Introspect(ctx, apiKey)
 	if errors.Is(err, identity.ErrInactive) {
@@ -112,15 +122,11 @@ func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller
 	if err != nil {
 		return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "identity is temporarily unavailable")
 	}
-	admin := token.HasRole(grant.SystemAdminRole)
-	var user *grant.OwnerUser
-	if !admin {
-		user, err = s.grants.ReadOwnerUser(ctx, token.Subject)
-		if err != nil {
-			return caller{}, grant.Op(http.StatusServiceUnavailable, "identity_unavailable", "user is temporarily unreadable")
-		}
-		admin = user != nil && user.Admin
+	platformRole, err := s.grants.PlatformRole(ctx, token)
+	if err != nil {
+		return caller{}, err
 	}
+	admin := platformRole == identity.RoleSystemAdmin
 	var grantID string
 	if write {
 		grantID, err = s.grants.EnsureOwner(ctx, token.Subject, token.Email, admin)
@@ -135,8 +141,9 @@ func (s *Service) lookup(ctx context.Context, apiKey string, write bool) (caller
 		role:    s.grants.OwnerRole(),
 		owner:   true,
 		userID:  token.Subject,
+		groups:  token.Groups,
 		admin:   admin,
-		user:    user,
+		token:   token,
 	}, nil
 }
 
@@ -172,12 +179,73 @@ type ListResponse struct {
 	NextToken string            `json:"nextToken,omitempty"`
 }
 
-// firstWorkspace is the workspace the child workload runs in.
-func firstWorkspace(names []string) (string, error) {
+// grantWorkspace is the workspace a grant-key sandbox runs in: the one its
+// template names, else the grant's first. A template workspace the grant does
+// not list is refused: the attestation and the membership check covered only
+// the listed ones.
+func grantWorkspace(names []string, templateWorkspace string) (string, error) {
+	if templateWorkspace != "" {
+		if !contains(names, templateWorkspace) {
+			return "", grant.Op(http.StatusForbidden, "workspace_not_allowed", "template workspace "+templateWorkspace+" is not listed on the grant")
+		}
+		return templateWorkspace, nil
+	}
 	if len(names) == 0 || names[0] == "" {
 		return "", grant.Op(http.StatusBadRequest, "invalid_grant", "workspace is required")
 	}
 	return names[0], nil
+}
+
+// resolveUserTemplate returns the user template id when an identity key may
+// use it: its creator, any caller of a public template, or a system-admin.
+// A template the caller may not use is reported as not found.
+func (s *Service) resolveUserTemplate(ctx context.Context, who caller, id string) (resolvedTemplate, error) {
+	ut, err := s.grants.UserTemplate(ctx, id)
+	if err != nil {
+		return resolvedTemplate{}, err
+	}
+	if !ut.Public && !who.admin && (who.userID == "" || ut.UserID != who.userID) {
+		return resolvedTemplate{}, grant.TemplateNotFound(id)
+	}
+	return resolvedTemplate{
+		ID:        ut.Name,
+		Alias:     ut.Name,
+		GPUs:      ut.GPUs,
+		Pending:   defaultPendingWait,
+		Workspace: ut.Workspace,
+		User:      true,
+	}, nil
+}
+
+// createTarget resolves the template of a create and the workspace it runs in.
+// An identity key falls back to a user template, which runs in its own
+// workspace and accepts env vars only from a system-admin.
+func (s *Service) createTarget(ctx context.Context, who caller, snap grant.Snapshot, body CreateBody) (resolvedTemplate, string, error) {
+	tpl, err := resolveTemplate(snap, who.role, body.TemplateID)
+	if who.owner && grant.IsReason(err, "template_not_found") {
+		tpl, err = s.resolveUserTemplate(ctx, who, body.TemplateID)
+	}
+	if err != nil {
+		return resolvedTemplate{}, "", err
+	}
+	if !(tpl.User && who.admin) {
+		if err := checkEnv(tpl.AcceptedEnvs, body.EnvVars); err != nil {
+			return resolvedTemplate{}, "", err
+		}
+	}
+	if !who.owner {
+		workspace, err := grantWorkspace(snap.Workspaces, tpl.Workspace)
+		return tpl, workspace, err
+	}
+	requested := body.Metadata[workspaceMetadata]
+	if tpl.User {
+		if requested != "" && requested != tpl.Workspace {
+			return resolvedTemplate{}, "", grant.Op(http.StatusBadRequest, "workspace_mismatch", "template "+tpl.ID+" runs in workspace "+tpl.Workspace)
+		}
+		requested = tpl.Workspace
+	}
+	workspace, err := s.grants.OwnerWorkspace(ctx, who.token, requested)
+	return tpl, workspace, err
 }
 
 // Create starts a sandbox, or replays an idempotency key.
@@ -196,24 +264,26 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
-	tpl, err := resolveTemplate(snap, role, body.TemplateID)
+	tpl, workspace, err := s.createTarget(ctx, who, snap, body)
 	if err != nil {
 		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
-	if err := checkEnv(tpl.AcceptedEnvs, body.EnvVars); err != nil {
+	pending, err := pendingWait(tpl.Pending, body.Metadata[pendingTimeoutMetadata])
+	if err != nil {
 		s.grants.AuditDenied(ctx, grantID, "", err)
 		return SandboxResponse{}, 0, err
 	}
-	var workspace string
+	// A grant key is not an identity subject. It is replaced only when the owner is rechecked.
+	subjectKey := ""
 	if who.owner {
-		workspace, err = s.grants.OwnerWorkspace(ctx, who.userID, body.Metadata[workspaceMetadata], who.admin, who.user)
-	} else {
-		workspace, err = firstWorkspace(snap.Workspaces)
-	}
-	if err != nil {
-		s.grants.AuditDenied(ctx, grantID, "", err)
-		return SandboxResponse{}, 0, err
+		subjectKey = apiKey
+	} else if s.grants.ChecksGrantOwner() {
+		subjectKey, err = s.grants.CheckGrantOwner(ctx, grantID, workspace)
+		if err != nil {
+			s.grants.AuditDenied(ctx, grantID, "", err)
+			return SandboxResponse{}, 0, err
+		}
 	}
 	if snap.SessionID == "" {
 		err := grant.Op(http.StatusBadRequest, "invalid_grant", "session is required")
@@ -266,13 +336,14 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		Namespace:         s.namespace,
 		GPUs:              tpl.GPUs,
 		TimeoutSec:        timeoutSec,
-		PendingTimeoutSec: int64(tpl.Pending / time.Second),
+		PendingTimeoutSec: int64(pending / time.Second),
 		IdempotencyKey:    metadata[idempotencyMetadataKey],
 		AccessTokenHash:   hash,
 		Metadata:          metadata,
 		Sealed:            tpl.Sealed,
 		Inputs:            tpl.Inputs,
 		Outputs:           tpl.Outputs,
+		UserTemplate:      tpl.User,
 	})
 	var replay *grant.Replay
 	if errors.As(err, &replay) {
@@ -287,15 +358,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		}
 		return SandboxResponse{}, 0, err
 	}
-	if s.runner == nil {
-		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
-		return SandboxResponse{}, 0, grant.Op(http.StatusServiceUnavailable, "sandbox_unavailable", "runner is not configured")
-	}
-	// Placement outlives the HTTP request. A gateway close at 180s must not
-	// delete the Workload or spend the idempotency key while the pod is still pending.
-	runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tpl.Pending)
-	defer cancel()
-	result, runErr := s.runner.Create(runCtx, CreateRequest{
+	result, err := s.place(ctx, grantID, sandboxID, pending, CreateRequest{
 		SandboxID:     sandboxID,
 		TemplateID:    tpl.ID,
 		Namespace:     s.namespace,
@@ -308,22 +371,13 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		GrantID:       snap.GrantID,
 		Attestation:   snap.Attestation,
 		OwnerKey:      who.owner,
-		SubjectKey:    subjectKey(who, apiKey),
+		SubjectKey:    subjectKey,
 		Env:           body.EnvVars,
 		SigningKeyPEM: privateKey,
 		AvoidNodes:    excludedNodesLabel(metadata[avoidNodesMetadata]),
 	})
-	if runErr != nil {
-		if errors.Is(runErr, ErrTemplateMissing) {
-			_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
-			return SandboxResponse{}, 0, grant.Op(http.StatusServiceUnavailable, "template_unavailable", tpl.ID)
-		}
-		failed := grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
-		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			failed = grant.Op(http.StatusServiceUnavailable, "pending_timeout", "not running after "+tpl.Pending.String()+": "+runErr.Error())
-		}
-		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
-		return SandboxResponse{}, 0, failed
+	if err != nil {
+		return SandboxResponse{}, 0, err
 	}
 	running := grant.RunningUpdate{
 		SandboxName: result.SandboxName,
@@ -347,6 +401,59 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 	ref.State = runtimev1alpha1.SandboxRunning
 	ref.SandboxName = result.SandboxName
 	return createdResponse(ref, token), http.StatusCreated, nil
+}
+
+// place waits up to pending for the runner to start the sandbox.
+// A gateway close does not cancel the placement. At the deadline a sandbox that
+// is not running yet is ended as pending_timeout before the runner is cancelled.
+func (s *Service) place(ctx context.Context, grantID, sandboxID string, pending time.Duration, req CreateRequest) (CreateResult, error) {
+	if s.runner == nil {
+		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
+		return CreateResult{}, grant.Op(http.StatusServiceUnavailable, "sandbox_unavailable", "runner is not configured")
+	}
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+	expired := make(chan bool, 1)
+	timer := time.AfterFunc(pending, func() {
+		ended, err := s.grants.ExpirePending(context.WithoutCancel(ctx), grantID, sandboxID, pendingTimeoutError(pending, "").Error())
+		if err == nil && !ended {
+			expired <- false
+			return
+		}
+		expired <- true
+		cancel()
+	})
+	result, runErr := s.runner.Create(runCtx, req)
+	timedOut := !timer.Stop() && <-expired
+	if runErr != nil {
+		if errors.Is(runErr, ErrTemplateMissing) {
+			_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
+			return CreateResult{}, grant.Op(http.StatusServiceUnavailable, "template_unavailable", req.TemplateID)
+		}
+		failed := grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
+		if timedOut {
+			failed = pendingTimeoutError(pending, runErr.Error())
+		}
+		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
+		return CreateResult{}, failed
+	}
+	if timedOut {
+		_ = s.runner.Delete(context.WithoutCancel(ctx), sandboxID)
+		failed := pendingTimeoutError(pending, "")
+		_ = s.grants.FailSandbox(context.WithoutCancel(ctx), grantID, sandboxID, failed.Error())
+		return CreateResult{}, failed
+	}
+	return result, nil
+}
+
+// pendingTimeoutError reports a sandbox that was not running within its pending wait.
+// cause is the last state the runner observed, when known.
+func pendingTimeoutError(pending time.Duration, cause string) *grant.OpError {
+	detail := "not running after " + pending.String() + " (pendingTimeoutSec=" + strconv.FormatInt(int64(pending/time.Second), 10) + ")"
+	if cause != "" {
+		detail += ": " + cause
+	}
+	return grant.Op(http.StatusServiceUnavailable, "pending_timeout", detail)
 }
 
 // spentDetail is the 410 body of a spent key: the sandbox id, then the stored end reason.
@@ -680,14 +787,6 @@ func tighterCap(a, b int64) int64 {
 	return b
 }
 
-// subjectKey returns the caller's identity key for an owner-record create, and empty for a grant key.
-func subjectKey(who caller, apiKey string) string {
-	if !who.owner {
-		return ""
-	}
-	return apiKey
-}
-
 // withOwner returns a copy of md with the owner user id.
 func withOwner(md map[string]string, userID string) map[string]string {
 	out := make(map[string]string, len(md)+1)
@@ -710,7 +809,8 @@ func createdResponse(ref runtimev1alpha1.GrantSandboxRef, token string) SandboxR
 	}
 }
 
-// detail is the SandboxDetail body. endAt is the expiry, startedAt plus the
+// detail is the SandboxDetail body. startedAt is the time the sandbox was
+// first running, else its create time; endAt is the expiry, startedAt plus the
 // sandbox timeout, and state is running. cpuCount and memoryMB meet the
 // schema minimum when the template does not set them.
 func (s *Service) detail(ctx context.Context, grantID string, ref runtimev1alpha1.GrantSandboxRef) SandboxResponse {
@@ -721,7 +821,10 @@ func (s *Service) detail(ctx context.Context, grantID string, ref runtimev1alpha
 		}
 	}
 	cpu, mem, disk := sandboxSize(spec)
-	started := ref.StartedAt.Time
+	started := ref.RunningAt.Time
+	if started.IsZero() {
+		started = ref.StartedAt.Time
+	}
 	if started.IsZero() {
 		started = time.Now()
 	}

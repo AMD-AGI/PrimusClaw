@@ -92,3 +92,11 @@ test("isAnonymousPath: cannot be widened by a crafted path", () => {
   // A near-miss on the internal prefix must not inherit its exemption.
   assert.equal(isAnonymousPath("/v1/internalx/tasks"), false);
 });
+
+test("isAnonymousPath: claiming a pairing code is anonymous, and nothing else under remote agents is", () => {
+  // The one-time code in the body is the credential (remote-agents/pairing.ts); a machine being paired has nothing else.
+  assert.equal(isAnonymousPath("/v1/remote-agents/pairings/claim"), true);
+  assert.equal(isAnonymousPath("/v1/remote-agents/pairings"), false);
+  assert.equal(isAnonymousPath("/v1/remote-agents/pairings/claim/x"), false);
+  assert.equal(isAnonymousPath("/v1/remote-agents/connectors"), false);
+});
