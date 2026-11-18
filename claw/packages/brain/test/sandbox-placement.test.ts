@@ -8,6 +8,10 @@
  *   B1 an application's sandbox and its reader sandbox carry the labels; without one, no field
  *   B2 an AppRunner hands the labels to every sandbox it ensures, a rebuild included
  *   B3 a request whose placement fails the check creates no workload, with its own reason
+ *   B4 an application's run adopts a live sandbox only when it was created with the placement;
+ *      one created without it is stopped and replaced, and without a placement nothing is asked
+ *   B5 a session's Hands sandbox built without the placement is not reused for a request with
+ *      one; the fingerprint without a placement is the one every stored sandbox already has
  */
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -15,7 +19,9 @@ import type { ExecuteRequest } from "@claw/protocol";
 
 import { createAppReaderSandbox, ensureAppSandbox, type AppSandboxRun } from "../src/apps/app-sandbox.js";
 import { placementNodeLabels, SANDBOX_PLACEMENT_INVALID } from "../src/sandbox/create-sandbox.js";
-import { ensureHands } from "../src/sandbox/ensure-hands.js";
+import { bindSandboxReuseEffects, ensureHands, requestSpecFingerprint, tryReuseSessionSandbox } from "../src/sandbox/ensure-hands.js";
+import { resolveSandboxAction } from "../src/sandbox/params.js";
+import { evaluateReuse } from "../src/sandbox/spec-fingerprint.js";
 import { bindSandboxProviders } from "../src/sandbox/factory.js";
 import { bindHandsKv } from "../src/sandbox/registry.js";
 import { SandboxProvisionTerminalError } from "../src/sandbox/errors.js";
@@ -97,6 +103,13 @@ test("B2 an AppRunner hands the labels to every sandbox it ensures, a rebuild in
   for (const labels of [...ensured, ...read]) assert.deepEqual(labels, LABELS);
 });
 
+test("B2 the AppRunner Brain builds for a run carries the session's labels, and none without them", async () => {
+  const { createAppRunner } = await import("../src/apps/app-runner-wiring.js");
+  const depsOf = (r: unknown) => (r as { deps: { nodeLabels?: Record<string, string> } }).deps;
+  assert.deepEqual(depsOf(createAppRunner("run-w", "pk", 1, undefined, LABELS)).nodeLabels, LABELS);
+  assert.equal("nodeLabels" in depsOf(createAppRunner("run-w", "pk", 1)), false);
+});
+
 test("B3 placementNodeLabels: none, the labels, or a refusal with its own reason", () => {
   assert.equal(placementNodeLabels({}), undefined);
   assert.deepEqual(placementNodeLabels({ placement: { nodeLabels: LABELS } }), LABELS);
@@ -133,4 +146,168 @@ test("B3 ensureHands creates no workload for a placement that fails the check", 
     (e: unknown) => e instanceof SandboxProvisionTerminalError && e.reason === SANDBOX_PLACEMENT_INVALID,
   );
   assert.equal(creates, 0);
+});
+
+test("B3 ensureHands refuses a placement that fails the check before a DAG handle is even looked up", async () => {
+  bindHandsKv({ async get() { return null; }, async put() { return 1; }, async update() { return 1; }, async delete() {} } as never);
+  const request = {
+    task_id: "task-1", dag_root_task_id: "dag-1",
+    sandbox_spec: { use: "main" },
+    placement: { nodeLabels: { "kubernetes.io/hostname": "node-1" } },
+  } as unknown as ExecuteRequest;
+  await assert.rejects(
+    ensureHands("sess-bad", request, "pk", async () => {}),
+    (e: unknown) => e instanceof SandboxProvisionTerminalError && e.reason === SANDBOX_PLACEMENT_INVALID,
+  );
+});
+
+// --- B4 adopting an application's live sandbox -----------------------------------
+
+/**
+ * SaFE for the adopt path: the run's list names one live sandbox `wl-old`, whose detail
+ * carries `customerLabels`. Records every path asked.
+ */
+function adoptSafe(customerLabels: Record<string, string> | null) {
+  const asked: string[] = [];
+  const fetchImpl = (async (input: string | URL | Request) => {
+    const url = new URL(String(input), "http://safe.test");
+    asked.push(url.pathname);
+    if (url.pathname === "/api/v1/workloads") {
+      return new Response(JSON.stringify({
+        totalCount: 1,
+        items: [{ workloadId: "wl-old", phase: "Running", groupVersionKind: { kind: "Sandbox" } }],
+      }), { status: 200 });
+    }
+    if (url.pathname === "/api/v1/workloads/wl-old") {
+      return new Response(JSON.stringify({ workloadId: "wl-old", phase: "Running", customerLabels }), { status: 200 });
+    }
+    return new Response("{}", { status: 404 });
+  }) as typeof fetch;
+  return { asked, fetchImpl };
+}
+
+test("B4 a live sandbox created without the session's labels is stopped, and one with them created", async () => {
+  for (const left of [null, { "example.com/pool": "reserved" }, { ...LABELS, "example.com/extra": "x" }]) {
+    const safe = adoptSafe(left);
+    const c = capturingCreate();
+    const stopped: string[] = [];
+    const got = await ensureAppSandbox(appRun({ nodeLabels: LABELS }), {
+      fetch: safe.fetchImpl, recordWorkloadId: async () => {}, create: c.create, stop: async (id) => { stopped.push(id); },
+    });
+    assert.deepEqual(stopped, ["wl-old"], JSON.stringify(left));
+    assert.equal(got.created, true, JSON.stringify(left));
+    assert.equal(c.created.length, 1);
+    assert.deepEqual(c.created[0]!.nodeLabels, LABELS);
+  }
+});
+
+test("B4 a live sandbox created with the session's labels is adopted", async () => {
+  const safe = adoptSafe({ ...LABELS });
+  const c = capturingCreate();
+  const stopped: string[] = [];
+  const got = await ensureAppSandbox(appRun({ nodeLabels: LABELS }), {
+    fetch: safe.fetchImpl, recordWorkloadId: async () => {}, create: c.create, stop: async (id) => { stopped.push(id); },
+  });
+  assert.equal(got.created, false);
+  assert.equal(got.workloadId, "wl-old");
+  assert.deepEqual(stopped, []);
+  assert.equal(c.created.length, 0);
+});
+
+test("B4 without a placement a live sandbox is adopted as before, its detail never asked", async () => {
+  const safe = adoptSafe({ ...LABELS });
+  const c = capturingCreate();
+  const got = await ensureAppSandbox(appRun(), {
+    fetch: safe.fetchImpl, recordWorkloadId: async () => {}, create: c.create, stop: async () => { throw new Error("stopped"); },
+  });
+  assert.equal(got.workloadId, "wl-old");
+  assert.equal(got.created, false);
+  assert.deepEqual(safe.asked, ["/api/v1/workloads"]);
+});
+
+test("B4 a detail SaFE will not give is not read as either answer", async () => {
+  const fetchImpl = (async (input: string | URL | Request) => {
+    const url = new URL(String(input), "http://safe.test");
+    if (url.pathname === "/api/v1/workloads") {
+      return new Response(JSON.stringify({
+        totalCount: 1, items: [{ workloadId: "wl-old", phase: "Running", groupVersionKind: { kind: "Sandbox" } }],
+      }), { status: 200 });
+    }
+    return new Response("{}", { status: 503 });
+  }) as typeof fetch;
+  const c = capturingCreate();
+  const stopped: string[] = [];
+  await assert.rejects(ensureAppSandbox(appRun({ nodeLabels: LABELS }), {
+    fetch: fetchImpl, recordWorkloadId: async () => {}, create: c.create, stop: async (id) => { stopped.push(id); },
+  }), /placement check failed: HTTP 503/);
+  assert.deepEqual(stopped, []);
+  assert.equal(c.created.length, 0);
+});
+
+// --- B5 reusing a session's Hands sandbox ------------------------------------------
+
+const HANDS_REQUEST: ExecuteRequest = { session_id: "s-place", prompt: "go", sandbox_image: "example.io/torch:2.4" };
+
+function fingerprintOf(request: ExecuteRequest): string {
+  const action = resolveSandboxAction(request);
+  assert.equal(action.kind, "create");
+  return requestSpecFingerprint(request, action as never);
+}
+
+test("B5 the fingerprint carries the placement, and without one is what it always was", () => {
+  const plain = fingerprintOf(HANDS_REQUEST);
+  for (const none of [null, {}, { nodeLabels: {} }]) {
+    assert.equal(fingerprintOf({ ...HANDS_REQUEST, placement: none } as ExecuteRequest), plain, JSON.stringify(none));
+  }
+  const placed = fingerprintOf({ ...HANDS_REQUEST, placement: { nodeLabels: LABELS } });
+  assert.notEqual(placed, plain);
+  assert.equal(evaluateReuse(plain, placed).reuse, false, "a sandbox built without the placement was reused");
+  assert.equal(fingerprintOf({ ...HANDS_REQUEST, placement: { nodeLabels: { ...LABELS } } }), placed);
+  assert.notEqual(fingerprintOf({ ...HANDS_REQUEST, placement: { nodeLabels: { ...LABELS, "example.com/pool": "a" } } }), placed);
+  assert.throws(
+    () => fingerprintOf({ ...HANDS_REQUEST, placement: { nodeLabels: { "kubernetes.io/hostname": "n" } } } as ExecuteRequest),
+    (e: unknown) => e instanceof SandboxProvisionTerminalError && e.reason === SANDBOX_PLACEMENT_INVALID,
+  );
+});
+
+/** A session record naming a parked sandbox built to `builtFor`. */
+function sessionKv(builtFor: ExecuteRequest) {
+  const enc = new TextEncoder();
+  const entry = {
+    status: "ready", provider: "safe-workload", workloadId: "wl-hands", platformKey: "pk", sessionId: "s-place",
+    sandboxName: "sb", namespace: "ns", handsUrl: "http://hands:9100/mcp", token: "tok",
+    specFingerprint: fingerprintOf(builtFor), keepalive: false, idleSince: "2020-01-01T00:00:00.000Z",
+  };
+  let revision = 7;
+  return {
+    async get(key: string) {
+      if (!key.startsWith("hands.")) return null;
+      return { key, value: enc.encode(JSON.stringify(entry)), revision };
+    },
+    async update() { return ++revision; },
+    async put() { return ++revision; },
+    async create() { return ++revision; },
+    async delete() {},
+  };
+}
+
+test("B5 a session's sandbox built without the placement is rebuilt, not reused, for a request with one", async () => {
+  const realFetch = globalThis.fetch;
+  restores.push(() => { globalThis.fetch = realFetch; });
+  globalThis.fetch = (async () => ({ ok: true, status: 200 }) as Response) as typeof fetch;
+  const destroyed: string[] = [];
+  restores.push(bindSandboxReuseEffects({
+    destroyHands: async (sessionId: string) => { destroyed.push(sessionId); },
+    registerSandbox: (() => {}) as never,
+    probeSandboxContainer: async () => ({ verdict: "alive" as const, reason: "exec_ok" as const }),
+  }));
+  const placed = { ...HANDS_REQUEST, placement: { nodeLabels: LABELS } } as ExecuteRequest;
+  const attempt = (builtFor: ExecuteRequest, request: ExecuteRequest) => tryReuseSessionSandbox({
+    kv: sessionKv(builtFor), sessionId: "s-place", request, requestedSpec: fingerprintOf(request), onEvent: async () => {},
+  } as never);
+
+  assert.equal(await attempt(HANDS_REQUEST, placed), null, "the sandbox built without the placement was reused");
+  // The controls: the same placement, and none on either side, are reused as before.
+  assert.notEqual(await attempt(placed, placed), null, "a sandbox built with the placement was not reused");
+  assert.notEqual(await attempt(HANDS_REQUEST, HANDS_REQUEST), null, "a sandbox without a placement was not reused");
 });

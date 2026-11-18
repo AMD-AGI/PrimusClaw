@@ -42,6 +42,13 @@ export interface SandboxSpecFacts {
    * fingerprint only when set, for the same reason as `withholdKeys`: a sandbox built for anything else is never reused for one.
    */
   profile?: "review";
+  /**
+   * The session's placement (`placement.nodeLabels`): node labels the workload requires, which SaFE turns into a required node
+   * affinity at create and which cannot change afterwards. Part of the fingerprint only when it names at least one label, for the same
+   * reason as `withholdKeys`: every fingerprint already stored (none of them placed) still compares as it did, and a sandbox built
+   * without the placement -- by a Brain that did not read it -- is not reused for a session that requires it.
+   */
+  nodeLabels?: Record<string, string>;
 }
 
 /**
@@ -85,6 +92,7 @@ export function sandboxSpecFingerprint(facts: SandboxSpecFacts): string {
     llmKey: fingerprintLlmKey(facts.llmKey),
     ...(facts.withholdKeys ? { withheldEnv: "brain-only" } : {}),
     ...(facts.profile ? { profile: facts.profile } : {}),
+    ...(facts.nodeLabels && Object.keys(facts.nodeLabels).length > 0 ? { nodeLabels: sortedEntries(facts.nodeLabels) } : {}),
   });
   // A format prefix, not part of the hash, so a comparison change can be told
   // apart from a spec change. evaluateReuse treats a different format as a

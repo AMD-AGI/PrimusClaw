@@ -32,7 +32,7 @@ import {
 import { multiNodeWorkloadName } from "../workload-naming.js";
 import { gpuWorkspaceFor } from "../workspace-select.js";
 import { SandboxProvisionTerminalError, assertSandboxWorkspaceAllowed } from "../errors.js";
-import { placementNodeLabels } from "../create-sandbox.js";
+import { placementNodeLabels, workloadPlacementMatches } from "../create-sandbox.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES, waitForWorkloadReady, type WorkloadWaitDeps } from "../workload-wait.js";
 import { parseWorkloadListPage, type WorkloadRef } from "./workload-parse.js";
 import {
@@ -457,7 +457,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     // anything is sent -- does not name a cluster that was never asked for.
     const create = { posted: false };
     try {
-      const adopted = await this.adoptExisting(sessionId, messageId, apiKey);
+      const adopted = await this.adoptExisting(sessionId, messageId, apiKey, nodeLabels);
       workloadId = adopted
         ?? await this.createWorkload(
           sessionId, messageId, displayName, namespace, image, spec, apiKey, keypair, onEvent,
@@ -632,11 +632,18 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
    * still queueing for GPUs (the workload exists from creation, its backend CR
    * does not), and a workload already in a terminal phase is not adopted -- the
    * caller clears it so the id frees up.
+   *
+   * Nor is one created without the session's placement (`nodeLabels`): a Brain that did
+   * not read the placement creates the cluster without it, and adopting that cluster would
+   * run the message on nodes the session excluded. It is deleted instead, so the id frees
+   * up for a cluster with the placement. Asked only when there is a placement, so a session
+   * without one adopts exactly as it did before.
    */
   private async adoptExisting(
     sessionId: string,
     messageId: string,
     apiKey: string,
+    nodeLabels: Record<string, string> | undefined,
   ): Promise<string | null> {
     const resp = await safeFetch(`/api/v1/workloads/${messageId}`, { apiKey }).catch((e) => {
       logger.warn({ err: String(e), sessionId, messageId }, "mn.safe_adopt_lookup_failed");
@@ -650,6 +657,11 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     const phase = String((resp.body as Record<string, unknown>)?.phase ?? "").toLowerCase();
     if (TERMINAL_PHASES.has(phase)) {
       logger.info({ sessionId, workloadId: messageId, phase }, "mn.safe_adopt_skipped_terminal");
+      return null;
+    }
+    if (nodeLabels && !workloadPlacementMatches(resp.body, nodeLabels)) {
+      logger.warn({ sessionId, workloadId: messageId, phase }, "mn.safe_adopt_skipped_placement_mismatch");
+      await this.deleteWorkload(sessionId, messageId, apiKey, "mn.safe_adopt_placement_mismatch");
       return null;
     }
     return messageId;
@@ -739,12 +751,13 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     if (resp.status === 409) {
       // The workload id is the message id, so a conflict means a previous
       // delivery already created this cluster.
-      const existing = await this.adoptExisting(sessionId, messageId, apiKey);
+      const existing = await this.adoptExisting(sessionId, messageId, apiKey, nodeLabels);
       if (existing) {
         logger.info({ sessionId, messageId, workloadId: existing }, "mn.safe_create_conflict_adopted");
         return existing;
       }
-      // Nothing adoptable, so the conflicting workload is in a terminal phase.
+      // Nothing adoptable, so the conflicting workload is in a terminal phase, or was
+      // created without the session's placement and is being deleted.
       // Without clearing it the id stays taken and every redelivery of this
       // message would fail on the same 409 forever.
       logger.info({ sessionId, messageId }, "mn.safe_create_conflict_clearing_terminal");

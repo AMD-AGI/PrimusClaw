@@ -249,6 +249,10 @@ export function requestSpecFingerprint(
     namespace,
     withholdKeys,
     ...(isReviewProfile(request) ? { profile: "review" } : {}),
+    // As create sends it (SaFE's customerLabels): a sandbox built without the session's placement -- by a Brain
+    // that did not read it -- is rebuilt rather than reused. A placement that does not pass is refused here, so
+    // before any reuse is decided.
+    nodeLabels: placementNodeLabels(request),
   });
 }
 
@@ -2597,6 +2601,9 @@ async function provisionHands(
   if (action.kind === "none") {
     throw new Error("ensureHands called for sandbox_spec='none'; caller must short-circuit");
   }
+  // The session's placement is checked before any sandbox is looked up, reused or created: a request whose
+  // placement does not pass gets no sandbox at all, a reused one included.
+  placementNodeLabels(request);
   if (action.kind === "use") {
     // task-design.md §9.4: look the handle up in DagHandleMap; an upstream
     // node should have registered it via sandbox.create. Surface a clear

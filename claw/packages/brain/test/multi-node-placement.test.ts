@@ -14,6 +14,9 @@
  *   M2 the provider's create, against a stand-in SaFE, sends them (RayJob and InferaDeployment)
  *   M3 a placement that fails the check asks SaFE nothing at all
  *   M4 through the run: the cluster the runner opens carries them, and a bad one opens nothing
+ *   M5 a cluster an earlier delivery left is adopted only when it carries the same labels; one
+ *      created without them (by a Brain that did not read the placement) is deleted and
+ *      created again with them, and without a placement adoption is what it always was
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -32,6 +35,8 @@ const LABELS = { "autopilot.amd.com/preemptible": "false", "example.com/pool": "
 /** What the stand-in SaFE saw: "METHOD /path", and each create body. */
 const safeCalls: string[] = [];
 const creates: Array<Record<string, unknown>> = [];
+/** The workload an earlier delivery left under the message id, as SaFE's GET describes it; null: none. */
+let existing: Record<string, unknown> | null = null;
 
 const safe = createServer((req, res) => {
   const chunks: Buffer[] = [];
@@ -48,6 +53,13 @@ const safe = createServer((req, res) => {
       // Accepted without an id: ensure ends there ("no workloadId"). What these tests
       // read is the body the create sent.
       return reply(200, {});
+    }
+    if (path === `/api/v1/workloads/${MESSAGE}` && existing) {
+      if (req.method === "GET") return reply(200, existing);
+      if (req.method === "DELETE") {
+        existing = null;
+        return reply(200, {});
+      }
     }
     // Nothing to adopt, and a release finds the workload already gone.
     return reply(404, { message: "not found" });
@@ -88,6 +100,7 @@ function request(prompt: string, placement?: unknown): ExecuteRequest {
 function reset(): void {
   safeCalls.length = 0;
   creates.length = 0;
+  existing = null;
 }
 
 // --- M1 the bodies --------------------------------------------------------------
@@ -127,8 +140,9 @@ for (const [kind, build] of BUILDERS) {
 
 // --- M2 / M3 the provider -------------------------------------------------------
 
-async function ensureFails(prompt: string, placement?: unknown): Promise<unknown> {
+async function ensureFails(prompt: string, placement?: unknown, left: Record<string, unknown> | null = null): Promise<unknown> {
   reset();
+  existing = left;
   let caught: unknown;
   await new SafeMultiNodeProvider().ensure(SESSION, request(prompt, placement), async () => {})
     .catch((e: unknown) => { caught = e; });
@@ -249,4 +263,51 @@ test("M4 a run whose placement fails the check opens no cluster and no sandbox",
   assert.deepEqual(creates, []);
   assert.equal(r.ensureHands, 0, "the Hands sandbox was opened");
   assert.match(JSON.stringify(r.events), /placement/, "the run did not say why");
+});
+
+// --- M5 adopting what an earlier delivery left ------------------------------------
+
+/** A RayJob cluster an earlier delivery created, running, with these customerLabels (absent: SaFE's null). */
+function leftCluster(customerLabels: Record<string, string> | null): Record<string, unknown> {
+  return {
+    workloadId: MESSAGE, phase: "Running", groupVersionKind: { kind: "RayJob", version: "v1" },
+    customerLabels, pods: [],
+  };
+}
+
+test("M5 a cluster left without the session's labels is deleted, and created again with them", async () => {
+  for (const left of [null, {}, { "example.com/pool": "reserved" }, { ...LABELS, "example.com/extra": "x" }]) {
+    const err = await ensureFails(RAYJOB, { nodeLabels: LABELS }, leftCluster(left));
+    assert.match(String((err as Error).message), /no workloadId/, JSON.stringify(left));
+    assert.ok(safeCalls.includes(`DELETE /api/v1/workloads/${MESSAGE}`), `not deleted: ${JSON.stringify(left)}`);
+    assert.equal(creates.length, 1, `not created again: ${JSON.stringify(left)}`);
+    assert.deepEqual(creates[0]!.customerLabels, LABELS);
+  }
+});
+
+test("M5 a cluster left with the session's labels is adopted: no delete, no create", async () => {
+  reset();
+  existing = leftCluster({ ...LABELS });
+  const ac = new AbortController();
+  const events: Array<Record<string, unknown>> = [];
+  await new SafeMultiNodeProvider().ensure(SESSION, request(RAYJOB, { nodeLabels: LABELS }), async (e) => {
+    events.push(e as Record<string, unknown>);
+  }, { signal: ac.signal }).catch(() => {});
+  assert.ok(events.some((e) => String(e.status ?? "").includes("reused")), JSON.stringify(events));
+  assert.equal(safeCalls.filter((c) => c.startsWith("DELETE")).length, 0, safeCalls.join(", "));
+  assert.deepEqual(creates, []);
+});
+
+test("M5 without a placement a left cluster is adopted whatever it carries, as before", async () => {
+  for (const left of [null, { ...LABELS }]) {
+    reset();
+    existing = leftCluster(left);
+    const events: Array<Record<string, unknown>> = [];
+    await new SafeMultiNodeProvider().ensure(SESSION, request(RAYJOB), async (e) => {
+      events.push(e as Record<string, unknown>);
+    }).catch(() => {});
+    assert.ok(events.some((e) => String(e.status ?? "").includes("reused")), JSON.stringify(events));
+    assert.equal(safeCalls.filter((c) => c.startsWith("DELETE")).length, 0, safeCalls.join(", "));
+    assert.deepEqual(creates, []);
+  }
 });
