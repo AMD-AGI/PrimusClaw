@@ -18,6 +18,11 @@ export const READ_ONLY_REASONS: readonly string[] = ["read_only_live_session", "
 export const TERMINAL_CLOSED = "terminal_closed";
 /** The connector's own word for a turn it ended because it restarted. */
 export const CONNECTOR_RESTARTED = "connector_restarted";
+/**
+ * A connector's end of a turn whose message went into a terminal that did not show it in its transcript in time: the terminal may
+ * well have taken it, so it is never said as a turn that failed, and what the session says next is still followed.
+ */
+export const TERMINAL_INPUT_UNCONFIRMED = "terminal_input_unconfirmed";
 
 /** A terminal's permission modes in which Claude Code acts without asking, and what they are called. */
 export const NO_ASK_MODES: Readonly<Record<string, string>> = {

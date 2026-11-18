@@ -237,9 +237,24 @@ function chunk(payload: Json, kind: string): RemoteStep {
   return remoteStep({ chunk: { kind: kind === "agent_message_chunk" ? "message" : "thought", text } });
 }
 
+/**
+ * A block Claude Code puts in a prompt in place of a paste of several lines: `<pasted_content id="…">`, the pasted text on lines of
+ * its own, `</pasted_content id="…">` (2.1.285-2.1.327). A connector before 0.1.22 passes it on as it is.
+ */
+const PASTED_BLOCK = /\n*<pasted_content id="([^"\s<>]{1,64})">\n([\s\S]*?)\n<\/pasted_content id="\1">\n*/gu;
+
+/** `text` with each pasted block as the text that was pasted, on lines of its own. */
+export function unwrapPasted(text: string): string {
+  if (!text.includes("<pasted_content ")) return text;
+  return text.replace(PASTED_BLOCK, (whole: string, _id: string, inner: string, at: number, all: string) => {
+    const end = at + whole.length;
+    return `${at > 0 ? "\n" : ""}${inner}${end < all.length ? "\n" : ""}`;
+  });
+}
+
 function typed(payload: Json): RemoteStep {
   // (a prompt typed at the terminal: the connector does not echo the chat's own messages)
-  const text = pyStrip(textOf(payload));
+  const text = pyStrip(unwrapPasted(textOf(payload)));
   return text && !NOT_TYPED.test(text) ? remoteStep({ typed: text }) : NOTHING;
 }
 
