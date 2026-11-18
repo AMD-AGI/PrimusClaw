@@ -592,7 +592,8 @@ export async function workSend(
       [item.item_id, text, claims.task_id],
     );
     if (replayed.rowCount) return { userId, item, workerSessionId: null, files: null };
-    if (!await reopenWorkItem(q, { userId, itemId: item.item_id, text })) {
+    // A result delivered without the user's Accept in the last week is changed by sending to its item (`reopenWorkItem`).
+    if (!await reopenWorkItem(q, { userId, itemId: item.item_id, text, delivered: true })) {
       throw new ToolRefused("item_closed", "that item is finished or stopped; start a new item instead");
     }
     if (choice) {

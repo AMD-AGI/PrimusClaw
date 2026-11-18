@@ -148,18 +148,37 @@ interface ItemRow {
   result_version: number;
   attention_seq: number;
   outcome: string | null;
+  params?: Record<string, unknown> | null;
 }
 
-const ITEM_COLUMNS = "item_id, user_id, seq, title, board_state, last_report_kind, pending_question, result_version, attention_seq, outcome";
+const ITEM_COLUMNS = "item_id, user_id, seq, title, board_state, last_report_kind, pending_question, result_version, attention_seq, outcome, params";
 
-const snapshot = (item: ItemRow): AssistantItemSnapshot => ({
-  item_id: item.item_id,
-  seq: item.seq,
-  title: redact(item.title),
-  board_state: item.board_state,
-  result_version: item.result_version,
-  can_accept: canAccept(item),
-});
+/**
+ * A result Claw delivered without the user's Accept (`applyWorkerReport`), while the item stands delivered: closed by it (outcome
+ * accepted), or open only to watch its pull request (`watching_pr`). Null otherwise: an item worked on again after a delivery is not.
+ */
+export function deliveredOf(item: Pick<ItemRow, "board_state" | "outcome" | "params">): { version: number; watching: string[] } | null {
+  const p = item.params ?? {};
+  const version = Number(p.delivered);
+  if (!Number.isInteger(version) || version < 1) return null;
+  const watching = Array.isArray(p.watching_pr) ? p.watching_pr.filter((x): x is string => typeof x === "string") : [];
+  if (item.board_state === "done" ? item.outcome !== "accepted" : !watching.length) return null;
+  return { version, watching };
+}
+
+const snapshot = (item: ItemRow): AssistantItemSnapshot => {
+  const delivered = deliveredOf(item);
+  return {
+    item_id: item.item_id,
+    seq: item.seq,
+    title: redact(item.title),
+    board_state: item.board_state,
+    result_version: item.result_version,
+    can_accept: canAccept(item),
+    ...(delivered ? { delivered_version: delivered.version } : {}),
+    ...(delivered?.watching.length ? { watching_pr: delivered.watching } : {}),
+  };
+};
 
 /** Text leaves the system for a receiver of the user's choosing: a credential a model repeated is masked on the way. */
 const redact = (text: string): string => String(redactPublicJson(text) ?? "");
@@ -773,6 +792,17 @@ const NEEDS_YOU_TEXT_ZH: Record<string, (item: ItemRow, review: boolean) => stri
   failed: () => "失败了，需要你看一下。",
 };
 
+/** The system's own words for a delivered result (`needsYouMessage`): the version, what still watches, the result, and that a reply changes it. */
+function deliveredText(item: ItemRow, d: { version: number; watching: string[] }, result: string, zh: boolean): string {
+  const what = result.trim();
+  if (zh) {
+    const head = d.watching.length ? `v${d.version} 已交付，继续盯 ${d.watching.join("、")}` : `v${d.version} 已交付`;
+    return `#${item.seq} ${item.title} ${head}${what ? `：${what}` : "。"}\n要改直接回复我。`;
+  }
+  const head = d.watching.length ? `v${d.version} delivered; still watching ${d.watching.join(", ")}` : `v${d.version} delivered`;
+  return `#${item.seq} "${item.title}" ${head}${what ? `: ${what}` : "."}\nReply to me to have it changed.`;
+}
+
 function needsYouText(item: ItemRow, zh = false, review = false): string {
   if (zh) {
     const what = (NEEDS_YOU_TEXT_ZH[item.last_report_kind ?? ""] ?? (() => "需要你处理。"))(item, review);
@@ -998,7 +1028,9 @@ async function ensureLiveAssistant(itemId: string): Promise<void> {
 async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToStore, { type: "work_item.needs_you" }> | null> {
   const item = await loadItem(q, itemId);
   const answered = item?.board_state === "done" && item.outcome === "answered";
-  if (!item || (item.board_state !== "needs_you" && !answered)) return null;
+  // A result delivered without the user's Accept is said like an answer: what was done, and that a reply changes it.
+  const delivered = item ? deliveredOf(item) : null;
+  if (!item || (item.board_state !== "needs_you" && !answered && !delivered)) return null;
   // An answer is said whole, from the report (the item's own summary is cut to a line).
   const answer = answered
     ? ((await q(
@@ -1010,11 +1042,17 @@ async function needsYouMessage(q: Querier, itemId: string): Promise<Extract<ToSt
   if (!where) return null;
   const held = (await q("SELECT params, worker_session_id, kind FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0] as
     { params: Record<string, unknown> | null; worker_session_id: string | null; kind: string | null } | undefined;
-  const params = answered ? null : held?.params ?? null;
-  const heldWrite = answered ? null : heldWriteCard(item, params, held?.worker_session_id ?? null);
+  const params = answered || delivered ? null : held?.params ?? null;
+  const heldWrite = answered || delivered ? null : heldWriteCard(item, params, held?.worker_session_id ?? null);
   const zh = await personWritesChinese(q, item.user_id, item.title, requestedByOfItem(held?.params ?? null));
+  const result = delivered
+    ? ((await q(
+        "SELECT summary FROM claw_work_item_events WHERE item_id = $1 AND kind = 'ready' ORDER BY id DESC LIMIT 1", [item.item_id],
+      )).rows[0]?.summary as string | undefined) ?? ""
+    : "";
   const said = answered
     ? (zh ? `#${item.seq} ${item.title}：${answer}` : `#${item.seq} "${item.title}": ${answer}`)
+    : delivered ? deliveredText(item, delivered, result, zh)
     : heldWriteText(item, params) ?? needsYouText(item, zh, held?.kind === "review");
   const text = where.moved ? `${zh ? MOVED_PREFIX_ZH : MOVED_PREFIX_EN}${said}` : said;
   return {
@@ -1206,6 +1244,12 @@ export async function recordSkillCard(
 
 /** An item closed by its answer, recently enough that saying it still helps (over `claw_work_items w`). */
 export const ANSWERED_UNSAID_SQL = "w.board_state = 'done' AND w.outcome = 'answered' AND w.closed_at > NOW() - INTERVAL '1 day'";
+/**
+ * A result delivered without the user's Accept within the day (`deliveredOf`, as SQL over `claw_work_items w`): said by the system
+ * when nobody said it, as an answer is.
+ */
+export const DELIVERED_UNSAID_SQL = `w.params ? 'delivered' AND w.updated_at > NOW() - INTERVAL '1 day'
+  AND (CASE WHEN w.board_state = 'done' THEN w.outcome = 'accepted' ELSE w.params ? 'watching_pr' END)`;
 
 /**
  * The event type a stored say `s` goes out as: `work_item.needs_you` for the fallback `recordNeedsYouFallback` stores, told
@@ -1318,7 +1362,8 @@ async function resendItemSays(input: { userId: string; itemId?: string }): Promi
     `SELECT DISTINCT ON (s.item_id) s.say_id::text AS say_id, s.text, (${SAY_EVENT_TYPE_SQL}) AS type, s.created_at, s.item_id
        FROM claw_work_items w
        JOIN claw_assistant_says s ON s.item_id = w.item_id AND s.item_attention_seq = w.attention_seq
-      WHERE w.user_id = $1 AND ($2::text IS NULL OR w.item_id = $2) AND (w.board_state = 'needs_you' OR (${ANSWERED_UNSAID_SQL}))
+      WHERE w.user_id = $1 AND ($2::text IS NULL OR w.item_id = $2)
+        AND (w.board_state = 'needs_you' OR (${ANSWERED_UNSAID_SQL}) OR (${DELIVERED_UNSAID_SQL}))
         AND ${SAY_UNREACHED_SQL}
         AND ${SAY_SENDABLE_SQL}
       ORDER BY s.item_id, s.created_at DESC, s.say_id DESC

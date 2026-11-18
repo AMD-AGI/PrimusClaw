@@ -111,6 +111,25 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Added
+
+- Assistant: `CLAW_ASSISTANT_AUTO_DELIVER` (default off) delivers a worker's ready result without asking for an Accept. The
+  item closes as accepted by policy (an `accepted` event with source `policy`, `accepted_version` set to the delivered
+  version, `params.delivered`), the way a review item closes when it posts its review, and frees its slot at once. The router
+  is told there is nothing to accept and that a reply changes the result; the item's message carries the new
+  `delivered_version` instead of an Accept (`can_accept` is false), and the silent sweep says a delivered result nobody said,
+  as it says an answer. A result that names, in `result.refs`, a pull request the item watches keeps the item open watching it
+  (`params.watching_pr`, also on the message as `watching_pr`): it holds no slot and needs nothing, a comment, a review or
+  failed CI there still sends it back to its worker and the next ready result is delivered as the next version, a worker that
+  only answers the news (`waiting` with no question) goes back to watching, and the merge or close of the last pull request
+  it watches, the end of every watch of it, or 7 days with nothing new on it close the item as delivered. Stopping the item, a Retry, and any run
+  that starts on it end the watching (and a stop or Retry the delivered mark), so a watch never closes an item that is
+  worked on again. A watching item's sandbox gives up its
+  background work as one that waits for a person does. Off, a ready result waits for the user's Accept as before.
+- Assistant: `work_send` reopens an item whose result was delivered by policy in the last 7 days, so a reply asking for a
+  change produces the next version of the same item. An item the user stopped, one they accepted themselves and one delivered
+  longer ago stay closed (`item_closed`).
+
 ### Changed
 
 - Connector: on a paired machine whose configuration is on the container's own file system, the note on where to keep
