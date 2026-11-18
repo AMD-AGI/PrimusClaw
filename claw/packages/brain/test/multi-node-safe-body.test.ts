@@ -724,7 +724,11 @@ test("gpuPodsReady with the router required waits for a router pod IP", () => {
 /** Run `detachedServer(command, port)` then `echo HELD`; stdout, stderr and exit status. */
 function runDetached(command: string, port: number): { status: number | null; stdout: string; stderr: string } {
   const script = ["set -euo pipefail", ...detachedServer(command, String(port)), "echo HELD"].join("\n");
-  return spawnSync("bash", ["-c", script], { encoding: "utf-8", timeout: 20_000 });
+  return spawnSync("bash", ["-c", script], {
+    encoding: "utf-8",
+    timeout: 20_000,
+    env: { ...process.env, NODE_BIN: process.execPath },
+  });
 }
 
 test("a server that exits before it listens fails the entrypoint; one that listens is held", () => {
@@ -733,8 +737,7 @@ test("a server that exits before it listens fails the entrypoint; one that liste
   assert.equal(dead.stdout.includes("HELD"), false);
   assert.match(dead.stderr, /exited before listening on 39411/);
 
-  const node = process.execPath;
-  const up = runDetached(`${node} -e "require('net').createServer().listen(39412); setTimeout(() => process.exit(0), 3000)"`, 39412);
+  const up = runDetached(`"$NODE_BIN" -e "require('net').createServer().listen(39412); setTimeout(() => process.exit(0), 3000)"`, 39412);
   assert.equal(up.status, 0, up.stderr);
   assert.match(up.stdout, /HELD/);
 });
