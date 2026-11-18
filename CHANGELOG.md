@@ -111,25 +111,6 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
-### Added
-
-- Assistant: `CLAW_ASSISTANT_AUTO_DELIVER` (default off) delivers a worker's ready result without asking for an Accept. The
-  item closes as accepted by policy (an `accepted` event with source `policy`, `accepted_version` set to the delivered
-  version, `params.delivered`), the way a review item closes when it posts its review, and frees its slot at once. The router
-  is told there is nothing to accept and that a reply changes the result; the item's message carries the new
-  `delivered_version` instead of an Accept (`can_accept` is false), and the silent sweep says a delivered result nobody said,
-  as it says an answer. A result that names, in `result.refs`, a pull request the item watches keeps the item open watching it
-  (`params.watching_pr`, also on the message as `watching_pr`): it holds no slot and needs nothing, a comment, a review or
-  failed CI there still sends it back to its worker and the next ready result is delivered as the next version, a worker that
-  only answers the news (`waiting` with no question) goes back to watching, and the merge or close of the last pull request
-  it watches, the end of every watch of it, or 7 days with nothing new on it close the item as delivered. Stopping the item, a Retry, and any run
-  that starts on it end the watching (and a stop or Retry the delivered mark), so a watch never closes an item that is
-  worked on again. A watching item's sandbox gives up its
-  background work as one that waits for a person does. Off, a ready result waits for the user's Accept as before.
-- Assistant: `work_send` reopens an item whose result was delivered by policy in the last 7 days, so a reply asking for a
-  change produces the next version of the same item. An item the user stopped, one they accepted themselves and one delivered
-  longer ago stay closed (`item_closed`).
-
 ### Changed
 
 - Connector: on a paired machine whose configuration is on the container's own file system, the note on where to keep
@@ -144,45 +125,8 @@ release version, and its `appVersion` stays `latest`.
   message that reaches the bot late can now be told apart: a large `client_lag_ms` means the client held it, a small one
   that it was sent late. Only values of a timestamp's or an id's shape are logged; never the text or who sent it
   (#872).
-- Assistant reviews: a review the assistant's router starts or restarts with `merge=true` ("review and merge it for me")
-  for a person whose review mode is `fully_auto` now merges once the review approves, without asking them. Until now
-  every such review held its merge for the person's confirmation (the card's button or `批准 #<ref>` / `approve #<ref>`)
-  whatever their mode, on the reasoning that the router reads `merge=true` from a sentence and natural language never
-  approves a merge. A person who chose `fully_auto` has already said that nobody needs to confirm their merges, and asked
-  for a confirmation on exactly the reviews they asked for in their own words; under that mode their sentence is now
-  enough. Everything else that holds a merge still holds it: what the repository itself requires (its branch rules and
-  required checks, `confirm_merge` in `.github/claw-review.yml`), failed CI, open review threads, and an earlier approval
-  or merge of the same commit that waits for the person or that they refused. Under
-  `high_risk_confirm` (the default) nothing changes: the merge waits for the person's own confirmation, at any risk.
-  The mode is read when the review starts and stored on its item and session (`merge_needs_confirmation`, now only for
-  a mode other than `fully_auto`); the router's restart reads it again. Every review the router started is marked
-  (`config.started_by_assistant`), and one started under `fully_auto` asks for the merge after all once the person has
-  left `fully_auto`. The router's answers say how each review merges from that review's own `merge_needs_confirmation`
-  (in `review_start` and `review_restart`, and on each review in its item list), never from the mode alone; it no longer
-  says it cannot change the review mode: `review_mode_set` sets `high_risk_confirm`, and `fully_auto` is still turned on
-  only by the person, in their settings. The personal agent's review-mode card names `fully_auto`
-  "全自动合入（仓库自身要求的检查仍然生效）" / "Fully automatic merge (the repository's own requirements still apply)" and
-  says it covers reviews asked for in the chat.
-
 ### Fixed
 
-- Sandboxes: a sandbox that waits for capacity which can come is no longer given up on after 5 minutes. When the platform
-  has admitted a sandbox and the autoscaler is not adding a node for it yet for a reason that ends on its own (every account
-  it buys nodes as is at the scheduler's per-user limit, a node is still being given back, the pool is at its limit and
-  releases an idle node, a purchase in backoff; or the pod is held at a scheduling gate), the wait is a wait for capacity,
-  like a node being added: it runs on `SANDBOX_PENDING_TIMEOUT_SECONDS` (3 hours) and is never cut short by
-  `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS`, which used to end every GPU run that had to queue in a burst pool with
-  `sandbox_unschedulable`. The user is told what the sandbox waits for, with the autoscaler's reason. A refusal that no
-  wait settles (no pool serves the workspace, the pod fits no node of a pool, more nodes at once than a pool may hold)
-  still ends at the 5-minute limit. A request that names its own `timeout` waits for capacity at most that timeout less
-  the new `SANDBOX_MIN_RUN_SECONDS` (default 1 hour; chart value `secret.sandboxMinRunSeconds`), because SaFE counts a
-  sandbox's lifetime from admission and a wait after it is spent out of the run's own time: a 25200-second request waits
-  up to 3 hours and keeps at least 4 hours to run.
-- Runs: a run whose sandbox the platform had no capacity for is recorded as failed. Its turn still ends with the agent's
-  answer, but `GET /v1/runs` used to report it as `exited` with no exit code and an empty `failure_reason`, so a caller
-  could not tell it from a run that finished. It is now `failed` with the provisioning code (`sandbox_unschedulable`,
-  `sandbox_pending_timeout` or `sandbox_start_timeout`), and the terminal block has a new `failure_message` field with the platform's reason (`""` when the run recorded nothing beyond
-  its code). Task and DAG runs report the same through their callback.
 - Connector: a message for a conversation typed into its terminal no longer gives up after 10 minutes as
   `terminal_state_unknown` while a question of Claude Code's own (a permission prompt, such as a dangerous `rm` asked by a
   background agent) is on that terminal's screen. When Claude Code's registry row for the process cannot be read, the
@@ -233,6 +177,78 @@ release version, and its `appVersion` stays `latest`.
 - Personal agent: a turn that is cancelled (the chat detaches from or switches away from a running session, the machine
   is disconnected, or the turn breaks off) no longer leaves its progress message in the chat as stale progress: it is
   deleted, or edited down to one "Interrupted." line where the chat cannot delete it.
+
+## [0.5.8] - 2026-11-18
+
+Image `docker.io/primussafe/claw:202611181714` (commit f227c209), released as `docker.io/rocm/primusclaw:claw-0.5.8`. A patch
+release: sandboxes wait for capacity that can come and a run without a sandbox is recorded as failed; under `fully_auto` a
+review the assistant starts merges once it approves; results can be delivered without an Accept, behind a setting that is
+off by default. Schema: one index, `idx_work_items_watching_pr` on `claw_work_items`, created by the API at start. New
+settings, both optional with defaults: `SANDBOX_MIN_RUN_SECONDS` (Brain, default 3600) and `CLAW_ASSISTANT_AUTO_DELIVER`
+(API, default off). Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Added
+
+- Assistant: `CLAW_ASSISTANT_AUTO_DELIVER` (default off) delivers a worker's ready result without asking for an Accept. The
+  item closes as accepted by policy (an `accepted` event with source `policy`, `accepted_version` set to the delivered
+  version, `params.delivered`), the way a review item closes when it posts its review, and frees its slot at once. The router
+  is told there is nothing to accept and that a reply changes the result; the item's message carries the new
+  `delivered_version` instead of an Accept (`can_accept` is false), and the silent sweep says a delivered result nobody said,
+  as it says an answer. A result that names, in `result.refs`, a pull request the item watches keeps the item open watching it
+  (`params.watching_pr`, also on the message as `watching_pr`): it holds no slot and needs nothing, a comment, a review or
+  failed CI there still sends it back to its worker and the next ready result is delivered as the next version, a worker that
+  only answers the news (`waiting` with no question) goes back to watching, and the merge or close of the last pull request
+  it watches, the end of every watch of it, or 7 days with nothing new on it close the item as delivered. Stopping the item, a Retry, and any run
+  that starts on it end the watching (and a stop or Retry the delivered mark), so a watch never closes an item that is
+  worked on again. A watching item's sandbox gives up its
+  background work as one that waits for a person does. Off, a ready result waits for the user's Accept as before (#873).
+
+- Assistant: `work_send` reopens an item whose result was delivered by policy in the last 7 days, so a reply asking for a
+  change produces the next version of the same item. An item the user stopped, one they accepted themselves and one delivered
+  longer ago stay closed (`item_closed`) (#873).
+
+### Changed
+
+- Assistant reviews: a review the assistant's router starts or restarts with `merge=true` ("review and merge it for me")
+  for a person whose review mode is `fully_auto` now merges once the review approves, without asking them. Until now
+  every such review held its merge for the person's confirmation (the card's button or `批准 #<ref>` / `approve #<ref>`)
+  whatever their mode, on the reasoning that the router reads `merge=true` from a sentence and natural language never
+  approves a merge. A person who chose `fully_auto` has already said that nobody needs to confirm their merges, and asked
+  for a confirmation on exactly the reviews they asked for in their own words; under that mode their sentence is now
+  enough. Everything else that holds a merge still holds it: what the repository itself requires (its branch rules and
+  required checks, `confirm_merge` in `.github/claw-review.yml`), failed CI, open review threads, and an earlier approval
+  or merge of the same commit that waits for the person or that they refused. Under
+  `high_risk_confirm` (the default) nothing changes: the merge waits for the person's own confirmation, at any risk.
+  The mode is read when the review starts and stored on its item and session (`merge_needs_confirmation`, now only for
+  a mode other than `fully_auto`); the router's restart reads it again. Every review the router started is marked
+  (`config.started_by_assistant`), and one started under `fully_auto` asks for the merge after all once the person has
+  left `fully_auto`. The router's answers say how each review merges from that review's own `merge_needs_confirmation`
+  (in `review_start` and `review_restart`, and on each review in its item list), never from the mode alone; it no longer
+  says it cannot change the review mode: `review_mode_set` sets `high_risk_confirm`, and `fully_auto` is still turned on
+  only by the person, in their settings. The personal agent's review-mode card names `fully_auto`
+  "全自动合入（仓库自身要求的检查仍然生效）" / "Fully automatic merge (the repository's own requirements still apply)" and
+  says it covers reviews asked for in the chat (#874).
+
+### Fixed
+
+- Sandboxes: a sandbox that waits for capacity which can come is no longer given up on after 5 minutes. When the platform
+  has admitted a sandbox and the autoscaler is not adding a node for it yet for a reason that ends on its own (every account
+  it buys nodes as is at the scheduler's per-user limit, a node is still being given back, the pool is at its limit and
+  releases an idle node, a purchase in backoff; or the pod is held at a scheduling gate), the wait is a wait for capacity,
+  like a node being added: it runs on `SANDBOX_PENDING_TIMEOUT_SECONDS` (3 hours) and is never cut short by
+  `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS`, which used to end every GPU run that had to queue in a burst pool with
+  `sandbox_unschedulable`. The user is told what the sandbox waits for, with the autoscaler's reason. A refusal that no
+  wait settles (no pool serves the workspace, the pod fits no node of a pool, more nodes at once than a pool may hold)
+  still ends at the 5-minute limit. A request that names its own `timeout` waits for capacity at most that timeout less
+  the new `SANDBOX_MIN_RUN_SECONDS` (default 1 hour; chart value `secret.sandboxMinRunSeconds`), because SaFE counts a
+  sandbox's lifetime from admission and a wait after it is spent out of the run's own time: a 25200-second request waits
+  up to 3 hours and keeps at least 4 hours to run (#863).
+
+- Runs: a run whose sandbox the platform had no capacity for is recorded as failed. Its turn still ends with the agent's
+  answer, but `GET /v1/runs` used to report it as `exited` with no exit code and an empty `failure_reason`, so a caller
+  could not tell it from a run that finished. It is now `failed` with the provisioning code (`sandbox_unschedulable`,
+  `sandbox_pending_timeout` or `sandbox_start_timeout`), and the terminal block has a new `failure_message` field with the platform's reason (`""` when the run recorded nothing beyond
+  its code). Task and DAG runs report the same through their callback (#863).
 
 ## [0.5.7] - 2026-11-17
 
