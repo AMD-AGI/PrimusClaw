@@ -127,6 +127,15 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its
+  own run, the person is now told how it ended, once, in their language. Until now a review under the `fully_auto` mode
+  that approved and merged closed its item silently: the person got only the generic "Run completed" notice and had to
+  ask whether the pull request was merged. The server now sends one `assistant.say` when such an item closes: merged,
+  with the short merge commit and the pull request's link; approved and put in the merge queue; or approved with nothing
+  merged, and why (no merge was made, or writes are off; a review only says it approved). A merge GitHub refused after
+  the approval still needs the person, and they are told of it as before, by the assistant; a merge or approval the
+  person confirmed is answered where they confirmed it and is not told twice; a review that did not approve is still
+  told why. The review tools now keep the commit a merge made on its audit row (`claw_github_audit.merge_sha`).
 - Assistant reviews: a merge (or an approval) that a review the assistant started for the person's own account holds for
   them now reaches their chat as a card with a button. Until now the assistant told them to press the card's button or
   reply `批准 #<ref>`, and no card was ever sent: only a review a chat started itself (one asked of someone else) put

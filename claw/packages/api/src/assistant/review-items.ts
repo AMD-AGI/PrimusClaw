@@ -1239,7 +1239,9 @@ const FOLLOW_ENDS: ReadonlySet<string> = new Set(["merged", "queued", "already_m
  * A re-review of a head already reviewed that posted nothing (`unchangedReview`) is told to whoever asked for it, the owner or the requester:
  * it waits for CI on that head before it is run again (`unchanged_wait`), or it ends with nothing new to post (`unchanged`).
  */
-export type ReviewResult = "ci_wait" | "not_approved" | "unchanged_wait" | "unchanged" | "not_run" | "budget_exhausted" | "budget_partial";
+export type ReviewResult = "ci_wait" | "not_approved" | "unchanged_wait" | "unchanged" | "not_run" | "budget_exhausted" | "budget_partial"
+  // The owner's own review approved, and merged in its own run, put it in the merge queue, or went no further (`review-result.ts`).
+  | "merged" | "merge_queued" | "approved";
 
 /** The refusal of a review tool call made when the session's GitHub request budget is used up (`GithubReview.run`). */
 export const BUDGET_REFUSAL = "request_budget_exhausted";
@@ -1379,7 +1381,10 @@ export function reviewState(f: ReviewFacts): ReviewState {
     ?? f.writes.find((w) => w.tool === "gh_pr_merge" && w.result === "ok" && (w.detail === "merged" || w.detail === "queued"));
   if (merged) {
     const queued = ("status" in merged ? merged.status : merged.detail) === "queued";
-    return { boardState: "done", outcome: "accepted", summary: queued ? `${pr} is in the merge queue` : `${pr} was merged` };
+    // The owner of their own review is told by the server (N55, 2026-11-18: Primus-SaFE#891 and #885 merged under fully_auto, and the
+    // owner heard nothing but "Run completed"); `review-result.ts` leaves out a merge they confirmed, answered where they confirmed it.
+    const told = f.ownReview ? { result: queued ? "merge_queued" as const : "merged" as const } : {};
+    return { boardState: "done", outcome: "accepted", summary: queued ? `${pr} is in the merge queue` : `${pr} was merged`, ...told };
   }
   if (f.confirmations.some((c) => c.status === "merging")) {
     return { boardState: "in_progress", summary: `the confirmed write to ${pr} is being made`, question: null };
@@ -1445,6 +1450,8 @@ export function reviewState(f: ReviewFacts): ReviewState {
     if (f.ownReview && f.lastPosted && event !== "APPROVE") {
       return { boardState: "done", outcome: "accepted", summary: `the review of ${pr} was posted without an approval (${event || "no verdict"})`, result: "not_approved" };
     }
+    // An approval that ended the review with nothing merged (a review only, or no merge made): the owner is told that too (N55).
+    if (f.ownReview && f.lastPosted && event === "APPROVE") return { boardState: "done", outcome: "accepted", summary: `the review of ${pr} was posted`, result: "approved" };
     return { boardState: "done", outcome: "accepted", summary: `the review of ${pr} was posted` };
   }
   if (calledNoReviewTool(f)) {

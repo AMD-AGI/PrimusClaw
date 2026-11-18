@@ -4,7 +4,13 @@
 /**
  * What the owner of their own review (one their assistant started, `review_start`) is told when it ends without an approval, in their
  * language: why it did not approve (the blocking findings, with where they are, or the checks that were not green, by name, or what else the
- * review tools refused), and what happens next. An approval needs no word from here: it goes on to the merge's confirmation card.
+ * review tools refused), and what happens next. An approval held for the owner needs no word from here: it goes to the merge's confirmation
+ * card. One that went through in the review's own run is told here (`approvedText`): merged, with the merge commit; in the merge queue; or
+ * approved with nothing merged, and why.
+ *
+ * 2026-11-18 (N55, Primus-SaFE#891 and #885): the assistant's review under the owner's fully_auto mode approved and merged each in its run,
+ * the item closed as done, and the owner got only the "Run completed" notice; they learned of #885's merge by asking. A merge the owner
+ * confirmed is answered in the chat where they confirmed it, so a review whose session holds a confirmed write is not told again here.
  *
  * 2026-11-11 (#195, Primus-SaFE#873): the review found nothing to block it, the review tools refused its approval because one check was red
  * (codecov/patch), it posted a comment-only review instead, and the item closed as done. The owner had been told "the merge waits for your
@@ -164,6 +170,52 @@ export function resultText(kind: ReviewResult, f: ResultFacts, zh: boolean): str
   return zh
     ? [`**${f.pr} 审完了，没批准**`, "", `- 结论：${verdict}，原因写在评审里。`, `- 接下来：要再审一遍就回复 ${again}。`, link].join("\n")
     : [`**${f.pr} is reviewed and not approved**`, "", `- Verdict: ${verdict}; the review says why.`, `- Next: to review it again, reply ${again}.`, link].join("\n");
+}
+
+/** The facts of an approval that went through in the review's own run (`merged`, `merge_queued`, `approved`). */
+export interface ApprovedFacts {
+  pr: string;
+  url: string;
+  seq: number;
+  /** The commit the merge made (`merged`), when GitHub gave it. */
+  mergeSha: string | null;
+  /** The approving review's GitHub id, when known. */
+  reviewId: number | null;
+  /** A review only (no merge asked for). */
+  reviewOnly: boolean;
+  /** Why nothing was merged (`approved`, not a review only): the review made no merge call, or what its last merge call answered. */
+  notMerged: { detail: string } | null;
+}
+
+/** What the owner of their own review is told of an approval that went through in its run, by language. */
+export function approvedText(kind: "merged" | "merge_queued" | "approved", f: ApprovedFacts, zh: boolean): string {
+  const prLine = zh ? `- PR：${f.url}` : `- The pull request: ${f.url}`;
+  if (kind === "merged") {
+    const sha = f.mergeSha ? f.mergeSha.slice(0, 7) : null;
+    return zh
+      ? [`**${f.pr} 已合入**`, "", `- 评审通过，已批准并合入${sha ? `，合入提交 \`${sha}\`` : ""}。`, prLine].join("\n")
+      : [`**${f.pr} is merged**`, "", `- The review passed; it was approved and merged${sha ? ` as commit \`${sha}\`` : ""}.`, prLine].join("\n");
+  }
+  if (kind === "merge_queued") {
+    return zh
+      ? [`**${f.pr} 已批准，已进入合入队列**`, "", "- 评审通过，已批准；PR 在合入队列里，由 GitHub 按队列合入。", prLine].join("\n")
+      : [`**${f.pr} is approved and in the merge queue**`, "", "- The review passed and approved it; GitHub merges it from the merge queue.", prLine].join("\n");
+  }
+  const reviewLink = f.reviewId ? `${f.url}#pullrequestreview-${f.reviewId}` : f.url;
+  const link = zh ? `- 评审：${reviewLink}` : `- The review: ${reviewLink}`;
+  if (f.reviewOnly) {
+    return zh
+      ? [`**${f.pr} 审完了，已批准**`, "", "- 这次只审不合，没有合入。", link].join("\n")
+      : [`**${f.pr} is reviewed and approved**`, "", "- This was a review only; nothing was merged.", link].join("\n");
+  }
+  const detail = f.notMerged?.detail ?? "";
+  const why = detail === "" ? (zh ? "评审批准后没有执行合入" : "the review approved it but made no merge call")
+    : detail === "dry_run" ? (zh ? "这个部署关闭了写操作，合入没有执行" : "writes are switched off on this deployment, so the merge was not made")
+      : (zh ? `合入没有成功（${detail}）` : `the merge did not go through (${detail})`);
+  const again = zh ? `\`再审 #${f.seq}\`` : `\`review again #${f.seq}\``;
+  return zh
+    ? [`**${f.pr} 已批准，但没有合入**`, "", `- 原因：${why}。`, `- 接下来：在 GitHub 上自己合入，或回复 ${again} 再审一遍。`, link].join("\n")
+    : [`**${f.pr} is approved but not merged**`, "", `- Why: ${why}.`, `- Next: merge it on GitHub yourself, or reply ${again}.`, link].join("\n");
 }
 
 /** The facts of a re-review of a head already reviewed that posted nothing (`unchanged_wait`, `unchanged`). */
@@ -380,6 +432,7 @@ export async function tellReviewResult(itemId: string, kind: ReviewResult): Prom
       logger.info({ itemId, kind, pr: facts.pr, head: facts.headSha, toRequester: requester !== null }, "assistant.review_result_told");
       return true;
     }
+    if (kind === "merged" || kind === "merge_queued" || kind === "approved") return await tellApproved(q, { ...item, params: item.params }, kind, skipped);
     const last = (await q(
       `SELECT head_sha, COALESCE(posted->>'event', arguments->>'event', '') AS event, posted FROM claw_github_audit
         WHERE session_id = $1 AND tool = 'gh_review_submit' AND result = 'ok' AND detail IN ('submitted', 'already_submitted')
@@ -429,4 +482,48 @@ export async function tellReviewResult(itemId: string, kind: ReviewResult): Prom
     logger.warn({ err, itemId, kind }, "assistant.review_result_not_told");
     return false;
   }
+}
+
+/**
+ * Tell the owner of their own review, started by their assistant, of an approval that went through in its run (see the header). Once per
+ * item, whichever of the three it is; never for a review whose session holds a write the owner confirmed (answered in that chat).
+ */
+async function tellApproved(
+  q: Querier, item: { item_id: string; user_id: string; seq: number; params: Record<string, unknown>; worker_session_id: string },
+  kind: "merged" | "merge_queued" | "approved", skipped: (reason: string, extra?: Record<string, unknown>) => false,
+): Promise<boolean> {
+  const params = item.params;
+  if (params.started_by_assistant !== true && params.merge_needs_confirmation !== true) return skipped("not_started_by_assistant");
+  const pr = params.pr as { owner: string; repo: string; number: number };
+  const confirmed = (await q(
+    "SELECT EXISTS (SELECT 1 FROM claw_github_confirmations WHERE session_id = $1 AND status IN ('merged', 'queued', 'submitted')) AS yes",
+    [item.worker_session_id],
+  )).rows[0] as { yes: boolean } | undefined;
+  if (confirmed?.yes) return skipped("confirmed_in_chat");
+  const merge = (await q(
+    `SELECT result, detail, merge_sha FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_pr_merge' AND result <> 'started'
+      ORDER BY at DESC, id DESC LIMIT 1`,
+    [item.worker_session_id],
+  )).rows[0] as { result: string; detail: string; merge_sha: string | null } | undefined;
+  const approval = (await q(
+    `SELECT posted FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_review_submit' AND result = 'ok'
+        AND detail IN ('submitted', 'already_submitted') AND posted->>'event' = 'APPROVE' ORDER BY at DESC, id DESC LIMIT 1`,
+    [item.worker_session_id],
+  )).rows[0] as { posted: { review_id?: unknown } | null } | undefined;
+  const facts: ApprovedFacts = {
+    pr: `${pr.owner}/${pr.repo}#${pr.number}`, url: `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`, seq: Number(item.seq),
+    mergeSha: kind === "merged" && merge?.detail === "merged" && merge.merge_sha ? String(merge.merge_sha) : null,
+    reviewId: typeof approval?.posted?.review_id === "number" ? approval.posted.review_id : null,
+    reviewOnly: String(params.review_only ?? "true") !== "false",
+    notMerged: kind === "approved" ? { detail: merge ? merge.detail : "" } : null,
+  };
+  const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id as string | undefined;
+  if (!sessionId) return skipped("owner_has_no_assistant");
+  const zh = await personWritesChinese(q, item.user_id);
+  const told = await reviewResultPorts.recordSystemNotice({
+    userId: item.user_id, sessionId, text: approvedText(kind, facts, zh), key: `review_result:${item.item_id}:approved_outcome`,
+  });
+  if (told === null) return skipped("already_told");
+  logger.info({ itemId: item.item_id, kind, pr: facts.pr }, "assistant.review_result_told");
+  return true;
 }
