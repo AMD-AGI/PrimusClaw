@@ -36,7 +36,7 @@ import { db, inTransaction, type Querier } from "../infra/db.js";
 import { callLlmText } from "../llm/client.js";
 import { parseActingAs } from "./acting-as.js";
 import { classifyAttendedCaller } from "./attended.js";
-import { mergeNeedsConfirmationOf, reviewOnlyOf, reviewTargetOf } from "./review-target.js";
+import { mergeRulesOf, reviewTargetOf } from "./review-target.js";
 import { SECTIONS } from "./pages.js";
 import { GithubReview, type ReviewActor, type ToolOutcome } from "./service.js";
 import { readGithubReviewSettings, type GithubReviewSettings } from "./settings.js";
@@ -279,7 +279,7 @@ export async function registerGithubReviewRoutes(app: FastifyInstance, opts: Git
     const continuation = reviewItemsEnabled() ? await reviewContinuationOf(claims.sessionId).catch(() => null) : null;
     const mcp = buildReviewToolServer(service, {
       sessionId: claims.sessionId, requesterUserId: claims.requesterUserId, actorUserId: claims.actorUserId, requesterLabel: label, reviewTarget: target.target,
-      reviewOnly: reviewOnlyOf(row.config), mergeNeedsConfirmation: mergeNeedsConfirmationOf(row.config),
+      ...mergeRulesOf(row.config),
     }, { resolvable: continuation?.findings.some((f) => f.thread_id !== null && !f.resolved) === true });
     // Stateless, like the platform's own MCP endpoint: one server and transport per request.
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as unknown as () => string });

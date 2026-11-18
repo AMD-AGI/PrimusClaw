@@ -125,6 +125,25 @@ release version, and its `appVersion` stays `latest`.
   message that reaches the bot late can now be told apart: a large `client_lag_ms` means the client held it, a small one
   that it was sent late. Only values of a timestamp's or an id's shape are logged; never the text or who sent it
   (#872).
+- Assistant reviews: a review the assistant's router starts or restarts with `merge=true` ("review and merge it for me")
+  for a person whose review mode is `fully_auto` now merges once the review approves, without asking them. Until now
+  every such review held its merge for the person's confirmation (the card's button or `批准 #<ref>` / `approve #<ref>`)
+  whatever their mode, on the reasoning that the router reads `merge=true` from a sentence and natural language never
+  approves a merge. A person who chose `fully_auto` has already said that nobody needs to confirm their merges, and asked
+  for a confirmation on exactly the reviews they asked for in their own words; under that mode their sentence is now
+  enough. Everything else that holds a merge still holds it: what the repository itself requires (its branch rules and
+  required checks, `confirm_merge` in `.github/claw-review.yml`), failed CI, open review threads, and an earlier approval
+  or merge of the same commit that waits for the person or that they refused. Under
+  `high_risk_confirm` (the default) nothing changes: the merge waits for the person's own confirmation, at any risk.
+  The mode is read when the review starts and stored on its item and session (`merge_needs_confirmation`, now only for
+  a mode other than `fully_auto`); the router's restart reads it again. Every review the router started is marked
+  (`config.started_by_assistant`), and one started under `fully_auto` asks for the merge after all once the person has
+  left `fully_auto`. The router's answers say how each review merges from that review's own `merge_needs_confirmation`
+  (in `review_start` and `review_restart`, and on each review in its item list), never from the mode alone; it no longer
+  says it cannot change the review mode: `review_mode_set` sets `high_risk_confirm`, and `fully_auto` is still turned on
+  only by the person, in their settings. The personal agent's review-mode card names `fully_auto`
+  "全自动合入（仓库自身要求的检查仍然生效）" / "Fully automatic merge (the repository's own requirements still apply)" and
+  says it covers reviews asked for in the chat.
 
 ### Fixed
 
@@ -1498,7 +1517,7 @@ The first tagged Claw release, a baseline for what was deployed on that day; eve
   good the stamped rows of sessions deleted more than that many days ago. `SESSION_RETENTION_BATCH` (default 500) bounds
   each pass; `SESSION_RETENTION_DRY_RUN=true` only logs the counts (`session_retention.dry_run`). Archiving now records
   `claw_sessions.archived_at` (a new nullable column; a session archived before it existed counts from `updated_at`).
-- A review asked of someone else (`POST /v1/assistant/reviews` with `acting_as` naming another person) is that person's: their item, their session sealed with their own keys (brought as `x-acting-as-token` and `x-acting-as-api-key`), their quota; their delegation switch is asked at creation and before every queued turn; the session runs with a fixed review profile and, on SaFE, a sandbox in `SANDBOX_CPU_NAMESPACE` created with `useWorkspaceStorage: false`; the requester sees four facts only. `POST /v1/sessions` refuses `requested_by`, `sandbox_profile`, `requester_note` and `acting_as` naming anyone but the caller (a deployment with `CLAW_ASSISTANT_REVIEW_ITEMS` off has no way to ask a review of someone else). New settings `CLAW_REVIEW_FOR_OTHERS_*`. The assistant's `review_start` refuses a review by someone else (`acting_as_credentials_required`; the user is sent to the review agent named by `CLAW_GITHUB_REVIEW_AGENT_NAME`); the requester's assistant lists the reviews they asked of others read-only (four facts), and `work_recall` / `work_stop` act on them with only those facts in the answer. A review the assistant's router starts or restarts merges nothing by itself, whatever its `merge` says: its session (`config.merge_needs_confirmation`, kept by every restart) holds its merge, and an approval GitHub's auto-merge or merge queue would turn into one, for the acting user's confirmation whatever the risk and review mode, made only from the card's button or `批准 #<ref>` / `approve #<ref>`; while auto-merge is on or the pull request is in the merge queue, such a session (and a review-only one) resolves no thread (`gh_thread_resolve` answers `auto_merge_on`).
+- A review asked of someone else (`POST /v1/assistant/reviews` with `acting_as` naming another person) is that person's: their item, their session sealed with their own keys (brought as `x-acting-as-token` and `x-acting-as-api-key`), their quota; their delegation switch is asked at creation and before every queued turn; the session runs with a fixed review profile and, on SaFE, a sandbox in `SANDBOX_CPU_NAMESPACE` created with `useWorkspaceStorage: false`; the requester sees four facts only. `POST /v1/sessions` refuses `requested_by`, `sandbox_profile`, `requester_note` and `acting_as` naming anyone but the caller (a deployment with `CLAW_ASSISTANT_REVIEW_ITEMS` off has no way to ask a review of someone else). New settings `CLAW_REVIEW_FOR_OTHERS_*`. The assistant's `review_start` refuses a review by someone else (`acting_as_credentials_required`; the user is sent to the review agent named by `CLAW_GITHUB_REVIEW_AGENT_NAME`); the requester's assistant lists the reviews they asked of others read-only (four facts), and `work_recall` / `work_stop` act on them with only those facts in the answer. A review the assistant's router starts or restarts merges nothing by itself, whatever its `merge` says: its session (`config.merge_needs_confirmation`, kept by every restart) holds its merge, and an approval GitHub's auto-merge or merge queue would turn into one, for the acting user's confirmation whatever the risk and review mode, made only from the card's button or `批准 #<ref>` / `approve #<ref>`; while auto-merge is on or the pull request is in the merge queue, such a session (and a review-only one) resolves no thread (`gh_thread_resolve` answers `auto_merge_on`). (Later changed: such a review for a person whose review mode is `fully_auto` merges once it approves, since that person has already said nobody needs to confirm their merges; see the assistant reviews entry under Unreleased.)
 - The user's long-term memory in the assistant, behind `CLAW_ASSISTANT_MEMORY_TOOLS` (`on` | `off`, default off; needs
   `CLAW_ASSISTANT_ENABLED` and `CLAW_MEMORY_ENABLED`, and the user's own opt-in). A router turn is shown the one-line
   index and offered `memory_recall`, `memory_save`, `memory_update`, `memory_forget` and `memory_undo`; each write acts only

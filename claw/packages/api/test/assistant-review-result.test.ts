@@ -24,6 +24,11 @@ test("#873 as it happened, told in Chinese: CI alone held it back, it waits for 
   assert.match(zh, /回复 `再审 #195`/);
   assert.match(zh, /评审：https:\/\/github\.com\/AMD-AGI\/Primus-SaFE\/pull\/873#pullrequestreview-5856903798/);
   assert.match(resultText("ci_wait", facts({ reviewOnly: true }), true), /审过就批准/);
+  // One the assistant started under the person's fully_auto mode merges once it passes: no card is promised (2026-11-18).
+  const unasked = resultText("ci_wait", facts({ mergesUnasked: true }), true);
+  assert.match(unasked, /审过就直接合入（仓库自身要求的检查仍然生效）/);
+  assert.doesNotMatch(unasked, /确认卡片/);
+  assert.match(resultText("ci_wait", facts({ mergesUnasked: true }), false), /merge it if it passes \(the repository's own required checks still apply\)/);
   assert.match(resultText("ci_wait", facts(), false), /reply `review again #195`/);
 });
 

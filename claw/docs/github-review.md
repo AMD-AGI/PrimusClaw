@@ -246,12 +246,19 @@ They act only for the person, never for a key or a report:
   apart in brackets when two share a name, `确认 Alex Chen (achen2)`). A message that is that reply and nothing else, sent within ten
   minutes of the request, starts that request with that reviewer; a sentence that only starts with 确认 is a request of its own.
   A message longer than 8 KiB is not read for a name at all: it names nobody, and gets the same offer.
-- **`merge=true` never merges.** Whether the user asked for a merge is the router's reading of a sentence, and natural language
-  never approves one. So every review the router starts or restarts (`review_start`, `review_restart`, whatever `merge` says) is
-  made with `config.merge_needs_confirmation` (kept by every later restart of it): its `gh_pr_merge`, and a `gh_review_submit`
-  `APPROVE` while GitHub's auto-merge is on or the pull request is in the merge queue, are held for the acting user (`confirmation_required`) whatever the risk and their
-  review mode, and it resolves no thread while auto-merge is on or the pull request is in the merge queue (see `gh_thread_resolve`); the merge is made only from that confirmation: the card's button or the exact command below, by the acting
-  user. `merge=true` only lets the review go on to ask for that confirmation after its verdict; `merge=false` is a review only.
+- **`merge=true` merges unasked only under `fully_auto`.** Whether the user asked for a merge is the router's reading of a
+  sentence. For a user whose review mode is `high_risk_confirm` (the default) that sentence never approves a merge: every review
+  the router starts or restarts (`review_start`, `review_restart`, whatever `merge` says) is made with
+  `config.merge_needs_confirmation`, and its `gh_pr_merge`, and a `gh_review_submit` `APPROVE` while GitHub's auto-merge is on or
+  the pull request is in the merge queue, are held for the acting user (`confirmation_required`) whatever the risk, and it resolves
+  no thread while auto-merge is on or the pull request is in the merge queue (see `gh_thread_resolve`); the merge is made only from
+  that confirmation: the card's button or the exact command below, by the acting user. A user who chose `fully_auto` has already
+  said nobody needs to confirm their merges, so their sentence is enough: the review is made without
+  `merge_needs_confirmation` and merges once it approves, held only by what holds any of their reviews (what the repository itself
+  requires, failed CI, open threads, an earlier hold or refusal of the same commit). The mode is read when the review starts and again at the router's restart; a restart through
+  the route keeps what the review had. Every review the router starts or restarts carries `config.started_by_assistant`, and one
+  started under `fully_auto` is held as above once the user has left `fully_auto`. `review_start` and `review_restart` answer each
+  review's `merge_needs_confirmation` (true or false) and a note the router says it from. `merge=false` is a review only.
 - **Two acts are never read from a sentence.** A held write is let through only when the user's whole message is the approval
   command `批准 #<ref>` or `approve #<ref>` (case, spacing, a full-width `＃` and closing punctuation aside), where `<ref>` is the
   first six hex digits of its confirmation id (the assistant shows it; the whole id also works), and only for a write that was

@@ -17,9 +17,12 @@
  * Two acts are never read from a sentence at all, since a misreading there merges a pull request or changes a setting: letting a
  * held write through needs the person's message to be the exact command `批准 #<ref>` / `approve #<ref>` naming it (or the card's
  * button), and a channel action runs at once only when the message is its command typed whole; otherwise it is put to the person
- * as that command with a button, and runs only when they press it. So `merge=true` on a review this router starts or restarts never
- * merges by itself: the review's session holds its merge for the person's confirmation (`config.merge_needs_confirmation`), which only
- * that command or the card's button gives. A review of someone else's account is not started here: it is handed to the person's channel
+ * as that command with a button, and runs only when they press it. So `merge=true` on a review this router starts or restarts does
+ * not merge by itself for a person whose review mode is `high_risk_confirm`: the review's session holds its merge for their confirmation
+ * (`config.merge_needs_confirmation`), which only that command or the card's button gives. A person who chose `fully_auto` asked for
+ * merges nobody confirms, and their own sentence is enough (Yihan, 2026-11-18): the review merges once it approves, held only by what
+ * holds any of their reviews (the repository's own requirements, CI, open threads, an earlier hold of the same commit), and only while they keep that mode
+ * (`config.started_by_assistant`). A review of someone else's account is not started here: it is handed to the person's channel
  * (`handOffReview`), which starts it as a review asked of that person, merging as their own review setting says.
  *
  * Everything past that is the review's own gates, which these call rather than repeat: creating, stopping and restarting
@@ -703,8 +706,9 @@ export async function reviewStart(
     if (handed) return { ...handed, ...(args.model || args.effort ? { set_aside: [...(args.model ? ["model"] : []), ...(args.effort ? ["effort"] : [])] } : {}) };
   }
   // The body `POST /v1/assistant/reviews` would have been sent, read by the same parser: the same checks either way.
-  // `merge=true` is the router's reading of a sentence, and natural language never approves a merge: the review's session merges only once
-  // the acting user confirms that very merge (`mergeNeedsConfirmation`, held by the review tools; the card's button or `批准 #<ref>`).
+  // `merge=true` is the router's reading of a sentence: the review's session merges only once the acting user confirms that very merge
+  // (`mergeNeedsConfirmation`, held by the review tools; the card's button or `批准 #<ref>`), unless they chose fully automatic merges.
+  const mergeNeedsConfirmation = await assistantMergeNeedsConfirmation(ready.userId, ready.actingAs);
   const items = await asTool(async () => asRequesterOfOther(ready.actingAs !== ready.userId, () => reviewToolPorts.startReviews(ready.signedIn.user, ready.signedIn.method, {
     ...parseReviewRequest({
       prs: prs.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
@@ -713,10 +717,32 @@ export async function reviewStart(
       ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
       review_only: !args.merge,
     }),
-    mergeNeedsConfirmation: true,
+    mergeNeedsConfirmation,
     requestMessageId: requestKey(claims),
   }, stillActing(claims, ready.userId))));
-  return { ok: true, items };
+  return { ok: true, items: items.map(withMergeRule), ...(args.merge ? { merge: mergeNote(mergeNeedsConfirmation) } : {}) };
+}
+
+/**
+ * Whether a merge of a review the router starts or restarts as `actingAs`, for `userId`, waits for the acting user's own confirmation: not
+ * for a review of their own account while their review mode is `fully_auto` (Yihan, 2026-11-18: under fully_auto the person's sentence is
+ * enough), always otherwise. Read now, when the review starts; the review keeps it until it is restarted.
+ */
+export async function assistantMergeNeedsConfirmation(userId: string, actingAs: string): Promise<boolean> {
+  if (actingAs !== userId) return true;
+  return (await getReviewMode(db, userId)).mode !== LOOSER_MODE;
+}
+
+/** A started review as the router is told of it: whether its merge waits for the user, said either way. */
+function withMergeRule<T extends { review_only?: boolean; merge_needs_confirmation?: true }>(item: T): T & { merge_needs_confirmation?: boolean } {
+  return item.review_only === false ? { ...item, merge_needs_confirmation: item.merge_needs_confirmation === true } : item;
+}
+
+/** What the router tells the user of how a review it started or restarted with merge=true merges. */
+export function mergeNote(mergeNeedsConfirmation: boolean): string {
+  return mergeNeedsConfirmation
+    ? "merge_needs_confirmation is true: nothing merges by itself. Once the review approves, the user is asked to confirm the merge (the button on its card, or approve #<ref>, 批准 #<ref> in Chinese). Never say it will be merged automatically."
+    : "merge_needs_confirmation is false (the user's review mode is fully_auto): once the review approves, it merges without asking the user. What holds any of their merges still holds it: what the repository itself requires (its required checks and rules, a confirmation it asks for), failed CI, open review threads, and an earlier approval or merge of the same commit that waits for the user or that they refused. In Chinese say 审过就会直接合入（仓库自身要求的检查仍然生效）. Never promise them they will be asked to confirm it, nor that nothing can hold it: if a merge is held after all, it is listed under Waiting for you.";
 }
 
 /**
@@ -895,17 +921,22 @@ export async function reviewRestart(
     if (args.model && !modelChoiceOn() && !modelGrounded(message.content, args.model)) {
       refuseUngrounded("model_not_in_message", "the user did not ask for that model: leave model out to keep the one it had");
     }
-    return { userId, itemId: item.item_id, signedIn: await requesterSignedIn(q, claims.sid, userId, message, via) };
+    const actingAs = typeof item.params?.acting_as === "string" ? item.params.acting_as : userId;
+    return { userId, itemId: item.item_id, actingAs, signedIn: await requesterSignedIn(q, claims.sid, userId, message, via) };
   });
-  // As at a start: whatever the router passed for merge, the restarted review merges only on the acting user's confirmation.
+  // As at a start, resolved again from the acting user's review mode now: whatever the router passed for merge, the restarted review merges
+  // only on the acting user's confirmation unless they chose fully automatic merges. (Only the owner restarts an item, and the owner is the
+  // acting user.)
+  const mergeNeedsConfirmation = await assistantMergeNeedsConfirmation(chosen.userId, chosen.actingAs);
   const restarted = await asTool(async () => reviewToolPorts.restartReview(chosen.signedIn.user, chosen.signedIn.method, chosen.itemId, {
     ...parseRestartRequest({
       ...(args.model ? { model: args.model } : {}), ...(args.effort ? { effort: args.effort } : {}),
       ...(typeof args.merge === "boolean" ? { review_only: !args.merge } : {}),
     }),
-    mergeNeedsConfirmation: true,
+    mergeNeedsConfirmation,
   }, stillActing(claims, chosen.userId)));
-  return { ok: true, ...restarted };
+  const item = restarted.item ? withMergeRule(restarted.item) : restarted.item;
+  return { ok: true, ...restarted, item, ...(item?.review_only === false ? { merge: mergeNote(mergeNeedsConfirmation) } : {}) };
 }
 
 interface PendingConfirmation { id: string; repo: string; pr: number; kind: string; created_at: Date; expires_at: Date }

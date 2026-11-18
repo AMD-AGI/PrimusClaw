@@ -78,10 +78,17 @@ export interface ReviewParams {
   effort: string | null;
   review_only: boolean;
   /**
-   * Set when the assistant's router started or restarted the review (`review_start`, `review_restart`): its session merges only once the
-   * acting user confirms that very merge (`config.merge_needs_confirmation`, review-target.ts). Kept by every later restart.
+   * Set when the assistant's router started or restarted the review (`review_start`, `review_restart`) for a person whose review mode was
+   * not `fully_auto` then: its session merges only once the acting user confirms that very merge (`config.merge_needs_confirmation`,
+   * review-target.ts). A restart through the route keeps it; the router's own restart resolves it again from the mode at that moment.
    */
   merge_needs_confirmation?: true;
+  /**
+   * Set when the assistant's router started or restarted the review, whatever it resolved for `merge_needs_confirmation`: its session
+   * merges without a confirmation only while the acting user's review mode is `fully_auto` (`config.started_by_assistant`). Kept by every
+   * later restart.
+   */
+  started_by_assistant?: true;
   /** The first message of the review's session, as it was sent; a restart that changes nothing about it sends it again. */
   brief: string;
   /**
@@ -252,8 +259,9 @@ export interface ReviewRequest {
    */
   actingAsUser?: UserInfo;
   /**
-   * The assistant's router asked (`review_start`): a merge is made only once the acting user confirms it (`merge_needs_confirmation`). Set by
-   * the router's tool, never parsed from a body.
+   * The assistant's router asked (`review_start`), when it is a boolean: true makes a merge wait until the acting user confirms it
+   * (`merge_needs_confirmation`); either value marks the review as one the router started (`started_by_assistant`). Set by the router's
+   * tool from the acting user's review mode, never parsed from a body.
    */
   mergeNeedsConfirmation?: boolean;
   /** The assistant message whose turn asked (`review_start`, `requestKey`), kept on each review as `request_message`. Set by the router's tool, never parsed from a body. */
@@ -392,11 +400,13 @@ export function parseRestartRequest(body: unknown): { model?: unknown; effort?: 
  */
 function checkAsCreate(
   user: UserInfo, method: string | null, actingAs: string, pr: PrRef, reviewOnly: boolean, model: unknown, effort: unknown, mergeNeedsConfirmation = false,
+  startedByAssistant = false,
 ): {
   config: Record<string, unknown>; model: string | null; effort: string | null; attended: AttendedProof;
 } {
   const config: Record<string, unknown> = {
     acting_as: actingAs, review_target: { ...pr }, review_only: reviewOnly, ...(mergeNeedsConfirmation ? { merge_needs_confirmation: true } : {}),
+    ...(startedByAssistant || mergeNeedsConfirmation ? { started_by_assistant: true } : {}),
   };
   const checked = checkSessionCreate({ config, model, effort, user, method });
   if (!checked.ok) {
@@ -675,14 +685,17 @@ export async function startReviews(
   const effort = forOther ? undefined : request.effort;
   // A request of more than can run at once: its reviews share a batch, and the ones past the first `REVIEWS_STARTED_AT_ONCE` wait (`hold`).
   const batch = request.prs.length > REVIEWS_STARTED_AT_ONCE ? randomUUID() : null;
+  // (the router's tool always says, true or false, whether the merge waits for a confirmation; nothing else says anything)
+  const byAssistant = typeof request.mergeNeedsConfirmation === "boolean";
   const plans: Planned[] = request.prs.map(({ pr, message }, index) => {
-    const checked = checkAsCreate(user, method, actingAs, pr, request.reviewOnly, model, effort, request.mergeNeedsConfirmation === true);
+    const checked = checkAsCreate(user, method, actingAs, pr, request.reviewOnly, model, effort, request.mergeNeedsConfirmation === true, byAssistant);
     const label = String(checked.config.acting_as_requester ?? user.userId);
     const base: ReviewParams = {
       pr, acting_as: actingAs, acting_as_name: request.actingAsName, model: checked.model, effort: checked.effort,
       ...(choice?.fellBackFrom ? { model_asked: choice.fellBackFrom } : {}),
       review_only: request.reviewOnly, brief: message ?? defaultBrief(pr, request.reviewOnly),
       ...(request.mergeNeedsConfirmation === true ? { merge_needs_confirmation: true as const } : {}),
+      ...(byAssistant ? { started_by_assistant: true as const } : {}),
       ...(batch ? { request_batch: batch } : {}),
       ...(request.requestMessageId ? { request_message: request.requestMessageId } : {}),
     };
@@ -767,6 +780,8 @@ function readParams(row: Record<string, unknown>): ReviewParams | null {
     // Any stored value but `undefined`/`false` keeps it: a restart refuses more, never less.
     ...(p.merge_needs_confirmation !== undefined && p.merge_needs_confirmation !== null && (p.merge_needs_confirmation as unknown) !== false
       ? { merge_needs_confirmation: true as const } : {}),
+    ...(p.started_by_assistant !== undefined && p.started_by_assistant !== null && (p.started_by_assistant as unknown) !== false
+      ? { started_by_assistant: true as const } : {}),
     ...(typeof p.requested_by === "string" && p.requested_by
       ? { requested_by: p.requested_by, requester_label: typeof p.requester_label === "string" ? p.requester_label : p.requested_by, requester_note: typeof p.requester_note === "string" ? p.requester_note : null }
       : {}),
@@ -922,19 +937,27 @@ export async function restartReview(
   if (!was) throw new ReviewItemRefused(400, "not_a_review_item", "only a review item can be restarted");
   const requestedBy = was.requested_by ?? null;
   const reviewOnly = change.reviewOnly ?? was.review_only;
-  // Once the assistant has started or restarted a review, every later restart of it merges only on the acting user's confirmation too.
-  const mergeNeedsConfirmation = was.merge_needs_confirmation === true || change.mergeNeedsConfirmation === true;
+  // The router's restart (a boolean, resolved from the acting user's review mode now) says again whether the merge waits for their
+  // confirmation; any other restart keeps what the review had. Once the assistant has started or restarted a review, it stays one it
+  // started (`started_by_assistant`): it merges unasked only while the acting user's mode is fully_auto.
+  const byAssistant = typeof change.mergeNeedsConfirmation === "boolean";
+  const mergeNeedsConfirmation = byAssistant ? change.mergeNeedsConfirmation === true : was.merge_needs_confirmation === true;
+  const startedByAssistant = byAssistant || was.started_by_assistant === true || was.merge_needs_confirmation === true;
   // A restart that names a model is a choice like a start's (`reviewModelFor`, the owner restarting is the payer); one that names none keeps
   // the model the review had.
   const choice = modelChoiceOn() && "model" in change && change.model !== null && change.model !== undefined ? await reviewModelFor(user, change.model) : null;
   const checked = checkAsCreate(user, method, was.acting_as, was.pr, reviewOnly,
-    choice ? choice.model : "model" in change ? change.model : was.model, "effort" in change ? change.effort : was.effort, mergeNeedsConfirmation);
+    choice ? choice.model : "model" in change ? change.model : was.model, "effort" in change ? change.effort : was.effort, mergeNeedsConfirmation,
+    startedByAssistant);
   // The old words are sent again only if they still say what is asked: a review that now merges, or now does not, gets new ones.
   const brief = change.message ?? (reviewOnly === was.review_only ? was.brief : defaultBrief(was.pr, reviewOnly));
   // (a restart is made as any start is: neither why the old one was halted nor that it waited for a slot carries over)
   // Nor which message started it: a resend of that message answers the review it started, never one a restart made (`startedFor`).
   // (nor that the old one stopped waiting for CI: the new one is a review of its own)
-  const { halted: _halted, queued: _queued, request_batch: _batch, request_message: _message, ci_wait_ended: _ciWaitEnded, author_wait_ended: _authorWaitEnded, empty_rerun: _emptyRerun, ...kept } = was;
+  const {
+    halted: _halted, queued: _queued, request_batch: _batch, request_message: _message, ci_wait_ended: _ciWaitEnded, author_wait_ended: _authorWaitEnded,
+    empty_rerun: _emptyRerun, merge_needs_confirmation: _confirm, started_by_assistant: _byAssistant, ...kept
+  } = was;
   delete (kept as Record<string, unknown>).ci_waiting;
   delete (kept as Record<string, unknown>).author_waiting;
   const plan: Planned = {
@@ -942,6 +965,7 @@ export async function restartReview(
     config: requestedBy ? asRequested(checked.config, { user_id: requestedBy, label: was.requester_label ?? requestedBy }) : checked.config,
     params: {
       ...kept, model: checked.model, effort: checked.effort, review_only: reviewOnly, brief, ...(mergeNeedsConfirmation ? { merge_needs_confirmation: true as const } : {}),
+      ...(startedByAssistant ? { started_by_assistant: true as const } : {}),
       ...(choice?.fellBackFrom ? { model_asked: choice.fellBackFrom } : {}),
     },
   };
