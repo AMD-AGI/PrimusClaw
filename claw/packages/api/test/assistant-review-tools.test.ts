@@ -1989,6 +1989,8 @@ describe("assistant review tools", { skip }, () => {
     assert.match(prompt, /merge_needs_confirmation true: it never merges by itself; once the review approves, the user is asked to confirm the merge \(the card's button or approve #<ref>, 批准 #<ref> in Chinese\), so never tell them it will be merged unasked or handled fully automatically\./);
     assert.match(prompt, /merge_needs_confirmation false \(the user's review mode was fully_auto when it started\): it merges as soon as the review approves, without asking them \(审过就会直接合入（仓库自身要求的检查仍然生效）/);
     assert.doesNotMatch(prompt, /merge=true never merges by itself/, "the old rule, wrong for fully_auto, is gone");
+    // A fully_auto review that is held after all (an earlier hold of the same commit) is told as any waiting write is.
+    assert.match(prompt, /never tell them up front that they will be asked to confirm it; a merge held after all is listed under Waiting for you, and you tell them of it as of any write waiting there\./);
     // review_mode_set: it can set high_risk_confirm, the user turns fully_auto on; never "no way to change it".
     assert.match(prompt, /You can set high_risk_confirm[^\n]*: call it\. You cannot set fully_auto \(it is refused\)/);
     assert.match(prompt, /say exactly that: you can switch them to high_risk_confirm, and fully_auto they switch on themselves; never say you have no way to change it/);
