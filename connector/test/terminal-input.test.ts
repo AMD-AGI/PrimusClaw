@@ -50,6 +50,16 @@ describe("what a question on the screen asks", () => {
     assert.ok(long.endsWith("…"));
     assert.equal(dialogSummary(on(bashQuestion({ command: "cat ~/secrets/notes.txt", description: "Read" }))), "Bash command: cat …/notes.txt");
   });
+  test("a path with spaces, quoted or escaped, is cut too; a path of one part is said as it is", () => {
+    const asks = (command: string) => dialogSummary(on(bashQuestion({ command, description: "Read" })));
+    assert.equal(asks('cat "/Private Documents/key"'), 'Bash command: cat "…/key"');
+    assert.equal(asks("cat '/Private Documents/a b/key.pem'"), "Bash command: cat '…/key.pem'");
+    assert.equal(asks("cat /Private\\ Documents/key"), "Bash command: cat …/key");
+    assert.equal(asks("tar --file=/srv/backups/db.tar x"), "Bash command: tar --file=…/db.tar x");
+    assert.equal(asks("echo $(cat /etc/secret/x)"), "Bash command: echo $(cat …/x)");
+    assert.equal(asks("rm -rf /"), "Bash command: rm -rf /", "what a dangerous rm reaches is never hidden");
+    assert.equal(asks("ls /tmp"), "Bash command: ls /tmp");
+  });
   test("a question it cannot split is named by its question; no question, nothing", () => {
     assert.equal(dialogSummary(`  ready\n${RULE}\n❯ hello\n${RULE}\n  ⏸ manual mode on\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel`), "Do you want to proceed?");
     assert.equal(dialogSummary(" Bash command\n   touch x\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend"), "Bash command: touch x");

@@ -358,12 +358,35 @@ export function dialogSummary(screen: string): string | null {
 /** One mode on the footer below the box (`⏸ manual mode on`): not a line of a question. */
 const MODE_RE_ONE = new RegExp(`(?:^|[\\s·⏵⏸▶])(?:${Object.keys(CLAUDE_MODE_INDICATORS).join("|")}) on\\b`);
 
+/** A word of a command line: a quoted string, or a run of anything else up to a space (a space after a backslash is the word's). */
+const WORD_RE = /"[^"]*"|'[^']*'|(?:\\.|[^\s"'])+/g;
+/** A path inside a quoted string, which may hold spaces: from where it starts up to what ends it in a shell (a quote, `)`, `$`, `;`...). */
+const QUOTED_PATH_RE = /(^|[\s(=:])((?:[^\s"'`()$;|&<>/]*)\/[^"'`()$;|&<>]*)/g;
+
+/** A path of two parts or more as only its last part (`/home/me/build` -> `…/build`); a path of one part (`/`, `/tmp`) as it is. */
+function cutPath(p: string): string {
+  const parts = p.split("/").filter(Boolean);
+  return parts.length < 2 ? p : `…/${parts[parts.length - 1]!}${p.endsWith("/") ? "/" : ""}`;
+}
+
+/** Every path in a line said by its last part only: in a quoted string (spaces and all) and as a word of its own. */
+function cutPaths(text: string): string {
+  return text.replace(WORD_RE, (word) => {
+    if (!word.includes("/")) return word;
+    if (word.startsWith('"') || word.startsWith("'")) {
+      return word[0]! + word.slice(1, -1).replace(QUOTED_PATH_RE, (_m, before: string, p: string) => {
+        const trailing = /\s*$/.exec(p)![0];
+        return before + cutPath(p.slice(0, p.length - trailing.length)) + trailing;
+      }) + word[0]!;
+    }
+    // (a word that is more than a path, `--out=/a/b` or `$(echo /a/b)`: the path in it, from its first slash's part)
+    return word.replace(/(?:\\.|[^\s"'`()$;|&<>=\\])*\/(?:\\.|[^\s"'`()$;|&<>\\])*/g, (p) => cutPath(p));
+  });
+}
+
 /** A line of the screen for the phone: paths cut to their last part, credentials masked, at most DIALOG_SUMMARY_MAX code points. */
 function shortLine(text: string): string {
-  const cut = text
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
-    // (an absolute or home path of two parts or more: only its last part is said)
-    .replace(/(?:~|\.{1,2})?\/(?:[^\s/"'`()$]+\/)+([^\s/"'`()$]*)/g, (_m, last: string) => `…/${last}`)
+  const cut = cutPaths(text.replace(/[\u0000-\u001f\u007f-\u009f]/g, ""))
     .replace(/\s+/g, " ")
     .trim();
   const masked = redactText(cut).text;
