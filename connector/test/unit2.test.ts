@@ -36,6 +36,30 @@ describe("outbox", async () => {
     assert.deepEqual(b.pending(10).map((e) => e.seq), [3]);
     assert.equal(b.append(SID, "turn_end", {}).seq, 4, "the next number is never one that was already used");
   });
+  test("after a restart each session's events go in their own order, whatever time each carries (a transcript entry's own time)", async () => {
+    const dir = tmp();
+    const a = new Outbox({ dir });
+    // (session 1: a step dated before the event in front of it; session 2 in between)
+    a.append(SID, "session_started", {}, 5_000);
+    a.append(SID2, "x", {}, 6_000);
+    a.append(SID, "tool_call", {}, 7_000);
+    a.append(SID, "tool_call_update", {}, 4_000);
+    a.append(SID, "agent_message_chunk", {}, 8_000);
+    await a.flush();
+    const b = new Outbox({ dir });
+    const order = b.pending(10).map((e) => [e.session_id === SID ? 1 : 2, e.seq]);
+    assert.deepEqual(order.filter(([s]) => s === 1).map(([, n]) => n), [1, 2, 3, 4]);
+    assert.deepEqual(order, [[1, 1], [2, 1], [1, 2], [1, 3], [1, 4]]);
+    // (sent in batches of two, acknowledged by the highest number stored: nothing is acknowledged before it was sent)
+    const sent: number[] = [];
+    for (let batch = b.pending(2); batch.length > 0; batch = b.pending(2)) {
+      for (const e of batch) if (e.session_id === SID) sent.push(e.seq);
+      const top: Record<string, number> = {};
+      for (const e of batch) top[e.session_id] = Math.max(top[e.session_id] ?? 0, e.seq);
+      b.ack(top);
+    }
+    assert.deepEqual(sent, [1, 2, 3, 4]);
+  });
   test("a restart with nothing acknowledged yet (a crash) does not reuse a number either", async () => {
     const dir = tmp();
     const a = new Outbox({ dir });

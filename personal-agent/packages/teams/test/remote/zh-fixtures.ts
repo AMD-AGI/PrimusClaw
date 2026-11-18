@@ -174,6 +174,7 @@ function liveView(lang: Lang): string {
   view.apply(remoteDomain.remoteStep({ tool: { id: "t1", title: "", status: "in_progress" } }));
   view.apply(remoteDomain.remoteStep({ tool: { id: "t1", title: "", status: "failed" } }));
   view.apply(remoteDomain.remoteStep({ tool: { id: "t2", title: "", status: "in_progress" } }));
+  view.apply(remoteDomain.remoteStep({ tool: { id: "t3", title: "", status: "in_progress", name: "Bash" } }));
   return [view.render(), ...view.statusLines()].join("\n");
 }
 

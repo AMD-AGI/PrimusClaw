@@ -16,6 +16,7 @@ import {
   TranscriptTail, TwinCheckError, transcriptUpdates, unwrapPasted, type Resumable,
 } from "../src/attach.js";
 import { ChildRegistry, processStart } from "../src/children.js";
+import { DEFAULT_SESSION_TIMING, SPECTATE_MS, entryTime } from "../src/session.js";
 import { memoryAudit } from "../src/audit.js";
 import { ConfigError, parseConfig } from "../src/config.js";
 import { terminalsDir, runHook } from "../src/terminals.js";
@@ -82,6 +83,41 @@ function fakeCli(mode: string, live: unknown[]): { cli: string; env: Record<stri
   fs.writeFileSync(cli, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_CLAUDE)} "$@"\n`, { mode: 0o755 });
   return { cli, env: { FAKE_CLAUDE_MODE: mode, FAKE_CLAUDE_LIVE: liveFile } };
 }
+
+describe("when a transcript entry happened, and which tool a step runs", () => {
+  test("each update of a line carries the time Claude Code wrote on it; a line without one carries none", () => {
+    const l = (o: Record<string, unknown>) => JSON.stringify({ sessionId: REF, isSidechain: false, uuid: "u-1", ...o });
+    // (the shape Claude Code 2.1.x writes: an ISO `timestamp` on every entry)
+    const at = "2026-11-17T14:12:40.123Z";
+    const ups = transcriptUpdates(l({ type: "assistant", timestamp: at, message: { role: "assistant", content: [
+      { type: "text", text: "Checking the tests." },
+      { type: "tool_use", id: "toolu_9", name: "Bash", input: { command: "npm test" } },
+    ] } }));
+    assert.deepEqual(ups.map((u) => [u.type, u.at]), [["agent_message_chunk", Date.parse(at)], ["tool_call", Date.parse(at)]]);
+    // (named where the Claude Code ACP adapter names it, so a phone counts the steps by tool for either)
+    assert.deepEqual(ups[1]!.update._meta, { claudeCode: { toolName: "Bash" } });
+    assert.equal(ups[1]!.update.title, "Bash: npm test");
+    const result = transcriptUpdates(l({ type: "user", timestamp: "2026-11-17T14:12:44.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_9", content: "ok" }] } }));
+    assert.equal(result[0]!.at, Date.parse("2026-11-17T14:12:44.000Z"));
+    assert.equal(transcriptUpdates(l({ type: "assistant", message: { role: "assistant", content: "no time" } }))[0]!.at, undefined);
+    assert.equal(transcriptUpdates(l({ type: "assistant", timestamp: "not a time", message: { role: "assistant", content: "x" } }))[0]!.at, undefined);
+  });
+
+  test("an entry's time is used unless it is missing or later than now", () => {
+    const now = Date.parse("2026-11-17T14:13:09.900Z");
+    assert.equal(entryTime(Date.parse("2026-11-17T14:12:40.123Z"), now), Date.parse("2026-11-17T14:12:40.123Z"));
+    assert.equal(entryTime(now, now), now);
+    assert.equal(entryTime(now + 1, now), undefined);
+    assert.equal(entryTime(undefined, now), undefined);
+    assert.equal(entryTime(Number.NaN, now), undefined);
+    assert.equal(entryTime(0, now), undefined);
+  });
+
+  test("a terminal's transcript is read at least four times a second", () => {
+    assert.ok(SPECTATE_MS <= 250, String(SPECTATE_MS));
+    assert.equal(DEFAULT_SESSION_TIMING.spectateMs, SPECTATE_MS);
+  });
+});
 
 describe("what a transcript says of a message Claude Code queued (submitted while a turn ran)", () => {
   test("enqueue, taken into the running turn (queued_command), and handed back to the box (popAll); nothing else of the queue", () => {
@@ -747,8 +783,9 @@ describe("which user turns of a terminal's transcript are a person's prompt (wha
     assert.equal(unwrapPasted(`look at this\n\n<pasted_content id="2a">\nline a\nline b\n</pasted_content id="2a">\n\nand fix it`), "look at this\nline a\nline b\nand fix it");
     assert.equal(unwrapPasted(`<pasted_content id="1">\nx\n</pasted_content id="2">`), `<pasted_content id="1">\nx\n</pasted_content id="2">`, "ids that do not pair are left");
     assert.equal(unwrapPasted("a prompt that names <pasted_content id=\"1\"> in prose"), "a prompt that names <pasted_content id=\"1\"> in prose");
-    assert.deepEqual(transcriptUpdates(line({ type: "queue-operation", operation: "enqueue", content: recorded })), [{ type: "queued", update: { text: phone } }]);
-    assert.deepEqual(transcriptUpdates(line({ type: "attachment", attachment: { type: "queued_command", prompt: recorded, commandMode: "prompt", origin: { kind: "human" } } })),
+    const updates = (doc: Record<string, unknown>) => transcriptUpdates(line(doc)).map(({ type, update }) => ({ type, update }));
+    assert.deepEqual(updates({ type: "queue-operation", operation: "enqueue", content: recorded }), [{ type: "queued", update: { text: phone } }]);
+    assert.deepEqual(updates({ type: "attachment", attachment: { type: "queued_command", prompt: recorded, commandMode: "prompt", origin: { kind: "human" } } }),
       [{ type: "queued_taken", update: { text: phone } }]);
   });
 
@@ -1119,6 +1156,40 @@ describe("attach end to end", () => {
     const taken = h.claw.eventsOf(again, "session_started")[0]!.data;
     assert.equal(taken.read_only, undefined);
     assert.equal(adapterMethods(h).filter((m) => m === "session/resume").length, 1);
+  });
+
+  test("a watched terminal's steps reach Claw dated when Claude Code wrote them, each its own, however many one read takes", async () => {
+    const h = await attachHarness({ live: [{ pid: process.pid, sessionId: REF, status: "busy" }], timing: { spectateMs: 20, spectateCheckMs: 60_000 } });
+    const file = path.join(h.attachDir, "projects", fs.realpathSync(h.work).replace(/[^A-Za-z0-9]/g, "-"), `${REF}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const line = (doc: Record<string, unknown>) => `${JSON.stringify({ sessionId: REF, isSidechain: false, ...doc })}\n`;
+    fs.writeFileSync(file, line({ type: "user", timestamp: new Date(Date.now() - 600_000).toISOString(), message: { role: "user", content: "earlier" } }));
+    const sid = await h.attach(REF);
+    await h.claw.until("the history", () => h.claw.eventsOf(sid).some((e) => e.data.replay === true));
+    // Four steps of one turn, a few seconds apart as Claude Code wrote them, all reaching the file before the next read.
+    const t0 = Date.now() - 40_000;
+    const iso = (ms: number) => new Date(ms).toISOString();
+    fs.appendFileSync(file, [
+      line({ type: "assistant", timestamp: iso(t0), message: { role: "assistant", content: [{ type: "text", text: "Looking." }, { type: "tool_use", id: "toolu_a", name: "Read", input: { file_path: "/w/a.ts" } }] } }),
+      line({ type: "user", timestamp: iso(t0 + 3_000), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_a", content: "x" }] } }),
+      line({ type: "assistant", timestamp: iso(t0 + 9_000), message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_b", name: "Bash", input: { command: "npm test" } }] } }),
+      // (one with no time, and one dated ahead of this machine's clock: dated when sent)
+      line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "undated" }] } }),
+      line({ type: "assistant", timestamp: iso(Date.now() + 3_600_000), message: { role: "assistant", content: [{ type: "text", text: "ahead" }] } }),
+    ].join(""));
+    const sentFrom = Date.now();
+    await h.claw.until("the last step", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "ahead"));
+    const live = h.claw.eventsOf(sid).filter((e) => e.data.replay !== true && e.type !== "session_started");
+    const ts = (type: string, pick: (e: (typeof live)[number]) => boolean) => live.find((e) => e.type === type && pick(e))?.ts;
+    assert.equal(ts("agent_message_chunk", (e) => e.data.update.content.text === "Looking."), t0);
+    assert.equal(ts("tool_call", (e) => e.data.update.toolCallId === "toolu_a"), t0);
+    assert.equal(ts("tool_call_update", (e) => e.data.update.toolCallId === "toolu_a"), t0 + 3_000);
+    assert.equal(ts("tool_call", (e) => e.data.update.toolCallId === "toolu_b"), t0 + 9_000);
+    assert.deepEqual(live.find((e) => e.type === "tool_call" && e.data.update.toolCallId === "toolu_b")?.data.update._meta, { claudeCode: { toolName: "Bash" } });
+    for (const text of ["undated", "ahead"]) {
+      const at = ts("agent_message_chunk", (e) => e.data.update.content.text === text)!;
+      assert.ok(at >= sentFrom - 1_000 && at <= Date.now(), `${text}: ${at - sentFrom}`);
+    }
   });
 
   test("a takeover the person confirmed ends the terminal that has the conversation open, then resumes it; without it, the same request is only watched", async () => {

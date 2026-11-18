@@ -267,3 +267,68 @@ test("a mode id that names an Object property is a mode like any other", () => {
     ["default", false],
   ]);
 });
+
+test("a step names its tool where the Claude Code adapter and the connector put it, else by its title's first word", () => {
+  const meta = { claudeCode: { toolName: "Bash" } };
+  const cases: [string, ReturnType<typeof acp>, string | undefined][] = [
+    // (the connector reading a terminal's transcript, connector/src/attach.ts)
+    [
+      "connector",
+      acp("tool_call", "1", {
+        toolCallId: "toolu_1",
+        title: "Bash: npm test",
+        kind: "other",
+        status: "in_progress",
+        rawInput: { command: "npm test" },
+        _meta: meta,
+      }),
+      "Bash",
+    ],
+    [
+      "adapter title without the name",
+      acp("tool_call", "1", { toolCallId: "t", title: "`npm test`", _meta: { claudeCode: { toolName: "Read" } } }),
+      "Read",
+    ],
+    [
+      "an MCP tool",
+      acp("tool_call", "1", { toolCallId: "t", title: "mcp__github__issue_search: x" }),
+      "mcp__github__issue_search",
+    ],
+    ["title only", acp("tool_call", "1", { toolCallId: "t", title: "Run tests" }), undefined],
+    ["no title", acp("tool_call", "1", { toolCallId: "t" }), undefined],
+    [
+      "a name that is not a word",
+      acp("tool_call", "1", { toolCallId: "t", title: "x", _meta: { claudeCode: { toolName: "**Bash** [x](y)" } } }),
+      undefined,
+    ],
+    [
+      "a title whose head is not a word",
+      acp("tool_call", "1", { toolCallId: "t", title: "Run the tests: now" }),
+      undefined,
+    ],
+  ];
+  for (const [label, event, name] of cases) assert.equal(read(event).tool?.name, name, label);
+});
+
+test("a message that waits for the terminal says which one, and whether the terminal's own queue holds it", () => {
+  const step = read(
+    frame("terminal_input_queued", {
+      reason: "terminal_working",
+      cmd_id: "c-1",
+      cmd_seq: 4,
+      queued: 1,
+      held: "terminal",
+    }),
+  );
+  assert.deepEqual(
+    [step.queued, step.queuedFor, step.queuedSeq, step.queuedHeld],
+    ["terminal_working", "c-1", 4, true],
+  );
+  const bare = read(frame("terminal_input_queued", { reason: "terminal_typing", cmd_seq: 5 }));
+  assert.deepEqual([bare.queued, bare.queuedFor, bare.queuedSeq, bare.queuedHeld], ["terminal_typing", "5", 5, false]);
+  const none = read(frame("terminal_input_queued", {}));
+  assert.deepEqual(
+    [none.queued, none.queuedFor, none.queuedSeq, none.queuedHeld],
+    ["terminal_working", null, null, false],
+  );
+});

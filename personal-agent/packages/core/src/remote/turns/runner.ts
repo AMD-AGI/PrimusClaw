@@ -37,6 +37,10 @@ export const RECONNECT_BACKOFF_SECONDS = 1.0;
 export const CURSOR_EVERY = 25;
 /** A stream that keeps dropping is given up after this many tries in a row. */
 export const STREAM_ATTEMPTS = 4;
+/** Why a message waits that is the terminal's running turn (`terminal_input_queued`): the person is told so once per message. */
+export const BUSY_REASONS: ReadonlySet<string> = new Set(["terminal_working", "terminal_waiting"]);
+/** The messages a chat was told wait for a busy terminal, remembered per chat (the newest) so each is told once. */
+export const BUSY_TOLD_KEPT = 20;
 
 /** How the turn is shown: in the chat, or in the session card (`window-turn.ts`). */
 export type DisplayFor = (request: TurnRequest, signer: Signer | null) => TurnDisplay;
@@ -62,6 +66,8 @@ export interface TurnRequest {
 export class TurnRunner {
   /** The questions on the terminal each turn's display said in the chat (by their line). */
   private readonly questionsTold = new WeakMap<TurnDisplay, Set<string>>();
+  /** Per chat: what it was told of each message (Claw's number) waiting for a busy terminal (`tellBusy`), oldest first. */
+  private readonly toldBusy = new Map<string, Map<number, "waiting" | "held">>();
 
   constructor(
     private readonly ctx: RemoteContext,
@@ -266,7 +272,7 @@ export class TurnRunner {
     if (step.rejected?.type === "prompt" && step.rejected.cmdSeq !== null) {
       await this.queuedRefused(chatKey, to, step.rejected.cmdSeq, step.rejected.reason);
     }
-    if (step.queued !== null) await this.showWait(chatKey, step, display, to);
+    if (step.queued !== null) await this.showWait(request, step, display);
     else display.progress(step);
     if (step.rowUnreadable) await this.sayRowUnreadable(chatKey, sid, to);
     if (saysModes(step)) this.ctx.remoteState.setRemoteModes(chatKey, sid, step);
@@ -276,6 +282,39 @@ export class TurnRunner {
     if (step.recovered !== null && (step.recovered.continuing || !step.recovered.interrupted)) {
       // (a turn the restart ended says so as its own end, which comes next)
       await this.sayRecovered(chatKey, to, step.recovered.interrupted, step.recovered.continuing);
+    }
+  }
+
+  /**
+   * This turn's message waits for the turn the terminal is running: the person is told at once, in the chat, once per message, and
+   * how to take it back (in the terminal when its own queue holds it; else /stop). A message queued behind a turn of this chat was
+   * told so when it was sent (`queuedBehind`): not again here.
+   */
+  private async tellBusy(request: TurnRequest, step: RemoteStep): Promise<void> {
+    const { chatKey, to } = request;
+    // (only a wait the connector ties to this turn's own message: another one was told when it was sent, `queuedBehind`)
+    const mine = request.cmdSeq?.();
+    if (step.queuedSeq === null || mine === undefined || step.queuedSeq !== mine) return;
+    const told = this.toldBusy.get(chatKey) ?? new Map<number, "waiting" | "held">();
+    const before = told.get(mine);
+    const now = step.queuedHeld ? "held" : "waiting";
+    if (before === "held" || before === now) return;
+    told.set(mine, now);
+    for (const oldest of told.keys()) {
+      if (told.size <= BUSY_TOLD_KEPT) break;
+      told.delete(oldest);
+    }
+    this.toldBusy.set(chatKey, told);
+    const words = remoteAgentText.in(this.state.lang(chatKey));
+    // (said once; a message the terminal's queue takes after it was said to wait is told only where it is now)
+    const text =
+      before === "waiting"
+        ? words.terminalBusyNowHeld
+        : words.terminalBusy + (step.queuedHeld ? words.terminalBusyHeld : words.terminalBusyWaiting);
+    try {
+      await to.send(textMessage(text));
+    } catch (error) {
+      this.ctx.logger.warn("that the message waits for a busy terminal could not be told", { error: errorName(error) });
     }
   }
 
@@ -298,14 +337,16 @@ export class TurnRunner {
   /**
    * Why the message still waits for the terminal, in the chat's language: the whole line in the turn's live view and on the session
    * card, a short one in the floating status; what a question on the terminal asks is also said in the chat when the display does
-   * not show the whole line.
+   * not show the whole line; that it waits for a busy terminal is said in the chat at once (`tellBusy`).
    */
-  private async showWait(chatKey: string, step: RemoteStep, display: TurnDisplay, to: Conversation): Promise<void> {
+  private async showWait(request: TurnRequest, step: RemoteStep, display: TurnDisplay): Promise<void> {
+    const { chatKey, to } = request;
     const lang = this.state.lang(chatKey);
     const reason = step.queued ?? "";
     const note = queuedNote(reason, step.dialog, lang);
     display.progress({ ...step, note, waitLine: queuedLine(reason, lang) });
     if (reason === "terminal_dialog" && !display.showsWaits) await this.sayQuestion(display, note, to);
+    if (BUSY_REASONS.has(reason)) await this.tellBusy(request, step);
   }
 
   /**

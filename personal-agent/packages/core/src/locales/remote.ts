@@ -14,6 +14,8 @@ export const remoteText = defineCatalog({
     liveHeader: (p: { label: string }) => `Working on it (${p.label})...`,
     aStep: "a step",
     stepFailed: (p: { title: string }) => `⚠️ ${p.title} failed, continuing`,
+    /** The steps of the turn so far, by tool (`Bash ×3, Read ×2`). */
+    stepsSoFar: (p: { tools: string }) => `Working: ${p.tools}`,
     anAction: "an action",
     approvalNeeded: (p: { tool: string }) => `Approval needed: ${p.tool}`,
     agentOnHost: (p: { agent: string; host: string }) => `${p.agent} on ${p.host}`,
@@ -224,6 +226,7 @@ It installs the connector, pairs the machine with you and keeps it running. I wi
     liveHeader: (p) => `正在处理（${p.label}）…`,
     aStep: "一个步骤",
     stepFailed: (p) => `⚠️ ${p.title} 失败了，继续执行`,
+    stepsSoFar: (p) => `正在：${p.tools}`,
     anAction: "一个操作",
     approvalNeeded: (p) => `需要批准：${p.tool}`,
     agentOnHost: (p) => `${p.host} 上的 ${p.agent}`,

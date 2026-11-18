@@ -461,6 +461,8 @@ A conversation that a terminal has open when the phone asks for it is not refuse
 started: the connector reads the transcript the terminal writes, from its end (opened read-only; nothing is ever written to it),
 and sends each new line as the update an adapter would have sent (the user's words, the agent's words, the steps it starts
 and how they end; thinking and sub-agents are left out), scrubbed for credentials like every event and marked `read_only`.
+The transcript is read every 250 ms, and each event carries the time Claude Code wrote on its line (`ts`), not the time it was
+read; a step's `tool_call` names its tool in `_meta.claudeCode.toolName`, as the Claude Code ACP adapter does.
 The last twenty updates already there are sent first, marked `replay`. `session_started` says `read_only: true` and
 `read_only_reason: "session_live"`. A prompt, a mode change or a decision sent to it is refused with
 `read_only_live_session` and reaches nothing that could write to the transcript; the server refuses them too
@@ -475,7 +477,9 @@ watch. Nothing else writes to the conversation, so its history never forks, and 
 conversation. `session_started` then says `live_terminal: true` and `input: "terminal"` instead of `read_only`, and a prompt is
 accepted and typed at once, whatever Claude Code is doing there: one submitted while a turn runs is queued by Claude Code
 itself and taken in at that turn's next step or once it ends, as one typed by the person at the terminal is (no registry status, no
-transcript reading and no footer decides when it may be typed). It waits (one notice, `terminal_input_queued`, with `reason`
+transcript reading and no footer decides when it may be typed). When the busy terminal draws the paste late, and once Claude Code
+has queued it (its `queue-operation` enqueue in the transcript), the phone is told, each at most once (`terminal_input_queued`,
+`reason` `terminal_working`; `held: "terminal"` once it is in Claude Code's queue, where only the terminal can take it back, with ↑). It waits (one notice, `terminal_input_queued`, with `reason`
 `terminal_typing`, `terminal_dialog`, `terminal_screen` or `terminal_scrolled`) only while it could not be typed safely: the input
 box holds someone's half-typed text, a question or a menu is on the screen (an Enter there would answer it: on a permission
 question it would approve a tool call), or the pane is scrolled back. A `terminal_dialog` notice also says what the question asks
