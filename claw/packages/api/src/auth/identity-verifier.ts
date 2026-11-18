@@ -9,9 +9,10 @@
  *
  *   - Every credential is judged by the identity service's RFC 7662 introspection with allowStale: false
  *     (a revoked credential is never accepted from cache during an outage): an `ak-` key, or the session
- *     token of the `Token` cookie (with its `userType`). The caller is the answer's `sub`. Its roles are
- *     `default` plus the answer's roles the operator lets the provider confer (CLAW_IDENTITY_TOKEN_TRUSTED_ROLES,
- *     a subset of {@link ADOPTABLE_ROLES}).
+ *     token of the `Token` cookie (with its `userType`). The caller is the answer's `sub`. Its roles are the
+ *     answer's roles that are `default`, an admin role the operator lets the provider confer
+ *     (CLAW_IDENTITY_TOKEN_TRUSTED_ROLES, a subset of {@link ADOPTABLE_ROLES}), or a role CLAW_REQUIRED_PLATFORM_ROLES
+ *     names. Nothing is added that the answer does not list.
  *   - The platform key of an `ak-` caller is the key it presented. The platform key of a session caller is the
  *     one the identity service keeps for the user, read from `GET /api/v1/apikeys/platform` under
  *     IDENTITY_API_URL (or the base of IDENTITY_INTROSPECTION_URL) with that session and this API's identity
@@ -31,6 +32,7 @@ import {
 } from "@claw/utils";
 import type { UserInfo } from "./models.js";
 import { AuthServiceMisconfiguredError, AuthUpstreamUnreachableError, isApiKey } from "./safe-client.js";
+import { requiredPlatformRoles } from "./platform-access.js";
 
 const PLATFORM_KEY_PATH = "/api/v1/apikeys/platform";
 const INTROSPECTION_PATH = "/oauth/introspect";
@@ -90,8 +92,10 @@ export interface IdentityVerifierOptions {
   /** Base URL of the identity HTTP APIs, without a trailing slash. */
   apiUrl: string;
   client: IdentityServiceClient;
-  /** Platform roles the provider may confer; anything else in an answer is dropped. */
+  /** Admin roles the provider may confer. */
   trustedRoles: readonly string[];
+  /** Roles that only admit a caller (CLAW_REQUIRED_PLATFORM_ROLES), read on every answer. */
+  gateRoles?: () => readonly string[];
   fetchFn?: typeof fetch;
   /** Request timeout for the platform key, IDENTITY_REQUEST_TIMEOUT_MS by default 5000. */
   timeoutMs?: number;
@@ -133,13 +137,14 @@ export class IdentityVerifier {
   readonly authProvider = {
     name: "the identity service",
     settings: "IDENTITY_INTROSPECTION_URL, IDENTITY_CLIENT_ID",
-    logFields: { identityUrl: process.env.IDENTITY_INTROSPECTION_URL ?? "" },
+    logFields: { identityUrl: process.env.IDENTITY_INTROSPECTION_URL ?? "", identityApiUrl: process.env.IDENTITY_API_URL ?? "" },
   };
   private platformKeys = new Map<string, { key: string; expiresAt: number }>();
   private inflight = new Map<string, Promise<string>>();
   private readonly apiUrl: string;
   private readonly clientToken: string;
   private readonly trusted: ReadonlySet<string>;
+  private readonly gateRoles: () => readonly string[];
   private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
 
@@ -147,6 +152,7 @@ export class IdentityVerifier {
     this.apiUrl = opts.apiUrl.replace(/\/+$/, "");
     this.clientToken = `${opts.client.clientId}:${opts.client.clientSecret}`;
     this.trusted = new Set(opts.trustedRoles);
+    this.gateRoles = opts.gateRoles ?? (() => requiredPlatformRoles());
     this.fetchFn = opts.fetchFn ?? fetch;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
@@ -238,13 +244,15 @@ export class IdentityVerifier {
     if (status === 404) {
       if (errorMessageOf(text) === NO_PRIMARY_KEY_MESSAGE) throw new PlatformKeyMissingError("the identity service holds no platform key for this user");
       throw new AuthServiceMisconfiguredError(
-        `the identity service does not serve ${PLATFORM_KEY_PATH} at ${this.apiUrl} (check IDENTITY_API_URL, API_KEY_MODE=local and CREDENTIAL_KEYS_FILE)`,
+        `the identity service does not serve ${PLATFORM_KEY_PATH} at the configured base (check IDENTITY_API_URL, API_KEY_MODE=local and CREDENTIAL_KEYS_FILE)`,
       );
     }
     if (status === 405) {
       throw new AuthServiceMisconfiguredError("the identity service does not serve platform keys (needs API_KEY_MODE=local and CREDENTIAL_KEYS_FILE)");
     }
     if (status === 403) throw forbiddenError(errorMessageOf(text));
+    // The introspection answer may be cached: the session was signed out since.
+    if (status === 401) throw new Error("invalid or expired cookie");
     // The session was just introspected as active, so any other refusal is not a verdict on the cookie.
     if (status < 200 || status >= 300) throw new IdentityUpstreamError(`the identity service answered the platform key with HTTP ${status}`, status);
     let body: Record<string, unknown>;
@@ -258,23 +266,29 @@ export class IdentityVerifier {
       throw new IdentityUpstreamError("the identity service answered the platform key without the session user's key", status);
     }
     if (key === "") throw new PlatformKeyMissingError("the identity service holds no platform key for this user");
-    const expires = typeof body.expirationTime === "string" ? Date.parse(body.expirationTime) : NaN;
+    const expires = typeof body.expirationTime === "string" ? parseUtc(body.expirationTime) : NaN;
     this.remember(userId, key, Number.isNaN(expires) ? Infinity : expires);
     return key;
   }
 
-  /** The caller an active introspection answer names, with its platform key and only the trusted roles. */
+  /** The caller an active introspection answer names, with its platform key and the roles it may adopt from the answer. */
   private userOf(answer: ActiveAnswer, platformKey: string): UserInfo {
     const userId = answer.sub ?? "";
+    const gate = new Set(this.gateRoles());
     return {
       userId,
       userName: (answer.name || answer.preferredUsername || answer.username || answer.email || userId).slice(0, MAX_NAME_CHARS),
       ...(answer.email ? { email: answer.email } : {}),
-      roles: ["default", ...answer.roles.filter((r) => this.trusted.has(r))],
+      roles: answer.roles.filter((r) => r === "default" || this.trusted.has(r) || gate.has(r)),
       platformKey,
       virtualKey: "",
     };
   }
+}
+
+/** Milliseconds of a date-time; one without a zone (the provider's `2006-01-02T15:04:05`) is UTC. */
+function parseUtc(value: string): number {
+  return Date.parse(/(Z|[+-]\d{2}:?\d{2})$/i.test(value) ? value : `${value}Z`);
 }
 
 /** The `errorMessage` of an identity error body, or empty. */

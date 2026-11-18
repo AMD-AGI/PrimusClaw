@@ -86,7 +86,7 @@ test("a session cookie is the introspected user, with the platform key read with
   );
   const user = await verifier.verifyCookie("sess-alice", "sso");
   assert.deepEqual(user, {
-    userId: "u-alice", userName: "Alice", email: "alice@example.test", roles: ["default", "system-admin"],
+    userId: "u-alice", userName: "Alice", email: "alice@example.test", roles: ["system-admin", "default"],
     platformKey: "ak-alice-platform", virtualKey: "",
   });
   assert.deepEqual(seen.introspect[0], { token: "sess-alice", params: { user_type: "sso" }, allowStale: false });
@@ -99,13 +99,13 @@ test("a session cookie is the introspected user, with the platform key read with
   assert.equal(seen.fetch.length, 1, "the platform key is kept per user");
 });
 
-test("an ak- key is the introspected user, and the key is its platform key; roles always include default", async () => {
+test("an ak- key is the introspected user, and the key is its platform key; no role is added that the answer does not list", async () => {
   const { verifier, seen } = fakeIdentity(
     { "ak-bob": active({ sub: "u-bob", username: "bob@example.test", roles: ["system-admin-readonly"], tokenType: "api_key" }) },
     {},
   );
   const user = await verifier.verifyApiKey("ak-bob");
-  assert.deepEqual(user, { userId: "u-bob", userName: "bob@example.test", roles: ["default", "system-admin-readonly"], platformKey: "ak-bob", virtualKey: "" });
+  assert.deepEqual(user, { userId: "u-bob", userName: "bob@example.test", roles: ["system-admin-readonly"], platformKey: "ak-bob", virtualKey: "" });
   assert.equal(seen.fetch.length, 0);
 });
 
@@ -116,7 +116,7 @@ test("only the roles the operator trusts are adopted from an answer", async () =
     ["system-admin-readonly"],
   );
   const user = await verifier.verifyApiKey("ak-mallory");
-  assert.deepEqual(user.roles, ["default", "system-admin-readonly"]);
+  assert.deepEqual(user.roles, ["system-admin-readonly"]);
 });
 
 test("refusals: an inactive credential, a cookie that is not a session, and a platform key of another user", async () => {
@@ -270,7 +270,8 @@ test("platform-key answers: 405 and a refused client are misconfigured, an expir
   await assert.rejects(verifier.verifyCookie("sess-405"), AuthServiceMisconfiguredError);
   await assert.rejects(verifier.verifyCookie("sess-403"), AuthServiceMisconfiguredError);
   await assert.rejects(verifier.verifyCookie("sess-expired"), PlatformKeyMissingError);
-  for (const t of ["sess-401", "sess-429", "sess-500"]) {
+  await assert.rejects(verifier.verifyCookie("sess-401"), /invalid or expired cookie/);
+  for (const t of ["sess-429", "sess-500"]) {
     await assert.rejects(verifier.verifyCookie(t), IdentityUpstreamError, t);
   }
 
@@ -379,14 +380,21 @@ test("an account refusal is a 403 for the cookie", async () => {
   }
 });
 
-test("a kept platform key is not served past its expirationTime", async (t) => {
-  const start = Date.now();
+test("a kept platform key is not served past its expirationTime, read as UTC in the provider's layout", async (t) => {
+  const tz = process.env.TZ;
+  process.env.TZ = "Asia/Shanghai";
+  t.after(() => { if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz; });
+  const start = Math.floor(Date.now() / 1000) * 1000;
+  const layout = new Date(start + 10_000).toISOString().slice(0, 19);
   const { verifier, seen } = fakeIdentity(
     { "sess-lee": active({ sub: "u-lee", tokenType: "session" }) },
-    { "sess-lee": { status: 200, body: { userId: "u-lee", apiKey: "ak-lee", expirationTime: new Date(start + 10_000).toISOString() } } },
+    { "sess-lee": { status: 200, body: { userId: "u-lee", apiKey: "ak-lee", expirationTime: layout } } },
   );
   const now = t.mock.method(Date, "now", () => start);
   await verifier.verifyCookie("sess-lee");
+  now.mock.mockImplementation(() => start + 9_000);
+  await verifier.verifyCookie("sess-lee");
+  assert.equal(seen.fetch.length, 1, "kept until the expiry");
   now.mock.mockImplementation(() => start + 11_000);
   await verifier.verifyCookie("sess-lee");
   assert.equal(seen.fetch.length, 2);
@@ -413,4 +421,22 @@ test("an active answer without a known token type is an upstream protocol failur
   );
   await assert.rejects(verifier.verifyApiKey("ak-notype"), IdentityUpstreamError);
   await assert.rejects(verifier.verifyCookie("sess-notype"), IdentityUpstreamError);
+});
+
+test("a 401 for the platform key is an invalid cookie: the session was signed out after introspection", async () => {
+  const { verifier } = fakeIdentity(
+    { "sess-out": active({ sub: "u-out", tokenType: "session" }) },
+    { "sess-out": { status: 401, body: { errorMessage: "invalid token" } } },
+  );
+  const err = await verifier.verifyCookie("sess-out").catch((e: unknown) => e);
+  assert.ok(err instanceof Error && !(err instanceof IdentityUpstreamError), String(err));
+  assert.match((err as Error).message, /invalid or expired cookie/);
+});
+
+test("a misconfiguration message names the settings, not the identity API URL", async () => {
+  const { verifier } = fakeIdentity({ "sess-mis": active({ sub: "u-mis", tokenType: "session" }) }, { "sess-mis": { status: 404 } });
+  const err = await verifier.verifyCookie("sess-mis").catch((e: unknown) => e);
+  assert.ok(err instanceof AuthServiceMisconfiguredError);
+  assert.doesNotMatch((err as Error).message, /identity\.test/);
+  assert.match((err as Error).message, /IDENTITY_API_URL/);
 });

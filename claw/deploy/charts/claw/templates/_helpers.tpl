@@ -112,7 +112,6 @@ same client, so they cannot be configured to disagree.
       key: {{ dig "clientSecret" "key" "client-secret" $i | quote }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_DISCOVERY_URL" "value" $i.discoveryUrl) }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_INTROSPECTION_URL" "value" (dig "endpoints" "introspection" "" $i)) }}
-{{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_API_URL" "value" (dig "endpoints" "api" "" $i)) }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_TOKEN_URL" "value" (dig "endpoints" "token" "" $i)) }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_JWKS_URL" "value" (dig "endpoints" "jwks" "" $i)) }}
 {{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_INTROSPECTION_CACHE_SECONDS" "value" (dig "cache" "positiveSeconds" "" $i)) }}
@@ -143,7 +142,10 @@ virtualKey
 CLAW_AUTH_PROVIDER for the API: identity.authProvider, default "safe".
 The identity provider verifies callers with the identity client, so it needs identity.enabled
 and identity.endpoints.introspection. It also needs LLM_KEY_SOURCE=platformKey because
-IdentityVerifier leaves virtualKey empty.
+IdentityVerifier leaves virtualKey empty. With the identity provider it also renders
+IDENTITY_API_URL (identity.endpoints.api) and, unless identity.tokenAuth.enabled renders it,
+CLAW_IDENTITY_TOKEN_TRUSTED_ROLES (identity.tokenAuth.trustedRoles): the admin roles the
+introspection answer may confer.
 */ -}}
 {{- define "primus-claw.authProviderEnv" -}}
 {{- $i := .Values.identity | default dict -}}
@@ -156,6 +158,16 @@ IdentityVerifier leaves virtualKey empty.
 {{- end -}}
 - name: CLAW_AUTH_PROVIDER
   value: {{ $p | quote }}
+{{- if eq $p "identity" }}
+{{- include "primus-claw.identityOptionalEnv" (dict "name" "IDENTITY_API_URL" "value" (dig "endpoints" "api" "" $i)) }}
+{{- $t := $i.tokenAuth | default dict -}}
+{{- if not $t.enabled }}
+{{- with $t.trustedRoles }}
+- name: CLAW_IDENTITY_TOKEN_TRUSTED_ROLES
+  value: {{ join "," . | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- end -}}
 
 {{- /*

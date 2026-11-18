@@ -7,7 +7,7 @@ import cookie from "@fastify/cookie";
 import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
-  AUTH_INTERNAL_TOKEN, NATS_URL, isIdentityAuthProvider, envBool, LLM_KEY_SOURCE,
+  AUTH_INTERNAL_TOKEN, NATS_URL, isIdentityAuthProvider, LLM_KEY_SOURCE,
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_AUTO_EVOLUTION_ENABLED, CLAW_USER_SKILLS_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   SESSION_PURGE_DAYS, SESSION_RETENTION_BATCH, SESSION_RETENTION_DAYS, SESSION_RETENTION_DRY_RUN,
   SESSION_RETENTION_HOLD_BUDGET_SEC, SESSION_RETENTION_LOCK_RETRY_MIN,
@@ -22,7 +22,7 @@ import { initNats, nc as natsConnection } from "./infra/nats.js";
 import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
-import { identityApiBase } from "./auth/identity-verifier.js";
+import { identityAuthMissingSettings, identityKeySourceProblem } from "./startup/identity-auth.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerSessionDeliveryRoutes } from "./routes/session-deliveries.js";
 import { registerAnswerFeedbackRoutes } from "./routes/answer-feedback.js";
@@ -163,13 +163,10 @@ function assertNoSharedIdentityBypass(): void {
  * virtualKey empty, so virtualKey mode would silently fall back to the deployment key.
  */
 function assertIdentityUsesPlatformKey(): void {
-  if (!isIdentityAuthProvider()) return;
-  if (LLM_KEY_SOURCE === "platformKey") return;
+  const problem = identityKeySourceProblem(isIdentityAuthProvider(), LLM_KEY_SOURCE);
+  if (problem === null) return;
   logger.error({ LLM_KEY_SOURCE }, "startup.identity_requires_platform_key");
-  throw new Error(
-    "CLAW_AUTH_PROVIDER=identity requires LLM_KEY_SOURCE=platformKey: the identity " +
-      "verifier leaves virtualKey empty, so Engines and the sandbox must use the platform key.",
-  );
+  throw new Error(problem);
 }
 
 /**
@@ -177,13 +174,7 @@ function assertIdentityUsesPlatformKey(): void {
  * without them every request is answered 500.
  */
 function assertIdentityAuthConfig(): void {
-  if (!isIdentityAuthProvider()) return;
-  if (["dev", "development", "local"].includes(APP_ENV.toLowerCase())) return;
-  const missing: string[] = [];
-  if (!envBool("IDENTITY_CLIENT_ENABLED", false)) missing.push("IDENTITY_CLIENT_ENABLED");
-  if (!(process.env.IDENTITY_CLIENT_ID ?? "").trim()) missing.push("IDENTITY_CLIENT_ID");
-  if (!(process.env.IDENTITY_CLIENT_SECRET ?? "").trim()) missing.push("IDENTITY_CLIENT_SECRET");
-  if (!identityApiBase(process.env.IDENTITY_INTROSPECTION_URL)) missing.push("IDENTITY_INTROSPECTION_URL or IDENTITY_API_URL");
+  const missing = identityAuthMissingSettings(isIdentityAuthProvider(), APP_ENV, process.env);
   if (missing.length === 0) return;
   logger.error({ missing }, "startup.identity_auth_refused");
   throw new Error(`CLAW_AUTH_PROVIDER=identity cannot authenticate without: ${missing.join(", ")}`);

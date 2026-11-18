@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Who may use Claw at all, judged by the platform roles SaFE reports for them.
+ * Who may use Claw at all, judged by the platform roles the auth provider (SaFE, or identity under
+ * CLAW_AUTH_PROVIDER=identity) reports for them.
  *
  * Signing in to the platform does not by itself entitle a person to the services
  * Claw spends the platform's money on (the LLM, sandboxes, remote agents): an
@@ -12,13 +13,16 @@
  *   - Empty (the default): nothing is checked, and every caller is judged exactly
  *     as before this setting existed.
  *   - Non-empty: a caller is served only when it holds at least one of the named
- *     roles, as SaFE's verification of its credential reported them. Anyone else
+ *     roles, as the provider's verification of its credential reported them. Anyone else
  *     gets a 403 `platform_access_required` that a client can show as is.
  *
  * Claw keeps no list of SaFE roles. Which role means "may use Claw" is the
  * operator's word, and a role SaFE has not defined simply matches nobody.
  *
- * Only a credential SaFE verified brings roles SaFE reported. The identity-token,
+ * Only a credential the provider verified brings roles the provider reported. Under
+ * CLAW_AUTH_PROVIDER=identity those are the roles of the identity introspection answer that are
+ * `default`, a trusted admin role (CLAW_IDENTITY_TOKEN_TRUSTED_ROLES) or a role named here; nothing
+ * is added that the answer does not list (`IdentityVerifier`). The identity-token,
  * connector-token and BYOK paths build the caller themselves and give it the
  * single role `default`, which is Claw's own marker for "an ordinary user" and not
  * anything SaFE said, so counting it would let a caller SaFE never vouched for
@@ -48,7 +52,7 @@ export const PLATFORM_ACCESS_MESSAGE = "no access yet - ask an administrator";
 
 /**
  * The credential methods (`recordRequestCredential`, the `method` of a verified
- * outcome) whose `roles` are SaFE's answer: the session cookie, an `ak-` key in a
+ * outcome) whose `roles` are the provider's answer: the session cookie, an `ak-` key in a
  * download URL, in `Authorization: Bearer` and in `x-api-key`. Every other method
  * has no platform roles to offer. A new SaFE-verified path has to be added here
  * to count, and until it is the requirement refuses it, which is the safe way to
