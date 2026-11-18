@@ -503,6 +503,23 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.ok(h.audit().some((a) => a.kind === "terminal_input_uncertain" && a.cmd_id === end.data.cmd_id));
   });
 
+  test("a prompt taken as the message's whose turn ended before the echo wait did ends the message's turn at once, by that end, not by a later idle look (2026-11-18, review on #870)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      // (no idle look ends it here: an hour of idle is needed, as a terminal whose state cannot be read never gives one)
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 3_600_000, terminalEchoMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir, 300, { FAKE_PASTE_REF: "placeholder" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "line one\nline two");
+    const end = await h.claw.until("its end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 10_000);
+    assert.deepEqual([end.data.stopReason, end.data.error, end.data.input_unconfirmed], ["end_turn", undefined, true]);
+  });
+
   test("a prompt the terminal records only after the echo wait: the turn ends unconfirmed, and the prompt and its reply still reach the phone (2026-11-18)", async () => {
     const work = tmpdir("cc-work-");
     const h = await Harness.create({

@@ -229,6 +229,8 @@ export class Session {
     entered?: boolean;
     /** A prompt the terminal recorded after the Enter in words that do not match: taken as this message's if none matches in time. */
     candidate?: boolean;
+    /** How the turn of that prompt ended, when it ended before the prompt was taken as this message's. */
+    candidateEnd?: "end_turn" | "cancelled";
     /**
      * Taken as this message's without its words matching what was typed (a prompt the terminal recorded after the Enter, and none that
      * matched by the echo wait's end): its turn is followed and ends as any other, said `input_unconfirmed` on its end, never as a failure.
@@ -470,12 +472,11 @@ export class Session {
 
   private emitTranscript(u: TranscriptUpdate, replay: boolean): void {
     const turn = replay ? null : this.terminalTurn;
-    if (u.type === "turn_done") {
-      if (turn?.seen) this.endTerminalTurn("end_turn");
-      return;
-    }
-    if (u.type === "turn_interrupted") {
-      if (turn?.seen) this.endTerminalTurn("cancelled");
+    if (u.type === "turn_done" || u.type === "turn_interrupted") {
+      const how = u.type === "turn_done" ? "end_turn" : "cancelled";
+      if (turn?.seen) this.endTerminalTurn(how);
+      // (the turn of a prompt kept in mind ended before the echo wait did: if that prompt is taken as the message's, so is this end)
+      else if (turn?.candidate) turn.candidateEnd = how;
       return;
     }
     // What Claude Code did with a message submitted while a turn ran: queued it (taken: the echo), took it into that turn (its start
@@ -779,6 +780,8 @@ export class Session {
         turn.uncertain = true;
         turn.own = false;
         this.audit("terminal_input_uncertain", { cmd_id: turn.cmdId });
+        // (its turn already ended, and nothing else may end it now: a terminal whose state cannot be read waits for that end alone)
+        if (turn.candidateEnd) this.endTerminalTurn(turn.candidateEnd);
       }
       return;
     }
