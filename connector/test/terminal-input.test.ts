@@ -580,35 +580,89 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.ok(!h.audit().some((a) => a.kind === "terminal_own_text_cleared"), "nothing was taken out");
   });
 
-  test("a message of the phone's own left in the box is taken out before the next one, never waited for as someone typing; anyone else's text still is (2026-11-18)", async () => {
+  test("what the person types into the box right after a phone cancel stops a turn is left there: only the stopped message itself is taken out (2026-11-18)", async () => {
     const work = tmpdir("cc-work-");
     const h = await Harness.create({
       work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
       attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
     });
     hs.push(h);
-    const t = terminal(work, h.attachDir);
+    const escs = path.join(tmpdir("cc-esc-"), "escs");
+    // (no FAKE_ESC_REWIND: the Esc stops a turn whose answer had begun, and the box stays the person's)
+    const t = terminal(work, h.attachDir, 4_000, { FAKE_ESC_FILE: escs });
     h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
     await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
     const sid = await h.attach(REF);
-    h.prompt(sid, "first message");
-    await h.turnEnd(sid, 1);
-    // Its text back in the box, alone (an Enter that did not submit it leaves it so, as a stop before its answer does).
-    t.tmux("send-keys", "-t", "%0", "-l", "first message");
-    await until("the text in the box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "typed");
+    const one = h.prompt(sid, "please summarise");
+    await until("its turn running", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("esc to interrupt"), 10_000);
+    await new Promise((r) => setTimeout(r, 1_000));
+    h.claw.issue("cancel", sid);
+    await until("the Esc", () => fs.existsSync(escs), 5_000);
+    t.tmux("send-keys", "-t", "%0", "-l", "my own words");
+    await h.claw.until("the cancelled end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 10_000);
+    await new Promise((r) => setTimeout(r, 4_000));
+    assert.ok(t.tmux("capture-pane", "-p", "-t", "%0").includes("my own words"), "their text left as it is");
+    assert.ok(!h.audit().some((a) => a.kind === "terminal_own_text_cleared"));
+  });
+
+  test("a message refused with its text left in the box (its Enter lost) is taken out at once, so the next one goes in, never held as someone typing; the same words typed by the person later are theirs (2026-11-18)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    // (every Enter for the first message is lost: it is refused with its text in the box)
+    const t = terminal(work, h.attachDir, 300, { FAKE_ENTER_IGNORE: "4" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const one = h.prompt(sid, "first message");
+    const end1 = await h.claw.until("the first one refused", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 15_000);
+    assert.deepEqual([end1.data.stopReason, end1.data.error], ["error", "terminal_input_failed"]);
+    await until("its text taken out of the box again", () => h.audit().some((a) => a.kind === "terminal_own_text_cleared" && a.why === "refused"), 5_000);
+    assert.equal(inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")), "empty");
     const two = h.prompt(sid, "second message");
-    const end = await h.turnEnd(sid, 2);
-    assert.deepEqual([end.data.stopReason, end.data.cmd_seq], ["end_turn", two]);
-    assert.deepEqual(typed(t.transcript), ["first message", "second message"], "the leftover was not submitted");
-    assert.ok(h.audit().some((a) => a.kind === "terminal_own_text_cleared" && a.why === "left_in_box"));
+    const end2 = await h.claw.until("the second's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === two), 15_000);
+    assert.deepEqual([end2.data.stopReason, end2.data.error], ["end_turn", undefined]);
+    assert.deepEqual(typed(t.transcript), ["second message"], "the refused one was never submitted");
     assert.ok(!h.claw.eventsOf(sid, "terminal_input_queued").some((e) => e.data.cmd_seq === two));
-    // Someone else's words in the box, even with the phone's in them, are waited for as before.
-    t.tmux("send-keys", "-t", "%0", "-l", "second message, edited");
-    await until("their text", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "typed");
-    const three = h.prompt(sid, "third message");
-    const queued = await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === three));
-    assert.equal(queued.data.reason, "terminal_typing");
-    assert.ok(t.tmux("capture-pane", "-p", "-t", "%0").includes("second message, edited"), "their text left as it is");
+    // The same words as either message, typed by the person afterwards, are theirs: waited for, never taken out.
+    for (const [n, words] of [[3, "first message"], [4, "second message"]] as const) {
+      t.tmux("send-keys", "-t", "%0", "C-u");
+      t.tmux("send-keys", "-t", "%0", "-l", words);
+      await until("their text", () => t.tmux("capture-pane", "-p", "-t", "%0").includes(words));
+      const seq = h.prompt(sid, `message ${n}`);
+      const queued = await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === seq));
+      assert.equal(queued.data.reason, "terminal_typing");
+      await new Promise((r) => setTimeout(r, 1_000));
+      assert.ok(t.tmux("capture-pane", "-p", "-t", "%0").includes(words), "their text left as it is");
+      h.claw.issue("cancel", sid);
+      await h.claw.until("the waiting one dropped", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_seq === seq));
+    }
+    assert.equal(h.audit().filter((a) => a.kind === "terminal_own_text_cleared").length, 1);
+  });
+
+  test("a message taken as the person's prompt's when its own came late is the matching one's once that comes (2026-11-18, codex r2 on #870)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000, terminalEchoMs: 1_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    // (the phone's prompt is recorded 3 s after its Enter, well after the echo wait; the person's comes in between)
+    const t = terminal(work, h.attachDir, 300, { FAKE_RECORD_LAG_MS: "3000" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "from the phone");
+    await until("the Enter taken", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("Working"), 10_000);
+    fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "user", sessionId: REF, timestamp: new Date().toISOString(), promptSource: "typed", origin: { kind: "human" }, message: { role: "user", content: "the person's own prompt" } })}\n`);
+    await until("taken as that prompt's, uncertain", () => h.audit().some((a) => a.kind === "terminal_input_uncertain"), 5_000);
+    const end = await h.claw.until("its end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
+    assert.deepEqual([end.data.stopReason, end.data.error, end.data.input_unconfirmed], ["end_turn", undefined, undefined]);
+    assert.ok(h.audit().some((a) => a.kind === "terminal_input_confirmed_late"));
+    assert.ok(!h.claw.eventsOf(sid, "user_message_chunk").some((e) => e.data.update.content.text === "from the phone"), "its own prompt is not news");
   });
 
   test("a person's prompt the terminal records before the phone's Enter, or while Claude Code holds the phone's message queued, is never taken as the phone's (2026-11-18)", async () => {
@@ -655,6 +709,75 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
       assert.deepEqual([end.data.stopReason, end.data.input_unconfirmed], ["end_turn", undefined]);
       assert.ok(typed(t.transcript).includes("queued one"));
     }
+  });
+
+  test("a person's prompt recorded after the phone's Enter but before the phone's own is not taken for it: the phone's, matching, is (2026-11-18, codex r1 on #870)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000, terminalEchoMs: 3_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    // (the phone's prompt is recorded 800 ms after its Enter; the person's comes in between)
+    const t = terminal(work, h.attachDir, 300, { FAKE_RECORD_LAG_MS: "800" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "from the phone");
+    await until("the Enter taken", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("Working"), 10_000);
+    fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "user", sessionId: REF, timestamp: new Date().toISOString(), promptSource: "typed", origin: { kind: "human" }, message: { role: "user", content: "the person's own prompt" } })}\n`);
+    const end = await h.claw.until("its end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
+    assert.deepEqual([end.data.stopReason, end.data.error, end.data.input_unconfirmed], ["end_turn", undefined, undefined]);
+    assert.ok(h.claw.eventsOf(sid, "user_message_chunk").some((e) => e.data.update.content.text === "the person's own prompt"), "theirs shown as theirs");
+    assert.ok(!h.audit().some((a) => a.kind === "terminal_input_uncertain"));
+  });
+
+  test("a person's prompt recorded before the phone's Enter is not taken for the phone's message even when nothing matches in time: it ends unconfirmed (2026-11-18)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000, terminalEchoMs: 1_500 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const dir = tmpdir("cc-dialog-");
+    const dismiss = path.join(dir, "dismiss");
+    // (a question holds the Enter; the phone's prompt is recorded only well after the echo wait)
+    const t = terminal(work, h.attachDir, 300, { FAKE_DIALOG_FILE: path.join(dir, "approved"), FAKE_DIALOG_DISMISS: dismiss, FAKE_RECORD_LAG_MS: "4000" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    const seq = h.prompt(sid, "from the phone");
+    await h.claw.until("the notice that a question holds it", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === seq));
+    fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "user", sessionId: REF, timestamp: new Date().toISOString(), promptSource: "typed", origin: { kind: "human" }, message: { role: "user", content: "a prompt of the person's" } })}\n`);
+    await h.claw.until("theirs shown as theirs", () => h.claw.eventsOf(sid, "user_message_chunk").find((e) => e.data.update.content.text === "a prompt of the person's"));
+    fs.writeFileSync(dismiss, "");
+    const end = await h.claw.until("its end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
+    assert.deepEqual([end.data.stopReason, end.data.error, end.data.input_unconfirmed], ["error", "terminal_input_unconfirmed", undefined]);
+  });
+
+  test("a person's paste in the box that collapses to as many lines as the phone's last message is not taken for it (2026-11-18, codex r1 on #870)", async () => {
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const t = terminal(work, h.attachDir, 300, { FAKE_PASTE_REF: "1" });
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    const sid = await h.attach(REF);
+    h.prompt(sid, "line a\nline b\nline c");
+    await h.turnEnd(sid, 1);
+    // The person pastes three other lines: the box shows `[Pasted text #2 +2 lines]`, as it showed the phone's.
+    t.tmux("set-buffer", "-b", "theirs", "their x\ntheir y\ntheir z");
+    t.tmux("paste-buffer", "-p", "-d", "-b", "theirs", "-t", "%0");
+    await until("their paste in the box", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("[Pasted text #2 +2 lines]"));
+    const two = h.prompt(sid, "next from the phone");
+    const queued = await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === two));
+    assert.equal(queued.data.reason, "terminal_typing");
+    await new Promise((r) => setTimeout(r, 1_000));
+    assert.ok(t.tmux("capture-pane", "-p", "-t", "%0").includes("[Pasted text #2 +2 lines]"), "their paste left as it is");
+    assert.ok(!h.audit().some((a) => a.kind === "terminal_own_text_cleared"));
   });
 
   test("withdraw takes back a message waiting for the terminal and leaves the terminal alone: no Escape, nothing typed", async () => {

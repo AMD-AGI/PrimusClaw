@@ -46,6 +46,7 @@
  * FAKE_ESC_REWIND=1: an Esc while a turn of the phone's prompt runs, before its answer is written, stops it and puts the prompt back
  * into the box as it was submitted (a long paste as its `[Pasted text #n +k lines]`), as Claude Code 2.1.327 does (measured
  * 2026-11-18); nothing more is written for that turn.
+ * FAKE_ENTER_IGNORE=n: the first n Enters in the box are dropped (a Claude Code that lost the key): the text stays in the box.
  * FAKE_RECORD_LAG_MS: a submitted prompt is recorded in the transcript this much later (a busy Claude Code writing late); the turn
  * starts at once (the row says `busy`).
  */
@@ -122,6 +123,7 @@ function draw() {
 }
 
 /** A turn that answers `text` (null: one that is not the phone's), ending after workMs, and what was queued meanwhile. */
+let enterIgnored = 0;
 let turnTimer = null;
 let turnText = null;
 /** Esc stops the running turn of a prompt before its answer, and the prompt goes back into the box (FAKE_ESC_REWIND=1). */
@@ -238,6 +240,7 @@ process.stdin.on("data", (chunk) => {
         dialog = false;
         continue;
       }
+      if (enterIgnored < Number(process.env.FAKE_ENTER_IGNORE || "0")) { enterIgnored += 1; continue; }
       if (!working) submit();
       else if (buffer.trim()) {
         // (Claude Code queues it: taken at the running turn's next step, or once it ends)

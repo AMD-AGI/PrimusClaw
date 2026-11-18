@@ -591,7 +591,8 @@ export class TerminalInputUnseen extends Error {
 
 /** What was typed is in the box but was not submitted: the screen did not pass {@link enterGuard}. */
 export class TerminalNotSubmitted extends Error {
-  constructor(readonly why: string) {
+  /** `takenOut`: its own text, which the box still held exactly, was taken out of the box again before this was thrown. */
+  constructor(readonly why: string, readonly takenOut = false) {
     super(`typed but not submitted: ${why}`);
   }
 }
@@ -681,8 +682,10 @@ export class TerminalInput {
       if (pasted) {
         // (a question on the screen gets no key: its text is taken out once it is gone, if the box then holds exactly that)
         const by = Date.now() + CLEAR_WAIT_MS;
-        while (dialogOnScreen(await this.screen()) && Date.now() < by && (await this.alive())) await sleep(DIALOG_POLL_MS);
-        await this.clearOwn(text);
+        let questioned = told;
+        while (dialogOnScreen(await this.screen()) && Date.now() < by && (await this.alive())) { questioned = true; await sleep(DIALOG_POLL_MS); }
+        // (after a question the box may hold anyone's paste: a collapsed one, which shows only its count of lines, is left)
+        await this.clearOwn(text, !questioned);
       }
       throw new TerminalNotSubmitted("no longer wanted");
     };
@@ -745,7 +748,9 @@ export class TerminalInput {
           const after = await this.screen();
           if (dialogOnScreen(after)) { if (++declined > MAX_TYPINGS) throw new TerminalNotSubmitted("a question took the Enter, again and again"); dialog = true; continue; }
           if (enterGuard(after, text) === null && !opts.submitted?.()) {
-            if (++declined > MAX_TYPINGS) throw new TerminalNotSubmitted("the Enter did not submit it");
+            // (given up with its text in the box, which was just read to hold exactly that: taken out, so that nothing reads it later as
+            // someone typing and holds every later message behind it; a box holding anything else is left as it is)
+            if (++declined > MAX_TYPINGS) throw new TerminalNotSubmitted("the Enter did not submit it", await this.clearOwn(text, !told).catch(() => false));
             continue;
           }
           return;
@@ -768,11 +773,13 @@ export class TerminalInput {
    * paste goes with one Backspace, anything else with one per character. Backspace is never a choice on a question (measured on Claude
    * Code 2.1.285: five on a permission question chose nothing). Anything else in the box, or a question, and nothing is sent.
    */
-  private async clearOwn(text: string): Promise<boolean> {
+  private async clearOwn(text: string, collapsedToo = true): Promise<boolean> {
     const screen = await this.screen();
     if (enterGuard(screen, text) !== null) return false;
     const { plain, at, end } = boxOf(screen);
     const collapsed = end === at + 1 && /^\[Pasted text #\d+/.test(plain[at]!.trimStart().replace(PROMPT_RE, "").trim());
+    // (a collapsed paste shows only its count of lines: any paste of as many lines looks the same)
+    if (collapsed && !collapsedToo) return false;
     const n = collapsed ? 1 : [...text].length;
     await this.tmux.run(["send-keys", "-t", this.ref.pane, "-H", ...Array<string>(n).fill("7f")]);
     return true;
@@ -784,6 +791,8 @@ export class TerminalInput {
    * Claude Code puts a message back into its box when Esc stops the turn the message started before any answer came (measured on
    * 2.1.327, 2026-11-18: a one-line message back as it was, a long paste as `[Pasted text #n +k lines]`); and a message whose Enter
    * did not submit it is left there. Either way it is the phone's own text, not someone typing: anything else in the box is left.
+   * A box showing a collapsed paste (`[Pasted text #n +k lines]`) with as many lines counts as that text: it is looked for only right
+   * after the phone's own paste or Esc.
    */
   async takeBack(text: string, waitMs = 0): Promise<boolean> {
     const by = Date.now() + waitMs;
