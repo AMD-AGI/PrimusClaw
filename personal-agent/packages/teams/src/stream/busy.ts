@@ -3,7 +3,8 @@
 
 /**
  * Teams allows one open stream per conversation. This remembers, per conversation, until when this process does not open
- * another one there: one is open, or one whose final was refused may still be open on Teams' side until it times out.
+ * another one there: one is open, or one whose final did not get through may still be open on Teams' side until it times
+ * out. A final Teams refuses because the stream is already over (403 ContentStreamNotAllowed) frees the conversation at once.
  */
 import type { Clock } from "@primusclaw/personal-agent";
 

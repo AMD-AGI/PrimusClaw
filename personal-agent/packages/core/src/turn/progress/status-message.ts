@@ -115,6 +115,8 @@ export class StatusMessage<S> {
   private streamOver = false;
   /** The turn was cancelled (`close(true)`). */
   private hard = false;
+  /** The answer is on its way (`finish`): the progress message is the answer's to retire. */
+  private finishing = false;
 
   constructor(surface: TurnSurface, options: StatusOptions<S>) {
     this.surface = surface;
@@ -388,20 +390,28 @@ export class StatusMessage<S> {
 
   /**
    * Stop sending progress. A sleeping flusher is cancelled; one that is mid-send finishes that one send, unless the turn
-   * itself was cancelled (`hard`). A stream still open when the turn is cancelled is closed with INTERRUPTED, in the
-   * background (the floating status must not spin until the chat's limit).
+   * itself was cancelled (`hard`). When the turn is cancelled, what shows it is ended in the background: a stream still open
+   * is closed with INTERRUPTED (the floating status must not spin until the chat's limit), and the progress message is
+   * retired (no answer follows it, so it must not stay in the chat as stale progress).
    */
   close(hard = false): void {
     this.closed = true;
-    this.hard = this.hard || hard;
     this.stopPreparingTimer();
     if (this.flusher && !this.flusher.done && (hard || !this.sending)) this.flusher.cancel();
-    if (hard) for (const task of [this.again, this.expiry, this.choice]) task?.cancel();
-    if (hard && this.live?.closable && !this.streamOver) {
+    if (hard) this.cancelled();
+  }
+
+  /** The turn was cancelled: nothing more is repeated, and what shows it is ended (the first time only). */
+  private cancelled(): void {
+    const first = !this.hard;
+    this.hard = true;
+    for (const task of [this.again, this.expiry, this.choice]) task?.cancel();
+    if (this.live?.closable && !this.streamOver) {
       this.streamOver = true;
       const live = this.live;
       detach(() => this.interrupt(live));
     }
+    if (first && this.posted && !this.finishing) detach(() => this.retireCancelled());
   }
 
   private async interrupt(stream: StreamHandle): Promise<void> {
@@ -411,11 +421,21 @@ export class StatusMessage<S> {
   }
 
   /**
+   * The turn was cancelled with its progress message on screen: no answer follows to replace it, so it is retired here
+   * (deleted, or edited down to INTERRUPTED where the chat will not delete it). Never fails the turn.
+   */
+  private async retireCancelled(): Promise<void> {
+    const messageId = await this.messageId();
+    if (messageId) await this.retire(messageId, plainMessage(turnText.in(this.lang).interrupted));
+  }
+
+  /**
    * The turn is over: the user gets `parts`, in order. With a stream the first part is its final message (in the place
    * of the status) and the others follow; without one they are NEW messages, and the progress message is then retired.
    * The thumbs (`feedback`) and suggested replies go under the LAST part, and nowhere else.
    */
   async finish(parts: readonly string[], options: FinishOptions = {}): Promise<void> {
+    this.finishing = true;
     await this.quiesce();
     const messages = answerMessages(parts, options);
     if (this.stream && this.stream.open && !this.streamOver) {
@@ -494,10 +514,11 @@ export class StatusMessage<S> {
   }
 
   /**
-   * The answer is posted below: delete the progress message. The chat may refuse, and a queue cannot delete; the message
-   * is then edited down to one line, so it does not sit above the answer as stale progress. Never fails the turn.
+   * The answer is posted below, or none will come (the turn was cancelled): delete the progress message. The chat may
+   * refuse, and a queue cannot delete; the message is then edited down to one line (`line`), so it does not sit in the
+   * chat as stale progress. Never fails the turn.
    */
-  private async retire(messageId: string): Promise<void> {
+  private async retire(messageId: string, line: OutMessage = plainMessage(turnEnglish.doneLine)): Promise<void> {
     await this.settle();
     let removed: boolean;
     try {
@@ -508,9 +529,8 @@ export class StatusMessage<S> {
     }
     if (removed) return;
     this.log.warn("the progress message was not deleted; leaving it as one line");
-    const done = plainMessage(turnEnglish.doneLine);
-    await this.update(messageId, done);
-    this.reassert(messageId, done);
+    await this.update(messageId, line);
+    this.reassert(messageId, line);
   }
 
   /** Live edits went out, so one may still arrive after `message` replaced the progress message: send it once more. */
