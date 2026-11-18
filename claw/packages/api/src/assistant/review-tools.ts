@@ -21,7 +21,7 @@
  * not merge by itself for a person whose review mode is `high_risk_confirm`: the review's session holds its merge for their confirmation
  * (`config.merge_needs_confirmation`), which only that command or the card's button gives. A person who chose `fully_auto` asked for
  * merges nobody confirms, and their own sentence is enough (Yihan, 2026-11-18): the review merges once it approves, held only by what
- * holds any of their reviews (the repository's own requirements, CI, open threads), and only while they keep that mode
+ * holds any of their reviews (the repository's own requirements, CI, open threads, an earlier hold of the same commit), and only while they keep that mode
  * (`config.started_by_assistant`). A review of someone else's account is not started here: it is handed to the person's channel
  * (`handOffReview`), which starts it as a review asked of that person, merging as their own review setting says.
  *
@@ -742,7 +742,7 @@ function withMergeRule<T extends { review_only?: boolean; merge_needs_confirmati
 export function mergeNote(mergeNeedsConfirmation: boolean): string {
   return mergeNeedsConfirmation
     ? "merge_needs_confirmation is true: nothing merges by itself. Once the review approves, the user is asked to confirm the merge (the button on its card, or approve #<ref>, 批准 #<ref> in Chinese). Never say it will be merged automatically."
-    : "merge_needs_confirmation is false (the user's review mode is fully_auto): once the review approves, it merges without asking the user; only what the repository itself requires (its required checks and rules, a confirmation it asks for), failed CI and open review threads still hold it. In Chinese say 审过就会直接合入（仓库自身要求的检查仍然生效）. Never say they will be asked to confirm the merge.";
+    : "merge_needs_confirmation is false (the user's review mode is fully_auto): once the review approves, it merges without asking the user. What holds any of their merges still holds it: what the repository itself requires (its required checks and rules, a confirmation it asks for), failed CI, open review threads, and an earlier approval or merge of the same commit that waits for the user or that they refused. In Chinese say 审过就会直接合入（仓库自身要求的检查仍然生效）. Never promise them they will be asked to confirm it, nor that nothing can hold it: if a merge is held after all, it is listed under Waiting for you.";
 }
 
 /**

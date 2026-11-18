@@ -124,7 +124,8 @@ release version, and its `appVersion` stays `latest`.
   approves a merge. A person who chose `fully_auto` has already said that nobody needs to confirm their merges, and asked
   for a confirmation on exactly the reviews they asked for in their own words; under that mode their sentence is now
   enough. Everything else that holds a merge still holds it: what the repository itself requires (its branch rules and
-  required checks, `confirm_merge` in `.github/claw-review.yml`), failed CI and open review threads. Under
+  required checks, `confirm_merge` in `.github/claw-review.yml`), failed CI, open review threads, and an earlier approval
+  or merge of the same commit that waits for the person or that they refused. Under
   `high_risk_confirm` (the default) nothing changes: the merge waits for the person's own confirmation, at any risk.
   The mode is read when the review starts and stored on its item and session (`merge_needs_confirmation`, now only for
   a mode other than `fully_auto`); the router's restart reads it again. Every review the router started is marked

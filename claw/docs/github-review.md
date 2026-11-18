@@ -255,7 +255,7 @@ They act only for the person, never for a key or a report:
   that confirmation: the card's button or the exact command below, by the acting user. A user who chose `fully_auto` has already
   said nobody needs to confirm their merges, so their sentence is enough: the review is made without
   `merge_needs_confirmation` and merges once it approves, held only by what holds any of their reviews (what the repository itself
-  requires, failed CI, open threads). The mode is read when the review starts and again at the router's restart; a restart through
+  requires, failed CI, open threads, an earlier hold or refusal of the same commit). The mode is read when the review starts and again at the router's restart; a restart through
   the route keeps what the review had. Every review the router starts or restarts carries `config.started_by_assistant`, and one
   started under `fully_auto` is held as above once the user has left `fully_auto`. `review_start` and `review_restart` answer each
   review's `merge_needs_confirmation` (true or false) and a note the router says it from. `merge=false` is a review only.

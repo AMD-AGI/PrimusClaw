@@ -1794,6 +1794,8 @@ describe("assistant review tools", { skip }, () => {
     assert.doesNotMatch(rt.mergeNote(true), /直接合入|without asking/);
     assert.match(rt.mergeNote(false), /审过就会直接合入（仓库自身要求的检查仍然生效）/);
     assert.doesNotMatch(rt.mergeNote(false), /approve #<ref>|批准 #/);
+    // ...nor that nothing can hold it: an earlier hold of the same commit still asks them, as it would for any of their merges.
+    assert.match(rt.mergeNote(false), /an earlier approval or merge of the same commit that waits for the user or that they refused/);
   });
 
   /**
