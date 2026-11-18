@@ -159,8 +159,9 @@ test("a tool-heavy turn on the machine shows the agent's words and its steps by 
       .map(({ at }) => at);
     assert.ok(edits.length >= 1);
     const times = [posts[0]?.at ?? 0, ...edits];
+    assert.equal(REMOTE_EDIT_SECONDS, 3);
     for (let i = 1; i < times.length; i += 1) {
-      assert.ok((times[i] ?? 0) - (times[i - 1] ?? 0) >= REMOTE_EDIT_SECONDS * 1000 - 1, JSON.stringify(times));
+      assert.ok((times[i] ?? 0) - (times[i - 1] ?? 0) >= 3000 - 1, JSON.stringify(times));
     }
     await words(w.server, sid, "全部修好了，测试通过。");
     await endOf(w, sid, prompts[0]);
@@ -246,13 +247,26 @@ test("a message the busy terminal queues is said so in the chat at once, once, w
       queued: 1,
     });
     await w.until(() => w.said().includes(zh.terminalBusy + zh.terminalBusyWaiting));
+    // (the busy terminal drew the paste late, then Claude Code's queue took it: where it is now, said once)
+    const nowHeld = () =>
+      w.server.emit(sid, "terminal_input_queued", {
+        reason: "terminal_working",
+        cmd_id: next?.cmd_id ?? null,
+        cmd_seq: seqOf(w, next),
+        queued: 1,
+        held: "terminal",
+      });
+    await nowHeld();
+    await w.until(() => w.said().includes(zh.terminalBusyNowHeld));
+    await nowHeld();
     await words(w.server, sid, "好了。");
     await endOf(w, sid, next);
     await w.idle();
     assert.equal(w.said().filter((t) => t.startsWith(zh.terminalBusy)).length, 2);
+    assert.equal(w.said().filter((t) => t === zh.terminalBusyNowHeld).length, 1, w.said().join("\n"));
   }));
 
-test("a wait that is not the terminal's running turn, or another message's, says nothing more than the floating line", () =>
+test("a wait that is not the terminal's running turn, another message's, or no message's says nothing more than the floating line", () =>
   remoteWorld(async (w) => {
     const { sid, prompts } = await manual(w);
     await w.send("write the report");
@@ -265,6 +279,8 @@ test("a wait that is not the terminal's running turn, or another message's, says
       cmd_seq: seqOf(w, cmd),
       queued: 1,
     });
+    // a wait the connector does not tie to any message
+    await w.server.emit(sid, "terminal_input_queued", { reason: "terminal_working", queued: 1, held: "terminal" });
     // the terminal queues a message that is not this turn's (another prompt's number)
     await w.server.emit(sid, "terminal_input_queued", {
       reason: "terminal_working",

@@ -477,9 +477,9 @@ watch. Nothing else writes to the conversation, so its history never forks, and 
 conversation. `session_started` then says `live_terminal: true` and `input: "terminal"` instead of `read_only`, and a prompt is
 accepted and typed at once, whatever Claude Code is doing there: one submitted while a turn runs is queued by Claude Code
 itself and taken in at that turn's next step or once it ends, as one typed by the person at the terminal is (no registry status, no
-transcript reading and no footer decides when it may be typed). Once Claude Code has queued it (its `queue-operation` enqueue in
-the transcript), or when the busy terminal draws the paste late, the phone is told once (`terminal_input_queued`, `reason`
-`terminal_working`; `held: "terminal"` when it is in Claude Code's queue, where only the terminal can take it back, with ↑). It waits (one notice, `terminal_input_queued`, with `reason`
+transcript reading and no footer decides when it may be typed). When the busy terminal draws the paste late, and once Claude Code
+has queued it (its `queue-operation` enqueue in the transcript), the phone is told, each at most once (`terminal_input_queued`,
+`reason` `terminal_working`; `held: "terminal"` once it is in Claude Code's queue, where only the terminal can take it back, with ↑). It waits (one notice, `terminal_input_queued`, with `reason`
 `terminal_typing`, `terminal_dialog`, `terminal_screen` or `terminal_scrolled`) only while it could not be typed safely: the input
 box holds someone's half-typed text, a question or a menu is on the screen (an Enter there would answer it: on a permission
 question it would approve a tool call), or the pane is scrolled back. It is pasted as one bracketed paste (`load-buffer` and

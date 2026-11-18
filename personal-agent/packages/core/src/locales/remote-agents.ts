@@ -33,6 +33,9 @@ export const remoteAgentText = defineCatalog({
     terminalBusyHeld: " To withdraw it, press ↑ in that terminal: the queued message goes back into its input box.",
     /** ... and it still waits on the connector: /stop takes it back. */
     terminalBusyWaiting: " To withdraw it, send /stop.",
+    /** A message said to wait that the terminal's own queue has taken since: where it is now, and how to take it back from there. */
+    terminalBusyNowHeld:
+      "Your queued message is now in the terminal's own queue. To withdraw it, press ↑ in that terminal.",
     stopFirst: "A task is still running. Send /stop first.",
     notAttached:
       "You are not attached to a remote session. Start one with `/agent new AGENT PATH`, or `/agent attach N`.",
@@ -197,6 +200,7 @@ export const remoteAgentText = defineCatalog({
     terminalBusy: "会话正忙，已排队，当前回合结束后发送。",
     terminalBusyHeld: "要撤回：在那台机器的终端里按 ↑，排队的消息会回到输入框。",
     terminalBusyWaiting: "要撤回：发 /stop。",
+    terminalBusyNowHeld: "排队的消息已进入终端自己的队列。要撤回：在那台机器的终端里按 ↑。",
     stopFirst: "还有任务在运行。先发 /stop。",
     notAttached: "你还没有接入远程会话。用 `/agent new AGENT PATH` 开一个，或者发 `/agent attach N`。",
     approvalInactive: "这个审批请求已经失效了。",

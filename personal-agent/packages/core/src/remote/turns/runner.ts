@@ -64,10 +64,8 @@ export interface TurnRequest {
 }
 
 export class TurnRunner {
-  /** Per chat: the messages it was told wait for a busy terminal (`tellBusy`), oldest first. */
-  private readonly toldBusy = new Map<string, Set<string>>();
-  /** The turns told so whose connector named no message. */
-  private readonly toldTurns = new WeakSet<RemoteTurn>();
+  /** Per chat: what it was told of each message (Claw's number) waiting for a busy terminal (`tellBusy`), oldest first. */
+  private readonly toldBusy = new Map<string, Map<number, "waiting" | "held">>();
 
   constructor(
     private readonly ctx: RemoteContext,
@@ -293,38 +291,30 @@ export class TurnRunner {
    */
   private async tellBusy(request: TurnRequest, step: RemoteStep): Promise<void> {
     const { chatKey, to } = request;
+    // (only a wait the connector ties to this turn's own message: another one was told when it was sent, `queuedBehind`)
     const mine = request.cmdSeq?.();
-    if (step.queuedSeq !== null && mine !== undefined && step.queuedSeq !== mine) return;
-    const key = step.queuedFor ?? (mine !== undefined ? String(mine) : "");
-    if (!this.firstBusy(chatKey, key)) return;
-    const words = remoteAgentText.in(this.state.lang(chatKey));
-    try {
-      await to.send(
-        textMessage(words.terminalBusy + (step.queuedHeld ? words.terminalBusyHeld : words.terminalBusyWaiting)),
-      );
-    } catch (error) {
-      this.ctx.logger.warn("that the message waits for a busy terminal could not be told", { error: errorName(error) });
-    }
-  }
-
-  /** Whether the chat is told now that the message `key` waits for a busy terminal: once per message (per turn when none is named). */
-  private firstBusy(chatKey: string, key: string): boolean {
-    if (!key) {
-      const turn = this.state.chats.turns.get(chatKey);
-      if (turn === undefined) return true;
-      if (this.toldTurns.has(turn)) return false;
-      this.toldTurns.add(turn);
-      return true;
-    }
-    const told = this.toldBusy.get(chatKey) ?? new Set<string>();
-    if (told.has(key)) return false;
-    told.add(key);
-    for (const oldest of told) {
+    if (step.queuedSeq === null || mine === undefined || step.queuedSeq !== mine) return;
+    const told = this.toldBusy.get(chatKey) ?? new Map<number, "waiting" | "held">();
+    const before = told.get(mine);
+    const now = step.queuedHeld ? "held" : "waiting";
+    if (before === "held" || before === now) return;
+    told.set(mine, now);
+    for (const oldest of told.keys()) {
       if (told.size <= BUSY_TOLD_KEPT) break;
       told.delete(oldest);
     }
     this.toldBusy.set(chatKey, told);
-    return true;
+    const words = remoteAgentText.in(this.state.lang(chatKey));
+    // (said once; a message the terminal's queue takes after it was said to wait is told only where it is now)
+    const text =
+      before === "waiting"
+        ? words.terminalBusyNowHeld
+        : words.terminalBusy + (step.queuedHeld ? words.terminalBusyHeld : words.terminalBusyWaiting);
+    try {
+      await to.send(textMessage(text));
+    } catch (error) {
+      this.ctx.logger.warn("that the message waits for a busy terminal could not be told", { error: errorName(error) });
+    }
   }
 
   /**

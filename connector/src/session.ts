@@ -231,8 +231,11 @@ export class Session {
     keys?: boolean;
     /** Counts its prompt as handled (idempotent): a withdraw that takes the turn back before its keys go calls it itself. */
     started?: () => void;
-    /** The phone was told it waits for the terminal's running turn (`terminal_working`): once per message. */
-    toldWorking?: boolean;
+    /**
+     * What the phone was told of the message waiting for the terminal's running turn (`terminal_working`): `slow` (the paste is
+     * drawn late), then `held` once Claude Code's own queue has it. Each is said at most once.
+     */
+    toldWorking?: "slow" | "held";
   } | null = null;
   private terminalPumping = false;
   /** Whether this session recorded once that its terminal's Claude Code version is not one measured for `busy` (it waits as before). */
@@ -711,13 +714,14 @@ export class Session {
   }
 
   /**
-   * The phone's message waits for the turn the terminal is running: said once per message (`terminal_input_queued`, `terminal_working`),
-   * whichever comes first: the paste drawn late, or Claude Code's queue taking it (`held: "terminal"`: it is in Claude Code's
-   * queue now, taken in at that turn's next step or once it ends; only the terminal can take it back from there).
+   * The phone's message waits for the turn the terminal is running (`terminal_input_queued`, `terminal_working`): said when the
+   * busy terminal draws the paste late, and when Claude Code's queue takes it (`held: "terminal"`: it is in Claude Code's queue
+   * now, taken in at that turn's next step or once it ends; only the terminal can take it back from there). Each at most once, and
+   * nothing after `held`.
    */
   private tellWorking(turn: NonNullable<Session["terminalTurn"]>, held: boolean): void {
-    if (turn.toldWorking || this.terminalTurn !== turn) return;
-    turn.toldWorking = true;
+    if (this.terminalTurn !== turn || turn.toldWorking === "held" || (turn.toldWorking === "slow" && !held)) return;
+    turn.toldWorking = held ? "held" : "slow";
     this.emit("terminal_input_queued", {
       reason: "terminal_working", cmd_id: turn.cmdId, cmd_seq: turn.cmdSeq, queued: this.terminalQueue.length + 1, ...(held ? { held: "terminal" } : {}),
     });

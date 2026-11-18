@@ -152,13 +152,16 @@ release version, and its `appVersion` stays `latest`.
   progress message of such a turn is edited at most every 3 seconds (it was 1.5). The assistant's own turns are unchanged.
 - Personal agent: a message sent to a session that is busy with a turn in its terminal is said to be queued at once, in the
   chat, once per message: "The session is busy: your message is queued and goes in when the current turn ends." with how to
-  take it back (press ↑ in that terminal when Claude Code's own queue holds it, else /stop). Before, it was at most a short
-  "Queued" line in the floating status or the progress message.
+  take it back (press ↑ in that terminal when Claude Code's own queue holds it, else /stop); a message said to wait that
+  Claude Code's queue takes afterwards is told once more where it is now. Before, it was at most a short "Queued" line in the
+  floating status or the progress message.
 - Connector: a conversation open in a terminal is read every 250 ms (it was every second), and each event carries the time
   Claude Code wrote on its transcript line instead of the time it was read, so the steps of one read are no longer dated as
   one. A step names its tool in `_meta.claudeCode.toolName`, as the Claude Code ACP adapter does. When Claude Code queues a
   message typed from the phone behind its running turn, the connector now says so once (`terminal_input_queued`, reason
-  `terminal_working`, `held: "terminal"`); before, it said nothing unless the paste was drawn late.
+  `terminal_working`, `held: "terminal"`), also after a notice that the paste was drawn late; before, it said nothing unless
+  the paste was drawn late. After a restart, the events still to be sent go in each session's own order whatever time they
+  carry.
 
 ## [0.5.7] - 2026-11-17
 
