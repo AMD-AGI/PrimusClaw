@@ -203,6 +203,10 @@ ${p.quoted}`,
     unattendedNote: "Unattended: runs without asking for approval",
     noAsk: (p: { name: string }) =>
       `⚠️ This terminal is in ${p.name} mode: what you send from here runs at once, with no approval card.`,
+    dialogAsks: (p: { what: string }) => `⏳ The terminal is waiting for your confirmation: ${p.what}`,
+    dialogAsksBare: "⏳ The terminal is waiting for your confirmation",
+    rowUnreadable:
+      "ℹ️ Claude Code's session record for this terminal cannot be read, so the connector recognizes the session only by the name on its input box, and a confirmation on the screen hides it. Exit Claude Code there and reopen this conversation with `claude --resume`: then it is recognized reliably.",
     noTextOutput: "Done. There was no text output.",
     answerShortened: "\n\n... (shortened: ask the agent to continue, or read the rest on your machine)",
     pairBody: (p: {
@@ -400,6 +404,10 @@ ${p.quoted}`,
     unsolicitedOwn: (p) => `**${p.label}**，自己说的：`,
     unattendedNote: "⚠️ 无人值守：执行前不会请求批准",
     noAsk: (p) => `⚠️ 这个终端是 ${p.name} 模式：手机发的指令会直接执行，不会再弹审批卡。`,
+    dialogAsks: (p) => `⏳ 终端在等你确认：${p.what}`,
+    dialogAsksBare: "⏳ 终端在等你确认",
+    rowUnreadable:
+      "ℹ️ 这个终端里 Claude Code 的会话登记读不出来，连接器只能靠输入框上的会话名认出它，终端弹出确认时就认不出了。在终端里退出 Claude Code，再用 `claude --resume` 重新打开这段会话，之后就能稳定识别。",
     noTextOutput: "完成了，没有文字输出。",
     answerShortened: "\n\n……（已截断：让 agent 接着说，或在你的机器上看其余部分）",
     pairBody: (
@@ -452,7 +460,7 @@ export const remoteQueuedText = defineCatalog({
   en: {
     terminalWorking: "Queued",
     terminalWaiting: "Needs confirm",
-    terminalDialog: "Dialog open",
+    terminalDialog: "Confirm there",
     terminalTyping: "Box in use",
     terminalScrolled: "Scrolled back",
     other: "Waiting",
@@ -460,7 +468,7 @@ export const remoteQueuedText = defineCatalog({
   zh: {
     terminalWorking: "已排队",
     terminalWaiting: "待确认",
-    terminalDialog: "等弹窗",
+    terminalDialog: "等你确认",
     terminalTyping: "输入框忙",
     terminalScrolled: "回滚中",
     other: "等终端",

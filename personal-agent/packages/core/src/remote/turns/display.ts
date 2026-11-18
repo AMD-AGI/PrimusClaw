@@ -16,6 +16,11 @@ export interface TurnDisplay {
   finish(parts: readonly string[], options: FinishWith): Promise<void>;
   /** After `finish`, when the turn of a queued message follows at once: what this turn showed must stay readable (optional). */
   handOver?(): Promise<void>;
+  /**
+   * Whether the display itself shows a wait's whole line (the session card does). A chat's stream shows only a short floating status,
+   * so what a question on the terminal asks is said there as a message of its own.
+   */
+  readonly showsWaits?: boolean;
 }
 
 export interface FinishWith {

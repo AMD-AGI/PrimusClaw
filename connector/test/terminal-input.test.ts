@@ -15,13 +15,47 @@ import { fileURLToPath } from "node:url";
 import { localPidDomain } from "../src/attach.js";
 import { ConfigError, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
-import { CLAUDE_MODE_INDICATORS, MODES_THAT_DO_NOT_ASK, actsAsCommand, cleanInput, dialogOnScreen, enterGuard, inputBox, findPane, terminalMode, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
+import { CLAUDE_MODE_INDICATORS, DIALOG_SUMMARY_MAX, MODES_THAT_DO_NOT_ASK, actsAsCommand, cleanInput, dialogOnScreen, dialogSummary, enterGuard, inputBox, findPane, terminalMode, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
 import { wholeLinesOf } from "../src/session.js";
 import { Harness, onCleanup, onExitSync, tmpdir } from "./support/harness.js";
+// @ts-expect-error (a plain module shared with the stand-in terminal)
+import { bashQuestion, createFileQuestion, toolLine } from "./support/claude-question.mjs";
 
 const REF = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const FAKE_TERMINAL = path.join(path.dirname(fileURLToPath(import.meta.url)), "support", "fake-terminal.mjs");
 const RULE = "─".repeat(40);
+
+describe("what a question on the screen asks", () => {
+  // (Claude Code 2.1.325's own questions, drawn in place of the box: claude-question.mjs)
+  const on = (q: string[], tool = "Bash", arg = "x") => ["  ready", ...toolLine(tool, arg), ...q].join("\n");
+  test("a dangerous rm: its title and its command, every path cut to its last part", () => {
+    const screen = on(bashQuestion({ command: 'rm -rf "$(echo /home/dev/project/build)"', description: "Remove the build folder",
+      warning: "Dangerous rm operation on statically-unresolvable target: command substitution output" }));
+    assert.equal(dialogOnScreen(screen), true);
+    assert.equal(dialogSummary(screen), 'Bash command: rm -rf "$(echo …/build)"');
+  });
+  test("a plain command, a `Tip:` line above it; a new file, named by its file and not by its content", () => {
+    const tip = bashQuestion({ command: "touch /home/dev/project/a.txt", description: "Create a.txt" });
+    tip.splice(2, 0, " \x1b[38;5;246mTip: auto mode handles these prompts for you — choose \"switch to auto mode\" below\x1b[39m");
+    assert.equal(dialogSummary(on(tip)), "Bash command: touch …/a.txt");
+    assert.equal(dialogSummary(on(createFileQuestion({ file: "notes.md", content: "hi" }), "Write", "notes.md")), "Create file: notes.md");
+  });
+  test("a credential in the command is masked, a long one is cut, a home path too", () => {
+    const token = `ghp_${"a1B2".repeat(9)}`;
+    const masked = dialogSummary(on(bashQuestion({ command: `curl -H "Authorization: token ${token}" https://example.com/api`, description: "Call the API" })))!;
+    assert.ok(!masked.includes(token), masked);
+    assert.match(masked, /^Bash command: curl -H "Authorization: token \[hidden\]"/);
+    const long = dialogSummary(on(bashQuestion({ command: `echo ${"word ".repeat(60)}`, description: "Say it" })))!;
+    assert.ok([...long].length <= DIALOG_SUMMARY_MAX && [...long].length > DIALOG_SUMMARY_MAX - 6, long);
+    assert.ok(long.endsWith("…"));
+    assert.equal(dialogSummary(on(bashQuestion({ command: "cat ~/secrets/notes.txt", description: "Read" }))), "Bash command: cat …/notes.txt");
+  });
+  test("a question it cannot split is named by its question; no question, nothing", () => {
+    assert.equal(dialogSummary(`  ready\n${RULE}\n❯ hello\n${RULE}\n  ⏸ manual mode on\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel`), "Do you want to proceed?");
+    assert.equal(dialogSummary(" Bash command\n   touch x\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend"), "Bash command: touch x");
+    assert.equal(dialogSummary(screenIn("  ⏸ manual mode on")), null);
+  });
+});
 
 describe("reading Claude Code's input box", () => {
   test("empty, with or without its dimmed suggestion; typed; several lines; and no box at all", () => {
@@ -659,6 +693,58 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const end2 = await h.claw.until("the second turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === two), 30_000);
     assert.deepEqual([end2.data.stopReason, end2.data.error], ["end_turn", undefined]);
     assert.deepEqual(typed(t.transcript), ["from the phone", "typed at the terminal", "while it works"]);
+  });
+
+  test("a terminal whose registry row is torn, with a question of its own on the screen: the phone is told what it asks, the messages wait for as long as it is up (no terminal_state_unknown), and go in order once it is answered", { skip: process.platform !== "linux" }, async () => {
+    // (a background agent's dangerous `rm` question hid the box, and with it the name that proves a torn-row process: every message
+    // was held as a state the connector could not tell, "waiting for the terminal", and refused 10 minutes later)
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000, terminalWaitMs: 1_500 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "autopilot", updatedAt: "2026-11-09T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const uid = process.getuid!();
+    const project = fs.realpathSync(work).replace(/[^A-Za-z0-9]/g, "-");
+    const tasks = path.join(tmpdir("cc-tmp-"), `claude-${uid}`, project, REF, "tasks");
+    fs.mkdirSync(tasks, { recursive: true });
+    const question = path.join(tmpdir("cc-question-"), "up");
+    const t = terminal(fs.realpathSync(work), h.attachDir, 300, { FAKE_TORN_ROW: "1", FAKE_TASKS_DIR: tasks, FAKE_TITLE: "autopilot", FAKE_QUESTION_FILE: question }, true);
+    fs.writeFileSync(t.row, "");
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(t.row, old, old);
+    h.setLive([]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "system", sessionId: REF, entrypoint: "cli" })}\n${JSON.stringify({ type: "custom-title", customTitle: "autopilot", sessionId: REF })}\n`);
+    await h.online();
+    const live = (b: any) => b.agents[0].capabilities.resumable?.find((r: any) => r.ref === REF)?.input === "terminal";
+    await h.claw.until("a heartbeat that lists it live, typed into", () => h.claw.heartbeats.some(live));
+    const sid = await h.attach(REF);
+    const started = h.claw.eventsOf(sid, "session_started")[0]!.data;
+    assert.deepEqual([started.input, started.registry_row_unreadable], ["terminal", true], "the chat is told the row cannot be read");
+    // The terminal's own question comes up in place of the box: nothing proves the process any more (a look made since says so).
+    fs.writeFileSync(question, "");
+    await until("the question on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("Do you want to proceed?"));
+    const asked = h.claw.heartbeats.length;
+    await h.claw.until("a heartbeat made with the question up that no longer proves it", () => h.claw.heartbeats.slice(asked + 1).some((b) => !live(b)));
+    const one = h.prompt(sid, "first from the phone");
+    const two = h.prompt(sid, "second from the phone");
+    const told = await h.claw.until("the notice that a question holds it", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === one));
+    assert.equal(told.data.reason, "terminal_dialog");
+    assert.equal(told.data.dialog, 'Bash command: rm -rf "$(echo …/build)"', "what it asks, its path cut");
+    assert.equal(told.data.registry_row_unreadable, true);
+    // Held well past terminalWaitMs: still waiting, nothing refused, nothing typed into the question.
+    await new Promise((r) => setTimeout(r, 3_500));
+    assert.deepEqual(h.turnEnds(sid), [], "still waiting");
+    assert.deepEqual(h.claw.eventsOf(sid, "command_rejected"), []);
+    assert.ok(!h.claw.eventsOf(sid, "terminal_input_queued").some((e) => e.data.reason === "terminal_state_unknown"), "never held as a state it cannot read");
+    assert.deepEqual(typed(t.transcript), []);
+    // Answered at the terminal: both go in, in order.
+    fs.rmSync(question);
+    const end2 = await h.claw.until("the second turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === two), 30_000);
+    const end1 = h.turnEnds(sid).find((e) => e.data.cmd_seq === one)!;
+    assert.deepEqual([end1.data.stopReason, end1.data.error, end2.data.stopReason, end2.data.error], ["end_turn", undefined, "end_turn", undefined]);
+    assert.deepEqual(typed(t.transcript), ["first from the phone", "second from the phone"]);
   });
 
   for (const c of [

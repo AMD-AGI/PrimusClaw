@@ -88,7 +88,7 @@ export class RemoteLiveView {
   apply(step: RemoteStep): boolean {
     const before = this.render();
     const waited = this.waiting;
-    if (step.queued !== null) this.waiting = step.note ?? "";
+    if (step.queued !== null) this.waiting = step.waitLine ?? step.note ?? "";
     else if (showsTheTurn(step)) this.waiting = "";
     if (step.chunk) this.addText(step.chunk.kind, step.chunk.text);
     else if (step.tool) this.trackTool(step.tool.id, step.tool.title, step.tool.status);

@@ -58,8 +58,8 @@ test("a dialog on the terminal says so and does not fall back", () => {
   for (const lang of ["zh", "en"] as const) {
     assert.notEqual(queuedLine("terminal_dialog", lang), queuedLine("something_new", lang));
   }
-  assert.ok(queuedLine("terminal_dialog", "zh").includes("弹窗"));
-  assert.ok(queuedLine("terminal_dialog", "en").includes("Dialog"));
+  assert.ok(queuedLine("terminal_dialog", "zh").includes("确认"));
+  assert.ok(queuedLine("terminal_dialog", "en").includes("Confirm"));
 });
 
 const FIXED: readonly [string, (lang: Lang) => string][] = [

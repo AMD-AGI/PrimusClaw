@@ -137,6 +137,19 @@ release version, and its `appVersion` stays `latest`.
   could not tell it from a run that finished. It is now `failed` with the provisioning code (`sandbox_unschedulable`,
   `sandbox_pending_timeout` or `sandbox_start_timeout`), and the terminal block has a new `failure_message` field with the platform's reason (`""` when the run recorded nothing beyond
   its code). Task and DAG runs report the same through their callback.
+- Connector: a message for a conversation typed into its terminal no longer gives up after 10 minutes as
+  `terminal_state_unknown` while a question of Claude Code's own (a permission prompt, such as a dangerous `rm` asked by a
+  background agent) is on that terminal's screen. When Claude Code's registry row for the process cannot be read, the
+  connector proves which conversation the process holds by the name above its input box, and a question hides the box; it now
+  looks at the pane it types into, and a question there is waited out for as long as it is up, then the messages go in, in
+  order. Nothing is ever typed into the question. The `terminal_input_queued` notice says what the question asks (`dialog`:
+  its title and command, such as `Bash command: rm -rf "$(echo …/build)"`, every path cut to its last part and credentials
+  masked), and both it and `session_started` say `registry_row_unreadable: true` when the process's row cannot be read.
+- Personal agent: while a message waits for a question on the terminal, the chat says what it asks ("The terminal is
+  waiting for your confirmation: Bash command: rm -rf …", 「终端在等你确认：…」) once per question, and the floating status says
+  "Confirm there" (等你确认) instead of the bare "Waiting" (等终端). When the connector says Claude Code's registry row for the
+  terminal cannot be read, the chat says once per attach that reopening the conversation there with `claude --resume` makes
+  it recognized reliably.
 - Personal agent: a group chat switched to one of the sender's machine sessions can talk to it. With the session card as the
   window (`REMOTE_WINDOW_DEFAULT=card`, the default), the binder's next @-message went to the assistant instead (only a reply
   quoting the card reached the session), and every button on the group's session card answered "That button is not active

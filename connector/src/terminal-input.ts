@@ -24,6 +24,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { processStart } from "./children.js";
+import { redactText } from "./redact.js";
 import { errMessage } from "./util.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -292,6 +293,84 @@ export function dialogOnScreen(screen: string): boolean {
   return plain.slice(end + 1).some((l) => DIALOG_RE.test(l));
 }
 
+/** A dashed rule inside a question (`╌╌╌╌`): Claude Code draws one above and one below the command or the change it asks about. */
+const DASHED_RE = /^╌{8,}$/;
+/** OSC sequences (a link drawn as one: `ESC ] 8 ; ; url ST`): not text. */
+const OSC_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+/** The longest summary of a question (code points, the ellipsis included). */
+export const DIALOG_SUMMARY_MAX = 100;
+
+/**
+ * What a question on Claude Code's screen asks, in one short line for the phone: its title and the command (a `Bash command`) or what
+ * it is about (the file of a `Create file`, `Edit file`), as Claude Code 2.1.325 draws one in place of the input box (measured
+ * 2026-11-18):
+ *
+ * ```
+ * ────────────────────────────
+ *  Bash command
+ *  Remove the build folder              (its description; a `Tip:` line may come first)
+ * ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ *  rm -rf "$(echo /home/me/build)"
+ * ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ *  │ Dangerous rm operation on statically-unresolvable target: command substitution output
+ *
+ *  Do you want to proceed?
+ *  ❯ 1. Yes
+ *    2. No
+ *
+ *  Esc to cancel · Tab to amend
+ * ```
+ *
+ * `Bash command: rm -rf "$(echo …/build)"`. A question it cannot split that way is named by its own question line (`Do you want to
+ * proceed?`). Every path is cut to its last part (`…/build`) and every credential-shaped string masked: the line leaves the machine.
+ * Null when no question is on the screen. It only describes the question: nothing on the screen is ever answered from here.
+ */
+export function dialogSummary(screen: string): string | null {
+  if (!dialogOnScreen(screen)) return null;
+  const { plain, at, end } = boxOf(screen.replace(OSC_RE, ""));
+  const lines = plain.map((l) => l.replace(/^\s*[│|]\s?/, "").replace(/\s*│\s*$/, "").trim());
+  // Where the question starts: below the input box when one is drawn, else below the last rule above its first question line.
+  let from = 0;
+  if (at >= 0 && end >= 0) {
+    from = end + 1;
+  } else {
+    const first = lines.findIndex((l) => DIALOG_RE.test(l));
+    for (let i = first; i >= 0; i--) if (RULE_RE.test(lines[i]!)) { from = i + 1; break; }
+  }
+  const asked = lines.slice(from).findIndex((l) => DIALOG_RE.test(l));
+  if (asked < 0) return null;
+  const head = lines.slice(from, from + asked).filter((l) => l && !MODE_RE_ONE.test(l) && !/for shortcuts$/.test(l));
+  let summary: string;
+  if (!head.length || DIALOG_RE.test(head[0]!)) {
+    summary = lines[from + asked] ?? "";
+  } else {
+    const title = head[0]!;
+    const dash = head.findIndex((l) => DASHED_RE.test(l));
+    const shown = dash >= 0 ? head.slice(dash + 1).find((l) => !DASHED_RE.test(l)) ?? "" : "";
+    const about = head.slice(1, dash >= 0 ? dash : undefined).find((l) => !/^Tip:/i.test(l) && !DASHED_RE.test(l)) ?? "";
+    // (a command's own words say what it does; a file question names the file before its content)
+    const detail = /\bcommand\b/i.test(title) ? shown || about : about || shown;
+    summary = detail && !DASHED_RE.test(title) ? `${title}: ${detail}` : title;
+  }
+  return shortLine(summary) || null;
+}
+
+/** One mode on the footer below the box (`⏸ manual mode on`): not a line of a question. */
+const MODE_RE_ONE = new RegExp(`(?:^|[\\s·⏵⏸▶])(?:${Object.keys(CLAUDE_MODE_INDICATORS).join("|")}) on\\b`);
+
+/** A line of the screen for the phone: paths cut to their last part, credentials masked, at most DIALOG_SUMMARY_MAX code points. */
+function shortLine(text: string): string {
+  const cut = text
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+    // (an absolute or home path of two parts or more: only its last part is said)
+    .replace(/(?:~|\.{1,2})?\/(?:[^\s/"'`()$]+\/)+([^\s/"'`()$]*)/g, (_m, last: string) => `…/${last}`)
+    .replace(/\s+/g, " ")
+    .trim();
+  const masked = redactText(cut).text;
+  const cps = [...masked];
+  return cps.length <= DIALOG_SUMMARY_MAX ? masked : `${cps.slice(0, DIALOG_SUMMARY_MAX - 1).join("").trimEnd()}…`;
+}
+
 /**
  * Why Enter must not be sent now for a message typed into the box (null: it may). All on the one screen read: Claude Code's input
  * box is there, the bottom-most thing on the screen apart from its footer; it holds exactly what was typed (whitespace aside, as the
@@ -376,12 +455,16 @@ export const ECHO_SLOW_MS = 3_000;
 /** How long the screen must keep passing {@link enterGuard} before Enter goes: it is read again after this. */
 export const ENTER_SETTLE_MS = 250;
 
-export type Readiness = { ready: true; mode: string | null } | { ready: false; why: "typing" | "screen" | "copy_mode" | "gone" | "dialog" };
+export type Readiness =
+  | { ready: true; mode: string | null }
+  | { ready: false; why: "typing" | "screen" | "copy_mode" | "gone" }
+  /** `dialog`: what the question on the screen asks ({@link dialogSummary}), null when it cannot be read. */
+  | { ready: false; why: "dialog"; dialog: string | null };
 
 /** How a message is typed: what to do when a question shows before its Enter, and whether it is still wanted while one does. */
 export interface TypeOptions {
-  /** Called once when a question or a menu shows after the text was typed: the Enter waits for it to go. */
-  onDialog?: () => void;
+  /** Called once when a question or a menu shows after the text was typed (what it asks: {@link dialogSummary}): the Enter waits for it to go. */
+  onDialog?: (dialog: string | null) => void;
   /** Asked while a question shows: false ends the wait (`TerminalNotSubmitted`), nothing more is typed. */
   stillWanted?: () => boolean;
   /** Whether the terminal's transcript already shows the message submitted (by the person at the terminal): it is not typed again. */
@@ -452,7 +535,7 @@ export class TerminalInput {
     if (dead === "1" || !this.stillThere(Number(panePid))) return { ready: false, why: "gone" };
     if (mode !== "0") return { ready: false, why: "copy_mode" };
     const screen = await this.screen();
-    if (dialogOnScreen(screen)) return { ready: false, why: "dialog" };
+    if (dialogOnScreen(screen)) return { ready: false, why: "dialog", dialog: dialogSummary(screen) };
     const box = inputBox(screen);
     return box === "empty" ? { ready: true, mode: terminalMode(screen) } : { ready: false, why: box === "typed" ? "typing" : "screen" };
   }
@@ -518,7 +601,7 @@ export class TerminalInput {
     };
     // No key while a question shows: told once, waited out (or given up when the message is no longer wanted, or the terminal went).
     const waitOutDialog = async () => {
-      if (!told) { told = true; opts.onDialog?.(); }
+      if (!told) { told = true; opts.onDialog?.(dialogSummary(await this.screen())); }
       for (;;) {
         await stillWanted();
         if (!(await this.alive())) throw new TerminalNotSubmitted("the terminal went away while a question was on the screen");

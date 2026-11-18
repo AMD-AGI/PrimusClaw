@@ -16,6 +16,9 @@ import { neutral } from "./inert.js";
 import { pyStrip } from "../text/py-text.js";
 import { RESUME_REF_MAX } from "./limits.js";
 
+/** The longest summary of a terminal's question shown (the connector sends at most 100 characters). */
+const DIALOG_MAX = 120;
+
 export interface ToolUpdate {
   readonly id: string;
   readonly title: string;
@@ -58,6 +61,12 @@ export interface RemoteStep {
   readonly recovered: { readonly interrupted: boolean; readonly continuing: boolean } | null;
   /** A message for a terminal's conversation waits for that terminal (the connector's reason). */
   readonly queued: string | null;
+  /** What the question on that terminal's screen asks, while the message waits for it (`terminal_dialog`): one short line. */
+  readonly dialog: string | null;
+  /** The short line of Teams' floating status for that wait (said by the runner; `note` is the whole line). */
+  readonly waitLine: string | null;
+  /** The connector cannot read Claude Code's registry row of the terminal's process (`registry_row_unreadable`). */
+  readonly rowUnreadable: boolean;
   /** What the person typed at the terminal of a conversation shared with the chat. */
   readonly typed: string | null;
   /** What is sent is typed into a terminal on the machine (`input: "terminal"`). */
@@ -89,6 +98,9 @@ export const NOTHING: RemoteStep = Object.freeze({
   readOnly: null,
   recovered: null,
   queued: null,
+  dialog: null,
+  waitLine: null,
+  rowUnreadable: false,
   typed: null,
   terminal: null,
   terminalMode: null,
@@ -253,6 +265,7 @@ function sessionStarted(payload: Json): RemoteStep {
     terminal: payload["input"] === "terminal",
     terminalMode: neutral(str(payload["terminal_mode"]), 40) || null,
     acp: neutral(str(payload["acp_session_id"]), RESUME_REF_MAX) || null,
+    rowUnreadable: payload["registry_row_unreadable"] === true,
   });
 }
 
@@ -327,7 +340,12 @@ const READERS: Readonly<Record<string, Reader>> = {
   session_error: failed,
   turn_error: failed,
   // (the session types into a terminal on the machine, which is busy: the message waits)
-  terminal_input_queued: (payload) => remoteStep({ queued: str(payload["reason"]) || "terminal_working" }),
+  terminal_input_queued: (payload) =>
+    remoteStep({
+      queued: str(payload["reason"]) || "terminal_working",
+      dialog: neutral(str(payload["dialog"]), DIALOG_MAX) || null,
+      rowUnreadable: payload["registry_row_unreadable"] === true,
+    }),
 };
 
 /** One SSE frame of a remote session to what the runner does. What cannot be read is skipped (usage_update, history_complete

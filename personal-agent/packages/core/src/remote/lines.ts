@@ -117,6 +117,20 @@ export function queuedLine(reason: string, lang: Lang): string {
   return `⏳ ${key ? words[key] : words.other}`;
 }
 
+/** The whole line of a wait, for the turn's live view and the session card (not cut to the floating status): what a question on the
+ * terminal's screen asks when it waits for one (`terminal_dialog`), the floating status's line otherwise. */
+export function queuedNote(reason: string, dialog: string | null, lang: Lang): string {
+  if (reason !== "terminal_dialog") return queuedLine(reason, lang);
+  const words = remoteText.in(lang);
+  const what = dialog ? neutral(redactText(dialog), 120) : "";
+  return what ? words.dialogAsks({ what }) : words.dialogAsksBare;
+}
+
+/** Said once per attach: the terminal's process has a registry row the connector cannot read, and how to make it known again. */
+export function rowUnreadableLine(lang: Lang): string {
+  return remoteText.in(lang).rowUnreadable;
+}
+
 /** What a message to a watched session is answered with: it was not sent, and what makes sending possible without taking the
  * conversation from the terminal; `takeover`: the status card also offers Take over…, which ends the terminal's session. */
 export function readOnlyRefused(lang: Lang, takeover = false): string {

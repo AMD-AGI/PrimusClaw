@@ -865,6 +865,22 @@ export class AttachSupport {
   }
 
   /**
+   * Whether process `pid`'s registry row (`sessions/<pid>.json`) is there but cannot be read (empty, cut off: the doctor's
+   * `claude_registry_row_unreadable`). Claude Code never writes such a row again, so for as long as that process runs what it holds is
+   * only proven from its screen ({@link provenBlindHold}), which a question on it hides; a restart of it (`claude --resume`) writes a
+   * new row. False when there is no row at all, or it reads.
+   */
+  rowUnreadable(pid: number): boolean {
+    let text: string;
+    try {
+      text = fs.readFileSync(path.join(this.configDir, "sessions", `${pid}.json`), "utf8");
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+    try { JSON.parse(text); return false; } catch { return true; }
+  }
+
+  /**
    * What Claude Code's own registry says process `pid` is doing with `ref` (`idle`, `busy`, `waiting`); `other` when its row now
    * names another conversation (`/resume`, `/clear` in that terminal) or the pid is another process than the one proven
    * (`procStart`); null when the row cannot be read or does not say.

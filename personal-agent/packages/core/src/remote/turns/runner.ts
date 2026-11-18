@@ -14,7 +14,7 @@ import { remoteLeads } from "../../locales/remote-leads.js";
 import type { RemoteState } from "../../ports/store/remote.js";
 import { type Conversation, textMessage } from "../../ports/surface.js";
 import { type RemoteStep } from "../events.js";
-import { queuedLine, recoveredLine } from "../lines.js";
+import { queuedLine, queuedNote, recoveredLine, rowUnreadableLine } from "../lines.js";
 import { RemoteTurnState } from "../turn-state.js";
 import type { StatusBoard } from "../board.js";
 import { type RemoteTurn, newTurn } from "../chats.js";
@@ -60,6 +60,9 @@ export interface TurnRequest {
 }
 
 export class TurnRunner {
+  /** The questions on the terminal each turn's display said in the chat (by their line). */
+  private readonly questionsTold = new WeakMap<TurnDisplay, Set<string>>();
+
   constructor(
     private readonly ctx: RemoteContext,
     private readonly state: ChatState,
@@ -263,9 +266,9 @@ export class TurnRunner {
     if (step.rejected?.type === "prompt" && step.rejected.cmdSeq !== null) {
       await this.queuedRefused(chatKey, to, step.rejected.cmdSeq, step.rejected.reason);
     }
-    // (said in the chat's language, as a line of the turn's live view)
-    const shown = step.queued !== null ? { ...step, note: queuedLine(step.queued, this.state.lang(chatKey)) } : step;
-    display.progress(shown);
+    if (step.queued !== null) await this.showWait(chatKey, step, display, to);
+    else display.progress(step);
+    if (step.rowUnreadable) await this.sayRowUnreadable(chatKey, sid, to);
     if (saysModes(step)) this.ctx.remoteState.setRemoteModes(chatKey, sid, step);
     if (step.permission !== null) await this.show(chatKey, sid, step.permission, to);
     // answered somewhere else (or it ran out on the machine): the card is dead
@@ -289,6 +292,47 @@ export class TurnRunner {
       await to.send(textMessage(remoteAgentText.in(this.state.lang(chatKey)).queuedRefused({ reason })));
     } catch (error) {
       this.ctx.logger.warn("that a queued message was refused could not be told", { error: errorName(error) });
+    }
+  }
+
+  /**
+   * Why the message still waits for the terminal, in the chat's language: the whole line in the turn's live view and on the session
+   * card, a short one in the floating status; what a question on the terminal asks is also said in the chat when the display does
+   * not show the whole line.
+   */
+  private async showWait(chatKey: string, step: RemoteStep, display: TurnDisplay, to: Conversation): Promise<void> {
+    const lang = this.state.lang(chatKey);
+    const reason = step.queued ?? "";
+    const note = queuedNote(reason, step.dialog, lang);
+    display.progress({ ...step, note, waitLine: queuedLine(reason, lang) });
+    if (reason === "terminal_dialog" && !display.showsWaits) await this.sayQuestion(display, note, to);
+  }
+
+  /**
+   * What a question on the terminal asks, while the message waits for it: said in the chat once per question and turn (the stream's
+   * floating status has room for a few characters only, and the person must answer it at the terminal before anything runs).
+   */
+  private async sayQuestion(display: TurnDisplay, line: string, to: Conversation): Promise<void> {
+    const told = this.questionsTold.get(display) ?? new Set<string>();
+    if (told.has(line)) return;
+    told.add(line);
+    this.questionsTold.set(display, told);
+    try {
+      await to.send(textMessage(line));
+    } catch (error) {
+      this.ctx.logger.warn("what the terminal's question asks could not be told", { error: errorName(error) });
+    }
+  }
+
+  /** Once per attach: the terminal's registry row cannot be read, and a restart of it there makes it known again. */
+  private async sayRowUnreadable(chatKey: string, sid: string, to: Conversation): Promise<void> {
+    if (!this.state.chats.firstRowHint(chatKey, sid)) return;
+    try {
+      await to.send(textMessage(rowUnreadableLine(this.state.lang(chatKey))));
+    } catch (error) {
+      this.ctx.logger.warn("that the terminal's registry row cannot be read could not be told", {
+        error: errorName(error),
+      });
     }
   }
 

@@ -210,6 +210,9 @@ function lines(lang: Lang): string {
     words.unattendedNote,
     ...Object.values(remoteView.remoteOffText.in(lang)),
     remoteDomain.noAskLine("bypassPermissions", lang) ?? "",
+    remoteDomain.queuedNote("terminal_dialog", TERMINAL_ASKS, lang),
+    remoteDomain.queuedNote("terminal_dialog", null, lang),
+    remoteDomain.rowUnreadableLine(lang),
     remoteDomain.pairText("cmd", 10, lang),
     ...[10, 600, 7200, 200_000].map(ago),
   ].join("\n");
@@ -468,6 +471,9 @@ export function renders(lang: Lang): Record<string, unknown> {
   };
 }
 
+/** What a question on the terminal asks, as the connector says it: Claude Code's own words, not ours to translate. */
+const TERMINAL_ASKS = 'Bash command: rm -rf "$(echo …/build)"';
+
 /** Every string the fixtures supplied (not ours to translate). */
 export function fixtureStrings(): Set<string> {
   const found = new Set<string>();
@@ -480,6 +486,7 @@ export function fixtureStrings(): Set<string> {
   walk([connectors(), sessions(), OPTIONS, REQUEST, ASK, entries(), health(), "m-a", "m-b", "#3 修复"]);
   for (const kind of ["claude", "codex", "cursor"]) found.add(remoteDomain.kindLabel(kind).label);
   found.add("Agent");
+  found.add(TERMINAL_ASKS);
   found.add("PrimusClaw Assistant"); // (the bot's name, which the lines and cards say as the deployment gives it)
   return found;
 }
