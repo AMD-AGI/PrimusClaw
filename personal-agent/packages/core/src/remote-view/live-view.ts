@@ -22,6 +22,11 @@ export const LIVE_MAX_CHARS = 2500;
 export const LIVE_KEEP_BLOCKS = 40;
 /** The mark of the one line of the step that is running now. */
 export const RUNNING_MARK = "⏳";
+/** The steps-so-far line names at most this many tools (the most used first); the others are counted as "+N". */
+export const STEPS_LINE_TOOLS = 4;
+/** Step ids remembered for counting (a turn of hours does not grow it without bound; an older step seen again is not counted again
+ * only while it is remembered). */
+const COUNTED_KEEP = 2000;
 
 type BlockKind = "message" | "thought" | "failed" | "plan" | "note";
 interface Block {
@@ -73,6 +78,10 @@ export class RemoteLiveView {
   private readonly active = new Map<string, string>();
   /** The next text starts a new block (a tool ran since the last one). */
   private split = true;
+  /** Tool name -> steps of the turn that ran it, in the order the tools first ran. */
+  private readonly perTool = new Map<string, number>();
+  /** The step ids already counted. */
+  private readonly counted = new Set<string>();
   /** Why the message waits, while it waits for a terminal on the machine (`terminal_input_queued`, said in the chat's language by
    * the runner): the floating status says it, not only "Thinking…", until anything of the turn shows. */
   private waiting = "";
@@ -91,8 +100,10 @@ export class RemoteLiveView {
     if (step.queued !== null) this.waiting = step.note ?? "";
     else if (showsTheTurn(step)) this.waiting = "";
     if (step.chunk) this.addText(step.chunk.kind, step.chunk.text);
-    else if (step.tool) this.trackTool(step.tool.id, step.tool.title, step.tool.status);
-    else if (step.plan) this.setPlan(step.plan);
+    else if (step.tool) {
+      this.count(step.tool.id, step.tool.name ?? "");
+      this.trackTool(step.tool.id, step.tool.title, step.tool.status);
+    } else if (step.plan) this.setPlan(step.plan);
     else if (step.note) {
       this.blocks.push({ kind: "note", text: step.note });
       this.split = true;
@@ -111,10 +122,35 @@ export class RemoteLiveView {
     const last = this.blocks.at(-1);
     if (last?.kind === "failed")
       lines.push(remoteText.in(this.lang).stepFailed({ title: neutral(last.text, TOOL_TITLE_MAX) }));
+    const steps = this.stepsLine();
+    if (steps) lines.push(steps);
     const running = this.runningLine();
     if (running) lines.push(running);
     // (the floating status is the agent's words too: its plan's line, a step's title)
     return lines.map(inertAnswer);
+  }
+
+  /** `Working: Bash ×3, Read ×2`: the turn's steps so far, by tool (the most used first); null before the first named one. */
+  stepsLine(): string | null {
+    if (this.perTool.size === 0) return null;
+    const ranked = [...this.perTool.entries()].sort((a, b) => b[1] - a[1]); // (stable: a tie keeps the order the tools first ran)
+    const shown = ranked.slice(0, STEPS_LINE_TOOLS).map(([name, n]) => `${name} ×${String(n)}`);
+    const others = ranked.slice(STEPS_LINE_TOOLS).reduce((sum, [, n]) => sum + n, 0);
+    if (others > 0) shown.push(`+${String(others)}`);
+    return remoteText.in(this.lang).stepsSoFar({ tools: shown.join(", ") });
+  }
+
+  /** A step seen for the first time is counted under its tool's name (one the event does not name is not counted). */
+  private count(id: string, name: string): void {
+    if (!name || (id && this.counted.has(id))) return;
+    if (id) {
+      this.counted.add(id);
+      for (const oldest of this.counted) {
+        if (this.counted.size <= COUNTED_KEEP) break;
+        this.counted.delete(oldest);
+      }
+    }
+    this.perTool.set(name, (this.perTool.get(name) ?? 0) + 1);
   }
 
   /** The header and the newest part of the turn that fits. */
@@ -180,6 +216,8 @@ export class RemoteLiveView {
 
   private paragraphs(): string[] {
     const out = this.blocks.map((b) => this.paragraph(b)).filter((p) => p);
+    const steps = this.stepsLine();
+    if (steps) out.push(steps);
     const running = this.runningLine();
     if (running) out.push(running);
     // (the plan's line, a note, a step's title: whatever of the agent's reaches the progress message, its addresses are words)

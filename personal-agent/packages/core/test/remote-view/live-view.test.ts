@@ -213,3 +213,30 @@ test("the wait line goes once anything of the turn shows a plan too", () => {
     assert.ok(!v.statusLines().includes(wait), JSON.stringify(later));
   }
 });
+
+test("the steps of the turn are counted by tool, each once, the most used first, in the floating status and the progress message", () => {
+  const v = new RemoteLiveView("Claude Code", "zh");
+  const run = (id: string, name: string, status = "in_progress") =>
+    v.apply(remoteStep({ tool: { id, title: `${name}: x`, status, name } }));
+  assert.equal(v.stepsLine(), null);
+  run("t1", "Read");
+  run("t1", "Read", "completed"); // (its end is the same step)
+  run("t2", "Bash");
+  run("t2", "Bash", "completed");
+  run("t3", "Bash");
+  run("t4", "Read");
+  run("t5", "Bash");
+  assert.equal(v.stepsLine(), "正在：Bash ×3, Read ×2");
+  assert.ok(v.statusLines().includes("正在：Bash ×3, Read ×2"), JSON.stringify(v.statusLines()));
+  assert.ok(v.render().includes("正在：Bash ×3, Read ×2"), v.render());
+  // (a step the event does not name is not counted; it still runs on the running line)
+  v.apply(remoteStep({ tool: { id: "t6", title: "something", status: "in_progress" } }));
+  assert.equal(v.stepsLine(), "正在：Bash ×3, Read ×2");
+  assert.equal(v.statusLines().at(-1), "⏳ something");
+  for (const [i, name] of ["Grep", "Edit", "Write", "WebFetch"].entries()) run(`u${String(i)}`, name);
+  assert.equal(v.stepsLine(), "正在：Bash ×3, Read ×2, Grep ×1, Edit ×1, +2");
+  assert.equal(new RemoteLiveView("cx").stepsLine(), null);
+  const en = new RemoteLiveView("cx");
+  en.apply(remoteStep({ tool: { id: "a", title: "", status: "in_progress", name: "Bash" } }));
+  assert.equal(en.stepsLine(), "Working: Bash ×1");
+});

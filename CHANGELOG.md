@@ -145,6 +145,23 @@ release version, and its `appVersion` stays `latest`.
   "@bot back to the assistant". Another member's @-messages still go to the assistant, and their press on the card leaves it
   as it was. The group's card has no Switch button and never shows the binder's lists of sessions and machines; those stay in
   a 1:1 chat. 1:1 chats are unchanged (#855).
+- Personal agent: a chat attached to a session on a machine shows how a long turn goes while it runs. Next to the step
+  running now, the floating status (in a chat that streams, until the agent's first words) and the progress message count the
+  turn's steps by tool, for example "Working: Bash ×3, Read ×2" ("正在：Bash ×3, Read ×2"); the agent's words between steps
+  still show as they come. A turn of minutes that only ran tools used to show "Thinking…" and its step's title alone. The
+  progress message of such a turn is edited at most every 3 seconds (it was 1.5). The assistant's own turns are unchanged.
+- Personal agent: a message sent to a session that is busy with a turn in its terminal is said to be queued at once, in the
+  chat, once per message: "The session is busy: your message is queued and goes in when the current turn ends." with how to
+  take it back (press ↑ in that terminal when Claude Code's own queue holds it, else /stop); a message said to wait that
+  Claude Code's queue takes afterwards is told once more where it is now. Before, it was at most a short "Queued" line in the
+  floating status or the progress message.
+- Connector: a conversation open in a terminal is read every 250 ms (it was every second), and each event carries the time
+  Claude Code wrote on its transcript line instead of the time it was read, so the steps of one read are no longer dated as
+  one. A step names its tool in `_meta.claudeCode.toolName`, as the Claude Code ACP adapter does. When Claude Code queues a
+  message typed from the phone behind its running turn, the connector now says so once (`terminal_input_queued`, reason
+  `terminal_working`, `held: "terminal"`), also after a notice that the paste was drawn late; before, it said nothing unless
+  the paste was drawn late. After a restart, the events still to be sent go in each session's own order whatever time they
+  carry.
 
 ## [0.5.7] - 2026-11-17
 

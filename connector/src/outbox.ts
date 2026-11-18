@@ -137,7 +137,17 @@ export class Outbox {
       }
       this.meta.set(sid, meta);
     }
-    loaded.sort((a, b) => a.ts - b.ts || a.seq - b.seq);
+    // Sessions interleave by time, each in its own sequence order: an event may carry an earlier time than the one before it (a
+    // transcript entry dated when it was written), and Claw acknowledges a session up to the highest number it stored, so a later
+    // number sent first would let the ones before it be dropped unsent. Each event is placed at the latest time of its session so far.
+    const at = new Map<OutEvent, number>();
+    const bySession = new Map<string, OutEvent[]>();
+    for (const ev of loaded) bySession.set(ev.session_id, [...(bySession.get(ev.session_id) ?? []), ev]);
+    for (const evs of bySession.values()) {
+      let latest = -Infinity;
+      for (const ev of evs.sort((a, b) => a.seq - b.seq)) at.set(ev, (latest = Math.max(latest, ev.ts)));
+    }
+    loaded.sort((a, b) => (at.get(a) ?? 0) - (at.get(b) ?? 0) || (a.session_id < b.session_id ? -1 : a.session_id > b.session_id ? 1 : a.seq - b.seq));
     this.queue = loaded;
     for (const ev of loaded) this.bytes.set(ev.session_id, (this.bytes.get(ev.session_id) ?? 0) + JSON.stringify(ev).length);
   }

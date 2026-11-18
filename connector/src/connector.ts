@@ -413,7 +413,7 @@ export class Connector {
     const env: SessionEnv = {
       config: d.config, audit: d.audit, registry: this.registry, store: this.store, attach: this.attach, timing: this.timing,
       logDir: logDir(d.dirs), version: d.version, log: d.log,
-      emit: (sid, type, data, after) => this.emit(sid, type, data, after),
+      emit: (sid, type, data, after, at) => this.emit(sid, type, data, after, at),
     };
     this.manager = new SessionManager(env);
     this.approvals = new ApprovalBroker({
@@ -461,8 +461,8 @@ export class Connector {
   }
 
   /** Every event leaves through here: scrubbed of credential shapes, numbered, written to disk, then posted. */
-  private emit(sessionId: string, type: string, data: Record<string, unknown>, after?: Promise<unknown>): void {
-    this.outbox.append(sessionId, type, redactDeep(data), undefined, after);
+  private emit(sessionId: string, type: string, data: Record<string, unknown>, after?: Promise<unknown>, at?: number): void {
+    this.outbox.append(sessionId, type, redactDeep(data), at, after);
     if (type === "session_closed") this.outbox.markClosed(sessionId);
     this.wakeSender?.();
   }

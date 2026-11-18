@@ -84,7 +84,8 @@ const status = (s) => {
     fs.renameSync(`${real}.tmp`, real);
   } catch { /* the test has not written it yet */ }
 };
-const line = (doc) => fs.appendFileSync(transcript, `${JSON.stringify({ sessionId, isSidechain: false, ...doc })}\n`);
+// (every entry dated, as Claude Code dates them)
+const line = (doc) => fs.appendFileSync(transcript, `${JSON.stringify({ sessionId, isSidechain: false, timestamp: new Date().toISOString(), ...doc })}\n`);
 
 function draw() {
   const rule = "─".repeat(60);

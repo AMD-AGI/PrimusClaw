@@ -34,6 +34,12 @@ import type { FinishWith, TurnDisplay } from "./display.js";
 import type { Signer } from "./signer.js";
 import { inertAnswer } from "../links/answer.js";
 
+/**
+ * A remote turn's progress message (where there is no stream) is edited at most this often: a coding agent's turn runs for minutes,
+ * and an edit every few seconds keeps it current without coming near the chat's limits on edits.
+ */
+export const REMOTE_EDIT_SECONDS = 3;
+
 /** What the bubble shows of a remote turn, and how its stream ends. */
 export class RemoteStatusPolicy implements StatusPolicy<RemoteStep> {
   /** A line of ours after the answer (how the turn ended): not the agent's words. */
@@ -187,6 +193,7 @@ export class ChatTurn implements TurnDisplay {
       lang: options.lang,
       policy,
       streamReplyTo: options.replyTo,
+      editSeconds: REMOTE_EDIT_SECONDS,
     });
   }
 

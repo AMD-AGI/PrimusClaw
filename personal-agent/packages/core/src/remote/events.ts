@@ -20,6 +20,8 @@ export interface ToolUpdate {
   readonly id: string;
   readonly title: string;
   readonly status: string;
+  /** The tool's name (`Bash`, `Read`), "" when the event does not say (the steps are counted by it). */
+  readonly name?: string;
 }
 
 /** What the runner does after one event. Every field but the flags is null when the event does not say it. */
@@ -58,6 +60,12 @@ export interface RemoteStep {
   readonly recovered: { readonly interrupted: boolean; readonly continuing: boolean } | null;
   /** A message for a terminal's conversation waits for that terminal (the connector's reason). */
   readonly queued: string | null;
+  /** Which message waits (its `cmd_id`, else Claw's number of it), null when the connector did not say. */
+  readonly queuedFor: string | null;
+  /** Claw's number of the message that waits, null when the connector did not say. */
+  readonly queuedSeq: number | null;
+  /** It waits in the terminal's own queue (`held: "terminal"`): only the terminal can take it back. */
+  readonly queuedHeld: boolean;
   /** What the person typed at the terminal of a conversation shared with the chat. */
   readonly typed: string | null;
   /** What is sent is typed into a terminal on the machine (`input: "terminal"`). */
@@ -89,6 +97,9 @@ export const NOTHING: RemoteStep = Object.freeze({
   readOnly: null,
   recovered: null,
   queued: null,
+  queuedFor: null,
+  queuedSeq: null,
+  queuedHeld: false,
   typed: null,
   terminal: null,
   terminalMode: null,
@@ -220,11 +231,39 @@ function typed(payload: Json): RemoteStep {
   return text && !NOT_TYPED.test(text) ? remoteStep({ typed: text }) : NOTHING;
 }
 
+/** A tool's name as it may be counted: a word of letters, digits, `_`, `-` and `.` (an MCP tool's `mcp__server__tool` too). */
+const TOOL_NAME = /^[A-Za-z][\w.-]{0,63}$/u;
+
+/**
+ * The name of the tool a step runs: where the Claude Code ACP adapter (and the connector reading a terminal's transcript) puts it,
+ * `_meta.claudeCode.toolName`; else the word before the first ": " of the title (`Bash: npm test`); "" when neither says.
+ */
+function toolNameOf(u: Json): string {
+  const meta = record(record(u["_meta"])["claudeCode"]);
+  const named = str(meta["toolName"]);
+  if (TOOL_NAME.test(named)) return named;
+  const head = str(u["title"]).split(": ", 1)[0] ?? "";
+  return head !== str(u["title"]) && TOOL_NAME.test(head) ? head : "";
+}
+
 function tool(payload: Json, kind: string): RemoteStep {
   const u = update(payload);
   const id = str(u["toolCallId"]) || str(u["tool_call_id"]) || str(u["id"]);
   const status = str(u["status"]) || (kind === "tool_call" ? "pending" : "");
-  return remoteStep({ tool: { id, title: str(u["title"]), status } });
+  const name = toolNameOf(u);
+  return remoteStep({ tool: { id, title: str(u["title"]), status, ...(name ? { name } : {}) } });
+}
+
+/** A message waits for the terminal on the machine: why, which message, and whether the terminal itself holds it now. */
+function terminalQueued(payload: Json): RemoteStep {
+  const seq = seqOf(payload["cmd_seq"]);
+  const forId = neutral(str(payload["cmd_id"]), 80) || (seq !== null ? String(seq) : "");
+  return remoteStep({
+    queued: str(payload["reason"]) || "terminal_working",
+    queuedFor: forId || null,
+    queuedSeq: seq,
+    queuedHeld: payload["held"] === "terminal",
+  });
 }
 
 function turnEnd(payload: Json, _kind: string, errors: PublicErrors): RemoteStep {
@@ -327,7 +366,7 @@ const READERS: Readonly<Record<string, Reader>> = {
   session_error: failed,
   turn_error: failed,
   // (the session types into a terminal on the machine, which is busy: the message waits)
-  terminal_input_queued: (payload) => remoteStep({ queued: str(payload["reason"]) || "terminal_working" }),
+  terminal_input_queued: terminalQueued,
 };
 
 /** One SSE frame of a remote session to what the runner does. What cannot be read is skipped (usage_update, history_complete

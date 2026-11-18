@@ -542,7 +542,9 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
       const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 25_000);
       assert.deepEqual([end.data.stopReason, end.data.error], ["end_turn", undefined]);
       await h.claw.until("the reply", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "echo: from the phone"));
-      assert.deepEqual(h.claw.eventsOf(sid, "terminal_input_queued").filter((e) => e.data.cmd_seq === one), [], "never held back as busy");
+      // Never held back as busy: the phone is told once that Claude Code queued it behind the running turn, which only the terminal can take back.
+      assert.deepEqual(h.claw.eventsOf(sid, "terminal_input_queued").filter((e) => e.data.cmd_seq === one).map((e) => [e.data.reason, e.data.held]),
+        [["terminal_working", "terminal"]]);
       assert.ok(!h.claw.eventsOf(sid, "user_message_chunk").some((e) => e.data.update.content.text === "from the phone"), "its own echo is not news");
     });
   }
@@ -584,6 +586,9 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     assert.equal(told.data.reason, "terminal_working");
     await until("the message queued by Claude Code", () => queuedIn(t.transcript).includes("from the phone"), 15_000);
     const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === one), 30_000);
+    // (told it waits, then that Claude Code's queue holds it: only the terminal can take it back from there)
+    assert.deepEqual(h.claw.eventsOf(sid, "terminal_input_queued").filter((e) => e.data.cmd_seq === one).map((e) => [e.data.reason, e.data.held]),
+      [["terminal_working", undefined], ["terminal_working", "terminal"]]);
     assert.deepEqual([end.data.stopReason, end.data.error], ["end_turn", undefined]);
     assert.ok(!h.audit().some((a) => a.kind === "terminal_input_refused"), "never refused");
   });
