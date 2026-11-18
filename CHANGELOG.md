@@ -127,6 +127,18 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Assistant reviews: a merge (or an approval) that a review the assistant started for the person's own account holds for
+  them now reaches their chat as a card with a button. Until now the assistant told them to press the card's button or
+  reply `批准 #<ref>`, and no card was ever sent: only a review a chat started itself (one asked of someone else) put
+  one to the reviewer, so a person whose review mode is `high_risk_confirm` could answer only by typing the command. When
+  such a review's item comes to need its owner, each held write of its session that asks them goes out once as an
+  `assistant.say` carrying `confirm_write` (kind `github_merge` or `github_review`, with its ref and the button's label,
+  in the person's language); a new held write, such as the merge of a new head, gets its own card. The button calls
+  `POST /v1/assistant/confirmations/:id/decision`, which now makes that decision exactly as
+  `POST /v1/github-review/confirmations/:id/decision` does, for the person it asks only and with how they signed in;
+  the route is registered whenever review items are on. The personal agent draws the two kinds as the other held-write
+  cards, says how the answer ended (merged, queued, approval posted, not merged, new commits, expired, or why it was
+  refused), and gives the card back when Claw could not try it just now.
 - Connector: a message for a conversation typed into its terminal no longer gives up after 10 minutes as
   `terminal_state_unknown` while a question of Claude Code's own (a permission prompt, such as a dangerous `rm` asked by a
   background agent) is on that terminal's screen. When Claude Code's registry row for the process cannot be read, the

@@ -1,0 +1,14 @@
+{
+  "event_id": "<event_id>",
+  "occurred_at": "<occurred_at>",
+  "user_id": "u-alice",
+  "text": "#1 Primus-SaFE#892 的合入在等你确认：点「合入」，或回复 批准 #<ref>；不想合就回复 拒绝 #<ref>。",
+  "type": "assistant.say",
+  "confirm_write": {
+    "confirmation_id": "<confirmation_id>",
+    "ref": "<ref>",
+    "kind": "github_merge",
+    "allow_label": "合入",
+    "expires_at": "<expires_at>"
+  }
+}

@@ -252,7 +252,10 @@ They act only for the person, never for a key or a report:
   `config.merge_needs_confirmation`, and its `gh_pr_merge`, and a `gh_review_submit` `APPROVE` while GitHub's auto-merge is on or
   the pull request is in the merge queue, are held for the acting user (`confirmation_required`) whatever the risk, and it resolves
   no thread while auto-merge is on or the pull request is in the merge queue (see `gh_thread_resolve`); the merge is made only from
-  that confirmation: the card's button or the exact command below, by the acting user. A user who chose `fully_auto` has already
+  that confirmation: the card's button or the exact command below, by the acting user. The card is sent to the acting user's chat
+  once the review's item needs them: an `assistant.say` carrying `confirm_write` (kind `github_merge`, or `github_review` for a held
+  approval) for each held write of the session that asks them, once each, whose button is
+  `POST /v1/assistant/confirmations/:id/decision` (the same decision as the route below). A user who chose `fully_auto` has already
   said nobody needs to confirm their merges, so their sentence is enough: the review is made without
   `merge_needs_confirmation` and merges once it approves, held only by what holds any of their reviews (what the repository itself
   requires, failed CI, open threads, an earlier hold or refusal of the same commit). The mode is read when the review starts and again at the router's restart; a restart through
