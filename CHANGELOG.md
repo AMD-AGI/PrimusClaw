@@ -116,7 +116,8 @@ release version, and its `appVersion` stays `latest`.
 - Claw: `POST /v1/sessions` accepts an optional `placement.nodeLabels`, a map of node label key to value that every
   sandbox of the session requires. It is sent to SaFE as the workload's `customerLabels` (a required node affinity), kept
   with the session, and applied to every sandbox the session creates, a rebuilt or reclaimed one, a queued message's
-  and a task's, DAG node's or application run's included, so a rebuilt sandbox lands where the first was allowed to.
+  and a task's, DAG node's or application run's included, so a rebuilt sandbox lands where the first was allowed to. A
+  multi-node turn's GPU cluster (RayJob or InferaDeployment) carries the same `customerLabels` on every pod.
   Keys must be Kubernetes label keys, values single label values with no whitespace, at most 8 entries, and the keys the
   platform reads itself (`kubernetes.io/hostname`, `specified-nodes`, `excluded-nodes`, the workspace labels) are
   refused, all with `400`. Without the field the session and the workload request are unchanged. See "Placing a

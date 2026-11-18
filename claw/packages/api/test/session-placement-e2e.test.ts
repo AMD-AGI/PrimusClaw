@@ -13,6 +13,7 @@
  *   E2 a placement reaches SaFE as `customerLabels`, exactly
  *   E3 malformed and reserved placements are refused with 400 before any row, turn or workload
  *   E4 a sandbox rebuilt later in the session (a new Brain state, a later turn) keeps it
+ *   E5 a multi-node turn's GPU cluster, created before its Hands sandbox, carries it too
  */
 import test, { after, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -29,11 +30,15 @@ const safe = http.createServer((req, res) => {
     const url = req.url ?? "";
     res.setHeader("Content-Type", "application/json");
     if (req.method === "POST" && url === "/api/v1/workloads") {
-      creates.push(JSON.parse(raw) as Record<string, unknown>);
+      const body = JSON.parse(raw) as Record<string, unknown>;
+      creates.push(body);
+      // A GPU cluster's create is accepted without an id: the multi-node ensure ends there,
+      // and what E5 reads is the body it sent.
+      if ((body.groupVersionKind as { kind?: string } | undefined)?.kind !== "Sandbox") { res.end("{}"); return; }
       res.end(JSON.stringify({ workloadId: `wl-${++nextId}` }));
       return;
     }
-    if (req.method === "GET" && url.startsWith("/api/v1/workloads/")) {
+    if (req.method === "GET" && url.startsWith("/api/v1/workloads/wl-")) {
       res.end(JSON.stringify({ phase: "Running" }));
       return;
     }
@@ -50,6 +55,8 @@ await new Promise<void>((resolve) => safe.listen(0, "127.0.0.1", resolve));
 const SAFE = `http://127.0.0.1:${(safe.address() as AddressInfo).port}`;
 process.env.SAFE_API_URL = SAFE;
 process.env.CLAW_DEPLOY_MODE = "safe";
+// Read when Brain's config loads: an InferaDeployment's SSH key is derived from it.
+process.env.AUTH_INTERNAL_TOKEN ??= "test-internal-token";
 
 const Fastify = (await import("fastify")).default;
 const { db } = await import("../src/infra/db.js");
@@ -60,6 +67,7 @@ const { closedDoorbellBarrier } = await import("./doorbell-barrier-stub.js");
 const { ensureHands, bindSandboxReuseEffects } = await import("../../brain/src/sandbox/ensure-hands.js");
 const { bindHandsKv } = await import("../../brain/src/sandbox/registry.js");
 const { bindDagHandleKvForTest } = await import("../../brain/src/sandbox/handles.js");
+const { SafeMultiNodeProvider } = await import("../../brain/src/sandbox/multi-node/safe-provider.js");
 import type { UserInfo } from "../src/auth/models.js";
 import type { Harness } from "./scenario-harness.js";
 import type { ExecuteRequest } from "@claw/protocol";
@@ -298,3 +306,40 @@ test("E4 a sandbox rebuilt later in the session keeps the placement", async () =
   assert.equal(creates.length, 3);
   assert.deepEqual(creates[2].customerLabels, PLACEMENT.nodeLabels, "the rebuilt sandbox lost the placement");
 });
+
+/** POST /v1/sessions with a multi-node turn, then the cluster create Brain makes for it first. */
+async function createAndOpenCluster(payload: Record<string, unknown>): Promise<ExecuteRequest> {
+  const a = await app();
+  try {
+    const res = await a.inject({ method: "POST", url: "/v1/sessions", payload });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(published.length, 1, "the first turn was not published");
+    const request = JSON.parse(JSON.stringify(published[0])) as ExecuteRequest;
+    const sessionId = (res.json() as { data: { session_id: string } }).data.session_id;
+    // What the runner's openSandbox does for a multi-node request, before ensureHands.
+    await assert.rejects(new SafeMultiNodeProvider().ensure(sessionId, request, async () => {}), /no workloadId/);
+    return request;
+  } finally {
+    await a.close();
+  }
+}
+
+const MULTI_NODE: Array<[string, string]> = [
+  ["RayJob", "train it --nodes 2 --mn-backend rayjob --mn-image registry.example/mn:1"],
+  ["InferaDeployment", "serve it --nodes 2 --mn-backend infera --model /models/m --mn-image registry.example/mn:1"],
+];
+
+for (const [kind, content] of MULTI_NODE) {
+  test(`E5 a multi-node turn's ${kind} carries the placement as customerLabels`, async () => {
+    await createAndOpenCluster({ name: "mn", placement: PLACEMENT, message: { ...MESSAGE, content } });
+    assert.equal(creates.length, 1, "the cluster was not created");
+    assert.equal((creates[0].groupVersionKind as { kind: string }).kind, kind);
+    assert.deepEqual(creates[0].customerLabels, PLACEMENT.nodeLabels, "the GPU cluster dropped the placement");
+  });
+
+  test(`E5 without a placement a multi-node turn's ${kind} sends no customerLabels`, async () => {
+    await createAndOpenCluster({ name: "mn-plain", message: { ...MESSAGE, content } });
+    assert.equal(creates.length, 1);
+    assert.equal("customerLabels" in creates[0], false);
+  });
+}

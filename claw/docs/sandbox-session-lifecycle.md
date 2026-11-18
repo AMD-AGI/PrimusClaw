@@ -349,7 +349,9 @@ Each entry is sent to SaFE as the workload's `customerLabels`, which SaFE turns 
 (`<key> In [<value>]`). The placement is kept with the session (`config.placement`) and applied to every
 sandbox the session creates: the first turn's, a sandbox rebuilt after an idle reclaim or a lost container,
 a queued message's, a run reclaimed by another Brain, and the sandboxes of the session's tasks, DAG nodes and
-application runs. It cannot be changed after the session is created.
+application runs. A multi-node turn's GPU cluster (the RayJob or InferaDeployment workload created before its
+sandbox) carries the same `customerLabels`, so every pod of the cluster requires the labels too. It cannot be
+changed after the session is created.
 
 | Rule | Refused with `400` and an `error` starting with `placement` |
 |---|---|
@@ -363,5 +365,5 @@ application runs. It cannot be changed after the session is created.
 request is exactly what it was before the field existed. `config.placement` is server-managed and refused
 when a client sends it. A deployment that creates sandboxes through the Kubernetes agent-sandbox backend
 (`CLAW_DEPLOY_MODE=kubernetes`) refuses a placement rather than ignore it. Brain checks the placement again
-before it creates a sandbox and fails the run with `sandbox_placement_invalid` instead of creating one
-without it.
+before it creates a sandbox or a multi-node cluster, and fails the run with `sandbox_placement_invalid`
+instead of creating either without it.

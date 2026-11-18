@@ -32,6 +32,7 @@ import {
 import { multiNodeWorkloadName } from "../workload-naming.js";
 import { gpuWorkspaceFor } from "../workspace-select.js";
 import { SandboxProvisionTerminalError, assertSandboxWorkspaceAllowed } from "../errors.js";
+import { placementNodeLabels } from "../create-sandbox.js";
 import { ACTIVE_PHASES, TERMINAL_PHASES, waitForWorkloadReady, type WorkloadWaitDeps } from "../workload-wait.js";
 import { parseWorkloadListPage, type WorkloadRef } from "./workload-parse.js";
 import {
@@ -429,6 +430,10 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     // The cluster runs the run's code too, and is created before the Hands sandbox
     // that would otherwise be the first to ask: same list, same refusal.
     assertSandboxWorkspaceAllowed(namespace);
+    // The session's placement binds the cluster as it binds the Hands sandbox: every pod of
+    // it requires the node labels. Checked here, before anything is looked up or created,
+    // because the cluster is created before the Hands sandbox whose create would check it.
+    const nodeLabels = placementNodeLabels(request);
     const apiKey = (opts?.platformKey ?? request.platform_key ?? "").trim();
     if (!apiKey) throw new Error("multi-node request requires a SaFE platform key in safe mode");
     if (!SAFE_API_URL.trim()) throw new Error("SAFE_API_URL is not configured");
@@ -456,7 +461,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       workloadId = adopted
         ?? await this.createWorkload(
           sessionId, messageId, displayName, namespace, image, spec, apiKey, keypair, onEvent,
-          normalizeWorkloadTimeout(request.timeout), create,
+          normalizeWorkloadTimeout(request.timeout), create, nodeLabels,
         );
 
       if (adopted) {
@@ -671,6 +676,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     onEvent: MultiNodeEventSink,
     timeoutSec: number | undefined,
     create: { posted: boolean },
+    nodeLabels: Record<string, string> | undefined,
   ): Promise<string> {
     const common = {
       workspace: namespace,
@@ -686,6 +692,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       timeoutSec,
       defaultTimeoutSec: MULTI_NODE_DEFAULT_TIMEOUT_SECONDS,
       extraEnv: spec.extraEnv,
+      ...(nodeLabels ? { nodeLabels } : {}),
     };
 
     let body: Record<string, unknown>;
