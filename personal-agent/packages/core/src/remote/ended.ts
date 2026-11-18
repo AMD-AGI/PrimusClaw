@@ -5,7 +5,7 @@
 import { errorName } from "../errors.js";
 import { remoteAgentText } from "../locales/remote-agents.js";
 import { remoteLeads } from "../locales/remote-leads.js";
-import { OLD_CONNECTOR, type Pair, ended } from "./connector/reasons.js";
+import { FIXED_LATER, OLD_CONNECTOR, type Pair, ended } from "./connector/reasons.js";
 import type { RemoteContext } from "./context.js";
 import type { Lists } from "./lists.js";
 import type { ChatState } from "./state.js";
@@ -34,7 +34,8 @@ export class EndedWords {
     connectorId: string,
     reason: string | null,
   ): Promise<string | null> {
-    if (!OLD_CONNECTOR.has((reason ?? "").trim()) || !connectorId) return null;
+    const code = (reason ?? "").trim();
+    if (!(OLD_CONNECTOR.has(code) || Object.hasOwn(FIXED_LATER, code)) || !connectorId) return null;
     try {
       const credential = await credentialOf(key, provider);
       if (!credential) return null;

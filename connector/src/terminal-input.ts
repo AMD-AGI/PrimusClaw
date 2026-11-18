@@ -553,6 +553,11 @@ export interface TypeOptions {
   onPaste?: () => void;
   /** Called once when the box has not shown the pasted text ECHO_SLOW_MS after the paste (a busy terminal draws late): it is waited for. */
   onSlow?: () => void;
+  /**
+   * Called right before each Enter goes to the box (End and Enter, SUBMIT_BYTES): from then on the next prompt the transcript records
+   * may be this message, however Claude Code wrote it there.
+   */
+  onSubmit?: () => void;
 }
 
 /**
@@ -571,6 +576,8 @@ const DIALOG_POLL_MS = 200;
 const CLEAR_WAIT_MS = 10 * 60_000;
 /** How many times a message whose text a question took out of the box is typed again, once the question is gone. */
 const MAX_TYPINGS = 3;
+/** How long the box may take to show empty after the phone's own text was taken out of it ({@link TerminalInput.takeBack}). */
+const TAKE_BACK_SETTLE_MS = 1_000;
 
 /**
  * The pasted text never showed in the box within the echo wait (ECHO_WAIT_MS): nothing was submitted. `box` is what the box showed
@@ -728,6 +735,7 @@ export class TerminalInput {
         }
         if (!why) {
           await stillWanted();
+          opts.onSubmit?.();
           // End and Enter in one write (SUBMIT_BYTES): the box takes them as "to the end, submit"; a question that came up after the read
           // above takes End as its last option, "No", and Enter chooses that. Never a "Yes".
           await this.tmux.run(["send-keys", "-t", this.ref.pane, "-H", ...SUBMIT_BYTES]);
@@ -768,6 +776,30 @@ export class TerminalInput {
     const n = collapsed ? 1 : [...text].length;
     await this.tmux.run(["send-keys", "-t", this.ref.pane, "-H", ...Array<string>(n).fill("7f")]);
     return true;
+  }
+
+  /**
+   * Take `text`, a message this connector typed into this pane, out of the box again: only when the box holds exactly that text and
+   * no question or menu shows ({@link clearOwn}), looked for over `waitMs` (0: one look). True once the box is empty after it.
+   * Claude Code puts a message back into its box when Esc stops the turn the message started before any answer came (measured on
+   * 2.1.327, 2026-11-18: a one-line message back as it was, a long paste as `[Pasted text #n +k lines]`); and a message whose Enter
+   * did not submit it is left there. Either way it is the phone's own text, not someone typing: anything else in the box is left.
+   */
+  async takeBack(text: string, waitMs = 0): Promise<boolean> {
+    const by = Date.now() + waitMs;
+    for (;;) {
+      if (!(await this.alive())) return false;
+      if (await this.clearOwn(text)) {
+        const gone = Date.now() + TAKE_BACK_SETTLE_MS;
+        for (;;) {
+          if (inputBox(await this.screen()) === "empty") return true;
+          if (Date.now() >= gone) return false;
+          await sleep(50);
+        }
+      }
+      if (Date.now() >= by) return false;
+      await sleep(100);
+    }
   }
 
   /** Esc: Claude Code stops the turn it is running. */

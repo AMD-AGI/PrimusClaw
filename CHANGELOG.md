@@ -214,6 +214,23 @@ release version, and its `appVersion` stays `latest`.
 - Personal agent: a turn that is cancelled (the chat detaches from or switches away from a running session, the machine
   is disconnected, or the turn breaks off) no longer leaves its progress message in the chat as stale progress: it is
   deleted, or edited down to one "Interrupted." line where the chat cannot delete it.
+- Connector: a message typed into a terminal whose prompt Claude Code records in words that do not match what was pasted is
+  no longer ended as `terminal_input_unconfirmed` while the terminal answers it. The prompt is compared once both are read
+  alike (paste blocks unwrapped, CRLF and every run of white space as one, one Unicode form, no invisible characters); and the
+  first prompt the terminal records after the message's Enter, matching or not, is taken as the message's (unless Claude Code
+  queued the message), so its turn and its reply are followed and the turn ends as usual, with `input_unconfirmed: true` on
+  its `turn_end`. A message whose prompt shows only after the 20-second wait still ends as `terminal_input_unconfirmed`, and
+  what the terminal does next is still passed on.
+- Connector: a message the phone stopped before the session answered no longer blocks every later message. Claude Code puts
+  a prompt back into its input box when Esc stops its turn before any answer (measured on Claude Code 2.1.327); the
+  connector now takes that text out again, and a message of its own left alone in the box (that, or one whose Enter did not
+  submit it) is taken out before the next message instead of being read as someone typing, which held every later message
+  as `terminal_typing` for 10 minutes and then refused it. Text anyone else typed into the box is waited for as before.
+- Personal agent: `terminal_input_unconfirmed` is no longer said as a turn that did not complete or a message that may not
+  have been sent. It says the terminal has not confirmed the message yet, that whatever the session answers still shows in
+  the chat, and to look at the terminal before sending it again; a connector before 0.1.22, which did not recognise a
+  pasted message of several lines, is also told to upgrade. A prompt a connector passes on in Claude Code's
+  `<pasted_content>` block is shown as the text that was pasted.
 
 ## [0.5.7] - 2026-11-17
 

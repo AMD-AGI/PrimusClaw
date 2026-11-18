@@ -501,10 +501,15 @@ become spaces), so nothing in a message can act as a key or end the paste. Its t
 transcript records the end of the turn that took it in (a queued message: the turn whose `queued_command` it is, or its own turn
 after the `dequeue`), when the turn is stopped there (`cancelled`), or once Claude Code has said it is idle for 5 seconds; a message
 that neither appears in the transcript nor is queued there (`queue-operation` enqueue) within 20 seconds ends as
-`terminal_input_unconfirmed`, and one Claude Code queued whose queue went back into the box (`popAll`, to be edited there) as
+`terminal_input_unconfirmed`. Its prompt is told by its words once both are read alike (Claude Code's `<pasted_content>` blocks
+unwrapped, line breaks and every run of white space as one, one Unicode form); a prompt the terminal records after the message's
+Enter in words that do not match is still taken as the message's (not one Claude Code queued), and its turn ends as any other, with
+`input_unconfirmed: true` on its `turn_end`. One Claude Code queued whose queue went back into the box (`popAll`, to be edited there) as
 `terminal_input_withdrawn`. A
 `cancel` presses Esc in the terminal only for a turn the phone's message started itself (submitted straight at a prompt, not
-through Claude Code's queue), which stops it there. While the message is still being put in, waiting on a question, or
+through Claude Code's queue), which stops it there; Claude Code puts a prompt whose turn Esc stopped before any answer back into its box, and the connector
+takes it out again. A message of the phone's own left alone in the box (that, or one whose Enter did not submit it) is taken out
+before the next message is typed, never waited for as someone typing; anything else in the box is. While the message is still being put in, waiting on a question, or
 held in Claude Code's queue or taken into a turn the person started, no key is sent: the phone stops following it (the question
 stays the person's to answer; a message Claude Code already queued is still Claude Code's to run, and text already in the box stays
 there). A mode change is refused (`terminal_session`): the terminal keeps

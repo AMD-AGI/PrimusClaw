@@ -40,7 +40,14 @@
  * FAKE_DRAW_LAG_MS: while a turn runs, what comes in (a paste, a key) is drawn this much later (a busy Claude Code drawing late); what
  * the transcript records is written at once.
  * FAKE_PASTE_REF=1: a paste of several lines shows in the box as `[Pasted text #n +k lines]`, and the prompt (and the queue) records
- * it as Claude Code 2.1.285-2.1.319 does: `\n\n<pasted_content id="…">\n<the text>\n</pasted_content id="…">\n` in its place.
+ * it as Claude Code 2.1.285-2.1.327 does: `\n\n<pasted_content id="…">\n<the text>\n</pasted_content id="…">\n` in its place.
+ * FAKE_PASTE_REF=placeholder: the paste shows in the box the same way, but the prompt records the placeholder as the box showed it
+ * (`[Pasted text #n +k lines]`, not expanded): a prompt recorded in words the connector cannot compare with what it pasted.
+ * FAKE_ESC_REWIND=1: an Esc while a turn of the phone's prompt runs, before its answer is written, stops it and puts the prompt back
+ * into the box as it was submitted (a long paste as its `[Pasted text #n +k lines]`), as Claude Code 2.1.327 does (measured
+ * 2026-11-18); nothing more is written for that turn.
+ * FAKE_RECORD_LAG_MS: a submitted prompt is recorded in the transcript this much later (a busy Claude Code writing late); the turn
+ * starts at once (the row says `busy`).
  */
 import fs from "node:fs";
 import { bashQuestion, toolLine } from "./claude-question.mjs";
@@ -115,11 +122,27 @@ function draw() {
 }
 
 /** A turn that answers `text` (null: one that is not the phone's), ending after workMs, and what was queued meanwhile. */
+let turnTimer = null;
+let turnText = null;
+/** Esc stops the running turn of a prompt before its answer, and the prompt goes back into the box (FAKE_ESC_REWIND=1). */
+function rewind() {
+  if (process.env.FAKE_ESC_REWIND !== "1" || !working || turnText === null || turnTimer === null) return;
+  clearTimeout(turnTimer);
+  turnTimer = null;
+  working = false;
+  status(idleStatus);
+  buffer = turnText;
+  turnText = null;
+}
+
 function runTurn(text, ms) {
   working = true;
   status("busy");
   draw();
-  setTimeout(() => {
+  turnText = text;
+  turnTimer = setTimeout(() => {
+    turnTimer = null;
+    turnText = null;
     if (text !== null) line({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: `echo: ${text}` }], stop_reason: "end_turn" } });
     if (process.env.FAKE_QUEUE === "absorb") {
       for (const q of queue.splice(0)) {
@@ -145,8 +168,16 @@ function submit() {
   const text = buffer;
   buffer = "";
   if (!text.trim()) return draw();
-  line({ type: "user", message: { role: "user", content: expand(text) }, promptSource: "typed", origin: { kind: "human" } });
-  runTurn(text, workMs);
+  const record = () => line({ type: "user", message: { role: "user", content: process.env.FAKE_PASTE_REF === "placeholder" ? text : expand(text) }, promptSource: "typed", origin: { kind: "human" } });
+  const lag = Number(process.env.FAKE_RECORD_LAG_MS || "0");
+  if (lag <= 0) {
+    record();
+    return runTurn(text, workMs);
+  }
+  working = true;
+  status("busy");
+  draw();
+  setTimeout(() => { record(); runTurn(text, workMs); }, lag);
 }
 
 process.stdin.setRawMode?.(true);
@@ -162,7 +193,7 @@ process.stdin.on("data", (chunk) => {
     if (pending.startsWith("\x1b[201~")) {
       pasting = false;
       pending = pending.slice(6);
-      if (process.env.FAKE_PASTE_REF === "1" && pasted.includes("\n")) {
+      if ((process.env.FAKE_PASTE_REF === "1" || process.env.FAKE_PASTE_REF === "placeholder") && pasted.includes("\n")) {
         const n = pastes.size + 1;
         pastes.set(n, pasted);
         buffer = buffer.slice(0, buffer.length - pasted.length) + `[Pasted text #${n} +${pasted.split("\n").length - 1} lines]`;
@@ -175,6 +206,7 @@ process.stdin.on("data", (chunk) => {
       pending = "";
       if (process.env.FAKE_ESC_FILE) fs.appendFileSync(process.env.FAKE_ESC_FILE, "esc\n");
       if (dialog) { dialog = false; fs.writeFileSync(`${process.env.FAKE_DIALOG_FILE}.denied`, "denied"); }
+      else rewind();
       continue;
     }
     if (pending.startsWith("\x1b") && pending.length < 6 && "\x1b[200~".startsWith(pending)) break;   // the rest comes next
@@ -189,6 +221,7 @@ process.stdin.on("data", (chunk) => {
       pending = pending.slice(1);
       if (process.env.FAKE_ESC_FILE) fs.appendFileSync(process.env.FAKE_ESC_FILE, "esc\n");
       if (dialog) { dialog = false; fs.writeFileSync(`${process.env.FAKE_DIALOG_FILE}.denied`, "denied"); }
+      else rewind();
       continue;
     }
     const ch = pending[0];
@@ -215,7 +248,8 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
     if (ch === "\x15") { buffer = ""; continue; }   // Ctrl-U
-    if (ch === "\x7f") { if (!dialog) buffer = [...buffer].slice(0, -1).join(""); continue; }   // Backspace (nothing on a question)
+    // Backspace (nothing on a question); a `[Pasted text #n …]` it ends on goes whole, as in Claude Code (2.1.327, measured 2026-11-18)
+    if (ch === "\x7f") { if (!dialog) buffer = /\[Pasted text #\d+(?: \+\d+ lines)?\]$/.test(buffer) ? buffer.replace(/\[Pasted text #\d+(?: \+\d+ lines)?\]$/, "") : [...buffer].slice(0, -1).join(""); continue; }
     if (ch === "\x1b" || ch < " ") continue;
     buffer += ch;
     if (process.env.FAKE_DIALOG_FILE && !process.env.FAKE_DIALOG_AT_ENTER && !process.env.FAKE_DIALOG_ON_KEY && !dialogShown) showDialog();

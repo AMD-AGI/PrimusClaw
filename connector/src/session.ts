@@ -19,7 +19,7 @@
  * event that names its mode also says whether it is `unattended`, so a phone always shows it.
  */
 import path from "node:path";
-import { TranscriptTail, isIdleStatus, type AttachSupport, type TranscriptUpdate } from "./attach.js";
+import { TranscriptTail, isIdleStatus, unwrapPasted, type AttachSupport, type TranscriptUpdate } from "./attach.js";
 import type { Audit } from "./audit.js";
 import { ECHO_WAIT_MS, TerminalInput, TerminalInputUnseen, actsAsCommand, cleanInput, tmuxRunner, type PaneRef, type Readiness } from "./terminal-input.js";
 import { createHash } from "node:crypto";
@@ -142,6 +142,10 @@ const BYPASS_HINT = ` (Claude Code offers it to root only with IS_SANDBOX set, a
 
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024;
 const MAX_QUEUED_PROMPTS = 5;
+/** How many of the messages it typed a session remembers as its own, to take one out of the box if it is left there. */
+const OWN_TEXTS_KEPT = 5;
+/** How long after the Esc that stopped a message's turn the box is watched for Claude Code to put the message back. */
+const STOP_TAKE_BACK_MS = 3_000;
 /** How long a prompt waits for an entry the agent is still writing to the transcript to be complete: 8 × 250 ms. */
 const PARTIAL_ENTRY_TRIES = 8;
 const PARTIAL_ENTRY_WAIT_MS = 250;
@@ -223,6 +227,13 @@ export class Session {
     typing?: boolean;
     /** Its text went into the box: only from then on can the transcript show it (the same words before are someone else's). */
     pasted?: boolean;
+    /** An Enter went to the box after its text: from then on the next prompt the terminal records is taken as this message's. */
+    entered?: boolean;
+    /**
+     * Taken as this message's without its words matching what was typed (the first prompt the terminal recorded after the Enter): its
+     * turn is followed and ends as any other, said `input_unconfirmed` on its end, never as a failure.
+     */
+    uncertain?: boolean;
     /**
      * It started a turn of its own in the terminal (its prompt is the turn's, submitted at an idle prompt). Only such a turn is the
      * phone's to stop with Esc; one that went through Claude Code's queue (taken into a running turn, or out of the queue after it)
@@ -240,6 +251,14 @@ export class Session {
     toldWorking?: "slow" | "held";
   } | null = null;
   private terminalPumping = false;
+  /**
+   * The messages this session put into the terminal's box (the newest last, at most OWN_TEXTS_KEPT): one of them left alone in the
+   * box (Claude Code put it back there when Esc stopped its turn, or its Enter did not submit it) is the phone's own text, taken out
+   * again before the next message, never waited for as someone typing.
+   */
+  private ownTexts: string[] = [];
+  /** The box is being watched for a stopped message Claude Code puts back ({@link takeBackStopped}): nothing is typed meanwhile. */
+  private takingBack: Promise<void> | null = null;
   /** Whether this session recorded once that its terminal's Claude Code version is not one measured for `busy` (it waits as before). */
   private terminalRestoring: Promise<void> | null = null;
   private tail: TranscriptTail | null = null;
@@ -470,11 +489,11 @@ export class Session {
     if (u.type === "queued" || u.type === "queued_taken" || u.type === "queue_withdrawn") {
       if (!turn || turn.seen || !turn.pasted) return;
       const said = String(u.update.text ?? "");
-      if (u.type === "queued" && sameText(said, turn.text)) {
+      if (u.type === "queued" && echoOf(said, turn.text)) {
         turn.queued = true;
         this.tellWorking(turn, true);
       }
-      else if (u.type === "queued_taken" && sameText(said, turn.text)) turn.seen = true;
+      else if (u.type === "queued_taken" && echoOf(said, turn.text)) turn.seen = true;
       else if (u.type === "queue_withdrawn" && turn.queued) this.endTerminalTurn("error", "terminal_input_withdrawn");
       return;
     }
@@ -483,9 +502,19 @@ export class Session {
       // The message typed for the phone comes back as the terminal's own prompt: it is that turn's start, not news.
       // (its own turn only when it was submitted straight, not through Claude Code's queue: there an identical prompt the person
       // queued before it could be the one that came out first, and its turn is the person's)
-      if (turn.pasted && !turn.seen && sameText(said, turn.text)) { turn.seen = true; turn.own = !turn.queued; return; }
+      if (turn.pasted && !turn.seen && echoOf(said, turn.text)) { turn.seen = true; turn.own = !turn.queued; return; }
       // (several queued prompts can come out of Claude Code's queue as one: a queued message is in it, never its own turn)
       if (turn.pasted && !turn.seen && turn.queued && wholeLinesOf(said, turn.text)) { turn.seen = true; return; }
+      // The first prompt the terminal records after the Enter, in words that do not match (a paste Claude Code recorded in a shape
+      // this connector does not know): taken as this message's, uncertain, so that its turn and its reply are followed instead of the
+      // message being ended as unconfirmed while the terminal answers it. Shown as it was recorded (the phone sees what went in); never
+      // its own turn to stop with Esc, as it may be the person's. Not one Claude Code queued: those come out of its queue by name.
+      if (turn.entered && !turn.seen && !turn.queued) {
+        turn.seen = true;
+        turn.uncertain = true;
+        turn.own = false;
+        this.audit("terminal_input_uncertain", { cmd_id: turn.cmdId, length: said.length });
+      }
     }
     const text = u.type === "agent_message_chunk" ? String((u.update.content as { text?: unknown } | undefined)?.text ?? "") : "";
     if (text && this.env.config.dropMessagePatterns.some((re) => re.test(text))) return;
@@ -525,6 +554,8 @@ export class Session {
         // `!` or `/` first would run a shell command or a slash command there, not ask the agent: never typed.
         if (actsAsCommand(text)) { refused("terminal_command_refused"); continue; }
         if (this.terminalRestoring) await this.terminalRestoring;
+        // (a message just stopped may still come back into the box: it is taken out before anything else is put in)
+        if (this.takingBack) await this.takingBack;
         const term = this.terminal;
         if (!term) { refused("terminal_input_unavailable"); continue; }
         let told = "";
@@ -569,6 +600,8 @@ export class Session {
             // (`unread`: Claude Code's row for that process cannot be read, but the process is proven to hold this conversation)
             const r = await term.readiness();
             if (r.ready) { ready = true; break; }
+            // (the box holds only a message of the phone's own, left there: taken out, and the box read again)
+            if (r.why === "typing" && (await this.takeBackOwn(term, next.cmdId))) continue;
             why = WAIT_WHY[r.why];
             if (r.why === "dialog") dialog = r.dialog;
             if (r.why === "gone") { told = why; break; }
@@ -655,6 +688,7 @@ export class Session {
         let held = false;
         while (!again.ready && again.why !== "gone" && !this.closed && this.terminalTurn === turn && this.sameHolder(term)) {
           if (again.why === "screen" && Date.now() >= screenBy) break;
+          if (again.why === "typing" && (await this.takeBackOwn(term, next.cmdId))) { again = await term.readiness(); continue; }
           if ((again.why === "typing" || again.why === "copy_mode") && Date.now() >= heldBy) { held = true; break; }
           await sleep(200);
           again = await term.readiness();
@@ -672,7 +706,8 @@ export class Session {
             onDialog: (dialog) => this.emit("terminal_input_queued", { reason: WAIT_WHY.dialog, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length + 1, ...this.waitDetail(term, WAIT_WHY.dialog, dialog) }),
             stillWanted: () => !this.closed && !this.stopping && this.terminalTurn === turn && this.sameHolder(term),
             submitted: () => turn.seen || turn.queued === true,
-            onPaste: () => { turn.pasted = true; },
+            onPaste: () => { turn.pasted = true; this.ownTexts = [...this.ownTexts.filter((t) => t !== text), text].slice(-OWN_TEXTS_KEPT); },
+            onSubmit: () => { turn.entered = true; },
             // (a busy terminal draws the paste late: the phone is told the message waits there)
             onSlow: () => this.tellWorking(turn, false),
           });
@@ -773,9 +808,29 @@ export class Session {
     this.terminalTurn = null;
     // (Not when the connector is going away: the record is left for the next run, which ends the turn by name.)
     if (!this.stopping) this.env.store.endTurn(this.id);
-    this.audit("terminal_turn_end", { stop_reason: stopReason, ...(error ? { error } : {}), cmd_id: turn.cmdId });
-    this.emit("turn_end", { stopReason, ...(error ? { error } : {}), cmd_id: turn.cmdId, cmd_seq: turn.cmdSeq });
+    const uncertain = turn.uncertain ? { input_unconfirmed: true } : {};
+    this.audit("terminal_turn_end", { stop_reason: stopReason, ...(error ? { error } : {}), ...uncertain, cmd_id: turn.cmdId });
+    this.emit("turn_end", { stopReason, ...(error ? { error } : {}), ...uncertain, cmd_id: turn.cmdId, cmd_seq: turn.cmdSeq });
     turn.done();
+  }
+
+  /** A message of the phone's own left alone in the box is taken out (the newest that matches first): true when the box is empty now. */
+  private async takeBackOwn(term: TerminalInput, cmdId: string | null): Promise<boolean> {
+    for (const own of [...this.ownTexts].reverse()) {
+      if (this.closed || this.terminal !== term || !this.sameHolder(term)) return false;
+      if (await term.takeBack(own).catch(() => false)) {
+        this.audit("terminal_own_text_cleared", { why: "left_in_box", cmd_id: cmdId, length: own.length });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** After the Esc that stopped a message's turn: the message is taken out of the box if Claude Code put it back there. */
+  private async takeBackStopped(term: TerminalInput, text: string, cmdId: string | null): Promise<void> {
+    if (await term.takeBack(text, STOP_TAKE_BACK_MS).catch(() => false)) {
+      this.audit("terminal_own_text_cleared", { why: "stopped", cmd_id: cmdId, length: text.length });
+    }
   }
 
   /** The queued typed messages are dropped: each is refused by name (`cancelled`, or the reason given). */
@@ -1538,8 +1593,18 @@ export class Session {
       // the person's: the phone stops following it, and the message, if still queued, is Claude Code's to run).
       // (`own` is set only once the transcript shows its prompt starting a turn: by then it was submitted, whatever the typing still checks)
       const interrupt = running?.own === true;
-      if (interrupt && this.terminal) await this.terminal.interrupt().catch(() => undefined);
+      const term = this.terminal;
+      if (interrupt && term) await term.interrupt().catch(() => undefined);
       this.audit("cancelled", { turn_running: running !== null, queued_dropped: queued, terminal: true, interrupted: interrupt });
+      // Stopped before any answer came, Claude Code puts the message back into its box (2.1.327): the phone asked to stop it, so it is
+      // taken out again, not left there to be read as someone typing (every later message would wait behind it). Set before the turn
+      // ends, so the next message waits for it: one with the same words must not be taken for the stopped one and cleared.
+      if (interrupt && term && running) {
+        const watch: Promise<void> = this.takeBackStopped(term, running.text, running.cmdId).finally(() => {
+          if (this.takingBack === watch) this.takingBack = null;
+        });
+        this.takingBack = watch;
+      }
       if (running) this.endTerminalTurn("cancelled");
       else this.emit("turn_end", { stopReason: "cancelled", cmd_id: null, cmd_seq: null });
       return;
@@ -1643,7 +1708,13 @@ export function wholeLinesOf(joined: string, text: string): boolean {
   return false;
 }
 
-function sameText(a: string, b: string): boolean {
-  const norm = (t: string) => t.replace(/\s+/g, " ").trim();
-  return norm(a) === norm(b);
+/**
+ * Whether `said`, a prompt as the terminal's transcript records it, is `text`, the message as it was pasted: compared once both are
+ * read alike. Each `<pasted_content>` block Claude Code put in place of a paste is its text again, line breaks are `\n` whatever
+ * wrote them, the characters are in one Unicode form (NFC), invisible format characters (zero-width spaces and joiners, a byte-order
+ * mark) are gone, and every run of white space (Claude Code draws a tab as spaces) is one space.
+ */
+export function echoOf(said: string, text: string): boolean {
+  const norm = (t: string) => unwrapPasted(t.replace(/\r\n?/g, "\n")).normalize("NFC").replace(/[\u200b-\u200d\u2060\ufeff]/g, "").replace(/\s+/g, " ").trim();
+  return norm(said) === norm(text);
 }

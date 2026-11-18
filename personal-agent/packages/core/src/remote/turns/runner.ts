@@ -14,7 +14,7 @@ import { remoteLeads } from "../../locales/remote-leads.js";
 import type { RemoteState } from "../../ports/store/remote.js";
 import { type Conversation, textMessage } from "../../ports/surface.js";
 import { type RemoteStep } from "../events.js";
-import { queuedLine, queuedNote, recoveredLine, rowUnreadableLine } from "../lines.js";
+import { TERMINAL_INPUT_UNCONFIRMED, queuedLine, queuedNote, recoveredLine, rowUnreadableLine } from "../lines.js";
 import { RemoteTurnState } from "../turn-state.js";
 import type { StatusBoard } from "../board.js";
 import { type RemoteTurn, newTurn } from "../chats.js";
@@ -177,7 +177,14 @@ export class TurnRunner {
         sessionEnded: (reason) =>
           this.ended.sessionEnded(chatKey, request.key, request.provider, state.connectorId, reason),
         turnIncomplete: (code) =>
-          this.ended.said(chatKey, remoteLeads.turnIncomplete, request.key, request.provider, state.connectorId, code),
+          this.ended.said(
+            chatKey,
+            code === TERMINAL_INPUT_UNCONFIRMED ? remoteLeads.inputUnconfirmed : remoteLeads.turnIncomplete,
+            request.key,
+            request.provider,
+            state.connectorId,
+            code,
+          ),
         ...(signer ? { sign: (parts: string[]) => signer.later(parts) } : {}),
       },
     );
