@@ -24,7 +24,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { processStart } from "./children.js";
-import { redactText } from "./redact.js";
+import { MASK, redactText } from "./redact.js";
 import { errMessage } from "./util.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -369,29 +369,35 @@ const PATH_START = /[\s"'=($:`]/;
 /**
  * Every path in a line said by its last part only (`/home/me/build` -> `…/build`): in each word, everything from where its first
  * path starts to its last slash goes, whatever quotes or escapes it is written with (`cat /a/"b c"/key` -> `cat …/key`). A path of
- * one part (`/`, `/tmp`) is said as it is: what a dangerous `rm` reaches is never hidden that way.
+ * one part (`/`, `/tmp`) is said as it is: what a dangerous `rm` reaches is never hidden that way. A credential's mask (`[hidden]`)
+ * is kept as it is: the parts of a word around it are cut each on its own.
  */
 function cutPaths(text: string): string {
-  return text.replace(WORD_RE, (word) => {
-    const first = word.indexOf("/");
-    if (first < 0) return word;
-    const last = word.lastIndexOf("/");
-    let from = first;
-    while (from > 0 && !PATH_START.test(word[from - 1]!)) from--;
-    // (only a leading slash, or `~/`, `./`: one part)
-    if (/^(?:~|\.{1,2})?\/$/.test(word.slice(from, last + 1))) return word;
-    return `${word.slice(0, from)}…/${word.slice(last + 1)}`;
-  });
+  return text.replace(WORD_RE, (word) => word.split(MASK).map(cutWord).join(MASK));
 }
 
-/** A line of the screen for the phone: paths cut to their last part, credentials masked, at most DIALOG_SUMMARY_MAX code points. */
+function cutWord(word: string): string {
+  const first = word.indexOf("/");
+  if (first < 0) return word;
+  const last = word.lastIndexOf("/");
+  let from = first;
+  while (from > 0 && !PATH_START.test(word[from - 1]!)) from--;
+  // (only a leading slash, or `~/`, `./`: one part)
+  if (/^(?:~|\.{1,2})?\/$/.test(word.slice(from, last + 1))) return word;
+  return `${word.slice(0, from)}…/${word.slice(last + 1)}`;
+}
+
+/**
+ * A line of the screen for the phone: credentials masked, then paths cut to their last part, at most DIALOG_SUMMARY_MAX code points.
+ * Masked first: a credential with a `/` in it (`Bearer abc/def…`) would lose its head to the cut and no longer look like one, and
+ * its tail would leave the machine as it is.
+ */
 function shortLine(text: string): string {
-  const cut = cutPaths(text.replace(/[\u0000-\u001f\u007f-\u009f]/g, ""))
-    .replace(/\s+/g, " ")
-    .trim();
-  const masked = redactText(cut).text;
-  const cps = [...masked];
-  return cps.length <= DIALOG_SUMMARY_MAX ? masked : `${cps.slice(0, DIALOG_SUMMARY_MAX - 1).join("").trimEnd()}…`;
+  const masked = redactText(text.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")).text;
+  // (and again after: what the cut joins is masked too)
+  const cut = redactText(cutPaths(masked).replace(/\s+/g, " ").trim()).text;
+  const cps = [...cut];
+  return cps.length <= DIALOG_SUMMARY_MAX ? cut : `${cps.slice(0, DIALOG_SUMMARY_MAX - 1).join("").trimEnd()}…`;
 }
 
 /**

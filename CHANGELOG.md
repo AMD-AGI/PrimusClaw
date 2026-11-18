@@ -142,9 +142,10 @@ release version, and its `appVersion` stays `latest`.
   background agent) is on that terminal's screen. When Claude Code's registry row for the process cannot be read, the
   connector proves which conversation the process holds by the name above its input box, and a question hides the box; it now
   looks at the pane it types into, and a question there is waited out for as long as it is up, then the messages go in, in
-  order. Nothing is ever typed into the question. The `terminal_input_queued` notice says what the question asks (`dialog`:
+  order. A question on a terminal whose process nothing proves for another reason (no row, or a row that says no status) is
+  said too, but waits `terminalWaitMs` as before. Nothing is ever typed into the question. The `terminal_input_queued` notice says what the question asks (`dialog`:
   its title and command, such as `Bash command: rm -rf "$(echo …/build)"`, every path cut to its last part and credentials
-  masked), and both it and `session_started` say `registry_row_unreadable: true` when the process's row cannot be read.
+  masked first, so that a credential with a `/` in it is never cut into a tail that no longer looks like one), and both it and `session_started` say `registry_row_unreadable: true` when the process's row cannot be read.
 - Personal agent: while a message waits for a question on the terminal, the chat says what it asks ("The terminal is
   waiting for your confirmation: Bash command: rm -rf …", 「终端在等你确认：…」) once per question, and the floating status says
   "Confirm there" (等你确认) instead of the bare "Waiting" (等终端). When the connector says Claude Code's registry row for the

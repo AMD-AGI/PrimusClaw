@@ -62,7 +62,8 @@ export interface SessionTiming {
    * A message for a terminal whose process cannot be told to hold the conversation still (its Claude Code says nothing of it), or
    * whose box holds someone's half-typed text, or whose screen is scrolled back, waits this long, then is refused
    * (`terminal_state_unknown`, `terminal_busy`). Whether that Claude Code is busy is never waited on, nor a question on its screen
-   * (one in the pane it types into is waited out however long it is up, even while the question hides what proves the process).
+   * (one in the pane it types into is waited out however long it is up, even while the question hides what proves a process whose
+   * registry row is torn; one on a process nothing else proves is told, and waits this long).
    */
   terminalWaitMs: number;
   /** A message typed into a terminal must show up in its transcript within this long, or its turn ends `terminal_input_unconfirmed`. */
@@ -544,14 +545,19 @@ export class Session {
           const status = this.holderStatus(term);
           let why: string;
           let dialog: string | null = null;
+          // (a question on a screen whose process nothing proves, and whose registry row is not the torn one: bounded)
+          let blindDialog = false;
           if (status === "other") { told = WAIT_WHY.other; break; }   // (the terminal is on another conversation now, or gone)
           if (status === null) {
             // Nothing says the process holds this conversation still. A question on its screen hides the box, and with it the name a
             // process whose row cannot be read is proven by (`provenBlindHold`): one on the pane this session types into, in the
             // process proven at the start, is waited out as the question it is, never typed into (nothing is typed while the holder
-            // is not proven: `sameHolder` below). Anything else on the screen is still a state this connector cannot tell.
+            // is not proven: `sameHolder` below). Anything else on the screen is still a state this connector cannot tell. Only a
+            // process whose row is there but cannot be read has its question waited out however long it is up; one whose row says
+            // nothing else of it (no row yet, another pid, no status) is told the question but waits terminalWaitMs, as before.
             const r = await term.readiness();
             if (!r.ready && r.why === "dialog") { why = WAIT_WHY.dialog; dialog = r.dialog; } else why = WAIT_WHY.unknown;
+            blindDialog = why === WAIT_WHY.dialog && this.env.attach.get(this.agent.id)?.rowUnreadable(term.ref.pid) !== true;
             // (the question gone: its box shows the conversation's name again, and the proof is made anew at once, not at the next
             // heartbeat's look)
             if (why === WAIT_WHY.dialog) reproved = false;
@@ -576,10 +582,10 @@ export class Session {
             unreadableSince = null;
           }
           // (someone's half-typed text in the box, or a screen scrolled back, held for as long as terminalWaitMs: refused then, as
-          // before; a question on the screen is waited out however long it is up)
-          if (why === WAIT_WHY.unknown || why === WAIT_WHY.typing || why === WAIT_WHY.copy_mode) {
+          // before; a question on the screen is waited out however long it is up, unless nothing proves the process: `blindDialog`)
+          if (why === WAIT_WHY.unknown || blindDialog || why === WAIT_WHY.typing || why === WAIT_WHY.copy_mode) {
             heldSince ??= Date.now();
-            if (Date.now() - heldSince >= this.env.timing.terminalWaitMs) { refusal = why === WAIT_WHY.unknown ? "terminal_state_unknown" : "terminal_busy"; told = why; break; }
+            if (Date.now() - heldSince >= this.env.timing.terminalWaitMs) { refusal = why === WAIT_WHY.unknown || blindDialog ? "terminal_state_unknown" : "terminal_busy"; told = why; break; }
           } else {
             heldSince = null;
           }

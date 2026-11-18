@@ -16,6 +16,7 @@ import { localPidDomain } from "../src/attach.js";
 import { ConfigError, parseConfig } from "../src/config.js";
 import { processStart } from "../src/children.js";
 import { CLAUDE_MODE_INDICATORS, DIALOG_SUMMARY_MAX, MODES_THAT_DO_NOT_ASK, actsAsCommand, cleanInput, dialogOnScreen, dialogSummary, enterGuard, inputBox, findPane, terminalMode, TerminalInput, tmuxRunner } from "../src/terminal-input.js";
+import { redactText } from "../src/redact.js";
 import { wholeLinesOf } from "../src/session.js";
 import { Harness, onCleanup, onExitSync, tmpdir } from "./support/harness.js";
 // @ts-expect-error (a plain module shared with the stand-in terminal)
@@ -63,6 +64,49 @@ describe("what a question on the screen asks", () => {
     assert.equal(asks('cat "/Private Documents/key'), 'Bash command: cat "…/key', "a quote left open runs to the end");
     assert.equal(asks("rm -rf /"), "Bash command: rm -rf /", "what a dangerous rm reaches is never hidden");
     assert.equal(asks("ls /tmp"), "Bash command: ls /tmp");
+  });
+  test("a credential with a slash in it is masked before any path is cut: no part of it is left", () => {
+    const asks = (command: string) => dialogSummary(on(bashQuestion({ command, description: "Run" })))!;
+    const key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY1234";
+    assert.equal(asks(`export API_KEY=${key}`), "Bash command: export API_KEY=[hidden]");
+    const bearer = asks('curl -H "Authorization: Bearer abcdefgh1234/ijklmnopqrstuvwxyz5678" https://example.com/v1/api');
+    assert.equal(bearer, 'Bash command: curl -H "Authorization: [hidden]" https:…/api');
+    // (the mask is kept whole where the cut would take what is before it: only the path around it goes)
+    assert.equal(asks(`cat /srv/conf/sk-${"Ab3x".repeat(6)}/env`), "Bash command: cat …/[hidden]/env");
+  });
+  test("no part of a credential the masking knows survives, wherever its slashes are and whatever path is around it", () => {
+    // (seeded: the same cases every run)
+    let seed = 0x865;
+    const rand = (n: number) => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) >>> 8) % n;
+    const pick = (alphabet: string, n: number) => Array.from({ length: n }, () => alphabet[rand(alphabet.length)]).join("");
+    const ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    // (a value with slashes where the credential's own characters allow them, and at least one letter and one digit)
+    const slashed = (n: number) => {
+      const cs = [...pick(ALNUM, n)];
+      for (let k = 1 + rand(3); k > 0; k--) cs[2 + rand(n - 4)] = "/";
+      return `a1${cs.join("")}`;
+    };
+    const shapes: Array<() => { secret: string; command: string }> = [
+      () => { const v = slashed(30 + rand(10)); return { secret: v, command: `export API_KEY=${v}` }; },
+      () => { const v = slashed(30 + rand(10)); return { secret: v, command: `deploy --password=${v} /srv/app/run` }; },
+      () => { const v = slashed(16 + rand(20)); return { secret: v, command: `curl -H "Authorization: Bearer ${v}" https://x.example/a/b` }; },
+      () => { const v = slashed(16 + rand(20)); return { secret: v, command: `curl -H 'Authorization: Bearer ${v}' /opt/out/log` }; },
+      () => { const v = `ghp_${pick(ALNUM, 24)}`; return { secret: v, command: `cat /home/dev/${v}/notes` }; },
+      () => { const v = `sk-${pick(ALNUM, 20)}`; return { secret: v, command: `run --out=/var/tmp/${v} x` }; },
+    ];
+    for (let i = 0; i < 300; i++) {
+      const { secret, command } = shapes[i % shapes.length]!();
+      // (only what the masking itself knows as a credential: the cut must not lose it)
+      assert.ok(!redactText(command).text.includes(secret), command);
+      const said = dialogSummary(on(bashQuestion({ command, description: "Run" })))!;
+      assert.ok(said.includes("[hidden]"), `${command} -> ${said}`);
+      const body = secret.replace(/^(?:ghp_|sk-)/, "");
+      for (const part of body.split("/")) {
+        for (let at = 0; at + 6 <= part.length; at++) {
+          assert.ok(!said.includes(part.slice(at, at + 6)), `${command} -> ${said}: "${part.slice(at, at + 6)}" left`);
+        }
+      }
+    }
   });
   test("a question it cannot split is named by its question; no question, nothing", () => {
     assert.equal(dialogSummary(`  ready\n${RULE}\n❯ hello\n${RULE}\n  ⏸ manual mode on\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel`), "Do you want to proceed?");
@@ -764,6 +808,46 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const end1 = h.turnEnds(sid).find((e) => e.data.cmd_seq === one)!;
     assert.deepEqual([end1.data.stopReason, end1.data.error, end2.data.stopReason, end2.data.error], ["end_turn", undefined, "end_turn", undefined]);
     assert.deepEqual(typed(t.transcript), ["first from the phone", "second from the phone"]);
+  });
+
+  test("a question on a screen whose process nothing proves, its registry row readable but saying nothing of it: the phone is told what it asks, and the message is refused after terminalWaitMs as before (Wei Lei on #865)", { skip: process.platform !== "linux" }, async () => {
+    // (only the torn row hides the proof for as long as the question is up; a row that reads but says nothing is the old unknown)
+    const work = tmpdir("cc-work-");
+    const h = await Harness.create({
+      work, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000, terminalWaitMs: 1_500 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "autopilot", updatedAt: "2026-11-09T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const uid = process.getuid!();
+    const project = fs.realpathSync(work).replace(/[^A-Za-z0-9]/g, "-");
+    const tasks = path.join(tmpdir("cc-tmp-"), `claude-${uid}`, project, REF, "tasks");
+    fs.mkdirSync(tasks, { recursive: true });
+    const question = path.join(tmpdir("cc-question-"), "up");
+    const t = terminal(fs.realpathSync(work), h.attachDir, 300, { FAKE_TORN_ROW: "1", FAKE_TASKS_DIR: tasks, FAKE_TITLE: "autopilot", FAKE_QUESTION_FILE: question }, true);
+    fs.writeFileSync(t.row, "");
+    const old = (Date.now() - 3_600_000) / 1000;
+    fs.utimesSync(t.row, old, old);
+    h.setLive([]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    fs.appendFileSync(t.transcript, `${JSON.stringify({ type: "system", sessionId: REF, entrypoint: "cli" })}\n${JSON.stringify({ type: "custom-title", customTitle: "autopilot", sessionId: REF })}\n`);
+    await h.online();
+    const live = (b: any) => b.agents[0].capabilities.resumable?.find((r: any) => r.ref === REF)?.input === "terminal";
+    await h.claw.until("a heartbeat that lists it live, typed into", () => h.claw.heartbeats.some(live));
+    const sid = await h.attach(REF);
+    fs.writeFileSync(question, "");
+    await until("the question on the screen", () => t.tmux("capture-pane", "-p", "-t", "%0").includes("Do you want to proceed?"));
+    const asked = h.claw.heartbeats.length;
+    await h.claw.until("a heartbeat made with the question up that no longer proves it", () => h.claw.heartbeats.slice(asked + 1).some((b) => !live(b)));
+    // The row reads now, but says no status: nothing proves the process, and the row is not the torn one.
+    fs.writeFileSync(t.row, JSON.stringify({ pid: t.pid, sessionId: REF }));
+    const seq = h.prompt(sid, "from the phone");
+    const told = await h.claw.until("the notice that a question holds it", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === seq));
+    assert.equal(told.data.reason, "terminal_dialog");
+    assert.equal(told.data.dialog, 'Bash command: rm -rf "$(echo …/build)"');
+    assert.equal(told.data.registry_row_unreadable, undefined);
+    const end = await h.claw.until("the turn's end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
+    assert.deepEqual([end.data.stopReason, end.data.error], ["error", "terminal_state_unknown"]);
+    assert.deepEqual(typed(t.transcript), [], "nothing was typed");
   });
 
   for (const c of [
