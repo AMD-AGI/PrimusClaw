@@ -136,13 +136,13 @@ describes each one. Keep the filled-in file outside any repository.
 To put the personal agent on another chat app than Teams, see
 [`personal-agent/docs/adding-a-surface.md`](personal-agent/docs/adding-a-surface.md).
 
-From the published image, here release 0.10.2 (it runs as uid 65534; the state
+From the published image, here release 0.10.3 (it runs as uid 65534; the state
 volume must be writable by it):
 
 ```bash
 docker run --env-file /path/outside/the/repo/worker.env \
   -v personal-agent-data:/data \
-  docker.io/rocm/primusclaw:personal-agent-teams-0.10.2
+  docker.io/rocm/primusclaw:personal-agent-teams-0.10.3
 ```
 
 To build the same image from a checkout instead, run
