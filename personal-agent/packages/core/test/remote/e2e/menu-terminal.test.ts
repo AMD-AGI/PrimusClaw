@@ -6,9 +6,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { decode } from "../../../src/remote/events.js";
-import { NO_ASK_MODES, noAskLine } from "../../../src/remote/lines.js";
+import { NO_ASK_MODES, noAskLine, queuedLine, queuedNote, rowUnreadableLine } from "../../../src/remote/lines.js";
+import { RemoteLiveView } from "../../../src/remote-view/live-view.js";
 import type { RemoteStep } from "../../../src/remote/events.js";
 import type { FakeCommand, FakeRemote } from "../../../../../test-support/remote-fake.js";
+import type { Recorded } from "../../../../../test-support/surface.js";
 import {
   ALICE,
   type RemoteWorld,
@@ -225,6 +227,150 @@ test("a conversation open in a terminal its connector types into takes messages 
     await runner.apply(request, step, display);
     assert.equal(seen.at(-1), "⏳ 已排队");
   }));
+
+/** What a connector says of a question on the terminal's screen, as it says it (connector session.ts `terminal_input_queued`). */
+const RM_ASKS = 'Bash command: rm -rf "$(echo …/build)"';
+
+/**
+ * A connector that types into a terminal whose Claude Code has a registry row it cannot read (it says so at the start), and whose
+ * screen shows a question of its own when the message comes: it says what the question asks, twice (a second question after the
+ * first), and the message runs once the questions are answered there.
+ */
+class AtAQuestion extends Script {
+  /** The turn's own reply, sent once the test lets the questions be answered. */
+  readonly tasks: Promise<void>[] = [];
+
+  constructor(private readonly answered: Promise<void>) {
+    super();
+  }
+
+  protected override async handle(srv: FakeRemote, cmd: FakeCommand): Promise<void> {
+    const sid = cmd.session_id;
+    if (cmd.type === "session.new") {
+      await srv.emit(sid, "session_started", {
+        acp_session_id: "acp-1",
+        agent_id: "claude-attach",
+        kind: "claude",
+        cwd: "/home/me/work/term",
+        title: "autopilot",
+        attached: true,
+        live_terminal: true,
+        input: "terminal",
+        modes: [],
+        currentMode: null,
+        terminal_mode: "default",
+        registry_row_unreadable: true,
+      });
+    } else if (cmd.type === "prompt") {
+      for (const dialog of [RM_ASKS, "Create file: notes.md"]) {
+        await srv.emit(sid, "terminal_input_queued", {
+          reason: "terminal_dialog",
+          cmd_id: cmd.cmd_id ?? null,
+          cmd_seq: 1,
+          queued: 1,
+          dialog,
+          registry_row_unreadable: true,
+        });
+      }
+      this.tasks.push(
+        this.answered.then(async () => {
+          await srv.emit(sid, "agent_message_chunk", chunk("agent_message_chunk", "Done in the terminal."));
+          await srv.end(sid, "end_turn");
+        }),
+      );
+    }
+  }
+}
+
+for (const lang of ["en", "zh"] as const) {
+  test(`a message held by a question on the terminal says what it asks and a registry row it cannot read is said once: ${lang}`, () =>
+    remoteWorld(
+      async (w) => {
+        let answer = (): void => undefined;
+        const answered = new Promise<void>((resolve) => {
+          answer = resolve;
+        });
+        const script = new AtAQuestion(answered);
+        // (the live view's waits stay virtual; one of more than a minute, the stream's own closing, does not come within the test)
+        const virtual = w.virtual.sleep.bind(w.virtual);
+        w.virtual.sleep = (ms, signal) =>
+          ms > 60_000
+            ? new Promise<void>((_resolve, reject) => {
+                signal?.addEventListener("abort", () => {
+                  reject(signal.reason as Error);
+                });
+              })
+            : virtual(ms, signal);
+        w.server.addConnector(ALICE, "dev-pod", ATTACH_AGENT, { caps: typingCaps(w) });
+        w.server.onCommand = script.hook;
+        w.setLang(AAD, lang);
+        await press(w, await agentsCard(w), lang === "en" ? CONNECT : "连上（终端照常用）");
+        await w.idle();
+        const said = w.say("please run the tests again");
+        const asks = queuedNote("terminal_dialog", RM_ASKS, lang);
+        const short = queuedLine("terminal_dialog", lang);
+        const ops = (): Recorded[] => w.surface.outbox;
+        // What the person reads while it waits is what the question asks (the floating status: its short line), never the bare
+        // "waiting for the terminal".
+        try {
+          await w.until(() => JSON.stringify(ops()).includes(JSON.stringify(asks).slice(1, -1)));
+          await w.until(() => ops().some((r) => r.op === "stream.inform" && r.text.includes(short)));
+        } finally {
+          answer();
+        }
+        await said;
+        await Promise.all(script.tasks);
+        await w.until(() => JSON.stringify(ops()).includes("Done in the terminal."));
+        assert.ok(
+          !ops().some((r) => r.op === "stream.inform" && r.text.includes(queuedLine("terminal_state_unknown", lang))),
+        );
+        // Each question said once in the chat, in the order they came; the bare wait never.
+        const questions = w
+          .said()
+          .filter((t) => t.includes(lang === "en" ? "waiting for your confirmation" : "终端在等你确认"));
+        assert.deepEqual(questions, [asks, queuedNote("terminal_dialog", "Create file: notes.md", lang)]);
+        const hint = rowUnreadableLine(lang);
+        assert.ok(hint.includes("claude --resume"), hint);
+        assert.equal(
+          JSON.stringify(ops()).split("claude --resume").length - 1,
+          1,
+          `said once per attach: ${w.said().join(" | ")}`,
+        );
+        assert.equal(
+          asks,
+          lang === "en"
+            ? '⏳ The terminal is waiting for your confirmation: Bash command: rm -rf "$(echo …/build)"'
+            : '⏳ 终端在等你确认：Bash command: rm -rf "$(echo …/build)"',
+        );
+      },
+      { direct: true, streaming: true },
+    ));
+}
+
+test("a wait for a question on the terminal is the whole line in the live view and a short one in the floating status", () => {
+  const view = new RemoteLiveView("🤖 Claude", "zh");
+  const step = decode(
+    {
+      name: "terminal_input_queued",
+      data: {
+        data: { reason: "terminal_dialog", cmd_seq: 1, queued: 1, dialog: RM_ASKS, registry_row_unreadable: true },
+      },
+      id: "q1",
+    },
+    WORLD_ERRORS,
+  );
+  assert.deepEqual([step.queued, step.dialog, step.rowUnreadable], ["terminal_dialog", RM_ASKS, true]);
+  view.apply({
+    ...step,
+    note: queuedNote("terminal_dialog", step.dialog, "zh"),
+    waitLine: queuedLine("terminal_dialog", "zh"),
+  });
+  assert.deepEqual(view.statusLines(), ["⏳ 等你确认"]);
+  assert.ok(view.render().includes('⏳ 终端在等你确认：Bash command: rm -rf "$(echo …/build)"'), view.render());
+  // (no summary: the question all the same)
+  assert.equal(queuedNote("terminal_dialog", null, "en"), "⏳ The terminal is waiting for your confirmation");
+  assert.equal(queuedNote("terminal_working", null, "zh"), "⏳ 已排队");
+});
 
 test("what is typed at the shared terminal shows on the phone before its reply and leaving ends nothing there", () =>
   remoteWorld(async (w) => {

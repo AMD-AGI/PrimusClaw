@@ -16,6 +16,8 @@ import type { TurnDisplay } from "./display.js";
 
 export class WindowTurn implements TurnDisplay {
   tail = "";
+  /** (the card's state line says why a message waits, whole) */
+  readonly showsWaits = true;
   private readonly segments: string[] = [];
   private newSegment = true;
   private closed = false;

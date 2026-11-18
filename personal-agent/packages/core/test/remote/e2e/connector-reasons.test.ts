@@ -136,7 +136,7 @@ test("a session claw closed with its machine says why in words", async () => {
 for (const [reason, words] of [
   ["terminal_working", "已排队"],
   ["terminal_typing", "输入框"],
-  ["terminal_dialog", "弹窗"],
+  ["terminal_dialog", "等你确认"],
   ["terminal_screen", "等终端"],
   ["something_new", "等终端"],
 ] as const) {

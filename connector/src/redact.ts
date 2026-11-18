@@ -42,6 +42,25 @@ export function redactText(text: string): { text: string; masked: boolean } {
   return { text: out, masked };
 }
 
+/**
+ * Where in `text` each credential-shaped string {@link redactText} masks lies (`[start, end)`, in UTF-16 units), every rule run on the
+ * text as it is: for a caller that must mask the same characters in another rendering of the text (rows of a terminal joined
+ * differently).
+ */
+export function credentialSpans(text: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  for (const [re, group] of RULES) {
+    for (const m of text.matchAll(re)) {
+      const at = m.index;
+      if (group === 0) { spans.push([at, at + m[0].length]); continue; }
+      const value = m[group] ?? "";
+      const from = at + m[0].lastIndexOf(value);
+      spans.push([from, from + value.length]);
+    }
+  }
+  return spans;
+}
+
 /** A copy of `value` with every string inside it masked; keys are left alone. */
 export function redactDeep<T>(value: T): T {
   if (typeof value === "string") return redactText(value).text as T;

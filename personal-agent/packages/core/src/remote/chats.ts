@@ -87,6 +87,8 @@ export class ChatRegistry {
   private readonly readOnly = new Map<string, string>();
   private readonly readOnlyKnown = new Map<string, string>();
   private readonly terminalInput = new Map<string, string>();
+  /** The session each chat was told its terminal's registry row cannot be read for (once per attach). */
+  private readonly rowHinted = new Map<string, string>();
   private readonly tickets = new Map<string, TakeoverTicket>();
 
   /** How many messages wait behind the chat's running turn. */
@@ -198,6 +200,13 @@ export class ChatRegistry {
     else if (this.terminalInput.get(chatKey) === sessionId) this.terminalInput.delete(chatKey);
   }
 
+  /** True the first time for a chat's session: the chat is to be told its terminal's registry row cannot be read. */
+  firstRowHint(chatKey: string, sessionId: string): boolean {
+    if (!sessionId || this.rowHinted.get(chatKey) === sessionId) return false;
+    this.rowHinted.set(chatKey, sessionId);
+    return true;
+  }
+
   /** What is sent to the chat's session is typed into a terminal on the machine. */
   typesIntoTerminal(chatKey: string, sessionId: string | null): boolean {
     return sessionId !== null && this.terminalInput.get(chatKey) === sessionId;
@@ -243,6 +252,7 @@ export class ChatRegistry {
     this.agentUnattended.delete(chatKey);
     this.readOnly.delete(chatKey);
     this.readOnlyKnown.delete(chatKey);
+    this.rowHinted.delete(chatKey);
     this.queuedPrompts.delete(chatKey);
     this.refusals.delete(chatKey);
   }

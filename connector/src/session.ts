@@ -61,7 +61,9 @@ export interface SessionTiming {
   /**
    * A message for a terminal whose process cannot be told to hold the conversation still (its Claude Code says nothing of it), or
    * whose box holds someone's half-typed text, or whose screen is scrolled back, waits this long, then is refused
-   * (`terminal_state_unknown`, `terminal_busy`). Whether that Claude Code is busy is never waited on, nor a question on its screen.
+   * (`terminal_state_unknown`, `terminal_busy`). Whether that Claude Code is busy is never waited on, nor a question on its screen
+   * (one in the pane it types into is waited out however long it is up, even while the question hides what proves a process whose
+   * registry row is torn; one on a process nothing else proves is told, and waits this long).
    */
   terminalWaitMs: number;
   /** A message typed into a terminal must show up in its transcript within this long, or its turn ends `terminal_input_unconfirmed`. */
@@ -386,9 +388,13 @@ export class Session {
     if (pane.ok) {
       this.audit("session_terminal_input", { cwd: this.cwd, acp_session_id: this.acpId, pid: pane.pane.pid, pane: pane.pane.pane, terminal_mode: terminalMode, detail: detail.slice(0, 300) });
       // Not read-only: what is sent is typed into the terminal. The terminal keeps its own mode; it is not the phone's to set.
+      // (a process whose registry row cannot be read is known to hold the conversation only while its screen shows the box: said, so
+      // the chat can say once that a restart of it makes it known again)
+      const unreadable = support.rowUnreadable(pane.pane.pid);
       this.emit("session_started", {
         acp_session_id: this.acpId, agent_id: this.agent.id, kind: this.agent.kind, cwd: this.cwd, title, attached: true,
         live_terminal: true, input: "terminal", modes: [], currentMode: null, terminal_mode: terminalMode,
+        ...(unreadable ? { registry_row_unreadable: true } : {}),
       });
     } else {
       this.audit("session_spectating", { cwd: this.cwd, acp_session_id: this.acpId, detail: detail.slice(0, 300), why_not_typed: pane.why.slice(0, 300) });
@@ -522,6 +528,10 @@ export class Session {
         const term = this.terminal;
         if (!term) { refused("terminal_input_unavailable"); continue; }
         let told = "";
+        // (what the question on the screen asks, as last told: a new question is told again)
+        let toldDialog: string | null = null;
+        // (whether the holder was looked at anew since a question went away)
+        let reproved = false;
         let ready = false;
         // Typed in any permission mode (the terminal's owner chose it); the mode is recorded with what was typed.
         // Since when the screen has been one this connector cannot read (no input box, and no question it knows), and since when
@@ -534,14 +544,33 @@ export class Session {
           // conversation, and that its screen can take the keys without anything on it answering to them.
           const status = this.holderStatus(term);
           let why: string;
+          let dialog: string | null = null;
+          // (a question on a screen whose process nothing proves, and whose registry row is not the torn one: bounded)
+          let blindDialog = false;
           if (status === "other") { told = WAIT_WHY.other; break; }   // (the terminal is on another conversation now, or gone)
           if (status === null) {
-            why = WAIT_WHY.unknown;
+            // Nothing says the process holds this conversation still. A question on its screen hides the box, and with it the name a
+            // process whose row cannot be read is proven by (`provenBlindHold`): one on the pane this session types into, in the
+            // process proven at the start, is waited out as the question it is, never typed into (nothing is typed while the holder
+            // is not proven: `sameHolder` below). Anything else on the screen is still a state this connector cannot tell. Only a
+            // process whose row is there but cannot be read has its question waited out however long it is up; one whose row says
+            // nothing else of it (no row yet, another pid, no status) is told the question but waits terminalWaitMs, as before.
+            const r = await term.readiness();
+            if (!r.ready && r.why === "dialog") { why = WAIT_WHY.dialog; dialog = r.dialog; } else why = WAIT_WHY.unknown;
+            blindDialog = why === WAIT_WHY.dialog && this.env.attach.get(this.agent.id)?.rowUnreadable(term.ref.pid) !== true;
+            // (the question gone: its box shows the conversation's name again, and the proof is made anew at once, not at the next
+            // heartbeat's look)
+            if (why === WAIT_WHY.dialog) reproved = false;
+            else if (told === WAIT_WHY.dialog && !reproved) {
+              reproved = true;
+              if (await this.env.attach.get(this.agent.id)?.refreshBlind()) continue;
+            }
           } else {
             // (`unread`: Claude Code's row for that process cannot be read, but the process is proven to hold this conversation)
             const r = await term.readiness();
             if (r.ready) { ready = true; break; }
             why = WAIT_WHY[r.why];
+            if (r.why === "dialog") dialog = r.dialog;
             if (r.why === "gone") { told = why; break; }
           }
           // A typed-in, scrolled-back or questioning terminal is waited for (the phone is told it is queued); one that cannot be read
@@ -553,16 +582,17 @@ export class Session {
             unreadableSince = null;
           }
           // (someone's half-typed text in the box, or a screen scrolled back, held for as long as terminalWaitMs: refused then, as
-          // before; a question on the screen is waited out however long it is up)
-          if (why === WAIT_WHY.unknown || why === WAIT_WHY.typing || why === WAIT_WHY.copy_mode) {
+          // before; a question on the screen is waited out however long it is up, unless nothing proves the process: `blindDialog`)
+          if (why === WAIT_WHY.unknown || blindDialog || why === WAIT_WHY.typing || why === WAIT_WHY.copy_mode) {
             heldSince ??= Date.now();
-            if (Date.now() - heldSince >= this.env.timing.terminalWaitMs) { refusal = why === WAIT_WHY.unknown ? "terminal_state_unknown" : "terminal_busy"; told = why; break; }
+            if (Date.now() - heldSince >= this.env.timing.terminalWaitMs) { refusal = why === WAIT_WHY.unknown || blindDialog ? "terminal_state_unknown" : "terminal_busy"; told = why; break; }
           } else {
             heldSince = null;
           }
-          if (why !== told) {
+          if (why !== told || (why === WAIT_WHY.dialog && dialog !== toldDialog)) {
             told = why;
-            this.emit("terminal_input_queued", { reason: why, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length });
+            toldDialog = dialog;
+            this.emit("terminal_input_queued", { reason: why, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length, ...this.waitDetail(term, why, dialog) });
           }
           await sleep(Math.max(200, Math.min(1_000, this.env.timing.spectateMs * 5)));
         }
@@ -639,7 +669,7 @@ export class Session {
         try {
           // (a question that shows after the text went in holds the Enter until it is gone; the phone is told why it waits)
           await term.type(text, {
-            onDialog: () => this.emit("terminal_input_queued", { reason: WAIT_WHY.dialog, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length + 1 }),
+            onDialog: (dialog) => this.emit("terminal_input_queued", { reason: WAIT_WHY.dialog, cmd_id: next.cmdId, cmd_seq: next.cmdSeq, queued: this.terminalQueue.length + 1, ...this.waitDetail(term, WAIT_WHY.dialog, dialog) }),
             stillWanted: () => !this.closed && !this.stopping && this.terminalTurn === turn && this.sameHolder(term),
             submitted: () => turn.seen || turn.queued === true,
             onPaste: () => { turn.pasted = true; },
@@ -671,6 +701,16 @@ export class Session {
     } finally {
       this.terminalPumping = false;
     }
+  }
+
+  /**
+   * What a queue notice says beside its reason: what the question on the screen asks (`dialog`, {@link dialogSummary}: one short
+   * line, paths cut and credentials masked), and that the terminal's process has a registry row that cannot be read
+   * (`registry_row_unreadable`: the chat says once that restarting it with `claude --resume` makes it known again).
+   */
+  private waitDetail(term: TerminalInput, why: string, dialog: string | null): Record<string, unknown> {
+    const unreadable = (why === WAIT_WHY.dialog || why === WAIT_WHY.unknown) && this.env.attach.get(this.agent.id)?.rowUnreadable(term.ref.pid) === true;
+    return { ...(why === WAIT_WHY.dialog && dialog ? { dialog } : {}), ...(unreadable ? { registry_row_unreadable: true } : {}) };
   }
 
   /**

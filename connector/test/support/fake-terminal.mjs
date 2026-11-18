@@ -34,12 +34,16 @@
  * FAKE_DIALOG_ON_KEY=1 (with FAKE_DIALOG_FILE): an adversary for the moment between the screen read and the keys. The question shows
  * as the first input arrives, before it is read; while it shows, a typed digit answers it ("approved", as Claude Code 2.1.285 takes a
  * lone `1`) and a paste is dropped (as Claude Code drops one, measured 2026-11-10).
+ * FAKE_QUESTION_FILE: while this file exists, a permission question of the terminal's own (a background agent's dangerous `rm`) is
+ * drawn in place of the box, as Claude Code 2.1.325 draws one (claude-question.mjs): the box, and the conversation's name in the
+ * rule above it, are not on the screen until the file is gone (answered at the terminal).
  * FAKE_DRAW_LAG_MS: while a turn runs, what comes in (a paste, a key) is drawn this much later (a busy Claude Code drawing late); what
  * the transcript records is written at once.
  * FAKE_PASTE_REF=1: a paste of several lines shows in the box as `[Pasted text #n +k lines]`, and the prompt (and the queue) records
  * it as Claude Code 2.1.285-2.1.319 does: `\n\n<pasted_content id="…">\n<the text>\n</pasted_content id="…">\n` in its place.
  */
 import fs from "node:fs";
+import { bashQuestion, toolLine } from "./claude-question.mjs";
 
 const transcript = process.env.FAKE_TRANSCRIPT;
 const rowFile = process.env.FAKE_ROW;
@@ -68,6 +72,13 @@ let mode = readMode();
 let dialog = false;
 let dialogShown = false;
 let selected = 0;   // (0: Yes, 1: No)
+/** A question of the terminal's own is up (FAKE_QUESTION_FILE exists). */
+const questionUp = () => Boolean(process.env.FAKE_QUESTION_FILE) && fs.existsSync(process.env.FAKE_QUESTION_FILE);
+let asking = questionUp();
+const QUESTION = {
+  command: 'rm -rf "$(echo /home/dev/project/build)"', description: "Remove the build folder",
+  warning: "Dangerous rm operation on statically-unresolvable target: command substitution output", width: 100,
+};
 const queue = [];
 const footer = () => (mode === "none" ? "  ? for shortcuts" : mode === "default"
   ? "  \x1b[38;5;246m⏸ manual mode on · ? for shortcuts\x1b[39m"
@@ -90,6 +101,11 @@ const line = (doc) => fs.appendFileSync(transcript, `${JSON.stringify({ sessionI
 function draw() {
   const rule = "─".repeat(60);
   const top = process.env.FAKE_TITLE ? `${"─".repeat(50)} ${process.env.FAKE_TITLE} ─` : rule;
+  if (asking) {
+    const q = [...toolLine("Bash", QUESTION.command), ...bashQuestion(QUESTION)];
+    process.stdout.write(`\x1b[2J\x1b[H${working ? "✻ Working…" : "  ready"}\r\n${q.join("\r\n")}\r\n`);
+    return;
+  }
   if (mode === "nobox") { process.stdout.write("\x1b[2J\x1b[H  another program\r\n  nothing to type into here\r\n"); return; }
   const lines = buffer ? buffer.split("\n") : [];
   const box = lines.length ? [`\x1b[39m❯ ${lines[0]}`, ...lines.slice(1).map((l) => `  ${l}`)] : ["\x1b[39m❯ \x1b[2mTry \"fix lint errors\"\x1b[0m"];
@@ -216,6 +232,7 @@ draw();
 setInterval(() => {
   const m = readMode();
   if (m !== mode) { mode = m; draw(); }
+  if (questionUp() !== asking) { asking = !asking; draw(); }
   if (dialog && process.env.FAKE_DIALOG_DISMISS) {
     if (fs.existsSync(process.env.FAKE_DIALOG_DISMISS)) {
       dialog = false;
