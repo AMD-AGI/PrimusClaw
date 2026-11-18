@@ -358,29 +358,29 @@ export function dialogSummary(screen: string): string | null {
 /** One mode on the footer below the box (`⏸ manual mode on`): not a line of a question. */
 const MODE_RE_ONE = new RegExp(`(?:^|[\\s·⏵⏸▶])(?:${Object.keys(CLAUDE_MODE_INDICATORS).join("|")}) on\\b`);
 
-/** A word of a command line: a quoted string, or a run of anything else up to a space (a space after a backslash is the word's). */
-const WORD_RE = /"[^"]*"|'[^']*'|(?:\\.|[^\s"'])+/g;
-/** A path inside a quoted string, which may hold spaces: from where it starts up to what ends it in a shell (a quote, `)`, `$`, `;`...). */
-const QUOTED_PATH_RE = /(^|[\s(=:])((?:[^\s"'`()$;|&<>/]*)\/[^"'`()$;|&<>]*)/g;
+/**
+ * A word of a command line as a shell splits it: quoted parts (spaces and all; one left open runs to the end of the line), escaped
+ * characters and anything else up to an unquoted space, joined: `/a/"b c"/d` is one word.
+ */
+const WORD_RE = /(?:"[^"]*(?:"|$)|'[^']*(?:'|$)|\\.|[^\s"'\\])+/g;
+/** What a path in a word starts after: a space or quote inside it, `=` (`--out=/a`), `(`, `$`, `:`, a backtick. */
+const PATH_START = /[\s"'=($:`]/;
 
-/** A path of two parts or more as only its last part (`/home/me/build` -> `…/build`); a path of one part (`/`, `/tmp`) as it is. */
-function cutPath(p: string): string {
-  const parts = p.split("/").filter(Boolean);
-  return parts.length < 2 ? p : `…/${parts[parts.length - 1]!}${p.endsWith("/") ? "/" : ""}`;
-}
-
-/** Every path in a line said by its last part only: in a quoted string (spaces and all) and as a word of its own. */
+/**
+ * Every path in a line said by its last part only (`/home/me/build` -> `…/build`): in each word, everything from where its first
+ * path starts to its last slash goes, whatever quotes or escapes it is written with (`cat /a/"b c"/key` -> `cat …/key`). A path of
+ * one part (`/`, `/tmp`) is said as it is: what a dangerous `rm` reaches is never hidden that way.
+ */
 function cutPaths(text: string): string {
   return text.replace(WORD_RE, (word) => {
-    if (!word.includes("/")) return word;
-    if (word.startsWith('"') || word.startsWith("'")) {
-      return word[0]! + word.slice(1, -1).replace(QUOTED_PATH_RE, (_m, before: string, p: string) => {
-        const trailing = /\s*$/.exec(p)![0];
-        return before + cutPath(p.slice(0, p.length - trailing.length)) + trailing;
-      }) + word[0]!;
-    }
-    // (a word that is more than a path, `--out=/a/b` or `$(echo /a/b)`: the path in it, from its first slash's part)
-    return word.replace(/(?:\\.|[^\s"'`()$;|&<>=\\])*\/(?:\\.|[^\s"'`()$;|&<>\\])*/g, (p) => cutPath(p));
+    const first = word.indexOf("/");
+    if (first < 0) return word;
+    const last = word.lastIndexOf("/");
+    let from = first;
+    while (from > 0 && !PATH_START.test(word[from - 1]!)) from--;
+    // (only a leading slash, or `~/`, `./`: one part)
+    if (/^(?:~|\.{1,2})?\/$/.test(word.slice(from, last + 1))) return word;
+    return `${word.slice(0, from)}…/${word.slice(last + 1)}`;
   });
 }
 

@@ -57,6 +57,10 @@ describe("what a question on the screen asks", () => {
     assert.equal(asks("cat /Private\\ Documents/key"), "Bash command: cat …/key");
     assert.equal(asks("tar --file=/srv/backups/db.tar x"), "Bash command: tar --file=…/db.tar x");
     assert.equal(asks("echo $(cat /etc/secret/x)"), "Bash command: echo $(cat …/x)");
+    // (one path written in parts, quoted and not, as a shell joins them: cut as one)
+    assert.equal(asks('cat /private/"secret key"'), 'Bash command: cat …/"secret key"');
+    assert.equal(asks("cat '/a b'/c/'d e'"), "Bash command: cat '…/'d e'");
+    assert.equal(asks('cat "/Private Documents/key'), 'Bash command: cat "…/key', "a quote left open runs to the end");
     assert.equal(asks("rm -rf /"), "Bash command: rm -rf /", "what a dangerous rm reaches is never hidden");
     assert.equal(asks("ls /tmp"), "Bash command: ls /tmp");
   });
