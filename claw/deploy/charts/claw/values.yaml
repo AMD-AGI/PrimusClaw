@@ -586,9 +586,12 @@ identity:
   # Who verifies callers in the SaFE deployment mode (CLAW_AUTH_PROVIDER), for the API.
   # "safe": SaFE's /api/v1/auth/verify returns the user and the platform key.
   # "identity": the identity service introspects cookies and ak- keys and holds each user's platform key
-  # (GET /api/v1/apikeys/platform on endpoints.api, or the origin of endpoints.introspection).
-  # Needs identity.enabled, endpoints.introspection, and secret.llmKeySource=platformKey.
-  # Provider roles (including system-admin) become Claw platform roles verbatim.
+  # (GET /api/v1/apikeys/platform under endpoints.api, or under endpoints.introspection without
+  # /oauth/introspect), read with the user's session and this API's client (clientId, clientSecret).
+  # Needs identity.enabled, clientId, clientSecret, endpoints.introspection, and secret.llmKeySource=platformKey;
+  # the API refuses to start without them.
+  # Platform roles come from the provider's roles only as listed in CLAW_IDENTITY_TOKEN_TRUSTED_ROLES;
+  # every caller also has "default".
   # Access-token callers under this provider get no SaFE-exchanged LLM/sandbox keys.
   authProvider: safe
   # The issuer identifier, exactly as it appears in the `iss` claim of its tokens.
@@ -605,7 +608,7 @@ identity:
   # never discovered; with all three pinned discovery is not fetched at all.
   endpoints:
     introspection: ""
-    # Base URL for identity HTTP APIs (platform key). Empty: origin of introspection.
+    # Base URL for identity HTTP APIs (platform key), path included. Empty: introspection without /oauth/introspect.
     api: ""
     token: ""
     jwks: ""

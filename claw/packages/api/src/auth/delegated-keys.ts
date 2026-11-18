@@ -27,6 +27,7 @@ import { ACCESS_TOKEN_TYPE, IdentityExchangeRefusedError, IdentityUnavailableErr
 import {
   AuthServiceMisconfiguredError, AuthUpstreamUnreachableError, SafeUpstreamHttpError, SafeUpstreamProtocolError, type SafeClient,
 } from "./safe-client.js";
+import { IdentityUpstreamError } from "./identity-verifier.js";
 
 /** The keys SaFE holds for a token's subject, or why the caller has none. */
 export type SaFeKeys =
@@ -188,6 +189,7 @@ export class DelegatedKeys {
 export function safeFailureOf(err: unknown): Exclude<SaFeKeys, { status: "keys" }> {
   if (err instanceof AuthServiceMisconfiguredError) return { status: "misconfigured", message: err.message };
   // A 2xx that is not an answer (not JSON, no id) is SaFE, or something in front of it, failing: not a refusal.
+  if (err instanceof IdentityUpstreamError) return { status: "unavailable", source: "identity" };
   if (err instanceof AuthUpstreamUnreachableError || err instanceof SafeUpstreamProtocolError) return { status: "unavailable", source: "safe" };
   if (err instanceof SafeUpstreamHttpError) {
     return err.status >= 500 ? { status: "unavailable", source: "safe" } : { status: "none", reason: `safe_http_${err.status}` };

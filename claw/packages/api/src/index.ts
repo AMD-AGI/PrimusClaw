@@ -22,7 +22,7 @@ import { initNats, nc as natsConnection } from "./infra/nats.js";
 import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
-import { identityServiceOrigin } from "./auth/identity-verifier.js";
+import { identityApiBase } from "./auth/identity-verifier.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerSessionDeliveryRoutes } from "./routes/session-deliveries.js";
 import { registerAnswerFeedbackRoutes } from "./routes/answer-feedback.js";
@@ -115,12 +115,6 @@ function validateStartupConfig(): void {
   if (!isDev) {
     if (!SAFE_API_URL) missing.push("SAFE_API_URL");
     if (!AUTH_INTERNAL_TOKEN) missing.push("AUTH_INTERNAL_TOKEN");
-    if (isIdentityAuthProvider()) {
-      if (!envBool("IDENTITY_CLIENT_ENABLED", false)) {
-        missing.push("IDENTITY_CLIENT_ENABLED");
-      }
-      if (!identityServiceOrigin(process.env.IDENTITY_INTROSPECTION_URL)) missing.push("IDENTITY_INTROSPECTION_URL");
-    }
   }
   if (missing.length) {
     logger.warn({ missing, APP_ENV }, "startup.config_missing");
@@ -176,6 +170,23 @@ function assertIdentityUsesPlatformKey(): void {
     "CLAW_AUTH_PROVIDER=identity requires LLM_KEY_SOURCE=platformKey: the identity " +
       "verifier leaves virtualKey empty, so Engines and the sandbox must use the platform key.",
   );
+}
+
+/**
+ * Refuse identity auth outside dev mode without the identity client and a usable identity URL:
+ * without them every request is answered 500.
+ */
+function assertIdentityAuthConfig(): void {
+  if (!isIdentityAuthProvider()) return;
+  if (["dev", "development", "local"].includes(APP_ENV.toLowerCase())) return;
+  const missing: string[] = [];
+  if (!envBool("IDENTITY_CLIENT_ENABLED", false)) missing.push("IDENTITY_CLIENT_ENABLED");
+  if (!(process.env.IDENTITY_CLIENT_ID ?? "").trim()) missing.push("IDENTITY_CLIENT_ID");
+  if (!(process.env.IDENTITY_CLIENT_SECRET ?? "").trim()) missing.push("IDENTITY_CLIENT_SECRET");
+  if (!identityApiBase(process.env.IDENTITY_INTROSPECTION_URL)) missing.push("IDENTITY_INTROSPECTION_URL or IDENTITY_API_URL");
+  if (missing.length === 0) return;
+  logger.error({ missing }, "startup.identity_auth_refused");
+  throw new Error(`CLAW_AUTH_PROVIDER=identity cannot authenticate without: ${missing.join(", ")}`);
 }
 
 /**
@@ -243,6 +254,7 @@ async function main() {
   }
   assertNoSharedIdentityBypass();
   assertIdentityUsesPlatformKey();
+  assertIdentityAuthConfig();
   assertRunLeaseTiming();
   assertAssistantTokenKey(CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY);
   assertTriggerToolsConfig(CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY);
