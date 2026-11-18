@@ -179,8 +179,9 @@ export function resourcesMapToWorkloadArray(map: Record<string, string>): Array<
  * IPs, infera SSHes into the GPU pods directly and needs their IPs plus a
  * private key, and atomesh and sglangrouter hand their whole cluster over --
  * service and engine URLs included -- as one node list (`HYPERLOOM_MN_NODE_LIST`).
- * An infera cluster of `infera.engine.sglang` engines is handed over as a node
- * list too; any other infera cluster keeps the topology handoff.
+ * An infera cluster of `infera.engine.sglang` engines also gets the node list,
+ * beside the topology handoff and legacy variables every infera cluster gets; a
+ * reader that knows the node list prefers it.
  * Only the variables the active backend reads are set, since Hyperloom infers
  * the mode from which ones are present.
  *
@@ -199,11 +200,9 @@ export function applyMultiNodeExternalEnv(
 ): void {
   delete env.SAFE_API_URL;
   const nodeList = buildNodeList(ctx);
-  if (nodeList) {
-    env[MN_NODE_LIST_ENV] = JSON.stringify(nodeList);
-    return;
-  }
+  if (nodeList) env[MN_NODE_LIST_ENV] = JSON.stringify(nodeList);
   if (backendRequiresDisaggregatedPd(ctx.backend)) {
+    if (nodeList) return;
     throw new SandboxFailure(
       "mn_handoff_incomplete",
       `${ctx.backend} cluster ${ctx.name} cannot be handed over: it needs router, prefill and decode pod IPs and the launch request`,
@@ -358,14 +357,9 @@ export function buildNodeList(ctx: MultiNodeContext): MultiNodeNodeList | undefi
   return Object.assign(nodeList, nodeListLaunch(ctx, pd, true));
 }
 
-/** True when the cluster is handed over as a node list: always for atomesh and sglangrouter, for infera when one builds. */
-export function usesNodeList(ctx: MultiNodeContext): boolean {
-  return backendRequiresDisaggregatedPd(ctx.backend) || inferaNodeListEligible(ctx);
-}
-
 /** True when the backend hands its cluster over through the topology handoff file. */
 export function usesTopologyHandoff(ctx: MultiNodeContext): boolean {
-  return !usesNodeList(ctx);
+  return !backendRequiresDisaggregatedPd(ctx.backend);
 }
 
 /**

@@ -494,8 +494,8 @@ export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string,
     `export MN_SSH_PORT=${sshPortForPod("frontend", null, sshPortBase)}`,
     ...PD_SSHD_BOOTSTRAP,
     ...detachedServer(
-      `python3 -m infera.server --host 0.0.0.0 --port ${frontendPort} ` +
-        `--router-tokenizer-path ${shellSingleQuote(p.model.trim())}`,
+      `python3 -m infera.server --host 0.0.0.0 --port ${frontendPort} --router-policy round-robin ` +
+        `--router-tokenizer-path ${shellSingleQuote(p.model.trim())} --enable-profiling`,
       String(frontendPort),
     ),
     PD_HOLD,

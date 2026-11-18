@@ -255,8 +255,8 @@ test("buildInferaWorkloadBody deploys aggregated workers idle with a role-scoped
     new RegExp(`infera\\.server .*--port ${port} .*--router-tokenizer-path '/models/Qwen3-30B-A3B'`),
   );
   const frontend = decodeEp(body.entryPoints[0]);
-  assert.equal(frontend.includes("--router-policy"), false);
-  assert.equal(frontend.includes("--enable-profiling"), false);
+  assert.match(frontend, / --router-policy round-robin /);
+  assert.match(frontend, / --enable-profiling( |$)/m);
   // The worker never starts an engine at deploy time; the optimizer SSHes in.
   assert.equal(
     decodeEp(body.entryPoints[1]),

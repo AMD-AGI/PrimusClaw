@@ -251,11 +251,18 @@ test("infera hands an infera.engine.sglang cluster over as a node list behind it
       router_args: "",
     },
   });
-  for (const name of ["TOPOLOGY_HANDOFF_FILE", "HYPERLOOM_MN_EXT_SERVICE_URL", "HYPERLOOM_MN_EXT_SSH_KEY"]) {
-    assert.equal(env[name], undefined, name);
-  }
-  assert.equal(usesTopologyHandoff(INFERA_PD_CTX), false);
   assert.ok(!env[MN_NODE_LIST_ENV]!.includes("SECRETKEYBODY"), "the key is passed by path only");
+});
+
+test("an infera cluster with a node list also keeps the topology handoff and the legacy variables", () => {
+  const env: Record<string, string> = {};
+  applyMultiNodeExternalEnv(env, INFERA_PD_CTX, { legacyTopologyEnv: true });
+  assert.ok(env[MN_NODE_LIST_ENV]);
+  assert.equal(env.TOPOLOGY_HANDOFF_FILE, "/tmp/claw-topology/topology.json");
+  assert.equal(env.HYPERLOOM_MN_EXT_SERVICE_URL, INFERA_CTX.serviceUrl);
+  assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, "/tmp/primus-claw-mn-ssh-key");
+  assert.equal(env.INFERENCE_OPTIMIZER_MN_BACKEND, "infera");
+  assert.equal(usesTopologyHandoff(INFERA_PD_CTX), true);
 });
 
 test("aggregated infera names worker hosts and the server args as the workers' args", () => {

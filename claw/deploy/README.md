@@ -75,6 +75,10 @@ node, SSH port, user and key path, transfer backend, optional per-role topology
 and args, `launch_mode: in_place`), and no other multi-node variable. A
 Hyperloom that does not read the node list cannot drive these clusters.
 
+An infera cluster of `infera.engine.sglang` engines gets the same node list
+(`frontend: infera`, `launch_mode: direct`) in addition to the topology file and
+the variables above; a reader that knows the node list prefers it.
+
 ### Upgrade Note: Multi-Node Default Timeout
 
 The multi-node workload lifetime used when a request carries no timeout is now
