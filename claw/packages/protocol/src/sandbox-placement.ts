@@ -119,11 +119,12 @@ export function parseSandboxPlacement(raw: unknown): SandboxPlacementParse {
       error: `placement.nodeLabels has ${entries.length} entries; at most ${SANDBOX_PLACEMENT_MAX_NODE_LABELS} are allowed`,
     };
   }
-  const nodeLabels: Record<string, string> = {};
   for (const [key, value] of entries) {
     const err = keyError(key) ?? valueError(key, value);
     if (err) return { ok: false, error: err };
-    nodeLabels[key] = value as string;
   }
+  // Built from the checked entries in one step rather than by assigning caller-named
+  // properties one at a time.
+  const nodeLabels = Object.fromEntries(entries) as Record<string, string>;
   return { ok: true, placement: { nodeLabels } };
 }
