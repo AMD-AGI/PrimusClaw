@@ -1,7 +1,8 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-export { IdentityClient, IDENTITY_DEFAULTS, type IdentityClientSettings } from "./client.js";
+export { IdentityClient, IDENTITY_DEFAULTS, MAX_BODY_BYTES as IDENTITY_MAX_BODY_BYTES, type IdentityClientSettings } from "./client.js";
+export { send as identitySend, type HttpAnswer, type HttpSettings } from "./http.js";
 export { readIdentityConfig, type IdentityConfig } from "./config.js";
 export {
   buildIdentityClient, startIdentityClient,

@@ -21,16 +21,22 @@
  *     the platform key for the LLM gateway.
  *
  * Failures: an identity service that cannot be reached, or that answers with an error, is
- * {@link AuthUpstreamUnreachableError} or {@link IdentityUpstreamError} (503); one that refuses this API's
- * client is {@link AuthServiceMisconfiguredError} (500); a refused credential is a plain Error (401).
+ * {@link IdentityUnreachableError} or {@link IdentityUpstreamError} (503); one that refuses this API's
+ * client or does not serve platform keys at the configured base is {@link AuthServiceMisconfiguredError} (500);
+ * an account the identity service refuses is {@link IdentityAccountRefusedError} (403); a refused credential is
+ * a plain Error (401).
  */
-import { IdentityUnavailableError, type IdentityClient, type IntrospectionResult } from "@claw/utils";
+import {
+  IDENTITY_MAX_BODY_BYTES, IdentityUnavailableError, identitySend, type IdentityClient, type IntrospectionResult,
+} from "@claw/utils";
 import type { UserInfo } from "./models.js";
 import { AuthServiceMisconfiguredError, AuthUpstreamUnreachableError, isApiKey } from "./safe-client.js";
 
 const PLATFORM_KEY_PATH = "/api/v1/apikeys/platform";
 const INTROSPECTION_PATH = "/oauth/introspect";
 const PLATFORM_KEY_TTL_MS = 60_000;
+const DEFAULT_TIMEOUT_MS = 5_000;
+const NO_PRIMARY_KEY_MESSAGE = "this user has no primary API key";
 const MAX_PLATFORM_KEYS = 1000;
 const MAX_NAME_CHARS = 128;
 
@@ -42,6 +48,24 @@ export class PlatformKeyMissingError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "PlatformKeyMissingError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/** The identity service refuses the session user's account (disabled or restricted). */
+export class IdentityAccountRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IdentityAccountRefusedError";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+/** The identity service cannot be reached; it has not judged the credential. */
+export class IdentityUnreachableError extends AuthUpstreamUnreachableError {
+  constructor(message: string, cause?: unknown) {
+    super(message, cause);
+    this.name = "IdentityUnreachableError";
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }
@@ -69,6 +93,7 @@ export interface IdentityVerifierOptions {
   /** Platform roles the provider may confer; anything else in an answer is dropped. */
   trustedRoles: readonly string[];
   fetchFn?: typeof fetch;
+  /** Request timeout for the platform key, IDENTITY_REQUEST_TIMEOUT_MS by default 5000. */
   timeoutMs?: number;
 }
 
@@ -84,7 +109,7 @@ function httpUrl(raw: string | undefined): URL | null {
 /**
  * Base URL for identity HTTP APIs (platform key), without a trailing slash. IDENTITY_API_URL when set, path
  * included; otherwise IDENTITY_INTROSPECTION_URL without its `/oauth/introspect` suffix. Empty when neither is a
- * usable http(s) URL.
+ * usable http(s) URL, or when the introspection URL does not end in `/oauth/introspect`.
  */
 export function identityApiBase(
   introspectionUrl: string | undefined,
@@ -98,8 +123,8 @@ export function identityApiBase(
   const u = httpUrl(introspectionUrl);
   if (!u) return "";
   const path = u.pathname.replace(/\/+$/, "");
-  const prefix = path.endsWith(INTROSPECTION_PATH) ? path.slice(0, -INTROSPECTION_PATH.length) : "";
-  return `${u.origin}${prefix}`;
+  if (!path.endsWith(INTROSPECTION_PATH)) return "";
+  return `${u.origin}${path.slice(0, -INTROSPECTION_PATH.length)}`;
 }
 
 /** Verifies callers with the identity service and resolves their platform keys. */
@@ -123,14 +148,14 @@ export class IdentityVerifier {
     this.clientToken = `${opts.client.clientId}:${opts.client.clientSecret}`;
     this.trusted = new Set(opts.trustedRoles);
     this.fetchFn = opts.fetchFn ?? fetch;
-    this.timeoutMs = opts.timeoutMs ?? 10_000;
+    this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
   /** Verify an `ak-` key; the key itself is the caller's platform key. */
   async verifyApiKey(apiKey: string): Promise<UserInfo> {
     if (!isApiKey(apiKey)) throw new Error("invalid API key format");
     const answer = await this.introspect(apiKey, {}, "invalid or expired API key");
-    if (answer.tokenType !== "api_key") throw new Error("invalid or expired API key");
+    if (tokenKind(answer) !== "api_key") throw new Error("invalid or expired API key");
     return this.userOf(answer, apiKey);
   }
 
@@ -138,7 +163,7 @@ export class IdentityVerifier {
   async verifyCookie(token: string, userType = ""): Promise<UserInfo> {
     if (!token) throw new Error("empty Token cookie");
     const answer = await this.introspect(token, userType ? { user_type: userType } : {}, "invalid or expired cookie");
-    if (answer.tokenType !== "session") throw new Error("invalid or expired cookie");
+    if (tokenKind(answer) !== "session") throw new Error("invalid or expired cookie");
     const key = await this.platformKeyOf(answer.sub ?? "", token, userType);
     return this.userOf(answer, key);
   }
@@ -154,7 +179,7 @@ export class IdentityVerifier {
         if (err.reason === "client_rejected") {
           throw new AuthServiceMisconfiguredError("the identity service refused this API's client; check IDENTITY_CLIENT_ID and its identity.introspect scope");
         }
-        throw new AuthUpstreamUnreachableError("cannot reach the identity service (network, timeout or error answer)", err);
+        throw new IdentityUnreachableError("cannot reach the identity service (network, timeout or error answer)", err);
       }
       throw err;
     }
@@ -181,14 +206,14 @@ export class IdentityVerifier {
     return flight;
   }
 
-  /** Keep a platform key as the most recently used entry, evicting the least recently used one when full. */
-  private remember(userId: string, key: string): void {
+  /** Keep a platform key as the most recently used entry until `notAfter` at most, evicting the least recently used one when full. */
+  private remember(userId: string, key: string, notAfter: number): void {
     this.platformKeys.delete(userId);
     if (this.platformKeys.size >= MAX_PLATFORM_KEYS) {
       const oldest = this.platformKeys.keys().next().value;
       if (oldest !== undefined) this.platformKeys.delete(oldest);
     }
-    this.platformKeys.set(userId, { key, expiresAt: Date.now() + PLATFORM_KEY_TTL_MS });
+    this.platformKeys.set(userId, { key, expiresAt: Math.min(Date.now() + PLATFORM_KEY_TTL_MS, notAfter) });
   }
 
   /** Ask the identity service for the session user's platform key and keep it. */
@@ -199,39 +224,42 @@ export class IdentityVerifier {
       Accept: "application/json",
     };
     if (userType) headers.UserType = userType;
-    let resp: Response;
+    let status: number;
+    let text: string;
     try {
-      resp = await this.fetchFn(`${this.apiUrl}${PLATFORM_KEY_PATH}`, {
-        method: "GET", headers, signal: AbortSignal.timeout(this.timeoutMs),
-      });
+      ({ status, body: text } = await identitySend("platform_key", this.fetchFn, `${this.apiUrl}${PLATFORM_KEY_PATH}`,
+        { method: "GET", headers }, { timeoutMs: this.timeoutMs, maxBodyBytes: IDENTITY_MAX_BODY_BYTES }));
     } catch (err) {
-      throw new AuthUpstreamUnreachableError("cannot reach the identity service to read the platform key", err);
+      if (err instanceof IdentityUnavailableError && err.reason === "bad_response") {
+        throw new IdentityUpstreamError("the identity service answered the platform key with a body over the size limit", err.status ?? null, { cause: err });
+      }
+      throw new IdentityUnreachableError("cannot reach the identity service to read the platform key", err);
     }
-    if (resp.status === 404) throw new PlatformKeyMissingError("the identity service holds no platform key for this user");
-    if (resp.status === 405) {
-      throw new AuthServiceMisconfiguredError("the identity service does not serve platform keys (needs API_KEY_MODE=local and CREDENTIAL_KEYS_FILE)");
-    }
-    if (resp.status === 403) {
-      const message = await errorMessageOf(resp);
-      if (/expired/i.test(message)) throw new PlatformKeyMissingError("the user's platform key in the identity service has expired");
+    if (status === 404) {
+      if (errorMessageOf(text) === NO_PRIMARY_KEY_MESSAGE) throw new PlatformKeyMissingError("the identity service holds no platform key for this user");
       throw new AuthServiceMisconfiguredError(
-        "the identity service refused this API's client for the platform key; check IDENTITY_CLIENT_ID and its identity.introspect scope",
+        `the identity service does not serve ${PLATFORM_KEY_PATH} at ${this.apiUrl} (check IDENTITY_API_URL, API_KEY_MODE=local and CREDENTIAL_KEYS_FILE)`,
       );
     }
+    if (status === 405) {
+      throw new AuthServiceMisconfiguredError("the identity service does not serve platform keys (needs API_KEY_MODE=local and CREDENTIAL_KEYS_FILE)");
+    }
+    if (status === 403) throw forbiddenError(errorMessageOf(text));
     // The session was just introspected as active, so any other refusal is not a verdict on the cookie.
-    if (!resp.ok) throw new IdentityUpstreamError(`the identity service answered the platform key with HTTP ${resp.status}`, resp.status);
+    if (status < 200 || status >= 300) throw new IdentityUpstreamError(`the identity service answered the platform key with HTTP ${status}`, status);
     let body: Record<string, unknown>;
     try {
-      body = (await resp.json()) as Record<string, unknown>;
+      body = JSON.parse(text) as Record<string, unknown>;
     } catch (err) {
-      throw new IdentityUpstreamError("the identity service answered the platform key with a body that is not JSON", resp.status, { cause: err });
+      throw new IdentityUpstreamError("the identity service answered the platform key with a body that is not JSON", status, { cause: err });
     }
     const key = typeof body?.apiKey === "string" ? body.apiKey : "";
     if (body?.userId !== userId || (key !== "" && !isApiKey(key))) {
-      throw new IdentityUpstreamError("the identity service answered the platform key without the session user's key", resp.status);
+      throw new IdentityUpstreamError("the identity service answered the platform key without the session user's key", status);
     }
     if (key === "") throw new PlatformKeyMissingError("the identity service holds no platform key for this user");
-    this.remember(userId, key);
+    const expires = typeof body.expirationTime === "string" ? Date.parse(body.expirationTime) : NaN;
+    this.remember(userId, key, Number.isNaN(expires) ? Infinity : expires);
     return key;
   }
 
@@ -250,11 +278,30 @@ export class IdentityVerifier {
 }
 
 /** The `errorMessage` of an identity error body, or empty. */
-async function errorMessageOf(resp: Response): Promise<string> {
+function errorMessageOf(text: string): string {
   try {
-    const body = (await resp.json()) as { errorMessage?: unknown };
+    const body = JSON.parse(text) as { errorMessage?: unknown };
     return typeof body?.errorMessage === "string" ? body.errorMessage : "";
   } catch {
     return "";
   }
+}
+
+/** The error for a 403 from the platform key endpoint, by the identity service's message. */
+function forbiddenError(message: string): Error {
+  if (/^service client authentication required/i.test(message)) {
+    return new AuthServiceMisconfiguredError(
+      "the identity service refused this API's client for the platform key; check IDENTITY_CLIENT_ID and its identity.introspect scope",
+    );
+  }
+  if (/expired/i.test(message)) return new PlatformKeyMissingError("the user's platform key in the identity service has expired");
+  if (/account is (disabled|restricted)/i.test(message)) return new IdentityAccountRefusedError(`the identity service refused the account: ${message}`);
+  return new IdentityUpstreamError("the identity service refused the platform key with HTTP 403", 403);
+}
+
+/** The token type of an active answer; one this API does not know is the identity service breaking its contract. */
+function tokenKind(answer: ActiveAnswer): "api_key" | "session" | "access_token" {
+  const kind = answer.tokenType;
+  if (kind === "api_key" || kind === "session" || kind === "access_token") return kind;
+  throw new IdentityUpstreamError(`the identity service answered introspection with token_type ${JSON.stringify(kind ?? null)}`);
 }

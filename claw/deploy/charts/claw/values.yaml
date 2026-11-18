@@ -608,7 +608,8 @@ identity:
   # never discovered; with all three pinned discovery is not fetched at all.
   endpoints:
     introspection: ""
-    # Base URL for identity HTTP APIs (platform key), path included. Empty: introspection without /oauth/introspect.
+    # Base URL for identity HTTP APIs (platform key), path included. Empty: introspection without /oauth/introspect;
+    # required when the introspection URL does not end in /oauth/introspect.
     api: ""
     token: ""
     jwks: ""

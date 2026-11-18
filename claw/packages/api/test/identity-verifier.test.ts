@@ -16,7 +16,10 @@ delete process.env.IDENTITY_CLIENT_ENABLED;
 delete process.env.CLAW_INSECURE_DEV_AUTH;
 process.env.APP_ENV = "production";
 
-const { IdentityVerifier, IdentityUpstreamError, identityApiBase, PlatformKeyMissingError } = await import("../src/auth/identity-verifier.js");
+const {
+  IdentityAccountRefusedError, IdentityUnreachableError, IdentityVerifier, IdentityUpstreamError, identityApiBase, PlatformKeyMissingError,
+} = await import("../src/auth/identity-verifier.js");
+const { safeFailureOf } = await import("../src/auth/delegated-keys.js");
 const { AuthServiceMisconfiguredError, AuthUpstreamUnreachableError } = await import("../src/auth/safe-client.js");
 const config = await import("../src/config.js");
 
@@ -41,7 +44,7 @@ function fakeIdentity(
 ) {
   const seen = {
     introspect: [] as { token: string; params?: Record<string, string>; allowStale?: boolean }[],
-    fetch: [] as { url: string; method?: string; headers: Record<string, string> }[],
+    fetch: [] as { url: string; method?: string; headers: Record<string, string>; redirect?: RequestRedirect }[],
   };
   const identity = {
     introspect: async (token: string, opts: { params?: Record<string, string>; allowStale?: boolean } = {}) => {
@@ -53,7 +56,7 @@ function fakeIdentity(
   };
   const fetchFn = (async (url: string, init: RequestInit) => {
     const headers = init.headers as Record<string, string>;
-    seen.fetch.push({ url, method: init.method, headers });
+    seen.fetch.push({ url, method: init.method, headers, redirect: init.redirect });
     const answer = keys[headers.Authorization!.replace(/^Bearer /, "")] ?? { status: 401 };
     return new Response(answer.body === undefined ? "" : JSON.stringify(answer.body), { status: answer.status });
   }) as typeof fetch;
@@ -196,7 +199,7 @@ test("an identity service that cannot answer is unavailable; one that refuses th
       "ak-refused": new IdentityUnavailableError("introspection", "client_rejected", 401),
       "sess-nokeys": active({ sub: "u-frank", tokenType: "session" }),
     },
-    { "sess-nokeys": { status: 404 } },
+    { "sess-nokeys": { status: 404, body: { errorCode: "Primus.00005", errorMessage: "this user has no primary API key" } } },
   );
   await assert.rejects(verifier.verifyApiKey("ak-down"), AuthUpstreamUnreachableError);
   await assert.rejects(verifier.verifyApiKey("ak-refused"), AuthServiceMisconfiguredError);
@@ -311,4 +314,103 @@ test("the platform key cache keeps the most recently used users", async () => {
   assert.equal(seen.fetch.length, 1001, "a recently used key survives eviction");
   await verifier.verifyCookie("sess-1");
   assert.equal(seen.fetch.length, 1002, "the least recently used key is evicted");
+});
+
+test("the platform key request refuses redirects, so the client secret is never sent to another host", async () => {
+  const { verifier, seen } = fakeIdentity(
+    { "sess-kim": active({ sub: "u-kim", tokenType: "session" }) },
+    { "sess-kim": { status: 200, body: { userId: "u-kim", apiKey: "ak-kim" } } },
+  );
+  await verifier.verifyCookie("sess-kim");
+  assert.equal(seen.fetch[0]!.redirect, "error");
+});
+
+test("only identity's own no-key answer is a missing key; any other 404 is misconfiguration", async () => {
+  const statuses: Record<string, { status: number; body?: unknown }> = {
+    "sess-nokey": { status: 404, body: { errorCode: "Primus.00005", errorMessage: "this user has no primary API key" } },
+    "sess-notserved": { status: 404, body: { errorCode: "Primus.00005", errorMessage: "platform API keys are not served here" } },
+    "sess-wrongbase": { status: 404 },
+  };
+  const answers = Object.fromEntries(Object.keys(statuses).map((t) => [t, active({ sub: `u-${t}`, tokenType: "session" })]));
+  const { verifier } = fakeIdentity(answers, statuses);
+  await assert.rejects(verifier.verifyCookie("sess-nokey"), PlatformKeyMissingError);
+  await assert.rejects(verifier.verifyCookie("sess-notserved"), AuthServiceMisconfiguredError);
+  await assert.rejects(verifier.verifyCookie("sess-wrongbase"), AuthServiceMisconfiguredError);
+});
+
+test("an introspection URL that does not end in /oauth/introspect gives no API base without IDENTITY_API_URL", () => {
+  assert.equal(identityApiBase("https://host/identity/oauth2/introspect", ""), "");
+  assert.equal(identityApiBase("https://host/idp/oauth/introspect/extra", ""), "");
+  assert.equal(identityApiBase("https://host/identity/oauth2/introspect", "https://host/identity"), "https://host/identity");
+});
+
+test("a 403 for the account is a refusal of that user; an unrecognised 403 is an upstream failure", async () => {
+  const statuses: Record<string, { status: number; body?: unknown }> = {
+    "sess-disabled": { status: 403, body: { errorCode: "Primus.00003", errorMessage: "this account is disabled" } },
+    "sess-restricted": { status: 403, body: { errorCode: "Primus.00003", errorMessage: "this account is restricted" } },
+    "sess-other": { status: 403, body: { errorCode: "Primus.00003", errorMessage: "forbidden" } },
+  };
+  const answers = Object.fromEntries(Object.keys(statuses).map((t) => [t, active({ sub: `u-${t}`, tokenType: "session" })]));
+  const { verifier } = fakeIdentity(answers, statuses);
+  await assert.rejects(verifier.verifyCookie("sess-disabled"), IdentityAccountRefusedError);
+  await assert.rejects(verifier.verifyCookie("sess-restricted"), IdentityAccountRefusedError);
+  await assert.rejects(verifier.verifyCookie("sess-other"), IdentityUpstreamError);
+});
+
+test("an account refusal is a 403 for the cookie", async () => {
+  const { default: Fastify } = await import("fastify");
+  const { default: cookie } = await import("@fastify/cookie");
+  const { verifySessionCookie } = await import("../src/auth/middleware.js");
+  const { verifier } = fakeIdentity(
+    { "sess-off": active({ sub: "u-off", tokenType: "session" }) },
+    { "sess-off": { status: 403, body: { errorMessage: "this account is disabled" } } },
+  );
+  const app = Fastify();
+  await app.register(cookie);
+  app.get("/v1/ping", async (req) => verifySessionCookie(req, verifier, "/v1/ping"));
+  await app.ready();
+  try {
+    const res = await app.inject({ method: "GET", url: "/v1/ping", headers: { cookie: "Token=sess-off" } });
+    const outcome = JSON.parse(res.body);
+    assert.equal(outcome.error.status, 403);
+    assert.equal(outcome.error.legacyError, "account_refused");
+  } finally {
+    await app.close();
+  }
+});
+
+test("a kept platform key is not served past its expirationTime", async (t) => {
+  const start = Date.now();
+  const { verifier, seen } = fakeIdentity(
+    { "sess-lee": active({ sub: "u-lee", tokenType: "session" }) },
+    { "sess-lee": { status: 200, body: { userId: "u-lee", apiKey: "ak-lee", expirationTime: new Date(start + 10_000).toISOString() } } },
+  );
+  const now = t.mock.method(Date, "now", () => start);
+  await verifier.verifyCookie("sess-lee");
+  now.mock.mockImplementation(() => start + 11_000);
+  await verifier.verifyCookie("sess-lee");
+  assert.equal(seen.fetch.length, 2);
+});
+
+test("a platform key body larger than the cap is an upstream failure", async () => {
+  const identity = { introspect: async () => active({ sub: "u-big", tokenType: "session" }) };
+  const huge = verifierOf(identity, (async () => new Response(JSON.stringify({ userId: "u-big", apiKey: "ak-big", pad: "x".repeat(2 * 1024 * 1024) }), { status: 200 })) as typeof fetch);
+  await assert.rejects(huge.verifyCookie("sess-big"), IdentityUpstreamError);
+});
+
+test("an identity service that cannot be reached is attributed to identity, not SaFE", async () => {
+  const { verifier } = fakeIdentity({ "ak-gone": new IdentityUnavailableError("introspection", "network") }, {});
+  const err = await verifier.verifyApiKey("ak-gone").catch((e: unknown) => e);
+  assert.ok(err instanceof IdentityUnreachableError);
+  assert.ok(err instanceof AuthUpstreamUnreachableError);
+  assert.deepEqual(safeFailureOf(err), { status: "unavailable", source: "identity" });
+});
+
+test("an active answer without a known token type is an upstream protocol failure, not an invalid credential", async () => {
+  const { verifier } = fakeIdentity(
+    { "ak-notype": active({ sub: "u-x" }), "sess-notype": active({ sub: "u-y", tokenType: "apikey" }) },
+    {},
+  );
+  await assert.rejects(verifier.verifyApiKey("ak-notype"), IdentityUpstreamError);
+  await assert.rejects(verifier.verifyCookie("sess-notype"), IdentityUpstreamError);
 });

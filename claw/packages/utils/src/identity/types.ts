@@ -7,7 +7,7 @@
  */
 
 /** The five upstream conversations the client has. */
-export type IdentityOp = "discovery" | "jwks" | "introspection" | "exchange" | "credential";
+export type IdentityOp = "discovery" | "jwks" | "introspection" | "exchange" | "credential" | "platform_key";
 
 /**
  * How a lookup was answered. `hit` and `hit_negative` never left the process,

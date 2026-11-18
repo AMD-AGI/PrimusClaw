@@ -12,11 +12,11 @@ import {
 import type { UserInfo } from "./models.js";
 import { SAFE_API_URL, APP_ENV, MEMORY_LLM_BASE_URL, isKubernetesMode, isIdentityAuthProvider } from "../config.js";
 import { identityClient } from "./identity.js";
-import { IdentityVerifier, PlatformKeyMissingError, identityApiBase } from "./identity-verifier.js";
+import { IdentityAccountRefusedError, IdentityVerifier, PlatformKeyMissingError, identityApiBase } from "./identity-verifier.js";
 import { cacheUserLlmKey } from "../llm/client.js";
 import { resolveUserLlmKey, usePlatformKeyForLlm } from "../llm/key-source.js";
 import { ByokInvalidKeyError, ByokRateLimitError, ByokUpstreamUnavailableError, verifyByokKey } from "./byok.js";
-import { constantTimeEquals } from "@claw/utils";
+import { constantTimeEquals, readIdentityConfig } from "@claw/utils";
 import { verifyConnectorToken } from "./connector-token.js";
 import { verifyConnectorGrant } from "./connector-grant.js";
 import { identityTokenSettings, verifyIdentityAccessToken } from "./identity-token.js";
@@ -42,6 +42,7 @@ function getClient(): CredentialVerifier | null {
       apiUrl,
       client: { clientId: process.env.IDENTITY_CLIENT_ID ?? "", clientSecret: process.env.IDENTITY_CLIENT_SECRET ?? "" },
       trustedRoles: identityTokenSettings().trustedRoles,
+      timeoutMs: readIdentityConfig(process.env).settings?.requestTimeoutMs,
     });
     return _identityVerifier;
   }
@@ -300,6 +301,9 @@ function verificationFailureSpec(
   // that tells a person (and a connector, which stops for good after a run of them) that a good key is invalid.
   if (e instanceof PlatformKeyMissingError) {
     return { status: 403, legacyError: "platform_key_missing", anthropicType: "permission_error", message: e.message };
+  }
+  if (e instanceof IdentityAccountRefusedError) {
+    return { status: 403, legacyError: "account_refused", anthropicType: "permission_error", message: e.message };
   }
   const failure = safeFailureOf(e);
   if (failure.status === "unavailable") {
