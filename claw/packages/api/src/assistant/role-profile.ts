@@ -196,6 +196,11 @@ function reviewOf(params: unknown): NonNullable<ManifestItem["review"]> {
     actingAsName: typeof p.acting_as_name === "string" ? p.acting_as_name : null,
     model: typeof p.model === "string" ? p.model : null,
     reviewOnly: p.review_only !== false,
+    // How a merge of this review is made, said only of one the assistant started, which is the one asked about (a stored value but false
+    // reads as one that waits, as the review tools read it).
+    ...(p.started_by_assistant === true || (p.merge_needs_confirmation !== undefined && p.merge_needs_confirmation !== null)
+      ? { mergeNeedsConfirmation: p.merge_needs_confirmation !== undefined && p.merge_needs_confirmation !== null && p.merge_needs_confirmation !== false }
+      : {}),
   };
 }
 

@@ -418,7 +418,7 @@ describe("router quality, the prompt", () => {
     // now from the source that states them.
     assert.equal(p.ROUTER_PROMPT_VERSION, "router-v22");
     assert.equal(p.ROUTER_READ_PROMPT_VERSION, "router-read-v17");
-    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v28");
+    assert.equal(p.ROUTER_REVIEW_PROMPT_VERSION, "router-v29");
     const system = p.renderRouterPrompt({ servers: ["agent-board"], github: ["issue_search", "repo_get_file", "pr_list"] });
     const rules: Array<[string, RegExp]> = [
       ["the system confirms work_create", /the system tells the user at once that it has, with its number and title \(the result says announced: true\): a say after it in the turn is added to that same message, so never repeat the start/],

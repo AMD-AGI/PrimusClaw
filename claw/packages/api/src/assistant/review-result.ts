@@ -55,6 +55,11 @@ export interface ResultFacts {
   refused: string | null;
   /** A review only (no merge asked for). */
   reviewOnly: boolean;
+  /**
+   * The assistant started it under the person's fully_auto review mode (`started_by_assistant` without `merge_needs_confirmation`): it
+   * merges once it approves, with no confirmation card. Absent is false.
+   */
+  mergesUnasked?: boolean;
   /** How many turns the review has had: the second is the one run when CI turned green. */
   turns: number;
   /** Why the wait for CI ended, or null. */
@@ -94,7 +99,9 @@ export function resultText(kind: ReviewResult, f: ResultFacts, zh: boolean): str
   const again = zh ? `\`再审 #${f.seq}\`` : `\`review again #${f.seq}\``;
   const link = zh ? `- 评审：${reviewLink}` : `- The review: ${reviewLink}`;
   if (kind === "ci_wait") {
-    const after = f.reviewOnly ? (zh ? "审过就批准" : "approve it if it passes") : (zh ? "审过就发合入确认卡片" : "send you the merge confirmation card if it passes");
+    const after = f.reviewOnly ? (zh ? "审过就批准" : "approve it if it passes")
+      : f.mergesUnasked ? (zh ? "审过就直接合入（仓库自身要求的检查仍然生效）" : "merge it if it passes (the repository's own required checks still apply)")
+        : (zh ? "审过就发合入确认卡片" : "send you the merge confirmation card if it passes");
     return zh
       ? [
         `**${f.pr} 审完了，还没批准：在等 CI**`, "",
@@ -405,6 +412,7 @@ export async function tellReviewResult(itemId: string, kind: ReviewResult): Prom
       headSha: head, event: String(last.event), reviewId: typeof last.posted?.review_id === "number" ? last.posted.review_id : null,
       findings, ci: ciRow ? ciNamesOf(ciRow.risk_reasons) : null, refused: other ? other.detail : null,
       reviewOnly: String(item.params.review_only ?? "true") !== "false", turns,
+      ...(item.params.started_by_assistant === true && (item.params.merge_needs_confirmation ?? false) === false ? { mergesUnasked: true } : {}),
       ended: ended === "head_moved" || ended === "timeout" || ended === "not_queued" || ended === "threads_open" ? ended : null,
     };
     const sessionId = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1", [item.user_id])).rows[0]?.session_id as string | undefined;

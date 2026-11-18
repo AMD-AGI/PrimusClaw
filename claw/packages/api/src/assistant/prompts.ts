@@ -87,9 +87,11 @@ export const ROUTER_PROMPT_VERSION = "router-v22";
  * review started (2026-11-07 parity run, G3); v25: v24 with a pull request number its repository does not have (pr_state not_found)
  * said not to exist and started nothing for, never said to be unreadable (2026-11-08 E249 cat-review-a8-009: "#99999" was said to be
  * a failed read); v26: v25 on router-v20; v27: v26 on router-v21, with approve #<ref> named first and the user told the approval
- * command in the language they are answered in; v28: v27 on router-v22).
+ * command in the language they are answered in; v28: v27 on router-v22; v29: v28 with how merge=true merges said from each review's
+ * merge_needs_confirmation, which the user's review mode now decides (fully_auto merges once the review approves, 2026-11-18), the review
+ * mode line saying what it means, and review_mode_set said to set high_risk_confirm and to leave fully_auto to the user).
  */
-export const ROUTER_REVIEW_PROMPT_VERSION = "router-v28";
+export const ROUTER_REVIEW_PROMPT_VERSION = "router-v29";
 
 /** The assistant's MCP server, which is what Brain puts before each of its tools' names. */
 export const ASSISTANT_MCP_SERVER = "assistant";
@@ -501,14 +503,14 @@ export const ITEM_MEMORY_INTRO =
 
 export const ROUTER_REVIEW_PROMPT = `Reviews and settings
 These tools act for the user, with their GitHub account or their settings. They work only in a turn that answers a message the user just sent signed in; in a turn a ${WORK_EVENT_PREFIX} report started they are refused, so tell the user what you would do and let them say it.
-- review_start(prs, merge, reviewer?, model?, effort?): start reviewing pull requests, one review item each. prs are owner/repo#number, and only numbers the user wrote. Pass every pull request the user named in one call, up to 30, and never refuse or ask them to split a request of more than 10: the first 10 start and the rest wait for a slot and start by themselves (the items under queued); never split them over several calls. When the user gives only a number, use the one repository under Channel repos, else the one repository of their recent review items; if there is none or more than one, ask which repository. merge is true only when the user clearly asked for a merge (合入, 合并, merge, 审完合, approve and merge); review, check, 看一下, 审一下, 只审 mean merge=false; when unsure, ask in one short say. merge=true never merges by itself: each started item says merge_needs_confirmation, and the review asks the user to confirm the merge (the card's button or approve #<ref>, 批准 #<ref> in Chinese), so never tell them it will be merged unasked. reviewer: leave it out for the user. A review by another person (their user_id from People) runs on their own credentials, which you cannot carry: when the user's chat can carry them the call answers handed_off, and the chat starts the review as that person and answers the user's message about it itself, in one message (whether it started, on which model, how it merges). Then never say who has the review or that it was handed over, even when the user asks to be told who has it: the chat's answer tells them. If the user's message also asks something else, answer that with say before you call review_start: what you say before it in the turn is added to the chat's answer, the one message; a say after it is refused. End the turn as soon as review_start answers. Otherwise it is refused with acting_as_credentials_required: tell the user where to ask for it, as the refusal says, or offer to review it as themselves. model only when the user named one (用 opus → opus); effort only when they asked.
+- review_start(prs, merge, reviewer?, model?, effort?): start reviewing pull requests, one review item each. prs are owner/repo#number, and only numbers the user wrote. Pass every pull request the user named in one call, up to 30, and never refuse or ask them to split a request of more than 10: the first 10 start and the rest wait for a slot and start by themselves (the items under queued); never split them over several calls. When the user gives only a number, use the one repository under Channel repos, else the one repository of their recent review items; if there is none or more than one, ask which repository. merge is true only when the user clearly asked for a merge (合入, 合并, merge, 审完合, approve and merge); review, check, 看一下, 审一下, 只审 mean merge=false; when unsure, ask in one short say. How merge=true merges is what review_start answers, item by item, in merge_needs_confirmation (with its merge note), and what each review item in the list says: never say it from the review mode alone. merge_needs_confirmation true: it never merges by itself; once the review approves, the user is asked to confirm the merge (the card's button or approve #<ref>, 批准 #<ref> in Chinese), so never tell them it will be merged unasked or handled fully automatically. merge_needs_confirmation false (the user's review mode was fully_auto when it started): it merges as soon as the review approves, without asking them (审过就会直接合入（仓库自身要求的检查仍然生效）: what the repository itself requires, failed CI and open review threads still hold it), so never tell them they will be asked to confirm it. reviewer: leave it out for the user. A review by another person (their user_id from People) runs on their own credentials, which you cannot carry: when the user's chat can carry them the call answers handed_off, and the chat starts the review as that person and answers the user's message about it itself, in one message (whether it started, on which model, how it merges). Then never say who has the review or that it was handed over, even when the user asks to be told who has it: the chat's answer tells them. If the user's message also asks something else, answer that with say before you call review_start: what you say before it in the turn is added to the chat's answer, the one message; a say after it is refused. End the turn as soon as review_start answers. Otherwise it is refused with acting_as_credentials_required: tell the user where to ask for it, as the refusal says, or offer to review it as themselves. model only when the user named one (用 opus → opus); effort only when they asked.
   For a request to review or merge pull requests, first call pr_state with every pull request the user named, before you ask the user anything about the request (who the reviewer is, which model) and before any other lookup: it only reads where each stands on GitHub, and a turn that called it can still start the review. A pull request it says is merged gets no review_start: tell the user, in a few lines, that it is already merged, with when (merged_at, in UTC) and its short merge commit (merge_commit, 7 characters), and that no review was asked for. One it says is closed (closed without a merge) gets no review_start either: say it is closed, with when (closed_at). When none is left open, end there with the next step (nothing more is needed, or a review after the merge if they still want one). One it says is not_found does not exist (GitHub read its repository and has no pull request of that number): say so, with the number the user wrote, and start nothing for it; never call it unreadable. Call review_start only with the ones pr_state says are open or could not read (unknown), and say in the same answer which ones were merged, closed or not found. Never ask who the reviewer is for a pull request that is already merged or closed. When the reviewer they named is not under People, pass the name as they wrote it; review_start then says which person they may mean. review_start reads each pull request again: when it still answers already_merged, already_closed or not_found, nothing started: say it as above.
-- review_restart(item_id, model?, merge?, effort?): the user wants a review changed (another model, merge after all, review only) or run again. It stops the old item and starts a new one with the rest unchanged. It is refused once merged. 再审 #N, 重新审 #N and review again #N (what a finished review tells the user to reply) mean review_restart of item N, whether it is open or done, with nothing else changed.
+- review_restart(item_id, model?, merge?, effort?): the user wants a review changed (another model, merge after all, review only) or run again. It stops the old item and starts a new one with the rest unchanged, except merge_needs_confirmation, which it sets again from the user's review mode now (say how it merges from its answer, as for review_start). It is refused once merged. 再审 #N, 重新审 #N and review again #N (what a finished review tells the user to reply) mean review_restart of item N, whether it is open or done, with nothing else changed.
 - work_stop(item_id, reason) stops a review as well (like the tools above, only in a turn that answers the user), and cancels what waits for confirmation in it. If it answers merge_in_progress or already_merged, tell the user exactly that.
 - The user can always stop a review they asked someone else to do, from here, whether you handed it off to their chat or not and whether it runs or waits: once it has started it is listed under Reviews the user asked someone else to do, and work_stop with its item_id and a reason stops it (their message must name its pull request; when it does not, ask which). Never tell them a review they asked for cannot be stopped from here. A review that is in no list has not started, or has ended: say that, and that there is nothing running to stop.
 - work_send does not reach a review: use review_restart.
 - confirmation_answer(decision, confirmation_id?, pr?): the user answers a write listed under Waiting for you. deny when they say no to it (别合, don't merge 224, stop): name it by confirmation_id or pr. allow only when the user's whole message is the approval command with that write's ref, approve #<ref> or 批准 #<ref> (approve #a3f9c2); pass its confirmation_id. Any other yes (224 可以合入, ok, go ahead, lgtm) lets nothing through: tell the user to reply exactly the approval command for the write they mean (approve #<ref>, 批准 #<ref> in Chinese), or press the button on its card. When you tell the user about a waiting write, give its ref.
-- review_mode_set(mode): high_risk_confirm when the user wants to be asked before every high-risk approval or merge. Turning confirmations off is a setting only the user changes, in their settings: tell them so.
+- review_mode_set(mode): changes the user's review mode (The user's review mode, below). You can set high_risk_confirm, when the user wants to be asked before every high-risk approval or merge, and before every merge of a review they start with you: call it. You cannot set fully_auto (it is refused): turning confirmations off is a setting only the user changes themselves, in their settings (in a chat that has it, /github mode). Asked whether you can change the setting, say exactly that: you can switch them to high_risk_confirm, and fully_auto they switch on themselves; never say you have no way to change it. A new mode applies to reviews started after it; a running review keeps how it merges until it is restarted, except that one started under fully_auto asks for the merge once the user has left fully_auto.
 - channel_action(name, args): the user wants a setting their channel lists under Channel actions (每天十点给我晨报 → brief, "on 10:00"). Only actions listed with this message, and only when the user's message is about that setting; when it is not, do not call it. When their message is the command itself (/brief off), it runs at once. Otherwise nothing runs: the user is shown the exact command with a button and it runs only if they press it, so tell them to check it and press the button; never say it is done.
 Every one of these may be refused, and a refusal is the answer: tell the user what it says and what they can do; never report work as started or done that was refused. An item whose result has queued has not started: say it is queued and starts by itself once a slot is free. Never say a review was handed over, started, queued, or already asked for unless a result of this turn says so.`;
 
@@ -580,7 +582,7 @@ export interface ManifestItem {
   createdAt?: Date | string | null;
   closedAt?: Date | string | null;
   /** A review item's settings, which the user may ask to change (`review_restart`). */
-  review?: { pr: string; actingAsName: string | null; model: string | null; reviewOnly: boolean };
+  review?: { pr: string; actingAsName: string | null; model: string | null; reviewOnly: boolean; mergeNeedsConfirmation?: boolean };
   /**
    * A development environment item's place (`remote-items.ts`): the machine (as its connector named it: untrusted), the agent, the
    * remote session it is, and whether that machine is online now.
@@ -668,7 +670,9 @@ export function formatManifestLine(item: ManifestItem): string {
   if (item.resultVersion > 0) tail.push(`result v${item.resultVersion}`);
   if (item.review) {
     const r = item.review;
-    tail.push(`review of ${oneLine(r.pr)}, ${r.reviewOnly ? "review only" : "merge"}${r.model ? `, model ${oneLine(r.model)}` : ""}`);
+    const merge = r.mergeNeedsConfirmation === undefined ? "merge"
+      : `merge, merge_needs_confirmation: ${r.mergeNeedsConfirmation}${r.mergeNeedsConfirmation ? "" : " (merges unasked only while the review mode is fully_auto)"}`;
+    tail.push(`review of ${oneLine(r.pr)}, ${r.reviewOnly ? "review only" : merge}${r.model ? `, model ${oneLine(r.model)}` : ""}`);
   }
   for (const w of item.watches ?? []) {
     tail.push(`watches ${oneLine(w.pr)}, ${w.autoReply ? "auto-reply on: answers new comments as the user, no approval card" : "auto-reply off: answers on GitHub wait for the user's approval"}`);
@@ -781,6 +785,17 @@ export interface ReviewContext {
   commands?: CommandLanguage;
 }
 
+/**
+ * What the user's review mode means for a review they start with the router, said beside it: measured 2026-11-18, the router told a
+ * fully_auto user that a review whose item held its merge for a confirmation would be handled fully automatically. So the mode is said
+ * for new reviews only, and each started review's own merge_needs_confirmation is what is said of it.
+ */
+export function reviewModeMeaning(mode: string): string {
+  return mode === "fully_auto"
+    ? " (fully automatic: a review the user starts with you with merge=true merges once it approves, without asking them; what the repository itself requires, failed CI and open review threads still hold it. Say how a given review merges from its merge_needs_confirmation, never from this line)"
+    : " (high-risk confirm: a review the user starts with you with merge=true asks them to confirm every merge, with the card's button or approve #<ref>; a review asked of them in another way asks only for what is high risk. Say how a given review merges from its merge_needs_confirmation, never from this line)";
+}
+
 /** The review tools' state for this turn: what waits for the user, their review mode, and what the channel sent with the message. */
 export function renderReviewState(c: ReviewContext): string {
   const iso = (d: Date | string) => (d instanceof Date ? d.toISOString() : String(d));
@@ -801,7 +816,7 @@ export function renderReviewState(c: ReviewContext): string {
   return `Waiting for you (writes that wait for the user's own confirmation):
 ${waiting}
 
-The user's review mode: ${c.reviewMode}
+The user's review mode: ${c.reviewMode}${reviewModeMeaning(c.reviewMode)}
 
 People in this message (from the channel):
 ${people}

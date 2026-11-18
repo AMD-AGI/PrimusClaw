@@ -37,9 +37,17 @@
  *       still one
  *   S5  a model must be named by the user
  *   S6  what the review service refuses reaches the model as it said it, with its data
- *   S8  merge=true is never a merge: whatever the message says (a negation, a question, "yes merge it"), a start and a restart the router
- *       makes hand across mergeNeedsConfirmation, so the review merges only once the user confirms that very merge; and no sentence of
- *       theirs lets a held merge through, only the exact command, by the person it waits for
+ *   S8  merge=true is never a merge under high_risk_confirm: whatever the message says (a negation, a question, "yes merge it"), a start
+ *       and a restart the router makes hand across mergeNeedsConfirmation, so the review merges only once the user confirms that very
+ *       merge; and no sentence of theirs lets a held merge through, only the exact command, by the person it waits for
+ *   S8f under fully_auto it is (Yihan, 2026-11-18): a start and a restart hand across the review mode read at that moment, and the router
+ *       is told, item by item and in a note, how the merge is made, never the other way
+ *   S8g the whole way, through the real review items and review service over a fake GitHub: a fully_auto user's "替我 review 并合入"
+ *       merges once the review approves, nobody asked; the router's item list says so
+ *   S8h the same under high_risk_confirm waits for the user's own confirmation, at low risk too, and their allow makes it
+ *   S8i under fully_auto, what holds any merge still holds it: the repository's own confirm_merge, failed CI
+ *   S8j the mode is read at start and again at restart; a review started under fully_auto asks once the user has left fully_auto
+ *   S8k the router's rules, its review mode line and each item's line say how a review merges from its merge_needs_confirmation
  *   S7  a review by someone else is refused from here (their credentials cannot be carried), and the router is told to send the user to
  *       the deployment's review agent (CLAW_GITHUB_REVIEW_AGENT_NAME)
  *   S7b a review by someone else, from a channel that said it can be handed one (`channel_context.handoffs`), is handed to that channel
@@ -1751,6 +1759,253 @@ describe("assistant review tools", { skip }, () => {
     assert.match(items, /Any of these numbers is said with its window, in the user's language \(过去 24 小时 \/ in the last 24 hours\), never under a week's heading; for this week's count, call brief with range week/);
     assert.match(items, /never from counting the lines below, and a list of them says it is the latest 20 of 25\./);
     assert.match(prompts.formatAskedOfOthersTotals(3, { total: 3, open: 1, closed: 2, merged: 2, changes_requested: 0 }), /Every one of them is listed below\. Any of these numbers is said with its window/);
+  });
+
+  // --- Yihan, 2026-11-18 (option A): under fully_auto, the person's own "替我 review 并合入" merges once the review approves --------------
+
+  test("S8f merge=true from the router merges unasked only for a fully_auto user: start and restart hand across the mode read now, and say so", async () => {
+    const item = await reviewItem(alice, 1, { owner: "AMD-AGI", repo: "PrimusClaw", number: 254 });
+    const mode = (m: string) => w.q(
+      `INSERT INTO claw_github_review_settings (user_id, review_mode) VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE SET review_mode = EXCLUDED.review_mode, updated_at = NOW()`, [alice.userId, m]);
+    startAnswer = async (request) => request.prs.map((p: Recorded, i: number) => ({
+      item_id: `kwi_s${i}`, seq: i + 1, pr: p.pr, review_only: request.reviewOnly, ...(request.mergeNeedsConfirmation ? { merge_needs_confirmation: true } : {}),
+    }));
+    const steps: Array<[string, boolean]> = [["fully_auto", false], ["high_risk_confirm", true], ["fully_auto", false]];
+    for (const [m, held] of steps) {
+      await mode(m);
+      const turn = await userTurn(alice, "替我 review 并合入 254");
+      const started = await rt.reviewStart(turn, { prs: ["AMD-AGI/PrimusClaw#254"], merge: true }) as Recorded;
+      assert.equal(calls.start.at(-1)!.request.mergeNeedsConfirmation, held, `${m}: start`);
+      // What the router is told, per item and in the note it says the merge from: the one that matches the item, never the other.
+      assert.equal(started.items[0].merge_needs_confirmation, held, m);
+      assert.equal(started.merge, rt.mergeNote(held), m);
+      await rt.reviewRestart(turn, { item_id: item, merge: true });
+      assert.deepEqual(calls.restart.at(-1)!.change, { reviewOnly: false, mergeNeedsConfirmation: held }, `${m}: restart, resolved again`);
+      await w.closeRun(turn.task_id);
+    }
+    // A review only is said nothing about a merge; it is still marked as the router's (a boolean is handed across).
+    const only = await userTurn(alice, "审一下 254");
+    const reviewed = await rt.reviewStart(only, { prs: ["AMD-AGI/PrimusClaw#254"], merge: false }) as Recorded;
+    assert.equal(typeof calls.start.at(-1)!.request.mergeNeedsConfirmation, "boolean");
+    assert.equal("merge" in reviewed, false);
+    // The notes: the held one never says it merges by itself, the fully_auto one never that the user is asked.
+    assert.match(rt.mergeNote(true), /nothing merges by itself/);
+    assert.doesNotMatch(rt.mergeNote(true), /直接合入|without asking/);
+    assert.match(rt.mergeNote(false), /审过就会直接合入（仓库自身要求的检查仍然生效）/);
+    assert.doesNotMatch(rt.mergeNote(false), /approve #<ref>|批准 #/);
+  });
+
+  /**
+   * The whole way, with the real review items and the real review service over a fake GitHub that answers as GitHub does: the router's
+   * review_start makes the item and its session, the session's config is read back as the review tools read it (`mergeRulesOf`, mcp.ts),
+   * and the review service is asked to merge the approved head.
+   */
+  async function wholeWay() {
+    const { GithubReview } = await import("../src/github-review/service.js");
+    const { readGithubReviewSettings } = await import("../src/github-review/settings.js");
+    const { mergeRulesOf } = await import("../src/github-review/review-target.js");
+    const { reviewItemPorts } = await import("../src/assistant/review-items.js");
+    const { FakeGithub, HEAD } = await import("./support/fake-github.js");
+    const { credential, ownApproval, reviewedHead, SECRET } = await import("./support/review-env.js");
+    const pg = w.h.app.db.db;
+    const db = { query: async (text: string, params?: unknown[]) => { const r = await pg.query(text, params as never); return { rows: r.rows, rowCount: r.rowCount }; } };
+    const gh = new FakeGithub();
+    gh.graphql.mergeStateStatus = "CLEAN";
+    const service = new GithubReview({
+      settings: () => readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MCP_SECRET: SECRET, CLAW_GITHUB_WRITES_ENABLED: "true" }, true),
+      db, fetchImpl: gh.fetch, sleep: async () => {}, resolveCredential: async () => credential(),
+    });
+    const ports = w.h.app.chatRun.chatRunPorts;
+    const before = { check: reviewItemPorts.checkPullRequest, interrupt: ports.publishInterrupt };
+    reviewItemPorts.checkPullRequest = (actor, ref) => service.checkPullRequest(actor, ref);
+    ports.publishInterrupt = () => {};   // (a restart stops the old session's run: no message bus here)
+    rt.reviewToolPorts.startReviews = saved.startReviews as never;
+    rt.reviewToolPorts.restartReview = saved.restartReview as never;
+    const PR = "AMD-AGI/demo#7";
+    const LOW = { level: "low", reason: "an ordinary change, nothing for a person to look at" };
+    const mode = (m: string) => w.q(
+      `INSERT INTO claw_github_review_settings (user_id, review_mode) VALUES ($1, $2)
+       ON CONFLICT (user_id) DO UPDATE SET review_mode = EXCLUDED.review_mode, updated_at = NOW()`, [alice.userId, m]);
+    const sessionOf = async (itemId: string) => {
+      const item = (await w.q("SELECT worker_session_id, params FROM claw_work_items WHERE item_id = $1", [itemId]))[0];
+      const config = (await w.q("SELECT config FROM claw_sessions WHERE session_id = $1", [item.worker_session_id]))[0].config;
+      return { sessionId: item.worker_session_id as string, params: item.params as Recorded, config: config as Recorded };
+    };
+    /** The review approves the head and calls gh_pr_merge, as its session's review tools are built (mcp.ts). */
+    const merge = async (itemId: string) => {
+      const s = await sessionOf(itemId);
+      const actor = {
+        sessionId: s.sessionId, requesterUserId: alice.userId, actorUserId: alice.userId, reviewTarget: { owner: "AMD-AGI", repo: "demo", number: 7 },
+        ...mergeRulesOf(s.config),
+      };
+      gh.reviews = [ownApproval(s.sessionId)];
+      await reviewedHead({ sql: (text: string, params?: unknown[]) => w.q(text, params as never), actor }, { pr: PR });
+      return service.mergePr(actor, { pr: PR, head_sha: HEAD, risk_judgement: LOW });
+    };
+    const start = async (text = `替我 review 并合入 ${PR}`) => {
+      const turn = await userTurn(alice, text);
+      const out = await rt.reviewStart(turn, { prs: [PR], merge: true }) as Recorded;
+      await w.closeRun(turn.task_id);
+      return out;
+    };
+    const restart = async (itemId: string, text = `重新审 ${PR} 并合入`) => {
+      const turn = await userTurn(alice, text);
+      const out = await rt.reviewRestart(turn, { item_id: itemId, merge: true }) as Recorded;
+      await w.closeRun(turn.task_id);
+      return out;
+    };
+    const puts = () => gh.calls.filter((c) => c.method === "PUT").length;
+    const confirmations = () => count("claw_github_confirmations");
+    const done = () => {
+      reviewItemPorts.checkPullRequest = before.check;
+      ports.publishInterrupt = before.interrupt;
+      rt.reviewToolPorts.startReviews = (async (user: Recorded, method: string, request: Recorded) => {
+        calls.start.push({ user, method, request });
+        return startAnswer(request);
+      }) as never;
+      rt.reviewToolPorts.restartReview = (async (user: Recorded, method: string, itemId: string, change: Recorded) => {
+        calls.restart.push({ user, method, itemId, change });
+        return { stopped: { item_id: itemId, seq: 1 }, item: { item_id: "kwi_new", seq: 9 } };
+      }) as never;
+    };
+    return { gh, mode, sessionOf, merge, start, restart, puts, confirmations, done, service };
+  }
+
+  test("S8g the whole way: a fully_auto user's \"替我 review 并合入\" merges once the review approves, with no confirmation", async () => {
+    const x = await wholeWay();
+    try {
+      await x.mode("fully_auto");
+      const out = await x.start();
+      const [item] = out.items as Recorded[];
+      assert.equal(item.merge_needs_confirmation, false, JSON.stringify(out));
+      assert.match(String(out.merge), /审过就会直接合入（仓库自身要求的检查仍然生效）/);
+      const s = await x.sessionOf(item.item_id);
+      assert.deepEqual([s.config.merge_needs_confirmation, s.config.started_by_assistant, s.config.review_only], [undefined, true, false]);
+      assert.deepEqual([s.params.merge_needs_confirmation, s.params.started_by_assistant], [undefined, true]);
+      const o = await x.merge(item.item_id);
+      assert.equal(o.body.status, "merged", o.text);
+      assert.equal(x.puts(), 1, "GitHub was asked to merge, once");
+      assert.equal(await x.confirmations(), 0, "nobody was asked");
+      // What the router is shown of that item says the same.
+      const { routerManifest } = await import("../src/assistant/role-profile.js");
+      const { formatManifestLine } = await import("../src/assistant/prompts.js");
+      const line = formatManifestLine((await routerManifest(alice.userId)).find((i) => i.itemId === item.item_id)!);
+      assert.match(line, /review of AMD-AGI\/demo#7, merge, merge_needs_confirmation: false \(merges unasked only while the review mode is fully_auto\)/);
+    } finally { x.done(); }
+  });
+
+  test("S8h the whole way: under high_risk_confirm the same sentence still waits for the user's own confirmation, at low risk too", async () => {
+    const x = await wholeWay();
+    try {
+      await x.mode("high_risk_confirm");
+      const out = await x.start();
+      const [item] = out.items as Recorded[];
+      assert.equal(item.merge_needs_confirmation, true);
+      assert.doesNotMatch(String(out.merge), /直接合入/);
+      const s = await x.sessionOf(item.item_id);
+      assert.deepEqual([s.config.merge_needs_confirmation, s.config.started_by_assistant], [true, true]);
+      const o = await x.merge(item.item_id);
+      assert.equal(o.body.status, "confirmation_required", o.text);
+      assert.match((o.body.reasons as string[]).join(" "), /started through bob's assistant, so a merge is made only once bob confirms it/);
+      assert.equal(x.puts(), 0);
+      const { routerManifest } = await import("../src/assistant/role-profile.js");
+      const { formatManifestLine } = await import("../src/assistant/prompts.js");
+      const line = formatManifestLine((await routerManifest(alice.userId)).find((i) => i.itemId === item.item_id)!);
+      assert.match(line, /merge, merge_needs_confirmation: true[,)]/);
+      // Her allow, from the card or the exact command, makes it.
+      const r = await x.service.decide(alice.userId, String(o.body.confirmation_id), "allow", null);
+      assert.equal(r.body.status, "merged", JSON.stringify(r.body));
+      assert.equal(x.puts(), 1);
+    } finally { x.done(); }
+  });
+
+  test("S8i the whole way, under fully_auto: what holds any merge still holds this one (the repository's own requirement, failed CI)", async () => {
+    const x = await wholeWay();
+    try {
+      await x.mode("fully_auto");
+      x.gh.contents = { ".github/claw-review.yml": "confirm_merge: always\n" };
+      const [item] = (await x.start()).items as Recorded[];
+      const o = await x.merge(item.item_id);
+      assert.equal(o.body.status, "confirmation_required", o.text);
+      const reasons = (o.body.reasons as string[]).join(" ");
+      assert.match(reasons, /every merge/, "held by the repository");
+      assert.doesNotMatch(reasons, /started through/, "not by the assistant");
+      assert.equal(x.puts(), 0);
+      // CI failing on the head: refused, nothing merged.
+      x.gh.contents = {};
+      await x.mode("fully_auto");
+      await w.q("DELETE FROM claw_github_confirmations");
+      await w.q("UPDATE claw_work_items SET board_state = 'done', closed_at = NOW()");
+      x.gh.checkRuns = [{ name: "test", status: "completed", conclusion: "failure" }];
+      const [again] = (await x.start(`替我 review 并合入 ${"AMD-AGI/demo#7"}，再来一次`)).items as Recorded[];
+      const failed = await x.merge(again.item_id);
+      assert.notEqual(failed.body.status, "merged", failed.text);
+      assert.match(failed.text, /ci_not_green/);
+      assert.equal(x.puts(), 0);
+    } finally { x.done(); }
+  });
+
+  test("S8j the whole way: the mode is read when the review starts and again at its restart; a fully_auto review asks once the user has left fully_auto", async () => {
+    const x = await wholeWay();
+    try {
+      // Started under fully_auto, then the user turns confirmations back on: the running review asks after all.
+      await x.mode("fully_auto");
+      const [first] = (await x.start()).items as Recorded[];
+      await x.mode("high_risk_confirm");
+      const held = await x.merge(first.item_id);
+      assert.equal(held.body.status, "confirmation_required", held.text);
+      assert.match((held.body.reasons as string[]).join(" "), /while their review mode was fully automatic, and it no longer is/);
+      assert.equal(x.puts(), 0);
+      // Restarted under high_risk_confirm: resolved again, it waits for a confirmation.
+      await w.q("DELETE FROM claw_github_confirmations");
+      const back = await x.restart(first.item_id);
+      assert.equal(back.item.merge_needs_confirmation, true, JSON.stringify(back));
+      const second = (back.item as Recorded).item_id as string;
+      assert.deepEqual([(await x.sessionOf(second)).config.merge_needs_confirmation, (await x.sessionOf(second)).config.started_by_assistant], [true, true]);
+      // The user chooses fully_auto again: the review keeps its confirmation until it is restarted, and its restart merges unasked.
+      await x.mode("fully_auto");
+      const stillHeld = await x.merge(second);
+      assert.equal(stillHeld.body.status, "confirmation_required", stillHeld.text);
+      await w.q("DELETE FROM claw_github_confirmations");
+      const auto = await x.restart(second);
+      assert.equal(auto.item.merge_needs_confirmation, false, JSON.stringify(auto));
+      assert.match(String(auto.merge), /直接合入/);
+      const third = (auto.item as Recorded).item_id as string;
+      assert.deepEqual([(await x.sessionOf(third)).config.merge_needs_confirmation, (await x.sessionOf(third)).config.started_by_assistant], [undefined, true]);
+      const merged = await x.merge(third);
+      assert.equal(merged.body.status, "merged", merged.text);
+      assert.equal(x.puts(), 1);
+    } finally { x.done(); }
+  });
+
+  test("S8k what the router is told of a review's merge matches the review: the rules, the review mode line, review_mode_set", async () => {
+    const p = await import("../src/assistant/prompts.js");
+    const prompt = p.ROUTER_REVIEW_PROMPT;
+    // How merge=true merges is said from the item's merge_needs_confirmation, never from the mode; each value with its own words.
+    assert.match(prompt, /How merge=true merges is what review_start answers, item by item, in merge_needs_confirmation \(with its merge note\), and what each review item in the list says: never say it from the review mode alone\./);
+    assert.match(prompt, /merge_needs_confirmation true: it never merges by itself; once the review approves, the user is asked to confirm the merge \(the card's button or approve #<ref>, 批准 #<ref> in Chinese\), so never tell them it will be merged unasked or handled fully automatically\./);
+    assert.match(prompt, /merge_needs_confirmation false \(the user's review mode was fully_auto when it started\): it merges as soon as the review approves, without asking them \(审过就会直接合入（仓库自身要求的检查仍然生效）/);
+    assert.doesNotMatch(prompt, /merge=true never merges by itself/, "the old rule, wrong for fully_auto, is gone");
+    // review_mode_set: it can set high_risk_confirm, the user turns fully_auto on; never "no way to change it".
+    assert.match(prompt, /You can set high_risk_confirm[^\n]*: call it\. You cannot set fully_auto \(it is refused\)/);
+    assert.match(prompt, /say exactly that: you can switch them to high_risk_confirm, and fully_auto they switch on themselves; never say you have no way to change it/);
+    assert.match(prompt, /review_restart[^\n]*except merge_needs_confirmation, which it sets again from the user's review mode now/);
+    // The mode line says what the mode means for a new review, and that a given review is said from its own value.
+    const state = (mode: string) => p.renderReviewState({ confirmations: [], reviewMode: mode, people: [], actions: [], repos: [] });
+    const auto = state("fully_auto");
+    assert.match(auto, /The user's review mode: fully_auto \(fully automatic: a review the user starts with you with merge=true merges once it approves, without asking them;[^\n]*Say how a given review merges from its merge_needs_confirmation, never from this line\)/);
+    const high = state("high_risk_confirm");
+    assert.match(high, /The user's review mode: high_risk_confirm \(high-risk confirm: a review the user starts with you with merge=true asks them to confirm every merge/);
+    assert.doesNotMatch(high, /without asking/);
+    // An item's line carries its own value, and a review only or one the assistant did not start says nothing of it.
+    const line = (review: Record<string, unknown>) => p.formatManifestLine({
+      itemId: "kwi_1", seq: 1, title: "t", boardState: "in_progress", resultVersion: 0, review: { pr: "AMD-AGI/demo#7", actingAsName: null, model: null, ...review },
+    } as never);
+    assert.match(line({ reviewOnly: false, mergeNeedsConfirmation: true }), /review of AMD-AGI\/demo#7, merge, merge_needs_confirmation: true[,)]/);
+    assert.match(line({ reviewOnly: false, mergeNeedsConfirmation: false }), /merge, merge_needs_confirmation: false \(merges unasked only while the review mode is fully_auto\)/);
+    assert.doesNotMatch(line({ reviewOnly: false }), /merge_needs_confirmation/);
+    assert.doesNotMatch(line({ reviewOnly: true, mergeNeedsConfirmation: false }), /merge_needs_confirmation/);
   });
 
   test("T1 the tools exist only with CLAW_ASSISTANT_TOOLS on", async () => {

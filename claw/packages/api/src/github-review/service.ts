@@ -60,10 +60,17 @@ export interface ReviewActor {
   /** `config.review_only` (review-target.ts): the session reviews and never merges, so `gh_pr_merge` is refused (`review_only`). */
   reviewOnly?: boolean;
   /**
-   * `config.merge_needs_confirmation` (review-target.ts): a review the assistant's router started. Its merge, and an approval that GitHub's
-   * auto-merge would turn into one, is always held for the acting user's confirmation (C2), whatever the risk and their review mode.
+   * `config.merge_needs_confirmation` (review-target.ts): a review the assistant's router started for a person whose review mode was not
+   * `fully_auto`. Its merge, and an approval that GitHub's auto-merge would turn into one, is always held for the acting user's
+   * confirmation (C2), whatever the risk.
    */
   mergeNeedsConfirmation?: boolean;
+  /**
+   * `config.started_by_assistant` (review-target.ts): the assistant's router started or restarted this review. Without
+   * `mergeNeedsConfirmation` it merges as one the person started themselves, but only while their review mode is still `fully_auto`:
+   * once they have left it, its merge is held for their confirmation as `mergeNeedsConfirmation` holds it.
+   */
+  startedByAssistant?: boolean;
 }
 
 /** What `followPullRequest` is asked to look at: a review item's session, its pull request, who reviews and who asked. */
@@ -1521,13 +1528,27 @@ export class GithubReview {
   }
 
   /**
-   * A review the assistant's router started (`ReviewActor.mergeNeedsConfirmation`) merges only once the acting user has confirmed that very
-   * write: the router's `merge=true` came from reading a sentence, and natural language never approves a merge. So the merge is held, whatever
-   * the risk and the acting user's review mode, and made only from the card's button or the exact command (`decide`, with the confirmation).
+   * Why a merge by this session waits for the acting user's own confirmation of that very write, or null when it does not. A review the
+   * assistant's router started reads `merge=true` from a sentence: for a person whose review mode is `high_risk_confirm` that sentence never
+   * approves a merge (`ReviewActor.mergeNeedsConfirmation`, resolved when the review started); for one who chose `fully_auto` it does
+   * (2026-11-18), but only while they keep that mode (`ReviewActor.startedByAssistant`, asked of their mode now).
+   */
+  private assistantMergeHold(ctx: Ctx): string | null {
+    const confirm = `a merge is made only once ${ctx.cred.login} confirms it (the button on its card, or approve #<ref>, 批准 #<ref> in Chinese)`;
+    if (ctx.actor.mergeNeedsConfirmation) return `the review was started through ${ctx.cred.login}'s assistant, so ${confirm}`;
+    if (ctx.actor.startedByAssistant && ctx.cred.mode !== "fully_auto") {
+      return `the review was started through ${ctx.cred.login}'s assistant while their review mode was fully automatic, and it no longer is, so ${confirm}`;
+    }
+    return null;
+  }
+
+  /**
+   * A merge a review the assistant's router started may not make by itself (`assistantMergeHold`) is held, whatever the risk, and made
+   * only from the card's button or the exact command (`decide`, with the confirmation).
    */
   private confirmedMergesOnly(ctx: Ctx, risk: RiskResult): RiskResult {
-    if (!ctx.actor.mergeNeedsConfirmation) return risk;
-    const reason = `the review was started through ${ctx.cred.login}'s assistant, so a merge is made only once ${ctx.cred.login} confirms it (the button on its card, or approve #<ref>, 批准 #<ref> in Chinese)`;
+    const reason = this.assistantMergeHold(ctx);
+    if (!reason) return risk;
     return { ...risk, level: "high", reasons: [...risk.reasons, reason] };
   }
 
@@ -1967,7 +1988,7 @@ export class GithubReview {
         if (t.isResolved === true) return ok({ status: "already_resolved", thread_id: threadId, head_sha: headSha }, redact);
         // With GitHub's auto-merge on, or the pull request in the merge queue, the last open conversation resolved can be what merges it. A session
         // that may not merge by itself (a review only, or one the assistant started, whose merge waits for the acting user's confirmation) leaves it open.
-        if ((ctx.actor.reviewOnly || ctx.actor.mergeNeedsConfirmation) && mergesByItself(await this.readMergeFacts(ctx, ref))) {
+        if ((ctx.actor.reviewOnly || this.assistantMergeHold(ctx) !== null) && mergesByItself(await this.readMergeFacts(ctx, ref))) {
           throw new Refusal("auto_merge_on", "auto-merge is on for this pull request (or it is in the merge queue), so resolving a conversation could merge it, and this session "
             + "does not merge by itself: nothing was resolved. Leave the thread open and say in your review that the finding is fixed.");
         }

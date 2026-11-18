@@ -140,5 +140,10 @@ export const TYPED_MODE_HINT =
 /** The confirmation settings: [Chinese, English] of each, the first the default. */
 export const REVIEW_MODES: Readonly<Record<ReviewMode, readonly [string, string]>> = {
   high_risk_confirm: ["高风险人工再确认一次（默认）", "A person confirms high-risk changes (default)"],
-  fully_auto: ["全自动合入，无需人工确认", "Fully automatic merge, nobody is asked to confirm"],
+  // (not "nobody is asked": a repository that asks for a person still holds a merge under it, and since 2026-11-18 a review the person
+  // asks for in the chat merges unasked too)
+  fully_auto: [
+    "全自动合入（仓库自身要求的检查仍然生效）",
+    "Fully automatic merge (the repository's own requirements still apply)",
+  ],
 };
