@@ -75,6 +75,7 @@ import {
   SANDBOX_CAPACITY_FAILURE_REASONS, SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf,
   sandboxUnavailableOf,
 } from "../sandbox/errors.js";
+import { placementNodeLabels } from "../sandbox/create-sandbox.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
 import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
@@ -666,8 +667,8 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   postRunLease,
   settleRunAttempt: settleClaimedRun,
   runScript,
-  createAppRunner: (runId, platformKey, claimCount) =>
-    createAppRunner(runId, platformKey, claimCount, (sessionId, event, opts) => getDeps().emitter.emit(sessionId, event, opts)),
+  createAppRunner: (runId, platformKey, claimCount, _publish, nodeLabels) =>
+    createAppRunner(runId, platformKey, claimCount, (sessionId, event, opts) => getDeps().emitter.emit(sessionId, event, opts), nodeLabels),
   republishTask: async (subject, data) => {
     await getDeps().emitter.nc.jetstream().publish(subject, data);
   },
@@ -5306,7 +5307,8 @@ class TaskRunner {
       await fx().createAppRunner(runId, this.platformKey, epoch).finishNow("cancelled");
       throw new AppRunFailedError("a hosted application is not run for a session that acts as a user");
     }
-    const runner = fx().createAppRunner(runId, this.platformKey, epoch);
+    // The session's placement, checked before anything is created: the run's sandbox keeps it.
+    const runner = fx().createAppRunner(runId, this.platformKey, epoch, undefined, placementNodeLabels(this.request));
     // A finish-only dispatch is not a run starting: the task is already over as far as the
     // user is concerned, so nothing says "running" and nothing reports a terminal state.
     if (!finishOnly) {

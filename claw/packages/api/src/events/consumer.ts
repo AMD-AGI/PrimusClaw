@@ -12,6 +12,7 @@ import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { sessionEffortFromRow, sessionModelFromRow } from "../sessions/session-model.js";
 import { sessionRepoFromRow } from "../sessions/session-repo.js";
+import { sessionPlacementFromRow } from "../sessions/session-placement.js";
 import { withPendingDrainClaim } from "../sessions/drain-claim.js";
 import { releaseWorkspaceSaveHold, workspaceSaveHoldSet } from "../sessions/save-hold.js";
 import {
@@ -1529,7 +1530,7 @@ async function drainNextPendingMessage(sessionId: string, userId: string): Promi
   // A worker's report queued for the assistant waits behind what its user sent: the user is waiting for an answer,
   // and the report is on the board already, where the turn answering the user reads it.
   const pending = (await db.query(
-  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT effort FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_effort, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo FROM claw_pending_messages WHERE session_id = $1 ORDER BY starts_with(content, $2), created_at LIMIT 1",
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT effort FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_effort, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo, (SELECT config->'placement' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_placement FROM claw_pending_messages WHERE session_id = $1 ORDER BY starts_with(content, $2), created_at LIMIT 1",
   [sessionId, WORK_EVENT_PREFIX],
 )).rows[0];
 
@@ -1629,6 +1630,9 @@ if (pending) {
   // The session's bound repository, as the immediate path attaches it.
   const pendingRepo = sessionRepoFromRow({ repo: pending.session_repo }, sessionId);
   if (pendingRepo) task.repo = pendingRepo;
+  // Where the session's sandboxes may run, as the immediate path attaches it.
+  const pendingPlacement = sessionPlacementFromRow({ placement: pending.session_placement }, sessionId);
+  if (pendingPlacement) task.placement = pendingPlacement;
   const credentialsReadable = await applyPendingCredentials(task, pending, {
     sessionId, userId: pendingUserId, messageId: pendingMessageId,
   });
