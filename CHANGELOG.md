@@ -120,8 +120,10 @@ release version, and its `appVersion` stays `latest`.
   multi-node turn's GPU cluster (RayJob or InferaDeployment) carries the same `customerLabels` on every pod.
   Keys must be Kubernetes label keys, values single label values with no whitespace, at most 8 entries, and the keys the
   platform reads itself (`kubernetes.io/hostname`, `specified-nodes`, `excluded-nodes`, the workspace labels) are
-  refused, all with `400`. Without the field the session and the workload request are unchanged. See "Placing a
-  session's sandboxes on labelled nodes" in `claw/docs/sandbox-session-lifecycle.md`.
+  refused, all with `400`. Without the field the session and the workload request are unchanged. A sandbox or cluster
+  that already exists is reused or adopted only when it was created with the same placement, and is otherwise rebuilt.
+  Roll out Brain before the API. See "Placing a session's sandboxes on labelled nodes" in
+  `claw/docs/sandbox-session-lifecycle.md`.
 
 ### Changed
 

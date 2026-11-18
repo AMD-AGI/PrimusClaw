@@ -367,3 +367,11 @@ when a client sends it. A deployment that creates sandboxes through the Kubernet
 (`CLAW_DEPLOY_MODE=kubernetes`) refuses a placement rather than ignore it. Brain checks the placement again
 before it creates a sandbox or a multi-node cluster, and fails the run with `sandbox_placement_invalid`
 instead of creating either without it.
+
+A sandbox or cluster that already exists is reused or adopted only when it was created with the same
+placement. A session's sandbox whose spec was recorded without the placement is rebuilt rather than reused;
+a multi-node cluster a redelivered message left behind is adopted only when its `customerLabels` match, and
+is otherwise deleted and created again; an application run's live sandbox is adopted only when its
+`customerLabels` match, and is otherwise stopped and replaced. A session without a placement reuses and
+adopts exactly as before. When upgrading, roll out Brain before the API, so that no Brain that predates
+`placement` receives a request carrying one.
