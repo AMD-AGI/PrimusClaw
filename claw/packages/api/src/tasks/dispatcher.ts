@@ -17,7 +17,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import { SANDBOX_WORKSPACE_NOT_ALLOWED, taskSubject } from "@claw/protocol";
-import type { ExecuteRequest, ReasoningEffort, SandboxPlacement, ScriptStep, TaskMode } from "@claw/protocol";
+import type { ExecuteRequest, ReasoningEffort, ScriptStep, TaskMode } from "@claw/protocol";
 import {
   MissingPlatformKeyError,
   readTrustedSessionCredentials,
@@ -25,7 +25,6 @@ import {
 import { CLAW_AGENT_GUIDELINE_ENABLED, CLAW_DEPLOY_MODE, CLAW_SKILL_AUTO_EVOLUTION_ENABLED } from "../config.js";
 import { withAgentGuideline } from "../sessions/agent-guideline.js";
 import { sessionEffortFromRow } from "../sessions/session-model.js";
-import { sessionPlacementFromRow } from "../sessions/session-placement.js";
 import { actingSessionTurnFields, withholdsSandboxKeys } from "../github-review/session-tools.js";
 import { usesReviewProfile } from "../github-review/requested-by.js";
 import { applyReviewProfile, ReviewTurnBudgetUsedError, reviewTurnsLeft } from "../github-review/review-profile.js";
@@ -156,8 +155,6 @@ async function loadSessionCredentials(sessionId: string): Promise<{
   review_turns_left: number | null;
   /** The reasoning effort the session chose (`claw_sessions.effort`), or none. */
   effort: ReasoningEffort | undefined;
-  /** Where the session's sandboxes may run (`config.placement`), or none. */
-  placement: SandboxPlacement | undefined;
 }> {
   // `claw_sessions` only ships `user_id` in the canonical schema; the legacy
   // `platform_key` / `workspace_id` columns are optional add-ons in some
@@ -202,7 +199,6 @@ async function loadSessionCredentials(sessionId: string): Promise<{
     withhold_sandbox_keys: withholdsSandboxKeys(cfg),
     review_turns_left: usesReviewProfile(cfg) ? (await reviewTurnsLeft(sessionId, row.user_id ?? "")).left : null,
     effort,
-    placement: sessionPlacementFromRow(cfg, sessionId),
   };
 }
 
@@ -515,8 +511,6 @@ function executeRequestOf(opts: Parameters<typeof buildExecuteRequest>[0]): Exec
     tools_allowlist: (updated.tools_allowlist as string[]) ?? undefined,
     model: updated.model ?? undefined,
     ...(session.effort ? { effort: session.effort } : {}),
-    // Every sandbox this task, DAG node or application run creates keeps the session's placement.
-    ...(session.placement ? { placement: session.placement } : {}),
     files_workspace_id: filesWorkspaceId,
     files_workspace_required: true,
     // Legacy fields removed -- new schema uses sandbox_spec exclusively.

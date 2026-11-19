@@ -292,8 +292,6 @@ export interface AppRunnerDeps {
    * ordinary cancel. Absent means never deleted.
    */
   sessionDeleted?: (sessionId: string) => Promise<boolean>;
-  /** The session's placement (`ExecuteRequest.placement`): node labels the run's sandboxes require. Absent: none. */
-  nodeLabels?: Record<string, string>;
 }
 
 export interface AppRunOutcome {
@@ -1213,7 +1211,6 @@ export class AppRunner {
       workspaceId: rec.workspace_id ?? undefined,
       sandboxWorkloadId: rec.sandbox_workload_id,
       platformKey: this.platformKey,
-      ...(this.deps.nodeLabels ? { nodeLabels: this.deps.nodeLabels } : {}),
     };
   }
 

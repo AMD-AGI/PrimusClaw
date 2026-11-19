@@ -257,14 +257,6 @@ interface CommonWorkloadParams {
    */
   extraEnv?: Record<string, string>;
   extraLabels?: Record<string, string>;
-  /**
-   * Node labels every pod of the cluster requires: the session's placement
-   * (`ExecuteRequest.placement.nodeLabels`), sent as SaFE's `customerLabels`,
-   * which SaFE turns into a required node affinity on every role. Absent or
-   * empty sends no `customerLabels` at all. Checked by the caller
-   * (`placementNodeLabels`).
-   */
-  nodeLabels?: Record<string, string>;
 }
 
 /**
@@ -357,14 +349,6 @@ function correlationLabels(
   return labels;
 }
 
-/**
- * The session's placement on a cluster body, in place: last, and only when there
- * is one, so a session without one sends the body it always did.
- */
-function applyCustomerLabels(body: Record<string, unknown>, nodeLabels?: Record<string, string>): void {
-  if (nodeLabels && Object.keys(nodeLabels).length > 0) body.customerLabels = { ...nodeLabels };
-}
-
 function assertCommon(p: CommonWorkloadParams): void {
   if (p.nodes < 1) throw new Error(`nodes must be >= 1, got ${p.nodes}`);
   if (p.gpusPerNode < 1) throw new Error(`gpusPerNode must be >= 1, got ${p.gpusPerNode}`);
@@ -426,7 +410,6 @@ export function buildRayJobWorkloadBody(p: CommonWorkloadParams): Record<string,
   applyWorkloadId(body, p.messageId);
   if (p.description) body.description = p.description;
   if (p.ownerId) body.ownerId = p.ownerId;
-  applyCustomerLabels(body, p.nodeLabels);
   return body;
 }
 
@@ -574,7 +557,6 @@ export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string,
   applyWorkloadId(body, p.messageId);
   if (p.description) body.description = p.description;
   if (p.ownerId) body.ownerId = p.ownerId;
-  applyCustomerLabels(body, p.nodeLabels);
   return body;
 }
 
