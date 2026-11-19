@@ -35,6 +35,7 @@ import { SessionStore } from "./session-store.js";
 import type { SseFrame } from "./sse.js";
 import { backoffMs, errMessage, isObject, sleep, type Logger, type MayRun, type Verdict } from "./util.js";
 import { agentHealth, RECHECK_MS, type AgentHealth, type Report } from "./doctor.js";
+import type { AutoUpgrader } from "./auto-upgrade.js";
 
 /**
  * `base` with `health` in it, dropping its last problems until the whole stays well inside the capabilities cap (the
@@ -280,9 +281,21 @@ export interface ConnectorDeps {
    * report. Each agent's descriptor carries the result as `capabilities.health`. Absent: no health is reported.
    */
   health?: (signal: AbortSignal) => Promise<Report>;
+  /**
+   * Upgrading itself to the version Claw recommends (auto-upgrade.ts): told each heartbeat's answer, asked every
+   * `checkMs` whether to end the run for an upgrade, and reported in every descriptor. Absent: none.
+   */
+  upgrade?: AutoUpgrader;
+  /**
+   * A trial run of a newly installed version, started by the run that installed it (auto-upgrade.ts `TRIAL_ENV`): `run`
+   * identifies and sends one heartbeat, then returns `trial_ok`. It takes no command, starts no agent, and leaves the pid
+   * file, the sessions and the adapters alone: they are the stopped run's, which waits for it.
+   */
+  trial?: boolean;
 }
 
-export type RunResult = "stopped" | "revoked" | "auth_failed";
+/** `upgrade`: ended to upgrade the package (`upgradeTarget`); `trial_ok`: a trial run connected. */
+export type RunResult = "stopped" | "revoked" | "auth_failed" | "upgrade" | "trial_ok";
 
 /** Claw answered, and refused the credential itself (not a revocation of the row, which is {@link RevokedError}). */
 export const isAuthRefusal = (e: unknown): boolean => e instanceof HttpError && (e.status === 401 || e.status === 403);
@@ -333,6 +346,20 @@ export class Connector {
   private lastHealthAsk = 0;
   private streamCtl: AbortController | null = null;
   private readonly ctl = new AbortController();
+  /** Aborted only by {@link stop} (a stop from outside), not by the run ending itself to upgrade. */
+  private readonly stopCtl = new AbortController();
+  /** The version this run ended to upgrade to. */
+  private upgradeTo: string | null = null;
+  /** When the command stream last opened (its `ready` came) without ending since; null while it is not open. */
+  private streamUpAt: number | null = null;
+  /** The command stream is open (its `ready` came, and it has not ended since). */
+  private get streamReady(): boolean { return this.streamUpAt !== null; }
+  private set streamReady(v: boolean) { if (!v) this.streamUpAt = null; else this.streamUpAt ??= Date.now(); }
+  /** Since when (`Date.now()`) the command stream has been open without a break, or null while it is not open. */
+  get connectedSince(): number | null { return this.streamUpAt; }
+  private onConnected: (() => void) | null = null;
+  /** Settles when the command stream first opens (a run of a version on probation proves itself by it). */
+  readonly connected = new Promise<void>((ok) => { this.onConnected = ok; });
   /** The last tick of the stall clock, monotonic and wall (`stallWatch`). */
   private tickMono = performance.now();
   private tickWall = Date.now();
@@ -468,15 +495,34 @@ export class Connector {
   }
 
   get connectorId(): string { return this.cid; }
+  /** Set when the run ended to upgrade (`run` returned `upgrade`): the version to install. */
+  get upgradeTarget(): string | null { return this.upgradeTo; }
+  /** A stop asked from outside, also after `run` returned (an upgrade in progress ends where it is). */
+  get stopSignal(): AbortSignal { return this.stopCtl.signal; }
+
+  /**
+   * Nothing is going on that an upgrade would cut off: no command being carried out, no turn running or recorded, no prompt or
+   * terminal message queued, no approval waiting (an agent's or a terminal's), no confirmation being asked, and not paused.
+   */
+  idleNow(): boolean {
+    // Connected too: a prompt Claw queued while the stream was down would wait out the upgrade on top of the outage.
+    return this.streamReady && !this.paused && this.asking.size === 0 && this.manager.idleNow() && this.approvals.size === 0 && this.store.listTurns().length === 0;
+  }
   get isRevoked(): boolean { return this.revoked; }
 
   /** Ask the loops to end; `run` returns once adapters are stopped. */
   stop(): void {
+    this.stopCtl.abort();
     this.ctl.abort();
     this.streamCtl?.abort();
   }
 
   private async descriptors(): Promise<RemoteAgentDescriptor[]> {
+    const upgrade = this.d.upgrade?.report() ?? null;
+    // A connector that cannot upgrade itself says so among the machine's problems, with the command that does it by hand.
+    const report: Report | null = upgrade?.problem
+      ? { ...(this.healthReport ?? { checked_at: new Date().toISOString(), by: "run" as const, ok: [] }), problems: [...(this.healthReport?.problems ?? []), upgrade.problem] }
+      : this.healthReport;
     return Promise.all(this.d.config.agents.map(async (a) => {
       // `unattended`: sessions start in a mode that does not ask before a write or a command. `unattended_allowed`:
       // a phone may switch this agent to such a mode. A client shows the first so nobody is surprised by it.
@@ -486,13 +532,14 @@ export class Connector {
       // `watch_live`: a conversation open in a terminal can be opened read-only (session.ts `spectate`); a client offers that only then.
       // `terminal_input`: and one open in a tmux pane takes messages, typed into that terminal (`resumable[].input: "terminal"`).
       const base = withHealth({
+        ...(upgrade ? { auto_upgrade: upgrade.caps } : {}),
         ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes,
         // `withdraw`: a prompt that has not started can be taken back without stopping anything (Session.withdraw)
         withdraw: true,
         ...(support ? { watch_live: true, ...(support.typesIntoTerminals() ? { terminal_input: true } : {}) } : {}),
         ...(a.readOnlyModes.length ? { read_only_modes: a.readOnlyModes } : {}),
         ...(readOnly ? { edits: false, edits_hint: READ_ONLY_HINT } : {}),
-      }, this.healthReport ? agentHealth(this.healthReport, a.id) : null);
+      }, report ? agentHealth(report, a.id) : null);
       // An attach agent also says which existing sessions it could take over, and whether anything holds them open now.
       // `takeover`: a conversation a terminal has open can be taken over when the person confirms it (`session.new` with
       // `takeover`), which ends the terminal's process; without it, such a conversation is only watched.
@@ -592,7 +639,8 @@ export class Connector {
     this.hbLate = false;
     let failed = false;
     try {
-      await this.d.client.heartbeat(this.cid, body);
+      const answer = await this.d.client.heartbeat(this.cid, body);
+      this.d.upgrade?.observe((answer as Record<string, unknown> | undefined)?.connector_version);
     } catch (e) {
       failed = e instanceof TransportError;
       throw e;
@@ -808,6 +856,32 @@ export class Connector {
   }
 
   // --- the loops -----------------------------------------------------------------------
+
+  /**
+   * Ask, every `checkMs` of the upgrader's timing, whether to end the run to upgrade (auto-upgrade.ts). When the answer is a version and the run
+   * is still idle, the run ends as a stop does (what is in flight is left for the next run, and there is none), and `run`
+   * returns `upgrade`. A changed report is sent with an early heartbeat.
+   */
+  private async upgradeWatcher(): Promise<void> {
+    const up = this.d.upgrade;
+    if (!up) return;
+    while (!this.ctl.signal.aborted) {
+      await sleep(up.timing.checkMs, this.ctl.signal);
+      if (this.ctl.signal.aborted) break;
+      const before = JSON.stringify(up.report());
+      const target = await up.decide(this.idleNow(), this.ctl.signal);
+      if (JSON.stringify(up.report()) !== before) this.wakeHeartbeat?.();
+      if (!target || this.ctl.signal.aborted) continue;
+      // Looked at again: a command may have come while the preflight asked npm.
+      if (!this.idleNow()) { up.busy(); continue; }
+      this.upgradeTo = target;
+      this.d.log.info("stopping to upgrade the connector", { from: this.d.version, to: target });
+      this.d.audit.record("connector_upgrading", { from: this.d.version, to: target });
+      this.ctl.abort();
+      this.streamCtl?.abort();
+      return;
+    }
+  }
 
   /** Post events in batches, one request at a time and in order, until everything is acknowledged. */
   private async sender(): Promise<void> {
@@ -1219,6 +1293,7 @@ export class Connector {
     let reconnect = false;
     let lastRestartAt = -Infinity;
     while (!this.ctl.signal.aborted) {
+      this.streamReady = false;
       if (this.paused) { await sleep(this.timing.pausePollMs, this.ctl.signal); continue; }
       this.streamCtl = new AbortController();
       this.streamAskedAt = performance.now();
@@ -1230,13 +1305,14 @@ export class Connector {
         for await (const f of this.d.client.commands(this.cid, { lastEventId: this.ledger.highestSeen || undefined, signal: sig, watchdogMs: this.timing.watchdogMs })) {
           if (!got) { got = true; attempt = 0; this.authFailures = 0; }
           this.onFrame(f, reconnect);
-          if (f.event === "ready") reconnect = true;
+          if (f.event === "ready") { reconnect = true; this.streamReady = true; this.onConnected?.(); }
           // The Claw replica serving this stream is shutting down (a release): leave it now, without waiting for the
           // end of the response (which a gateway may hold) or a backoff, and open the stream on another replica.
           if (f.event === "reconnect") { restart = true; break; }
         }
         // The server ended the stream on purpose: a Claw release or restart, another run of this connector
         // (`superseded`), or an access token that ran out (`token_expired`). Said once, so a log shows why.
+        this.streamReady = false;
         if (!this.ctl.signal.aborted && !this.paused) {
           const why = restart ? "restart" : this.lastFrame === "superseded" || this.lastFrame === "token_expired" ? this.lastFrame : "the server closed the stream (a Claw release or restart)";
           this.d.log.info("command stream ended by the server; reconnecting", { why });
@@ -1266,6 +1342,7 @@ export class Connector {
         }
         this.d.log.warn("command stream lost; reconnecting", { error: errMessage(e), attempt });
       }
+      this.streamReady = false;
       if (this.ctl.signal.aborted) break;
       if (this.paused) continue;
       await sleep(backoffMs(attempt++, this.timing.backoffMinMs, this.timing.backoffMaxMs), this.ctl.signal);
@@ -1275,6 +1352,7 @@ export class Connector {
   /** Run until stopped or revoked. Always leaves no adapter process behind. */
   async run(): Promise<RunResult> {
     fs.mkdirSync(this.d.dirs.state, { recursive: true, mode: 0o700 });
+    if (this.d.trial) return this.trialRun();
     // Adapters a crashed earlier run left recorded are stopped first (only if they are still the processes we started).
     await this.registry.killAll();
     // A card whose adapter died with the previous run can never be answered: close it, so a phone does not keep a dead button.
@@ -1318,10 +1396,10 @@ export class Connector {
       this.tickMono = performance.now();
       this.tickWall = Date.now();
       await Promise.all([
-        this.sender(), this.heartbeater(), this.streamLoop(), this.pauseWatcher(), this.sessionsWatcher(), this.healthWatcher(),
+        this.sender(), this.heartbeater(), this.streamLoop(), this.pauseWatcher(), this.sessionsWatcher(), this.healthWatcher(), this.upgradeWatcher(),
         this.stallWatch().catch(() => undefined),
       ]);
-      result = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : "stopped";
+      result = this.revoked ? "revoked" : this.authFailed ? "auth_failed" : this.upgradeTo && !this.stopCtl.signal.aborted ? "upgrade" : "stopped";
     } catch (e) {
       failure = errMessage(e);
       throw e;
@@ -1345,6 +1423,17 @@ export class Connector {
       fs.rmSync(pidf, { force: true });
     }
     return result;
+  }
+
+  /** A trial run of a newly installed version (`ConnectorDeps.trial`): identify, one heartbeat, done. */
+  private async trialRun(): Promise<RunResult> {
+    try {
+      const up = await this.startup();
+      return up === "ok" ? "trial_ok" : up;
+    } finally {
+      await within(this.identityOut.settled(STATE_WRITE_WAIT_MS), STATE_WRITE_WAIT_MS, false);
+      this.identityOut.close(); this.store.close(); this.registry.close();
+    }
   }
 
   /** For tests: wait until every event is acknowledged. */

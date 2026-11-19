@@ -113,6 +113,26 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Connector: a connector that runs as a service upgrades itself to the version Claw recommends (on by default; off with
+  `claw-connector auto-upgrade off`, `auto_upgrade = false` in `agents.toml`, or `CLAW_CONNECTOR_AUTO_UPGRADE=0`). It
+  takes exactly the recommended version (never `latest`, never down, never a prerelease or a new major version; below
+  1.0.0 a new minor version only when Claw's minimum is in its own minor line), only when no turn runs and nothing is
+  queued or waiting for an approval, with the npm beside its own node into the prefix it was installed under; never while it is
+  disconnected from Claw or while `agents.toml` cannot be read. The new version is downloaded beside the live one while the
+  connector still runs and is moved in only then, so a connector killed during the download keeps its old version. The old
+  package directory is kept; a new version that does not connect within 60 seconds in three trial runs is rolled back and
+  not tried again until a newer one is recommended, and so is one whose first three real runs fail (or do not connect
+  within 60 seconds, or do not reconnect within 60 seconds after a drop) before one of them has stayed connected without a
+  break for a minute. Turning auto-upgrade off while a download is under way still stops the swap. Each real run of the new
+  version counts itself as its first step, so this holds under systemd and launchd as well as under the script
+  supervisor; a version that cannot even start its code is caught by the trial runs before it is moved in. A new version
+  whose runs cannot be counted (its state file cannot be written) is not run: the old one comes back. Where it cannot upgrade (no npm, a prefix it may not write, a
+  registry that does not answer) it changes nothing and the chat shows the machine's problem with the command that does
+  it by hand. The first run of a new version brings installed hooks up to date and never adds hooks that were not
+  installed. Each agent's `capabilities.auto_upgrade` reports the state and the last outcome, and `devenv_list` uses the
+  machine's own command as its `upgrade_command`. Connectors before this one cannot upgrade themselves: upgrade them once
+  by hand. See "Upgrades" in `connector/README.md`.
+
 - Claw: `POST /v1/sessions` accepts an optional `placement.nodeLabels`, a map of node label key to value that every
   sandbox of the session requires. It is sent to SaFE as the workload's `customerLabels` (a required node affinity), kept
   with the session, and applied to every sandbox the session creates, a rebuilt or reclaimed one, a queued message's

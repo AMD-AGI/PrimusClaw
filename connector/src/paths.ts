@@ -63,3 +63,8 @@ export const serviceFile = (d: Dirs) => path.join(d.state, "service.json");
 export const doctorFile = (d: Dirs) => path.join(d.state, "doctor.json");
 /** Touched by every `service ensure` (what keepalive.sh runs), so `doctor` can tell whether anything calls it. */
 export const keepaliveStampFile = (d: Dirs) => path.join(d.state, "keepalive-last");
+/**
+ * What the connector's own upgrades left behind (auto-upgrade.ts): the last outcome, a version that failed here and is not
+ * tried again, when to try again after a refusal, and the setup the next run still has to do.
+ */
+export const autoUpgradeFile = (d: Dirs) => path.join(d.state, "auto-upgrade.json");

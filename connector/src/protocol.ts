@@ -9,6 +9,8 @@
  * fails if any other file in `src/` imports that path or restates a constant.
  */
 export {
+  CONNECTOR_PACKAGE,
+  compareConnectorVersions,
   REMOTE_AGENT_LIMITS,
   REMOTE_AGENT_PROTOCOL_VERSION,
   REMOTE_AGENT_TIMING,

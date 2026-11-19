@@ -22,7 +22,7 @@ export const approvalOfferFile = (d: Dirs): string => path.join(d.state, "approv
 export const ENABLE_APPROVALS = "claw-connector hooks install --approvals";
 
 /** Commands after which nothing is offered: they install hooks themselves, end this machine's sign-in, or are not run by people. */
-const NOT_AFTER = new Set(["init", "pair", "hooks", "logout", "run", "supervise", "health-check"]);
+const NOT_AFTER = new Set(["init", "pair", "hooks", "logout", "run", "supervise", "health-check", "auto-upgrade"]);
 
 type Answer = { answer: "yes" | "no"; at: string };
 interface OfferState { v: 1; answered: Record<string, Answer> }

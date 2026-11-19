@@ -175,7 +175,7 @@ every 15 minutes and when `doctor` signals the connector. `scope` is `agent` (ab
 connector; a client shows it once per machine). `severity` is `fail` (sessions will not work until it is fixed) or `warn`.
 `detail` and `fix` are English lines for a client that does not know the `code`; `fix` is a command or edit for the machine.
 The codes: `node_too_old`, `agent_cli_missing`, `agent_not_signed_in`, `root_missing`, `root_not_writable`, `proxy_mismatch`,
-`proxy_invalid`, `no_service`, `linger_off`, `keepalive_not_scheduled` (and from `doctor` alone: `claw_unreachable`, `claw_tls_untrusted`, `service_path_missing`, `config_invalid`, `not_signed_in`, `needs_login`). An empty `problems` means the checks passed; an absent
+`proxy_invalid`, `no_service`, `linger_off`, `keepalive_not_scheduled`, `connector_upgrade_blocked` and `connector_upgrade_failed` (below) (and from `doctor` alone: `claw_unreachable`, `claw_tls_untrusted`, `service_path_missing`, `config_invalid`, `not_signed_in`, `needs_login`). An empty `problems` means the checks passed; an absent
 `health` means unknown (an older connector, or the first check not done yet). `devenv_list` relays the problems to the assistant.
 
 ## Connector access tokens
@@ -479,6 +479,28 @@ recommended version the connector list, `devenv_list` and the heartbeat's answer
 `npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install`
 (`stop` exits 0 when nothing runs, so a failed install stops the chain). Sessions already open
 are not touched.
+
+**Upgrading itself.** A connector with auto-upgrade (from the first release after 0.2.3; the upgrade to it is done by hand)
+reads `connector_version.recommended_version` and `minimum_version` from the heartbeat's answer and, when it runs under a
+supervisor (`run --supervised`) and its owner did not turn it off (`auto_upgrade = false` in `agents.toml`,
+`claw-connector auto-upgrade off`, `CLAW_CONNECTOR_AUTO_UPGRADE=0`), upgrades itself to exactly that version: never down,
+never to a prerelease or a new major version, and below 1.0.0 to a new minor version only when the server's minimum is in
+the connector's own minor line or below it. It does so only while its command stream is open, no turn runs, nothing is queued and no approval waits
+(for a minute; otherwise it looks again 15 minutes later), and never while `agents.toml` cannot be read. It downloads the
+version first, while still connected, with the npm beside the node that runs it, into a directory beside the package in the
+prefix it was installed under, then moves it in and keeps the old package directory; the new version must report its version
+and connect (a trial run: one identify and heartbeat) within 60 seconds, else after three tries the old version is put back
+and that version is not tried again until a newer one is recommended. After that the new version is on probation until one
+of its real runs has stayed connected without a break for a minute: three runs of it that end with a failure first (or do
+not connect within 60 seconds) put the old version back and pin the new one as failed the same way. Each run counts itself
+as its first step, so this holds under systemd and launchd as well as under the script supervisor. Every agent's `capabilities.auto_upgrade` says where it stands:
+`{enabled, state, target?, last?: {from, to, outcome, at}, failed_version?, reason?, command?}`, `state` one of `current`,
+`waiting_idle`, `upgrading`, `unreadable` (`agents.toml` or its own state could not be read; it does not upgrade), `blocked` (it cannot here: no npm, a prefix this user may not write, a registry that does not
+answer; nothing was changed), `failed`, `off`, `unsupervised`, `unmanaged` (not a global npm install) or `manual` (a step it
+does not take by itself); `command` is the command that upgrades that machine by hand, with its own npm, prefix and
+program. While it is `blocked` or `failed` the machine's health has `connector_upgrade_blocked` or
+`connector_upgrade_failed`. `devenv_list` gives each machine its `auto_upgrade` and uses the machine's own `command` as
+its `upgrade_command`.
 
 What a person runs to connect a machine is given by the server, never written by a client
 or a model: `GET /v1/remote-agents/setup`, and `connect_a_machine` in `devenv_list` (no
