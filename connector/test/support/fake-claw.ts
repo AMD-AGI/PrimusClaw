@@ -12,7 +12,7 @@
 import { randomUUID } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { parseEventBatch, parseHeartbeat } from "../../../claw/packages/protocol/src/remote-agents.js";
+import { compareConnectorVersions, parseEventBatch, parseHeartbeat } from "../../../claw/packages/protocol/src/remote-agents.js";
 
 export interface StoredEvent { session_id: string; seq: number; type: string; ts: number; data: any }
 
@@ -65,6 +65,11 @@ export class FakeClaw {
   readonly revocations: Array<{ method: string; id: string; auth: string | undefined }> = [];
   cursor = 0;
   nextSeq = 1;
+  /**
+   * The connector versions this Claw takes, as CLAW_REMOTE_AGENTS_{MIN,RECOMMENDED}_CONNECTOR_VERSION set them: a heartbeat from an
+   * older version than `recommended` is answered with `connector_version`, as the real server does. Null: never.
+   */
+  connectorVersions: { minimum: string; recommended: string } | null = null;
   /** Sessions closed on Claw's side (the person closed one, or removed the machine): their commands are no longer live. */
   readonly closedSessions = new Set<string>();
   /** What `POST .../commands/:cmd_id/confirm` answers for a command, instead of judging it. */
@@ -281,7 +286,16 @@ export class FakeClaw {
         this.heartbeats.push(body);
         if (hb.value.cmdCursor !== null) { this.cursor = Math.max(this.cursor, hb.value.cmdCursor); }
         this.wake();
-        return this.json(res, 200, { ok: true, data: { server_time: new Date().toISOString(), online_window_ms: 90000 } });
+        const pol = this.connectorVersions;
+        const old = pol && typeof hb.value.version === "string" && (compareConnectorVersions(hb.value.version, pol.recommended) ?? 0) < 0;
+        return this.json(res, 200, { ok: true, data: {
+          server_time: new Date().toISOString(), online_window_ms: 90000,
+          ...(old ? { connector_version: {
+            version_status: (compareConnectorVersions(hb.value.version!, pol.minimum) ?? 0) < 0 ? "unsupported" : "outdated",
+            upgrade_command: "npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install",
+            minimum_version: pol.minimum, recommended_version: pol.recommended,
+          } } : {}),
+        } });
       }
       case "events": {
         if (this.failPosts > 0) { this.failPosts--; return this.json(res, 503, { ok: false, error: "unavailable" }); }

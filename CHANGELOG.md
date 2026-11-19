@@ -113,6 +113,19 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Connector: a connector that runs as a service upgrades itself to the version Claw recommends (on by default; off with
+  `claw-connector auto-upgrade off`, `auto_upgrade = false` in `agents.toml`, or `CLAW_CONNECTOR_AUTO_UPGRADE=0`). It
+  takes exactly the recommended version (never `latest`, never down, never a prerelease or a new major version; below
+  1.0.0 a new minor version only when Claw's minimum is in its own minor line), only when no turn runs and nothing is
+  queued or waiting for an approval, with the npm beside its own node into the prefix it was installed under. The old
+  package directory is kept; a new version that does not connect within 60 seconds in three trial runs is rolled back and
+  not tried again until a newer one is recommended. Where it cannot upgrade (no npm, a prefix it may not write, a
+  registry that does not answer) it changes nothing and the chat shows the machine's problem with the command that does
+  it by hand. The first run of a new version brings installed hooks up to date and never adds hooks that were not
+  installed. Each agent's `capabilities.auto_upgrade` reports the state and the last outcome, and `devenv_list` uses the
+  machine's own command as its `upgrade_command`. Connectors before this one cannot upgrade themselves: upgrade them once
+  by hand. See "Upgrades" in `connector/README.md`.
+
 - Claw: `POST /v1/sessions` accepts an optional `placement.nodeLabels`, a map of node label key to value that every
   sandbox of the session requires. It is sent to SaFE as the workload's `customerLabels` (a required node affinity), kept
   with the session, and applied to every sandbox the session creates, a rebuilt or reclaimed one, a queued message's

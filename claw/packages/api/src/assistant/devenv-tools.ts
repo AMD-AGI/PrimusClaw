@@ -179,7 +179,15 @@ export interface DevenvMachine {
   version: string | null;
   /** Below `recommended`: `outdated` (works; `upgrade_command` upgrades it); below `minimum`: `unsupported` (no new session starts on it). */
   version_status: ConnectorVersionVerdict["version_status"];
+  /** For this machine: the command its connector reported (its own npm, prefix and program), else the general one. */
   upgrade_command?: string;
+  /**
+   * Whether the connector upgrades itself (`capabilities.auto_upgrade`, connector/src/auto-upgrade.ts): `waiting_idle` (it will,
+   * once no session is working), `blocked` (it cannot here: `upgrade_command` does it), `failed` (that version did not start
+   * there and was rolled back), `off`, `manual` (too big a step to take by itself), and the last upgrade's outcome. Absent for a
+   * connector from before it.
+   */
+  auto_upgrade?: DevenvAutoUpgrade;
   agents: DevenvAgent[];
   sessions: DevenvSession[];
   /**
@@ -188,6 +196,12 @@ export interface DevenvMachine {
    */
   problems?: DevenvProblem[];
   health_checked_at?: string | null;
+}
+
+export interface DevenvAutoUpgrade {
+  state: string;
+  target: string | null;
+  last: { from: string | null; to: string | null; outcome: string | null; at: string | null } | null;
 }
 
 export interface DevenvProblem { agent: string | null; code: string; severity: "fail" | "warn"; detail: string | null; fix: string | null }
@@ -248,11 +262,35 @@ const READ_ONLY_NOTE = "open in a terminal on that machine: attaching only watch
 const TYPED_NOTE = "open in a terminal on that machine: what is sent is typed into that terminal as the user's own input (it waits while the "
   + "terminal is busy or someone is typing there), and the replies come back here; the terminal keeps its own mode";
 
-/** The connector's version against this server's (`remote-agents/setup.ts`), as `devenv_list` shows it. */
-const versionOf = (c: Row): Pick<DevenvMachine, "version_status" | "upgrade_command"> => {
+/** The longest upgrade command passed on: it names this machine's own npm, prefix and program, so it may be long. */
+const COMMAND_MAX = 600;
+const UPGRADE_STATE_RE = /^[a-z_]{1,32}$/;
+
+/**
+ * The connector's version against this server's (`remote-agents/setup.ts`), as `devenv_list` shows it, with what the connector says
+ * about upgrading itself (its agents' `capabilities.auto_upgrade`, the same on each): its state, and the command for that machine,
+ * which replaces the general one. What a connector reports is passed on flattened and cut, never trusted further.
+ */
+export function machineVersion(c: Row, agents: Row[]): Pick<DevenvMachine, "version_status" | "upgrade_command" | "auto_upgrade"> {
   const v = versionVerdict(typeof c.version === "string" ? c.version : null);
-  return { version_status: v.version_status, ...(v.upgrade_command ? { upgrade_command: v.upgrade_command } : {}) };
-};
+  let auto: DevenvAutoUpgrade | null = null;
+  let command: string | null = null;
+  for (const a of agents) {
+    const caps = isObject(a.capabilities) ? a.capabilities : {};
+    const up = isObject(caps.auto_upgrade) ? caps.auto_upgrade : null;
+    if (!up || typeof up.state !== "string" || !UPGRADE_STATE_RE.test(up.state)) continue;
+    const last = isObject(up.last) ? up.last : null;
+    auto = {
+      state: up.state, target: flat(up.target, 40),
+      last: last ? { from: flat(last.from, 40), to: flat(last.to, 40), outcome: flat(last.outcome, 20), at: flat(last.at, 40) } : null,
+    };
+    command = flat(up.command, COMMAND_MAX);
+    break;
+  }
+  const outdated = v.version_status === "outdated" || v.version_status === "unsupported";
+  const upgrade = outdated ? command ?? v.upgrade_command ?? null : null;
+  return { version_status: v.version_status, ...(upgrade ? { upgrade_command: upgrade } : {}), ...(auto ? { auto_upgrade: auto } : {}) };
+}
 
 /** A machine name the channel's attach command can carry as `machine/agent` (one word: the channel splits on spaces). */
 const COMMAND_NAME_RE = /^[A-Za-z0-9._@+-]{1,80}$/;
@@ -461,7 +499,8 @@ export const ALL_OFFLINE_NOTE = " Every machine of the user's is offline, so not
   + "added. Do not call devenv_pair for another. Never say it is \"still\" offline or \"the same as last time\" (还是, 上次): say only what this list shows.";
 
 const OUTDATED_NOTE = " A machine whose version_status is outdated or unsupported needs its connector upgraded (unsupported: no new session "
-  + "starts on it): give the user its upgrade_command as it is.";
+  + "starts on it): give the user its upgrade_command as it is. Except when its auto_upgrade.state is waiting_idle or upgrading: then its "
+  + "connector upgrades itself as soon as no session is working there, so say that and give no command.";
 
 /**
  * The sessions each machine lists when every machine is asked for: the latest ones (open through Claw first, then each agent's own,
@@ -652,7 +691,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
     });
     const health = machineProblems(agents);
     machines.push({
-      machine, online, last_seen: iso(c.heartbeat_at), version: shown(c.version, NAME_MAX), ...versionOf(c), agents: offered, sessions,
+      machine, online, last_seen: iso(c.heartbeat_at), version: shown(c.version, NAME_MAX), ...machineVersion(c, agents), agents: offered, sessions,
       ...(health ? { problems: health.problems, health_checked_at: health.checked_at } : {}),
     });
   }

@@ -31,6 +31,8 @@ import { loadCredentials, reconnectFix, reconnectStep } from "./credentials.js";
 import { needsLogin, recordDisconnect, recentDisconnects } from "./health.js";
 import { credentialsFile, keepaliveFile, keepaliveStampFile, runLogFile, serviceEnvFile, serviceFile, supervisorPidFile } from "./paths.js";
 import { errMessage, isObject, sleep } from "./util.js";
+import { AUTO_UPGRADE_ENV, EXIT_UPGRADED } from "./auto-upgrade.js";
+import { VERSION } from "./version.js";
 
 export type Supervisor = "systemd" | "launchd" | "script";
 export const SUPERVISORS: readonly Supervisor[] = ["systemd", "launchd", "script"];
@@ -46,7 +48,7 @@ export const NEEDS_PERSON = 78;
  * No credential variable (CLAW_CONNECTOR_KEY, API keys) ever lands in a unit; the agents' own go to service-env.json.
  */
 export const CARRIED_ENV = [
-  "PATH", "CLAW_CONNECTOR_HOME", "CLAW_CONNECTOR_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+  "PATH", "CLAW_CONNECTOR_HOME", "CLAW_CONNECTOR_CONFIG_DIR", AUTO_UPGRADE_ENV, "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
   "NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA", "NODE_USE_ENV_PROXY", "SSL_CERT_FILE", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "LANG",
   "IS_SANDBOX", "npm_config_registry", "NPM_CONFIG_REGISTRY", "npm_config_proxy", "npm_config_https_proxy",
   "AWS_REGION", "AWS_PROFILE", "CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS",
@@ -385,6 +387,26 @@ export interface SuperviseOptions {
   /** The command a round runs (default: this cli.js run --supervised). */
   command?: [string, string[]];
   signal?: AbortSignal;
+  /**
+   * After a run that upgraded the package (exit EXIT_UPGRADED): start this supervisor again on the new code. Default: the
+   * real one (`reexecSupervisor`) when the round is this program's own `run`, nothing when a test gives `command`. Either
+   * way the next round starts at once.
+   */
+  reexec?: (() => void) | null;
+}
+
+/**
+ * This supervisor, again, on the code now installed at the same path: `process.execve` where Node has it (the same process,
+ * so the same pid in supervisor.pid); else a new detached supervisor with the same output, after this one gave up its pid
+ * file, and this one ends.
+ */
+export function reexecSupervisor(ctx: Ctx, node: string, cli: string): void {
+  const env = ctx.env as Record<string, string>;
+  const execve = (process as unknown as { execve?: (file: string, args: string[], env: Record<string, string>) => never }).execve;
+  if (typeof execve === "function") execve.call(process, node, [node, cli, "supervise"], env);
+  fs.rmSync(supervisorPidFile(ctx.dirs), { force: true });
+  const p = spawn(node, [cli, "supervise"], { detached: true, cwd: os.homedir(), stdio: ["ignore", "inherit", "inherit"], env: ctx.env });
+  p.unref();
 }
 
 /**
@@ -396,6 +418,7 @@ export async function supervise(ctx: Ctx, o: SuperviseOptions = {}): Promise<num
   const d = deps(ctx);
   const [cmd, args] = o.command ?? [d.node, [d.cli, "run", "--supervised"]];
   const restartMs = o.restartMs ?? RESTART_SEC * 1000;
+  const reexec = o.reexec !== undefined ? o.reexec : o.command ? null : () => reexecSupervisor(ctx, d.node, d.cli);
   const pidf = supervisorPidFile(ctx.dirs);
   const other = supervisorPid(ctx);
   if (other !== null && other !== process.pid) { ctx.err(`a supervisor is already running (pid ${other})`); return 1; }
@@ -409,6 +432,7 @@ export async function supervise(ctx: Ctx, o: SuperviseOptions = {}): Promise<num
   const handlers = sigs.map((s) => [s, () => onSig(s)] as const);
   for (const [s, h] of handlers) process.on(s, h);
   o.signal?.addEventListener("abort", () => onSig("SIGTERM"), { once: true });
+  ctx.err(`${new Date().toISOString()} supervisor ${VERSION} started (pid ${process.pid})`);
   try {
     for (let round = 0; !stopping; round++) {
       child = spawn(cmd, args, { stdio: ["ignore", "inherit", "inherit"], env: withThreadPool(ctx.env) });
@@ -422,6 +446,16 @@ export async function supervise(ctx: Ctx, o: SuperviseOptions = {}): Promise<num
       if (stopping) return 0;
       if (code === 0) { ctx.err(`${at} supervisor: the connector stopped on purpose (exit 0); not restarting`); return 0; }
       if (code === NEEDS_PERSON) { ctx.err(`${at} supervisor: the connector needs a new sign-in (exit 78); not restarting until: ${reconnectFix(credentialsFile(ctx.dirs))}`); return NEEDS_PERSON; }
+      if (code === EXIT_UPGRADED) {
+        ctx.err(`${at} supervisor: the connector upgraded itself (exit ${EXIT_UPGRADED}); ${reexec ? "starting the supervisor again on the new version" : "starting it again"}`);
+        if (reexec) {
+          for (const [s, h] of handlers) process.off(s, h);
+          reexec();
+          // Only without execve: a new supervisor runs now; this one ends.
+          return 0;
+        }
+        continue;
+      }
       const how = signal ? `killed by ${signal}` : `exit ${code}`;
       // A run killed outright never wrote why; say it here, so status shows it.
       if (signal) await recordDisconnect(ctx.dirs, { reason: "process_died", detail: `the connector was ${how}; restarted by the supervisor` });
