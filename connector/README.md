@@ -803,13 +803,20 @@ every heartbeat of an older connector; the connector then:
 - ends with exit code 79, which every supervisor restarts: systemd and launchd start the new version; the script supervisor
   first starts itself again on the new code.
 
-The new version is then on probation until one of its runs has been connected for a minute. A run of it that does not
-connect within 60 seconds ends with a failure; each run of it that ends with a failure counts, whether the run counted
-itself as it started or the script supervisor counted its exit. After three, the old version is put back, the new one is
-pinned as failed, and the old version starts again: the next run of the new version puts it back before doing anything else
-and exits 79 (so systemd and launchd restart the old one), and the script supervisor does it when it sees the third failure
-(so a version that fails before any of its own code runs is caught too). Stopping the connector on purpose
+The new version is then on probation until one of its runs has been connected to Claw without a break for a minute (a
+dropped command stream starts the minute again). Every run of it counts itself as the first thing it does, before it reads
+its configuration or signs in, so a run that fails at any later step of its start has been counted; a run that does not
+connect within 60 seconds ends with a failure. The script supervisor also counts each failed exit it sees. The run after
+the third puts the old version back, pins the new one as failed and exits 79 (so systemd and launchd, which restart every
+failed run, start the old one); the script supervisor does the same when it sees the third failure. A version that cannot
+run any of its code at all fails its trial runs and is never moved in. When its runs cannot be counted (the state
+directory cannot be written), the new version is not run: the old one is put back. Stopping the connector on purpose
 (`claw-connector stop`) does not count.
+
+The two renames of the swap follow each other directly. A connector killed between them (for example a `SIGKILL` at that
+moment) has no package directory: under the script supervisor the old version is put back at the next exit it sees; under
+systemd or launchd, run the command the chat shows for the machine, or rename `.connector-backup-<old version>` back to
+`connector` in the same directory.
 
 The first run of the new version brings the hooks it finds installed (the Claude Code session and approval hooks, the
 Codex approval hook) up to date. It never adds hooks you did not install; when the session hooks are missing it says so

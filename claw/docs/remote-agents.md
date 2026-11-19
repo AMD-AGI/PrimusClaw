@@ -491,8 +491,9 @@ version first, while still connected, with the npm beside the node that runs it,
 prefix it was installed under, then moves it in and keeps the old package directory; the new version must report its version
 and connect (a trial run: one identify and heartbeat) within 60 seconds, else after three tries the old version is put back
 and that version is not tried again until a newer one is recommended. After that the new version is on probation until one
-of its real runs has stayed connected for a minute: three runs of it that end with a failure first (or do not connect
-within 60 seconds) put the old version back and pin the new one as failed the same way. Every agent's `capabilities.auto_upgrade` says where it stands:
+of its real runs has stayed connected without a break for a minute: three runs of it that end with a failure first (or do
+not connect within 60 seconds) put the old version back and pin the new one as failed the same way. Each run counts itself
+as its first step, so this holds under systemd and launchd as well as under the script supervisor. Every agent's `capabilities.auto_upgrade` says where it stands:
 `{enabled, state, target?, last?: {from, to, outcome, at}, failed_version?, reason?, command?}`, `state` one of `current`,
 `waiting_idle`, `upgrading`, `unreadable` (`agents.toml` or its own state could not be read; it does not upgrade), `blocked` (it cannot here: no npm, a prefix this user may not write, a registry that does not
 answer; nothing was changed), `failed`, `off`, `unsupervised`, `unmanaged` (not a global npm install) or `manual` (a step it
