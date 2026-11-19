@@ -536,6 +536,10 @@ secret:
   anthropicBaseUrl: ""
   defaultModel: claude-opus-4-7
   openaiBaseUrl: ""
+  # virtualKey (default): the caller's own gateway key.
+  # platformKey: SaFE's /api/v1/llm-proxy puts the user's LiteLLM virtual key on the request.
+  # Required when identity.authProvider=identity (IdentityVerifier leaves virtualKey empty).
+  llmKeySource: virtualKey
   byokVerifyModelsUrl: ""
   byokVerifyApiStyle: openai
   cursorApiKey: ""
@@ -586,6 +590,16 @@ grantSigningKey:
 # and the default used.
 identity:
   enabled: false
+  # Who verifies callers in the SaFE deployment mode (CLAW_AUTH_PROVIDER), for the API.
+  # "safe": SaFE's /api/v1/auth/verify returns the user and the platform key.
+  # "identity": the identity service introspects cookies and ak- keys and holds each user's platform key
+  # (GET /api/v1/apikeys/platform under endpoints.api, or under endpoints.introspection without
+  # /oauth/introspect), read with the user's session and this API's client (clientId, clientSecret).
+  # Needs identity.enabled, clientId, clientSecret, endpoints.introspection, and secret.llmKeySource=platformKey;
+  # the API refuses to start without them.
+  # A caller's platform roles, admin roles included, are the introspection answer's roles as listed.
+  # Access-token callers under this provider get no SaFE-exchanged LLM/sandbox keys.
+  authProvider: safe
   # The issuer identifier, exactly as it appears in the `iss` claim of its tokens.
   issuerUrl: ""
   clientId: ""
@@ -600,12 +614,17 @@ identity:
   # never discovered; with all three pinned discovery is not fetched at all.
   endpoints:
     introspection: ""
+    # Base URL for identity HTTP APIs (platform key), path included, for the API with authProvider=identity.
+    # Empty: introspection without /oauth/introspect; required when the introspection URL does not end in /oauth/introspect.
+    api: ""
     token: ""
     jwks: ""
   cache:
     positiveSeconds: ""      # active answers, default 30; 0 = not cached
     negativeSeconds: ""      # inactive answers, default 5; 0 = not cached
-    staleIfErrorSeconds: ""  # stale active answers while the provider is down, default 1800; 0 = never
+    # Stale active answers while the provider is down, default 1800; 0 = never.
+    # Primary cookie/ak- auth always uses allowStale=false regardless of this value.
+    staleIfErrorSeconds: ""
   requestTimeoutMs: ""       # default 5000
   keysRefreshSeconds: ""     # discovery and JWKS refresh, default 300
   exchangeRefreshSkewSeconds: ""  # an exchanged token with less left is replaced, default 30

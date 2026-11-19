@@ -75,7 +75,7 @@ import type { FastifyRequest } from "fastify";
 import pino from "pino";
 import { IdentityUnavailableError, JwtVerificationError } from "@claw/utils";
 import type { UserInfo } from "./models.js";
-import { envBool } from "../config.js";
+import { envBool, isIdentityAuthProvider } from "../config.js";
 import { DelegatedKeys, safeFailureOf, type SaFeKeys } from "./delegated-keys.js";
 import { identityClient } from "./identity.js";
 import type { CredentialOutcome } from "./middleware.js";
@@ -270,7 +270,7 @@ async function safeKeysOf(
 ): Promise<SaFeKeys> {
   if (ownKey !== undefined) return ownKeysOf(verifier, ownKey, sub);
   const verifyAccessToken = verifier?.verifyAccessToken?.bind(verifier);
-  if (!verifier || !verifyAccessToken) return { status: "none", reason: "no_safe" };
+  if (!verifier || !verifyAccessToken) return { status: "none", reason: isIdentityAuthProvider() ? "identity_provider" : "no_safe" };
   if (claims.act !== undefined && !(clientId && settings.delegatedKeyClientIds.includes(clientId))) {
     return { status: "none", reason: "delegated_token" };
   }
@@ -366,8 +366,9 @@ export async function verifyIdentityAccessToken(
         error: { status: 500, legacyError: "authentication_misconfigured", anthropicType: "api_error", message: keys.message },
       };
     }
-    if (keys.status === "none" && keys.reason !== "no_safe") {
+    if (keys.status === "none" && keys.reason !== "no_safe" && keys.reason !== "identity_provider") {
       // Not an error of the request, but this user has no key for model calls or sandboxes: the log is where that is visible.
+      // identity_provider is expected in CLAW_AUTH_PROVIDER=identity (no SaFE key exchange); skip the per-request warn.
       logger.warn({ path: pathname, userId: sub, reason: keys.reason }, "auth.identity_token.no_safe_keys");
     }
     const actorSub = text((claims.act as { sub?: unknown } | undefined)?.sub);

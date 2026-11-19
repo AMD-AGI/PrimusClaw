@@ -7,7 +7,7 @@ import cookie from "@fastify/cookie";
 import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
-  AUTH_INTERNAL_TOKEN, NATS_URL,
+  AUTH_INTERNAL_TOKEN, NATS_URL, isIdentityAuthProvider, LLM_KEY_SOURCE,
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_AUTO_EVOLUTION_ENABLED, CLAW_USER_SKILLS_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   SESSION_PURGE_DAYS, SESSION_RETENTION_BATCH, SESSION_RETENTION_DAYS, SESSION_RETENTION_DRY_RUN,
   SESSION_RETENTION_HOLD_BUDGET_SEC, SESSION_RETENTION_LOCK_RETRY_MIN,
@@ -22,6 +22,7 @@ import { initNats, nc as natsConnection } from "./infra/nats.js";
 import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
+import { identityAuthMissingSettings, identityKeySourceProblem } from "./startup/identity-auth.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerSessionDeliveryRoutes } from "./routes/session-deliveries.js";
 import { registerAnswerFeedbackRoutes } from "./routes/answer-feedback.js";
@@ -158,6 +159,28 @@ function assertNoSharedIdentityBypass(): void {
 }
 
 /**
+ * Refuse identity auth without LLM_KEY_SOURCE=platformKey: IdentityVerifier leaves
+ * virtualKey empty, so virtualKey mode would silently fall back to the deployment key.
+ */
+function assertIdentityUsesPlatformKey(): void {
+  const problem = identityKeySourceProblem(isIdentityAuthProvider(), LLM_KEY_SOURCE);
+  if (problem === null) return;
+  logger.error({ LLM_KEY_SOURCE }, "startup.identity_requires_platform_key");
+  throw new Error(problem);
+}
+
+/**
+ * Refuse identity auth outside dev mode without the identity client and a usable identity URL:
+ * without them every request is answered 500.
+ */
+function assertIdentityAuthConfig(): void {
+  const missing = identityAuthMissingSettings(isIdentityAuthProvider(), APP_ENV, process.env);
+  if (missing.length === 0) return;
+  logger.error({ missing }, "startup.identity_auth_refused");
+  throw new Error(`CLAW_AUTH_PROVIDER=identity cannot authenticate without: ${missing.join(", ")}`);
+}
+
+/**
  * Refuse to serve when the timings that decide a run is dead disagree.
  *
  * Fatal rather than a warning, for the same reason an incomplete schema is: the
@@ -221,6 +244,8 @@ async function main() {
     logBackgroundOff(logger);
   }
   assertNoSharedIdentityBypass();
+  assertIdentityUsesPlatformKey();
+  assertIdentityAuthConfig();
   assertRunLeaseTiming();
   assertAssistantTokenKey(CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY);
   assertTriggerToolsConfig(CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY);

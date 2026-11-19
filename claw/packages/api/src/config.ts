@@ -166,10 +166,22 @@ export function isKubernetesMode(): boolean {
   return CLAW_DEPLOY_MODE === "kubernetes";
 }
 
+// --- Auth provider (SaFE deploy mode) ---
+// "safe" (default): callers are verified by SaFE's /api/v1/auth/verify, which returns the platform key.
+// "identity": callers are verified by the identity service, which also holds each user's platform key.
+export type AuthProvider = "identity" | "safe";
+export const CLAW_AUTH_PROVIDER: AuthProvider =
+  env("CLAW_AUTH_PROVIDER", "safe") === "identity" ? "identity" : "safe";
+/** True when the identity service verifies callers (SaFE deploy mode only). */
+export function isIdentityAuthProvider(): boolean {
+  return !isKubernetesMode() && CLAW_AUTH_PROVIDER === "identity";
+}
+
 // --- LLM key source ---
-// "virtualKey" preserves the existing behavior. "platformKey" is proxy mode:
-// Brain receives platform_key as llm_api_key so LLM calls authenticate via the
-// same per-user SaFE/proxy key used by the platform.
+// LLM_KEY_SOURCE: "virtualKey" (default) sends the caller's own gateway key.
+// "platformKey" sends the user's platform key (SaFE's /api/v1/llm-proxy puts the
+// user's LiteLLM virtual key on the request). CLAW_AUTH_PROVIDER=identity requires
+// platformKey because IdentityVerifier leaves virtualKey empty.
 export type LlmKeySource = "virtualKey" | "platformKey";
 export const LLM_KEY_SOURCE: LlmKeySource =
   env("LLM_KEY_SOURCE", "virtualKey") === "platformKey" ? "platformKey" : "virtualKey";
