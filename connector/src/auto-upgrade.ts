@@ -514,7 +514,7 @@ export interface PerformOptions {
   signal: AbortSignal;
 }
 
-export type PerformResult = { outcome: Outcome; detail: string } | { outcome: "stopped"; detail: string };
+export type PerformResult = { outcome: Outcome; detail: string } | { outcome: "stopped" | "off"; detail: string };
 
 /** One upgrade at a time per prefix (two connector homes may share one install): a directory made atomically. */
 function takeLock(scope: string): (() => void) | null {
@@ -646,7 +646,8 @@ export function probationPassed(dirs: Dirs, version: string, log: Logger): void 
 
 /**
  * A real run on probation proves its version: connected within `trialMs` (else `late`), and then connected without a break for
- * `probationMs` (`passed`); a command stream that drops in between starts that time again from its next opening.
+ * `probationMs` (`passed`); a command stream that drops in between starts that time again from its next opening, which must
+ * come within `trialMs` of the drop (else `late`): a version that connected once and then cannot reconnect is not kept for ever.
  */
 export function watchProbation(
   c: { readonly connected: Promise<void>; readonly connectedSince: number | null },
@@ -656,12 +657,19 @@ export function watchProbation(
   let late = false;
   let over = false;
   let timer: NodeJS.Timeout | undefined = setTimeout(() => { late = true; on.late(); }, timing.trialMs);
+  let downSince: number | null = null;
   const look = () => {
     if (over) return;
     const since = c.connectedSince;
-    const left = since === null ? timing.probationMs : since + timing.probationMs - Date.now();
+    const now = Date.now();
+    if (since === null) {
+      downSince ??= now;
+      if (now - downSince >= timing.trialMs) { over = true; late = true; on.late(); return; }
+    } else downSince = null;
+    const left = since === null ? Math.min(timing.probationMs, downSince! + timing.trialMs - now) : since + timing.probationMs - now;
     if (since !== null && left <= 0) { over = true; on.passed(); return; }
-    timer = setTimeout(look, Math.max(10, Math.min(left, 1000)));
+    // Looked at often enough that a drop is seen well within `trialMs`.
+    timer = setTimeout(look, Math.max(10, Math.min(left, 1000, timing.trialMs / 4)));
   };
   void c.connected.then(() => { if (over || late) return; clearTimeout(timer); look(); });
   return { get late() { return late; }, dispose() { over = true; clearTimeout(timer); } };
@@ -685,8 +693,8 @@ async function trial(o: PerformOptions): Promise<{ ok: true } | { ok: false; why
  * Put the staged `to` in place of `from` (the connector itself is stopped meanwhile: the caller's run ended first) and prove it.
  * The version goes on probation before it is moved in, so from then on every run of it counts, even when this process is killed.
  * Returns `upgraded` with the new version in place and proven to connect in a trial run (its real runs still on probation),
- * `rolled_back` with the old one back and `to` pinned as failed, `blocked` with nothing changed, or `stopped` (asked to stop; the
- * old version is back). Records the outcome (auto-upgrade.json) for the next run to report.
+ * `rolled_back` with the old one back and `to` pinned as failed, `blocked` with nothing changed, `off` with nothing changed
+ * (auto-upgrade was turned off while it was downloading), or `stopped` (asked to stop; the old version is back). Records the outcome (auto-upgrade.json) for the next run to report.
  */
 export async function performUpgrade(o: PerformOptions): Promise<PerformResult> {
   const { layout, from, to, dirs, log, staged } = o;
@@ -708,6 +716,12 @@ export async function performUpgrade(o: PerformOptions): Promise<PerformResult> 
   try {
     if (versionIn(staged.pkgDir) !== to) return blocked("staging_lost", `${staged.pkgDir} no longer holds ${to}`);
     if (versionIn(layout.pkgDir) !== from) return blocked("changed", `${layout.pkgDir} no longer holds ${from}`);
+    // Read once more at the last moment before anything moves: `auto-upgrade off` given while it downloaded still wins.
+    const setting = autoUpgradeSetting(dirs, o.env);
+    if (!setting.enabled || setting.source === "unreadable") {
+      log.info("auto-upgrade was turned off (or its setting cannot be read) before the swap; nothing was changed", { to, source: setting.source });
+      return { outcome: "off", detail: setting.source === "unreadable" ? `the auto-upgrade setting cannot be read: ${setting.detail ?? ""}` : "auto-upgrade is off" };
+    }
     log.info("upgrading the connector", { from, to, prefix: layout.prefix });
     // Unguarded (its runs could not be counted, so a failing version would never be rolled back): not done at all.
     if (!updateState(dirs, (st) => ({ ...st, probation: { version: to, from, pkg_dir: layout.pkgDir, backup, owner: process.pid, runs: [], at: at() } }))) {
@@ -900,6 +914,16 @@ export class AutoUpgrader {
           return null;
         }
         this.staged = r.staged;
+      }
+      // The preflight and the download can take minutes: `auto-upgrade off` given meanwhile is honoured (read once more here, and
+      // again by `performUpgrade` just before anything moves).
+      const again = await readAutoUpgradeSetting(this.o.dirs, this.o.env);
+      this.enabled = again.enabled;
+      if (again.source === "unreadable" || !again.enabled) {
+        this.dispose();
+        if (again.source === "unreadable") this.set("unreadable", null, { why: again.detail });
+        else this.set("off", null);
+        return null;
       }
       this.set("upgrading", e.target);
       return e.target;

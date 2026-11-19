@@ -767,18 +767,19 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   // A root that is missing or stalled is reported, not fatal: a network mount may come back, and its sessions with it.
   void rootProblems(cfg.agents).then((ps) => { for (const p of ps) ctx.out(`warning: ${p}`); }, () => undefined);
   // On probation: connected within `trialMs`, and then connected without a break for `probationMs`, proves this version (a
-  // stream that drops starts the time again); not connected in time ends the run with a failure, which counts against it.
+  // stream that drops starts the time again); not connected in time, or not again within that time after a drop, ends the run
+  // with a failure, which counts against it.
   const watch = probation === "watch" ? watchProbation(connector, timing, {
     passed: () => probationPassed(ctx.dirs, VERSION, log),
     late: () => {
-      log.error("this new connector version did not connect in time; ending the run (it counts against the version)", { version: VERSION, within_ms: timing.trialMs });
+      log.error("this new connector version did not connect, or reconnect after a drop, in time; ending the run (it counts against the version)", { version: VERSION, within_ms: timing.trialMs });
       connector.stop();
     },
   }) : null;
   try {
     const result = await connector.run().finally(() => watch?.dispose());
     if (result !== "upgrade") upgrade?.dispose();
-    if (watch?.late) { ctx.err(`${new Date().toISOString()} ${VERSION} did not connect within ${Math.round(timing.trialMs / 1000)} s; exit ${EXIT.failure}`); return EXIT.failure; }
+    if (watch?.late) { ctx.err(`${new Date().toISOString()} ${VERSION} did not connect (or reconnect after a drop) within ${Math.round(timing.trialMs / 1000)} s; exit ${EXIT.failure}`); return EXIT.failure; }
     // A machine paired from the chat has no login to run again: a new pairing code is what connects it.
     const again = reconnectAdvice(credentialsFile(ctx.dirs));
     if (result === "revoked") {
@@ -834,6 +835,7 @@ async function upgradeNow(ctx: Ctx, connector: Connector, upgrade: AutoUpgrader,
     const r = await performUpgrade({ layout, from: VERSION, to, staged, dirs: ctx.dirs, env: ctx.env, log, timing: upgradeTiming(ctx.env), signal: connector.stopSignal });
     if (r.outcome === "upgraded") { ctx.err(`${new Date().toISOString()} upgraded ${VERSION} -> ${to}; exit ${EXIT.upgraded}, so the supervisor starts ${to}`); return EXIT.upgraded; }
     if (r.outcome === "stopped") return takeStopRequest(ctx) ? EXIT.ok : EXIT.terminated;
+    if (r.outcome === "off") { ctx.err(`${new Date().toISOString()} not upgrading to ${to}: ${r.detail}; the supervisor starts ${VERSION} again`); return EXIT.terminated; }
     ctx.err(`${new Date().toISOString()} the upgrade to ${to} ${r.outcome === "rolled_back" ? "was rolled back" : "did not happen"} (${r.detail}); the supervisor starts ${VERSION} again`);
     return EXIT.terminated;
   } finally {

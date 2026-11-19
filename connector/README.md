@@ -804,7 +804,8 @@ every heartbeat of an older connector; the connector then:
   first starts itself again on the new code.
 
 The new version is then on probation until one of its runs has been connected to Claw without a break for a minute (a
-dropped command stream starts the minute again). Every run of it counts itself as the first thing it does, before it reads
+dropped command stream starts the minute again, and must open again within 60 seconds of the drop, or the run ends with a
+failure that counts). Every run of it counts itself as the first thing it does, before it reads
 its configuration or signs in, so a run that fails at any later step of its start has been counted; a run that does not
 connect within 60 seconds ends with a failure. The script supervisor also counts each failed exit it sees. The run after
 the third puts the old version back, pins the new one as failed and exits 79 (so systemd and launchd, which restart every
@@ -825,7 +826,9 @@ once in the log, with `claw-connector hooks install`.
 Only a supervised run upgrades itself (`claw-connector run` in a terminal does not: nothing would start it again). Turn it
 off with `claw-connector auto-upgrade off` (`auto_upgrade = false` at the top of `agents.toml`) or
 `CLAW_CONNECTOR_AUTO_UPGRADE=0` in the service's environment (`service install` carries it over), which wins over
-`agents.toml`. `claw-connector auto-upgrade status` shows where things stand.
+`agents.toml`. Turning it off takes effect at the next check, and also while a download is under way: the connector reads
+the setting again once the download is done and once more just before the swap, so a version downloaded meanwhile is
+discarded and never moved in. `claw-connector auto-upgrade status` shows where things stand.
 
 Connectors before this feature cannot upgrade themselves: upgrade them once by hand, with the command the chat shows for
 the machine or `npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install`

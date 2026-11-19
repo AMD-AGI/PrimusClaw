@@ -12,7 +12,7 @@ import path from "node:path";
 import { describe, test } from "node:test";
 import { spawn } from "node:child_process";
 import {
-  AutoUpgrader, autoUpgradeSetting, configSetting, installLayout, manualCommand, probationExited, probationForget, probationPassed, probationStart,
+  AutoUpgrader, autoUpgradeSetting, configSetting, installLayout, manualCommand, performUpgrade, probationExited, probationForget, probationPassed, probationStart,
   readAutoUpgradeSetting, readUpgradeState, upgradeTarget, upgradeTiming, watchProbation, writeConfigSetting, writeUpgradeState, type Blocked, type Layout, type StageResult,
 } from "../src/auto-upgrade.js";
 import { EXIT, main, type Ctx } from "../src/commands.js";
@@ -168,11 +168,14 @@ async function upgrading(o: {
   agentEnv?: Record<string, string>;
   /** Runs while the preflight asks (npm view): a command may come meanwhile. */
   duringPreflight?: (h: Harness) => Promise<void>;
+  /** Runs while it downloads (npm install into the staging prefix): `auto-upgrade off` may be given meanwhile. */
+  duringStage?: (dirs: ReturnType<typeof resolveDirs>) => Promise<void>;
 } = {}) {
   const home = tmpdir();
   const dirs = resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv);
   const preflights: string[] = [];
   const stages: string[] = [];
+  const stagedPrefixes: string[] = [];
   let harness: Harness | null = null;
   const up = new AutoUpgrader({
     dirs, env: o.env ?? {}, version: "1.0.0", supervised: o.supervised ?? true, cli: "/nowhere/cli.js", node: process.execPath, log: silentLogger,
@@ -185,6 +188,8 @@ async function upgrading(o: {
       const pkgDir = path.join(prefix, "pkg");
       fs.mkdirSync(pkgDir);
       fs.writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ version: target }));
+      stagedPrefixes.push(prefix);
+      if (o.duringStage) await o.duringStage(dirs);
       return { staged: { version: target, prefix, pkgDir } };
     },
   });
@@ -195,7 +200,7 @@ async function upgrading(o: {
   const ended = h.start();
   let result: string | null = null;
   void ended.then((r) => { result = r; });
-  return { h, up, ended, preflights, stages, result: () => result };
+  return { h, up, ended, preflights, stages, stagedPrefixes, result: () => result };
 }
 
 const capsOf = (hb: any) => hb.agents[0].capabilities;
@@ -252,6 +257,24 @@ describe("a running connector", () => {
       if (o.supervised === false) assert.match(last.command, /@primusclaw\/connector@1\.0\.1/);
       assert.equal(await h.stop(), "stopped");
     }
+  });
+
+  test("auto-upgrade off given while it downloads still wins: the run goes on, nothing is swapped, and the download goes", async () => {
+    const { h, preflights, stages, stagedPrefixes, result } = await upgrading({
+      idleMs: 50, retryMs: 100, topToml: "# connector\n",
+      duringStage: async (dirs) => { await sleep(300); writeConfigSetting(dirs, false); },
+    });
+    await h.online();
+    await h.claw.until("it downloaded", () => stages.length === 1);
+    await h.claw.until("a heartbeat that says off", () => h.claw.heartbeats.some((b) => capsOf(b).auto_upgrade?.state === "off"));
+    await sleep(600);
+    assert.equal(result(), null, "the run did not end to upgrade");
+    assert.equal(h.connector.upgradeTarget, null);
+    assert.deepEqual(preflights, ["1.0.1"]);
+    assert.equal(stages.length, 1, "not downloaded again while off");
+    assert.ok(!fs.existsSync(stagedPrefixes[0]!), "the download was removed");
+    assert.equal(capsOf(h.claw.heartbeats.at(-1)).auto_upgrade.enabled, false);
+    assert.equal(await h.stop(), "stopped");
   });
 
   test("where it cannot (a prefix it may not write), it changes nothing, says why with the command, and asks again only after the retry time", async () => {
@@ -451,6 +474,33 @@ describe("a new version on probation", () => {
     assert.equal(readUpgradeState(dirs).failed?.version, "1.0.1");
   });
 
+  test("auto-upgrade off given after the run ended to upgrade, before the swap: performUpgrade moves nothing", async () => {
+    const home = tmpdir();
+    const dirs = resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv);
+    fs.mkdirSync(dirs.config, { recursive: true });
+    fs.writeFileSync(path.join(dirs.config, "agents.toml"), "auto_upgrade = false\n");
+    const prefix = tmpdir();
+    const pkgDir = path.join(prefix, "lib", "node_modules", "@primusclaw", "connector");
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ name: "@primusclaw/connector", version: "1.0.0" }));
+    const sp = tmpdir();
+    const spkg = path.join(sp, "pkg");
+    fs.mkdirSync(spkg);
+    fs.writeFileSync(path.join(spkg, "package.json"), JSON.stringify({ name: "@primusclaw/connector", version: "1.0.1" }));
+    const layout: Layout = { pkgDir, prefix, cli: path.join(pkgDir, "dist", "cli.js"), node: process.execPath, npm: ["npm"], npmShown: "npm" };
+    for (const env of [{}, { CLAW_CONNECTOR_AUTO_UPGRADE: "0" }] as NodeJS.ProcessEnv[]) {
+      if ("CLAW_CONNECTOR_AUTO_UPGRADE" in env) writeConfigSetting(dirs, true);
+      fs.mkdirSync(spkg, { recursive: true });
+      fs.writeFileSync(path.join(spkg, "package.json"), JSON.stringify({ name: "@primusclaw/connector", version: "1.0.1" }));
+      const r = await performUpgrade({ layout, from: "1.0.0", to: "1.0.1", staged: { version: "1.0.1", prefix: sp, pkgDir: spkg }, dirs, env, log: silentLogger, timing: upgradeTiming({}), signal: new AbortController().signal });
+      assert.equal(r.outcome, "off", JSON.stringify(env));
+      assert.equal(JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8")).version, "1.0.0");
+      assert.equal(readUpgradeState(dirs).probation, undefined);
+      assert.ok(!fs.existsSync(path.join(prefix, "lib", "node_modules", "@primusclaw", ".connector-backup-1.0.0")), "nothing moved aside");
+      assert.ok(!fs.existsSync(sp), "the download goes");
+    }
+  });
+
   test("a run that cannot be counted (auto-upgrade.json cannot be written) never runs uncounted: the old version comes back", () => {
     const a = placed("1.0.0", "1.0.1");
     unwritableState(a.dirs);
@@ -498,6 +548,24 @@ describe("a new version on probation", () => {
       assert.equal(passed, 1);
       assert.equal(late, 0);
       assert.equal(w.late, false);
+      w.dispose();
+    });
+    test("connected once, then the stream dropped and never came back: late after the trial time, never passed", async (t) => {
+      const r = fakeRun();
+      let passed = 0;
+      let late = 0;
+      const w = watchProbation(r.c, { trialMs: 300, probationMs: 5_000 }, { passed: () => passed++, late: () => late++ });
+      t.after(() => w.dispose());
+      r.up();
+      await sleep(100);
+      r.down();
+      await sleep(150);
+      assert.equal(late, 0, "a short drop is not late yet");
+      await sleep(400);
+      assert.deepEqual([late, passed, w.late], [1, 0, true]);
+      r.c.connectedSince = Date.now();
+      await sleep(200);
+      assert.deepEqual([late, passed], [1, 0], "it ended: a late reconnect changes nothing");
       w.dispose();
     });
     test("never connected in time: late, and never passed", async () => {

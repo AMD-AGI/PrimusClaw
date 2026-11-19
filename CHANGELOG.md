@@ -122,7 +122,8 @@ release version, and its `appVersion` stays `latest`.
   connector still runs and is moved in only then, so a connector killed during the download keeps its old version. The old
   package directory is kept; a new version that does not connect within 60 seconds in three trial runs is rolled back and
   not tried again until a newer one is recommended, and so is one whose first three real runs fail (or do not connect
-  within 60 seconds) before one of them has stayed connected without a break for a minute. Each real run of the new
+  within 60 seconds, or do not reconnect within 60 seconds after a drop) before one of them has stayed connected without a
+  break for a minute. Turning auto-upgrade off while a download is under way still stops the swap. Each real run of the new
   version counts itself as its first step, so this holds under systemd and launchd as well as under the script
   supervisor; a version that cannot even start its code is caught by the trial runs before it is moved in. A new version
   whose runs cannot be counted (its state file cannot be written) is not run: the old one comes back. Where it cannot upgrade (no npm, a prefix it may not write, a
