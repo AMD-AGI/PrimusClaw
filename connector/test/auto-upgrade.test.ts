@@ -568,6 +568,22 @@ describe("a new version on probation", () => {
       assert.deepEqual([late, passed], [1, 0], "it ended: a late reconnect changes nothing");
       w.dispose();
     });
+    test("each drop has its own trial time: short drops far apart are never late", async (t) => {
+      const r = fakeRun();
+      let passed = 0;
+      let late = 0;
+      const w = watchProbation(r.c, { trialMs: 300, probationMs: 5_000 }, { passed: () => passed++, late: () => late++ });
+      t.after(() => w.dispose());
+      r.up();
+      for (let i = 0; i < 3; i++) {
+        await sleep(100);
+        r.down();
+        await sleep(200);
+        r.c.connectedSince = Date.now();
+        await sleep(300);
+      }
+      assert.deepEqual([late, passed, w.late], [0, 0, false]);
+    });
     test("never connected in time: late, and never passed", async () => {
       const r = fakeRun();
       let passed = 0;
