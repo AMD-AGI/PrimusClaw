@@ -40,7 +40,7 @@ import { probeAgents, probeLines, type ProbeFn } from "./probe.js";
 import { rootProblems } from "./roots.js";
 import {
   AUTO_UPGRADE_ENV, AutoUpgrader, EXIT_UPGRADED, TRIAL_ENV, TRIAL_OK_LINE, autoUpgradeSetting, installLayout, manualCommand, performUpgrade,
-  probationForget, probationPassed, probationStart, readUpgradeState, unwritable, upgradeTiming, writeConfigSetting, writeUpgradeState,
+  probationForget, probationPassed, probationStart, readUpgradeState, watchProbation, unwritable, upgradeTiming, writeConfigSetting, writeUpgradeState,
 } from "./auto-upgrade.js";
 
 export interface Ctx {
@@ -707,6 +707,17 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   // A trial run of a version this connector just installed (auto-upgrade.ts): it connects once and exits, beside the run that
   // installed it, which is stopped and waits for it (so the pid file is that run's, not this one's).
   const trial = (ctx.env[TRIAL_ENV] ?? "").trim() !== "";
+  const log = stderrLogger();
+  // A version this connector just upgraded itself to is on probation until one of its runs stays connected for a while; the
+  // run that would be one too many puts the old version back instead, and ends so that its supervisor starts that one.
+  // Counted first, before anything of this run that could fail: under systemd or launchd nothing else counts a run that
+  // fails (the run itself is restarted every few seconds), so a run that fails at any later step still counts.
+  const timing = upgradeTiming(ctx.env);
+  const probation = trial ? "none" : probationStart(ctx.dirs, VERSION, process.pid, timing.trialAttempts, log);
+  if (probation === "rolled_back") {
+    ctx.err(`${new Date().toISOString()} ${VERSION} did not stay connected in ${timing.trialAttempts} runs; the version before it is back; exit ${EXIT.upgraded}, so the supervisor starts it`);
+    return EXIT.upgraded;
+  }
   {
     const nl = needsLogin(ctx.dirs);
     if (nl) {
@@ -731,18 +742,9 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   const server = serverUrl(ctx, undefined, cfg, creds)!;
   const tokens = providerFor(creds, (c) => saveCredentials(credentialsFile(ctx.dirs), c), { fetch: ctx.fetch });
   const client = new ClawClient({ server, tokens, fetch: ctx.fetch });
-  const log = stderrLogger();
   const audit = fileAudit(auditFile(ctx.dirs));
   const cli = ctx.cli ?? ctx.service?.cli ?? fileURLToPath(import.meta.url);
   const node = ctx.node ?? process.execPath;
-  // A version this connector just upgraded itself to is on probation until one of its runs stays connected for a while; the
-  // run that would be one too many puts the old version back instead, and ends so that its supervisor starts that one.
-  const timing = upgradeTiming(ctx.env);
-  const probation = trial ? "none" : probationStart(ctx.dirs, VERSION, process.pid, timing.trialAttempts, log);
-  if (probation === "rolled_back") {
-    ctx.err(`${new Date().toISOString()} ${VERSION} did not stay connected in ${timing.trialAttempts} runs; the version before it is back; exit ${EXIT.upgraded}, so the supervisor starts it`);
-    return EXIT.upgraded;
-  }
   const upgrade = trial ? undefined : new AutoUpgrader({ dirs: ctx.dirs, env: ctx.env, version: VERSION, supervised: runFlags.supervised === true, cli, node, log });
   if (!trial) postUpgradeSetup(ctx);
   const connector = new Connector({
@@ -764,25 +766,19 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   for (const a of cfg.agents) if (a.readOnlyModes.includes(a.askMode)) ctx.out(`note: ${a.id}: its sessions start read-only (${a.askMode} mode changes no file); to let phone sessions write code, set approval = "never" on it in agents.toml`);
   // A root that is missing or stalled is reported, not fatal: a network mount may come back, and its sessions with it.
   void rootProblems(cfg.agents).then((ps) => { for (const p of ps) ctx.out(`warning: ${p}`); }, () => undefined);
-  // On probation: connected within `trialMs` and still up `probationMs` later proves this version; not connected in time ends
-  // the run with a failure, which counts against it.
-  let probationTimer: NodeJS.Timeout | undefined;
-  let notConnected = false;
-  if (probation === "watch") {
-    probationTimer = setTimeout(() => {
-      notConnected = true;
+  // On probation: connected within `trialMs`, and then connected without a break for `probationMs`, proves this version (a
+  // stream that drops starts the time again); not connected in time ends the run with a failure, which counts against it.
+  const watch = probation === "watch" ? watchProbation(connector, timing, {
+    passed: () => probationPassed(ctx.dirs, VERSION, log),
+    late: () => {
       log.error("this new connector version did not connect in time; ending the run (it counts against the version)", { version: VERSION, within_ms: timing.trialMs });
       connector.stop();
-    }, timing.trialMs);
-    void connector.connected.then(() => {
-      clearTimeout(probationTimer);
-      probationTimer = setTimeout(() => probationPassed(ctx.dirs, VERSION, log), timing.probationMs);
-    });
-  }
+    },
+  }) : null;
   try {
-    const result = await connector.run().finally(() => clearTimeout(probationTimer));
+    const result = await connector.run().finally(() => watch?.dispose());
     if (result !== "upgrade") upgrade?.dispose();
-    if (notConnected) { ctx.err(`${new Date().toISOString()} ${VERSION} did not connect within ${Math.round(timing.trialMs / 1000)} s; exit ${EXIT.failure}`); return EXIT.failure; }
+    if (watch?.late) { ctx.err(`${new Date().toISOString()} ${VERSION} did not connect within ${Math.round(timing.trialMs / 1000)} s; exit ${EXIT.failure}`); return EXIT.failure; }
     // A machine paired from the chat has no login to run again: a new pairing code is what connects it.
     const again = reconnectAdvice(credentialsFile(ctx.dirs));
     if (result === "revoked") {

@@ -350,8 +350,13 @@ export class Connector {
   private readonly stopCtl = new AbortController();
   /** The version this run ended to upgrade to. */
   private upgradeTo: string | null = null;
+  /** When the command stream last opened (its `ready` came) without ending since; null while it is not open. */
+  private streamUpAt: number | null = null;
   /** The command stream is open (its `ready` came, and it has not ended since). */
-  private streamReady = false;
+  private get streamReady(): boolean { return this.streamUpAt !== null; }
+  private set streamReady(v: boolean) { if (!v) this.streamUpAt = null; else this.streamUpAt ??= Date.now(); }
+  /** Since when (`Date.now()`) the command stream has been open without a break, or null while it is not open. */
+  get connectedSince(): number | null { return this.streamUpAt; }
   private onConnected: (() => void) | null = null;
   /** Settles when the command stream first opens (a run of a version on probation proves itself by it). */
   readonly connected = new Promise<void>((ok) => { this.onConnected = ok; });

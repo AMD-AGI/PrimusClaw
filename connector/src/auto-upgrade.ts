@@ -366,22 +366,26 @@ export async function readUpgradeStateOff(dirs: Dirs): Promise<UpgradeState | nu
   return "missing" in r ? {} : "error" in r ? null : stateOf(r.text);
 }
 
-export function writeUpgradeState(dirs: Dirs, st: UpgradeState): void {
+/** False when it could not be written (said by the callers that depend on it: a probation that cannot be counted). */
+export function writeUpgradeState(dirs: Dirs, st: UpgradeState): boolean {
   try {
     fs.mkdirSync(dirs.state, { recursive: true, mode: 0o700 });
     const file = autoUpgradeFile(dirs);
     const tmp = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(st, null, 2) + "\n", { mode: 0o600 });
     fs.renameSync(tmp, file);
-  } catch { /* best effort: the next run looks again */ }
+    return true;
+  } catch { return false; }
 }
 
-/** auto-upgrade.json changed by `f` (read afresh: a supervisor and its run each write it, one after the other). */
-const updateState = (dirs: Dirs, f: (st: UpgradeState) => UpgradeState): UpgradeState => {
-  const next = f(readUpgradeState(dirs));
-  writeUpgradeState(dirs, next);
-  return next;
-};
+/**
+ * auto-upgrade.json changed by `f` (read afresh: a supervisor and its run each write it, one after the other). False when the
+ * change could not be written.
+ */
+const updateState = (dirs: Dirs, f: (st: UpgradeState) => UpgradeState): boolean => writeUpgradeState(dirs, f(readUpgradeState(dirs)));
+
+/** The package directory holds a package (it is missing only when a kill came between the two renames of a swap). */
+const hasPackage = (pkgDir: string): boolean => fs.existsSync(path.join(pkgDir, "package.json"));
 
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; } };
 
@@ -594,7 +598,11 @@ export function probationStart(dirs: Dirs, version: string, pid: number, attempt
     rollbackProbation(dirs, `${runs.length} runs of ${version} ended without staying connected for a while`, log);
     return "rolled_back";
   }
-  updateState(dirs, (st) => (st.probation?.version === version ? { ...st, probation: { ...st.probation, runs: [...runs, pid] } } : st));
+  // A run that cannot be counted could fail for ever without the old version ever coming back: the old version comes back now.
+  if (!updateState(dirs, (st) => (st.probation?.version === version ? { ...st, probation: { ...st.probation, runs: [...runs, pid] } } : st))) {
+    rollbackProbation(dirs, `this run of ${version} could not be counted (${autoUpgradeFile(dirs)} cannot be written)`, log);
+    return "rolled_back";
+  }
   return "watch";
 }
 
@@ -605,10 +613,17 @@ export function probationStart(dirs: Dirs, version: string, pid: number, attempt
  */
 export function probationExited(dirs: Dirs, pid: number, attempts: number, log: Logger): boolean {
   const p = readUpgradeState(dirs).probation;
-  if (!p || pid === p.owner) return false;
+  if (!p) return false;
+  // Killed between the two renames of the swap (the upgrading run itself, or a run that then found no program): no version
+  // is in place, and the old one comes back at once.
+  if (!hasPackage(p.pkg_dir)) return rollbackProbation(dirs, `the package directory ${p.pkg_dir} was left empty (a kill during the swap)`, log);
+  if (pid === p.owner) return false;
   const runs = p.runs.includes(pid) ? p.runs : [...p.runs, pid];
   if (runs.length >= attempts) return rollbackProbation(dirs, `${runs.length} runs of ${p.version} ended without staying connected for a while`, log), true;
-  updateState(dirs, (st) => (st.probation?.version === p.version ? { ...st, probation: { ...st.probation, runs } } : st));
+  // Not counted: as above, the old version comes back rather than a failing one running for ever uncounted.
+  if (!updateState(dirs, (st) => (st.probation?.version === p.version ? { ...st, probation: { ...st.probation, runs } } : st))) {
+    return rollbackProbation(dirs, `a failed run of ${p.version} could not be counted (${autoUpgradeFile(dirs)} cannot be written)`, log);
+  }
   return false;
 }
 
@@ -627,6 +642,29 @@ export function probationPassed(dirs: Dirs, version: string, log: Logger): void 
     return rest;
   });
   if (passed) log.info("the new connector version works here", { version });
+}
+
+/**
+ * A real run on probation proves its version: connected within `trialMs` (else `late`), and then connected without a break for
+ * `probationMs` (`passed`); a command stream that drops in between starts that time again from its next opening.
+ */
+export function watchProbation(
+  c: { readonly connected: Promise<void>; readonly connectedSince: number | null },
+  timing: Pick<UpgradeTiming, "trialMs" | "probationMs">,
+  on: { passed: () => void; late: () => void },
+): { readonly late: boolean; dispose(): void } {
+  let late = false;
+  let over = false;
+  let timer: NodeJS.Timeout | undefined = setTimeout(() => { late = true; on.late(); }, timing.trialMs);
+  const look = () => {
+    if (over) return;
+    const since = c.connectedSince;
+    const left = since === null ? timing.probationMs : since + timing.probationMs - Date.now();
+    if (since !== null && left <= 0) { over = true; on.passed(); return; }
+    timer = setTimeout(look, Math.max(10, Math.min(left, 1000)));
+  };
+  void c.connected.then(() => { if (over || late) return; clearTimeout(timer); look(); });
+  return { get late() { return late; }, dispose() { over = true; clearTimeout(timer); } };
 }
 
 /** One trial run of the installed version: did it connect to Claw, as that version, within `trialMs`? */
@@ -671,7 +709,10 @@ export async function performUpgrade(o: PerformOptions): Promise<PerformResult> 
     if (versionIn(staged.pkgDir) !== to) return blocked("staging_lost", `${staged.pkgDir} no longer holds ${to}`);
     if (versionIn(layout.pkgDir) !== from) return blocked("changed", `${layout.pkgDir} no longer holds ${from}`);
     log.info("upgrading the connector", { from, to, prefix: layout.prefix });
-    updateState(dirs, (st) => ({ ...st, probation: { version: to, from, pkg_dir: layout.pkgDir, backup, owner: process.pid, runs: [], at: at() } }));
+    // Unguarded (its runs could not be counted, so a failing version would never be rolled back): not done at all.
+    if (!updateState(dirs, (st) => ({ ...st, probation: { version: to, from, pkg_dir: layout.pkgDir, backup, owner: process.pid, runs: [], at: at() } }))) {
+      return blocked("state_unwritable", `${autoUpgradeFile(dirs)} cannot be written`);
+    }
     // The old version, kept: moved aside whole, and the downloaded one moved in (renames in one directory).
     fs.rmSync(backup, { recursive: true, force: true });
     fs.renameSync(layout.pkgDir, backup);

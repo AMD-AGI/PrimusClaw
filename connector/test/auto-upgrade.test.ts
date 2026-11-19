@@ -13,11 +13,13 @@ import { describe, test } from "node:test";
 import { spawn } from "node:child_process";
 import {
   AutoUpgrader, autoUpgradeSetting, configSetting, installLayout, manualCommand, probationExited, probationForget, probationPassed, probationStart,
-  readAutoUpgradeSetting, readUpgradeState, upgradeTarget, upgradeTiming, writeConfigSetting, writeUpgradeState, type Blocked, type Layout, type StageResult,
+  readAutoUpgradeSetting, readUpgradeState, upgradeTarget, upgradeTiming, watchProbation, writeConfigSetting, writeUpgradeState, type Blocked, type Layout, type StageResult,
 } from "../src/auto-upgrade.js";
+import { EXIT, main, type Ctx } from "../src/commands.js";
+import { VERSION } from "../src/version.js";
 import { approvalSocketFile } from "../src/approvals.js";
 import { parseConfig } from "../src/config.js";
-import { resolveDirs } from "../src/paths.js";
+import { autoUpgradeFile, resolveDirs } from "../src/paths.js";
 import { silentLogger, sleep } from "../src/util.js";
 import { Harness, tmpdir } from "./support/harness.js";
 
@@ -162,6 +164,8 @@ const LAYOUT: Layout = { pkgDir: "/nowhere/lib/node_modules/@primusclaw/connecto
 
 async function upgrading(o: {
   env?: NodeJS.ProcessEnv; supervised?: boolean; blocked?: Blocked | null; topToml?: string; idleMs?: number; retryMs?: number; attach?: boolean;
+  /** The stand-in agent's environment. */
+  agentEnv?: Record<string, string>;
   /** Runs while the preflight asks (npm view): a command may come meanwhile. */
   duringPreflight?: (h: Harness) => Promise<void>;
 } = {}) {
@@ -184,7 +188,7 @@ async function upgrading(o: {
       return { staged: { version: target, prefix, pkgDir } };
     },
   });
-  const h = await Harness.create({ home, upgrade: up, version: "1.0.0", start: false, topToml: o.topToml, ...(o.attach ? { attach: { sessions: [] } } : {}) });
+  const h = await Harness.create({ home, upgrade: up, version: "1.0.0", start: false, topToml: o.topToml, env: o.agentEnv, ...(o.attach ? { attach: { sessions: [] } } : {}) });
   harness = h;
   if (o.topToml) { fs.mkdirSync(dirs.config, { recursive: true }); fs.writeFileSync(path.join(dirs.config, "agents.toml"), o.topToml); }
   h.claw.connectorVersions = { minimum: "1.0.0", recommended: "1.0.1" };
@@ -267,6 +271,20 @@ describe("a running connector", () => {
     assert.equal(preflights.length, n, "not asked again before the retry time");
     assert.equal(result(), null);
     assert.equal(await h.stop(), "stopped");
+  });
+
+  test("never while a command is still being carried out (a session that is still starting), though no turn runs yet", async () => {
+    const gate = path.join(tmpdir(), "new-gate");
+    const { h, ended, preflights, result } = await upgrading({ idleMs: 100, retryMs: 300, env: {}, agentEnv: { FAKE_NEW_GATE: gate } });
+    await h.online();
+    const sid = h.claw.newSession("fake", h.work);
+    await h.claw.until("the agent asked for the session", () => h.adapterLog().some((l) => l.method === "session/new"));
+    await sleep(1500);
+    assert.equal(result(), null, "no upgrade while the session.new is carried out");
+    assert.deepEqual(preflights, []);
+    fs.writeFileSync(gate, "");
+    await h.claw.until("the session started", () => h.claw.eventsOf(sid, "session_started")[0]);
+    assert.equal(await ended, "upgrade");
   });
 
   test("not while the command stream is down: a prompt Claw queued meanwhile would wait out the upgrade too", async () => {
@@ -366,8 +384,8 @@ describe("a running connector", () => {
 
 describe("a new version on probation", () => {
   /** A prefix with `to` in place and `from` in its backup, as `performUpgrade` leaves them. */
-  const placed = (from: string, to: string) => {
-    const dirs = resolveDirs({ CLAW_CONNECTOR_HOME: tmpdir() } as NodeJS.ProcessEnv);
+  const placed = (from: string, to: string, home = tmpdir()) => {
+    const dirs = resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv);
     const scope = path.join(tmpdir(), "lib", "node_modules", "@primusclaw");
     const pkgDir = path.join(scope, "connector");
     const backup = path.join(scope, `.connector-backup-${from}`);
@@ -379,6 +397,8 @@ describe("a new version on probation", () => {
     const installed = () => JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8")).version;
     return { dirs, pkgDir, backup, installed };
   };
+  /** auto-upgrade.json cannot be written by this process (its temporary file's name is taken by a directory). */
+  const unwritableState = (dirs: ReturnType<typeof resolveDirs>) => fs.mkdirSync(`${autoUpgradeFile(dirs)}.${process.pid}.tmp`);
 
   test("runs that start and never prove it: the one after the third puts the old version back and pins the new one", () => {
     const { dirs, backup, installed } = placed("1.0.0", "1.0.1");
@@ -421,5 +441,75 @@ describe("a new version on probation", () => {
     const b = placed("1.0.0", "1.0.1");
     assert.equal(probationStart(b.dirs, "1.0.7", 401, 3, silentLogger), "none", "installed by hand meanwhile");
     assert.equal(readUpgradeState(b.dirs).probation, undefined);
+  });
+
+  test("a kill between the two renames of the swap (no package in place): the old version comes back at the first exit seen, the upgrading run's own too", () => {
+    const { dirs, pkgDir, installed } = placed("1.0.0", "1.0.1");
+    fs.rmSync(pkgDir, { recursive: true });
+    assert.equal(probationExited(dirs, 1, 3, silentLogger), true);
+    assert.equal(installed(), "1.0.0");
+    assert.equal(readUpgradeState(dirs).failed?.version, "1.0.1");
+  });
+
+  test("a run that cannot be counted (auto-upgrade.json cannot be written) never runs uncounted: the old version comes back", () => {
+    const a = placed("1.0.0", "1.0.1");
+    unwritableState(a.dirs);
+    assert.equal(probationStart(a.dirs, "1.0.1", 501, 3, silentLogger), "rolled_back");
+    assert.equal(a.installed(), "1.0.0");
+    const b = placed("1.0.0", "1.0.1");
+    unwritableState(b.dirs);
+    assert.equal(probationExited(b.dirs, 601, 3, silentLogger), true);
+    assert.equal(b.installed(), "1.0.0");
+  });
+
+  test("a run counts itself before anything else it does: one with no usable configuration still counts, and the fourth puts the old version back", async () => {
+    const home = tmpdir();
+    const { dirs, installed } = placed("1.0.0", VERSION, home);
+    const c: Ctx = { dirs, env: {}, out: () => {}, err: () => {}, hostname: "box" };
+    // No agents.toml, no sign-in: the run ends at once, as a version that fails before it connects would.
+    assert.equal(await main(["run", "--supervised"], c), EXIT.needsPerson);
+    assert.deepEqual(readUpgradeState(dirs).probation?.runs, [process.pid]);
+    writeUpgradeState(dirs, { ...readUpgradeState(dirs), probation: { ...readUpgradeState(dirs).probation!, runs: [11, 12, 13] } });
+    assert.equal(await main(["run", "--supervised"], c), EXIT.upgraded);
+    assert.equal(installed(), "1.0.0");
+    assert.equal(readUpgradeState(dirs).failed?.version, VERSION);
+  });
+
+  describe("proving itself", () => {
+    const fakeRun = () => {
+      let open!: () => void;
+      const c = { connected: new Promise<void>((r) => { open = r; }), connectedSince: null as number | null };
+      return { c, up: () => { c.connectedSince = Date.now(); open(); }, down: () => { c.connectedSince = null; } };
+    };
+    test("connected without a break for the probation time; a drop starts the time again", async () => {
+      const r = fakeRun();
+      let passed = 0;
+      let late = 0;
+      const w = watchProbation(r.c, { trialMs: 2_000, probationMs: 400 }, { passed: () => passed++, late: () => late++ });
+      r.up();
+      await sleep(250);
+      r.down();
+      await sleep(250);
+      assert.equal(passed, 0, "dropped before the time was up");
+      r.c.connectedSince = Date.now();
+      await sleep(250);
+      assert.equal(passed, 0, "not counted from the first connection");
+      await sleep(400);
+      assert.equal(passed, 1);
+      assert.equal(late, 0);
+      assert.equal(w.late, false);
+      w.dispose();
+    });
+    test("never connected in time: late, and never passed", async () => {
+      const r = fakeRun();
+      let passed = 0;
+      let late = 0;
+      const w = watchProbation(r.c, { trialMs: 200, probationMs: 100 }, { passed: () => passed++, late: () => late++ });
+      await sleep(350);
+      r.up();
+      await sleep(300);
+      assert.deepEqual([late, passed, w.late], [1, 0, true]);
+      w.dispose();
+    });
   });
 });
