@@ -30,8 +30,8 @@ import { isAlive, processStart } from "./children.js";
 import { loadCredentials, reconnectFix, reconnectStep } from "./credentials.js";
 import { needsLogin, recordDisconnect, recentDisconnects } from "./health.js";
 import { credentialsFile, keepaliveFile, keepaliveStampFile, runLogFile, serviceEnvFile, serviceFile, supervisorPidFile } from "./paths.js";
-import { errMessage, isObject, sleep } from "./util.js";
-import { AUTO_UPGRADE_ENV, EXIT_UPGRADED } from "./auto-upgrade.js";
+import { errMessage, isObject, sleep, stderrLogger } from "./util.js";
+import { AUTO_UPGRADE_ENV, EXIT_UPGRADED, probationExited, upgradeTiming } from "./auto-upgrade.js";
 import { VERSION } from "./version.js";
 
 export type Supervisor = "systemd" | "launchd" | "script";
@@ -446,8 +446,13 @@ export async function supervise(ctx: Ctx, o: SuperviseOptions = {}): Promise<num
       if (stopping) return 0;
       if (code === 0) { ctx.err(`${at} supervisor: the connector stopped on purpose (exit 0); not restarting`); return 0; }
       if (code === NEEDS_PERSON) { ctx.err(`${at} supervisor: the connector needs a new sign-in (exit 78); not restarting until: ${reconnectFix(credentialsFile(ctx.dirs))}`); return NEEDS_PERSON; }
-      if (code === EXIT_UPGRADED) {
-        ctx.err(`${at} supervisor: the connector upgraded itself (exit ${EXIT_UPGRADED}); ${reexec ? "starting the supervisor again on the new version" : "starting it again"}`);
+      // A run of a version the connector just upgraded itself to that failed counts against it, also one that failed before
+      // it could count itself (auto-upgrade.ts `probationExited`); the last one it may have puts the old version back.
+      const rolledBack = code !== EXIT_UPGRADED && c.pid !== undefined && probationExited(ctx.dirs, c.pid, upgradeTiming(ctx.env).trialAttempts, stderrLogger());
+      if (code === EXIT_UPGRADED || rolledBack) {
+        ctx.err(rolledBack
+          ? `${at} supervisor: the new connector version failed (${signal ? `killed by ${signal}` : `exit ${code}`}) once too often; the version before it is back; ${reexec ? "starting the supervisor again on it" : "starting it again"}`
+          : `${at} supervisor: the connector upgraded itself (exit ${EXIT_UPGRADED}); ${reexec ? "starting the supervisor again on the new version" : "starting it again"}`);
         if (reexec) {
           for (const [s, h] of handlers) process.off(s, h);
           reexec();

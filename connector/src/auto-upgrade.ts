@@ -11,16 +11,20 @@
  *
  *  - only to exactly that version, never to "latest" and never down; only within the same major version, and below 1.0.0
  *    only within the range of minor versions Claw itself takes (its minimum); a prerelease is never installed by itself;
- *  - only while nothing is going on: no turn running, nothing queued for a terminal, no approval waiting, not paused, and
- *    that for a while (`idleMs`); otherwise it looks again `retryMs` later;
+ *  - only while nothing is going on: connected to Claw, no turn running, nothing queued for a terminal, no approval waiting,
+ *    not paused, and that for a while (`idleMs`); otherwise it looks again `retryMs` later. Never while agents.toml (which may
+ *    say `auto_upgrade = false`) or auto-upgrade.json (which may pin a failed version) cannot be read;
  *  - only where it can: a global npm install whose prefix this process may write, with the npm that belongs to the node
  *    running it, and a registry that has the version. Anything else changes nothing and is reported once, with the exact
  *    command that upgrades this machine by hand (the chat shows it beside the machine);
- *  - with the old version kept: the package directory is copied aside, `npm install -g --prefix <prefix>` puts the new
- *    one in place, its `--version` must name the version asked for, and a trial run of it (TRIAL_ENV) must connect to
- *    Claw within `trialMs`. Three failed trials restore the copy and pin that version as failed here: it is not tried
- *    again until Claw recommends a newer one. Only then does the run end (EXIT_UPGRADED), and its supervisor starts the
- *    new version (the script supervisor starts itself again on the new code first).
+ *  - downloaded first, while the run goes on (`stage`): `npm install -g` into a prefix of its own beside the package, its
+ *    `--version` must name the version asked for. Only then, still idle, does the run end; the package directory is moved
+ *    aside as the backup and the download moved in (renames), and a trial run of it (TRIAL_ENV) must connect to Claw within
+ *    `trialMs`. Three failed trials restore the backup and pin that version as failed here: it is not tried again until Claw
+ *    recommends a newer one. Otherwise the run ends (EXIT_UPGRADED), and its supervisor starts the new version (the script
+ *    supervisor starts itself again on the new code first);
+ *  - then on probation (`Probation`) until a real run of it stays connected for `probationMs`: three runs of it that fail
+ *    first (counted by the run as it starts and by the script supervisor as it ends) restore the backup and pin it the same way.
  *
  * The first run of the new version does the setup a new version may need (commands.ts `postUpgradeSetup`): hooks that are
  * installed are brought up to date; hooks that are not are never added, only mentioned once. The outcome travels to Claw
@@ -73,10 +77,12 @@ export interface UpgradeTiming {
   trialGapMs: number;
   /** One npm command may take this long. */
   npmMs: number;
+  /** A real run of a new version proves it by staying connected this long (it must connect within `trialMs`). */
+  probationMs: number;
 }
 
 export const DEFAULT_UPGRADE_TIMING: UpgradeTiming = {
-  checkMs: 30_000, idleMs: 60_000, retryMs: 15 * 60_000, trialMs: 60_000, trialAttempts: 3, trialGapMs: 5_000, npmMs: 5 * 60_000,
+  checkMs: 30_000, idleMs: 60_000, retryMs: 15 * 60_000, trialMs: 60_000, trialAttempts: 3, trialGapMs: 5_000, npmMs: 5 * 60_000, probationMs: 60_000,
 };
 
 /** The timings, with what TIMING_ENV sets (whole milliseconds, at least 10; `trialAttempts` at least 1). */
@@ -93,7 +99,11 @@ export function upgradeTiming(env: NodeJS.ProcessEnv): UpgradeTiming {
 
 // --- whether it is on ----------------------------------------------------------------------------------
 
-export interface Setting { enabled: boolean; source: "env" | "config" | "default" }
+/**
+ * `unreadable`: agents.toml is there but could not be read in time, or does not parse. Then it is off for that check: a file that
+ * may say `auto_upgrade = false` is never taken as saying nothing.
+ */
+export interface Setting { enabled: boolean; source: "env" | "config" | "default" | "unreadable"; detail?: string }
 
 function envSetting(env: NodeJS.ProcessEnv): boolean | null {
   const v = (env[AUTO_UPGRADE_ENV] ?? "").trim().toLowerCase();
@@ -104,32 +114,54 @@ function envSetting(env: NodeJS.ProcessEnv): boolean | null {
 
 /** agents.toml's top-level `auto_upgrade`, or null when it does not say (or cannot be read). */
 export function configSetting(text: string | null): boolean | null {
+  const c = parseSetting(text);
+  return typeof c === "boolean" ? c : null;
+}
+
+/** The same, telling "does not say" (null) from "does not parse" (`invalid`). */
+function parseSetting(text: string | null): boolean | null | "invalid" {
   if (text === null) return null;
   try {
     const doc = parseToml(text) as Record<string, unknown>;
-    return typeof doc.auto_upgrade === "boolean" ? doc.auto_upgrade : null;
-  } catch { return null; }
+    if (doc.auto_upgrade === undefined) return null;
+    return typeof doc.auto_upgrade === "boolean" ? doc.auto_upgrade : "invalid";
+  } catch { return "invalid"; }
 }
+
+/** A file's text, or that it is not there, or why it could not be read. */
+type Read = { text: string } | { missing: true } | { error: string };
 
 const readText = (f: string): string | null => { try { return fs.readFileSync(f, "utf8"); } catch { return null; } };
 const readTextOff = (f: string): Promise<string | null> => within(fsp.readFile(f, "utf8"), FS_WAIT_MS, null);
+const readFileAs = (f: string): Read => {
+  try { return { text: fs.readFileSync(f, "utf8") }; } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "ENOENT" ? { missing: true } : { error: errMessage(e) };
+  }
+};
+const readFileOff = (f: string): Promise<Read> => within(
+  fsp.readFile(f, "utf8").then((text): Read => ({ text }), (e: NodeJS.ErrnoException): Read => (e.code === "ENOENT" ? { missing: true } : { error: errMessage(e) })),
+  FS_WAIT_MS, { error: `no answer within ${FS_WAIT_MS / 1000} s` },
+);
 
-const settingOf = (env: NodeJS.ProcessEnv, text: string | null): Setting => {
+const settingOf = (env: NodeJS.ProcessEnv, file: string, r: Read): Setting => {
   const e = envSetting(env);
   if (e !== null) return { enabled: e, source: "env" };
-  const c = configSetting(text);
+  if ("missing" in r) return { enabled: true, source: "default" };
+  if ("error" in r) return { enabled: false, source: "unreadable", detail: `cannot read ${file}: ${r.error}` };
+  const c = parseSetting(r.text);
+  if (c === "invalid") return { enabled: false, source: "unreadable", detail: `${file} does not parse, or its auto_upgrade is not true or false` };
   if (c !== null) return { enabled: c, source: "config" };
   return { enabled: true, source: "default" };
 };
 
-/** On unless CLAW_CONNECTOR_AUTO_UPGRADE or agents.toml turns it off. */
+/** On unless CLAW_CONNECTOR_AUTO_UPGRADE or agents.toml turns it off; off while agents.toml cannot be read. */
 export function autoUpgradeSetting(dirs: Dirs, env: NodeJS.ProcessEnv): Setting {
-  return settingOf(env, readText(configFile(dirs)));
+  return settingOf(env, configFile(dirs), readFileAs(configFile(dirs)));
 }
 
 /** The same, read off the event loop: a running connector reads it afresh at each check, so a change applies without a restart. */
 export async function readAutoUpgradeSetting(dirs: Dirs, env: NodeJS.ProcessEnv): Promise<Setting> {
-  return settingOf(env, await readTextOff(configFile(dirs)));
+  return settingOf(env, configFile(dirs), await readFileOff(configFile(dirs)));
 }
 
 /**
@@ -285,6 +317,25 @@ const othersDir = async (dir: string): Promise<boolean> =>
 
 export type Outcome = "upgraded" | "rolled_back" | "blocked";
 
+/**
+ * A version this connector put in place that has not yet proven itself here. Kept from before the new version is moved in until
+ * one of its real runs has stayed connected for `probationMs`: until then every run of it that starts or ends counts, whoever
+ * starts it (the script supervisor, systemd, launchd, a person), and the run that would be the `trialAttempts`+1st, or the
+ * supervisor that saw the `trialAttempts`th end, puts the old version back and pins this one as failed (`rollbackProbation`).
+ */
+export interface Probation {
+  version: string;
+  from: string;
+  /** The package directory and the old version's copy beside it. */
+  pkg_dir: string;
+  backup: string;
+  /** The run that is upgrading (its trial runs are not counted). */
+  owner: number;
+  /** The real runs of `version` that started or ended since, by pid. */
+  runs: number[];
+  at: string;
+}
+
 export interface UpgradeState {
   failed?: { version: string; at: string; reason: string };
   last?: { from: string; to: string; outcome: Outcome; at: string; detail?: string };
@@ -294,6 +345,7 @@ export interface UpgradeState {
   setup_pending?: string;
   /** The command a person can run instead, for the last refusal. */
   command?: string;
+  probation?: Probation;
 }
 
 const stateOf = (t: string | null): UpgradeState => {
@@ -305,9 +357,13 @@ export function readUpgradeState(dirs: Dirs): UpgradeState {
   return stateOf(readText(autoUpgradeFile(dirs)));
 }
 
-/** The same, off the event loop (a running connector's check). */
-export async function readUpgradeStateOff(dirs: Dirs): Promise<UpgradeState> {
-  return stateOf(await readTextOff(autoUpgradeFile(dirs)));
+/**
+ * The same, off the event loop (a running connector's check); null when it is there but cannot be read now (a network disk
+ * that does not answer): a version pinned as failed in it must not be tried for want of reading the pin.
+ */
+export async function readUpgradeStateOff(dirs: Dirs): Promise<UpgradeState | null> {
+  const r = await readFileOff(autoUpgradeFile(dirs));
+  return "missing" in r ? {} : "error" in r ? null : stateOf(r.text);
 }
 
 export function writeUpgradeState(dirs: Dirs, st: UpgradeState): void {
@@ -319,6 +375,15 @@ export function writeUpgradeState(dirs: Dirs, st: UpgradeState): void {
     fs.renameSync(tmp, file);
   } catch { /* best effort: the next run looks again */ }
 }
+
+/** auto-upgrade.json changed by `f` (read afresh: a supervisor and its run each write it, one after the other). */
+const updateState = (dirs: Dirs, f: (st: UpgradeState) => UpgradeState): UpgradeState => {
+  const next = f(readUpgradeState(dirs));
+  writeUpgradeState(dirs, next);
+  return next;
+};
+
+const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; } };
 
 // --- running programs ---------------------------------------------------------------------------------------
 
@@ -380,10 +445,63 @@ export async function preflight(layout: Layout, target: string, env: NodeJS.Proc
 
 // --- the upgrade itself -------------------------------------------------------------------------------------
 
+const backupName = (version: string) => `.connector-backup-${version}`;
+const STAGE = ".connector-stage-";
+const LOCK = ".connector-upgrade.lock";
+/** A lock older than this was left by an upgrade that died. */
+const LOCK_STALE_MS = 30 * 60_000;
+
+/** A version downloaded beside the live one, not yet in place: `<scope>/.connector-stage-<version>-<pid>` is an npm prefix of its own. */
+export interface Staged { version: string; prefix: string; pkgDir: string }
+
+/** Download directories of processes that are gone (an upgrade killed while npm ran) are removed. */
+function sweepStages(scope: string): void {
+  let names: string[] = [];
+  try { names = fs.readdirSync(scope); } catch { return; }
+  for (const n of names) {
+    const m = /^\.connector-stage-.+-(\d+)$/.exec(n);
+    if (m && Number(m[1]) !== process.pid && !alive(Number(m[1]))) fs.rmSync(path.join(scope, n), { recursive: true, force: true });
+  }
+}
+
+export type StageResult = { staged: Staged } | { blocked: Blocked } | { broken: string };
+
+/**
+ * Download `to` while the connector still runs, into a prefix of its own beside the live package (same file system, so it is
+ * moved in with a rename), with the npm and the global npmrc the live prefix uses; then ask the downloaded program its version.
+ * Nothing the live connector runs is touched: a download that is killed half way leaves only a directory the next one removes.
+ * `broken`: npm installed it, and it does not even say its version (pinned as failed by the caller).
+ */
+export async function stage(layout: Layout, to: string, env: NodeJS.ProcessEnv, timing: UpgradeTiming, signal: AbortSignal): Promise<StageResult> {
+  const scope = path.dirname(layout.pkgDir);
+  const stopped: StageResult = { blocked: { reason: "stopped", detail: "the connector is stopping", command: manualCommand(layout, to) } };
+  sweepStages(scope);
+  const prefix = path.join(scope, `${STAGE}${to}-${process.pid}`);
+  const pkgDir = path.join(prefix, "lib", "node_modules", ...CONNECTOR_PACKAGE.split("/"));
+  const drop = () => fs.rmSync(prefix, { recursive: true, force: true });
+  drop();
+  const e = npmEnv(layout, env);
+  // npm reads the global npmrc of the prefix it installs into (a registry, a proxy, a CA set there): the live prefix's, not this one's.
+  const gc = await run([...layout.npm!, "config", "get", "globalconfig", "--prefix", layout.prefix], e, 60_000, signal);
+  const globalconfig = gc.code === 0 ? gc.out.trim() : "";
+  const r = await run([...layout.npm!, "install", "-g", "--prefix", prefix, ...(path.isAbsolute(globalconfig) ? ["--globalconfig", globalconfig] : []), `${CONNECTOR_PACKAGE}@${to}`], e, timing.npmMs, signal);
+  if (signal.aborted) { drop(); return stopped; }
+  if (r.code !== 0) {
+    drop();
+    return { blocked: { reason: "npm_failed", detail: r.timedOut ? "npm install did not finish in time" : `npm install exited ${r.code}: ${tail(r.err || r.out)}`, command: manualCommand(layout, to) } };
+  }
+  const v = await run([layout.node, path.join(pkgDir, "dist", "cli.js"), "--version"], env, 30_000, signal);
+  if (signal.aborted) { drop(); return stopped; }
+  if (v.code !== 0 || v.out.trim() !== to) { drop(); return { broken: `the installed program says ${JSON.stringify(tail(v.out || v.err, 80))}, not ${to}` }; }
+  return { staged: { version: to, prefix, pkgDir } };
+}
+
 export interface PerformOptions {
   layout: Layout;
   from: string;
   to: string;
+  /** What `stage` downloaded. */
+  staged: Staged;
   dirs: Dirs;
   env: NodeJS.ProcessEnv;
   log: Logger;
@@ -393,11 +511,6 @@ export interface PerformOptions {
 }
 
 export type PerformResult = { outcome: Outcome; detail: string } | { outcome: "stopped"; detail: string };
-
-const backupName = (version: string) => `.connector-backup-${version}`;
-const LOCK = ".connector-upgrade.lock";
-/** A lock older than this was left by an upgrade that died. */
-const LOCK_STALE_MS = 30 * 60_000;
 
 /** One upgrade at a time per prefix (two connector homes may share one install): a directory made atomically. */
 function takeLock(scope: string): (() => void) | null {
@@ -414,9 +527,7 @@ function takeLock(scope: string): (() => void) | null {
         const o: unknown = JSON.parse(fs.readFileSync(path.join(dir, "owner"), "utf8"));
         const pid = isObject(o) && typeof o.pid === "number" ? o.pid : 0;
         const at = isObject(o) && typeof o.at === "string" ? Date.parse(o.at) : 0;
-        let alive = pid > 0;
-        try { if (alive) process.kill(pid, 0); } catch { alive = false; }
-        stale = !alive || !(Date.now() - at < LOCK_STALE_MS);
+        stale = !(pid > 0 && alive(pid)) || !(Date.now() - at < LOCK_STALE_MS);
       } catch { stale = (Date.now() - (fs.statSync(dir, { throwIfNoEntry: false })?.mtimeMs ?? 0)) > LOCK_STALE_MS; }
       if (!stale) return null;
       fs.rmSync(dir, { recursive: true, force: true });
@@ -425,10 +536,97 @@ function takeLock(scope: string): (() => void) | null {
   return null;
 }
 
-/** Put the copy back where the package was (the new version, or what is left of it, goes). */
-function restore(pkgDir: string, backup: string): void {
-  fs.rmSync(pkgDir, { recursive: true, force: true });
-  fs.cpSync(backup, pkgDir, { recursive: true, verbatimSymlinks: true });
+const versionIn = (pkgDir: string): unknown => {
+  try { const p: unknown = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8")); return isObject(p) ? p.version : null; } catch { return null; }
+};
+
+/**
+ * Put the old version's copy back as the package directory (the new one is moved aside and removed). By renames within one
+ * directory, so the package directory is missing only between two of them. False when there is no copy of `from` to put back.
+ */
+export function restoreBackup(pkgDir: string, backup: string, from: string): boolean {
+  if (versionIn(backup) !== from) return false;
+  const aside = path.join(path.dirname(pkgDir), `.connector-failed-${process.pid}`);
+  fs.rmSync(aside, { recursive: true, force: true });
+  const had = fs.existsSync(pkgDir);
+  if (had) fs.renameSync(pkgDir, aside);
+  try { fs.renameSync(backup, pkgDir); } catch (e) { if (had) fs.renameSync(aside, pkgDir); throw e; }
+  fs.rmSync(aside, { recursive: true, force: true });
+  return true;
+}
+
+/**
+ * The version on probation did not work here: the old one goes back, and this one is pinned as failed (not tried again until
+ * Claw recommends a newer one). Said in auto-upgrade.json, which the old version's next run reports to Claw.
+ */
+export function rollbackProbation(dirs: Dirs, reason: string, log: Logger): boolean {
+  let restored = false;
+  updateState(dirs, (st) => {
+    const p = st.probation;
+    if (!p) return st;
+    let why = reason;
+    try { restored = restoreBackup(p.pkg_dir, p.backup, p.from); } catch (e) { why = `${reason}; putting ${p.from} back failed: ${errMessage(e)}`; }
+    if (!restored && why === reason) why = `${reason}; there is no copy of ${p.from} to put back (${p.backup})`;
+    const at = new Date().toISOString();
+    const { probation: _p, setup_pending: _s, next_try_at: _n, command: _c, ...rest } = st;
+    if (restored) log.error("the new connector version did not work here; the old one is back, and this version is not tried again", { from: p.from, to: p.version, reason: why });
+    else log.error("the new connector version did not work here, and the old one could not be put back", { from: p.from, to: p.version, reason: why });
+    return { ...rest, last: { from: p.from, to: p.version, outcome: "rolled_back", at, detail: why.slice(0, 300) }, failed: { version: p.version, at, reason: why.slice(0, 300) } };
+  });
+  return restored;
+}
+
+/**
+ * A real run of `version` starts (`run`, not a trial). `rolled_back`: it was on probation and `attempts` runs of it already ended
+ * without proving themselves, so the old version is back now and this run must end for its supervisor to start that one.
+ * `watch`: it is on probation, and this run proves it by staying connected (`probationPassed`). `none`: nothing to prove.
+ */
+export function probationStart(dirs: Dirs, version: string, pid: number, attempts: number, log: Logger): "none" | "watch" | "rolled_back" {
+  const p = readUpgradeState(dirs).probation;
+  if (!p) return "none";
+  if (p.version !== version) {
+    // Another version than the one on probation runs: put in place by hand, or the old one already back.
+    updateState(dirs, ({ probation: _p, ...rest }) => rest);
+    return "none";
+  }
+  const runs = p.runs.filter((r) => r !== pid);
+  if (runs.length >= attempts) {
+    rollbackProbation(dirs, `${runs.length} runs of ${version} ended without staying connected for a while`, log);
+    return "rolled_back";
+  }
+  updateState(dirs, (st) => (st.probation?.version === version ? { ...st, probation: { ...st.probation, runs: [...runs, pid] } } : st));
+  return "watch";
+}
+
+/**
+ * A supervisor saw a run end with a failure (`pid`, not the upgrading run): counted for the version on probation, whether or
+ * not that run got as far as `probationStart` (a version that fails before it does is counted here). True when that was the
+ * last chance and the old version is back: the supervisor starts it next.
+ */
+export function probationExited(dirs: Dirs, pid: number, attempts: number, log: Logger): boolean {
+  const p = readUpgradeState(dirs).probation;
+  if (!p || pid === p.owner) return false;
+  const runs = p.runs.includes(pid) ? p.runs : [...p.runs, pid];
+  if (runs.length >= attempts) return rollbackProbation(dirs, `${runs.length} runs of ${p.version} ended without staying connected for a while`, log), true;
+  updateState(dirs, (st) => (st.probation?.version === p.version ? { ...st, probation: { ...st.probation, runs } } : st));
+  return false;
+}
+
+/** A run of the version on probation that ends on purpose (`claw-connector stop`) does not count against it. */
+export function probationForget(dirs: Dirs, version: string, pid: number): void {
+  updateState(dirs, (st) => (st.probation?.version === version ? { ...st, probation: { ...st.probation, runs: st.probation.runs.filter((r) => r !== pid) } } : st));
+}
+
+/** A run of the version on probation stayed connected for `probationMs`: it works here. */
+export function probationPassed(dirs: Dirs, version: string, log: Logger): void {
+  let passed = false;
+  updateState(dirs, (st) => {
+    if (st.probation?.version !== version) return st;
+    passed = true;
+    const { probation: _p, ...rest } = st;
+    return rest;
+  });
+  if (passed) log.info("the new connector version works here", { version });
 }
 
 /** One trial run of the installed version: did it connect to Claw, as that version, within `trialMs`? */
@@ -446,91 +644,74 @@ async function trial(o: PerformOptions): Promise<{ ok: true } | { ok: false; why
 }
 
 /**
- * Upgrade the package from `from` to `to` (the connector itself is stopped meanwhile: the caller's run ended first). Returns
- * `upgraded` with the new version in place and proven to connect, `rolled_back` with the old one back and `to` pinned as failed,
- * `blocked` with nothing changed (npm failed: offline, a registry that refused), or `stopped` (asked to stop; the old version is
- * back unless the new one was already proven). Records the outcome (auto-upgrade.json) for the next run to report.
+ * Put the staged `to` in place of `from` (the connector itself is stopped meanwhile: the caller's run ended first) and prove it.
+ * The version goes on probation before it is moved in, so from then on every run of it counts, even when this process is killed.
+ * Returns `upgraded` with the new version in place and proven to connect in a trial run (its real runs still on probation),
+ * `rolled_back` with the old one back and `to` pinned as failed, `blocked` with nothing changed, or `stopped` (asked to stop; the
+ * old version is back). Records the outcome (auto-upgrade.json) for the next run to report.
  */
 export async function performUpgrade(o: PerformOptions): Promise<PerformResult> {
-  const { layout, from, to, dirs, log } = o;
+  const { layout, from, to, dirs, log, staged } = o;
   const at = () => new Date().toISOString();
-  const st = readUpgradeState(dirs);
   const scope = path.dirname(layout.pkgDir);
-  const record = (outcome: Outcome, detail: string, extra: Partial<UpgradeState> = {}) => {
-    const next: UpgradeState = { ...st, last: { from, to, outcome, at: at(), ...(detail ? { detail: detail.slice(0, 300) } : {}) }, ...extra };
-    if (outcome !== "blocked") { delete next.next_try_at; delete next.command; }
-    if (outcome === "upgraded") delete next.failed;
-    writeUpgradeState(dirs, next);
-  };
+  const backup = path.join(scope, backupName(from));
   const blocked = (reason: string, detail: string): PerformResult => {
-    record("blocked", `${reason}: ${detail}`, { next_try_at: new Date(Date.now() + o.timing.retryMs).toISOString(), command: manualCommand(layout, to) });
+    updateState(dirs, (st) => ({ ...st, last: { from, to, outcome: "blocked", at: at(), detail: `${reason}: ${detail}`.slice(0, 300) }, next_try_at: new Date(Date.now() + o.timing.retryMs).toISOString(), command: manualCommand(layout, to) }));
     log.warn("the connector could not upgrade itself; nothing was changed", { to, reason, detail, by_hand: manualCommand(layout, to) });
     return { outcome: "blocked", detail: `${reason}: ${detail}` };
   };
+  const putBack = () => {
+    restoreBackup(layout.pkgDir, backup, from);
+    updateState(dirs, ({ probation: _p, ...rest }) => rest);
+  };
   const unlock = takeLock(scope);
-  if (!unlock) return blocked("busy", `another upgrade holds ${path.join(scope, LOCK)}`);
-  const backup = path.join(scope, backupName(from));
+  if (!unlock) { fs.rmSync(staged.prefix, { recursive: true, force: true }); return blocked("busy", `another upgrade holds ${path.join(scope, LOCK)}`); }
+  let moved = false;
   try {
+    if (versionIn(staged.pkgDir) !== to) return blocked("staging_lost", `${staged.pkgDir} no longer holds ${to}`);
+    if (versionIn(layout.pkgDir) !== from) return blocked("changed", `${layout.pkgDir} no longer holds ${from}`);
     log.info("upgrading the connector", { from, to, prefix: layout.prefix });
-    // The old version, kept: a copy, so the package directory itself is never missing (a supervisor may start it any time).
-    const tmp = `${backup}.${process.pid}.tmp`;
-    try {
-      fs.rmSync(tmp, { recursive: true, force: true });
-      fs.cpSync(layout.pkgDir, tmp, { recursive: true, verbatimSymlinks: true });
-      fs.rmSync(backup, { recursive: true, force: true });
-      fs.renameSync(tmp, backup);
-    } catch (e) {
-      fs.rmSync(tmp, { recursive: true, force: true });
-      return blocked("backup_failed", `cannot copy ${layout.pkgDir} aside: ${errMessage(e)}`);
-    }
-    const npm = await run([...layout.npm!, "install", "-g", "--prefix", layout.prefix, `${CONNECTOR_PACKAGE}@${to}`], npmEnv(layout, o.env), o.timing.npmMs, o.signal);
-    const installed = (() => { try { const p: unknown = JSON.parse(fs.readFileSync(path.join(layout.pkgDir, "package.json"), "utf8")); return isObject(p) ? p.version : null; } catch { return null; } })();
-    if (o.signal.aborted) {
-      if (installed !== from) restore(layout.pkgDir, backup);
-      return { outcome: "stopped", detail: "stopped while installing; the old version is in place" };
-    }
-    if (npm.code !== 0) {
-      // npm puts the old directory back itself when it fails; if it did not, the copy does.
-      if (installed !== from) restore(layout.pkgDir, backup);
-      return blocked("npm_failed", npm.timedOut ? "npm install did not finish in time" : `npm install exited ${npm.code}: ${tail(npm.err || npm.out)}`);
-    }
-    const failed = (reason: string): PerformResult => {
-      restore(layout.pkgDir, backup);
-      record("rolled_back", reason, { failed: { version: to, at: at(), reason: reason.slice(0, 300) } });
-      log.error("the new connector version did not work here; the old one is back, and this version is not tried again", { from, to, reason });
-      return { outcome: "rolled_back", detail: reason };
-    };
-    const v = await run([layout.node, layout.cli, "--version"], o.env, 30_000, o.signal);
-    if (o.signal.aborted) { restore(layout.pkgDir, backup); return { outcome: "stopped", detail: "stopped while checking the new version; the old version is in place" }; }
-    if (v.code !== 0 || v.out.trim() !== to) return failed(`the installed program says ${JSON.stringify(tail(v.out || v.err, 80))}, not ${to}`);
+    updateState(dirs, (st) => ({ ...st, probation: { version: to, from, pkg_dir: layout.pkgDir, backup, owner: process.pid, runs: [], at: at() } }));
+    // The old version, kept: moved aside whole, and the downloaded one moved in (renames in one directory).
+    fs.rmSync(backup, { recursive: true, force: true });
+    fs.renameSync(layout.pkgDir, backup);
+    try { fs.renameSync(staged.pkgDir, layout.pkgDir); } catch (e) { fs.renameSync(backup, layout.pkgDir); throw e; }
+    moved = true;
     let why = "";
     for (let i = 1; i <= o.timing.trialAttempts; i++) {
       const t = await trial(o);
-      if (o.signal.aborted) { restore(layout.pkgDir, backup); return { outcome: "stopped", detail: "stopped during the trial; the old version is in place" }; }
+      if (o.signal.aborted) { putBack(); return { outcome: "stopped", detail: "stopped during the trial; the old version is in place" }; }
       if (t.ok) {
         // Older copies than this one go; this one stays until the next upgrade.
         for (const n of fs.readdirSync(scope)) if (n.startsWith(".connector-backup-") && n !== backupName(from)) fs.rmSync(path.join(scope, n), { recursive: true, force: true });
-        record("upgraded", "", { setup_pending: to });
-        log.info("the connector is upgraded; restarting on the new version", { from, to, backup });
+        updateState(dirs, (st) => {
+          const { failed: _f, next_try_at: _n, command: _c, ...rest } = st;
+          return { ...rest, last: { from, to, outcome: "upgraded", at: at() }, setup_pending: to, ...(st.probation ? { probation: { ...st.probation, runs: [] } } : {}) };
+        });
+        log.info("the connector is upgraded; restarting on the new version (on probation until a run of it stays connected)", { from, to, backup });
         return { outcome: "upgraded", detail: "" };
       }
       why = t.why;
       log.warn("a trial run of the new connector version failed", { to, attempt: i, why });
       if (i < o.timing.trialAttempts) await sleep(o.timing.trialGapMs, o.signal);
     }
-    return failed(`${o.timing.trialAttempts} trial runs failed; the last: ${why}`);
+    const reason = `${o.timing.trialAttempts} trial runs failed; the last: ${why}`;
+    rollbackProbation(dirs, reason, log);
+    return { outcome: "rolled_back", detail: reason };
   } catch (e) {
-    // Something unforeseen (a disk that refused the copy back): said, and the next run looks again.
-    try { if (fs.existsSync(backup) && !isFile(path.join(layout.pkgDir, "dist", "cli.js"))) restore(layout.pkgDir, backup); } catch { /* reported below */ }
+    // Something unforeseen (a disk that refused a rename): the old version back if it was moved, said, and the next run looks again.
+    try { if (moved || !fs.existsSync(layout.pkgDir)) putBack(); else updateState(dirs, ({ probation: _p, ...rest }) => rest); } catch { /* reported below */ }
     return blocked("error", errMessage(e));
   } finally {
+    fs.rmSync(staged.prefix, { recursive: true, force: true });
     unlock();
   }
 }
 
 // --- the running connector's side -------------------------------------------------------------------------
 
-export type UpgradeStateName = "off" | "unsupervised" | "unmanaged" | "current" | "manual" | "waiting_idle" | "blocked" | "failed" | "upgrading";
+/** `unreadable`: agents.toml or auto-upgrade.json cannot be read now, so it does not upgrade (and says why in the log). */
+export type UpgradeStateName = "off" | "unreadable" | "unsupervised" | "unmanaged" | "current" | "manual" | "waiting_idle" | "blocked" | "failed" | "upgrading";
 
 export interface AutoUpgraderOptions {
   dirs: Dirs;
@@ -545,6 +726,7 @@ export interface AutoUpgraderOptions {
   /** Tests replace them. */
   layout?: () => Promise<Layout | { unmanaged: string }>;
   preflight?: (layout: Layout, target: string, signal: AbortSignal) => Promise<Blocked | null>;
+  stage?: (layout: Layout, target: string, signal: AbortSignal) => Promise<StageResult>;
   now?: () => number;
 }
 
@@ -562,6 +744,7 @@ export class AutoUpgrader {
   private nextAt = 0;
   private said = "";
   private enabled = true;
+  private staged: Staged | null = null;
   /** auto-upgrade.json as last read, and the command for this machine (both kept for `report`, which never touches the disk). */
   private st: UpgradeState;
   private command: string | undefined;
@@ -583,7 +766,9 @@ export class AutoUpgrader {
 
   /** The heartbeat's answer: `connector_version` when this connector is older than Claw recommends, absent when it is not. */
   observe(cv: unknown): void {
-    if (isObject(cv) && typeof cv.recommended_version === "string" && typeof cv.minimum_version === "string") {
+    // Only versions: the recommended one goes into the command a person is shown (`manualCommand`), so nothing else is taken.
+    if (isObject(cv) && typeof cv.recommended_version === "string" && typeof cv.minimum_version === "string"
+      && parts(cv.recommended_version) !== null && parts(cv.minimum_version) !== null) {
       this.rec = { minimum: cv.minimum_version, recommended: cv.recommended_version };
     } else {
       this.rec = null;
@@ -623,10 +808,14 @@ export class AutoUpgrader {
       const setting = await readAutoUpgradeSetting(this.o.dirs, this.o.env);
       this.enabled = setting.enabled;
       this.command = undefined;
+      if (setting.source === "unreadable") { this.set("unreadable", null, { why: setting.detail }); return null; }
       if (!setting.enabled) { this.set("off", null); return null; }
       if (!this.rec) { this.set("current", null); return null; }
       const st = await readUpgradeStateOff(this.o.dirs);
+      if (st === null) { this.set("unreadable", null, { why: `cannot read ${autoUpgradeFile(this.o.dirs)} now` }); return null; }
       this.st = st;
+      // This version is itself still on probation (commands.ts `cmdRun`): not before it has proven itself.
+      if (st.probation) { this.set("current", null); return null; }
       const e = upgradeTarget(this.o.version, this.rec, st.failed?.version ?? null);
       if ("skip" in e) {
         if (e.skip === "current") this.set("current", null);
@@ -652,11 +841,24 @@ export class AutoUpgrader {
       if (now - this.idleSince < this.timing.idleMs) { if (this.state !== "blocked") this.set("waiting_idle", e.target); return null; }
       const blocked = await (this.o.preflight ? this.o.preflight(layout, e.target, signal) : preflight(layout, e.target, this.o.env, this.timing, signal));
       if (signal.aborted) return null;
-      if (blocked) {
-        this.blocked = blocked;
-        this.nextAt = this.now() + this.timing.retryMs;
-        this.set("blocked", e.target);
-        return null;
+      if (blocked) return this.refused(blocked, e.target);
+      // Downloaded while still connected (a prompt sent meanwhile is taken as usual); the run ends only once it is here.
+      if (this.staged?.version !== e.target || !isFile(path.join(this.staged.pkgDir, "package.json"))) {
+        this.dispose();
+        this.set("upgrading", e.target, { step: "download" });
+        const r = await (this.o.stage ? this.o.stage(layout, e.target, signal) : stage(layout, e.target, this.o.env, this.timing, signal));
+        if (signal.aborted) { if ("staged" in r) fs.rmSync(r.staged.prefix, { recursive: true, force: true }); return null; }
+        if ("blocked" in r) return this.refused(r.blocked, e.target);
+        if ("broken" in r) {
+          const at = new Date().toISOString();
+          const next = { ...st, last: { from: this.o.version, to: e.target, outcome: "rolled_back" as const, at, detail: r.broken.slice(0, 300) }, failed: { version: e.target, at, reason: r.broken.slice(0, 300) } };
+          writeUpgradeState(this.o.dirs, next);
+          this.st = next;
+          this.o.log.error("the new connector version does not work here; it is not tried again", { to: e.target, reason: r.broken });
+          this.set("failed", e.target);
+          return null;
+        }
+        this.staged = r.staged;
       }
       this.set("upgrading", e.target);
       return e.target;
@@ -664,6 +866,22 @@ export class AutoUpgrader {
       this.o.log.warn("auto-upgrade check failed", { error: errMessage(err) });
       return null;
     }
+  }
+
+  private refused(blocked: Blocked, target: string): null {
+    this.blocked = blocked;
+    this.nextAt = this.now() + this.timing.retryMs;
+    this.set("blocked", target);
+    return null;
+  }
+
+  /** What `decide` downloaded for the version it returned (`performUpgrade` moves it in). */
+  get stagedVersion(): Staged | null { return this.staged; }
+
+  /** The run ends without upgrading: what was downloaded goes. */
+  dispose(): void {
+    if (this.staged) fs.rmSync(this.staged.prefix, { recursive: true, force: true });
+    this.staged = null;
   }
 
   /** Lost its idleness (a command came): the quiet period starts again. */

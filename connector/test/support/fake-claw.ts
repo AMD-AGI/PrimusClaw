@@ -287,7 +287,8 @@ export class FakeClaw {
         if (hb.value.cmdCursor !== null) { this.cursor = Math.max(this.cursor, hb.value.cmdCursor); }
         this.wake();
         const pol = this.connectorVersions;
-        const old = pol && typeof hb.value.version === "string" && (compareConnectorVersions(hb.value.version, pol.recommended) ?? 0) < 0;
+        // A recommended version that does not compare (not a version at all) is sent too: a connector must refuse it itself.
+        const old = pol && typeof hb.value.version === "string" && (compareConnectorVersions(hb.value.version, pol.recommended) ?? -1) < 0;
         return this.json(res, 200, { ok: true, data: {
           server_time: new Date().toISOString(), online_window_ms: 90000,
           ...(old ? { connector_version: {

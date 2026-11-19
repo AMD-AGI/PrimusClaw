@@ -720,7 +720,7 @@ the connector sees it within a heartbeat, stops every agent and exits without re
 commands handled), `connector-id.json` (the identity alone, written once and flushed to the disk: a `connector.json` damaged
 by a crash falls back to it instead of registering the machine as a new connector), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
 decisions, every command received, every permission request and answer, every automatic approval, mode changes),
-`logs/`, `children.json`, `connector.pid`, `disconnects.jsonl`, `auto-upgrade.json` (the last upgrade, a version that failed here, when to try again), `needs-login.json` (only after a run that needs a new sign-in), `doctor.json`
+`logs/`, `children.json`, `connector.pid`, `disconnects.jsonl`, `auto-upgrade.json` (the last upgrade, a version that failed here, when to try again, a new version still on probation), `needs-login.json` (only after a run that needs a new sign-in), `doctor.json`
 (the last `doctor` report), `approval-hooks-offer.json` (the answer to the one-time offer of the approval hooks), and with the script supervisor `supervisor.pid`, `keepalive.sh`, `keepalive-last` (when it last ran) and `run.log`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
 
 ## Keeping it running
@@ -781,21 +781,35 @@ every heartbeat of an older connector; the connector then:
 - takes exactly that version, never `latest`, never an older one, never a prerelease or a new major version. Below 1.0.0 a
   new minor version is taken only when Claw's minimum version is in this connector's minor line or below it (Claw then
   works with both);
-- waits until nothing is going on: no turn running, nothing queued for an agent or a terminal, no approval waiting, not
-  paused, for a minute. While something is, it looks again 15 minutes later;
+- waits until nothing is going on: connected to Claw, no turn running, nothing queued for an agent or a terminal, no
+  approval waiting, not paused, for a minute. While something is, it looks again 15 minutes later. If `agents.toml` is
+  there but cannot be read or parsed at that moment, it does not upgrade;
 - checks first, while still connected, that it can: a global npm install (`<prefix>/lib/node_modules/@primusclaw/connector`),
   the `npm` beside the `node` that runs it, a prefix this user may write, and a registry that has that version. If any of
   these fails nothing is changed, the reason is logged once, and the chat shows the machine's problem
   (`connector_upgrade_blocked`) with the command that does it by hand on that machine, for example
   `sudo /usr/bin/npm install -g --prefix /usr @primusclaw/connector@0.2.5 && /usr/bin/claw-connector stop && /usr/bin/claw-connector service install`;
-- stops, copies the package directory aside (`.connector-backup-<old version>` next to it), runs
-  `npm install -g --prefix <prefix> @primusclaw/connector@<version>` with the same node, and checks that the new program says
-  that version (npm checks the package's integrity against the registry);
+- downloads the new version while still connected, with the same node and npm and that prefix's global npmrc, into a
+  directory of its own beside the package (`.connector-stage-<version>-<pid>`, an npm prefix:
+  `npm install -g --prefix <that directory> @primusclaw/connector@<version>`; npm checks the package's integrity against the
+  registry), and checks that the new program says that version. Nothing the running connector uses is touched yet, so a
+  connector killed during the download (a service manager that gave up waiting) still has its old version in place; the
+  next upgrade removes what the killed one left;
+- once it is still idle, stops, moves the package directory aside (`.connector-backup-<old version>` next to it) and moves
+  the new one in, by renames in one directory;
 - starts the new version once as a trial: it must connect to Claw within 60 seconds. Three failed trials put the old
   version back, pin the new one as failed here (not tried again until Claw recommends a newer one), and show
   `connector_upgrade_failed` in the chat;
 - ends with exit code 79, which every supervisor restarts: systemd and launchd start the new version; the script supervisor
   first starts itself again on the new code.
+
+The new version is then on probation until one of its runs has been connected for a minute. A run of it that does not
+connect within 60 seconds ends with a failure; each run of it that ends with a failure counts, whether the run counted
+itself as it started or the script supervisor counted its exit. After three, the old version is put back, the new one is
+pinned as failed, and the old version starts again: the next run of the new version puts it back before doing anything else
+and exits 79 (so systemd and launchd restart the old one), and the script supervisor does it when it sees the third failure
+(so a version that fails before any of its own code runs is caught too). Stopping the connector on purpose
+(`claw-connector stop`) does not count.
 
 The first run of the new version brings the hooks it finds installed (the Claude Code session and approval hooks, the
 Codex approval hook) up to date. It never adds hooks you did not install; when the session hooks are missing it says so

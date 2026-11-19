@@ -40,7 +40,7 @@ import { probeAgents, probeLines, type ProbeFn } from "./probe.js";
 import { rootProblems } from "./roots.js";
 import {
   AUTO_UPGRADE_ENV, AutoUpgrader, EXIT_UPGRADED, TRIAL_ENV, TRIAL_OK_LINE, autoUpgradeSetting, installLayout, manualCommand, performUpgrade,
-  readUpgradeState, unwritable, upgradeTiming, writeConfigSetting, writeUpgradeState,
+  probationForget, probationPassed, probationStart, readUpgradeState, unwritable, upgradeTiming, writeConfigSetting, writeUpgradeState,
 } from "./auto-upgrade.js";
 
 export interface Ctx {
@@ -735,6 +735,14 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   const audit = fileAudit(auditFile(ctx.dirs));
   const cli = ctx.cli ?? ctx.service?.cli ?? fileURLToPath(import.meta.url);
   const node = ctx.node ?? process.execPath;
+  // A version this connector just upgraded itself to is on probation until one of its runs stays connected for a while; the
+  // run that would be one too many puts the old version back instead, and ends so that its supervisor starts that one.
+  const timing = upgradeTiming(ctx.env);
+  const probation = trial ? "none" : probationStart(ctx.dirs, VERSION, process.pid, timing.trialAttempts, log);
+  if (probation === "rolled_back") {
+    ctx.err(`${new Date().toISOString()} ${VERSION} did not stay connected in ${timing.trialAttempts} runs; the version before it is back; exit ${EXIT.upgraded}, so the supervisor starts it`);
+    return EXIT.upgraded;
+  }
   const upgrade = trial ? undefined : new AutoUpgrader({ dirs: ctx.dirs, env: ctx.env, version: VERSION, supervised: runFlags.supervised === true, cli, node, log });
   if (!trial) postUpgradeSetup(ctx);
   const connector = new Connector({
@@ -756,8 +764,25 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   for (const a of cfg.agents) if (a.readOnlyModes.includes(a.askMode)) ctx.out(`note: ${a.id}: its sessions start read-only (${a.askMode} mode changes no file); to let phone sessions write code, set approval = "never" on it in agents.toml`);
   // A root that is missing or stalled is reported, not fatal: a network mount may come back, and its sessions with it.
   void rootProblems(cfg.agents).then((ps) => { for (const p of ps) ctx.out(`warning: ${p}`); }, () => undefined);
+  // On probation: connected within `trialMs` and still up `probationMs` later proves this version; not connected in time ends
+  // the run with a failure, which counts against it.
+  let probationTimer: NodeJS.Timeout | undefined;
+  let notConnected = false;
+  if (probation === "watch") {
+    probationTimer = setTimeout(() => {
+      notConnected = true;
+      log.error("this new connector version did not connect in time; ending the run (it counts against the version)", { version: VERSION, within_ms: timing.trialMs });
+      connector.stop();
+    }, timing.trialMs);
+    void connector.connected.then(() => {
+      clearTimeout(probationTimer);
+      probationTimer = setTimeout(() => probationPassed(ctx.dirs, VERSION, log), timing.probationMs);
+    });
+  }
   try {
-    const result = await connector.run();
+    const result = await connector.run().finally(() => clearTimeout(probationTimer));
+    if (result !== "upgrade") upgrade?.dispose();
+    if (notConnected) { ctx.err(`${new Date().toISOString()} ${VERSION} did not connect within ${Math.round(timing.trialMs / 1000)} s; exit ${EXIT.failure}`); return EXIT.failure; }
     // A machine paired from the chat has no login to run again: a new pairing code is what connects it.
     const again = reconnectAdvice(credentialsFile(ctx.dirs));
     if (result === "revoked") {
@@ -770,11 +795,13 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
       ctx.err(`Claw keeps refusing this sign-in (${connector.authFailure}): every agent was stopped. ${again}`);
       return EXIT.needsPerson;
     }
-    if (result === "upgrade") return await upgradeNow(ctx, connector, cli, node, log);
+    if (result === "upgrade") return await upgradeNow(ctx, connector, upgrade!, cli, node, log);
     if (runFlags.supervised && !takeStopRequest(ctx)) {
       ctx.err(`${new Date().toISOString()} stopped by a signal that did not come from "claw-connector stop"; exit ${EXIT.terminated}, so the supervisor starts it again`);
       return EXIT.terminated;
     }
+    // Stopped on purpose: not a failure of the version on probation.
+    if (probation === "watch") probationForget(ctx.dirs, VERSION, process.pid);
     return EXIT.ok;
   } catch (e) {
     // Refused at start (a deleted key, a sign-in the identity service ended): retrying cannot help.
@@ -795,15 +822,20 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
  * the supervisor starts it; or, when that cannot be done, end with EXIT.terminated so the supervisor starts this version again.
  * `claw-connector stop` still finds this process meanwhile (the pid file is written again) and ends the upgrade where it is.
  */
-async function upgradeNow(ctx: Ctx, connector: Connector, cli: string, node: string, log: ReturnType<typeof stderrLogger>): Promise<number> {
+async function upgradeNow(ctx: Ctx, connector: Connector, upgrade: AutoUpgrader, cli: string, node: string, log: ReturnType<typeof stderrLogger>): Promise<number> {
   const to = connector.upgradeTarget!;
+  const staged = upgrade.stagedVersion;
   const layout = await installLayout(cli, node, ctx.env);
-  if ("unmanaged" in layout) { ctx.err(`cannot upgrade: ${layout.unmanaged}`); return EXIT.terminated; }
+  if ("unmanaged" in layout || !staged || staged.version !== to) {
+    upgrade.dispose();
+    ctx.err(`cannot upgrade: ${"unmanaged" in layout ? layout.unmanaged : `${to} is not downloaded`}`);
+    return EXIT.terminated;
+  }
   const pidf = pidFile(ctx.dirs);
   const mine = JSON.stringify({ pid: process.pid, start: processStart(process.pid) ?? "" });
   fs.writeFileSync(pidf, mine, { mode: 0o600 });
   try {
-    const r = await performUpgrade({ layout, from: VERSION, to, dirs: ctx.dirs, env: ctx.env, log, timing: upgradeTiming(ctx.env), signal: connector.stopSignal });
+    const r = await performUpgrade({ layout, from: VERSION, to, staged, dirs: ctx.dirs, env: ctx.env, log, timing: upgradeTiming(ctx.env), signal: connector.stopSignal });
     if (r.outcome === "upgraded") { ctx.err(`${new Date().toISOString()} upgraded ${VERSION} -> ${to}; exit ${EXIT.upgraded}, so the supervisor starts ${to}`); return EXIT.upgraded; }
     if (r.outcome === "stopped") return takeStopRequest(ctx) ? EXIT.ok : EXIT.terminated;
     ctx.err(`${new Date().toISOString()} the upgrade to ${to} ${r.outcome === "rolled_back" ? "was rolled back" : "did not happen"} (${r.detail}); the supervisor starts ${VERSION} again`);
@@ -864,11 +896,11 @@ async function cmdAutoUpgrade(args: string[], ctx: Ctx): Promise<number> {
     version: VERSION, enabled: setting.enabled, source: setting.source,
     install: "unmanaged" in layout ? { managed: false, why: layout.unmanaged }
       : { managed: true, prefix: layout.prefix, package_dir: layout.pkgDir, npm: layout.npm?.join(" ") ?? null, writable: no === null, ...(no ? { not_writable: no.dir } : {}) },
-    last: st.last ?? null, failed: st.failed ?? null, next_try_at: st.next_try_at ?? null,
+    last: st.last ?? null, failed: st.failed ?? null, next_try_at: st.next_try_at ?? null, probation: st.probation ? { version: st.probation.version, from: st.probation.from, runs: st.probation.runs.length } : null,
     by_hand: st.command ?? (st.last ? manualCommand("unmanaged" in layout ? null : layout, st.last.to) : null),
   };
   if (values.json) { ctx.out(JSON.stringify(status, null, 2)); return EXIT.ok; }
-  ctx.out(`auto-upgrade: ${setting.enabled ? "on" : "off"} (${setting.source === "env" ? AUTO_UPGRADE_ENV : setting.source === "config" ? `auto_upgrade in ${configFile(ctx.dirs)}` : "the default"})`);
+  ctx.out(`auto-upgrade: ${setting.enabled ? "on" : "off"} (${setting.source === "env" ? AUTO_UPGRADE_ENV : setting.source === "config" ? `auto_upgrade in ${configFile(ctx.dirs)}` : setting.source === "unreadable" ? `off while it cannot be read: ${setting.detail}` : "the default"})`);
   ctx.out(`version:      ${VERSION}`);
   if ("unmanaged" in layout) ctx.out(`install:      cannot upgrade itself: ${layout.unmanaged}`);
   else {
@@ -877,6 +909,7 @@ async function cmdAutoUpgrade(args: string[], ctx: Ctx): Promise<number> {
     ctx.out(`writable:     ${no ? `no: ${no.dir} (${no.code})` : "yes"}`);
   }
   if (st.last) ctx.out(`last:         ${st.last.at} ${st.last.from} -> ${st.last.to}: ${st.last.outcome}${st.last.detail ? ` (${st.last.detail})` : ""}`);
+  if (st.probation) ctx.out(`probation:    ${st.probation.version} (${st.probation.runs.length} run(s) so far); ${st.probation.from} goes back if it does not stay connected`);
   if (st.failed) ctx.out(`failed here:  ${st.failed.version} (${st.failed.reason}); not tried again until a newer version is recommended`);
   if (status.by_hand && st.last?.outcome !== "upgraded") ctx.out(`by hand:      ${status.by_hand}`);
   return EXIT.ok;

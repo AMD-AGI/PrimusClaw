@@ -10,10 +10,12 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, test } from "node:test";
+import { spawn } from "node:child_process";
 import {
-  AutoUpgrader, autoUpgradeSetting, configSetting, installLayout, manualCommand, upgradeTarget, upgradeTiming, writeConfigSetting,
-  type Blocked, type Layout,
+  AutoUpgrader, autoUpgradeSetting, configSetting, installLayout, manualCommand, probationExited, probationForget, probationPassed, probationStart,
+  readAutoUpgradeSetting, readUpgradeState, upgradeTarget, upgradeTiming, writeConfigSetting, writeUpgradeState, type Blocked, type Layout, type StageResult,
 } from "../src/auto-upgrade.js";
+import { approvalSocketFile } from "../src/approvals.js";
 import { parseConfig } from "../src/config.js";
 import { resolveDirs } from "../src/paths.js";
 import { silentLogger, sleep } from "../src/util.js";
@@ -80,6 +82,27 @@ describe("whether it is on", () => {
     assert.equal(configSetting(again), true);
     assert.equal(again.match(/^auto_upgrade = /gm)?.length, 1, "changed in place, not added twice");
   });
+  test("agents.toml there but unreadable, or not parsing, or saying neither true nor false: off, never the default", async () => {
+    const dirs = resolveDirs({ CLAW_CONNECTOR_HOME: tmpdir() } as NodeJS.ProcessEnv);
+    fs.mkdirSync(dirs.config, { recursive: true });
+    const file = path.join(dirs.config, "agents.toml");
+    // A read that fails (here: it is a directory; on a machine: a network disk that does not answer in time).
+    fs.mkdirSync(file);
+    for (const s of [autoUpgradeSetting(dirs, {}), await readAutoUpgradeSetting(dirs, {})]) {
+      assert.equal(s.enabled, false);
+      assert.equal(s.source, "unreadable");
+    }
+    fs.rmdirSync(file);
+    for (const text of ["auto_upgrade = false\n[[agents\n", "auto_upgrade = \"no\"\n"]) {
+      fs.writeFileSync(file, text);
+      assert.deepEqual([autoUpgradeSetting(dirs, {}).enabled, autoUpgradeSetting(dirs, {}).source], [false, "unreadable"], text);
+      assert.equal((await readAutoUpgradeSetting(dirs, {})).source, "unreadable");
+    }
+    // The variable still decides where it is set.
+    assert.deepEqual(autoUpgradeSetting(dirs, { CLAW_CONNECTOR_AUTO_UPGRADE: "1" }), { enabled: true, source: "env" });
+    fs.rmSync(file);
+    assert.deepEqual(await readAutoUpgradeSetting(dirs, {}), { enabled: true, source: "default" });
+  });
   test("there is nothing to write without agents.toml", () => {
     const dirs = resolveDirs({ CLAW_CONNECTOR_HOME: tmpdir() } as NodeJS.ProcessEnv);
     assert.throws(() => writeConfigSetting(dirs, false), /claw-connector init/);
@@ -137,23 +160,38 @@ describe("where it is installed", () => {
 /** A layout that is never touched: the in-process tests stop at the decision to upgrade. */
 const LAYOUT: Layout = { pkgDir: "/nowhere/lib/node_modules/@primusclaw/connector", prefix: "/nowhere", cli: "/nowhere/cli.js", node: process.execPath, npm: ["npm"], npmShown: "npm" };
 
-async function upgrading(o: { env?: NodeJS.ProcessEnv; supervised?: boolean; blocked?: Blocked | null; topToml?: string; idleMs?: number; retryMs?: number } = {}) {
+async function upgrading(o: {
+  env?: NodeJS.ProcessEnv; supervised?: boolean; blocked?: Blocked | null; topToml?: string; idleMs?: number; retryMs?: number; attach?: boolean;
+  /** Runs while the preflight asks (npm view): a command may come meanwhile. */
+  duringPreflight?: (h: Harness) => Promise<void>;
+} = {}) {
   const home = tmpdir();
   const dirs = resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv);
   const preflights: string[] = [];
+  const stages: string[] = [];
+  let harness: Harness | null = null;
   const up = new AutoUpgrader({
     dirs, env: o.env ?? {}, version: "1.0.0", supervised: o.supervised ?? true, cli: "/nowhere/cli.js", node: process.execPath, log: silentLogger,
     timing: { ...upgradeTiming({}), checkMs: 30, idleMs: o.idleMs ?? 150, retryMs: o.retryMs ?? 200 },
     layout: async () => LAYOUT,
-    preflight: async (_l, target) => { preflights.push(target); return o.blocked ?? null; },
+    preflight: async (_l, target) => { preflights.push(target); if (o.duringPreflight && harness) await o.duringPreflight(harness); return o.blocked ?? null; },
+    stage: async (_l, target): Promise<StageResult> => {
+      stages.push(target);
+      const prefix = tmpdir();
+      const pkgDir = path.join(prefix, "pkg");
+      fs.mkdirSync(pkgDir);
+      fs.writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ version: target }));
+      return { staged: { version: target, prefix, pkgDir } };
+    },
   });
-  const h = await Harness.create({ home, upgrade: up, version: "1.0.0", start: false, topToml: o.topToml });
+  const h = await Harness.create({ home, upgrade: up, version: "1.0.0", start: false, topToml: o.topToml, ...(o.attach ? { attach: { sessions: [] } } : {}) });
+  harness = h;
   if (o.topToml) { fs.mkdirSync(dirs.config, { recursive: true }); fs.writeFileSync(path.join(dirs.config, "agents.toml"), o.topToml); }
   h.claw.connectorVersions = { minimum: "1.0.0", recommended: "1.0.1" };
   const ended = h.start();
   let result: string | null = null;
   void ended.then((r) => { result = r; });
-  return { h, up, ended, preflights, result: () => result };
+  return { h, up, ended, preflights, stages, result: () => result };
 }
 
 const capsOf = (hb: any) => hb.agents[0].capabilities;
@@ -231,10 +269,157 @@ describe("a running connector", () => {
     assert.equal(await h.stop(), "stopped");
   });
 
+  test("not while the command stream is down: a prompt Claw queued meanwhile would wait out the upgrade too", async () => {
+    const { h, ended, preflights, result } = await upgrading({ idleMs: 100, retryMs: 300 });
+    await h.online();
+    await h.claw.until("a heartbeat that says it waits for idle", () => h.claw.heartbeats.some((b) => capsOf(b).auto_upgrade?.state === "waiting_idle"));
+    h.claw.unavailable = 1_000_000;
+    h.claw.dropStreams();
+    await sleep(1500);
+    assert.equal(result(), null, "no upgrade while disconnected");
+    assert.deepEqual(preflights, []);
+    h.claw.unavailable = 0;
+    assert.equal(await ended, "upgrade");
+  });
+
+  test("not while a terminal's approval waits for an answer from the chat", async () => {
+    // Off until the card is there (so it does not upgrade before the terminal asks), then on.
+    const { h, ended, preflights, result } = await upgrading({ idleMs: 100, retryMs: 300, attach: true, topToml: "auto_upgrade = false\n" });
+    await h.online();
+    const sock = approvalSocketFile(h.dirs.state);
+    await h.claw.until("the approval socket", () => fs.existsSync(sock));
+    const hook = spawn(process.execPath, ["--import", "tsx", path.join(path.dirname(new URL(import.meta.url).pathname), "..", "src", "approval-hook.ts"),
+      "ask", "--dir", h.attachDir, "--socket", sock, "--managed-by", "claw-connector"], {
+      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SESSION_ATTENDED: "1", CLAW_APPROVAL_HOOKS: "" }, stdio: ["pipe", "pipe", "pipe"],
+    });
+    const exited = new Promise((res) => hook.on("exit", res));
+    const REF = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    hook.stdin.end(JSON.stringify({ session_id: REF, transcript_path: "/x/y.jsonl", cwd: h.work, permission_mode: "default", hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command: "ls" } }));
+    let herr = "";
+    hook.stderr.on("data", (c) => { herr += c; });
+    await h.claw.until("the terminal session to be opened", () => h.claw.terminalOpens.length === 1).catch((e) => { throw new Error(`${e.message}\n${herr}\n${JSON.stringify(h.audit().slice(-5))}`); });
+    const sid = h.claw.terminalSessions.get(REF)!;
+    const card = await h.permission(sid);
+    writeConfigSetting(h.dirs, true);
+    await sleep(1500);
+    assert.equal(result(), null, "no upgrade while the terminal waits for an answer");
+    assert.deepEqual(preflights, []);
+    h.decide(sid, String(card.data.actionId), "deny");
+    assert.equal(await exited, 0);
+    assert.equal(await ended, "upgrade");
+  });
+
+  test("a command that comes while it asks npm keeps it from ending the run; it upgrades after that turn", async () => {
+    let sid = "";
+    let gate = "";
+    const { h, ended, preflights, stages, result } = await upgrading({
+      idleMs: 50, retryMs: 300,
+      duringPreflight: async (hh) => {
+        if (sid) return;
+        sid = await hh.newSession();
+        gate = path.join(hh.work, "gate2");
+        hh.prompt(sid, `wait ${gate}`);
+        await hh.claw.until("the turn to be taken", () => !hh.connector.idleNow());
+      },
+    });
+    await h.online();
+    await h.claw.until("the preflight", () => preflights.length === 1);
+    await sleep(1000);
+    assert.equal(result(), null, "the run goes on: a turn started meanwhile");
+    assert.equal(stages.length, 1, "the download was made, and is kept for later");
+    fs.writeFileSync(gate, "");
+    await h.turnEnd(sid);
+    assert.equal(await ended, "upgrade");
+    assert.equal(stages.length, 1, "the same download is used");
+  });
+
+  test("a recommended version that is not a version is not taken, nor put into a command", async () => {
+    const { h, up, preflights, result } = await upgrading({ idleMs: 50, retryMs: 100 });
+    h.claw.connectorVersions = { minimum: "1.0.0", recommended: "1.0.1 && curl x | sh" };
+    await h.online();
+    await sleep(800);
+    assert.equal(result(), null);
+    assert.deepEqual(preflights, []);
+    const caps = up.report().caps;
+    assert.equal(caps.state, "current");
+    assert.equal(caps.command, undefined);
+    assert.equal(await h.stop(), "stopped");
+  });
+
+  test("agents.toml that cannot be read keeps it from upgrading", async () => {
+    const { h, preflights, result } = await upgrading({ idleMs: 50, retryMs: 100, topToml: "auto_upgrade = \"maybe\"\n" });
+    await h.online();
+    await h.claw.until("a heartbeat that says unreadable", () => h.claw.heartbeats.some((b) => capsOf(b).auto_upgrade?.state === "unreadable"));
+    await sleep(500);
+    assert.equal(result(), null);
+    assert.deepEqual(preflights, []);
+    assert.equal(await h.stop(), "stopped");
+  });
+
   test("a stop from outside is a stop, not an upgrade", async () => {
     const { h } = await upgrading({ idleMs: 60_000 });
     await h.online();
     assert.equal(await h.stop(), "stopped");
     assert.equal(h.connector.upgradeTarget, null);
+  });
+});
+
+describe("a new version on probation", () => {
+  /** A prefix with `to` in place and `from` in its backup, as `performUpgrade` leaves them. */
+  const placed = (from: string, to: string) => {
+    const dirs = resolveDirs({ CLAW_CONNECTOR_HOME: tmpdir() } as NodeJS.ProcessEnv);
+    const scope = path.join(tmpdir(), "lib", "node_modules", "@primusclaw");
+    const pkgDir = path.join(scope, "connector");
+    const backup = path.join(scope, `.connector-backup-${from}`);
+    for (const [d, v] of [[pkgDir, to], [backup, from]] as const) {
+      fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(d, "package.json"), JSON.stringify({ name: "@primusclaw/connector", version: v }));
+    }
+    writeUpgradeState(dirs, { last: { from, to, outcome: "upgraded", at: "x" }, probation: { version: to, from, pkg_dir: pkgDir, backup, owner: 1, runs: [], at: "x" } });
+    const installed = () => JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8")).version;
+    return { dirs, pkgDir, backup, installed };
+  };
+
+  test("runs that start and never prove it: the one after the third puts the old version back and pins the new one", () => {
+    const { dirs, backup, installed } = placed("1.0.0", "1.0.1");
+    assert.equal(probationStart(dirs, "1.0.1", 101, 3, silentLogger), "watch");
+    assert.equal(probationStart(dirs, "1.0.1", 102, 3, silentLogger), "watch");
+    assert.equal(probationStart(dirs, "1.0.1", 103, 3, silentLogger), "watch");
+    assert.equal(installed(), "1.0.1");
+    assert.equal(probationStart(dirs, "1.0.1", 104, 3, silentLogger), "rolled_back");
+    assert.equal(installed(), "1.0.0");
+    assert.ok(!fs.existsSync(backup), "the copy is what is in place now");
+    const st = readUpgradeState(dirs);
+    assert.equal(st.failed?.version, "1.0.1");
+    assert.equal(st.last?.outcome, "rolled_back");
+    assert.equal(st.probation, undefined);
+    assert.equal(upgradeTarget("1.0.0", { minimum: "1.0.0", recommended: "1.0.1" }, st.failed!.version).hasOwnProperty("skip"), true);
+  });
+
+  test("runs that end before they could count themselves are counted by the supervisor, once each", () => {
+    const { dirs, installed } = placed("1.0.0", "1.0.1");
+    assert.equal(probationExited(dirs, 1, 3, silentLogger), false, "the upgrading run's own end is not counted");
+    assert.equal(probationStart(dirs, "1.0.1", 201, 3, silentLogger), "watch");
+    assert.equal(probationExited(dirs, 201, 3, silentLogger), false, "counted once, when it started");
+    assert.equal(probationExited(dirs, 202, 3, silentLogger), false);
+    assert.equal(installed(), "1.0.1");
+    assert.equal(probationExited(dirs, 203, 3, silentLogger), true);
+    assert.equal(installed(), "1.0.0");
+    assert.equal(readUpgradeState(dirs).failed?.version, "1.0.1");
+  });
+
+  test("a run that stays connected ends the probation; a stop on purpose does not count; another version drops it", () => {
+    const a = placed("1.0.0", "1.0.1");
+    probationStart(a.dirs, "1.0.1", 301, 3, silentLogger);
+    probationForget(a.dirs, "1.0.1", 301);
+    assert.deepEqual(readUpgradeState(a.dirs).probation?.runs, []);
+    probationStart(a.dirs, "1.0.1", 302, 3, silentLogger);
+    probationPassed(a.dirs, "1.0.1", silentLogger);
+    assert.equal(readUpgradeState(a.dirs).probation, undefined);
+    for (const pid of [303, 304, 305, 306]) assert.equal(probationStart(a.dirs, "1.0.1", pid, 3, silentLogger), "none");
+    assert.equal(a.installed(), "1.0.1");
+    const b = placed("1.0.0", "1.0.1");
+    assert.equal(probationStart(b.dirs, "1.0.7", 401, 3, silentLogger), "none", "installed by hand meanwhile");
+    assert.equal(readUpgradeState(b.dirs).probation, undefined);
   });
 });

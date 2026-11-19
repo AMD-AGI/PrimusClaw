@@ -350,6 +350,11 @@ export class Connector {
   private readonly stopCtl = new AbortController();
   /** The version this run ended to upgrade to. */
   private upgradeTo: string | null = null;
+  /** The command stream is open (its `ready` came, and it has not ended since). */
+  private streamReady = false;
+  private onConnected: (() => void) | null = null;
+  /** Settles when the command stream first opens (a run of a version on probation proves itself by it). */
+  readonly connected = new Promise<void>((ok) => { this.onConnected = ok; });
   /** The last tick of the stall clock, monotonic and wall (`stallWatch`). */
   private tickMono = performance.now();
   private tickWall = Date.now();
@@ -495,7 +500,8 @@ export class Connector {
    * terminal message queued, no approval waiting (an agent's or a terminal's), no confirmation being asked, and not paused.
    */
   idleNow(): boolean {
-    return !this.paused && this.asking.size === 0 && this.manager.idleNow() && this.approvals.size === 0 && this.store.listTurns().length === 0;
+    // Connected too: a prompt Claw queued while the stream was down would wait out the upgrade on top of the outage.
+    return this.streamReady && !this.paused && this.asking.size === 0 && this.manager.idleNow() && this.approvals.size === 0 && this.store.listTurns().length === 0;
   }
   get isRevoked(): boolean { return this.revoked; }
 
@@ -1282,6 +1288,7 @@ export class Connector {
     let reconnect = false;
     let lastRestartAt = -Infinity;
     while (!this.ctl.signal.aborted) {
+      this.streamReady = false;
       if (this.paused) { await sleep(this.timing.pausePollMs, this.ctl.signal); continue; }
       this.streamCtl = new AbortController();
       this.streamAskedAt = performance.now();
@@ -1293,13 +1300,14 @@ export class Connector {
         for await (const f of this.d.client.commands(this.cid, { lastEventId: this.ledger.highestSeen || undefined, signal: sig, watchdogMs: this.timing.watchdogMs })) {
           if (!got) { got = true; attempt = 0; this.authFailures = 0; }
           this.onFrame(f, reconnect);
-          if (f.event === "ready") reconnect = true;
+          if (f.event === "ready") { reconnect = true; this.streamReady = true; this.onConnected?.(); }
           // The Claw replica serving this stream is shutting down (a release): leave it now, without waiting for the
           // end of the response (which a gateway may hold) or a backoff, and open the stream on another replica.
           if (f.event === "reconnect") { restart = true; break; }
         }
         // The server ended the stream on purpose: a Claw release or restart, another run of this connector
         // (`superseded`), or an access token that ran out (`token_expired`). Said once, so a log shows why.
+        this.streamReady = false;
         if (!this.ctl.signal.aborted && !this.paused) {
           const why = restart ? "restart" : this.lastFrame === "superseded" || this.lastFrame === "token_expired" ? this.lastFrame : "the server closed the stream (a Claw release or restart)";
           this.d.log.info("command stream ended by the server; reconnecting", { why });
@@ -1329,6 +1337,7 @@ export class Connector {
         }
         this.d.log.warn("command stream lost; reconnecting", { error: errMessage(e), attempt });
       }
+      this.streamReady = false;
       if (this.ctl.signal.aborted) break;
       if (this.paused) continue;
       await sleep(backoffMs(attempt++, this.timing.backoffMinMs, this.timing.backoffMaxMs), this.ctl.signal);

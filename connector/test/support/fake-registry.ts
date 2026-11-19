@@ -19,6 +19,8 @@ export class FakeRegistry {
   private readonly packages = new Map<string, Map<string, Entry>>();
   /** Every request, as `METHOD path`. */
   readonly requests: string[] = [];
+  /** Tarballs (`name@version`) whose download waits until `release` (a slow network, to stop a connector half way). */
+  private readonly held = new Map<string, Array<() => void>>();
 
   static async start(): Promise<FakeRegistry> {
     const r = new FakeRegistry();
@@ -41,6 +43,15 @@ export class FakeRegistry {
     this.packages.set(manifest.name, versions);
   }
 
+  /** Hold the downloads of `name@version` until `release`. */
+  hold(name: string, version: string): void { this.held.set(`${name}@${version}`, []); }
+
+  release(name: string, version: string): void {
+    const waiting = this.held.get(`${name}@${version}`) ?? [];
+    this.held.delete(`${name}@${version}`);
+    for (const f of waiting) f();
+  }
+
   /** How many times the tarball of `name@version` was downloaded. */
   downloads(name: string, version: string): number {
     return this.requests.filter((r) => r === `GET ${this.tarballPath(name, version)}`).length;
@@ -57,8 +68,9 @@ export class FakeRegistry {
     if (t) {
       const e = this.packages.get(decodeURIComponent(t[1]!))?.get(t[2]!);
       if (!e) return this.send(res, 404, { error: "not_found" });
-      res.writeHead(200, { "content-type": "application/octet-stream" });
-      fs.createReadStream(e.file).pipe(res);
+      const serve = () => { res.writeHead(200, { "content-type": "application/octet-stream" }); fs.createReadStream(e.file).pipe(res); };
+      const waiting = this.held.get(`${decodeURIComponent(t[1]!)}@${t[2]!}`);
+      if (waiting) waiting.push(serve); else serve();
       return;
     }
     const name = decodeURIComponent(p.slice(1));

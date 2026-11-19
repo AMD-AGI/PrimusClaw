@@ -485,13 +485,16 @@ reads `connector_version.recommended_version` and `minimum_version` from the hea
 supervisor (`run --supervised`) and its owner did not turn it off (`auto_upgrade = false` in `agents.toml`,
 `claw-connector auto-upgrade off`, `CLAW_CONNECTOR_AUTO_UPGRADE=0`), upgrades itself to exactly that version: never down,
 never to a prerelease or a new major version, and below 1.0.0 to a new minor version only when the server's minimum is in
-the connector's own minor line or below it. It does so only while no turn runs, nothing is queued and no approval waits
-(for a minute; otherwise it looks again 15 minutes later), with the npm beside the node that runs it, into the prefix it
-was installed under, keeping the old package directory; the new version must report its version and connect (a trial run:
-one identify and heartbeat) within 60 seconds, else after three tries the old version is put back and that version is not
-tried again until a newer one is recommended. Every agent's `capabilities.auto_upgrade` says where it stands:
+the connector's own minor line or below it. It does so only while its command stream is open, no turn runs, nothing is queued and no approval waits
+(for a minute; otherwise it looks again 15 minutes later), and never while `agents.toml` cannot be read. It downloads the
+version first, while still connected, with the npm beside the node that runs it, into a directory beside the package in the
+prefix it was installed under, then moves it in and keeps the old package directory; the new version must report its version
+and connect (a trial run: one identify and heartbeat) within 60 seconds, else after three tries the old version is put back
+and that version is not tried again until a newer one is recommended. After that the new version is on probation until one
+of its real runs has stayed connected for a minute: three runs of it that end with a failure first (or do not connect
+within 60 seconds) put the old version back and pin the new one as failed the same way. Every agent's `capabilities.auto_upgrade` says where it stands:
 `{enabled, state, target?, last?: {from, to, outcome, at}, failed_version?, reason?, command?}`, `state` one of `current`,
-`waiting_idle`, `upgrading`, `blocked` (it cannot here: no npm, a prefix this user may not write, a registry that does not
+`waiting_idle`, `upgrading`, `unreadable` (`agents.toml` or its own state could not be read; it does not upgrade), `blocked` (it cannot here: no npm, a prefix this user may not write, a registry that does not
 answer; nothing was changed), `failed`, `off`, `unsupervised`, `unmanaged` (not a global npm install) or `manual` (a step it
 does not take by itself); `command` is the command that upgrades that machine by hand, with its own npm, prefix and
 program. While it is `blocked` or `failed` the machine's health has `connector_upgrade_blocked` or
