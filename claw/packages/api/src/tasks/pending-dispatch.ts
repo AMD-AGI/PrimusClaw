@@ -267,7 +267,7 @@ export async function publishRefusedTurn(
    * Where an earlier, partly published attempt at this same refusal got to.
    * Without it the refusal is published whole, which is right for a caller
    * that tries once; a caller that retries passes it so a retry after a
-   * partial publish sends only what is still missing, never a second copy.
+   * partial publish sends only what is still missing.
    */
   progress?: RefusedTurnProgress,
 ): Promise<void> {
@@ -320,7 +320,10 @@ export async function publishRefusedTurn(
  * minutes later resumes after them. A publish that reached the stream and then
  * failed to acknowledge, or whose count could not be recorded, is not in that
  * count; `dedupeKey` names every event, so the stream drops that one event's
- * second copy when the retry comes inside its duplicate window.
+ * second copy when the retry comes inside its duplicate window. A caller that
+ * retries keeps its retries inside that window (the event stream's is set by
+ * `EVENT_STREAM_DUPLICATE_WINDOW_MS`); after it the id is no longer known and a
+ * second copy would be stored.
  */
 export interface RefusedTurnProgress {
   /** Events of this refusal already published, in order: 0 to 3. */

@@ -51,7 +51,7 @@ import { dispatchPendingMessage } from "../tasks/pending-dispatch.js";
 import {
   CREDENTIALS_UNREADABLE, quarantineUnsendablePending, recordPendingDrainFailure,
 } from "../tasks/pending-quarantine.js";
-import { applySealedCredentials } from "../tasks/run-secrets.js";
+import { applySealedCredentials, RunCredentialFault } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
 import { redactStoredValue } from "@claw/utils";
 import pino from "pino";
@@ -868,15 +868,23 @@ async function turnOfChatRow(sessionId: string, taskId: string): Promise<string 
 /**
  * Put the pending row's sealed credentials on the task, or end that turn.
  *
- * A blob that will not open is permanent for the row that carries it, and the
- * throw used to escape `handleComplete`: the event was naked with
- * `processed_at` still null and redelivered every ten seconds, failing
- * identically, so one unreadable row wedged the drain for every session behind
- * it. No retry can make the ciphertext readable, so the row is quarantined at
- * once (tasks/pending-quarantine.ts): it leaves the queue, is counted, and the
+ * The throw used to escape `handleComplete` with nothing to bound it: the event
+ * was naked with `processed_at` still null and redelivered every ten seconds,
+ * failing identically, so one unreadable row wedged the drain for every session
+ * behind it.
+ *
+ * A blob no replica can open (`RunCredentialFault.permanent`: too short to be
+ * sealed, or opened to something that is not our JSON) is quarantined at once
+ * (tasks/pending-quarantine.ts): it leaves the queue, is counted, and the
  * reader is told -- once, and by the sweeper if the notice cannot be published
  * now. A row that cannot be moved is a failed drain like any other, raised to
  * be counted on the row and retried.
+ *
+ * Any other failure to open it -- a tag that does not authenticate, a key not
+ * loaded -- is also what a replica with a stale or missing key sees while the
+ * other replicas open the same blob, so it is raised as a failed drain: counted
+ * on the row, retried by whichever replica drains next, and quarantined only
+ * once it has had its attempts.
  *
  * @returns whether the task is safe to dispatch.
  */
@@ -889,7 +897,12 @@ export async function applyPendingCredentials(
     applySealedCredentials(task, pending.credentials_blob);
     return true;
   } catch (err) {
-    logger.error({ err, sessionId: who.sessionId, pendingId: pending.id }, "pending.credentials_unreadable");
+    const permanent = err instanceof RunCredentialFault && err.permanent;
+    logger.error(
+      { err, sessionId: who.sessionId, pendingId: pending.id, permanent },
+      "pending.credentials_unreadable",
+    );
+    if (!permanent) throw err;
     await quarantineUnsendablePending({
       sessionId: who.sessionId,
       pendingId: Number(pending.id),

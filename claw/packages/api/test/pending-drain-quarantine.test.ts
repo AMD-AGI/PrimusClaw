@@ -33,6 +33,10 @@
  *      counted at once, even when its notice cannot be published, and the
  *      message behind it is sent
  *   Q11 one whose move the database refuses is a counted, retried drain failure
+ *   Q12 one sealed under a key this replica does not hold is retried within its
+ *       bounds, not quarantined at once, and the replica that holds the key sends it
+ *   Q13 a notice still unsent past the retry horizon is given up on, never
+ *       published after the event stream has forgotten its ids
  *
  * Skipped without DATABASE_URL, and a skip is not a pass: CI sets it.
  */
@@ -589,5 +593,126 @@ describe("a queued message that cannot be sent", { skip }, () => {
     assert.equal(await counter("claw_api_pending_quarantined_total") - quarantinedBefore, 1);
     assert.equal(await counter("claw_api_pending_drain_failures_total") - failuresBefore, 2, "one per attempt");
     assert.equal(notices().length, 1);
+  });
+
+  /** Seal credentials under another key, as a replica holding a different key wrote them, and load ours back. */
+  async function sealedUnder(key: string, creds: { llm_api_key: string; platform_key: string }): Promise<string> {
+    const crypto = await import("../src/crypto/user-env.js");
+    const ours = process.env.USER_ENV_ENCRYPTION_KEY;
+    try {
+      process.env.USER_ENV_ENCRYPTION_KEY = key;
+      crypto.initUserEnvCrypto();
+      return secrets.sealRunCredentials(creds);
+    } finally {
+      process.env.USER_ENV_ENCRYPTION_KEY = ours;
+      crypto.initUserEnvCrypto();
+    }
+  }
+
+  /** Run `fn` as the replica that holds `key`. */
+  async function asReplicaWith<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const crypto = await import("../src/crypto/user-env.js");
+    const ours = process.env.USER_ENV_ENCRYPTION_KEY;
+    try {
+      process.env.USER_ENV_ENCRYPTION_KEY = key;
+      crypto.initUserEnvCrypto();
+      return await fn();
+    } finally {
+      process.env.USER_ENV_ENCRYPTION_KEY = ours;
+      crypto.initUserEnvCrypto();
+    }
+  }
+
+  test("Q12 credentials another key opens are retried within their bounds, and the replica with the key sends them", async () => {
+    const otherKey = Buffer.alloc(32, 9).toString("base64");
+    const blob = await sealedUnder(otherKey, { llm_api_key: "vk-other-replica", platform_key: "pk-other-replica" });
+    const headId = await enqueue("sealed by the other key");
+    await rows("UPDATE claw_pending_messages SET credentials_blob = $2 WHERE id = $1", [headId, blob]);
+    await enqueue("the message behind it");
+    const quarantinedBefore = await counter("claw_api_pending_quarantined_total");
+
+    // This replica's key does not authenticate the blob. That is also what a
+    // replica with a stale key sees, so the row is not moved on it.
+    const delivered = await completeRunningTurn();
+    assert.equal(delivered.naks, 1, "a failed drain, retried as any other");
+    let q = await queue();
+    assert.equal(q[0].id, headId, "still at the head");
+    assert.equal(q[0].drain_failures, 1, "and counted");
+    assert.match(q[0].drain_last_error, /RunCredentialFault/);
+    assert.equal((await rows("SELECT 1 FROM claw_pending_messages_quarantine")).length, 0, "not quarantined on one replica's say");
+    assert.equal(events.length, 0, "and nobody is told it was refused");
+    assert.equal(await counter("claw_api_pending_quarantined_total") - quarantinedBefore, 0);
+
+    // The replica that holds the key drains it next, and it is sent with the keys it was sealed with.
+    await asReplicaWith(otherKey, () => sweep());
+    q = await queue();
+    assert.deepEqual(q.map((r) => r.content), ["the message behind it"]);
+    assert.deepEqual(prompts(), ["sealed by the other key"]);
+    assert.equal(published[0].llm_api_key, "vk-other-replica");
+    assert.equal(published[0].platform_key, "pk-other-replica");
+    assert.equal(notices().length, 0);
+  });
+
+  test("Q12b credentials no replica opens on any attempt are quarantined past their bounds, as unreadable", async () => {
+    const blob = await sealedUnder(Buffer.alloc(32, 11).toString("base64"), { llm_api_key: "k", platform_key: "p" });
+    const headId = await enqueue("sealed by a key that is gone");
+    await rows("UPDATE claw_pending_messages SET credentials_blob = $2 WHERE id = $1", [headId, blob]);
+    await enqueue("the message behind it");
+    await completeRunningTurn();
+    await sweep();
+    await sweep();
+    assert.equal((await queue())[0].id, headId, "three failures inside the window are still retries");
+    await windowPasses(headId);
+    await sweep();
+    assert.deepEqual(prompts(), ["the message behind it"]);
+    const [held] = await rows("SELECT failure_reason, attempts, notified_at FROM claw_pending_messages_quarantine WHERE id = $1", [headId]);
+    assert.equal(held.failure_reason, "credentials_unreadable");
+    assert.equal(held.attempts, 4);
+    assert.ok(held.notified_at);
+    assert.equal(notices().length, 1);
+    assert.equal(notices()[0].failure_reason, "credentials_unreadable");
+  });
+
+  /** Quarantine a poison whose notice could not be published, and age the quarantine by `ageSec`. */
+  async function unsentNoticeAged(ageSec: number): Promise<number> {
+    eventsDown = true;
+    const poisonId = await quarantinePoison();
+    eventsDown = false;
+    const [held] = await rows("SELECT notified_at, notice_events FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
+    assert.equal(held.notified_at, null);
+    assert.equal(held.notice_events, 0);
+    await rows(
+      "UPDATE claw_pending_messages_quarantine SET quarantined_at = NOW() - make_interval(secs => $2) WHERE id = $1",
+      [poisonId, ageSec],
+    );
+    return poisonId;
+  }
+
+  test("Q13 a notice is retried up to the horizon, which the stream's duplicate window covers twice over", async () => {
+    assert.ok(quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC >= 10 * 60, "ten attempts a minute apart fit inside it");
+    assert.ok(
+      quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC * 1000 <= nats.EVENT_STREAM_DUPLICATE_WINDOW_MS / 2,
+      "the horizon leaves half the stream's duplicate window for a slow publish",
+    );
+    const poisonId = await unsentNoticeAged(quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC - 30);
+    assert.equal(await quarantine.retryQuarantineNotices(), 1);
+    assert.equal(notices().length, 1);
+    const [held] = await rows("SELECT notified_at FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
+    assert.ok(held.notified_at);
+  });
+
+  test("Q13b a notice still unsent past the horizon is given up on, never published", async () => {
+    // The event stream may have forgotten the ids an earlier attempt stored
+    // under, so a retry now could tell the user twice.
+    const poisonId = await unsentNoticeAged(quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC + 30);
+    assert.equal(await quarantine.retryQuarantineNotices(), 0);
+    assert.equal(notices().length, 0, "nothing is published past the horizon");
+    assert.equal(events.length, 0);
+    const [held] = await rows("SELECT notified_at, notice_attempts FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
+    assert.equal(held.notified_at, null);
+    assert.equal(held.notice_attempts, 10, "marked given up on, so no later sweep picks it up");
+    await rows("UPDATE claw_pending_messages_quarantine SET notice_claimed_at = NULL");
+    assert.equal(await quarantine.retryQuarantineNotices(), 0);
+    assert.equal(events.length, 0);
   });
 });

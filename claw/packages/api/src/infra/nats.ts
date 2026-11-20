@@ -133,6 +133,22 @@ const SYSTEM_ENV_TTL_MS = 0;
  */
 export const EVENT_STREAM_RETENTION_MS = 24 * 3600 * 1000;
 
+/**
+ * The shortest duplicate window the event stream is allowed to have.
+ *
+ * Almost every event is published without a deduplication id, and an event
+ * without one is never tracked, so this costs nothing for them. The ones that
+ * carry an id are the notices of a quarantined queued message
+ * (tasks/pending-quarantine.ts), which are retried for minutes: a publish that
+ * reached the stream and lost its acknowledgement is published again under the
+ * same id, and only a window that still remembers the first copy drops the
+ * second. NATS's default window is two minutes, shorter than that retry span,
+ * so the notice retry stops well inside this window
+ * (`QUARANTINE_NOTICE_RETRY_HORIZON_SEC`), never after it. Like the retention
+ * it is a lower bound: `ensureStream` widens a narrower window and keeps a wider one.
+ */
+export const EVENT_STREAM_DUPLICATE_WINDOW_MS = 60 * 60 * 1000;
+
 /** What the event stream keeps, and whether the server said so. */
 export interface EventStreamRetention {
   /** Milliseconds, or `null` when the stream never expires. */
@@ -321,7 +337,7 @@ export async function initNats(): Promise<void> {
 
   await ensureStream(
     jsm, EVENT_STREAM, ["events.>"], EVENT_STREAM_RETENTION_MS * 1_000_000,
-    0, EVENT_STREAM_REPLICAS,
+    EVENT_STREAM_DUPLICATE_WINDOW_MS * 1_000_000, EVENT_STREAM_REPLICAS,
   );
   // Read back here, ahead of the bucket that is sized from it, because no later
   // start corrects a bucket sized from the constant instead. What would be wrong

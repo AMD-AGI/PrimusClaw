@@ -169,8 +169,15 @@ release version, and its `appVersion` stays `latest`.
   (default 5) over at least `PENDING_DRAIN_FAILURE_WINDOW_SEC` (default 600) is moved to the new
   `claw_pending_messages_quarantine` table, with its text, sender and last error, and the next message is sent at once.
   The session is told once, in the turn the message would have been, that it was not sent and can be sent again; a
-  notice that cannot be published then is retried by the sweeper. A message whose run may still be delivered is never
-  moved. Quarantined messages are kept for `PENDING_QUARANTINE_RETENTION_DAYS` (default 30) and are deleted with their
+  notice that cannot be published then is retried by the sweeper for up to 30 minutes, and given up on (logged as
+  `pending.quarantine_notice_abandoned`) after that. Each event of the notice is published under a stable id, and the
+  event stream's duplicate window is widened at start-up from the server's default of two minutes to one hour, so a
+  retry after a publish whose acknowledgement was lost does not show the user the notice twice. A message whose run may
+  still be delivered is never moved. A queued message whose sealed credentials are too short to be sealed, or open to
+  something that is not the credentials written, is quarantined at once (`credentials_unreadable`); one whose
+  credentials fail to authenticate under this replica's key, which a replica with a stale key sees while the others
+  open them, is retried like any other failure and quarantined only once it has had its attempts. Until now any such
+  failure refused and deleted the message on the first replica that could not open it. Quarantined messages are kept for `PENDING_QUARANTINE_RETENTION_DAYS` (default 30) and are deleted with their
   session. The log line (`pending.drain_quarantined`) names the message and the error, never the text. New metrics:
   `claw_api_pending_drain_failures_total`, `claw_api_pending_quarantined_total`,
   `claw_api_pending_messages_consecutive_failures` (the longest failing streak of any queued message) and
