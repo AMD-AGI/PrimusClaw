@@ -13,6 +13,7 @@
  */
 
 import pino from "pino";
+import { redactSecrets } from "@claw/utils";
 import {
   SAFE_API_URL,
   SANDBOX_DEFAULT_TIMEOUT_SECONDS,
@@ -29,6 +30,9 @@ import {
   classifyWorkloadTerminalReason,
   workloadDisrupted,
   SANDBOX_WORKSPACE_FORBIDDEN,
+  SANDBOX_REJECTED,
+  platformErrorText,
+  sandboxRejectedText,
   SandboxExecRouteUnavailableError,
   SandboxProvisionTerminalError,
   sandboxWorkspaceForbiddenText,
@@ -36,6 +40,7 @@ import {
   SandboxRuntimeTerminalError,
   SandboxStopUnavailable,
   assertSandboxWorkspaceAllowed,
+  oneLineText,
 } from "./errors.js";
 import { resourcesMapToWorkloadArray } from "./params.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
@@ -136,6 +141,65 @@ export function capacityWaitTimeoutMs(
   return pendingTimeoutMs > 0 ? Math.min(pendingTimeoutMs, fromRequestMs) : fromRequestMs;
 }
 
+/**
+ * Whether a non-2xx answer to a workload create is the platform refusing the
+ * request (terminal: the same request is refused again) rather than a failure a
+ * later try can get past. Every 4xx but those that mean "later" (408 timeout,
+ * 425 too early, 429 rate limited) and 403, which has its own ending
+ * (SANDBOX_WORKSPACE_FORBIDDEN). A 5xx is the platform failing, not refusing.
+ */
+export function createRefused(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 403 && status !== 408 && status !== 425 && status !== 429;
+}
+
+/**
+ * The values a workload create sent that may be credentials, for masking what the
+ * platform says back: the platform key and every env value. `redactSecrets` skips
+ * the short ones, so a flag or a path does not blank out the platform's text.
+ *
+ * Each value in every spelling the platform's answer may carry it in, longest
+ * first so a whole value is masked before any piece of it: as sent; escaped as a
+ * JSON string carries it (a PEM key's line breaks become `\n`); folded onto one
+ * line (`oneLineText`); and, for a multi-line value, each of its lines, since an
+ * answer that quotes part of the value quotes it a line at a time. Every JSON
+ * spelling also comes as Go's `json.Marshal` writes it (the platform is a Go
+ * service): `&`, `<`, `>`, U+2028 and U+2029 as `\u` escapes, so a URL's `&sig=`
+ * is matched in the body the platform actually sends.
+ */
+export function requestSecrets(apiKey: string, env: Record<string, unknown> | undefined): string[] {
+  const values = apiKey ? [apiKey] : [];
+  for (const value of Object.values(env ?? {})) {
+    if (typeof value === "string" && value) values.push(value);
+  }
+  const forms = new Set<string>();
+  const addJson = (text: string) => {
+    const json = JSON.stringify(text).slice(1, -1);
+    forms.add(json);
+    forms.add(goJsonEscaped(json));
+  };
+  for (const value of values) {
+    forms.add(value);
+    addJson(value);
+    forms.add(oneLineText(value, Number.MAX_SAFE_INTEGER));
+    if (/[\r\n]/.test(value)) {
+      for (const line of value.split(/\r?\n|\r/)) {
+        const piece = line.trim();
+        forms.add(piece);
+        addJson(piece);
+      }
+    }
+  }
+  return [...forms].filter((form) => form.length > 0).sort((a, b) => b.length - a.length);
+}
+
+/** A JSON string's body as Go's `json.Marshal` writes it: HTML-safe, and with U+2028/U+2029 escaped. */
+function goJsonEscaped(json: string): string {
+  return json.replace(/[&<>\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/** The longest answer to a refused create that is read; it is masked whole, then cut for display. */
+const CREATE_ERROR_BODY_LIMIT = 1 << 20;
+
 export class SafeWorkloadProvider implements SandboxProvider {
   readonly kind = "safe-workload" as const;
 
@@ -170,13 +234,38 @@ export class SafeWorkloadProvider implements SandboxProvider {
         : {}),
     };
 
+    if (params.timeoutSec !== undefined && timeout !== params.timeoutSec + SHUTDOWN_BUFFER_SECONDS) {
+      // The deployment's ceiling cut the padded deadline: say so where it happens,
+      // since nothing the caller reads shows the number that was sent.
+      logger.warn(
+        { requestedSec: params.timeoutSec, sentSec: timeout, ceilingSec: AGENT_SANDBOX_MAX_SESSION_SECONDS },
+        "safe-workload.timeout_capped",
+      );
+    }
+
     const resp = await fetch(`${SAFE_API_URL}/api/v1/workloads`, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify(workloadBody),
+    }).catch((err: unknown) => {
+      // Named for the classifier (`classifySandboxFailure`): a create that never
+      // reached the platform is a create that failed, and is retried as one.
+      throw new Error(`Create Hands failed: platform unreachable: ${String((err as Error)?.message ?? err).slice(0, 200)}`, { cause: err });
     });
     if (!resp.ok) {
-      const errBody = (await resp.text()).slice(0, 300);
+      // Masked before it goes anywhere: the body is echoed into the run's failure,
+      // which the caller, the session's events and a notification all carry.
+      const rawBody = (await resp.text().catch(() => "")).slice(0, CREATE_ERROR_BODY_LIMIT);
+      // Everything this request carried that may be a credential: the platform key
+      // and every value the sandbox's env was given (a caller's own credential sits
+      // there under any name). A platform that echoes the request back -- into this
+      // body, and so into the logs below and the run's failure -- has them masked.
+      // Masked whole and before the text is folded or cut, never after: a cut
+      // through a credential leaves a prefix no later mask matches, and a
+      // multi-line one folded onto a line no longer matches the value sent.
+      const sent = requestSecrets(apiKey, params.env);
+      const mask = (text: string): string => redactSecrets(text, sent).text;
+      const errBody = oneLineText(mask(rawBody), 300);
       if (resp.status === 403) {
         // The account may not create workloads here. Retrying cannot change
         // that, and SaFE's body names the user id and an internal error code,
@@ -187,11 +276,26 @@ export class SafeWorkloadProvider implements SandboxProvider {
           sandboxWorkspaceForbiddenText(ns, !!SANDBOX_CPU_NAMESPACE && ns === SANDBOX_CPU_NAMESPACE.trim()),
         );
       }
+      if (createRefused(resp.status)) {
+        // The platform refused this request -- an admission webhook (SaFE's QoS
+        // ceiling on `timeout`), a validation error. Nothing was created and the
+        // same request is refused again, so this is terminal for the run and is
+        // reported with the platform's own words.
+        const platformText = platformErrorText(rawBody, mask);
+        const message = sandboxRejectedText(resp.status, platformText, {
+          requestedSec: params.timeoutSec, sentSec: timeout, bufferSec: SHUTDOWN_BUFFER_SECONDS,
+        });
+        logger.warn({ status: resp.status, workspace: ns, body: errBody, timeout }, "safe-workload.create_rejected");
+        await params.onEvent?.({
+          type: "sandboxStatus", event: "phase", phase: "Rejected", status: "failed", reason: SANDBOX_REJECTED, message,
+        }).catch(() => {});
+        throw new SandboxProvisionTerminalError(SANDBOX_REJECTED, message);
+      }
       throw new Error(`Create Hands failed: HTTP ${resp.status} ${errBody}`);
     }
     const result = (await resp.json()) as Record<string, unknown>;
     const workloadId = (result.workloadId as string) || "";
-    if (!workloadId) throw new Error(`No workloadId returned: ${JSON.stringify(result)}`);
+    if (!workloadId) throw new Error(`Create Hands failed: no workloadId returned: ${JSON.stringify(result).slice(0, 300)}`);
     logger.info({ workloadId, capacityWaitSec: Math.round(capacityWaitMs / 1000) }, "safe-workload.created");
 
     // Two-phase pending hook: caller records a pending KV entry (+ rollback on

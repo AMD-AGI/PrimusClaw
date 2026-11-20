@@ -171,6 +171,24 @@ describe("notification outbox", { skip }, () => {
       assert.ok(!p.summary.includes("abcdef123456"), "the bearer token must be redacted");
     });
 
+    test("a failure with what it failed with says the code, then that, redacted and clipped", async () => {
+      await subscribe();
+      await seedRun({ sid: "s1", tid: "t1", trigger: "trg", seconds: 3 });
+      await seedRun({ sid: "s2", tid: "t2", trigger: "trg", seconds: 3 });
+      await outbox.recordRunFinished({
+        sessionId: "s1", taskIds: ["t1"], outcome: "failed", failureReason: "sandbox_rejected",
+        failureMessage: "The platform refused to create the sandbox (HTTP 400): timeout 64800 exceeds the qos limit "
+          + "of 10800 seconds for scope Sandbox Bearer abcdef123456 " + "x".repeat(900),
+      });
+      await outbox.recordRunFinished({ sessionId: "s2", taskIds: ["t2"], outcome: "failed", failureReason: "agent_error" });
+      const byTask = new Map((await rows()).map((r) => [r.payload.task_id, r.payload]));
+      const p = byTask.get("t1");
+      assert.ok(p.summary.startsWith("sandbox_rejected: The platform refused to create the sandbox (HTTP 400): timeout 64800"), p.summary);
+      assert.ok(p.summary.length <= 500, String(p.summary.length));
+      assert.ok(!p.summary.includes("abcdef123456"), "the bearer token must be redacted");
+      assert.equal(byTask.get("t2").summary, "agent_error", "a failure with no message says its code, as before");
+    });
+
     test("only the run's owner's subscriptions receive it, and a source filter is honoured", async () => {
       await subscribe("u1");
       await subscribe("u2");

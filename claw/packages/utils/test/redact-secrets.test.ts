@@ -436,3 +436,13 @@ test("the marker allowance keeps the URL-credential pass linear on a diff of lon
     assert.ok(ms < 1000, `${label}: ${ms} ms`);
   }
 });
+
+test("an exact secret is masked whole even when a pattern matches part of it", () => {
+  // Masked by pattern first, the hex token went and the password beside it stayed;
+  // the URL's `user:pass@` went and its host and database stayed.
+  const blob = JSON.stringify({ token: "0123456789abcdef".repeat(4), password: "Zz9Yy8Xx7Ww6Vv5Uu4Tt" });
+  const dsn = "postgres://svc:pw@db.internal/team";
+  const r = redactSecrets(`env CFG=${blob} DB_URL=${dsn}`, [blob, dsn]);
+  assert.equal(r.text, "env CFG=<redacted> DB_URL=<redacted>");
+  assert.equal(r.hits, 2);
+});
