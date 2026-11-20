@@ -232,6 +232,37 @@ for (const [name, cred] of [["a PEM key", PEM], ["a value of short lines", SHORT
   }
 });
 
+test("a credential echoed in Go's HTML-safe JSON, or with a piece a pattern knows, leaves no part of it in the failure or the log", async () => {
+  // Shaped like what a caller puts in a sandbox's env; each made up here.
+  const env = {
+    // A signed URL: Go's json.Marshal writes its `&` as `\u0026`.
+    BLOB_URL: "https://store.example/blob?sv=2024&sig=Qw7ErTy9UiOp3AsDf6Gh&se=2026",
+    // A hex token beside a password: masking the token by pattern first left the password whole.
+    CFG: JSON.stringify({ token: "0123456789abcdef".repeat(4), password: "Zz9Yy8Xx7Ww6Vv5Uu4Tt" }),
+    // A URL's `user:pass@` is masked by pattern; the host and database are the value's too.
+    DB_URL: "postgres://svc:pw@db.internal/team",
+  };
+  const withEnv = { ...params(61_200), env };
+  // As a Go server writes its error body: json.Marshal's escaping, then `&`, `<`, `>` as `\u` escapes.
+  const goJson = (o: unknown) => JSON.stringify(o).replace(/[&<>]/g, (c) => `\\u00${c.charCodeAt(0).toString(16)}`);
+  for (const status of [400, 500]) {
+    for (const [name, value] of Object.entries(env)) {
+      answer(status, goJson({ errorCode: "Primus.00001", errorMessage: `error creating workload: env ${name}=${value}` }));
+      let err: Error | null = null;
+      const logs = await logsOf(async () => {
+        err = await new SafeWorkloadProvider().create(withEnv).then(() => null, (e: unknown) => e as Error);
+      });
+      const message = (err as unknown as Error).message;
+      for (const [what, text] of [["failure", message], ["log", logs]] as const) {
+        for (const spelling of [value, JSON.stringify(value).slice(1, -1)]) {
+          assert.equal(leaksPartOf(text, spelling), null, `${status} ${name} ${what}: ${text}`);
+        }
+      }
+      assert.ok(message.includes(`${name}=<redacted>`), `${status} ${name}: ${message}`);
+    }
+  }
+});
+
 test("a 5xx body on several lines is folded onto one", async () => {
   answer(502, "<html>\r\n<h1>Bad Gateway</h1>\n\tupstream reset\n</html>");
   const err = await new SafeWorkloadProvider().create(params(600)).then(() => null, (e: unknown) => e) as Error;

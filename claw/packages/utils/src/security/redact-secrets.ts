@@ -448,12 +448,27 @@ export interface RedactResult {
  *
  * Pass `extraSecrets` (e.g. the run's internal_token) to also redact the exact
  * value — useful when the caller knows its own credential and wants to defend
- * against unconventional formats the regex catalogue missed.
+ * against unconventional formats the regex catalogue missed. They are masked
+ * before the patterns run, so a pattern matching part of one cannot leave the
+ * rest of it in the text.
  */
 export function redactSecrets(text: string, extraSecrets: string[] = []): RedactResult {
   if (!text) return { text: "", hits: 0 };
   let hits = 0;
   let out = text;
+  // The exact values first: a pattern below that rewrites one piece of a known
+  // value (a hex token inside a JSON blob, a URL's `user:pass@`) leaves the rest
+  // of it unmatchable, and the rest -- another field, the host -- goes out as is.
+  for (const secret of extraSecrets) {
+    if (!secret || secret.length < 16) continue;
+    // Use string-replace with global semantics; avoid regex special-char issues.
+    let from = 0;
+    while ((from = out.indexOf(secret, from)) !== -1) {
+      hits += 1;
+      out = out.slice(0, from) + "<redacted>" + out.slice(from + secret.length);
+      from += "<redacted>".length;
+    }
+  }
   out = out.replace(TOKEN_LITERAL_RE, (_, prefix) => {
     hits += 1;
     return `${prefix}<redacted>`;
@@ -478,16 +493,6 @@ export function redactSecrets(text: string, extraSecrets: string[] = []): Redact
     hits += 1;
     return `${scheme}<redacted>@`;
   });
-  for (const secret of extraSecrets) {
-    if (!secret || secret.length < 16) continue;
-    // Use string-replace with global semantics; avoid regex special-char issues.
-    let from = 0;
-    while ((from = out.indexOf(secret, from)) !== -1) {
-      hits += 1;
-      out = out.slice(0, from) + "<redacted>" + out.slice(from + secret.length);
-      from += "<redacted>".length;
-    }
-  }
   return { text: out, hits };
 }
 

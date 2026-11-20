@@ -193,7 +193,8 @@ release version, and its `appVersion` stays `latest`.
   that failed before it was ready, and a create that failed with a 5xx. The codes: `sandbox_rejected` (SaFE answered the
   create with a 4xx other than 403, 408, 425 or 429: the same request is not sent again within the run),
   `sandbox_create_failed` (a 5xx, a 408, 425 or 429, or no answer; retried, and the run fails with it once no retry is
-  left before the run's deadline or its delivery limit), the workload's terminal code (for example `sandbox_workload_terminal`,
+  left before the run's deadline or its delivery limit, a run claimed through `/v1/runs` counting its claims, so it no
+  longer ends `max_retries_exceeded` instead), the workload's terminal code (for example `sandbox_workload_terminal`,
   with the `AdminFailed` condition's reason and message), `sandbox_unschedulable` and `sandbox_pending_timeout`. When a
   refusal is about the timeout, the message also says the timeout the run asked for and the one Claw sent (Claw adds
   3600 s to stop the run cleanly) and, when only that hour is over the platform's limit, the largest timeout that fits.
@@ -202,8 +203,12 @@ release version, and its `appVersion` stays `latest`.
   platform's text is bounded, kept on one line and masked like every other value the run sends; every value the
   sandbox's env was sent is masked in it too, and in the log of the refusal, since a platform may echo the request back.
   It is masked before it is cut or folded onto one line, and in each spelling the answer may carry a value in (as sent,
-  JSON-escaped, folded, a line at a time), so neither a credential that runs across the cut nor a multi-line one (a PEM
-  key) is left partly or wholly in clear.
+  JSON-escaped as JavaScript and as Go write it, folded, a line at a time), so neither a credential that runs across the
+  cut, nor a multi-line one (a PEM key), nor a signed URL whose `&` the platform wrote as `\u0026` is left partly or
+  wholly in clear.
+- Claw: `redactSecrets` masks the exact values it is given before its patterns run. A pattern that matched part of such
+  a value (a hex token inside a JSON value, a URL's `user:pass@`) used to leave the rest of it, such as a password beside
+  the token or the URL's host and database, unmasked.
 - Claw API: a queued message that can never be sent no longer holds every later message on its session behind it. A
   message sent while the session is busy waits in that session's queue, and a drain sends only the oldest one; a
   message whose dispatch failed every time (for example, one larger than NATS's `max_payload`) was retried on every

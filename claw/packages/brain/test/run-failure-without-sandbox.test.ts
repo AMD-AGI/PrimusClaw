@@ -82,6 +82,8 @@ async function runTurn(o: {
   script?: boolean;
   /** Which delivery of the task this is. */
   deliveryCount?: number;
+  /** A run claimed by its doorbell (`/v1/runs`), at this claim of its row. */
+  claimCount?: number;
   /** The run's deadline (`deadline_at`). */
   deadlineAt?: string;
   /** The run is expected to nak for a redelivery rather than end. */
@@ -163,7 +165,7 @@ async function runTurn(o: {
   const abortCtrl = new AbortController();
   const lockKey = `lock.${SESSION}`;
   activeAbort.set(lockKey, abortCtrl);
-  await runHandleTask(msg, request, SESSION, lockKey, MESSAGE, "u1", abortCtrl);
+  await runHandleTask(msg, request, SESSION, lockKey, MESSAGE, "u1", abortCtrl, o.claimCount ? { claimCount: o.claimCount } : null);
   const completion = events.find((e) => e.type === "exec_complete");
   if (o.expectRetry) {
     assert.equal(completion, undefined, "the run was meant to be retried, not ended");
@@ -333,6 +335,24 @@ test("a run whose sandbox create keeps failing is retried, and failed with sandb
     assert.equal(delivered[0]!.failureReason, "sandbox_create_failed", what);
     assert.equal(delivered[0]!.failureMessage, `${UNAVAILABLE} ${note}`, what);
   }
+});
+
+test("a claimed run whose sandbox create keeps failing is failed with sandbox_create_failed on its last claim", async () => {
+  // A doorbell run is retried by claim, not by redelivery, and the API fails the
+  // claim that reaches the poison threshold as max_retries_exceeded. The claim
+  // before it is the last one the run gets, so it must end the run itself.
+  const UNAVAILABLE = "Create Hands failed: HTTP 503 upstream connect error";
+  const open = () => new Error(UNAVAILABLE);
+  // With claims left, and a delivery count that says nothing about a claimed run, it is retried.
+  const early = await runTurn({ open, callback: true, script: true, claimCount: TASK_POISON_DELIVERY_COUNT - 2, expectRetry: true });
+  assert.equal(early.delivered.length, 0);
+  const last = await runTurn({ open, callback: true, script: true, claimCount: TASK_POISON_DELIVERY_COUNT - 1 });
+  const message = `${UNAVAILABLE} (failed on ${TASK_POISON_DELIVERY_COUNT - 1} attempts)`;
+  assert.equal(last.completion.failed, true);
+  assert.equal(last.completion.failure_reason, "sandbox_create_failed");
+  assert.equal(String(last.completion.failure_message), message);
+  assert.equal(last.delivered[0]!.failureReason, "sandbox_create_failed");
+  assert.equal(last.delivered[0]!.failureMessage, message);
 });
 
 test("a deadline that falls while the sandbox create is failing fails the run for the create, not the budget", async () => {

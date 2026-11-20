@@ -161,7 +161,10 @@ export function createRefused(status: number): boolean {
  * first so a whole value is masked before any piece of it: as sent; escaped as a
  * JSON string carries it (a PEM key's line breaks become `\n`); folded onto one
  * line (`oneLineText`); and, for a multi-line value, each of its lines, since an
- * answer that quotes part of the value quotes it a line at a time.
+ * answer that quotes part of the value quotes it a line at a time. Every JSON
+ * spelling also comes as Go's `json.Marshal` writes it (the platform is a Go
+ * service): `&`, `<`, `>`, U+2028 and U+2029 as `\u` escapes, so a URL's `&sig=`
+ * is matched in the body the platform actually sends.
  */
 export function requestSecrets(apiKey: string, env: Record<string, unknown> | undefined): string[] {
   const values = apiKey ? [apiKey] : [];
@@ -169,19 +172,29 @@ export function requestSecrets(apiKey: string, env: Record<string, unknown> | un
     if (typeof value === "string" && value) values.push(value);
   }
   const forms = new Set<string>();
+  const addJson = (text: string) => {
+    const json = JSON.stringify(text).slice(1, -1);
+    forms.add(json);
+    forms.add(goJsonEscaped(json));
+  };
   for (const value of values) {
     forms.add(value);
-    forms.add(JSON.stringify(value).slice(1, -1));
+    addJson(value);
     forms.add(oneLineText(value, Number.MAX_SAFE_INTEGER));
     if (/[\r\n]/.test(value)) {
       for (const line of value.split(/\r?\n|\r/)) {
         const piece = line.trim();
         forms.add(piece);
-        forms.add(JSON.stringify(piece).slice(1, -1));
+        addJson(piece);
       }
     }
   }
   return [...forms].filter((form) => form.length > 0).sort((a, b) => b.length - a.length);
+}
+
+/** A JSON string's body as Go's `json.Marshal` writes it: HTML-safe, and with U+2028/U+2029 escaped. */
+function goJsonEscaped(json: string): string {
+  return json.replace(/[&<>\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 /** The longest answer to a refused create that is read; it is masked whole, then cut for display. */

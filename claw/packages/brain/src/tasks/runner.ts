@@ -5630,9 +5630,11 @@ class TaskRunner {
   /**
    * The message to fail the run with when `err` is a failed sandbox create and
    * this attempt was its last chance: the redelivery it would nak into lands
-   * after the run's deadline, or is the delivery the poison guard resolves
-   * (`TASK_POISON_DELIVERY_COUNT`; a claimed run's lease is its liveness and the
-   * guard does not count it). Null while a retry is still worth making.
+   * after the run's deadline, or is the one the poison guard resolves
+   * (`TASK_POISON_DELIVERY_COUNT`). The guard counts both kinds of attempt: a
+   * JetStream delivery by `deliveryCount`, and a claimed run by its
+   * `claim_count`, which the API's claim fails as `max_retries_exceeded` once it
+   * reaches the same threshold. Null while a retry is still worth making.
    */
   private sandboxCreateRetriesSpent(err: unknown): string | null {
     const message = this.sandboxCreateFailureOf(err);
@@ -5642,8 +5644,8 @@ class TaskRunner {
     if (Number.isFinite(deadlineMs) && Date.now() + retryableNakMs(attempt) >= deadlineMs) {
       return `${message} (no retry left before the run's deadline of ${this.request.deadline_at})`;
     }
-    if (!this.claimed && this.msg.info.deliveryCount >= TASK_POISON_DELIVERY_COUNT - 1) {
-      return `${message} (failed on ${this.msg.info.deliveryCount} attempts)`;
+    if (attempt >= TASK_POISON_DELIVERY_COUNT - 1) {
+      return `${message} (failed on ${attempt} attempts)`;
     }
     return null;
   }
