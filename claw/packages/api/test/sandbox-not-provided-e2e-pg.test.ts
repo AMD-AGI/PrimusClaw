@@ -19,6 +19,9 @@
  *   E1 SaFE's webhook denial (HTTP 400, its production body): sandbox_rejected,
  *      SaFE's text, and the timeout the run asked for beside the one Claw sent;
  *      the same through the A2A route
+ *   E1b the same denial quoting the env back, one credential across the cut of the
+ *      platform's text and one on several lines (a PEM key): no part of either
+ *      leaves the run
  *   E2 the workload failed before it was ready (AdminFailed): its code, and the
  *      condition's message
  *   E3 the create answered 5xx every time, a proxy's multi-line text echoing the
@@ -75,7 +78,22 @@ const WEBHOOK_DENIAL = JSON.stringify({
     + "timeout 64800 exceeds the qos limit of 10800 seconds for scope Sandbox",
 });
 
-type Mode = "rejected" | "forbidden" | "admin_failed" | "create_5xx" | "unschedulable" | "queued";
+/** A caller's credential in the sandbox's env, which the platform's denial echoes across the cut of its text. */
+const STRADDLING_CRED = "Zq9Xw2Lm7Pv4Rt8Ks1Hn6Bv3Cx5Dz0Qa";
+/** A multi-line one (a PEM key), echoed back in SaFE's JSON (its line breaks escaped in the body). */
+/** 64 characters of a PEM body: a fixed, made-up sequence, different on each line. */
+function fakeKeyLine(line: number): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  return Array.from({ length: 64 }, (_, i) => alphabet[(i * 7 + line * 13 + i * i * 3) % 64]).join("");
+}
+const PEM_CRED = [
+  // Shaped like a PEM key, built here rather than written out so it is plainly not one.
+  `-----BEGIN ${"PRIVATE"} KEY-----`,
+  ...Array.from({ length: 2 }, (_, i) => fakeKeyLine(i)),
+  `-----END ${"PRIVATE"} KEY-----`,
+].join("\n");
+
+type Mode = "rejected" | "rejected_echo" | "forbidden" | "admin_failed" | "create_5xx" | "unschedulable" | "queued";
 let mode: Mode = "rejected";
 /** Every request the fake SaFE received: method, path, and the create's body. */
 let safeCalls: Array<{ method: string; path: string; body?: Record<string, unknown> }> = [];
@@ -101,6 +119,16 @@ async function startFakeSafe(): Promise<string> {
     };
     if (req.method === "POST" && path === "/api/v1/workloads") {
       if (mode === "rejected") return send(400, WEBHOOK_DENIAL);
+      if (mode === "rejected_echo") {
+        // The webhook's denial quoting the request's env back: the PEM key whole,
+        // then the other credential placed to run across the 600th character, where
+        // the platform's text is cut.
+        const env = (safeCalls.at(-1)?.body?.env ?? {}) as Record<string, string>;
+        const head = `admission webhook "vworkload.kb.io" denied the request: Bad request. env DEPLOY_PEM=${env.DEPLOY_PEM} is not allowed;`;
+        const lead = " env MY_CRED=";
+        const said = `${head}${" ".padEnd(581 - head.length - lead.length, "x")}${lead}${env.MY_CRED} is not allowed either`;
+        return send(400, { errorCode: "Primus.00002", errorMessage: said });
+      }
       if (mode === "forbidden") {
         return send(403, { errorCode: "Primus.00003", errorMessage: `The user(${USER}) is not allowed to create workload, workspace: [default]` });
       }
@@ -312,7 +340,9 @@ after(async () => {
  * claimed as a brain claims it, and the request the claim assembles is run by
  * Brain. Returns once the run's completion has been consumed.
  */
-async function runOnce(): Promise<{ sessionId: string; runId: string; request: ExecuteRequest }> {
+async function runOnce(
+  withRequest: (request: ExecuteRequest) => void = () => {},
+): Promise<{ sessionId: string; runId: string; request: ExecuteRequest }> {
   const { claimRunById } = await import("../src/tasks/run-claim.js");
   let request: ExecuteRequest | null = null;
   ports.publishTask = async (_subject, payload) => {
@@ -334,6 +364,7 @@ async function runOnce(): Promise<{ sessionId: string; runId: string; request: E
   const claimed = await claimRunById(doorbell.task_id, "brain-e2e");
   assert.ok(claimed && typeof claimed === "object" && "request" in claimed, `claimed: ${JSON.stringify(claimed)}`);
   request = claimed.request;
+  withRequest(request);
   // A run announced on its end: a subscription, and the session counted as long-running.
   await client.query(
     `INSERT INTO claw_notification_subscriptions (subscription_id, owner_user_id, url, secret_enc, event_types)
@@ -497,6 +528,39 @@ test("E3 a create answered 5xx: sandbox_create_failed, with the status", { skip 
     for (const c of credentials) assert.ok(!String(text).includes(c), `a value the sandbox's env was sent left the run unmasked: ${text}`);
   }
   assert.match(String(s.run.terminal.failure_message), /<redacted>/, "the echoed env is in the message, masked");
+});
+
+/** Whether any piece of `secret` of 8 characters or more appears in `text`: a cut credential leaves its prefix. */
+function leaksPartOf(text: string, secret: string): string | null {
+  for (let at = 0; at + 8 <= secret.length; at++) {
+    const piece = secret.slice(at, at + 8);
+    if (text.includes(piece)) return piece;
+  }
+  return null;
+}
+
+test("E1b a denial that echoes the env back: no part of a cut or multi-line credential leaves the run", { skip }, async () => {
+  mode = "rejected_echo";
+  const { sessionId, runId } = await runOnce((request) => {
+    // A run whose sandbox spec carries the caller's own credentials in its env.
+    Object.assign(request, {
+      sandbox_spec: {
+        handle: "main", image: request.sandbox_image, timeout: REQUESTED_TIMEOUT,
+        env: { MY_CRED: STRADDLING_CRED, DEPLOY_PEM: PEM_CRED },
+      },
+    });
+  });
+  const create = safeCalls.find((c) => c.method === "POST")!.body!;
+  assert.equal((create.env as Record<string, string>).DEPLOY_PEM, PEM_CRED, "the create carried the key");
+  const s = await seen(sessionId, runId);
+  assertFailedEverywhere(s, "sandbox_rejected", /env DEPLOY_PEM=<redacted> is not allowed/);
+  const texts = [s.run.terminal.failure_message, s.row.error_message, s.notice!.summary, ...s.sandboxFailed.map((e) => e.message)];
+  const secrets = [STRADDLING_CRED, ...PEM_CRED.split("\n").slice(1, -1)];
+  for (const text of texts) {
+    for (const secret of secrets) assert.equal(leaksPartOf(String(text), secret), null, `part of a credential left the run: ${text}`);
+  }
+  // The credential at the cut was there to be cut: the text runs up to it.
+  assert.match(String(s.run.terminal.failure_message), /x env MY_CRED=/);
 });
 
 test("E4 admitted, and no node takes the pod: sandbox_unschedulable", { skip, timeout: 60_000 }, async () => {

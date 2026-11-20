@@ -49,7 +49,7 @@ import {
   S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, S3_API_ENDPOINT,
   BRAIN_WORKSPACE_SNAPSHOT_ENABLED,
   RETRY_PENDING_KEEPALIVE_GRACE_SEC,
-  TASK_MAX_DELIVER, BRAIN_LAZY_SANDBOX, BRAIN_SANDBOX_PRESTART,
+  TASK_MAX_DELIVER, TASK_POISON_DELIVERY_COUNT, BRAIN_LAZY_SANDBOX, BRAIN_SANDBOX_PRESTART,
   RUN_LEASE_HEARTBEAT_MS, RUN_LEASE_TTL_MS,
   LOCK_REFRESH_INTERVAL_MS,
   SANDBOX_HANDS_RESTART_ENABLED,
@@ -5547,12 +5547,18 @@ class TaskRunner {
     }
 
     if (this.abortCtrl.signal.reason === DEADLINE_EXCEEDED_ABORT_REASON) {
+      // A deadline that fell while the sandbox's create was failing ends the run
+      // for that: the run reached it because the platform never gave it a
+      // sandbox, and that is what a caller needs to read, not a spent budget.
+      const sandboxCause = this.sandboxCreateFailureOf(err);
       await this.settleTerminal(
         () => this.handleFatalError(
-          new Error(
-            `run_budget_exhausted: the run reached its deadline of ${this.request.deadline_at} `
-            + `after ${this.reportedCkpt?.turns_completed ?? 0} turns`,
-          ),
+          sandboxCause
+            ? new Error(`${sandboxCause} (retried until the run reached its deadline of ${this.request.deadline_at})`)
+            : new Error(
+              `run_budget_exhausted: the run reached its deadline of ${this.request.deadline_at} `
+              + `after ${this.reportedCkpt?.turns_completed ?? 0} turns`,
+            ),
         ),
         "task.deadline_agent_done_delivery_exhausted",
       );
@@ -5592,6 +5598,20 @@ class TaskRunner {
       return;
     }
     if (isRetryable(err)) {
+      // A create the platform keeps failing (a 5xx, a 429) is retried by
+      // redelivery. When no retry is left -- the next would come after the
+      // run's deadline, or be the delivery the poison guard resolves -- the run
+      // is failed here, as `sandbox_create_failed` with the platform's words;
+      // left to either of those, it ends with a reason that says nothing about
+      // the sandbox.
+      const lastRetry = this.sandboxCreateRetriesSpent(err);
+      if (lastRetry) {
+        await this.settleTerminal(
+          () => this.handleFatalError(new Error(lastRetry)),
+          "task.sandbox_create_retries_spent_agent_done_delivery_exhausted",
+        );
+        return;
+      }
       await this.handleRetryableError(err);
       return;
     }
@@ -5599,6 +5619,33 @@ class TaskRunner {
       () => this.handleFatalError(err),
       "task.failed_agent_done_delivery_exhausted",
     );
+  }
+
+  /** The failed create's message (`sandbox_create_failed`) behind `err`, or null when `err` is not one. */
+  private sandboxCreateFailureOf(err: unknown): string | null {
+    const failure = sandboxOpenFailureOf(err, classifySandboxFailure);
+    return failure?.reason === "sandbox_create_failed" ? failure.message : null;
+  }
+
+  /**
+   * The message to fail the run with when `err` is a failed sandbox create and
+   * this attempt was its last chance: the redelivery it would nak into lands
+   * after the run's deadline, or is the delivery the poison guard resolves
+   * (`TASK_POISON_DELIVERY_COUNT`; a claimed run's lease is its liveness and the
+   * guard does not count it). Null while a retry is still worth making.
+   */
+  private sandboxCreateRetriesSpent(err: unknown): string | null {
+    const message = this.sandboxCreateFailureOf(err);
+    if (!message) return null;
+    const attempt = this.claimed ? this.attempt.claimCount : this.msg.info.deliveryCount;
+    const deadlineMs = this.request.deadline_at ? Date.parse(this.request.deadline_at) : NaN;
+    if (Number.isFinite(deadlineMs) && Date.now() + retryableNakMs(attempt) >= deadlineMs) {
+      return `${message} (no retry left before the run's deadline of ${this.request.deadline_at})`;
+    }
+    if (!this.claimed && this.msg.info.deliveryCount >= TASK_POISON_DELIVERY_COUNT - 1) {
+      return `${message} (failed on ${this.msg.info.deliveryCount} attempts)`;
+    }
+    return null;
   }
 
   private async finishRun(

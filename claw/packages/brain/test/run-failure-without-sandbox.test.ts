@@ -27,6 +27,7 @@ import type { SandboxProvider } from "../src/sandbox/provider.js";
 import type { Engine, ExecuteExtras } from "../src/agent/index.js";
 import type { NatsEmitter } from "../src/events/emitter.js";
 import { activeAbort } from "../src/tasks/abort-registry.js";
+import { TASK_POISON_DELIVERY_COUNT } from "../src/config.js";
 
 const SESSION = "sess-run-failure";
 /** The run's platform key: what a failure message must never carry out of the run. */
@@ -79,6 +80,12 @@ async function runTurn(o: {
   callback?: boolean;
   /** A script task, which opens its sandbox up front and fails when it cannot. */
   script?: boolean;
+  /** Which delivery of the task this is. */
+  deliveryCount?: number;
+  /** The run's deadline (`deadline_at`). */
+  deadlineAt?: string;
+  /** The run is expected to nak for a redelivery rather than end. */
+  expectRetry?: boolean;
 }) {
   const opens = o.opens ?? (o.open ? [o.open] : []);
   let opened = 0;
@@ -88,7 +95,10 @@ async function runTurn(o: {
     async exec() { return { exitCode: 0, stdout: "", stderr: "" }; },
   } as unknown as SandboxProvider;
   restoreProviders = bindSandboxProviders({ safeWorkload: provider, agentSandbox: provider });
-  const msg = { seq: 1, info: { deliveryCount: 1 }, ack() {}, nak() {}, working() {}, term() {} } as unknown as JsMsg;
+  const naks: number[] = [];
+  const msg = {
+    seq: 1, info: { deliveryCount: o.deliveryCount ?? 1 }, ack() {}, nak(ms: number) { naks.push(ms); }, working() {}, term() {},
+  } as unknown as JsMsg;
   const noop = <T>(v: T) => (() => Promise.resolve(v)) as never;
   const kv = fakeKv();
   bindHandsKv(kv);
@@ -147,6 +157,7 @@ async function runTurn(o: {
     timeout: 25_200,
     ...(o.callback ? { callback_url: "http://api.test/v1/internal/tasks" } : {}),
     ...(o.script ? { mode: "script", script: { steps: [{ kind: "bash", command: "make" }] } } : {}),
+    ...(o.deadlineAt ? { deadline_at: o.deadlineAt } : {}),
     run_lease: { url: `http://api.test/v1/internal/tasks/${TASK}/lease`, token: "tok" },
   } as unknown as ExecuteRequest;
   const abortCtrl = new AbortController();
@@ -154,8 +165,13 @@ async function runTurn(o: {
   activeAbort.set(lockKey, abortCtrl);
   await runHandleTask(msg, request, SESSION, lockKey, MESSAGE, "u1", abortCtrl);
   const completion = events.find((e) => e.type === "exec_complete");
+  if (o.expectRetry) {
+    assert.equal(completion, undefined, "the run was meant to be retried, not ended");
+    assert.equal(naks.length, 1, "naked once for a redelivery");
+    return { completion: {} as Record<string, unknown>, delivered, naks };
+  }
   assert.ok(completion, "the turn ended");
-  return { completion: completion!, delivered };
+  return { completion: completion!, delivered, naks };
 }
 
 const refused = (reason: string) => () => new SandboxAttachError(new SandboxProvisionTerminalError(reason, WHY));
@@ -287,5 +303,46 @@ test("a run that needs its sandbox up front and is refused one fails with the co
   assert.ok(message.startsWith(REJECTED), message);
   assert.ok(!message.includes(PLATFORM_KEY), message);
   assert.equal(delivered[0]!.failureReason, "sandbox_rejected");
+  assert.equal(delivered[0]!.failureMessage, message);
+});
+
+test("a run whose sandbox create keeps failing is retried, and failed with sandbox_create_failed once no retry is left", async () => {
+  const UNAVAILABLE = "Create Hands failed: HTTP 503 upstream connect error";
+  const open = () => new Error(UNAVAILABLE);
+  // A retry is still worth making: the run naks for a redelivery.
+  const early = await runTurn({ open, callback: true, script: true, expectRetry: true });
+  assert.equal(early.delivered.length, 0);
+  // A retryable failure that is not the sandbox's keeps its redelivery at the same point.
+  const other = await runTurn({
+    open: () => new Error("nats: timeout"), callback: true, script: true,
+    deliveryCount: TASK_POISON_DELIVERY_COUNT - 1, deadlineAt: new Date(Date.now() + 1_000).toISOString(), expectRetry: true,
+  });
+  assert.equal(other.delivered.length, 0);
+  // The next try would land after the run's deadline.
+  const deadlineAt = new Date(Date.now() + 1_000).toISOString();
+  const atDeadline = await runTurn({ open, callback: true, script: true, deadlineAt });
+  // Or would be the delivery the poison guard resolves.
+  const atBudget = await runTurn({ open, callback: true, script: true, deliveryCount: TASK_POISON_DELIVERY_COUNT - 1 });
+  for (const [what, { completion, delivered }, note] of [
+    ["deadline", atDeadline, `(no retry left before the run's deadline of ${deadlineAt})`],
+    ["deliveries", atBudget, `(failed on ${TASK_POISON_DELIVERY_COUNT - 1} attempts)`],
+  ] as const) {
+    assert.equal(completion.failed, true, what);
+    assert.equal(completion.failure_reason, "sandbox_create_failed", what);
+    assert.equal(String(completion.failure_message), `${UNAVAILABLE} ${note}`, what);
+    assert.equal(delivered[0]!.failureReason, "sandbox_create_failed", what);
+    assert.equal(delivered[0]!.failureMessage, `${UNAVAILABLE} ${note}`, what);
+  }
+});
+
+test("a deadline that falls while the sandbox create is failing fails the run for the create, not the budget", async () => {
+  const UNAVAILABLE = "Create Hands failed: HTTP 503 upstream connect error";
+  const deadlineAt = new Date(Date.now() - 1_000).toISOString();
+  const { completion, delivered } = await runTurn({ open: () => new Error(UNAVAILABLE), callback: true, script: true, deadlineAt });
+  const message = `${UNAVAILABLE} (retried until the run reached its deadline of ${deadlineAt})`;
+  assert.equal(completion.failed, true);
+  assert.equal(completion.failure_reason, "sandbox_create_failed");
+  assert.equal(String(completion.failure_message), message);
+  assert.equal(delivered[0]!.failureReason, "sandbox_create_failed");
   assert.equal(delivered[0]!.failureMessage, message);
 });

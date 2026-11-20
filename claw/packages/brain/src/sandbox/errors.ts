@@ -143,9 +143,16 @@ export function oneLineText(raw: unknown, limit: number): string {
 /**
  * What the platform said in a refused create's body: SaFE's `errorMessage` when
  * the body is its JSON error shape, else the body itself. One line, cut to a
- * bound; secrets are masked by the caller.
+ * bound.
+ *
+ * `mask` is applied to the text as the platform wrote it, BEFORE it is folded
+ * onto one line and cut: a credential the platform echoed back only matches the
+ * value that was sent while it is whole and keeps its own line breaks. Folded
+ * first, a multi-line value (a PEM key) no longer matches and goes out in clear;
+ * cut first, a value that straddles the cut leaves its prefix in clear. Nothing
+ * downstream can catch either, since every later mask also matches whole values.
  */
-export function platformErrorText(body: string): string {
+export function platformErrorText(body: string, mask: (text: string) => string): string {
   let said: unknown = body;
   try {
     const parsed = JSON.parse(body) as Record<string, unknown>;
@@ -153,7 +160,8 @@ export function platformErrorText(body: string): string {
       said = parsed.errorMessage ?? parsed.message ?? parsed.error ?? body;
     }
   } catch { /* not JSON: the body is the text */ }
-  return oneLineText(said, PLATFORM_TEXT_LIMIT);
+  const text = typeof said === "string" ? said : JSON.stringify(said) ?? "";
+  return oneLineText(mask(text), PLATFORM_TEXT_LIMIT);
 }
 
 /**

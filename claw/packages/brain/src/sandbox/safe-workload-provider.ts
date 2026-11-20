@@ -156,14 +156,36 @@ export function createRefused(status: number): boolean {
  * The values a workload create sent that may be credentials, for masking what the
  * platform says back: the platform key and every env value. `redactSecrets` skips
  * the short ones, so a flag or a path does not blank out the platform's text.
+ *
+ * Each value in every spelling the platform's answer may carry it in, longest
+ * first so a whole value is masked before any piece of it: as sent; escaped as a
+ * JSON string carries it (a PEM key's line breaks become `\n`); folded onto one
+ * line (`oneLineText`); and, for a multi-line value, each of its lines, since an
+ * answer that quotes part of the value quotes it a line at a time.
  */
 export function requestSecrets(apiKey: string, env: Record<string, unknown> | undefined): string[] {
-  const out = apiKey ? [apiKey] : [];
+  const values = apiKey ? [apiKey] : [];
   for (const value of Object.values(env ?? {})) {
-    if (typeof value === "string" && value) out.push(value);
+    if (typeof value === "string" && value) values.push(value);
   }
-  return out;
+  const forms = new Set<string>();
+  for (const value of values) {
+    forms.add(value);
+    forms.add(JSON.stringify(value).slice(1, -1));
+    forms.add(oneLineText(value, Number.MAX_SAFE_INTEGER));
+    if (/[\r\n]/.test(value)) {
+      for (const line of value.split(/\r?\n|\r/)) {
+        const piece = line.trim();
+        forms.add(piece);
+        forms.add(JSON.stringify(piece).slice(1, -1));
+      }
+    }
+  }
+  return [...forms].filter((form) => form.length > 0).sort((a, b) => b.length - a.length);
 }
+
+/** The longest answer to a refused create that is read; it is masked whole, then cut for display. */
+const CREATE_ERROR_BODY_LIMIT = 1 << 20;
 
 export class SafeWorkloadProvider implements SandboxProvider {
   readonly kind = "safe-workload" as const;
@@ -220,13 +242,17 @@ export class SafeWorkloadProvider implements SandboxProvider {
     if (!resp.ok) {
       // Masked before it goes anywhere: the body is echoed into the run's failure,
       // which the caller, the session's events and a notification all carry.
-      const rawBody = (await resp.text().catch(() => "")).slice(0, 4000);
+      const rawBody = (await resp.text().catch(() => "")).slice(0, CREATE_ERROR_BODY_LIMIT);
       // Everything this request carried that may be a credential: the platform key
       // and every value the sandbox's env was given (a caller's own credential sits
       // there under any name). A platform that echoes the request back -- into this
       // body, and so into the logs below and the run's failure -- has them masked.
+      // Masked whole and before the text is folded or cut, never after: a cut
+      // through a credential leaves a prefix no later mask matches, and a
+      // multi-line one folded onto a line no longer matches the value sent.
       const sent = requestSecrets(apiKey, params.env);
-      const errBody = oneLineText(redactSecrets(rawBody, sent).text, 300);
+      const mask = (text: string): string => redactSecrets(text, sent).text;
+      const errBody = oneLineText(mask(rawBody), 300);
       if (resp.status === 403) {
         // The account may not create workloads here. Retrying cannot change
         // that, and SaFE's body names the user id and an internal error code,
@@ -242,7 +268,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
         // ceiling on `timeout`), a validation error. Nothing was created and the
         // same request is refused again, so this is terminal for the run and is
         // reported with the platform's own words.
-        const platformText = redactSecrets(platformErrorText(rawBody), sent).text;
+        const platformText = platformErrorText(rawBody, mask);
         const message = sandboxRejectedText(resp.status, platformText, {
           requestedSec: params.timeoutSec, sentSec: timeout, bufferSec: SHUTDOWN_BUFFER_SECONDS,
         });

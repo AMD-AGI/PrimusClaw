@@ -159,6 +159,79 @@ test("a credential the sandbox's env carried, echoed back by the platform, is ma
   }
 });
 
+/** Whether any piece of `secret` of 8 characters or more appears in `text`: a cut credential leaves its prefix. */
+function leaksPartOf(text: string, secret: string): string | null {
+  for (let at = 0; at + 8 <= secret.length; at++) {
+    const piece = secret.slice(at, at + 8);
+    if (text.includes(piece)) return piece;
+  }
+  return null;
+}
+
+const STRADDLING = "Zq9Xw2Lm7Pv4Rt8Ks1Hn6Bv3Cx5Dz0Qa";
+/** 64 characters of a PEM body: a fixed, made-up sequence, different on each line. */
+function fakeKeyLine(line: number): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  return Array.from({ length: 64 }, (_, i) => alphabet[(i * 7 + line * 13 + i * i * 3) % 64]).join("");
+}
+const PEM = [
+  // Shaped like a PEM key, built here rather than written out so it is plainly not one.
+  `-----BEGIN ${"PRIVATE"} KEY-----`,
+  ...Array.from({ length: 3 }, (_, i) => fakeKeyLine(i)),
+  `-----END ${"PRIVATE"} KEY-----`,
+].join("\n");
+
+test("a credential the platform echoed across the cut of its text leaves no part of it in the failure or the log", async () => {
+  const withEnv = { ...params(61_200), env: { MY_CRED: STRADDLING } };
+  // Placed so the value runs across the 600th character of the platform's text,
+  // and the 300th of the logged body: cut before it is masked, its prefix would stay.
+  for (const [status, lead] of [[400, 600 - 19], [503, 300 - 19 - "{\"errorMessage\":\"".length]] as const) {
+    const said = `${"x".repeat(lead - " env MY_CRED=".length)} env MY_CRED=${STRADDLING} and more text after it`;
+    answer(status, JSON.stringify({ errorMessage: said }));
+    let err: Error | null = null;
+    const logs = await logsOf(async () => {
+      err = await new SafeWorkloadProvider().create(withEnv).then(() => null, (e: unknown) => e as Error);
+    });
+    const message = (err as unknown as Error).message;
+    assert.equal(leaksPartOf(message, STRADDLING), null, `${status}: ${message}`);
+    assert.equal(leaksPartOf(logs, STRADDLING), null, `${status}: ${logs}`);
+  }
+});
+
+// Lines each too short to be masked alone: only the whole value, in the spelling the answer carries it in, is.
+const SHORT_LINES = ["k7Qp2Wx9", "Rm4Tz8Lc", "Vb1Nh6Jd", "Fs3Gy5Ae"].join("\n");
+
+for (const [name, cred] of [["a PEM key", PEM], ["a value of short lines", SHORT_LINES]] as const) test(`a multi-line credential (${name}) echoed back is masked as the platform wrote it: JSON-escaped, as text, or folded`, async () => {
+  const PEM = cred;
+  const withEnv = { ...params(61_200), env: { DEPLOY_PEM: PEM } };
+  const echoes = [
+    // SaFE's JSON error shape: the key's line breaks escaped in the body, real ones once parsed.
+    JSON.stringify({ errorCode: "Primus.00002", errorMessage: `Bad request. env DEPLOY_PEM=${PEM} is invalid` }),
+    // A plain-text answer quoting it as sent.
+    `Bad request. env DEPLOY_PEM=${PEM} is invalid`,
+    // An answer that already folded it onto one line.
+    `Bad request. env DEPLOY_PEM=${PEM.replace(/\n/g, " ")} is invalid`,
+    // An answer that quotes a single line of it.
+    ...(cred === SHORT_LINES ? [] : [`Bad request. bad line ${PEM.split("\n")[2]}`]),
+  ];
+  const body = cred === SHORT_LINES ? [PEM.replace(/\n/g, "")] : PEM.split("\n").slice(1, -1);
+  for (const status of [400, 503]) {
+    for (const echo of echoes) {
+      answer(status, echo);
+      let err: Error | null = null;
+      const logs = await logsOf(async () => {
+        err = await new SafeWorkloadProvider().create(withEnv).then(() => null, (e: unknown) => e as Error);
+      });
+      const message = (err as unknown as Error).message;
+      for (const line of body) {
+        assert.equal(leaksPartOf(message, line), null, `${status} ${echo.slice(0, 40)}: ${message}`);
+        assert.equal(leaksPartOf(logs, line), null, `${status} ${echo.slice(0, 40)}: ${logs}`);
+      }
+      assert.ok(message.includes("<redacted>"), message);
+    }
+  }
+});
+
 test("a 5xx body on several lines is folded onto one", async () => {
   answer(502, "<html>\r\n<h1>Bad Gateway</h1>\n\tupstream reset\n</html>");
   const err = await new SafeWorkloadProvider().create(params(600)).then(() => null, (e: unknown) => e) as Error;
@@ -166,9 +239,9 @@ test("a 5xx body on several lines is folded onto one", async () => {
 });
 
 test("a body that is not SaFE's JSON is passed on as text; a JSON body without a message as itself", () => {
-  assert.equal(platformErrorText("<html>Bad Gateway</html>"), "<html>Bad Gateway</html>");
-  assert.equal(platformErrorText(JSON.stringify({ message: "denied" })), "denied");
-  assert.equal(platformErrorText(""), "");
+  assert.equal(platformErrorText("<html>Bad Gateway</html>", (t) => t), "<html>Bad Gateway</html>");
+  assert.equal(platformErrorText(JSON.stringify({ message: "denied" }), (t) => t), "denied");
+  assert.equal(platformErrorText("", (t) => t), "");
 });
 
 test("which answers are a refusal: every 4xx but 403 and the ones that mean later", () => {

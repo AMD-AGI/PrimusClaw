@@ -113,8 +113,9 @@ A run whose turn asked for a sandbox and never got one is `failed` with the code
 attempt even when its agent went on to answer without one: the answer is in the session, but
 none of the work that needed the sandbox ran. That covers a create the platform refused
 (`sandbox_rejected`: any 4xx but 403, 408, 425 and 429, such as an admission webhook's denial;
-it is not sent again within the run), a create that failed (`sandbox_create_failed`: a 5xx or no
-answer), a workload that failed before it was ready (its terminal code, such as
+it is not sent again within the run), a create that failed (`sandbox_create_failed`: a 5xx, a 408,
+425 or 429, or no answer; such a create is retried, and the run fails with this code once it has
+no retry left, or reaches its deadline while the create is failing), a workload that failed before it was ready (its terminal code, such as
 `sandbox_workload_terminal`), and no capacity (`sandbox_unschedulable`, `sandbox_pending_timeout`,
 `sandbox_start_timeout`). An account the platform refuses a sandbox to
 (`sandbox_workspace_forbidden`, `sandbox_workspace_not_allowed`) is not such a failure: its
