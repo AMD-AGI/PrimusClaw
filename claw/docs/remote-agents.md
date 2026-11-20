@@ -344,11 +344,12 @@ while events wait, or the server has answered its posts with a 5xx for 2 minutes
 does. When the assistant is on, the owner is told once, through their assistant, that the
 replies from the sessions on that machine are delayed and being retried (with how many wait
 and for how long, when the connector reported it), and told once more when a batch from it
-is stored again and nothing has failed on either side since (a clean report alone is not
-enough: a connector restarted mid-stall reports no failure while its backlog still waits). A
-notice counts as told only once the assistant has it; until then a later sweep tries again,
-and its key keeps it from being said twice. A connector that goes offline while stalled is told nothing more here; presence,
-below, reports that it went. The same rows feed the `claw_delivery_*` and
+is stored again, or its fresh report says nothing waits any more, and nothing has failed on
+either side since (a clean report with events still waiting is not enough: a connector
+restarted mid-stall reports no failure while its backlog still waits). A notice counts as
+told only once the assistant has it; until then a later sweep tries again, and its key keeps
+it from being said twice. A connector that goes offline while stalled is told nothing more
+here; presence, below, reports that it went. The same rows feed the `claw_delivery_*` and
 `claw_remote_connector_*` metrics, which the chart's alert rules read
 (`prometheusRule.enabled`, `claw/deploy/charts/claw/alerts/delivery.rules.yaml`).
 

@@ -452,6 +452,49 @@ describe("remote delivery health", { skip }, () => {
     assert.equal((await says("bob")).length, 2);
   });
 
+  test("D12 a stall whose backlog drained before the sweep declared it is told it recovered once nothing waits", async () => {
+    const cid = await connector("bob", "build-host");
+    const sid = await session("bob", cid);
+    // Its posts never reach Claw (a proxy drops them; Claw answers no 5xx), for two and a half minutes: only the report says so.
+    await heartbeat("bob", cid, report({ pending: 2, oldestMs: 150_000, failures: 4, failingMs: 150_000, lastError: "network", sessions: [[sid, 2, 150_000]] }));
+    // The network comes back and the backlog goes in one batch, before the next sweep: no failure to clear, no stall yet, so this
+    // batch leaves nothing behind it.
+    assert.equal((await post("bob", cid, [chunk(sid, 1, "the replies that waited"), turnEnd(sid, 2)])).status, 200);
+    // The sweep reads the report it still has, fresh: stalled, and told.
+    assert.deepEqual((await sweep()).notices.map((n) => n.kind), ["delayed"]);
+    assert.equal((await row(cid)).stall_notice, "sent");
+    // The next heartbeats: nothing waits, nothing fails. No batch follows, there is nothing left to post.
+    await heartbeat("bob", cid, report());
+    assert.deepEqual((await sweep()).notices.map((n) => n.kind), ["recovered"]);
+    assert.equal((await says("bob"))[1], "Replies from the sessions on your dev environment build-host are getting through again; the delayed ones are being delivered now.");
+    const r = await row(cid);
+    assert.equal(r.stall_state, "ok");
+    assert.equal(r.stall_notice, "back_sent");
+    assert.equal((await health.sampleDeliveryHealth()).stalled, 0, "the stall alert stops firing");
+    await heartbeat("bob", cid, report());
+    assert.deepEqual((await sweep()).notices, []);
+    assert.equal((await says("bob")).length, 2);
+  });
+
+  test("D13 a report that drained before the stall was declared, or that is stale, does not end it", async () => {
+    const cid = await connector("alice", "dev-box");
+    await heartbeat("alice", cid, report({ pending: 3, oldestMs: 200_000, failures: 6, failingMs: 200_000, lastError: "network" }));
+    assert.deepEqual((await sweep()).notices.map((n) => n.kind), ["delayed"]);
+    // A clean, empty report from before the stall began says nothing about after it.
+    await w.q("UPDATE claw_remote_delivery_health SET pending = 0, oldest_since = NULL, post_failures = 0, post_failing_since = NULL, reported_at = stall_since - interval '1 second' WHERE connector_id = $1", [cid]);
+    assert.deepEqual((await sweep()).notices, []);
+    assert.equal((await row(cid)).stall_state, "stalled");
+    // Nor does one after it that went stale: the connector went quiet, presence says so.
+    await w.q("UPDATE claw_remote_delivery_health SET stall_since = NOW() - interval '20 minutes', reported_at = NOW() - interval '10 minutes' WHERE connector_id = $1", [cid]);
+    assert.deepEqual((await sweep()).notices, []);
+    assert.equal((await row(cid)).stall_state, "stalled");
+    // Nor one with nothing waiting while Claw still fails its posts.
+    await heartbeat("alice", cid, report());
+    await w.q("UPDATE claw_remote_delivery_health SET api_failures = 2, api_failing_since = NOW() - interval '30 seconds', api_failed_at = NOW() WHERE connector_id = $1", [cid]);
+    assert.deepEqual((await sweep()).notices, []);
+    assert.equal((await row(cid)).stall_state, "stalled");
+  });
+
   test("D11 a notice is marked said only once it is said, and is said once", async () => {
     const a = await connector("alice", "dev-box");
     await heartbeat("alice", a, report({ pending: 1, oldestMs: 180_000, failures: 3, failingMs: 180_000, lastError: "http_500" }));

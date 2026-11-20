@@ -21,8 +21,9 @@
  * have failed for {@link STALL_NOTICE_MS} (2 minutes) on the connector's fresh report while events wait, or Claw has answered
  * its posts with a 5xx for that long and did so recently. On the step to stalled the owner is told once, through their
  * assistant, that the replies are delayed and being retried; when the posts succeed again (positive evidence: a batch Claw stored
- * after the stall began, and since then a report with no failure and no failing answer of Claw's) they are told once that they
- * get through. A notice is marked said only after it was said, and handed out again until it is. A connector that went quiet meanwhile
+ * after the stall began, or a fresh report made after it began with nothing waiting; and no failure reported and no failing
+ * answer of Claw's) they are told once that they get through. A notice is marked said only after it was said, and handed out
+ * again until it is. A connector that went quiet meanwhile
  * (offline: its report is stale) stays stalled and is told nothing more here -- presence (`presence.ts`) says it went offline.
  *
  * The same rows feed the delivery gauges (`sampleDeliveryHealth`, `infra/metrics.ts`) the alert rules read.
@@ -270,7 +271,13 @@ export async function sweepDeliveryHealth(opts: { stallAfterMs?: number; reportF
               -- side since. A clean report alone is not: a connector restarted mid-stall reports no failure (its count is of this
               -- run) while the batch that stalled still waits on its disk. The connector posts its oldest events first, so a batch
               -- that got through is the one that stalled, or one behind it.
-              (h.post_failures = 0 AND h.api_failures = 0 AND h.api_ok_at > h.stall_since) AS clear,
+              -- Or a fresh report, made after the stall began, with nothing waiting and nothing failing: the backlog drained. The
+              -- batch that drained it may have got through before the sweep declared the stall from a report still in hand, so no
+              -- batch after it is left to stamp api_ok_at; nothing waiting is evidence enough (a restarted connector still counts
+              -- the batch on its disk).
+              (h.post_failures = 0 AND h.api_failures = 0
+                 AND (h.api_ok_at > h.stall_since
+                      OR (h.reported_at > h.stall_since AND h.reported_at > NOW() - make_interval(secs => $2::float8) AND h.pending = 0))) AS clear,
               -- A notice handed out and not marked said yet, whose sender may still be saying it.
               (h.stall_notice_at > NOW() - make_interval(secs => $4::float8)) AS notice_in_flight,
               CASE WHEN h.reported_at > NOW() - make_interval(secs => $2::float8) THEN h.pending END AS pending,
