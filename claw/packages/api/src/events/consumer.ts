@@ -50,7 +50,7 @@ import {
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
 import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
-import { redactStoredValue } from "@claw/utils";
+import { redactStoredText, redactStoredValue } from "@claw/utils";
 import pino from "pino";
 import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
 import { metrics } from "../infra/metrics.js";
@@ -59,6 +59,9 @@ import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
 import type { LeaderLease } from "../infra/leader-lock.js";
 import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
+import {
+  eventDeliveryHealth, quarantineEventDelivery, startEventBacklogGauges, storableEvent, storableText,
+} from "./poison.js";
 
 /** Brain's event for a streaming tool call's text so far (`ExecuteRequest.stream_tool_text`); never stored. */
 export const TOOL_TEXT_DELTA_EVENT = "toolTextDelta";
@@ -161,7 +164,7 @@ function makeEventId(seq: unknown): string {
  * Background durable consumer: listens to all events, persists to DB,
  * and triggers post-completion logic (save turns, summarize, pending messages).
  */
-export async function startEventConsumer(): Promise<void> {
+export async function startEventConsumer(opts: { signal?: AbortSignal } = {}): Promise<void> {
   const subject = "events.>";
   const consumerName = "api-consumer";
   const jsm = await nc.jetstreamManager();
@@ -184,11 +187,23 @@ export async function startEventConsumer(): Promise<void> {
   const consumer = await js.consumers.get(EVENT_STREAM, consumerName);
   const iter = await consumer.consume();
 
-  listenForCleanupNotices();
+  const cleanupSub = listenForCleanupNotices();
+  const stopGauges = startEventBacklogGauges(jsm, EVENT_STREAM, consumerName);
+  // Stops pulling, so the loop below ends once the delivery in hand is answered.
+  opts.signal?.addEventListener("abort", () => {
+    stopGauges();
+    cleanupSub.unsubscribe();
+    void iter.close().catch(() => {});
+  }, { once: true });
   logger.info({ subject, consumerName }, "event-consumer.started");
 
   for await (const msg of iter) {
-    await consumeEventDelivery(msg);
+    // `consumeEventDelivery` answers every delivery itself and does not throw;
+    // were it ever to, this loop must not end with it, since every session's
+    // events would stop with the one that threw.
+    await consumeEventDelivery(msg).catch((err) => {
+      logger.error({ err: (err as Error)?.message, seq: msg.seq }, "event-consumer.delivery_threw");
+    });
   }
 }
 
@@ -203,7 +218,7 @@ export async function startEventConsumer(): Promise<void> {
  * in that window. Core NATS, at-most-once: a missed notice only costs the
  * remaining TTL, which is how the cache behaved before this existed.
  */
-function listenForCleanupNotices(): void {
+function listenForCleanupNotices(): { unsubscribe(): void } {
   const sub = nc.subscribe("cleanup.>");
   (async () => {
     for await (const msg of sub) {
@@ -215,6 +230,7 @@ function listenForCleanupNotices(): void {
       "event-consumer.cleanup_listener_died",
     );
   });
+  return sub;
 }
 
 /**
@@ -419,29 +435,141 @@ async function processCompletionEvent(
   return outcome.ran ? outcome.result : "busy";
 }
 
+/** One delivery of the event stream, as `consumeEventDelivery` reads it. */
+export interface EventDelivery {
+  subject: string;
+  data: Uint8Array;
+  seq?: number;
+  info?: { streamSequence?: number; deliveryCount?: number; redeliveryCount?: number; timestampNanos?: number };
+  ack: () => void;
+  nak: (millis?: number) => void;
+}
+
+/** Postgres refusing the value itself: retrying the same event cannot succeed. */
+const UNSTORABLE_PG_CODES = new Set([
+  "22P05", // untranslatable character (a \u0000 escape in jsonb)
+  "22021", // invalid byte sequence (NUL in text)
+  "22P02", // invalid text representation (a lone surrogate escape in jsonb)
+  "54001", // statement too complex (nesting deeper than the server's stack)
+]);
+
 /**
  * One delivery: refuse a deleted session before any write, otherwise persist.
  *
  * Pulled out of the consume loop so the two properties the loop exists for --
  * the tombstone check sits in front of the INSERT, and a refusal acks rather
  * than naks -- can be pinned without a live JetStream iterator.
+ *
+ * Every delivery is answered (acked or nak'd), and none throws: a step that
+ * throws is answered with a nak. A delivery that has failed for long enough
+ * while other events are being stored is set aside instead of processed (see
+ * `eventQuarantinePolicy`), with a durable copy, so it cannot hold up the
+ * consumer for the life of the stream.
  */
-export async function consumeEventDelivery(msg: {
-  subject: string;
-  data: Uint8Array;
-  seq?: number;
-  info?: { streamSequence?: number };
-  ack: () => void;
-  nak: (millis?: number) => void;
-}): Promise<void> {
+export async function consumeEventDelivery(msg: EventDelivery): Promise<void> {
+  const seq = msg.seq ?? msg.info?.streamSequence;
+  const deliveries = msg.info?.deliveryCount ?? msg.info?.redeliveryCount ?? 1;
+  const publishedMs = typeof msg.info?.timestampNanos === "number" && msg.info.timestampNanos > 0
+    ? Math.floor(msg.info.timestampNanos / 1_000_000) : undefined;
+  let answer: "ack" | "nak" | undefined;
+  const tracked: EventDelivery = {
+    subject: msg.subject, data: msg.data, seq: msg.seq, info: msg.info,
+    ack: () => { answer ??= "ack"; msg.ack(); },
+    nak: (millis?: number) => { answer ??= "nak"; msg.nak(millis); },
+  };
+  try {
+    if (eventDeliveryHealth.shouldQuarantine({ seq, deliveries, publishedMs })) {
+      await setAside(tracked, "retries_exhausted", { seq, deliveries, publishedMs });
+    } else {
+      await processEventDelivery(tracked, { seq, deliveries, publishedMs });
+    }
+  } catch (err) {
+    eventDeliveryHealth.noteError(seq, err);
+    logger.error({ err: (err as Error)?.message, seq, subject: msg.subject }, "event-consumer.delivery_failed");
+    if (!answer) tracked.nak(5_000);
+  }
+  eventDeliveryHealth.answered(seq, answer ?? "none");
+}
+
+/**
+ * Set a delivery aside: keep its copy, then ack it. A copy that cannot be
+ * written naks instead, so the event is retried rather than lost. An event of a
+ * session that has since been deleted is dropped without a copy, as the normal
+ * path would drop it.
+ */
+async function setAside(
+  msg: EventDelivery,
+  reason: "unparseable" | "unstorable" | "retries_exhausted",
+  d: { seq?: number; deliveries: number; publishedMs?: number },
+  event?: Record<string, unknown>,
+): Promise<void> {
+  const sessionId = storableText(msg.subject.split(".")[1] ?? "");
+  const text = sc.decode(msg.data);
+  if (!event && reason !== "unparseable") {
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) event = storableEvent(parsed as Record<string, unknown>).event;
+    } catch { /* kept as text below */ }
+  }
+  const eventType = event && typeof event.type === "string" ? event.type : null;
+  // The copy is masked the way the stored event is (`redactStoredValue`), or as text when it is not JSON:
+  // a quarantined event is still conversation content at rest.
+  let copy: string;
+  try {
+    copy = event ? JSON.stringify(redactStoredValue(event)) : redactStoredText(text).text;
+  } catch {
+    // An event too deeply nested to serialise again is kept as its text.
+    copy = redactStoredText(text).text;
+  }
+  const payload = new TextEncoder().encode(copy);
+  const deleted = await sessionWasDeleted(sessionId);
+  if (deleted === "unknown") {
+    // Neither keep a copy (the session may be gone) nor drop it (it may not be): ask again later.
+    msg.nak(TOMBSTONE_UNKNOWN_NAK_MS);
+    return;
+  }
+  if (deleted) {
+    logger.info({ sessionId, type: eventType, reason }, "event-consumer.dropped_deleted_session");
+    msg.ack();
+    return;
+  }
+  try {
+    await quarantineEventDelivery({
+      eventId: makeEventId(d.seq), sessionId, subject: msg.subject, seq: d.seq, eventType, reason,
+      deliveries: d.deliveries, publishedMs: d.publishedMs, lastError: eventDeliveryHealth.takeError(d.seq),
+      payload,
+    });
+  } catch (err) {
+    logger.error({ err: (err as Error)?.message, sessionId, seq: d.seq, reason }, "event-consumer.quarantine_failed");
+    msg.nak(5_000);
+    return;
+  }
+  msg.ack();
+}
+
+async function processEventDelivery(
+  msg: EventDelivery,
+  d: { seq?: number; deliveries: number; publishedMs?: number },
+): Promise<void> {
     // subject layout: "events.{sessionId}"
-    const sessionId = msg.subject.split(".")[1];
+    const sessionId = storableText(msg.subject.split(".")[1] ?? "");
     let event: Record<string, unknown>;
     try {
-      const raw = sc.decode(msg.data).replace(/\u0000/g, "");
-      event = JSON.parse(raw);
+      const parsed: unknown = JSON.parse(sc.decode(msg.data));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("event is not a JSON object");
+      // The write boundary: every string Postgres cannot store (NUL, a lone
+      // surrogate) is replaced here, before anything below writes it.
+      const storable = storableEvent(parsed as Record<string, unknown>);
+      event = storable.event;
+      if (storable.replaced) {
+        metrics.onEventSanitised();
+        logger.warn(
+          { sessionId, type: event.type, seq: d.seq, replaced: storable.replaced },
+          "event-consumer.unstorable_characters_replaced",
+        );
+      }
     } catch {
-      msg.ack();
+      await setAside(msg, "unparseable", d);
       return;
     }
     logger.info({ sessionId, type: event.type, seq: (msg as any).seq }, "event-consumer.msg_received");
@@ -535,6 +663,7 @@ export async function consumeEventDelivery(msg: {
         `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${isAppEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
         [eventId, sessionId, (event.type as string) || "message", redactStoredValue(event)],
       );
+      eventDeliveryHealth.stored(d.seq);
       if (isAppEvent && !insertResult.rowCount) {
         logger.info({ sessionId, appTaskId: appEvent?.appTaskId, appEventId: appEvent?.eventId }, "event-consumer.app_event_duplicate_dropped");
         msg.ack();
@@ -554,10 +683,13 @@ export async function consumeEventDelivery(msg: {
       }
     } catch (e: any) {
       metrics.onEventPersisted("error");
+      eventDeliveryHealth.noteError(d.seq, e);
       const pgCode = e?.code || "";
-      if (pgCode === "22P05" || pgCode === "22021") {
-        logger.error({ err: e, sessionId, eventId }, "event-consumer.persist_poison_skipped");
-        msg.ack();
+      if (UNSTORABLE_PG_CODES.has(pgCode)) {
+        // Not expected once the event is sanitised above; if it happens anyway,
+        // no retry can store it, so it is set aside at once with its copy.
+        logger.error({ sessionId, eventId, type: event.type, code: pgCode }, "event-consumer.persist_unstorable");
+        await setAside(msg, "unstorable", d, event);
       } else {
         logger.error({ err: e, sessionId }, "event-consumer.persist_failed");
         msg.nak(5000);
@@ -592,6 +724,7 @@ export async function consumeEventDelivery(msg: {
         // stamp in `processCompletionEvent`, which is the statement that makes
         // this comment true.
         logger.error({ err: e, sessionId }, "event-consumer.complete_failed");
+        eventDeliveryHealth.noteError(d.seq, e);
         msg.nak(10_000);
         return;
       }

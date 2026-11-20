@@ -75,6 +75,9 @@ function isQueueWaitOutcome(outcome: QueueExitOutcome): outcome is QueueWaitOutc
 
 export type EverHeld = "true" | "false";
 
+/** Why the event consumer set an event aside (events/poison.ts). */
+export type EventQuarantineReason = "unparseable" | "unstorable" | "retries_exhausted";
+
 export const registry = new Registry();
 registry.setDefaultLabels({ service: "claw-api" });
 collectDefaultMetrics({ register: registry });
@@ -101,6 +104,45 @@ const eventPersistedTotal = new Counter({
   name: "claw_api_event_persisted_total",
   help: "Events persisted by the durable event consumer.",
   labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
+// The event consumer's own health (events/poison.ts). Consecutive failures is this replica's run of deliveries answered
+// with a retry since it last stored an event or set one aside; an outage or a poison event shows here first. Quarantined is an event set aside with a
+// durable copy in claw_event_quarantine, by why: `unparseable` (not JSON), `unstorable` (the database refused it after
+// sanitising), or `retries_exhausted` (it kept failing while other events were stored). Sanitised counts the events
+// stored with characters Postgres cannot hold (NUL, a lone surrogate) replaced by U+FFFD.
+const eventConsumerConsecutiveFailures = new Gauge({
+  name: "claw_api_event_consumer_consecutive_failures",
+  help: "Event deliveries this replica answered with a retry since it last stored or set aside an event.",
+  registers: [registry],
+});
+const eventQuarantinedTotal = new Counter({
+  name: "claw_api_event_quarantined_total",
+  help: "Events the event consumer set aside in claw_event_quarantine, by reason.",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+const eventSanitisedTotal = new Counter({
+  name: "claw_api_event_sanitised_total",
+  help: "Events stored with NUL or lone-surrogate characters replaced by U+FFFD.",
+  registers: [registry],
+});
+// The durable consumer's backlog as the server reports it, read every 30 s by each replica (the same numbers on
+// every replica). Oldest pending age is how long the oldest event not yet acknowledged has waited: the stall signal.
+const eventConsumerAckPending = new Gauge({
+  name: "claw_api_event_consumer_ack_pending",
+  help: "Events delivered to the api-consumer durable and not yet acknowledged.",
+  registers: [registry],
+});
+const eventConsumerPending = new Gauge({
+  name: "claw_api_event_consumer_pending",
+  help: "Events on the event stream not yet delivered to the api-consumer durable.",
+  registers: [registry],
+});
+const eventConsumerOldestPendingAge = new Gauge({
+  name: "claw_api_event_consumer_oldest_pending_age_seconds",
+  help: "Age of the oldest event the api-consumer durable has not acknowledged; 0 when none is pending.",
   registers: [registry],
 });
 
@@ -383,6 +425,20 @@ export const metrics = {
   },
   onEventPersisted(outcome: "ok" | "error"): void {
     eventPersistedTotal.inc({ outcome });
+  },
+  setEventConsumerConsecutiveFailures(n: number): void {
+    eventConsumerConsecutiveFailures.set(n);
+  },
+  onEventQuarantined(reason: EventQuarantineReason): void {
+    eventQuarantinedTotal.inc({ reason });
+  },
+  onEventSanitised(): void {
+    eventSanitisedTotal.inc();
+  },
+  setEventConsumerBacklog(b: { ackPending: number; pending: number; oldestPendingAgeSeconds: number }): void {
+    eventConsumerAckPending.set(b.ackPending);
+    eventConsumerPending.set(b.pending);
+    eventConsumerOldestPendingAge.set(b.oldestPendingAgeSeconds);
   },
 
   onAdmissionDecision(origin: AdmissionOrigin, decision: AdmissionDecisionLabel): void {

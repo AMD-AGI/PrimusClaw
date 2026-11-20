@@ -78,6 +78,11 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["event_id", "session_id", "event", "data", "created_at"],
   },
   {
+    // Absent, an event the consumer sets aside cannot be recorded, and it is retried instead of set aside.
+    table: "claw_event_quarantine",
+    columns: ["event_id", "session_id", "subject", "stream_seq", "event_type", "reason", "deliveries", "payload"],
+  },
+  {
     table: "claw_tasks",
     columns: [
       "task_id", "session_id", "status", "dag_root_task_id", "dag_node_id",

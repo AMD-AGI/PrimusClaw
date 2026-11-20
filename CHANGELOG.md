@@ -113,6 +113,13 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: metrics for the API's event consumer: `claw_api_event_consumer_consecutive_failures` (deliveries this replica
+  retried since it last stored or set aside an event), `claw_api_event_quarantined_total{reason}` (`unparseable`,
+  `unstorable`, `retries_exhausted`), `claw_api_event_sanitised_total`, and, read from the server every 30 seconds,
+  `claw_api_event_consumer_ack_pending`, `claw_api_event_consumer_pending` and
+  `claw_api_event_consumer_oldest_pending_age_seconds` (how long the oldest event not yet acknowledged has waited; 0 when
+  none is).
+
 - Connector: a connector that runs as a service upgrades itself to the version Claw recommends (on by default; off with
   `claw-connector auto-upgrade off`, `auto_upgrade = false` in `agents.toml`, or `CLAW_CONNECTOR_AUTO_UPGRADE=0`). It
   takes exactly the recommended version (never `latest`, never down, never a prerelease or a new major version; below
@@ -160,6 +167,17 @@ release version, and its `appVersion` stays `latest`.
   that it was sent late. Only values of a timestamp's or an id's shape are logged; never the text or who sent it
   (#872).
 ### Fixed
+
+- Claw: one event the database cannot store no longer stalls the API's event consumer. A NUL character or a lone
+  UTF-16 surrogate in an event (a tool's output, a model's text) is now replaced with U+FFFD where the event is parsed,
+  before anything is written, so the event is stored and a completion carrying one still runs (its turn is written and
+  its run is closed) instead of being skipped. The two clean-ups that existed did nothing: they ran over JSON text, where
+  both characters are escapes. An event that keeps failing for another reason is set aside once it has been delivered
+  more than 20 times over at least 15 minutes while other events are being stored: a copy of it, sanitised and with
+  credential-shaped content masked as a stored event is, goes to the new `claw_event_quarantine` table (deleted with its
+  session), a log line `event-consumer.quarantined` without its content says so, and it is acknowledged. While nothing
+  else is being stored (the database is down) nothing is set aside, and events wait as before. An event that is not JSON
+  is kept there too rather than dropped unrecorded.
 
 - Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its
   own run, the person is now told how it ended, once, in their language. Until now a review under the `fully_auto` mode
