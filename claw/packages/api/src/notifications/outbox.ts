@@ -394,6 +394,8 @@ async function claimDue(): Promise<Claimed[]> {
  * backend takes it: 400 (the personal agent's `bad_event`), 413 (too large), 415 and 422 (a body the receiver cannot take).
  */
 const BODY_REFUSALS = new Set(["400", "413", "415", "422"]);
+/** `refusedForGood` as a PostgreSQL regular expression over `last_status`. */
+const BODY_REFUSAL_STATUS = `^http_(${[...BODY_REFUSALS].join("|")})$`;
 
 /**
  * A failure that is the receiver refusing this event, the same way every time it is sent (`BODY_REFUSALS`). Only these count
@@ -476,6 +478,9 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
     // Only an unbroken run counts: any other failure (a 5xx, a 401, a timeout) ends it, and both counters start again. A good
     // event refused a few times during one rollout of the receiver (an old backend's schema refusing a new type or field), then
     // failing otherwise for an hour, must not be quarantined by one refusal during the next rollout.
+    // The run is also taken as broken when the row's previous status is not a refusal (`$8`), or is NULL, whatever the counters
+    // say: a replica of an older version writes `last_status` on a failure without resetting them, and a row carried over to
+    // another subscription (`adoptOrphanedRows`) has its status cleared.
     const updated = (await db.query(
       `UPDATE claw_notification_outbox o
           SET next_attempt_at = NOW() + make_interval(secs => CASE
@@ -485,16 +490,19 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
                      AND p.delivered_at IS NULL AND p.dropped_at IS NULL AND p.attempts > 0)
                 THEN LEAST($2::int, $5::int) ELSE $2::int END),
               last_status = $3,
-              isolated_failures = CASE WHEN NOT $6::boolean THEN 0 ELSE o.isolated_failures + CASE
+              isolated_failures = CASE WHEN NOT $6::boolean THEN 0 ELSE CASE
+                WHEN o.last_status IS NOT NULL AND o.last_status ~ $8::text THEN o.isolated_failures ELSE 0 END + CASE
                 WHEN o.last_failed_at IS NOT NULL AND (
                   SELECT s.last_delivered_at FROM claw_notification_subscriptions s WHERE s.subscription_id = o.subscription_id
                 ) > o.last_failed_at THEN 1 ELSE 0 END END,
               last_failed_at = NOW(),
-              refused_since = CASE WHEN $6::boolean THEN COALESCE(o.refused_since, NOW()) ELSE NULL END
+              refused_since = CASE WHEN NOT $6::boolean THEN NULL
+                WHEN o.last_status IS NOT NULL AND o.last_status ~ $8::text THEN COALESCE(o.refused_since, NOW()) ELSE NOW() END
         WHERE o.id = $1
         RETURNING o.isolated_failures,
                   (o.refused_since IS NOT NULL AND o.refused_since <= NOW() - make_interval(mins => $7::int)) AS refused_long`,
-      [row.id, backoff, status, receiverDown(status), PROBE_SECONDS, refusedForGood(status), QUARANTINE_AFTER_REFUSING_MINUTES],
+      [row.id, backoff, status, receiverDown(status), PROBE_SECONDS, refusedForGood(status), QUARANTINE_AFTER_REFUSING_MINUTES,
+        BODY_REFUSAL_STATUS],
     )).rows[0] as { isolated_failures: number; refused_long: boolean } | undefined;
     const isolated = Number(updated?.isolated_failures ?? 0);
     // Not a failure of the subscription: the receiver took another row since this one last failed, which ended the streak, and

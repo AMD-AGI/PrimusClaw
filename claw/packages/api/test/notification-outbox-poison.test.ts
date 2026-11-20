@@ -382,6 +382,74 @@ describe("notification outbox: poison rows", { skip }, () => {
     assert.equal((await subRow(sub)).enabled, true);
   });
 
+  for (const between of ["http_503", null]) test(`P11 a row whose last status is ${between ?? "NULL"} between refusals, with the counters left as they were (an older replica, a carried-over row), starts the count and the hour again`, async () => {
+    // A replica of an older version records a 503 in last_status without resetting isolated_failures or refused_since, and a
+    // carried-over row has its status cleared. The run of refusals is broken all the same.
+    await subscribe();
+    const ev = eventIdOf("t-mixed", "completed");
+    let refuse = true;
+    answer = (eventId) => (eventId === ev && refuse ? 400 : 200);
+    await finishRun("t-mixed", "completed");
+    const before = await sample("claw_notification_quarantined_total", 'reason="isolated_failures"');
+    const row = async () => (await q("SELECT * FROM claw_notification_outbox WHERE event_id = $1", [ev]))[0];
+    let n = 0;
+    const round = async () => {
+      await finishRun(`t-other-${n++}`, "completed");
+      await makeDue();
+      await deliver();
+    };
+    // The first refusal, then QUARANTINE_AFTER_ISOLATED_FAILURES - 1 isolated ones -- one short of quarantine.
+    for (let i = 0; i < outbox.QUARANTINE_AFTER_ISOLATED_FAILURES; i++) await round();
+    let r = await row();
+    assert.equal(r.isolated_failures, outbox.QUARANTINE_AFTER_ISOLATED_FAILURES - 1);
+    // The other failure, written as an older replica writes it: the status only. Then over an hour passes.
+    await q("UPDATE claw_notification_outbox SET last_status = $2 WHERE event_id = $1", [ev, between]);
+    await ageRefusals();
+    const aged = (await row()).refused_since as Date;
+    await round();
+    r = await row();
+    assert.equal(r.last_status, "http_400");
+    assert.equal(r.quarantined_at, null, "one refusal after the run was broken does not quarantine");
+    assert.equal(r.dropped_at, null);
+    assert.equal(r.isolated_failures, 1, "counted from 0 again");
+    assert.ok(new Date(r.refused_since).getTime() > new Date(aged).getTime(), "the hour starts again");
+    refuse = false;
+    await round();
+    assert.ok((await row()).delivered_at, "delivered");
+    assert.equal(await sample("claw_notification_quarantined_total", 'reason="isolated_failures"') - before, 0);
+  });
+
+  test("P12 the quarantine threshold: past the hour, a row is quarantined on its QUARANTINE_AFTER_ISOLATED_FAILURES-th isolated refusal, not before", async () => {
+    await subscribe();
+    const ev = eventIdOf("t-threshold", "failed");
+    answer = (eventId) => (eventId === ev ? 400 : 200);
+    await finishRun("t-threshold", "failed");
+    const row = async () => (await q("SELECT * FROM claw_notification_outbox WHERE event_id = $1", [ev]))[0];
+    let n = 0;
+    const round = async () => {
+      await finishRun(`t-other-${n++}`, "completed");
+      await makeDue();
+      await deliver();
+    };
+    // The first refusal (not isolated: there is no "since" yet), and the hour already behind it.
+    await round();
+    assert.equal((await row()).isolated_failures, 0);
+    await ageRefusals();
+    for (let i = 1; i < outbox.QUARANTINE_AFTER_ISOLATED_FAILURES; i++) {
+      await round();
+      const r = await row();
+      assert.equal(r.isolated_failures, i);
+      assert.equal(r.quarantined_at, null, `not quarantined after ${i} isolated refusals`);
+      assert.equal(r.dropped_at, null);
+    }
+    await round();
+    const r = await row();
+    assert.equal(r.isolated_failures, outbox.QUARANTINE_AFTER_ISOLATED_FAILURES);
+    assert.ok(r.quarantined_at, `quarantined on isolated refusal ${outbox.QUARANTINE_AFTER_ISOLATED_FAILURES}`);
+    assert.equal(received.filter((x) => x.eventId === ev).length, outbox.QUARANTINE_AFTER_ISOLATED_FAILURES + 1);
+    assert.equal(outbox.QUARANTINE_AFTER_ISOLATED_FAILURES, 5, "the receiver contract says five");
+  });
+
   test("P6 the gauges read the table: a stalled row's age and the rows pending; 0 once it clears", async () => {
     await subscribe();
     answer = () => 503;
