@@ -106,6 +106,13 @@ export NAMESPACE="$NAMESPACE_EXPLICIT"
 # It honors the NAMESPACE we just exported and does not override it.
 source "$SCRIPT_DIR/common.sh"
 
+# The API verifies callers with identity. The chart renders CLAW_AUTH_PROVIDER
+# from identity.authProvider (default safe); this extra env is applied after that
+# entry and replaces it. values.<ns>.env can set EXTRA_ENV_API_CLAW_AUTH_PROVIDER=safe.
+if [ -z "${EXTRA_ENV_API_CLAW_AUTH_PROVIDER:-}" ]; then
+  export EXTRA_ENV_API_CLAW_AUTH_PROVIDER=identity
+fi
+
 # TAG is required: image building was removed from the upgrade path. Build &
 # push $REGISTRY/$REPOSITORY:<tag> out-of-band (e.g. deploy/build.sh) first. IMG is
 # consumed by health checks and deploy_hands_from_image / deploy_shared_assets.
