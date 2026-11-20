@@ -256,7 +256,8 @@ type PendingResult = ExecuteResult & { run_time?: RunTimeReport; outbox_since_ms
  * dozen deliveries later -- holding the run's message, or its claimed row, for
  * all of that time. The result is kept instead, in the same bucket as the
  * outbox it came from, under a key nothing replays, and the caller settles the
- * delivery as it would a delivered one. The row is left to the API's sweeper,
+ * delivery as it would a delivered one. If that write fails, the result stays
+ * in the outbox and the delivery is naked, as for any undelivered result. The row is left to the API's sweeper,
  * which fails a run that never reports.
  *
  * The log line says which task and why, and never what the result contained.
@@ -278,16 +279,21 @@ async function quarantineAgentDone(
     result: pending,
   };
   const encoded = sc.encode(JSON.stringify(record));
-  let stored = true;
-  await kvCkpt.put(quarantinedResultKey(taskId), encoded).catch((e) => {
-    stored = false;
+  try {
+    await kvCkpt.put(quarantinedResultKey(taskId), encoded);
+  } catch (e) {
+    // Without the record, settling would delete the only copy of the result
+    // (the caller clears the outbox next). Fail the way an undelivered result
+    // does instead: the caller naks, the outbox stays, and the poison guard
+    // still bounds the redeliveries.
     logger.error({ err: (e as Error).message, taskId }, "task.agent_done_quarantine_write_failed");
-  });
+    throw new AgentDoneDeliveryError(`quarantine write failed after ${err.message}`);
+  }
   metrics.onAgentDoneQuarantined("refused");
   logger.error(
     {
       taskId, sessionId: request.session_id, httpStatus: err.status, sqlstate: err.sqlstate,
-      resultBytes: encoded.length, stored,
+      resultBytes: encoded.length,
     },
     "task.agent_done_quarantined",
   );

@@ -32,6 +32,8 @@
  *   P2 a result left in the outbox by an earlier delivery is replayed, made
  *      storable, and lands
  *   P3 a replayed result refused twice is quarantined the same way
+ *   P4 a quarantine record that cannot be written leaves the result in the
+ *      outbox and naks, rather than settling with no copy kept
  */
 
 import assert from "node:assert/strict";
@@ -63,6 +65,8 @@ const outputs = new Map<string, ExecuteResult>();
 /** Task ids whose callbacks are refused outright, as by a field nothing can make storable. */
 const refuseAll = new Set<string>();
 const store = new Map<string, Uint8Array>();
+/** Keys whose writes the bucket refuses, as a full or unreachable bucket does. */
+const failingPuts = new Set<string>();
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
@@ -72,6 +76,7 @@ const kvCkpt = {
     return value ? { key, value, operation: "PUT" } : null;
   },
   async put(key: string, value: Uint8Array | string) {
+    if (failingPuts.has(key)) throw new Error("nats: timeout");
     store.set(key, typeof value === "string" ? enc.encode(value) : value);
     return 1;
   },
@@ -296,4 +301,14 @@ test("P3 a replayed result refused twice is quarantined, not naked", { skip }, a
   const record = JSON.parse(dec.decode(store.get("task-quarantine.t-replay-refused")!)) as Record<string, unknown>;
   assert.equal((record.result as { finalText: string }).finalText, "stored by the delivery before");
   assert.equal((await row("t-replay-refused")).status, "running");
+});
+
+test("P4 a quarantine that cannot be written keeps the outbox and naks", { skip }, async () => {
+  const request = await seedTask("t-quarantine-unwritable");
+  outputs.set("t-quarantine-unwritable", scriptResult("the only copy"));
+  refuseAll.add("t-quarantine-unwritable");
+  failingPuts.add("task-quarantine.t-quarantine-unwritable");
+  assert.deepEqual(await deliver(request), ["nak:5000"]);
+  const kept = JSON.parse(dec.decode(store.get("task-result.t-quarantine-unwritable")!)) as { finalText: string };
+  assert.equal(kept.finalText, "the only copy", "the result is still in the outbox for the redelivery");
 });
