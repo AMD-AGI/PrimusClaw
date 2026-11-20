@@ -41,7 +41,7 @@ import { SANDBOX_RECIPE_USAGE, buildSandboxRecipe } from "./sandbox-recipe.js";
 import { GITHUB_PROVIDER, type GithubReviewSettings } from "./settings.js";
 import {
   auditFinish, auditStart, claimConfirmation, finishConfirmation, getConfirmation, openConfirmation,
-  acquireWriteLock, writeLockKey, claimHeldMerges, countPendingConfirmations, postedApprovalIds, getReviewMode, headReviewFacts, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
+  acquireWriteLock, writeLockKey, claimHeldMerges, countPendingConfirmations, REQUESTER_MERGE, requesterMergeOn, reviewerMergeRefusal, postedApprovalIds, getReviewMode, headReviewFacts, heldOrDeniedOn, recentWrites, releaseWriteLock, renewWriteLock, reopenConfirmation, reserveWrite, reviewDigest, sessionRequestCount,
   type ClaimResult, type Confirmation, type DecidedVia, type HeldReview, type PostedFinding, type PostedReview, type Queryable, type ReviewComment, type ReviewEvent, type ReviewMode,
 } from "./store.js";
 
@@ -82,7 +82,10 @@ export interface FollowRequest {
   /** R: who asked; the owner for a review of one's own account. */
   requesterUserId: string;
   requesterLabel?: string;
-  /** R asked X for a review that merges (not a review only): R's account merges once X's approval is on GitHub. */
+  /**
+   * R asked X for a review that merges (not a review only). The merge is X's; only when X approved and X's account cannot merge it is R
+   * asked whether R's own account merges it (`followPullRequest`).
+   */
   mergeByRequester: boolean;
   /**
    * Read CI on the head too, when the pull request is open and nothing is merged for R: the answer's `ci` (green, the names of the failed,
@@ -353,6 +356,35 @@ const WORKFLOW_SCOPE_MESSAGE = "GitHub refused the merge: this pull request chan
 /** Whether `text`, GitHub's own words for a refused write, is the missing-`workflow`-scope refusal. */
 export function isWorkflowScopeRefusal(text: string): boolean {
   return WORKFLOW_SCOPE_RE.test(text);
+}
+
+/**
+ * GitHub's refusal of a merge because the account may not merge on this branch, whatever the pull request: a protected branch that
+ * restricts who may push ("You're not authorized to push to this branch"), a token or role without the right ("Resource not accessible by
+ * integration", "Must have admin rights to Repository"). Not a conflict, a check or a review rule: those say other words.
+ */
+const MERGE_PERMISSION_RE = /not authori[sz]ed to (?:push|merge)|not (?:allowed|permitted) to (?:push|merge)|must have (?:admin|write|push|maintain)\b|resource not accessible|permission to (?:push|merge)|insufficient permission/i;
+
+/** The audit tool of a merge made with the requester's own account on their yes (`requester_merge`): never one of the reviewer's merges. */
+export const REQUESTER_MERGE_TOOL = "gh_pr_merge_as_requester";
+
+/** The refusal code of a merge GitHub refused because the acting account may not merge there (`MERGE_PERMISSION_RE`, or a plain 403). */
+export const MERGE_NOT_PERMITTED = "merge_not_permitted";
+
+/**
+ * A merge GitHub refused for a permission reason, as its own refusal (`MERGE_NOT_PERMITTED`), or null for any other answer: a 403 that is
+ * not a rate limit nor the missing `workflow` scope, or a 405/422 (and a merge queue's GraphQL refusal) in GitHub's words for a permission.
+ */
+function mergePermissionRefusal(err: unknown, approved?: boolean): Refusal | null {
+  const words = err instanceof GithubGraphqlError ? err.detail : err instanceof GithubError ? err.message : null;
+  if (words === null || isWorkflowScopeRefusal(words)) return null;
+  const plain403 = err instanceof GithubError && err.status === 403 && !err.rateLimited;
+  const said = (err instanceof GithubGraphqlError || (err instanceof GithubError && [403, 405, 422].includes(err.status))) && MERGE_PERMISSION_RE.test(words);
+  if (!plain403 && !said) return null;
+  return new Refusal("merge_not_permitted", `GitHub refused the merge for a permission reason: ${words}`, {
+    github_request_id: err instanceof GithubError ? err.requestId : undefined,
+    ...(approved === undefined ? {} : { approved_by_this_call: approved }),
+  });
 }
 
 const ENQUEUE_MUTATION = `mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{id position state}}}`;
@@ -889,28 +921,31 @@ export class GithubReview {
 
   /**
    * What became of the pull request of a review asked of someone else, looked at by the review items' sweep after the review's turn
-   * (`assistant/review-items.ts` `followReviewItems`), and the merge the requester asked for, made with the requester's own account.
+   * (`assistant/review-items.ts` `followReviewItems`), and, when the reviewer cannot merge it, the question to the requester whether their
+   * own account merges it instead.
    *
-   * A review asked of X by R, when R's message asked for a merge (`mergeByRequester`: not a review only), has done its part once X's
-   * approval of the head is on GitHub. The merge is then R's: R wrote the pull request, R asked for it to be merged, and merging one's own
-   * pull request after a second person's approval is what GitHub's own rules are for. So the merge is made with R's GitHub account (R's
-   * own credential, which needs nobody's switch), and X is not asked to confirm it: X's review mode and X's held merge govern what is done
-   * with X's account, not what R does with R's own. It is made only when every one of these holds, read now:
+   * A review asked of X by R that may merge (`mergeByRequester`: R's message asked for a merge, not a review only) is merged with X's
+   * account, as X's review mode says: at once under `fully_auto`, after X's own confirmation when X's merge is held. X's held merge is
+   * X's to answer: R's account is never used because a merge waits for X (2026-11-20). Only when X's account cannot merge the
+   * pull request, X's last merge of the current head having been refused for that (`REVIEWER_CANNOT_MERGE`: no write permission, or GitHub
+   * refused it for a permission reason), is R asked, never merged for unasked: a `requester_merge` confirmation that asks R (R is its
+   * acting user), opened once per head, answered with R's card or `批准 #<ref>` (`decide`), when every one of these holds, read now:
    *   - the pull request is open, not a draft, and R's account wrote it (`requester_not_author`) and may push to the repository;
    *   - this review session posted an approval of the current head with X's account (its own audit row, `posted.review_id`), and GitHub
    *     still has it as APPROVED on that commit (`approval_missing`): a push after it, or a dismissal, takes it back;
    *   - CI is green on the head, no review thread is open, and GitHub's merge state is CLEAN (the repository's own rules, met as GitHub
-   *     counts them);
-   *   - nobody is deciding X's held merge right now (`write_in_progress`, `reviewer_deciding`). A held merge of the session for that head is
-   *     closed as merged by the requester, so X's card or command for it then answers that it no longer waits.
-   * Otherwise nothing is written and the answer says why (`status: "waiting"`); the sweep looks again later.
+   *     counts them).
+   * The answer is then `waiting` with `requester_asked` and the confirmation's id (the sweep sends R the card), `requester_declined` once R
+   * said no, `requester_answered` once R's answer ended otherwise; and `waiting` with the gate that is not open yet otherwise. R's yes
+   * reads every gate again before anything is merged (`mergeForRequester`).
    *
-   * Whether or not it merges, a pull request that is merged or closed on GitHub is said so (`already_merged`, `closed`), and every write
-   * the session still holds for X's answer is closed with it (`stale`, with the reason): there is nothing left to confirm.
-   * Without `mergeByRequester`, or when R has no GitHub account bound, the pull request is read with X's account, as the review read it.
+   * Whether or not R is asked, a pull request that is merged or closed on GitHub is said so (`already_merged`, `closed`), and every write
+   * the session still holds for an answer is closed with it (`stale`, with the reason): there is nothing left to confirm.
+   * Until X cannot merge, and when R has no GitHub account bound, the pull request is read with X's account, as the review read it.
    */
   async followPullRequest(f: FollowRequest): Promise<ToolOutcome> {
-    const asRequester = f.mergeByRequester && f.requesterUserId !== f.actingUserId;
+    const asRequester = f.mergeByRequester && f.requesterUserId !== f.actingUserId
+      && await reviewerMergeRefusal(this.deps.db, f.sessionId, f.actingUserId, null) !== null;
     const tool = "gh_pr_follow";
     const args = { pr: `${f.ref.owner}/${f.ref.repo}#${f.ref.number}`, as: asRequester ? "requester" : "acting_user" };
     const actor: ReviewActor = asRequester
@@ -935,7 +970,7 @@ export class GithubReview {
           } } : {}),
         }, redact);
       }
-      return ok(await this.mergeForRequester(ctx, ref, repo, pr, f), redact);
+      return ok(await this.askRequester(ctx, ref, repo, pr, f), redact);
     }, { skipBudget: true, ref: f.ref });
     // R has no GitHub account bound (or it lapsed): what became of the pull request is still read, with X's account as the review read it.
     if (asRequester && outcome.isError && ["actor_not_bound", "credential_expired", "acting_login_unknown"].includes(String(outcome.body.reason))) {
@@ -944,15 +979,26 @@ export class GithubReview {
     return outcome;
   }
 
-  /** The merge of `followPullRequest`, as R, once X's approval is on GitHub. */
-  private async mergeForRequester(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, f: FollowRequest): Promise<Record<string, unknown>> {
-    const waiting = (reason: string, message: string, extra: Record<string, unknown> = {}): Record<string, unknown> =>
-      ({ status: "waiting", reason, message, url: pr.url, head_sha: pr.headSha, ...extra });
+  /**
+   * The gates of a merge with R's account after X's approval, read now (`followPullRequest`): the first one shut, as `waiting` with its
+   * reason, or what the merge needs. Writes nothing.
+   */
+  private async requesterGates(
+    ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, f: Pick<FollowRequest, "sessionId" | "actingUserId">,
+  ): Promise<{ waiting: Record<string, unknown> } | {
+    waiting: null; state: PullState; queue: boolean; method: "squash" | "merge" | "rebase" | undefined; approval: { reviewId: number; login: string };
+    refusal: string;
+  }> {
+    const waiting = (reason: string, message: string, extra: Record<string, unknown> = {}) =>
+      ({ waiting: { status: "waiting", reason, message, url: pr.url, head_sha: pr.headSha, ...extra } });
     if (pr.draft) return waiting("draft", "the pull request is a draft");
     if (!ctx.cred.login.trim() || pr.authorLogin.toLowerCase() !== ctx.cred.login.toLowerCase()) {
-      return waiting("requester_not_author", "the requester's GitHub account did not write this pull request, so the merge stays with the reviewer");
+      return waiting("requester_not_author", "the requester's GitHub account did not write this pull request, so it is never merged with it");
     }
     if (!repo.push) return waiting("no_merge_permission", `${ctx.cred.login} has no write permission on ${repo.fullName}`);
+    // X's account cannot merge this very head: a refusal of an earlier head says nothing of this one, which X merges as usual.
+    const refusal = await reviewerMergeRefusal(this.deps.db, f.sessionId, f.actingUserId, pr.headSha);
+    if (!refusal) return waiting("reviewer_may_merge", "the reviewer's merge of the current head was not refused for a missing permission, so it stays with the reviewer");
     const approval = await this.sessionApprovalOf(ctx, ref, f.sessionId, pr.headSha);
     if (!approval) return waiting("approval_missing", "the reviewer's approval of the current head is not on the pull request");
     let state = await this.readState(ctx, ref, pr, repo);
@@ -963,60 +1009,123 @@ export class GithubReview {
       throw err;
     }
     state = await this.settleMergeState(ctx, ref, pr, state, false);
-    // Already in the merge queue (queued by a person): nothing to write, but the reviewer's held merge of this head is closed below as well.
-    const alreadyQueued = state.queueEntry;
     const queue = this.viaQueue(ctx, state);
-    if (!alreadyQueued && !queue && !mergeStateOpen(state)) {
+    if (!state.queueEntry && !queue && !mergeStateOpen(state)) {
       return waiting("merge_state_not_clean", `GitHub's merge state is ${state.mergeStateStatus} (review decision ${state.reviewDecision ?? "none"}), not CLEAN`);
     }
     const method = (["squash", "merge", "rebase"] as const).find((m) => repo.methods.includes(m));
-    if (!alreadyQueued && !queue && !method) return waiting("merge_method_not_allowed", this.methodRefusal(repo).message);
-    if (!alreadyQueued && queue && !state.nodeId) return waiting("unreadable_pull_request", "GitHub did not give the pull request's id");
+    if (!state.queueEntry && !queue && !method) return waiting("merge_method_not_allowed", this.methodRefusal(repo).message);
+    if (!state.queueEntry && queue && !state.nodeId) return waiting("unreadable_pull_request", "GitHub did not give the pull request's id");
+    return { waiting: null, state, queue, method, approval, refusal };
+  }
+
+  /**
+   * The question to R, once X's account could not merge the head X approved (`followPullRequest`): asked once per head, and only while every
+   * gate is open. Nothing is written to GitHub.
+   */
+  private async askRequester(ctx: Ctx, ref: PrRef, repo: RepoInfo, pr: PrInfo, f: FollowRequest): Promise<Record<string, unknown>> {
+    const gates = await this.requesterGates(ctx, ref, repo, pr, f);
+    if (gates.waiting) return gates.waiting;
+    const base = { url: pr.url, head_sha: pr.headSha, approved_by: gates.approval.login, reviewer_refusal: gates.refusal };
+    // Already in the merge queue (queued by a person): nothing to ask, and what X still holds for that head is closed.
+    if (gates.state.queueEntry) {
+      const held = await claimHeldMerges(this.deps.db, f.sessionId, pr.headSha, f.requesterUserId);
+      if (held === null) return { status: "waiting", reason: "reviewer_deciding", message: "the reviewer is deciding the held merge right now", ...base };
+      for (const id of held) await finishConfirmation(this.deps.db, id, "stale", f.requesterUserId, { by: "github", reason: "pr_queued", queue_entry_id: gates.state.queueEntry.id });
+      return { status: "queued", already_queued: true, queue_entry_id: gates.state.queueEntry.id, ...base };
+    }
+    const asked = await requesterMergeOn(this.deps.db, f.sessionId, pr.headSha);
+    if (asked && asked.status !== "pending") {
+      return asked.status === "denied"
+        ? { status: "waiting", reason: "requester_declined", message: "the requester said not to merge it with their own account", confirmation_id: asked.id, ...base }
+        : { status: "waiting", reason: "requester_answered", message: `the requester's answer for this head ended ${asked.status}`, confirmation_id: asked.id, answer: asked.status, ...base };
+    }
+    const c = await openConfirmation(this.deps.db, {
+      sessionId: f.sessionId, requesterUserId: f.requesterUserId, actorUserId: f.requesterUserId,
+      repo: `${ref.owner}/${ref.repo}`, pr: ref.number, headSha: pr.headSha, title: pr.title, author: pr.authorLogin,
+      kind: REQUESTER_MERGE, review: null, reasons: [`reviewer_cannot_merge:${gates.refusal}`], checks: { green: true, approved_by: gates.approval.login },
+      ttlSeconds: ctx.settings.confirmationTtlSeconds,
+    });
+    return {
+      status: "waiting", reason: "requester_asked", confirmation_id: c.id, expires_at: c.expiresAt, ...base,
+      message: `${gates.approval.login} approved it but cannot merge it (${gates.refusal}); the requester is asked whether their own account merges it`,
+    };
+  }
+
+  /**
+   * R's yes to the question `askRequester` put (a `requester_merge` confirmation, claimed by `decide`): every gate is read again, and the merge
+   * of that head is made with R's account. A gate shut now refuses it (`waiting` becomes the refusal's code), nothing merged.
+   */
+  private async mergeForRequester(ctx: Ctx, ref: PrRef, confirmation: Confirmation): Promise<Record<string, unknown>> {
+    const { repo, pr } = await this.load(ctx, ref);
+    if (pr.merged) throw new Refusal("already_merged", "the pull request is already merged");
+    if (pr.state !== "open") throw new Refusal("not_open", "the pull request is not open");
+    if (pr.headSha !== confirmation.headSha) throw new Refusal("head_moved", "the pull request got new commits since the requester was asked; nothing was merged");
+    const actingUserId = await this.sessionActor(confirmation.sessionId);
+    if (!actingUserId) throw new Refusal("session_unreadable", "the review's session could not be read; nothing was merged");
+    const f = { sessionId: confirmation.sessionId, actingUserId };
+    const gates = await this.requesterGates(ctx, ref, repo, pr, f);
+    if (gates.waiting) throw new Refusal(String(gates.waiting.reason), String(gates.waiting.message));
+    const alreadyQueued = gates.state.queueEntry;
     if (!alreadyQueued && !ctx.settings.writesEnabled) {
       ctx.acc.dryRun = true;
-      return { status: "would_merge", url: pr.url, head_sha: pr.headSha, note: "writes are switched off in this deployment: nothing was merged" };
+      return { status: "dry_run", url: pr.url, head_sha: pr.headSha, note: "writes are switched off in this deployment: nothing was merged" };
     }
     // The reviewer's lock on their writes to this pull request: their own answer to a held merge, a stop, and this merge, one at a time.
-    const key = writeLockKey(f.actingUserId, ref);
+    const key = writeLockKey(actingUserId, ref);
     const holder = await acquireWriteLock(this.deps.db, key, WRITE_LOCK_SECONDS);
-    if (!holder) return waiting("write_in_progress", "the reviewer's write to this pull request is being decided right now");
+    if (!holder) throw new Refusal("write_in_progress", "the reviewer's write to this pull request is being decided right now; try again in a moment");
     const claimed: string[] = [];
     try {
-      if (this.deps.sessionStopped && await this.deps.sessionStopped(f.sessionId)) return waiting("review_stopped", "the review was stopped");
-      const held = await claimHeldMerges(this.deps.db, f.sessionId, pr.headSha, f.requesterUserId);
-      if (held === null) return waiting("reviewer_deciding", "the reviewer is deciding the held merge right now");
+      if (this.deps.sessionStopped && await this.deps.sessionStopped(confirmation.sessionId)) throw new Refusal("review_stopped", "the review was stopped; nothing was merged");
+      const held = await claimHeldMerges(this.deps.db, confirmation.sessionId, pr.headSha, confirmation.requesterUserId, [confirmation.id]);
+      if (held === null) throw new Refusal("reviewer_deciding", "the reviewer is deciding the held merge right now; try again in a moment");
       claimed.push(...held);
       if (alreadyQueued) {
         for (const id of claimed.splice(0)) {
-          await finishConfirmation(this.deps.db, id, "stale", f.requesterUserId, { by: "github", reason: "pr_queued", queue_entry_id: alreadyQueued.id });
+          await finishConfirmation(this.deps.db, id, "stale", confirmation.requesterUserId, { by: "github", reason: "pr_queued", queue_entry_id: alreadyQueued.id });
         }
         return { status: "queued", already_queued: true, url: pr.url, head_sha: pr.headSha, queue_entry_id: alreadyQueued.id };
       }
       await this.limits(ctx, pr.headSha);
       ctx.acc.write = true;
       let body: Record<string, unknown>;
-      if (queue) {
-        body = await this.enqueue(ctx, ref, pr, state, pr.headSha, false);
+      if (gates.queue) {
+        body = await this.enqueue(ctx, ref, pr, gates.state, pr.headSha, false);
       } else {
         try {
-          const merged = await this.putMerge<{ sha?: string }>(ctx, ref, pr.headSha, method);
-          body = { status: "merged", merge_sha: merged.json?.sha ?? null, method, url: pr.url, head_sha: pr.headSha, github_request_id: merged.requestId };
+          const merged = await this.putMerge<{ sha?: string }>(ctx, ref, pr.headSha, gates.method);
+          body = { status: "merged", merge_sha: merged.json?.sha ?? null, method: gates.method, url: pr.url, head_sha: pr.headSha, github_request_id: merged.requestId };
         } catch (err) {
           if (err instanceof GithubError && err.status === 409) throw new Refusal("head_moved", "the pull request changed while it was being merged; nothing was merged");
+          const notPermitted = mergePermissionRefusal(err);
+          if (notPermitted) throw notPermitted;
           if (err instanceof GithubError && (err.status === 405 || err.status === 422)) throw new Refusal("not_mergeable", `GitHub refused the merge: ${err.message}`);
           throw err;
         }
       }
       for (const id of claimed.splice(0)) {
-        await finishConfirmation(this.deps.db, id, body.status === "queued" ? "queued" : "merged", f.requesterUserId, {
+        await finishConfirmation(this.deps.db, id, body.status === "queued" ? "queued" : "merged", confirmation.requesterUserId, {
           by: "requester", merge_sha: body.merge_sha ?? null, queue_entry_id: body.queue_entry_id ?? null,
         });
       }
-      return { ...body, approved_by: approval.login, review_id: approval.reviewId };
+      return { ...body, approved_by: gates.approval.login, review_id: gates.approval.reviewId, merged_as: "requester" };
     } finally {
       // A merge that did not happen gives the reviewer's held merge back to them, still waiting.
       for (const id of claimed) await reopenConfirmation(this.deps.db, id).catch(() => false);
       await releaseWriteLock(this.deps.db, key, holder).catch(() => undefined);
+    }
+  }
+
+  /** Whose account the review session acts with (`config.acting_as`), or null when the session cannot be read. */
+  private async sessionActor(sessionId: string): Promise<string | null> {
+    try {
+      const r = await this.deps.db.query("SELECT config->>'acting_as' AS acting_as, user_id FROM claw_sessions WHERE session_id = $1", [sessionId]);
+      const row = r.rows[0] as { acting_as?: string | null; user_id?: string | null } | undefined;
+      const who = row?.acting_as || row?.user_id || "";
+      return who ? who : null;
+    } catch {
+      return null;
     }
   }
 
@@ -1118,17 +1227,22 @@ export class GithubReview {
       await finishConfirmation(this.deps.db, id, "refused", deciderUserId, { ...by, reason: "unreadable_confirmation" });
       return { http: 200, body: { ok: true, status: "refused", reason: "unreadable_confirmation" } };
     }
-    const tool = held ? "gh_review_submit" : "gh_pr_merge";
+    // The requester's yes to merging with their own account, the reviewer having approved and being unable to merge (`askRequester`): their
+    // own account, read and merged as theirs, every gate read again. Audited apart from the reviewer's merges, so it is never read as one.
+    const asRequester = confirmation.kind === REQUESTER_MERGE;
+    const tool = held ? "gh_review_submit" : asRequester ? REQUESTER_MERGE_TOOL : "gh_pr_merge";
     const outcome = await this.run(actor, tool, { pr: `${confirmation.repo}#${confirmation.pr}`, head_sha: confirmation.headSha, confirmation_id: id, ...(via ? { decided_by_service: via.clientId, decided_by_service_act: via.actorSub } : {}) }, async (ctx) => {
       const body = held
         ? await this.submit(ctx, ref, confirmation.headSha, { event: held.event, text: held.body, rawComments: held.comments, flags: [], judgement: null, confirmation })
-        : await this.merge(ctx, ref, confirmation.headSha, { flags: [], judgement: null, confirmation });
+        : asRequester
+          ? await this.mergeForRequester(ctx, ref, confirmation)
+          : await this.merge(ctx, ref, confirmation.headSha, { flags: [], judgement: null, confirmation });
       return ok(body, (t) => ctx.client.redact(t));
     }, { skipBudget: true, ref, consented: true });
     const status = String(outcome.body.status ?? "");
     const reason = String(outcome.body.reason ?? "");
     if (status === "merged") {
-      await finishConfirmation(this.deps.db, id, "merged", deciderUserId, { ...by, merge_sha: outcome.body.merge_sha ?? null });
+      await finishConfirmation(this.deps.db, id, "merged", deciderUserId, { ...by, merge_sha: outcome.body.merge_sha ?? null, ...(asRequester && !via ? { by: "requester" } : {}) });
       return { http: 200, body: { ok: true, status: "merged", merge_sha: outcome.body.merge_sha ?? null, url: outcome.body.url ?? null } };
     }
     if (status === "queued") {
@@ -1148,7 +1262,8 @@ export class GithubReview {
     // given back: a later deny or expiry would leave that review standing, and a 5xx on the write may
     // mean it went through.
     const wrote = outcome.wrote === true;
-    if (!wrote && (TRANSIENT_REFUSALS.has(reason) || (reason === "github_error" && Number(outcome.body.github_status) >= 500))) {
+    const busy = asRequester && (reason === "write_in_progress" || reason === "reviewer_deciding");
+    if (!wrote && (busy || TRANSIENT_REFUSALS.has(reason) || (reason === "github_error" && Number(outcome.body.github_status) >= 500))) {
       // Nothing was decided about the write and nothing was written: the person's "allow" is not used up, and they can give it again.
       if (await reopenConfirmation(this.deps.db, id)) {
         return { http: 200, body: { ok: true, status: "retry", reason, message: "this could not be tried just now; the confirmation is still open, so allow it again in a moment" } };
@@ -2092,6 +2207,8 @@ export class GithubReview {
       return { status: "merged", merge_sha: merged.json?.sha ?? null, method, url: pr.url, github_request_id: merged.requestId };
     } catch (err) {
       if (err instanceof GithubError && err.status === 409) throw new Refusal("head_moved", "the pull request changed while it was being merged; nothing was merged", { github_request_id: err.requestId });
+      const notPermitted = mergePermissionRefusal(err, approved);
+      if (notPermitted) throw notPermitted;
       if (err instanceof GithubError && (err.status === 405 || err.status === 422)) throw new Refusal("not_mergeable", `GitHub refused the merge: ${err.message}`, { github_request_id: err.requestId });
       throw err;
     }
@@ -2181,6 +2298,8 @@ export class GithubReview {
       if (isWorkflowScopeRefusal(why)) {
         throw new Refusal(WORKFLOW_SCOPE_REFUSAL, WORKFLOW_SCOPE_MESSAGE, { github_request_id: err.requestId, github_message: why, approved_by_this_call: approved });
       }
+      const notPermitted = mergePermissionRefusal(err, approved);
+      if (notPermitted) throw notPermitted;
       throw new Refusal("enqueue_refused", `GitHub refused to put the pull request in the merge queue: ${why}`, { github_request_id: err.requestId, approved_by_this_call: approved });
     }
     if (!entry) {

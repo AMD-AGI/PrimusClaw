@@ -694,7 +694,7 @@ describe("M the merge gates", () => {
     assert.deepEqual({ ...(await row()) }, { result: "ok", detail: "merged", merge_state: null });
   });
 
-  test("M8d GitHub's 403 for a pull request that changes a CI workflow file, with a token that has no `workflow` scope, is its own refusal: merge it by hand on GitHub, not bind again; any other 403 is still github_error", async () => {
+  test("M8d GitHub's 403 for a pull request that changes a CI workflow file, with a token that has no `workflow` scope, is its own refusal: merge it by hand on GitHub, not bind again; any other 403 is the account's missing permission (merge_not_permitted)", async () => {
     const workflow = "refusing to allow an OAuth App to create or update workflow `.github/workflows/tests.yml` without `workflow` scope";
     const row = async () => (await e.sql("SELECT result, detail FROM claw_github_audit WHERE tool = 'gh_pr_merge' ORDER BY id DESC LIMIT 1"))[0];
     e.gh.graphql.mergeStateStatus = "CLEAN";
@@ -713,11 +713,16 @@ describe("M the merge gates", () => {
     // A GitHub App says `workflows` permission: the same refusal.
     e.gh.mergeAnswers = [{ status: 403, message: "refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission" }];
     assert.equal(reason(await merge()), "github_workflow_scope_missing");
-    // Another 403 is not this one.
+    // Another 403 is not this one: the account may not merge here, which lets the requester be asked (`followPullRequest`).
     e.gh.mergeAnswers = [{ status: 403, message: "Resource not accessible by integration" }];
     const other = await merge();
-    assert.equal(reason(other), "github_error", other.text);
-    assert.deepEqual({ ...(await row()) }, { result: "refused", detail: "github_error" });
+    assert.equal(reason(other), "merge_not_permitted", other.text);
+    assert.deepEqual({ ...(await row()) }, { result: "refused", detail: "merge_not_permitted" });
+    // A protected branch that restricts who may push answers 405 in these words: the same refusal. A 405 in other words is not.
+    e.gh.mergeAnswers = [{ status: 405, message: "You're not authorized to push to this branch. Visit https://docs.github.com/articles/about-protected-branches/ for more information." }];
+    assert.equal(reason(await merge()), "merge_not_permitted");
+    e.gh.mergeAnswers = [{ status: 405, message: "Required status check \"test\" is expected." }];
+    assert.equal(reason(await merge()), "not_mergeable");
   });
 
   test("M16 GitHub works the merge state out after the approval a person's allow made, not at once: UNKNOWN, and BLOCKED while the review does not count yet, are waited for, a few seconds at most; the merge is made when it settles, and not otherwise", async () => {

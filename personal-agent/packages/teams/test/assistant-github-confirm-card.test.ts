@@ -8,9 +8,12 @@
  * `/claw-events` route as Claw posts it, the proactive delivery and the say planner draw it as Teams shows it, and its buttons answer
  * the held write over Claw's HTTP client, as the person, with their exchanged token.
  *
- *   K1  the card: the words in it, "合入" and "不要" buttons that name the recorded card; nothing else is sent for it, once only
+ *   K1  the card: the words in it, "合入" and "不合" buttons that name the recorded card; nothing else is sent for it, once only
  *   K2  "合入": `POST /v1/assistant/confirmations/<id>/decision {decision: allow}` with the person's token, and the card says it merged
  *   K3  deny, an approval's card, every way the answer can end, and Claw's "retry" giving the card back to press again
+ *   K4  the question put to the person who asked a colleague to review and merge, when the colleague approved and cannot merge
+ *       (`claw/packages/api/test/fixtures/github-requester-merge-card.outbox.json`, `assistant-review-merge-actor.test.ts` MA3): drawn
+ *       with "合入" and "不合"; "合入" is the person's own yes, as them; "不合" says nothing was merged
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -31,16 +34,20 @@ import { ALICE, CardsWorld } from "../../../test-support/assistant/cards-world.j
 import { bodyText, render, str, titles } from "../../../test-support/assistant/teams-cards.js";
 
 const FIXTURE = join(import.meta.dirname, "../../../../claw/packages/api/test/fixtures/github-merge-card.outbox.json");
+const ASKER_FIXTURE = join(
+  import.meta.dirname,
+  "../../../../claw/packages/api/test/fixtures/github-requester-merge-card.outbox.json",
+);
 const SECRET = "s3cret-alice";
 const ROUTE = "route-alice";
 const CONFIRMATION = "a3f9c2d1-0b7e-4c55-9e21-6d0f5b8c7a10";
 const REF = "a3f9c2";
 
 /** Claw's body for the card, as the fixture holds it, with this run's ids and times filled in. */
-function body(o: { id?: string; kind?: string; label?: string } = {}): JsonObject {
+function body(o: { id?: string; kind?: string; label?: string; fixture?: string } = {}): JsonObject {
   const id = o.id ?? CONFIRMATION;
   const ref = id.replace(/-/g, "").slice(0, 6);
-  const raw = readFileSync(FIXTURE, "utf8")
+  const raw = readFileSync(o.fixture ?? FIXTURE, "utf8")
     .replaceAll("<confirmation_id>", id)
     .replaceAll("<ref>", ref)
     .replaceAll("<event_id>", `say-${ref}`)
@@ -173,7 +180,7 @@ test("K1 Claw's card for a held merge is drawn as a card with its buttons, from 
     bodyText(card),
   );
   const buttons = w.cards.buttons();
-  assert.deepEqual(titles(buttons), ["合入", "不要"]);
+  assert.deepEqual(titles(buttons), ["合入", "不合"]);
   const recorded = w.cards.store.assistantButtons.getConfirmCard(cardId(w));
   assert.deepEqual(
     [recorded?.confirmationId, recorded?.kind, recorded?.state, recorded?.userId],
@@ -247,4 +254,39 @@ test("K3 every way the answer ends is said, an approval's card is its own, and C
   await w.press("allow");
   assert.equal(w.told(), "已合入。");
   assert.equal(w.calls.length, 2);
+});
+
+test("K4 the question to the asker when the colleague approved and cannot merge: 合入 and 不合, answered as the asker", async () => {
+  const w = new World();
+  const posted = await w.post(body({ fixture: ASKER_FIXTURE }));
+  assert.deepEqual(posted, { status: 200, json: { status: "delivered" } });
+  const card = w.cards.lastCard();
+  assert.equal(
+    bodyText(card).includes(
+      `Bob 已批准 AMD-AGI/demo#7，但 Bob 没有合入权限；要用你自己的账号合入吗？点「合入」（或回复 批准 #${REF}）`,
+    ),
+    true,
+    bodyText(card),
+  );
+  assert.deepEqual(titles(w.cards.buttons()), ["合入", "不合"]);
+  await w.press("allow");
+  assert.deepEqual(w.calls, [
+    {
+      method: "POST",
+      path: `/v1/assistant/confirmations/${CONFIRMATION}/decision`,
+      bearer: `Bearer tok-${ALICE}`,
+      body: { decision: "allow" },
+    },
+  ]);
+  assert.equal(w.told(), "已合入。");
+  // 不合: nothing merged, said so.
+  const no = new World();
+  no.answer = { status: 200, json: { ok: true, data: { ok: true, status: "denied" } } };
+  await no.post(body({ fixture: ASKER_FIXTURE }));
+  await no.press("deny");
+  assert.deepEqual(
+    no.calls.map((c) => c.body),
+    [{ decision: "deny" }],
+  );
+  assert.equal(no.told(), "好的，没有合入。");
 });

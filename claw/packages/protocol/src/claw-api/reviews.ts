@@ -31,7 +31,11 @@ export interface StartedReview {
   review_only: boolean;
   /** Present when every merge of this review waits for the acting user's own confirmation, whatever their review mode. */
   merge_needs_confirmation?: true;
-  /** Present on a review asked of someone else that may merge: the requester's own account merges it once it is approved and green. */
+  /**
+   * Present on a review asked of someone else that may merge. The reviewer's account merges it once they approve (at once under their
+   * fully automatic setting, else on their own confirmation); only when the reviewer cannot merge it (no permission) is the requester
+   * asked, with a card, whether their own account merges it. Nothing is merged with the requester's account unasked.
+   */
   merge_by_requester?: true;
   /** With model choice on: the model the review runs on (null: the deployment's default). Absent with model choice off. */
   model?: string | null;
