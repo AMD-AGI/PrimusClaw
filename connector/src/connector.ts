@@ -639,7 +639,10 @@ export class Connector {
   }
 
   private async heartbeat(): Promise<void> {
-    const body = { version: this.d.version, agents: await this.descriptors(), cmd_cursor: this.ledger.cursor > 0 ? this.ledger.cursor : null };
+    const body = {
+      version: this.d.version, agents: await this.descriptors(), cmd_cursor: this.ledger.cursor > 0 ? this.ledger.cursor : null,
+      outbox: this.outboxReport(),
+    };
     // How long the answer takes is watched (`tick`): one held back in the network says command frames may be held back too.
     const since = performance.now();
     this.hbSince = since;
@@ -658,6 +661,20 @@ export class Connector {
       // Answered late, or not at all: the window after it starts now, whatever order its answer and held frames come in.
       if (late || failed || performance.now() - since > this.timing.transitMs) this.netTrouble(failed ? "heartbeat_failed" : "heartbeat_late");
     }
+  }
+
+  /**
+   * The outbox as the heartbeat reports it (`RemoteOutboxReport`): what waits, for how long, and how many posts in a row failed.
+   * Claw tells the owner when their replies are stuck, and alerts its operators, from this.
+   */
+  private outboxReport(): Record<string, unknown> {
+    const b = this.outbox.backlog();
+    const posts = this.d.client.postHealth();
+    return {
+      pending: b.pending, oldest_age_ms: b.oldestAgeMs,
+      failures: posts.failures, failing_ms: posts.failingMs, last_error: posts.lastError,
+      sessions: b.sessions.map((s) => ({ session_id: s.sessionId, pending: s.pending, oldest_age_ms: s.oldestAgeMs })),
+    };
   }
 
   /** The first heartbeat, answering "not found" once by registering afresh (the stored id may belong to another account). */

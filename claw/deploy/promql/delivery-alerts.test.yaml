@@ -1,0 +1,207 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# The delivery-stall alerts of claw/deploy/charts/claw/alerts/delivery.rules.yaml
+# (the file the chart's PrometheusRule ships) against synthetic stalls: each
+# rule stays quiet through a short stall, fires on one that lasts, and resolves
+# once delivery resumes. Series carry the labels a ServiceMonitor scrape gives
+# them, from two API replicas reporting the same deployment-wide numbers.
+#
+#   run with: promtool test rules claw/deploy/promql/delivery-alerts.test.yaml
+
+rule_files:
+  - ../charts/claw/alerts/delivery.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - name: "a connector stuck behind one batch for twenty-five minutes, then unblocked"
+    # The connector's report: the oldest event's age grows a minute a minute for
+    # twenty-five minutes while its posts fail, then everything is delivered and the
+    # connector is no longer exported at all (a staleness marker, as a scrape
+    # that no longer carries a series writes).
+    interval: 1m
+    input_series:
+      - series: 'claw_delivery_backlog_oldest_age_seconds{queue="remote_events", namespace="primus-claw", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0+60x25 0x20'
+      - series: 'claw_delivery_backlog_oldest_age_seconds{queue="remote_events", namespace="primus-claw", service="primus-claw-api", pod="primus-claw-api-2"}'
+        values: '0+60x25 0x20'
+      - series: 'claw_remote_connector_backlog_age_seconds{connector_id="c-1", namespace="primus-claw", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0+60x25 stale'
+      - series: 'claw_remote_connector_post_failures{connector_id="c-1", side="connector", namespace="primus-claw", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0+2x25 stale'
+      - series: 'claw_remote_connector_post_failures{connector_id="c-1", side="api", namespace="primus-claw", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0+2x25 stale'
+      - series: 'claw_remote_delivery_stalled{namespace="primus-claw", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0x2 1x23 0x20'
+    alert_rule_test:
+      # Ten minutes in (600 s, not over it): nothing yet.
+      - eval_time: 10m
+        alertname: ClawDeliveryBacklogStale
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ClawRemoteConnectorStalled
+        exp_alerts: []
+      # Over 600 s from minute 11, for five minutes: firing at 16.
+      - eval_time: 15m
+        alertname: ClawDeliveryBacklogStale
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: ClawDeliveryBacklogStale
+        exp_alerts:
+          - exp_labels: { severity: warning, queue: remote_events }
+            exp_annotations:
+              summary: "Claw remote_events: the oldest undelivered item has waited 16m 0s"
+              description: "Items in the remote_events queue are not being delivered. See the Claw delivery dashboard; for remote_events, claw_remote_connector_backlog_age_seconds names the connectors."
+      - eval_time: 16m
+        alertname: ClawRemoteConnectorStalled
+        exp_alerts:
+          - exp_labels: { severity: warning, connector_id: c-1 }
+            exp_annotations:
+              summary: "Connector c-1: events not delivered for 16m 0s"
+              description: "The connector's event posts keep failing; its owner has been told in chat. Look at claw_remote_delivery_health for the connector and at the API log for remote_agents.events failures."
+      # Claw's own 5xx: three in a row from minute 2, for ten minutes.
+      - eval_time: 11m
+        alertname: ClawRemoteEventsRefused
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: ClawRemoteEventsRefused
+        exp_alerts:
+          - exp_labels: { severity: warning, connector_id: c-1 }
+            exp_annotations:
+              summary: "Connector c-1: Claw has failed 24 event posts in a row"
+              description: "The API answers this connector's event batches with a server error on every retry. claw_remote_delivery_health.api_last_error says which database error."
+      # Held as stalled from minute 3 for ten minutes.
+      - eval_time: 12m
+        alertname: ClawRemoteDeliveryStalled
+        exp_alerts: []
+      - eval_time: 13m
+        alertname: ClawRemoteDeliveryStalled
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "Claw: 1 connector(s) held as stalled for over ten minutes"
+              description: "The delivery-health sweep holds these connectors' replies as not getting through, and their owners were told."
+      # Twenty-five minutes is not half an hour: max over the two replicas, which
+      # report the same number, not their sum.
+      - eval_time: 25m
+        alertname: ClawDeliveryBacklogStaleCritical
+        exp_alerts: []
+      # Delivered at minute 26: every alert resolves.
+      - eval_time: 27m
+        alertname: ClawDeliveryBacklogStale
+        exp_alerts: []
+      - eval_time: 27m
+        alertname: ClawRemoteConnectorStalled
+        exp_alerts: []
+      - eval_time: 27m
+        alertname: ClawRemoteEventsRefused
+        exp_alerts: []
+      - eval_time: 27m
+        alertname: ClawRemoteDeliveryStalled
+        exp_alerts: []
+
+  - name: "short stalls never fire: nine minutes of backlog, a connector behind but not failing"
+    interval: 1m
+    input_series:
+      - series: 'claw_delivery_backlog_oldest_age_seconds{queue="remote_events", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0+60x9 0x30'
+      # Behind for half an hour while its posts succeed (draining a large backlog): not a stall.
+      - series: 'claw_remote_connector_backlog_age_seconds{connector_id="c-2", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0+60x30'
+      - series: 'claw_remote_connector_post_failures{connector_id="c-2", side="connector", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0x30'
+      # Two 5xx in a row, then fine.
+      - series: 'claw_remote_connector_post_failures{connector_id="c-3", side="api", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '2x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: ClawDeliveryBacklogStale
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ClawRemoteConnectorStalled
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ClawRemoteEventsRefused
+        exp_alerts: []
+
+  - name: "the notification outbox stuck for forty minutes: warning, then critical, then resolved"
+    interval: 1m
+    input_series:
+      - series: 'claw_delivery_backlog_oldest_age_seconds{queue="notification_outbox", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0+60x40 0x10'
+      - series: 'claw_notification_subscription_failures_max{service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0+1x40 0x10'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: ClawDeliveryBacklogStale
+        exp_alerts:
+          - exp_labels: { severity: warning, queue: notification_outbox }
+            exp_annotations:
+              summary: "Claw notification_outbox: the oldest undelivered item has waited 16m 0s"
+              description: "Items in the notification_outbox queue are not being delivered. See the Claw delivery dashboard; for remote_events, claw_remote_connector_backlog_age_seconds names the connectors."
+      - eval_time: 35m
+        alertname: ClawDeliveryBacklogStaleCritical
+        exp_alerts: []
+      - eval_time: 36m
+        alertname: ClawDeliveryBacklogStaleCritical
+        exp_alerts:
+          - exp_labels: { severity: critical, queue: notification_outbox }
+            exp_annotations:
+              summary: "Claw notification_outbox: the oldest undelivered item has waited 36m 0s"
+              description: "Nothing in the notification_outbox queue has got through for over half an hour."
+      # Twenty failures in a row from minute 20, for ten minutes.
+      - eval_time: 29m
+        alertname: ClawNotificationSubscriptionFailing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: ClawNotificationSubscriptionFailing
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "Claw: a notification subscription has failed 30 deliveries in a row"
+              description: "A receiver (the chat bot) is not taking notifications. It is disabled after 24 hours of failures; see claw_notification_subscriptions."
+      - eval_time: 42m
+        alertname: ClawDeliveryBacklogStaleCritical
+        exp_alerts: []
+      - eval_time: 42m
+        alertname: ClawNotificationSubscriptionFailing
+        exp_alerts: []
+
+  - name: "the event consumer retrying one message, and the events route failing for everyone"
+    interval: 1m
+    input_series:
+      - series: 'claw_api_event_redelivery_oldest_age_seconds{service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0+60x20 0x10'
+      # Another replica retrying nothing: max(), not this one's zero, decides.
+      - series: 'claw_api_event_redelivery_oldest_age_seconds{service="primus-claw-api", pod="primus-claw-api-2"}'
+        values: '0x30'
+      # 10 batches a minute; from minute 5 on, half of them fail.
+      - series: 'claw_remote_events_post_total{outcome="ok", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0+10x5 50+5x25'
+      - series: 'claw_remote_events_post_total{outcome="server_error", service="primus-claw-api", pod="primus-claw-api-1"}'
+        values: '0x5 0+5x25'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ClawEventConsumerRedeliveryStuck
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: ClawEventConsumerRedeliveryStuck
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "Claw event consumer: one message redelivered for 16m 0s"
+              description: "The api-consumer keeps naking a message. Search the API log for event-consumer errors on the session it names."
+      - eval_time: 23m
+        alertname: ClawEventConsumerRedeliveryStuck
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: ClawRemoteEventsFailureRate
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: ClawRemoteEventsFailureRate
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "Claw: 50% of connector event batches fail"
+              description: "The remote-agents events route is failing for many connectors at once."

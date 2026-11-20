@@ -54,6 +54,7 @@ import { redactStoredText, redactStoredValue } from "@claw/utils";
 import pino from "pino";
 import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
 import { metrics, type EventQuarantineReason } from "../infra/metrics.js";
+import { trackDelivery } from "./redelivery.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
@@ -201,7 +202,7 @@ export async function startEventConsumer(opts: { signal?: AbortSignal } = {}): P
     // `consumeEventDelivery` answers every delivery itself and does not throw;
     // were it ever to, this loop must not end with it, since every session's
     // events would stop with the one that threw.
-    await consumeEventDelivery(msg).catch((err) => {
+    await consumeEventDelivery(trackDelivery(msg)).catch((err) => {
       logger.error({ err: (err as Error)?.message, seq: msg.seq }, "event-consumer.delivery_threw");
     });
   }
