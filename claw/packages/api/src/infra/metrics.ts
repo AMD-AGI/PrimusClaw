@@ -569,6 +569,24 @@ export const metrics = {
     runDispatchHeldTotal.inc({ cause });
   },
 
+  /** Where the delivery gauges read their numbers from; null stops reading (a test, or a process going down). */
+  setDeliverySampler(sampler: (() => Promise<DeliverySample | null>) | null): void {
+    deliverySampler = sampler;
+    deliverySampled = null;
+  },
+  onRemoteEventsPost(outcome: RemoteEventsPostOutcome): void {
+    remoteEventsPostTotal.inc({ outcome });
+  },
+  onEventRedelivered(): void {
+    eventRedeliveredTotal.inc();
+  },
+  setRedeliveryOldestAge(read: () => number): void {
+    redeliveryOldestAge = read;
+  },
+  onDeliveryStallNotice(kind: DeliveryNoticeKind, outcome: DeliveryNoticeOutcome): void {
+    deliveryStallNoticesTotal.inc({ kind, outcome });
+  },
+
   onRunClaim(mode: ClaimMode, outcome: ClaimOutcome): void {
     runClaimTotal.inc({ mode, outcome });
   },
@@ -635,22 +653,5 @@ export const metrics = {
   },
   onUserSkillSave(op: "create" | "update" | "draft" | "delete" | "disable" | "enable" | "undo", outcome: string): void {
     userSkillSaveTotal.inc({ op, outcome });
-  },
-  /** Where the delivery gauges read their numbers from; null stops reading (a test, or a process going down). */
-  setDeliverySampler(sampler: (() => Promise<DeliverySample | null>) | null): void {
-    deliverySampler = sampler;
-    deliverySampled = null;
-  },
-  onRemoteEventsPost(outcome: RemoteEventsPostOutcome): void {
-    remoteEventsPostTotal.inc({ outcome });
-  },
-  onEventRedelivered(): void {
-    eventRedeliveredTotal.inc();
-  },
-  setRedeliveryOldestAge(read: () => number): void {
-    redeliveryOldestAge = read;
-  },
-  onDeliveryStallNotice(kind: DeliveryNoticeKind, outcome: DeliveryNoticeOutcome): void {
-    deliveryStallNoticesTotal.inc({ kind, outcome });
   },
 };

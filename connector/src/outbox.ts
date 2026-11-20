@@ -20,7 +20,7 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { REMOTE_AGENT_LIMITS } from "./protocol.js";
+import { REMOTE_AGENT_LIMITS, REMOTE_OUTBOX_REPORT_MAX_SESSIONS } from "./protocol.js";
 import { DiskQueue, writeWhole, type WriteReport } from "./statefile.js";
 
 export interface OutEvent {
@@ -75,7 +75,7 @@ export class Outbox {
   private readonly bytes = new Map<string, number>();
   private readonly closed = new Set<string>();
   /**
-   * When each event was queued in this run (`now()`), for how long the oldest has waited ({@link report}). An event loaded from
+   * When each event was queued in this run (`now()`), for how long the oldest has waited ({@link backlog}). An event loaded from
    * disk counts from when this run started: its `ts` is when the agent said it, which can be long before it was queued.
    */
   private readonly queuedAt = new WeakMap<OutEvent, number>();
@@ -238,25 +238,11 @@ export class Outbox {
     await writeWhole(this.eventsFile(sessionId), mine.map((e) => JSON.stringify(e) + "\n").join(""));
   }
 
-  /** The oldest events not yet acknowledged, in the order they were appended, up to the first not yet written. */
-  pending(max: number): OutEvent[] {
-    const out: OutEvent[] = [];
-    for (const ev of this.queue) {
-      if (out.length >= max || this.unwritten.has(ev)) break;
-      out.push(ev);
-    }
-    return out;
-  }
-
-  get size(): number {
-    return this.queue.length;
-  }
-
   /**
    * How long what is queued has waited: the oldest event overall, and per session (the longest waiting first, at most
    * `maxSessions`). Every event counts, written or not: a reply stuck behind a slow disk is as late as one stuck behind Claw.
    */
-  backlog(maxSessions: number): { pending: number; oldestAgeMs: number; sessions: Array<{ sessionId: string; pending: number; oldestAgeMs: number }> } {
+  backlog(maxSessions: number = REMOTE_OUTBOX_REPORT_MAX_SESSIONS): { pending: number; oldestAgeMs: number; sessions: Array<{ sessionId: string; pending: number; oldestAgeMs: number }> } {
     const now = this.now();
     const bySession = new Map<string, { pending: number; oldest: number }>();
     let oldest = now;
@@ -272,6 +258,20 @@ export class Outbox {
       .sort((a, b) => b.oldestAgeMs - a.oldestAgeMs || (a.sessionId < b.sessionId ? -1 : 1))
       .slice(0, maxSessions);
     return { pending: this.queue.length, oldestAgeMs: Math.max(0, now - oldest), sessions };
+  }
+
+  /** The oldest events not yet acknowledged, in the order they were appended, up to the first not yet written. */
+  pending(max: number): OutEvent[] {
+    const out: OutEvent[] = [];
+    for (const ev of this.queue) {
+      if (out.length >= max || this.unwritten.has(ev)) break;
+      out.push(ev);
+    }
+    return out;
+  }
+
+  get size(): number {
+    return this.queue.length;
   }
 
   /** The server stored everything up to `acked[session]`. */

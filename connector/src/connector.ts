@@ -28,7 +28,7 @@ import { cursorConfigDir } from "./cursor-approvals.js";
 import {
   childrenFile, identityFile, identityKeepFile, logDir, outboxDir, pauseFile, pidFile, sessionsFile, type Dirs,
 } from "./paths.js";
-import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_OUTBOX_REPORT_MAX_SESSIONS, type RemoteAgentDescriptor } from "./protocol.js";
+import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, type RemoteAgentDescriptor } from "./protocol.js";
 import { redactDeep } from "./redact.js";
 import { DEFAULT_SESSION_TIMING, type SessionEnv, type SessionTiming } from "./session.js";
 import { SessionStore } from "./session-store.js";
@@ -411,10 +411,6 @@ export class Connector {
   private hbSince: number | null = null;
   /** The heartbeat in flight was seen late (`tick`). */
   private hbLate = false;
-  /** Posts of events that failed in a row, since when (wall clock, ms), and how the last one failed: told with every heartbeat. */
-  private postFailures = 0;
-  private postFailingSince = 0;
-  private postLastError: string | null = null;
   /** connector.json, written off the event loop: a heartbeat never waits for the disk (see statefile.ts). */
   private readonly identityOut: SnapshotFile;
 
@@ -665,11 +661,11 @@ export class Connector {
    * Claw tells the owner when their replies are stuck, and alerts its operators, from this.
    */
   private outboxReport(): Record<string, unknown> {
-    const b = this.outbox.backlog(REMOTE_OUTBOX_REPORT_MAX_SESSIONS);
+    const b = this.outbox.backlog();
+    const posts = this.d.client.postHealth();
     return {
       pending: b.pending, oldest_age_ms: b.oldestAgeMs,
-      failures: this.postFailures, failing_ms: this.postFailures ? Math.max(0, Date.now() - this.postFailingSince) : 0,
-      last_error: this.postFailures ? this.postLastError : null,
+      failures: posts.failures, failing_ms: posts.failingMs, last_error: posts.lastError,
       sessions: b.sessions.map((s) => ({ session_id: s.sessionId, pending: s.pending, oldest_age_ms: s.oldestAgeMs })),
     };
   }
@@ -933,14 +929,10 @@ export class Connector {
           this.d.audit.record("event_rejected", { session_id: ev.session_id, seq: ev.seq, type: ev.type, reason: r.reason });
         }
         failures = 0;
-        this.postFailures = 0;
-        this.postLastError = null;
       } catch (e) {
         if (this.isRevocation(e)) return void (await this.onRevoked(e));
         this.noteOutage(e);
         failures++;
-        if (this.postFailures++ === 0) this.postFailingSince = Date.now();
-        this.postLastError = e instanceof HttpError ? `http_${e.status}` : e instanceof TransportError ? "network" : "error";
         this.d.log.warn("posting events failed; will retry", { error: errMessage(e), pending: this.outbox.size });
         await sleep(backoffMs(failures - 1, this.timing.backoffMinMs, this.timing.backoffMaxMs), this.ctl.signal);
       }

@@ -99,8 +99,30 @@ export class ClawClient {
     return this.json("POST", `/v1/remote-agents/connectors/${cid}/heartbeat`, hb);
   }
 
+  /**
+   * Event posts that failed in a row, since when (wall clock, ms), and how the last one failed (`http_<status>`, `network` or
+   * `error`): what the heartbeat reports (`outbox`), so Claw can tell the owner their replies are stuck. A post that carries no
+   * event (a probe) counts neither way.
+   */
+  private posts = { failures: 0, since: 0, lastError: null as string | null };
+
+  postHealth(): { failures: number; failingMs: number; lastError: string | null } {
+    const p = this.posts;
+    return { failures: p.failures, failingMs: p.failures ? Math.max(0, Date.now() - p.since) : 0, lastError: p.failures ? p.lastError : null };
+  }
+
   async postEvents(cid: string, batchId: string, events: OutEvent[]): Promise<EventsAck> {
-    const d = await this.json("POST", `/v1/remote-agents/connectors/${cid}/events`, { batch_id: batchId, events });
+    let d: Record<string, unknown>;
+    try {
+      d = await this.json("POST", `/v1/remote-agents/connectors/${cid}/events`, { batch_id: batchId, events });
+    } catch (e) {
+      if (events.length) {
+        if (this.posts.failures++ === 0) this.posts.since = Date.now();
+        this.posts.lastError = e instanceof HttpError ? `http_${e.status}` : e instanceof RevokedError ? "http_401" : e instanceof TransportError ? "network" : "error";
+      }
+      throw e;
+    }
+    if (events.length) this.posts = { failures: 0, since: 0, lastError: null };
     return { acked: (isObject(d.acked) ? d.acked : {}) as Record<string, number>, rejected: (Array.isArray(d.rejected) ? d.rejected : []) as EventsAck["rejected"] };
   }
 
