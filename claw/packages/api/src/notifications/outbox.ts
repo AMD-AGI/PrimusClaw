@@ -14,12 +14,20 @@
  * skill-evolution worker, so any number of replicas can run the loop. A claim
  * pushes `next_attempt_at` a lease into the future, which is what makes a
  * replica that dies mid-send hand the row back instead of stranding it.
+ *
+ * Order is not a promise across claims: each process sends the rows it claimed
+ * in id order per subscription, but two replicas can claim different rows of one
+ * subscription at the same moment and send them side by side, and a row that
+ * failed goes again after rows written later. A receiver that needs an order
+ * reads it from the event (`occurred_at`), not from when the event arrived.
  */
 import { createHash, randomUUID } from "node:crypto";
 import pino from "pino";
+import { storableJson, storableText } from "@claw/utils";
 import { NOTIFY_LINK_BASE, NOTIFY_MIN_RUN_SECONDS, NOTIFY_WEBHOOK_ALLOWED_HOSTS } from "../config.js";
 import { decryptUserEnvValue } from "../crypto/user-env.js";
 import { db, type Querier } from "../infra/db.js";
+import { metrics, type NotificationOutboxHealth } from "../infra/metrics.js";
 import { redactPublicJson } from "../events/redaction.js";
 import { approvalTarget, redactCommandSecrets } from "./approval-target.js";
 import type { NotificationEventType, NotificationPayload, OutboundPayload } from "@claw/protocol";
@@ -49,6 +57,26 @@ export const GIVE_UP_AFTER_HOURS = 24;
  * down for a few hours loses nothing.
  */
 export const SUBSCRIPTION_DISABLE_AFTER_HOURS = GIVE_UP_AFTER_HOURS;
+/**
+ * How many times the receiver may refuse a row (`refusedForGood`) while it keeps taking the subscription's other rows before the
+ * row is quarantined. Each such failure is one after which the receiver delivered something else (`recordFailure`), so a
+ * receiver that is down -- which takes nothing -- never quarantines a row, and nor does one that refuses everything (a wrong
+ * secret): the retry window above is what covers those. A row refused five times in between the receiver's successes is one the
+ * receiver cannot take, and retrying it for the rest of the day sends the same doomed request every five minutes.
+ *
+ * Only a refusal counts, never a 5xx, a timeout or a connection error. The personal agent answers 503 for an event it cannot
+ * take *yet* while it takes the others: a run's end while that chat's turn is still answering (`turn_in_progress`, for up to
+ * the turn's 32-minute deadline), a copy another worker is sending (`in_progress`), a send to the chat that failed
+ * (`send_failed`) -- `personal-agent/packages/runtime/src/http/claw-events.ts`. Counted, such a row was quarantined in under a
+ * minute of a busy chat, and the person never heard how their run ended. A 5xx row keeps the retry window.
+ */
+export const QUARANTINE_AFTER_ISOLATED_FAILURES = 5;
+/**
+ * A receiver's answer that this event can never be processed (a body it cannot render, a card the chat refuses): the row is
+ * quarantined at once instead of retried. Unlike 410 the event is kept as a record of what was not delivered.
+ */
+export const UNPROCESSABLE_STATUS = 422;
+
 /** Longer than the slowest group of sequential sends in one claimed batch. */
 const CLAIM_LEASE_SECONDS = 120;
 const CLAIM_BATCH = 10;
@@ -164,13 +192,17 @@ export async function enqueue(
   hold?: { status: string; seconds: number },
 ): Promise<number> {
   let written = 0;
+  // What the database cannot store -- a NUL, a lone surrogate, in text a run or a model produced -- would fail this insert, and
+  // the caller's whole transaction with it, every time it is retried (`@claw/utils` storableJson): each becomes U+FFFD instead.
+  const body = JSON.stringify(storableJson(payload));
+  const holdStatus = hold?.status === undefined ? null : storableText(hold.status);
   for (const sub of subs) {
     // A held row is not due until `seconds` from now, and says so in `last_status` (`assistant/say-hold.ts`): whoever holds it
     // releases it (due now) or drops it before then.
     const r = await q(
       `INSERT INTO claw_notification_outbox (event_id, subscription_id, payload, next_attempt_at, last_status)
        VALUES ($1, $2, $3::jsonb, NOW() + make_interval(secs => $4), $5) ON CONFLICT (event_id, subscription_id) DO NOTHING`,
-      [eventId, sub.subscription_id, JSON.stringify(payload), hold?.seconds ?? 0, hold?.status ?? null],
+      [storableText(eventId), sub.subscription_id, body, hold?.seconds ?? 0, holdStatus],
     );
     written += r.rowCount ?? 0;
   }
@@ -354,6 +386,16 @@ async function claimDue(): Promise<Claimed[]> {
   )).rows;
 }
 
+/**
+ * A failure that is the receiver refusing this request, on purpose and the same way every time it is sent: a 4xx other than
+ * 408 and 429 (which ask for a retry). The personal agent answers 400 to a body it cannot read and 413 to one too large; it
+ * answers 4xx for nothing that could pass. Only these count towards a row's quarantine (`QUARANTINE_AFTER_ISOLATED_FAILURES`).
+ */
+export function refusedForGood(status: string): boolean {
+  const code = /^http_(4\d\d)$/.exec(status)?.[1];
+  return code !== undefined && code !== "408" && code !== "429";
+}
+
 /** A failure that says the receiver is not there (yet) rather than that it refuses: what the probe retries soon. */
 export function receiverDown(status: string): boolean {
   if (status.startsWith("error:")) return true;
@@ -378,17 +420,44 @@ async function releaseWaiting(subscriptionId: string): Promise<number> {
   return r.rowCount ?? 0;
 }
 
+/**
+ * Set a row aside for good: never claimed again (`dropped_at`), and marked `quarantined_at` so it stays the record of an event
+ * that was not delivered, with its payload, for a person to look at or send again (clear both columns). The log line says which
+ * row and why, never what it carries.
+ */
+async function quarantine(row: Claimed, status: string, reason: QuarantineReason, isolatedFailures: number): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_notification_outbox SET quarantined_at = NOW(), dropped_at = NOW(), last_status = $2
+      WHERE id = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
+    [row.id, status],
+  );
+  if ((r.rowCount ?? 0) === 0) return false;
+  metrics.onNotificationQuarantined(reason);
+  logger.warn({
+    eventId: row.event_id, subscriptionId: row.subscription_id, type: row.payload?.type, status, reason,
+    attempts: row.attempts, isolatedFailures,
+  }, "notification.quarantined");
+  return true;
+}
+
+export type QuarantineReason = "unprocessable" | "isolated_failures";
+
 async function recordFailure(row: Claimed, status: string): Promise<void> {
+  status = storableText(status);
   if (row.expired) {
     await db.query(
-      `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = $2 WHERE id = $1`,
+      `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = $2, last_failed_at = NOW() WHERE id = $1`,
       [row.id, status],
     );
+    metrics.onNotificationDelivery("dropped_expired");
     logger.warn({ eventId: row.event_id, subscriptionId: row.subscription_id, status }, "notification.dropped_after_retries");
   } else {
     const backoff = RETRY_BACKOFF_SECONDS[Math.min(row.attempts - 1, RETRY_BACKOFF_SECONDS.length - 1)];
     // The subscription's probe (`PROBE_SECONDS`): its oldest row that has been tried and is still pending, when the receiver is down.
-    await db.query(
+    // A refusal is the row's own when the receiver delivered another of the subscription's rows since this row last failed: the
+    // receiver works, and it is this event it refuses. The first failure is never counted (there is no "since" yet), and a
+    // failure that is not a refusal (`refusedForGood`) never is: the receiver may take the row on a later try.
+    const updated = (await db.query(
       `UPDATE claw_notification_outbox o
           SET next_attempt_at = NOW() + make_interval(secs => CASE
                 WHEN $4::boolean AND NOT EXISTS (
@@ -396,10 +465,23 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
                    WHERE p.subscription_id = o.subscription_id AND p.id < o.id
                      AND p.delivered_at IS NULL AND p.dropped_at IS NULL AND p.attempts > 0)
                 THEN LEAST($2::int, $5::int) ELSE $2::int END),
-              last_status = $3
-        WHERE o.id = $1`,
-      [row.id, backoff, status, receiverDown(status), PROBE_SECONDS],
-    );
+              last_status = $3,
+              isolated_failures = o.isolated_failures + CASE
+                WHEN $6::boolean AND o.last_failed_at IS NOT NULL AND (
+                  SELECT s.last_delivered_at FROM claw_notification_subscriptions s WHERE s.subscription_id = o.subscription_id
+                ) > o.last_failed_at THEN 1 ELSE 0 END,
+              last_failed_at = NOW()
+        WHERE o.id = $1
+        RETURNING o.isolated_failures`,
+      [row.id, backoff, status, receiverDown(status), PROBE_SECONDS, refusedForGood(status)],
+    )).rows[0] as { isolated_failures: number } | undefined;
+    const isolated = Number(updated?.isolated_failures ?? 0);
+    // Not a failure of the subscription: the receiver took another row since this one last failed, which ended the streak, and
+    // this row's last failure is not added to it.
+    if (isolated >= QUARANTINE_AFTER_ISOLATED_FAILURES && await quarantine(row, status, "isolated_failures", isolated)) {
+      return;
+    }
+    metrics.onNotificationDelivery("failed");
   }
   const sub = (await db.query(
     `UPDATE claw_notification_subscriptions
@@ -441,6 +523,7 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
         `UPDATE claw_notification_outbox SET dropped_at = NOW(), last_status = 'subscription_gone' WHERE id = $1`,
         [row.id],
       );
+      metrics.onNotificationDelivery("dropped_subscription_gone");
       return;
     }
     let status = "";
@@ -468,6 +551,12 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
             `UPDATE claw_notification_outbox SET delivered_at = NOW(), last_status = $2 WHERE id = $1`,
             [row.id, String(code)],
           );
+          // What tells a later failure of another row that the receiver works (`recordFailure`).
+          await db.query(
+            "UPDATE claw_notification_subscriptions SET last_delivered_at = NOW() WHERE subscription_id = $1",
+            [row.subscription_id],
+          );
+          metrics.onNotificationDelivery("delivered");
           const recovered = await db.query(
             `UPDATE claw_notification_subscriptions
                 SET consecutive_failures = 0, failing_since = NULL,
@@ -494,6 +583,14 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
             [row.id],
           );
           logger.warn({ eventId: row.event_id, subscriptionId: row.subscription_id }, "notification.dropped_gone");
+          metrics.onNotificationDelivery("dropped_gone");
+          failed += 1;
+          return;
+        }
+        if (code === UNPROCESSABLE_STATUS) {
+          // The receiver works and says this event is one it can never take: set aside now, not retried for a day. Not a
+          // failure of the subscription, for the reason 410 is not.
+          await quarantine(row, `http_${code}`, "unprocessable", 0);
           failed += 1;
           return;
         }
@@ -506,10 +603,13 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
     await recordFailure(row, status);
   };
   // One receiver's slowness must not hold up the others: each subscription's rows
-  // are sent in order, and the subscriptions run side by side.
+  // are sent one after another, and the subscriptions run side by side.
   await sweepOrphans();
   const bySub = new Map<string, Claimed[]>();
-  for (const row of await claimDue()) {
+  // This claim's rows in the order they were written: `UPDATE ... RETURNING` hands them back in no particular order. Within one
+  // claim only -- another replica may hold other rows of the subscription (see the top of this file).
+  const claimed = (await claimDue()).sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0));
+  for (const row of claimed) {
     const list = bySub.get(row.subscription_id) ?? [];
     list.push(row);
     bySub.set(row.subscription_id, list);
@@ -518,6 +618,34 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
     for (const row of rows) await sendOne(row);
   }));
   return { delivered, failed };
+}
+
+/**
+ * The outbox's state as the metrics read it at a scrape (`metrics.setNotificationOutboxReader`): read from the table, not
+ * counted by the delivery loop, so a loop that stopped -- the stall these exist to show -- cannot freeze them. Rows of a
+ * deleted subscription are not pending here: they wait for their owner's next subscription (`adoptOrphanedRows`).
+ */
+export async function readOutboxHealth(): Promise<NotificationOutboxHealth> {
+  const row = (await db.query(
+    `SELECT
+       (SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at))), 0)::float8 FROM claw_notification_outbox
+         WHERE delivered_at IS NULL AND dropped_at IS NULL AND subscription_id IS NOT NULL) AS oldest_pending_age_seconds,
+       (SELECT COUNT(*)::int FROM claw_notification_outbox
+         WHERE delivered_at IS NULL AND dropped_at IS NULL AND subscription_id IS NOT NULL) AS pending,
+       (SELECT COALESCE(MAX(consecutive_failures), 0)::int FROM claw_notification_subscriptions WHERE enabled) AS max_consecutive_failures,
+       (SELECT COUNT(*)::int FROM claw_notification_subscriptions WHERE enabled AND consecutive_failures > 0) AS failing_subscriptions`,
+  )).rows[0] as Record<string, unknown>;
+  return {
+    oldestPendingAgeSeconds: Math.max(0, Number(row.oldest_pending_age_seconds)),
+    pending: Number(row.pending),
+    maxConsecutiveFailures: Number(row.max_consecutive_failures),
+    failingSubscriptions: Number(row.failing_subscriptions),
+  };
+}
+
+/** Where the outbox gauges read from, in a process that has the tables (`CLAW_NOTIFICATIONS_ENABLED`). */
+export function registerNotificationMetrics(): void {
+  metrics.setNotificationOutboxReader(readOutboxHealth);
 }
 
 export function newSubscriptionId(): string {

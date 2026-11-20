@@ -46,7 +46,9 @@ import { registerTriggerMcpRoutes } from "./triggers/mcp.js";
 import { assertTriggerToolsConfig } from "./triggers/token.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
 import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
-import { deliverNotificationsOnRequest, startNotificationWorker, stopNotificationDelivery } from "./notifications/outbox.js";
+import {
+  deliverNotificationsOnRequest, registerNotificationMetrics, startNotificationWorker, stopNotificationDelivery,
+} from "./notifications/outbox.js";
 import { registerAssistantDeliveryHook } from "./assistant/outbound.js";
 import { registerHoldDeliveryHook } from "./assistant/holds.js";
 import { a2aPushEnabled } from "./routes/a2a-flags.js";
@@ -441,6 +443,8 @@ async function main() {
   // Scheduled triggers: nothing is registered unless the deployment turns them on.
   if (CLAW_TRIGGERS_ENABLED) await registerTriggerRoutes(app);
 
+  // The outbox gauges read the table, so every replica that has it reports them, whether or not it delivers.
+  if (CLAW_NOTIFICATIONS_ENABLED) registerNotificationMetrics();
   // The assistant's messages go out through the same outbox, so both switches have to be on. Hooks, not loops: they run
   // when this process delivers, which with CLAW_API_BACKGROUND=off it does not.
   if (CLAW_NOTIFICATIONS_ENABLED && CLAW_ASSISTANT_ENABLED) registerAssistantDeliveryHook();

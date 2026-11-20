@@ -1,0 +1,88 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# The alerts of notification-outbox.rules.yaml against the PromQL engine: each fires once on the shape it is for, across
+# two replicas reporting the same table, and is gone when that shape clears.
+#
+#   run with: promtool test rules claw/deploy/promql/notification-outbox.test.yaml
+
+rule_files:
+  - notification-outbox.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - name: "a stall fires one alert after 15 minutes plus 5, and clears when the backlog is delivered"
+    interval: 1m
+    input_series:
+      # Both replicas read the same table. Healthy for 10 minutes, then a row waits and ages one minute a minute for
+      # 30 minutes, then everything is delivered.
+      - series: 'claw_notification_outbox_oldest_pending_age_seconds{namespace="primus-claw", pod="claw-api-1"}'
+        values: '0x9 0+60x29 0x20'
+      - series: 'claw_notification_outbox_oldest_pending_age_seconds{namespace="primus-claw", pod="claw-api-2"}'
+        values: '0x9 0+60x29 0x20'
+    alert_rule_test:
+      # 10 minutes in: nothing waits.
+      - eval_time: 10m
+        alertname: ClawNotificationOutboxStalled
+        exp_alerts: []
+      # 25 minutes in: the row has waited 900 s, not more: not yet.
+      - eval_time: 25m
+        alertname: ClawNotificationOutboxStalled
+        exp_alerts: []
+      # 28 minutes in: past 900 s for 2 minutes, pending for "for".
+      - eval_time: 28m
+        alertname: ClawNotificationOutboxStalled
+        exp_alerts: []
+      # 32 minutes in: past 900 s for more than 5 minutes: one alert, not one per replica.
+      - eval_time: 32m
+        alertname: ClawNotificationOutboxStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Claw notifications are not being delivered"
+              description: >-
+                The oldest notification still to be delivered has waited 22m 0s. Check the
+                receiver of the failing subscription (claw_notification_subscriptions_failing,
+                claw_notification_subscription_consecutive_failures) and claw-api's "notification." log lines.
+      # 41 minutes in: delivered: resolved.
+      - eval_time: 41m
+        alertname: ClawNotificationOutboxStalled
+        exp_alerts: []
+
+  - name: "a quarantined notification fires one warning, which clears an hour later"
+    interval: 1m
+    input_series:
+      - series: 'claw_notification_quarantined_total{namespace="primus-claw", pod="claw-api-1", reason="isolated_failures"}'
+        values: '0x10 1x100'
+      - series: 'claw_notification_quarantined_total{namespace="primus-claw", pod="claw-api-2", reason="unprocessable"}'
+        values: '0x110'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ClawNotificationQuarantined
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ClawNotificationQuarantined
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "A Claw notification was quarantined"
+              description: >-
+                At least one notification was quarantined in the last hour. Look for "notification.quarantined" in claw-api's
+                log for the event and the receiver's answer, and at the receiver's log for why it cannot take it.
+      # Still within the hour: still firing, so it is not missed between two looks.
+      - eval_time: 50m
+        alertname: ClawNotificationQuarantined
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "A Claw notification was quarantined"
+              description: >-
+                At least one notification was quarantined in the last hour. Look for "notification.quarantined" in claw-api's
+                log for the event and the receiver's answer, and at the receiver's log for why it cannot take it.
+      - eval_time: 80m
+        alertname: ClawNotificationQuarantined
+        exp_alerts: []

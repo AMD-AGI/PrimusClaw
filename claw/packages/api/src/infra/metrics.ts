@@ -361,6 +361,93 @@ const identityClientEnabled = new Gauge({
   registers: [registry],
 });
 
+// ─── Outbound notifications (notifications/outbox.ts) ─────────────────
+// What became of each delivery attempt. `failed` is a row that will be tried again; the `dropped_*` and `quarantined`
+// outcomes are the ones it will not.
+export type NotificationDeliveryOutcome =
+  | "delivered" | "failed" | "quarantined" | "dropped_gone" | "dropped_expired" | "dropped_subscription_gone";
+const notificationDeliveryTotal = new Counter({
+  name: "claw_notification_delivery_total",
+  help: "Outbound notification delivery attempts, by outcome.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+// The one to alert on: an event a person was owed and did not get, set aside because the receiver works and cannot take it
+// (`unprocessable`: it answered 422) or kept refusing it (4xx) while it took everything else (`isolated_failures`).
+const notificationQuarantinedTotal = new Counter({
+  name: "claw_notification_quarantined_total",
+  help: "Outbound notifications quarantined instead of retried, by reason.",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+const notificationReadFailedTotal = new Counter({
+  name: "claw_notification_outbox_read_failed_total",
+  help: "Scrapes whose read of the notification outbox failed; the outbox gauges then keep their last value.",
+  registers: [registry],
+});
+
+export interface NotificationOutboxHealth {
+  oldestPendingAgeSeconds: number;
+  pending: number;
+  maxConsecutiveFailures: number;
+  failingSubscriptions: number;
+}
+let notificationOutboxReader: (() => Promise<NotificationOutboxHealth>) | null = null;
+let notificationOutboxRead: { at: number; reading: Promise<NotificationOutboxHealth | null> } | null = null;
+/** One read of the table per scrape, shared by the gauges below (each collects on its own). */
+function readNotificationOutbox(): Promise<NotificationOutboxHealth | null> {
+  const reader = notificationOutboxReader;
+  if (!reader) return Promise.resolve(null);
+  const now = Date.now();
+  if (notificationOutboxRead && now - notificationOutboxRead.at < 1000) return notificationOutboxRead.reading;
+  const reading = reader().catch(() => {
+    notificationReadFailedTotal.inc();
+    return null;
+  });
+  notificationOutboxRead = { at: now, reading };
+  return reading;
+}
+// The stall gauge: how long the oldest notification still to be delivered has waited. A receiver that is down, a delivery
+// loop that stopped, a row retried without end -- each shows here, whatever the loop itself believes.
+const notificationOldestPendingAge = new Gauge({
+  name: "claw_notification_outbox_oldest_pending_age_seconds",
+  help: "Age of the oldest outbound notification not yet delivered, dropped or quarantined (0 when none).",
+  registers: [registry],
+  async collect() {
+    const r = await readNotificationOutbox();
+    if (r) this.set(r.oldestPendingAgeSeconds);
+  },
+});
+const notificationPending = new Gauge({
+  name: "claw_notification_outbox_pending",
+  help: "Outbound notifications not yet delivered, dropped or quarantined.",
+  registers: [registry],
+  async collect() {
+    const r = await readNotificationOutbox();
+    if (r) this.set(r.pending);
+  },
+});
+const notificationConsecutiveFailures = new Gauge({
+  name: "claw_notification_subscription_consecutive_failures",
+  help: "The longest run of failed deliveries without a success, over the enabled notification subscriptions.",
+  registers: [registry],
+  async collect() {
+    const r = await readNotificationOutbox();
+    if (r) this.set(r.maxConsecutiveFailures);
+  },
+});
+const notificationFailingSubscriptions = new Gauge({
+  name: "claw_notification_subscriptions_failing",
+  help: "Enabled notification subscriptions whose last delivery failed.",
+  registers: [registry],
+  async collect() {
+    const r = await readNotificationOutbox();
+    if (r) this.set(r.failingSubscriptions);
+  },
+});
+// (registered by construction; nothing else refers to them)
+void [notificationOldestPendingAge, notificationPending, notificationConsecutiveFailures, notificationFailingSubscriptions];
+
 // A marker ahead of the clock is pod skew, not a negative wait, so it clamps
 // to zero rather than entering the first bucket as a measurement nobody took.
 function sojournSeconds(markerIso: string | null | undefined): number | null {
@@ -493,6 +580,18 @@ export const metrics = {
   },
   onUserSkillRead(role: "router", outcome: "ok" | "not_found" | "not_here"): void {
     userSkillReadTotal.inc({ role, outcome });
+  },
+  onNotificationDelivery(outcome: NotificationDeliveryOutcome): void {
+    notificationDeliveryTotal.inc({ outcome });
+  },
+  onNotificationQuarantined(reason: "unprocessable" | "isolated_failures"): void {
+    notificationQuarantinedTotal.inc({ reason });
+    notificationDeliveryTotal.inc({ outcome: "quarantined" });
+  },
+  /** Set by a process that has the outbox tables; until then the outbox gauges read 0. */
+  setNotificationOutboxReader(reader: (() => Promise<NotificationOutboxHealth>) | null): void {
+    notificationOutboxReader = reader;
+    notificationOutboxRead = null;
   },
   onUserSkillSave(op: "create" | "update" | "draft" | "delete" | "disable" | "enable" | "undo", outcome: string): void {
     userSkillSaveTotal.inc({ op, outcome });

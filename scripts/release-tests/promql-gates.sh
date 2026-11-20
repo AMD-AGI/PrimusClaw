@@ -52,3 +52,6 @@ command -v "$promtool" >/dev/null 2>&1 || {
 }
 
 "$promtool" test rules "$repo_root/claw/deploy/promql/rollout-gates.test.yaml"
+# The notification outbox alerts: they fire on a stall and on a quarantine, once, and clear.
+"$promtool" check rules "$repo_root/claw/deploy/promql/notification-outbox.rules.yaml"
+"$promtool" test rules "$repo_root/claw/deploy/promql/notification-outbox.test.yaml"
