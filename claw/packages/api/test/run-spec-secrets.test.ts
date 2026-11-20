@@ -161,6 +161,9 @@ test("an unreadable pending blob ends that turn instead of wedging the drain", a
   const originalPublish = pendingDispatchPorts.publishSessionEvent;
   const events: Array<Record<string, unknown>> = [];
   pendingDispatchPorts.publishSessionEvent = async (_s, e) => { events.push(e); };
+  const { pendingQuarantinePorts } = await import("../src/tasks/pending-quarantine.js");
+  const originalProbe = pendingQuarantinePorts.natsStreamsAnswer;
+  pendingQuarantinePorts.natsStreamsAnswer = async () => true;
   try {
     const task: Record<string, unknown> = { prompt: "hi" };
     const ok = await applyPendingCredentials(
@@ -177,6 +180,7 @@ test("an unreadable pending blob ends that turn instead of wedging the drain", a
   } finally {
     db.query = originalQuery;
     pendingDispatchPorts.publishSessionEvent = originalPublish;
+    pendingQuarantinePorts.natsStreamsAnswer = originalProbe;
   }
 });
 

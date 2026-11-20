@@ -35,7 +35,9 @@ import pino from "pino";
 import { envInt } from "../config.js";
 import { db, PENDING_QUARANTINE_TABLE } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
-import { EVENT_STREAM_DUPLICATE_WINDOW_MS, natsUnreachable, publishCertainlyFailed } from "../infra/nats.js";
+import {
+  EVENT_STREAM_DUPLICATE_WINDOW_MS, natsStreamsAnswer, natsUnreachable, publishCertainlyFailed,
+} from "../infra/nats.js";
 import { completionAlreadyPublished } from "../events/store.js";
 import { queuedMessageId } from "./chat-run.js";
 import { PENDING_DRAIN_QUARANTINED, publishRefusedTurn } from "./pending-dispatch.js";
@@ -55,9 +57,10 @@ export const PENDING_DRAIN_FAILURE_WINDOW_SEC = envInt("PENDING_DRAIN_FAILURE_WI
 
 /**
  * Attempts at telling the session, after the first, before the notice is given
- * up on. An attempt NATS refused because no stream answered is not one of
- * them: it stored nothing and says nothing about the notice, so a notice
- * outlasts a NATS outage of any length and is given once NATS is back.
+ * up on. An attempt NATS refused because no stream answered, or one that failed
+ * while NATS answered nobody, is not one of them: it says nothing about the
+ * notice, so a notice outlasts a NATS outage of any length and is given once
+ * NATS is back. No attempt is begun while NATS answers nobody.
  */
 const NOTICE_MAX_ATTEMPTS = 10;
 
@@ -96,10 +99,37 @@ export const PENDING_QUARANTINE_RETENTION_DAYS = envInt("PENDING_QUARANTINE_RETE
  */
 const NOTICE_PROMPT_MAX_CHARS = 32_000;
 
-/** Seam over the event publish, so a test can see the notice and fail it. */
+/**
+ * Seams over the event publish, so a test can see the notice and fail it, and
+ * over the probe that asks whether NATS is answering at all.
+ */
 export const pendingQuarantinePorts = {
   publishRefusedTurn,
+  natsStreamsAnswer: (): Promise<boolean> => natsStreamsAnswer(),
 };
+
+/**
+ * Whether a failure says NATS is away, rather than anything about the request
+ * that failed.
+ *
+ * A refusal or a lost connection says so by itself. A `TIMEOUT` does not: the
+ * real client raises it for every request while the server is down or the
+ * connection is being re-established, and also for one request that a healthy
+ * server did not answer in time -- a large turn on a slow path, say. So a
+ * timeout is NATS being away only while NATS is not answering a probe either;
+ * one that timed out while the streams answer is the request's own, and is
+ * counted like any other failure, or a message that always times out would
+ * hold its session's queue for good.
+ */
+async function natsAway(err: unknown): Promise<boolean> {
+  if (!natsUnreachable(err)) return false;
+  if ((err as { code?: unknown }).code !== "TIMEOUT") return true;
+  try {
+    return !await pendingQuarantinePorts.natsStreamsAnswer();
+  } catch {
+    return true;
+  }
+}
 
 /** The queue row a drain was working on when it failed. */
 export interface FailedPendingRow {
@@ -139,7 +169,7 @@ export async function recordPendingDrainFailure(
 ): Promise<"quarantined" | "retry"> {
   metrics.onPendingDrainFailure();
   const error = drainErrorSummary(err, row.content);
-  if (natsUnreachable(err)) {
+  if (await natsAway(err)) {
     // Not counted. While NATS is away every queued message fails this way and
     // every one is sent once it is back, so the failure says nothing about this
     // message; counted, a NATS outage longer than the window would quarantine
@@ -161,11 +191,12 @@ export async function recordPendingDrainFailure(
       `UPDATE claw_pending_messages
           SET drain_failures = drain_failures + 1,
               drain_first_failed_at = COALESCE(drain_first_failed_at, NOW()),
-              drain_last_error = $2
+              -- The refusal of a spent message to go again is not why it failed.
+              drain_last_error = CASE WHEN $4 THEN drain_last_error ELSE $2 END
         WHERE id = $1
         RETURNING drain_failures,
                   drain_first_failed_at <= NOW() - make_interval(secs => $3) AS window_spent`,
-      [row.pendingId, error, PENDING_DRAIN_FAILURE_WINDOW_SEC],
+      [row.pendingId, error, PENDING_DRAIN_FAILURE_WINDOW_SEC, (err as { code?: unknown } | null)?.code === "PENDING_DRAIN_SPENT"],
     )).rows[0] as typeof counted;
   } catch (countErr) {
     // The retry the caller falls back to is the behaviour before this module:
@@ -186,6 +217,22 @@ export async function recordPendingDrainFailure(
   // Credentials that did not open on any attempt end as the refusal they are.
   const reason = err instanceof RunCredentialFault ? CREDENTIALS_UNREADABLE : PENDING_DRAIN_QUARANTINED;
   return (await quarantinePendingMessage(row, reason)) ? "quarantined" : "retry";
+}
+
+/**
+ * Whether a queued message has failed `PENDING_DRAIN_MAX_FAILURES` times over
+ * at least `PENDING_DRAIN_FAILURE_WINDOW_SEC`: the bounds after which its next
+ * counted failure quarantines it.
+ */
+export async function pendingDrainSpent(pendingId: unknown): Promise<boolean> {
+  const r = (await db.query(
+    `SELECT 1 FROM claw_pending_messages
+      WHERE id = $1
+        AND drain_failures >= $2
+        AND drain_first_failed_at <= NOW() - make_interval(secs => $3)`,
+    [pendingId, PENDING_DRAIN_MAX_FAILURES, PENDING_DRAIN_FAILURE_WINDOW_SEC],
+  )).rows;
+  return r.length > 0;
 }
 
 /** Why a queued message whose sealed credentials will not open is refused. */
@@ -285,7 +332,13 @@ async function afterQuarantine(
     id: row.pendingId, session_id: row.sessionId, user_id: row.userId, message_id: messageId,
     content: row.content, notice_events: 0, failure_reason: failureReason,
   };
-  await settleNoticeAttempt(quarantined, moved.notice_started_at, await noticeQuarantined(quarantined));
+  // A message can be quarantined while NATS is away (a turn too large to send
+  // is refused by the client itself), and an attempt begun then could only
+  // time out and start the horizon for nothing: it is left to the sweeper.
+  const outcome = await pendingQuarantinePorts.natsStreamsAnswer().catch(() => false)
+    ? await noticeQuarantined(quarantined)
+    : "refused";
+  await settleNoticeAttempt(quarantined, moved.notice_started_at, outcome);
 }
 
 type MovedRow = {
@@ -352,9 +405,11 @@ interface QuarantinedRow {
  * is there to take it, so nothing of this attempt was stored. `certain`: it
  * failed, and nothing it may have stored is missing from `notice_events`.
  * `unsure`: an event of it may be on the stream without being recorded, so a
- * retry is safe only inside the stream's duplicate window.
+ * retry is safe only inside the stream's duplicate window. `unreachable`: an
+ * `unsure` attempt that failed while NATS was not answering at all, which says
+ * nothing about the notice and so, like `refused`, is not one of its attempts.
  */
-type NoticeOutcome = "sent" | "refused" | "certain" | "unsure";
+type NoticeOutcome = "sent" | "refused" | "certain" | "unsure" | "unreachable";
 
 /**
  * Tell the session its message was not sent: the turn the message would have
@@ -411,11 +466,17 @@ async function noticeQuarantined(row: QuarantinedRow): Promise<NoticeOutcome> {
     );
     return "sent";
   } catch (err) {
-    const outcome: NoticeOutcome = stage === "before" || stage === "stamping"
+    let outcome: NoticeOutcome = stage === "before" || stage === "stamping"
       ? "certain"
       : stage === "publishing" && publishCertainlyFailed(err)
         ? (natsUnreachable(err) ? "refused" : "certain")
         : "unsure";
+    // A timeout or a lost connection while NATS answers nobody is the outage,
+    // not the notice: it is given back, so a notice outlasts an outage of any
+    // length; what it may have stored still starts the horizon.
+    if ((outcome === "unsure" || outcome === "certain") && await natsAway(err)) {
+      outcome = outcome === "unsure" ? "unreachable" : "refused";
+    }
     logger.warn(
       { err: String(err), sessionId: row.session_id, pendingId: row.id, outcome },
       "pending.quarantine_notice_failed",
@@ -438,9 +499,9 @@ async function settleNoticeAttempt(row: QuarantinedRow, startedAt: string, outco
     await db.query(
       `UPDATE ${PENDING_QUARANTINE_TABLE}
           SET notice_started_at = NULL,
-              notice_attempts = CASE WHEN $3 = 'refused' THEN GREATEST(notice_attempts - 1, 0)
+              notice_attempts = CASE WHEN $3 IN ('refused', 'unreachable') THEN GREATEST(notice_attempts - 1, 0)
                                      ELSE notice_attempts END,
-              notice_unsure_since = CASE WHEN $3 = 'unsure'
+              notice_unsure_since = CASE WHEN $3 IN ('unsure', 'unreachable')
                                          THEN COALESCE(notice_unsure_since, notice_started_at)
                                          ELSE notice_unsure_since END
         WHERE id = $1 AND notice_started_at = $2::timestamptz`,
@@ -494,6 +555,21 @@ export async function retryQuarantineNotices(limit = 20): Promise<number> {
       "pending.quarantine_notice_abandoned",
     );
   }
+  // Not while NATS answers nobody: every attempt would fail for the outage's
+  // sake, and one that times out may yet leave a copy to start the horizon.
+  const claimable = `notified_at IS NULL
+           AND notice_attempts < $1
+           AND COALESCE(notice_claimed_at, quarantined_at) <= NOW() - make_interval(secs => $2)
+           AND COALESCE(notice_unsure_since, notice_started_at, NOW()) > NOW() - make_interval(secs => $3)`;
+  const due = (await db.query(
+    `SELECT 1 FROM ${PENDING_QUARANTINE_TABLE} WHERE ${claimable} LIMIT 1`,
+    [NOTICE_MAX_ATTEMPTS, NOTICE_CLAIM_SEC, QUARANTINE_NOTICE_RETRY_HORIZON_SEC],
+  )).rows.length > 0;
+  if (!due) return 0;
+  if (!await pendingQuarantinePorts.natsStreamsAnswer().catch(() => false)) {
+    logger.warn("pending.quarantine_notice_retry_deferred_nats_away");
+    return 0;
+  }
   const claimed = (await db.query(
     `UPDATE ${PENDING_QUARANTINE_TABLE} q
         SET notice_attempts = notice_attempts + 1, notice_claimed_at = NOW(),
@@ -501,23 +577,20 @@ export async function retryQuarantineNotices(limit = 20): Promise<number> {
             notice_started_at = NOW()
       WHERE q.id IN (
         SELECT id FROM ${PENDING_QUARANTINE_TABLE}
-         WHERE notified_at IS NULL
-           AND notice_attempts < $1
-           AND COALESCE(notice_claimed_at, quarantined_at) <= NOW() - make_interval(secs => $2)
-           AND COALESCE(notice_unsure_since, notice_started_at, NOW()) > NOW() - make_interval(secs => $4)
+         WHERE ${claimable}
          ORDER BY quarantined_at
-         LIMIT $3
+         LIMIT $4
          FOR UPDATE SKIP LOCKED)
       RETURNING q.id, q.session_id, q.user_id, q.message_id, q.content, q.notice_attempts,
                 q.notice_events, q.failure_reason, q.notice_started_at::text AS notice_started_at`,
-    [NOTICE_MAX_ATTEMPTS, NOTICE_CLAIM_SEC, limit, QUARANTINE_NOTICE_RETRY_HORIZON_SEC],
+    [NOTICE_MAX_ATTEMPTS, NOTICE_CLAIM_SEC, QUARANTINE_NOTICE_RETRY_HORIZON_SEC, limit],
   )).rows as Array<QuarantinedRow & { notice_attempts: number; notice_started_at: string }>;
   let sent = 0;
   for (const row of claimed) {
     const outcome = await noticeQuarantined(row);
     await settleNoticeAttempt(row, row.notice_started_at, outcome);
     if (outcome === "sent") sent += 1;
-    else if (outcome !== "refused" && row.notice_attempts >= NOTICE_MAX_ATTEMPTS) {
+    else if (outcome !== "refused" && outcome !== "unreachable" && row.notice_attempts >= NOTICE_MAX_ATTEMPTS) {
       logger.error(
         { sessionId: row.session_id, pendingId: row.id, attempts: row.notice_attempts },
         "pending.quarantine_notice_abandoned",

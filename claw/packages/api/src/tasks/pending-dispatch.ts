@@ -1171,6 +1171,19 @@ async function preparePendingHandoff(
   while (true) {
     const recorded = await recordedHandoffState(handoffId);
     if (recorded === "retryable") {
+      // A message that has had its attempts is not sent again. A publish that
+      // timed out leaves its run open until the sweeper finds nothing was
+      // delivered, so the failure counted on it could never quarantine the
+      // row (the move waits for that run); this is the first drain after the
+      // run has closed, and it fails, is counted and moves the row instead of
+      // opening yet another run that may time out the same way.
+      const { pendingDrainSpent } = await import("./pending-quarantine.js");
+      if (await pendingDrainSpent(input.pendingId)) {
+        throw Object.assign(
+          new Error(`queued message ${String(input.pendingId)} has had its attempts and was not delivered`),
+          { code: "PENDING_DRAIN_SPENT" },
+        );
+      }
       // The only place the reservation is ever rotated, and it is reached only
       // from a terminal row -- that is what "retryable" now means. Rotating off
       // a row that is still open loses the turn's durable identity to a run

@@ -321,10 +321,44 @@ const NATS_UNREACHABLE_CODES = new Set([
  *
  * This is not the same question as `publishCertainlyFailed`: a timeout means
  * NATS did not answer, and says nothing about whether the message was stored.
+ *
+ * Nor is a `TIMEOUT` by itself proof that NATS is away: a request can time out
+ * on a server that answers everything else. A caller that counts failures
+ * against what it sent asks `natsStreamsAnswer` before it lets one go uncounted.
  */
 export function natsUnreachable(err: unknown): boolean {
   const e = err as { name?: unknown; code?: unknown } | null | undefined;
   return e?.name === "NatsError" && typeof e.code === "string" && NATS_UNREACHABLE_CODES.has(e.code);
+}
+
+/** How long `natsStreamsAnswer` waits for each stream before it reads NATS as away. */
+const STREAMS_PROBE_TIMEOUT_MS = 3_000;
+
+/**
+ * Whether both streams the API publishes to answer right now: the connection is
+ * open and JetStream returns each stream's info in time.
+ *
+ * What tells a `TIMEOUT` that says NATS is away from one that says something
+ * about the request that timed out. A publish while the server is down or the
+ * client is reconnecting times out like any other, and so does this probe; a
+ * publish that times out while the probe is answered is the request's own.
+ */
+export async function natsStreamsAnswer(timeoutMs = STREAMS_PROBE_TIMEOUT_MS): Promise<boolean> {
+  if (!nc || !jsm || nc.isClosed()) return false;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      Promise.all([jsm.streams.info(TASK_STREAM), jsm.streams.info(EVENT_STREAM)]),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("streams probe timed out")), timeoutMs);
+      }),
+    ]);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

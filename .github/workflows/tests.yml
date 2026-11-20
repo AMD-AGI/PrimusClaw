@@ -311,7 +311,8 @@ jobs:
       # only the server's duplicate window makes a retry after a lost
       # acknowledgement a no-op; this measures it against the same nats-server
       # (claw/packages/api/test/pending-quarantine-jetstream.test.ts), along
-      # with the 503 the real client raises while the streams are unavailable.
+      # with the 503 and the TIMEOUT the real client raises while the streams are
+      # unavailable or the server is down.
       - name: Quarantine notice against JetStream
         working-directory: claw/packages/api
         env:
@@ -320,7 +321,7 @@ jobs:
           set -euo pipefail
           test -x "$CLAW_CHAOS_NATS_SERVER"
           npx --no-install tsx --test --test-reporter=spec test/pending-quarantine-jetstream.test.ts | tee "$RUNNER_TEMP/quarantine-js.log"
-          grep -q "^ℹ pass 3$" "$RUNNER_TEMP/quarantine-js.log"
+          grep -q "^ℹ pass 4$" "$RUNNER_TEMP/quarantine-js.log"
 
   connector:
     name: Connector (TypeScript)

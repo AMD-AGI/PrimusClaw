@@ -27,6 +27,9 @@
  *      count and window, the notice's attempts and its horizon -- a good queued
  *      message is not quarantined and is sent once they are back, and the
  *      poison's notice is given, once, then too
+ *   J4 a publish TIMEOUT is told apart by asking the streams: one that timed
+ *      out while they answer is counted against the message, and the TIMEOUT
+ *      the real client raises while the server is down is not
  *
  * Skipped without DATABASE_URL and CLAW_CHAOS_NATS_SERVER, and a skip is not a
  * pass: the rolling-restart CI job sets both and checks the pass count.
@@ -58,6 +61,7 @@ const SERVER_DEFAULT_WINDOW_NS = 2 * 60 * 1e9;
 describe("a quarantine notice against JetStream", { skip }, () => {
   let dir: string;
   let server: Proc;
+  let serverArgs: string[];
   let probe: NatsConnection;
   let h: AdmissionCluster;
   let nats: typeof import("../src/infra/nats.js");
@@ -70,9 +74,8 @@ describe("a quarantine notice against JetStream", { skip }, () => {
   before(async () => {
     dir = mkdtempSync(join(tmpdir(), "claw-quarantine-js-"));
     const port = await freePort();
-    server = new Proc("nats", NATS_SERVER!, ["-js", "-a", "127.0.0.1", "-p", String(port), "-sd", join(dir, "js")], {
-      cwd: dir, env: process.env, log: join(dir, "nats.log"),
-    });
+    serverArgs = ["-js", "-a", "127.0.0.1", "-p", String(port), "-sd", join(dir, "js")];
+    server = new Proc("nats", NATS_SERVER!, serverArgs, { cwd: dir, env: process.env, log: join(dir, "nats.log") });
     process.env.NATS_URL = `nats://127.0.0.1:${port}`;
     probe = await until("nats-server", async () => {
       try { return await connect({ servers: process.env.NATS_URL }); } catch { return null; }
@@ -293,5 +296,74 @@ describe("a quarantine notice against JetStream", { skip }, () => {
     }
     assert.deepEqual(stored, { AssistantMessage: 1, ResultMessage: 1, exec_complete: 1 }, "the notice, once");
     assert.deepEqual(tasks, [goodMessage], "the good message, once");
+  });
+
+  test("J4 a TIMEOUT counts against the message only while the streams answer, and a server outage's does not", async () => {
+    const submit = await import("../src/sessions/submit-message.js");
+    const secrets = await import("../src/tasks/run-secrets.js");
+    const consumer = await import("../src/events/consumer.js");
+    /** A session with a turn running and one message queued behind it, drained by that turn's completion. */
+    const queuedBehindRunningTurn = async (session: string, content: string): Promise<number> => {
+      const running = `${session}-running`;
+      await rows(
+        `INSERT INTO claw_sessions (session_id, user_id, agent_status, agent_gate_message_id) VALUES ($1, $2, 'running', $3)`,
+        [session, USER, running],
+      );
+      await rows(
+        `INSERT INTO claw_tasks (task_id, session_id, name, status, origin, executor, metadata, input, prompt, queued_at, started_at)
+         VALUES ($1, $2, 'chat', 'running', 'chat', 'brain', $3::jsonb, '{}'::jsonb, 'first', NOW(), NOW())`,
+        [`run-${session}`, session, JSON.stringify({ message_id: running, user_id: USER, dispatch: "fat" })],
+      );
+      const id = (await submit.insertPendingMessage(h.app.db.db, {
+        sessionId: session, content, userId: USER, toolIds: [],
+        secrets: secrets.pendingSecretColumns({ llmKey: "vk", platformKey: "pk", userEnv: {}, doorbell: false }),
+        sessionEnv: {},
+      })).id!;
+      await consumer.consumeEventDelivery({
+        subject: `events.${session}`,
+        data: nats.sc.encode(JSON.stringify({
+          type: "exec_complete", session_id: session, task_id: `run-${session}`, user_id: USER,
+          message_id: running, prompt: "first", final_text: "done", failed: false, error_count: 0, skills_used: {},
+        })),
+        seq: 200 + id,
+        ack: () => {},
+        nak: () => {},
+      });
+      return id;
+    };
+    const queued = async (id: number) =>
+      (await rows("SELECT drain_failures, drain_last_error FROM claw_pending_messages WHERE id = $1", [id]))[0];
+
+    // The server answers everything else: a turn whose own publish times out
+    // is counted, or a message that always does would hold its queue for good.
+    assert.equal(await nats.natsStreamsAnswer(), true, "the streams answer the probe");
+    const realPublish = dispatch.pendingDispatchPorts.publish;
+    dispatch.pendingDispatchPorts.publish = async () => {
+      throw Object.assign(new Error("TIMEOUT"), { name: "NatsError", code: "TIMEOUT" });
+    };
+    let slow: Record<string, any>;
+    try {
+      slow = await queued(await queuedBehindRunningTurn("s-jetstream-slow", "a turn that times out"));
+    } finally {
+      dispatch.pendingDispatchPorts.publish = realPublish;
+    }
+    assert.equal(slow.drain_failures, 1, "counted");
+    assert.match(slow.drain_last_error, /NatsError:TIMEOUT/);
+
+    // The server goes away: the real client's publish times out while it
+    // reconnects, the streams answer nobody, and nothing is counted.
+    await server.stop("SIGKILL", 10_000);
+    let good: Record<string, any>;
+    try {
+      good = await queued(await queuedBehindRunningTurn("s-jetstream-down", "a good message"));
+      assert.equal(await nats.natsStreamsAnswer(), false, "nobody answers the probe");
+    } finally {
+      server = new Proc("nats", NATS_SERVER!, serverArgs, { cwd: dir, env: process.env, log: join(dir, "nats-2.log") });
+    }
+    assert.match(good.drain_last_error, /NatsError:TIMEOUT/, "what the real client raises during an outage");
+    assert.equal(good.drain_failures, 0, "and it is not counted against the message");
+
+    // The client is back on the restarted server.
+    await until("the streams answer again", async () => (await nats.natsStreamsAnswer()) || null, 30_000);
   });
 });
