@@ -372,8 +372,8 @@ const notificationDeliveryTotal = new Counter({
   labelNames: ["outcome"] as const,
   registers: [registry],
 });
-// The one to alert on: an event a person was owed and did not get, set aside because the receiver works and cannot take it
-// (`unprocessable`: it answered 422) or kept refusing it (4xx) while it took everything else (`isolated_failures`).
+// The one to alert on: an event a person was owed and did not get, set aside because the receiver works and kept refusing it
+// (400, 413, 415, 422) for an hour while it took everything else (`isolated_failures`).
 const notificationQuarantinedTotal = new Counter({
   name: "claw_notification_quarantined_total",
   help: "Outbound notifications quarantined instead of retried, by reason.",
@@ -584,7 +584,7 @@ export const metrics = {
   onNotificationDelivery(outcome: NotificationDeliveryOutcome): void {
     notificationDeliveryTotal.inc({ outcome });
   },
-  onNotificationQuarantined(reason: "unprocessable" | "isolated_failures"): void {
+  onNotificationQuarantined(reason: "isolated_failures"): void {
     notificationQuarantinedTotal.inc({ reason });
     notificationDeliveryTotal.inc({ outcome: "quarantined" });
   },

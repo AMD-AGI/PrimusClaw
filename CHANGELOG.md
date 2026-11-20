@@ -196,12 +196,15 @@ release version, and its `appVersion` stays `latest`.
   failed the same way every time. The outbox uses the replacement the rest of the server stores events with
   (`storableJson` and `storableText` in `@claw/utils`).
 - Claw notifications: one notification the receiver refuses for good no longer retries for a day. A row the receiver
-  refuses five times with a 4xx (other than 408 and 429), each time after it has taken another of the subscription's
-  notifications, is quarantined: it is no longer sent, it is kept in `claw_notification_outbox` with `quarantined_at`
-  set as the record of what was not delivered, and the `notification.quarantined` log line names the event, the
-  receiver's answer and the reason, never what the notification says. A receiver that answers `422` for a notification
-  has it quarantined at once. The quarantining answer does not count against the subscription. A 5xx, a timeout or a
-  connection error never quarantines a row: the personal agent answers 503 for a notification it will take on a later
+  refuses at least five times for its body (`400`, `413`, `415` or `422`), each time after it has taken another of the
+  subscription's notifications, and for at least an hour since its first refusal, is quarantined: it is no longer sent,
+  it is kept in `claw_notification_outbox` with `quarantined_at` set as the record of what was not delivered, and the
+  `notification.quarantined` log line names the event, the receiver's answer and the reason, never what the
+  notification says. No single answer quarantines a row, a `422` included, and no other 4xx counts: a `401`
+  (the personal agent's `bad_signature` from a backend still on the old secret, or `stale_timestamp` to a Claw replica
+  whose clock is off), a `403` or a `404` depends on who sent the request or where it landed, not on the event. The
+  quarantining answer does not count against the subscription. A 5xx, a timeout or a connection error never
+  quarantines a row: the personal agent answers 503 for a notification it will take on a later
   try (a run's end while that chat's turn is still answering), so such a row keeps the 24-hour retry window, as does
   every row of a receiver that is down or refuses everything (a wrong secret). The rows one delivery round claims for a
   subscription are now sent in the order they were recorded; before, the order the database handed them back in could

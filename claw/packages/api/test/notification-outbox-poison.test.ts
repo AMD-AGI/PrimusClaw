@@ -7,15 +7,19 @@
  * entry points (`recordRunFinished`, `recordApprovalRequested`).
  *
  *   P1 text the database cannot store (NUL, a lone surrogate) is stored with U+FFFD, not refused
- *   P2 a row the receiver keeps refusing while it takes the rest is quarantined after a bounded number of failures; every
- *      later row is delivered, in order, while it fails; the record stays; the log line has no content
+ *   P2 a row the receiver keeps refusing (400, 422) while it takes the rest is quarantined after a bounded number of
+ *      failures and an hour of refusals, never before; every later row is delivered, in order, while it fails; the record
+ *      stays; the log line has no content
  *   P3 a receiver that is down quarantines nothing, however long, and gets everything on recovery
  *   P4 a receiver that refuses everything (a wrong secret) quarantines nothing
- *   P5 a 422 quarantines at once and does not count against the subscription
+ *   P5 a single 422 quarantines nothing: the row is retried, and delivered when the receiver takes it
  *   P6 the outbox gauges read the table: oldest pending age, failing subscriptions, consecutive failures
  *   P7 the personal agent's 503s for an event it cannot take *yet* (a run's end while that chat's turn still answers, a copy
  *      in flight elsewhere, a send that failed) never quarantine it, however long the rest flows; it is delivered after
  *   P8 a NUL or a lone surrogate nested deeper than the sanitiser's walk is stored as U+FFFD too
+ *   P9 a receiver behind a load balancer with one bad backend -- still on the old secret (401 bad_signature) or with its clock
+ *      off (401 stale_timestamp) -- never quarantines a good row that keeps landing on it while the rest succeed; it is
+ *      delivered once the backend is fixed
  *
  * Skipped without DATABASE_URL, and a skip is not a pass.
  */
@@ -47,14 +51,19 @@ describe("notification outbox: poison rows", { skip }, () => {
   const received: Array<{ eventId: string; body: any; status: number }> = [];
   const deliver = () => outbox.deliverDue({ allowedHosts: new Set(["127.0.0.1"]) });
   const makeDue = () => q("UPDATE claw_notification_outbox SET next_attempt_at = NOW() - interval '1 second' WHERE delivered_at IS NULL AND dropped_at IS NULL");
+  /** As if the rows' refusals began longer ago than the quarantine's time bound (`QUARANTINE_AFTER_REFUSING_MINUTES`). */
+  const ageRefusals = () => q(
+    "UPDATE claw_notification_outbox SET refused_since = refused_since - make_interval(mins => $1::int + 1) WHERE refused_since IS NOT NULL",
+    [outbox.QUARANTINE_AFTER_REFUSING_MINUTES],
+  );
 
-  async function subscribe(owner = "u1") {
+  async function subscribe(owner = "u1", to = url) {
     secret = `secret-${owner}-${Math.random()}`;
     const id = outbox.newSubscriptionId();
     await q(
       `INSERT INTO claw_notification_subscriptions (subscription_id, owner_user_id, url, secret_enc, event_types)
        VALUES ($1, $2, $3, $4, ARRAY['run.completed','run.failed','approval.requested'])`,
-      [id, owner, url, crypto.encryptUserEnvValue(secret)],
+      [id, owner, to, crypto.encryptUserEnvValue(secret)],
     );
     return id;
   }
@@ -149,19 +158,24 @@ describe("notification outbox: poison rows", { skip }, () => {
     assert.match(received[0].body.summary, /�binary�/, "the receiver is sent the stored text");
   });
 
-  test("refusedForGood: a 4xx the receiver means, not one that asks for a retry, and never a 5xx or a failure to connect", () => {
-    for (const s of ["http_400", "http_401", "http_403", "http_404", "http_413", "http_418"]) assert.equal(outbox.refusedForGood(s), true, s);
-    for (const s of ["http_408", "http_429", "http_500", "http_502", "http_503", "error:timeout", "refused:not_allowed", "http_200", ""]) {
+  test("refusedForGood: only an answer about the body, never one that depends on the sender or the backend, a 5xx or a failure to connect", () => {
+    for (const s of ["http_400", "http_413", "http_415", "http_422"]) assert.equal(outbox.refusedForGood(s), true, s);
+    // 401 is the personal agent's bad_signature and stale_timestamp: a backend on the old secret, a replica's clock. 403 and 404
+    // are as often a proxy's.
+    for (const s of [
+      "http_401", "http_403", "http_404", "http_405", "http_409", "http_418", "http_408", "http_429",
+      "http_500", "http_502", "http_503", "error:timeout", "refused:not_allowed", "http_200", "",
+    ]) {
       assert.equal(outbox.refusedForGood(s), false, s);
     }
   });
 
-  test("P2 a row the receiver keeps refusing is quarantined after a bounded number of failures; everything after it flows, in order", async () => {
+  for (const refusal of [400, 422]) test(`P2 a row the receiver keeps refusing (${refusal}) is quarantined after a bounded number of failures over an hour; everything after it flows, in order`, async () => {
     const sub = await subscribe();
     const poison = eventIdOf("t-poison", "failed");
     // The receiver works, except for this one event, which it refuses as it refuses a body it cannot read (the personal agent's
     // 400 bad_event): the same answer every time it is sent.
-    answer = (eventId) => (eventId === poison ? 400 : 200);
+    answer = (eventId) => (eventId === poison ? refusal : 200);
     await finishRun("t-poison", "failed", `renders badly ${CANARY}`);
     const goods: string[] = [];
     const before = await sample("claw_notification_quarantined_total", 'reason="isolated_failures"');
@@ -170,7 +184,7 @@ describe("notification outbox: poison rows", { skip }, () => {
     for (; round < 20; round++) {
       // Two more events arrive every round, behind the poison row -- but not in the round it is quarantined in, so nothing
       // delivered after its last failure is what ends the subscription's streak.
-      for (const n of round < outbox.QUARANTINE_AFTER_ISOLATED_FAILURES ? [0, 1] : []) {
+      for (const n of round <= outbox.QUARANTINE_AFTER_ISOLATED_FAILURES ? [0, 1] : []) {
         const tid = `t-good-${round}-${n}`;
         await finishRun(tid, "completed");
         goods.push(eventIdOf(tid, "completed"));
@@ -178,16 +192,24 @@ describe("notification outbox: poison rows", { skip }, () => {
       await makeDue();
       const captured = await captureLogLines(() => deliver(), "notification.quarantined");
       lines = lines.concat(captured);
-      if ((await q("SELECT quarantined_at FROM claw_notification_outbox WHERE event_id = $1", [poison]))[0].quarantined_at) break;
+      const now = (await q("SELECT * FROM claw_notification_outbox WHERE event_id = $1", [poison]))[0];
+      if (now.quarantined_at) break;
+      if (round === outbox.QUARANTINE_AFTER_ISOLATED_FAILURES) {
+        // Enough isolated refusals, but all within minutes -- as long as a rolling deploy of the receiver may last: not yet.
+        assert.equal(now.isolated_failures, outbox.QUARANTINE_AFTER_ISOLATED_FAILURES);
+        assert.equal(now.dropped_at, null, "not quarantined before it has been refused for an hour");
+        // An hour later, it is still refused.
+        await ageRefusals();
+      }
     }
     const row = (await q("SELECT * FROM claw_notification_outbox WHERE event_id = $1", [poison]))[0];
     assert.ok(row.quarantined_at, "quarantined");
     assert.ok(row.dropped_at, "and never claimed again");
-    assert.equal(row.isolated_failures, outbox.QUARANTINE_AFTER_ISOLATED_FAILURES);
-    // The first failure has no "since"; each later one followed a delivery of another row.
-    assert.equal(round + 1, outbox.QUARANTINE_AFTER_ISOLATED_FAILURES + 1, "quarantined on the first round it could be, not later");
-    assert.equal(received.filter((r) => r.eventId === poison).length, outbox.QUARANTINE_AFTER_ISOLATED_FAILURES + 1);
-    assert.equal(row.last_status, "http_400");
+    assert.equal(row.isolated_failures, outbox.QUARANTINE_AFTER_ISOLATED_FAILURES + 1);
+    // The first failure has no "since"; each later one followed a delivery of another row; then the hour.
+    assert.equal(round, outbox.QUARANTINE_AFTER_ISOLATED_FAILURES + 1, "quarantined on the first round it could be, not later");
+    assert.equal(received.filter((r) => r.eventId === poison).length, outbox.QUARANTINE_AFTER_ISOLATED_FAILURES + 2);
+    assert.equal(row.last_status, `http_${refusal}`);
     assert.match(row.payload.summary, new RegExp(CANARY), "the record keeps what was not delivered");
 
     // Every other event was delivered, each once, in the order it was recorded.
@@ -274,25 +296,35 @@ describe("notification outbox: poison rows", { skip }, () => {
     assert.equal((await q("SELECT COUNT(*)::int AS n FROM claw_notification_outbox WHERE delivered_at IS NOT NULL"))[0].n, 3);
   });
 
-  test("P5 a 422 quarantines the row at once, keeps it, and is not a failure of the subscription", async () => {
+  test("P5 a single 422 quarantines nothing: the row is retried, counted like any refusal, and delivered when the receiver takes it", async () => {
+    // One answer from one backend is not proof the event can never be taken: a backend mid-deploy may refuse what the others take.
     const sub = await subscribe();
     const bad = eventIdOf("t-bad", "failed");
-    answer = (eventId) => (eventId === bad ? 422 : 200);
-    await finishRun("t-bad", "failed", "a card the chat refuses");
+    let refusals = 2;
+    answer = (eventId) => (eventId === bad && refusals-- > 0 ? 422 : 200);
+    await finishRun("t-bad", "failed", "a card the chat refused");
     await finishRun("t-ok", "completed");
-    const before = await sample("claw_notification_quarantined_total", 'reason="unprocessable"');
+    const before = await sample("claw_notification_quarantined_total");
     assert.deepEqual(await deliver(), { delivered: 1, failed: 1 });
-    const row = (await q("SELECT * FROM claw_notification_outbox WHERE event_id = $1", [bad]))[0];
-    assert.ok(row.quarantined_at);
-    assert.ok(row.dropped_at);
+    let row = (await q("SELECT * FROM claw_notification_outbox WHERE event_id = $1", [bad]))[0];
+    assert.equal(row.quarantined_at, null, "not quarantined on one answer");
+    assert.equal(row.dropped_at, null);
     assert.equal(row.last_status, "http_422");
-    assert.equal(row.payload.summary, "a card the chat refuses");
-    assert.equal((await subRow(sub)).consecutive_failures, 0);
-    assert.equal(await sample("claw_notification_quarantined_total", 'reason="unprocessable"') - before, 1);
+    assert.ok(row.refused_since, "but counted as a refusal");
+    await finishRun("t-ok-2", "completed");
     await makeDue();
-    received.length = 0;
     await deliver();
-    assert.equal(received.length, 0, "not sent again");
+    row = (await q("SELECT * FROM claw_notification_outbox WHERE event_id = $1", [bad]))[0];
+    assert.equal(row.isolated_failures, 1, "a refusal across another delivery is the row's own");
+    assert.equal(row.dropped_at, null);
+    await makeDue();
+    await deliver();
+    row = (await q("SELECT * FROM claw_notification_outbox WHERE event_id = $1", [bad]))[0];
+    assert.ok(row.delivered_at, "delivered once the receiver took it");
+    assert.equal(row.payload.summary, "a card the chat refused");
+    assert.equal(received.filter((r) => r.eventId === bad).length, 3);
+    assert.equal((await subRow(sub)).consecutive_failures, 0);
+    assert.equal(await sample("claw_notification_quarantined_total"), before);
   });
 
   test("P6 the gauges read the table: a stalled row's age, the failing subscriptions, their longest streak; 0 once it clears", async () => {
@@ -395,6 +427,71 @@ describe("notification outbox: poison rows", { skip }, () => {
     assert.equal(leaf.command, `cat \ufffd ${CANARY} \ufffd`);
     assert.deepEqual(Object.keys(leaf).sort(), ["command", "key\ufffd"]);
   });
+
+  for (const fault of ["bad_signature", "stale_timestamp"] as const) {
+    test(`P9 one backend answering 401 ${fault} behind a load balancer never quarantines a good row that keeps landing on it`, async () => {
+      // The personal agent behind a load balancer that takes turns between two backends. One is fine; the other is still on the
+      // old secret during a rotation (401 bad_signature), or its clock is more than five minutes off (401 stale_timestamp): it
+      // answers exactly as `personal-agent/packages/runtime/src/http/claw-events.ts` does. The row first in line lands on that
+      // backend on every round while the subscription's other rows land on the good one -- each of its failures is "isolated".
+      let fixed = false;
+      let turn = 0;
+      const answers: Array<{ eventId: string; backend: number; status: number }> = [];
+      const lb = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+          const body = Buffer.concat(chunks).toString("utf8");
+          const backend = turn++ % 2;
+          const bad = backend === 0 && !fixed;
+          const verdict = verifySignature({
+            secret: bad && fault === "bad_signature" ? "the-secret-before-the-rotation" : secret,
+            timestamp: String(req.headers[TIMESTAMP_HEADER.toLowerCase()]),
+            signature: String(req.headers[SIGNATURE_HEADER.toLowerCase()]),
+            body,
+            nowSeconds: Math.floor(Date.now() / 1000) + (bad && fault === "stale_timestamp" ? 400 : 0),
+            toleranceSeconds: 300,
+          });
+          const status = verdict === "ok" ? 200 : 401;
+          answers.push({ eventId: String(req.headers[EVENT_ID_HEADER.toLowerCase()]), backend, status });
+          res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(status === 200 ? { status: "sent" } : { error: verdict }));
+        });
+      });
+      await new Promise<void>((resolve) => lb.listen(0, "127.0.0.1", resolve));
+      try {
+        const sub = await subscribe("u1", `http://127.0.0.1:${(lb.address() as AddressInfo).port}/claw-events/route-1`);
+        const unlucky = eventIdOf("t-unlucky", "completed");
+        await finishRun("t-unlucky", "completed");
+        const rounds = 4 * outbox.QUARANTINE_AFTER_ISOLATED_FAILURES;
+        for (let round = 0; round < rounds; round++) {
+          await finishRun(`t-other-${round}`, "completed");
+          await makeDue();
+          await deliver();
+          // Hours of this: past any time bound on refusals.
+          await ageRefusals();
+        }
+        const mine = answers.filter((a) => a.eventId === unlucky);
+        assert.equal(mine.length, rounds);
+        assert.ok(mine.every((a) => a.backend === 0 && a.status === 401), "it landed on the bad backend every time");
+        assert.equal(answers.filter((a) => a.eventId !== unlucky && a.status === 200).length, rounds, "while every other row went through");
+        let row = (await q("SELECT * FROM claw_notification_outbox WHERE event_id = $1", [unlucky]))[0];
+        assert.equal(row.quarantined_at, null, "a 401 is the sender's or the backend's, not the event's: never quarantined");
+        assert.equal(row.dropped_at, null);
+        assert.equal(row.isolated_failures, 0);
+        assert.equal(row.last_status, "http_401");
+
+        // The rotation completes (or the clock is fixed): the next try delivers it.
+        fixed = true;
+        await makeDue();
+        await deliver();
+        row = (await q("SELECT * FROM claw_notification_outbox WHERE event_id = $1", [unlucky]))[0];
+        assert.ok(row.delivered_at, "delivered once the backend could take it");
+        assert.equal((await subRow(sub)).consecutive_failures, 0);
+      } finally {
+        await new Promise((resolve) => lb.close(resolve));
+      }
+    });
+  }
 });
 
 /**

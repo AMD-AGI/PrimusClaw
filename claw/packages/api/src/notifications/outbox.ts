@@ -72,10 +72,13 @@ export const SUBSCRIPTION_DISABLE_AFTER_HOURS = GIVE_UP_AFTER_HOURS;
  */
 export const QUARANTINE_AFTER_ISOLATED_FAILURES = 5;
 /**
- * A receiver's answer that this event can never be processed (a body it cannot render, a card the chat refuses): the row is
- * quarantined at once instead of retried. Unlike 410 the event is kept as a record of what was not delivered.
+ * And how long the receiver must have been refusing the row (from its first refusal) before it is quarantined. Five isolated
+ * refusals take about ten minutes of the backoff above, and that is as long as a rolling deploy of the receiver can last: a
+ * backend that is still the old version may refuse an event the new one takes, and a row that kept landing on it would be set
+ * aside for a refusal that was the deploy's, not the event's. An hour of refusals across the receiver's own successes is not a
+ * rollout. A single answer never quarantines a row, a 422 included: one status code from one backend is not proof.
  */
-export const UNPROCESSABLE_STATUS = 422;
+export const QUARANTINE_AFTER_REFUSING_MINUTES = 60;
 
 /** Longer than the slowest group of sequential sends in one claimed batch. */
 const CLAIM_LEASE_SECONDS = 120;
@@ -387,13 +390,25 @@ async function claimDue(): Promise<Claimed[]> {
 }
 
 /**
- * A failure that is the receiver refusing this request, on purpose and the same way every time it is sent: a 4xx other than
- * 408 and 429 (which ask for a retry). The personal agent answers 400 to a body it cannot read and 413 to one too large; it
- * answers 4xx for nothing that could pass. Only these count towards a row's quarantine (`QUARANTINE_AFTER_ISOLATED_FAILURES`).
+ * The answers that refuse the request's body -- what this event is -- and so come back the same whatever sends it or whichever
+ * backend takes it: 400 (the personal agent's `bad_event`), 413 (too large), 415 and 422 (a body the receiver cannot take).
+ */
+const BODY_REFUSALS = new Set(["400", "413", "415", "422"]);
+
+/**
+ * A failure that is the receiver refusing this event, the same way every time it is sent (`BODY_REFUSALS`). Only these count
+ * towards a row's quarantine (`QUARANTINE_AFTER_ISOLATED_FAILURES`).
+ *
+ * Every other 4xx depends on who sent the request or where it landed, not on the event, and never counts. The personal agent
+ * answers 401 `bad_signature` from a backend still on the old secret during a rotation or a rollout, and 401 `stale_timestamp`
+ * to a Claw replica whose clock is more than five minutes off (`personal-agent/packages/runtime/src/http/claw-events.ts`):
+ * behind a load balancer some sends get them while the rest succeed, and a good event that kept landing on the bad path would
+ * be quarantined and never delivered. 403 and 404 are as often a proxy's or an ingress's as the receiver's; 408 and 429 ask for
+ * a retry. Such a row keeps the 24-hour retry window, as does every row of a receiver that refuses everything.
  */
 export function refusedForGood(status: string): boolean {
-  const code = /^http_(4\d\d)$/.exec(status)?.[1];
-  return code !== undefined && code !== "408" && code !== "429";
+  const code = /^http_(\d{3})$/.exec(status)?.[1];
+  return code !== undefined && BODY_REFUSALS.has(code);
 }
 
 /** A failure that says the receiver is not there (yet) rather than that it refuses: what the probe retries soon. */
@@ -440,7 +455,7 @@ async function quarantine(row: Claimed, status: string, reason: QuarantineReason
   return true;
 }
 
-export type QuarantineReason = "unprocessable" | "isolated_failures";
+export type QuarantineReason = "isolated_failures";
 
 async function recordFailure(row: Claimed, status: string): Promise<void> {
   status = storableText(status);
@@ -456,7 +471,8 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
     // The subscription's probe (`PROBE_SECONDS`): its oldest row that has been tried and is still pending, when the receiver is down.
     // A refusal is the row's own when the receiver delivered another of the subscription's rows since this row last failed: the
     // receiver works, and it is this event it refuses. The first failure is never counted (there is no "since" yet), and a
-    // failure that is not a refusal (`refusedForGood`) never is: the receiver may take the row on a later try.
+    // failure that is not a refusal (`refusedForGood`) never is: the receiver may take the row on a later try. `refused_since` is
+    // the row's first refusal, what `QUARANTINE_AFTER_REFUSING_MINUTES` is measured from.
     const updated = (await db.query(
       `UPDATE claw_notification_outbox o
           SET next_attempt_at = NOW() + make_interval(secs => CASE
@@ -470,15 +486,20 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
                 WHEN $6::boolean AND o.last_failed_at IS NOT NULL AND (
                   SELECT s.last_delivered_at FROM claw_notification_subscriptions s WHERE s.subscription_id = o.subscription_id
                 ) > o.last_failed_at THEN 1 ELSE 0 END,
-              last_failed_at = NOW()
+              last_failed_at = NOW(),
+              refused_since = CASE WHEN $6::boolean THEN COALESCE(o.refused_since, NOW()) ELSE o.refused_since END
         WHERE o.id = $1
-        RETURNING o.isolated_failures`,
-      [row.id, backoff, status, receiverDown(status), PROBE_SECONDS, refusedForGood(status)],
-    )).rows[0] as { isolated_failures: number } | undefined;
+        RETURNING o.isolated_failures,
+                  (o.refused_since IS NOT NULL AND o.refused_since <= NOW() - make_interval(mins => $7::int)) AS refused_long`,
+      [row.id, backoff, status, receiverDown(status), PROBE_SECONDS, refusedForGood(status), QUARANTINE_AFTER_REFUSING_MINUTES],
+    )).rows[0] as { isolated_failures: number; refused_long: boolean } | undefined;
     const isolated = Number(updated?.isolated_failures ?? 0);
     // Not a failure of the subscription: the receiver took another row since this one last failed, which ended the streak, and
     // this row's last failure is not added to it.
-    if (isolated >= QUARANTINE_AFTER_ISOLATED_FAILURES && await quarantine(row, status, "isolated_failures", isolated)) {
+    if (
+      isolated >= QUARANTINE_AFTER_ISOLATED_FAILURES && updated?.refused_long === true
+      && await quarantine(row, status, "isolated_failures", isolated)
+    ) {
       return;
     }
     metrics.onNotificationDelivery("failed");
@@ -584,13 +605,6 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
           );
           logger.warn({ eventId: row.event_id, subscriptionId: row.subscription_id }, "notification.dropped_gone");
           metrics.onNotificationDelivery("dropped_gone");
-          failed += 1;
-          return;
-        }
-        if (code === UNPROCESSABLE_STATUS) {
-          // The receiver works and says this event is one it can never take: set aside now, not retried for a day. Not a
-          // failure of the subscription, for the reason 410 is not.
-          await quarantine(row, `http_${code}`, "unprocessable", 0);
           failed += 1;
           return;
         }

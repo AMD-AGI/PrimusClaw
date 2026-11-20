@@ -28,8 +28,8 @@ groups:
             receiver of the failing subscription (claw_notification_subscriptions_failing,
             claw_notification_subscription_consecutive_failures) and claw-api's "notification." log lines.
 
-      # A notification was set aside instead of delivered: the receiver answered 422 for it, or kept refusing it (4xx) while
-      # it took the subscription's other rows. The row is kept (quarantined_at in claw_notification_outbox).
+      # A notification was set aside instead of delivered: the receiver kept refusing its body (400, 413, 415, 422) for an
+      # hour while it took the subscription's other rows. The row is kept (quarantined_at in claw_notification_outbox).
       - alert: ClawNotificationQuarantined
         expr: sum(increase(claw_notification_quarantined_total[1h])) > 0
         labels:

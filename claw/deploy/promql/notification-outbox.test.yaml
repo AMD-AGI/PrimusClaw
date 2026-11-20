@@ -56,7 +56,7 @@ tests:
     input_series:
       - series: 'claw_notification_quarantined_total{namespace="primus-claw", pod="claw-api-1", reason="isolated_failures"}'
         values: '0x10 1x100'
-      - series: 'claw_notification_quarantined_total{namespace="primus-claw", pod="claw-api-2", reason="unprocessable"}'
+      - series: 'claw_notification_quarantined_total{namespace="primus-claw", pod="claw-api-2", reason="isolated_failures"}'
         values: '0x110'
     alert_rule_test:
       - eval_time: 5m
