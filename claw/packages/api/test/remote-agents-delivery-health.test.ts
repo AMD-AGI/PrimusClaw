@@ -4,8 +4,9 @@
 /**
  * Whether a machine's replies get through (`remote-agents/delivery-health.ts`), over the real connector routes on a real Postgres
  * with remote agents, the assistant and notifications on. Batches and heartbeats have the shapes the connector posts; a batch the
- * database refuses is made by a trigger that raises the error a NUL in jsonb raises (22P05) on a marked event, so the 5xx comes
- * from the real `ingestEvents` and the real route. Time is moved by writing the instants the sweep counts from, so no test
+ * database refuses is made by a trigger that raises, on a marked event, the error a full disk raises (53100): one the route
+ * cannot set aside as that event's own (an event it cannot store, class 22 or 54, is refused alone and the rest kept), so the
+ * same batch fails on every retry and the 5xx comes from the real `ingestEvents` and the real route. Time is moved by writing the instants the sweep counts from, so no test
  * waits two minutes. Skipped without DATABASE_URL, and a skip is not a pass.
  *
  *   D1  the heartbeat's outbox report is recorded; a malformed one is ignored and the heartbeat still answers 200
@@ -61,11 +62,12 @@ describe("remote delivery health", { skip }, () => {
     await registerRemoteAgentRoutes(app, { pingMs: 150, pollMs: 40, retentionDays: 0, presenceSweepMs: 0, undeliveredSweepMs: 0, deliverySweepMs: 0 });
     await app.listen({ port: 0, host: "127.0.0.1" });
     base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
-    // The database refusing one event as it refuses a NUL in jsonb: the error a batch with one meets on every retry.
+    // The database refusing a batch with an error that is not one event's value (a full disk): the batch fails as a whole, on
+    // every retry while it lasts.
     await w.q(`CREATE OR REPLACE FUNCTION test_poison_event() RETURNS trigger AS $$
       BEGIN
         IF NEW.data::text LIKE '%${POISON}%' THEN
-          RAISE EXCEPTION 'unsupported Unicode escape sequence' USING ERRCODE = '22P05';
+          RAISE EXCEPTION 'could not extend file: No space left on device' USING ERRCODE = '53100';
         END IF;
         RETURN NEW;
       END $$ LANGUAGE plpgsql`);
@@ -188,7 +190,7 @@ describe("remote delivery health", { skip }, () => {
     for (let i = 0; i < 3; i++) assert.equal((await post("alice", cid, stuck)).status, 500);
     const h = await row(cid);
     assert.equal(h.api_failures, 3);
-    assert.equal(h.api_last_error, "pg_22P05");
+    assert.equal(h.api_last_error, "pg_53100");
     // What the connector says meanwhile, with every heartbeat.
     await heartbeat("alice", cid, report({ pending: 3, oldestMs: 30_000, failures: 3, failingMs: 30_000, lastError: "http_500", sessions: [[sid, 3, 30_000]] }));
     assert.deepEqual((await sweep()).notices, [], "not before two minutes");
