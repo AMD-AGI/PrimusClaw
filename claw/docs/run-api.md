@@ -120,6 +120,11 @@ answer), a workload that failed before it was ready (its terminal code, such as
 (`sandbox_workspace_forbidden`, `sandbox_workspace_not_allowed`) is not such a failure: its
 turns carry on without one by design.
 
+Such a run's `class` is `failed`, except after a provisioning timeout (`sandbox_pending_timeout`,
+`sandbox_timed_out`, `sandbox_start_timeout`): that is a deadline, so when the platform gave no
+other account of the sandbox (a preemption, say) the run reads `class: killed`,
+`kill_reason: deadline`. Its status is `failed` and `failure_reason` is the code either way.
+
 `failure_message` is what happened, for a person, when the run recorded more than its code:
 for a sandbox the platform could not provide, the platform's reason (for example
 `workload ... could not be scheduled: ...`, `workload ... still waiting for capacity after

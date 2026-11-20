@@ -21,7 +21,8 @@
  *      the same through the A2A route
  *   E2 the workload failed before it was ready (AdminFailed): its code, and the
  *      condition's message
- *   E3 the create answered 5xx every time: sandbox_create_failed
+ *   E3 the create answered 5xx every time, a proxy's multi-line text echoing the
+ *      env back: sandbox_create_failed, on one line, every env value masked
  *   E4 admitted, and no node takes the pod: sandbox_unschedulable
  *   E5 queued past the capacity wait: sandbox_pending_timeout
  *   E6 the control: SaFE refusing the account the workspace (403), which a run
@@ -103,7 +104,14 @@ async function startFakeSafe(): Promise<string> {
       if (mode === "forbidden") {
         return send(403, { errorCode: "Primus.00003", errorMessage: `The user(${USER}) is not allowed to create workload, workspace: [default]` });
       }
-      if (mode === "create_5xx") return send(503, { errorCode: "Primus.00001", errorMessage: "upstream connect error" });
+      if (mode === "create_5xx") {
+        // A proxy's plain-text 503, on several lines, echoing the request's env back:
+        // what reaches the run must be one line with every credential in it masked.
+        const env = (safeCalls.at(-1)?.body?.env ?? {}) as Record<string, string>;
+        const echoed = Object.entries(env).map(([k, v]) => `${k}=${v}`).join("\n");
+        res.writeHead(503, { "content-type": "text/plain" });
+        return res.end(`upstream connect error or disconnect/reset before headers.\nreset reason: connection termination\n${echoed}`);
+      }
       return send(200, { workloadId: "claw-e2e-sandbox-k7m2p" });
     }
     if (req.method === "GET" && path.startsWith("/api/v1/workloads/")) {
@@ -476,7 +484,19 @@ test("E2 a workload that failed before it was ready (AdminFailed): its code and 
 test("E3 a create answered 5xx: sandbox_create_failed, with the status", { skip }, async () => {
   mode = "create_5xx";
   const { sessionId, runId } = await runOnce();
-  assertFailedEverywhere(await seen(sessionId, runId), "sandbox_create_failed", /Create Hands failed: HTTP 503 .*upstream connect error/);
+  const s = await seen(sessionId, runId);
+  assertFailedEverywhere(s, "sandbox_create_failed", /Create Hands failed: HTTP 503 upstream connect error or disconnect\/reset before headers\. reset reason: connection termination /);
+  const env = safeCalls.find((c) => c.method === "POST")!.body!.env as Record<string, string>;
+  // Any of them may be a credential under an innocent name (a sandbox spec's own
+  // env is sent as written), so none long enough to be one may come back unmasked.
+  const credentials = Object.values(env).filter((v) => typeof v === "string" && v.length >= 16);
+  assert.ok(credentials.length > 0, "the sandbox's env carries values for the platform to echo");
+  const texts = [s.run.terminal.failure_message, s.row.error_message, s.notice!.summary, ...s.sandboxFailed.map((e) => e.message)];
+  for (const text of texts) {
+    assert.ok(!/[\r\n]/.test(String(text)), `on one line: ${JSON.stringify(text)}`);
+    for (const c of credentials) assert.ok(!String(text).includes(c), `a value the sandbox's env was sent left the run unmasked: ${text}`);
+  }
+  assert.match(String(s.run.terminal.failure_message), /<redacted>/, "the echoed env is in the message, masked");
 });
 
 test("E4 admitted, and no node takes the pod: sandbox_unschedulable", { skip, timeout: 60_000 }, async () => {

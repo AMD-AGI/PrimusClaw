@@ -131,7 +131,7 @@ const NOT_A_RUN_FAILURE: ReadonlySet<string> = new Set([
 const PLATFORM_TEXT_LIMIT = 600;
 
 /** One line of the platform's text: control characters and runs of space folded, cut at `limit`. */
-function oneLine(raw: unknown, limit: number): string {
+export function oneLineText(raw: unknown, limit: number): string {
   const text = String(raw ?? "")
     // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u001f\u007f]+/g, " ")
@@ -153,7 +153,7 @@ export function platformErrorText(body: string): string {
       said = parsed.errorMessage ?? parsed.message ?? parsed.error ?? body;
     }
   } catch { /* not JSON: the body is the text */ }
-  return oneLine(said, PLATFORM_TEXT_LIMIT);
+  return oneLineText(said, PLATFORM_TEXT_LIMIT);
 }
 
 /**
@@ -319,9 +319,9 @@ export function workloadTerminalText(info: Record<string, unknown>): string {
     const t = String(c?.type ?? "").toLowerCase();
     return t === "adminfailed" || t === "adminstopped";
   });
-  if (!terminal) return oneLine(info.message, PLATFORM_TEXT_LIMIT);
+  if (!terminal) return oneLineText(info.message, PLATFORM_TEXT_LIMIT);
   const parts = [terminal.type, terminal.reason, terminal.message].map((v) => String(v ?? "").trim()).filter(Boolean);
-  return oneLine(parts.join(": "), PLATFORM_TEXT_LIMIT);
+  return oneLineText(parts.join(": "), PLATFORM_TEXT_LIMIT);
 }
 
 /**

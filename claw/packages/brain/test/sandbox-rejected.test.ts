@@ -14,6 +14,7 @@
 
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 
 import { SafeWorkloadProvider, createRefused, SHUTDOWN_BUFFER_SECONDS } from "../src/sandbox/safe-workload-provider.js";
 import {
@@ -115,6 +116,53 @@ test("the platform's text is bounded, on one line, and never carries the run's k
   assert.ok(!(retryable instanceof SandboxProvisionTerminalError));
   assert.ok(retryable.message.startsWith("Create Hands failed: HTTP 503"), retryable.message);
   assert.ok(!retryable.message.includes(KEY), retryable.message);
+});
+
+/**
+ * What the provider's logger writes to stdout while `fn` runs. pino writes fd 1
+ * through sonic-boom, with `fs.write` or `fs.writeSync`; both are watched.
+ */
+async function logsOf(fn: () => Promise<unknown>): Promise<string> {
+  const mod = fs as unknown as Record<"write" | "writeSync", (...a: unknown[]) => unknown>;
+  const real = { write: mod.write, writeSync: mod.writeSync };
+  let out = "";
+  const seen = (fd: unknown, data: unknown) => {
+    if (fd === 1 && (typeof data === "string" || Buffer.isBuffer(data))) out += String(data);
+  };
+  mod.write = (...a: unknown[]) => { seen(a[0], a[1]); return real.write(...a); };
+  mod.writeSync = (...a: unknown[]) => { seen(a[0], a[1]); return real.writeSync(...a); };
+  try {
+    await fn();
+    // A line queued behind an earlier write goes out from that write's callback.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } finally { mod.write = real.write; mod.writeSync = real.writeSync; }
+  return out;
+}
+
+test("a credential the sandbox's env carried, echoed back by the platform, is masked in the failure and the log", async () => {
+  const CUSTOM = "custom-cred-9f8e7d6c5b4a3210";
+  const withEnv = { ...params(61_200), env: { MY_SERVICE_CREDENTIAL: CUSTOM, SHORT: "1" } };
+  const echo = `Bad request. env MY_SERVICE_CREDENTIAL=${CUSTOM} key ${KEY}`;
+  for (const status of [400, 503]) {
+    answer(status, JSON.stringify({ errorCode: "Primus.00002", errorMessage: echo }));
+    let err: Error | null = null;
+    const logs = await logsOf(async () => {
+      err = await new SafeWorkloadProvider().create(withEnv).then(() => null, (e: unknown) => e as Error);
+    });
+    assert.ok(err, String(status));
+    const message = (err as unknown as Error).message;
+    assert.ok(message.includes("MY_SERVICE_CREDENTIAL=<redacted>"), message);
+    assert.ok(!message.includes(CUSTOM) && !message.includes(KEY), message);
+    // The refusal is logged here with the platform's body; a 5xx is logged by whoever catches it.
+    if (status === 400) assert.ok(logs.includes("safe-workload.create_rejected"), `logged: ${logs}`);
+    assert.ok(!logs.includes(CUSTOM) && !logs.includes(KEY), logs);
+  }
+});
+
+test("a 5xx body on several lines is folded onto one", async () => {
+  answer(502, "<html>\r\n<h1>Bad Gateway</h1>\n\tupstream reset\n</html>");
+  const err = await new SafeWorkloadProvider().create(params(600)).then(() => null, (e: unknown) => e) as Error;
+  assert.equal(err.message, "Create Hands failed: HTTP 502 <html> <h1>Bad Gateway</h1> upstream reset </html>");
 });
 
 test("a body that is not SaFE's JSON is passed on as text; a JSON body without a message as itself", () => {

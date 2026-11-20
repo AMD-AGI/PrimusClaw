@@ -40,6 +40,7 @@ import {
   SandboxRuntimeTerminalError,
   SandboxStopUnavailable,
   assertSandboxWorkspaceAllowed,
+  oneLineText,
 } from "./errors.js";
 import { resourcesMapToWorkloadArray } from "./params.js";
 import { EXEC_TRANSPORT_SLACK_MS, parseExecTimeoutMs } from "./provider.js";
@@ -151,6 +152,19 @@ export function createRefused(status: number): boolean {
   return status >= 400 && status < 500 && status !== 403 && status !== 408 && status !== 425 && status !== 429;
 }
 
+/**
+ * The values a workload create sent that may be credentials, for masking what the
+ * platform says back: the platform key and every env value. `redactSecrets` skips
+ * the short ones, so a flag or a path does not blank out the platform's text.
+ */
+export function requestSecrets(apiKey: string, env: Record<string, unknown> | undefined): string[] {
+  const out = apiKey ? [apiKey] : [];
+  for (const value of Object.values(env ?? {})) {
+    if (typeof value === "string" && value) out.push(value);
+  }
+  return out;
+}
+
 export class SafeWorkloadProvider implements SandboxProvider {
   readonly kind = "safe-workload" as const;
 
@@ -207,7 +221,12 @@ export class SafeWorkloadProvider implements SandboxProvider {
       // Masked before it goes anywhere: the body is echoed into the run's failure,
       // which the caller, the session's events and a notification all carry.
       const rawBody = (await resp.text().catch(() => "")).slice(0, 4000);
-      const errBody = redactSecrets(rawBody, apiKey ? [apiKey] : []).text.slice(0, 300);
+      // Everything this request carried that may be a credential: the platform key
+      // and every value the sandbox's env was given (a caller's own credential sits
+      // there under any name). A platform that echoes the request back -- into this
+      // body, and so into the logs below and the run's failure -- has them masked.
+      const sent = requestSecrets(apiKey, params.env);
+      const errBody = oneLineText(redactSecrets(rawBody, sent).text, 300);
       if (resp.status === 403) {
         // The account may not create workloads here. Retrying cannot change
         // that, and SaFE's body names the user id and an internal error code,
@@ -223,7 +242,7 @@ export class SafeWorkloadProvider implements SandboxProvider {
         // ceiling on `timeout`), a validation error. Nothing was created and the
         // same request is refused again, so this is terminal for the run and is
         // reported with the platform's own words.
-        const platformText = redactSecrets(platformErrorText(rawBody), apiKey ? [apiKey] : []).text;
+        const platformText = redactSecrets(platformErrorText(rawBody), sent).text;
         const message = sandboxRejectedText(resp.status, platformText, {
           requestedSec: params.timeoutSec, sentSec: timeout, bufferSec: SHUTDOWN_BUFFER_SECONDS,
         });

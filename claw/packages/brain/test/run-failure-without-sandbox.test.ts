@@ -231,6 +231,12 @@ test("an open the run could have retried past, that it never got past, fails the
       () => new SandboxAttachError(new Error("Create Hands failed: HTTP 503 upstream connect error")),
       "sandbox_create_failed", "Create Hands failed: HTTP 503 upstream connect error",
     ],
+    [
+      // A failed create's message as some other path built it, the platform's body
+      // on several lines: the run's message is one line whichever way it came.
+      () => new SandboxAttachError(new Error("Create Hands failed: HTTP 503 upstream\r\nconnect error\n\tretry later")),
+      "sandbox_create_failed", "Create Hands failed: HTTP 503 upstream connect error retry later",
+    ],
   ];
   for (const [open, reason, message] of cases) {
     const { completion, delivered } = await runTurn({ open, callback: true });

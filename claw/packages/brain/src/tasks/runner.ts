@@ -73,7 +73,7 @@ import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
 import {
   SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf, sandboxOpenFailureOf,
-  sandboxUnavailableOf,
+  sandboxUnavailableOf, oneLineText,
 } from "../sandbox/errors.js";
 import { placementNodeLabels } from "../sandbox/create-sandbox.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
@@ -3053,9 +3053,11 @@ class TaskRunner {
     if (!err) return null;
     const failure = sandboxOpenFailureOf(err, classifySandboxFailure);
     if (!failure) return null;
-    // Bounded here; the run's secrets are masked on the way out, as for every
-    // event (`onEvent`) and callback (`redactEgressPayload`) this run sends.
-    return { reason: failure.reason, message: failure.message.slice(0, 2000) };
+    // One line and bounded here, whichever path built it: a failed create's message
+    // carries the platform's body as it came, newlines and all. The run's secrets
+    // are masked on the way out, as for every event (`onEvent`) and callback
+    // (`redactEgressPayload`) this run sends.
+    return { reason: failure.reason, message: oneLineText(failure.message, 2000) };
   }
 
   /**

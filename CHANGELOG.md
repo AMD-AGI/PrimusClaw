@@ -196,8 +196,10 @@ release version, and its `appVersion` stays `latest`.
   with the `AdminFailed` condition's reason and message), `sandbox_unschedulable` and `sandbox_pending_timeout`. When a
   refusal is about the timeout, the message also says the timeout the run asked for and the one Claw sent (Claw adds
   3600 s to stop the run cleanly) and, when only that hour is over the platform's limit, the largest timeout that fits.
-  A run that is refused the workspace (403) still carries on without a sandbox and is not failed for it. The platform's
-  text is bounded and masked like every other value the run sends.
+  A run that is refused the workspace (403) still carries on without a sandbox and is not failed for it. After
+  `sandbox_pending_timeout`, a deadline, `GET /v1/runs` keeps `class: killed` with `kill_reason: deadline`, as before. The
+  platform's text is bounded, kept on one line and masked like every other value the run sends; every value the
+  sandbox's env was sent is masked in it too, and in the log of the refusal, since a platform may echo the request back.
 - Claw: in the SaFE deployment mode with `LLM_KEY_SOURCE=platformKey`, a caller signed in with an `ak-` key (in
   `Authorization: Bearer`, `x-api-key` or a download URL) or a default session cookie has their email again:
   `GET /v1/me` answers it and the request's user carries it, as in 0.5.8. Since 0.5.9 the API no longer asked SaFE's
