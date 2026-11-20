@@ -76,7 +76,7 @@ function isQueueWaitOutcome(outcome: QueueExitOutcome): outcome is QueueWaitOutc
 export type EverHeld = "true" | "false";
 
 /** Why the event consumer set an event aside (events/poison.ts). */
-export type EventQuarantineReason = "unparseable" | "unstorable";
+export type EventQuarantineReason = "unparseable" | "unstorable" | "bounded";
 
 export const registry = new Registry();
 registry.setDefaultLabels({ service: "claw-api" });
@@ -125,7 +125,8 @@ const agentDoneRefusedTotal = new Counter({
 // The event consumer's own health (events/poison.ts). Consecutive failures is this replica's run of deliveries answered
 // with a retry since it last stored an event or set one aside; an outage or a poison event shows here first. Quarantined is an event set aside with a
 // durable copy in claw_event_quarantine, by why: `unparseable` (not a JSON object) or `unstorable` (the database refused
-// its value after sanitising). Sanitised counts the events newly stored with characters Postgres cannot hold (NUL, a
+// its value after sanitising), or `bounded` (a completion the database refused for its depth, run with a depth-bounded
+// copy; the record keeps the original). Sanitised counts the events newly stored with characters Postgres cannot hold (NUL, a
 // lone surrogate) replaced by U+FFFD; a delivery that fails, is dropped, or finds its row already stored is not counted.
 const eventConsumerConsecutiveFailures = new Gauge({
   name: "claw_api_event_consumer_consecutive_failures",

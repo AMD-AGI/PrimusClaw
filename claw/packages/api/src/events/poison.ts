@@ -14,7 +14,10 @@
  *   a durable copy in `claw_event_quarantine`. Only two kinds are: one that is
  *   not a JSON object, and one Postgres refused for its value after it was made
  *   storable (consumer.ts, `UNSTORABLE_PG_CODES`). Both are properties of the
- *   bytes, so the same delivery fails the same way every time. Nothing is set
+ *   bytes, so the same delivery fails the same way every time. A completion is
+ *   never set aside: when Postgres refuses it for nesting too deep to parse
+ *   (54001), a depth-bounded copy (`depthBoundedEvent`) is stored and run in
+ *   its place, and the original is kept here with reason `bounded`. Nothing is set
  *   aside for how often or how long it has failed: an outage of the database or
  *   of the tombstone bucket fails every event for as long as it lasts, and a
  *   completion is redelivered for as long as its session's lock is held or its
@@ -99,6 +102,48 @@ export function storableEvent(event: Record<string, unknown>): { event: Record<s
   const count = { n: 0 };
   const out = storableValue(event, count) as Record<string, unknown>;
   return count.n ? { event: out, replaced: count.n } : { event, replaced: 0 };
+}
+
+/**
+ * How deep a stored copy of a completion is kept when Postgres refused the
+ * whole one (54001, stack depth limit exceeded). Far below where it refuses
+ * (about 13,000 levels with the default `max_stack_depth` of 2MB) and far above
+ * anything a completion's own fields reach.
+ */
+export const STORED_DEPTH_LIMIT = 1_000;
+
+/** What stands in for each object or array cut off below `STORED_DEPTH_LIMIT`. */
+export const TOO_DEEP_PLACEHOLDER = "[nested too deep to store]";
+
+/**
+ * A copy of `event` with every object or array deeper than `limit` levels
+ * (the event itself is level 0) replaced by `TOO_DEEP_PLACEHOLDER`. `cut` is
+ * how many were replaced; zero means the copy is equal to the input.
+ * Iterative for the same reason `storableValue` is, and every key is defined
+ * as an own field, so a `__proto__` key stays a key.
+ */
+export function depthBoundedEvent(
+  event: Record<string, unknown>, limit = STORED_DEPTH_LIMIT,
+): { event: Record<string, unknown>; cut: number } {
+  let cut = 0;
+  const pending: Array<[source: object, copy: object, depth: number]> = [];
+  const copyOf = (v: unknown, depth: number): unknown => {
+    if (!v || typeof v !== "object") return v;
+    if (depth > limit) { cut++; return TOO_DEEP_PLACEHOLDER; }
+    const copy: object = Array.isArray(v) ? new Array<unknown>(v.length) : {};
+    pending.push([v, copy, depth]);
+    return copy;
+  };
+  const out = copyOf(event, 0) as Record<string, unknown>;
+  for (let next = pending.pop(); next; next = pending.pop()) {
+    const [source, copy, depth] = next;
+    if (Array.isArray(source)) {
+      for (let i = 0; i < source.length; i++) (copy as unknown[])[i] = copyOf(source[i], depth + 1);
+    } else {
+      for (const [key, value] of Object.entries(source)) defineField(copy, key, copyOf(value, depth + 1));
+    }
+  }
+  return cut ? { event: out, cut } : { event, cut: 0 };
 }
 
 /** The same, for one string (a subject's session id). */

@@ -14,6 +14,8 @@
  *   marked processed.
  * - An event Postgres refuses for its value (22P05, 22021, 22P02) is set aside
  *   at once with a durable copy, and the events after it are stored.
+ * - A completion Postgres refuses for its nesting (54001) is stored and run
+ *   with a depth-bounded copy on its first delivery, and its original is kept.
  * - Nothing else is set aside, however many deliveries and however old: not
  *   the backlog an outage of the database or the tombstone bucket leaves, and
  *   not a completion. The refusals are raised by a trigger on the real table,
@@ -46,7 +48,8 @@ describe("event consumer: unstorable input and poison events", { skip }, () => {
   const q = (text: string, params: unknown[] = []) => h.app.db.db.query(text, params);
 
   before(async () => {
-    h = await startAdmissionCluster({ CLAW_NOTIFICATIONS_ENABLED: "false" });
+    // Skill evolution on, as where it is enabled: a completion then writes itself again (its `skills_used`, its evolution job).
+    h = await startAdmissionCluster({ CLAW_NOTIFICATIONS_ENABLED: "false", CLAW_SKILL_AUTO_EVOLUTION_ENABLED: "true" });
     consumer = await import("../src/events/consumer.js");
     poison = await import("../src/events/poison.js");
     registry = (await import("../src/infra/metrics.js")).registry;
@@ -76,10 +79,10 @@ describe("event consumer: unstorable input and poison events", { skip }, () => {
     (await import("../src/sessions/deleted-cache.js")).resetDeletedSessionCache();
     poison.eventDeliveryHealth.reset();
     consumer.tombstoneReader.has = async () => false;
-    for (const t of ["poison_test_refuse", "claw_event_quarantine", "claw_session_events", "claw_conversation_turns", "claw_tasks", "claw_sessions"]) {
+    for (const t of ["poison_test_refuse", "claw_evolution_jobs", "claw_event_quarantine", "claw_session_events", "claw_conversation_turns", "claw_tasks", "claw_sessions"]) {
       await q(`DELETE FROM ${t}`);
     }
-    Object.assign(consumer.completionPorts, originalPorts, { maybeSummarize: async () => {} });
+    Object.assign(consumer.completionPorts, originalPorts, { maybeSummarize: async () => {}, maybeRecordTaskPattern: async () => {} });
     for (const sid of [SESSION, OTHER]) {
       await q(
         `INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status, agent_gate_message_id, config)
@@ -192,6 +195,74 @@ describe("event consumer: unstorable input and poison events", { skip }, () => {
       assert.ok(turns.some((t) => t.role === "assistant" && String(t.content).includes("done")), JSON.stringify(turns));
     });
   }
+
+  // Deeper than Postgres parses (54001 past about 13,000 levels with the default max_stack_depth), yet a valid event and
+  // about 100 KB on the wire, well inside a NATS payload. Retried, it would be refused on every delivery.
+  test("a completion nested 17,000 levels deep is stored bounded and processed, and its original is kept", async () => {
+    const depth = 17_000;
+    const completion = deeplyNested("exec_complete", depth, `deep${NUL}`, {
+      session_id: SESSION, task_id: RUN, message_id: "m1", user_id: "u1",
+      final_text: "done", failed: false, run_claim: 1, prompt: "hi", api_key: "s3cr3t-value-123",
+      // An inline skill: the completion writes the stored copy again with its version filled in.
+      selected_skills: ["inline-skill"],
+    });
+    await assert.rejects(q("SELECT $1::text::jsonb", [new TextDecoder().decode(completion).replace("\\u0000", "")]),
+      (e: { code?: string }) => e.code === "54001", "CONTROL: Postgres refuses this event whole");
+    assert.equal(await deliver(SESSION, 920, completion), "ack", "on its first delivery");
+    const ev = (await q("SELECT processed_at, data FROM claw_session_events WHERE event = 'exec_complete'")).rows;
+    assert.equal(ev.length, 1, "the completion is stored");
+    assert.notEqual(ev[0].processed_at, null, "the completion ran");
+    // Levels 3 (the input) to STORED_DEPTH_LIMIT are kept; the object below them is the placeholder.
+    assert.deepEqual(nestedLeaf(ev[0].data), { depth: poison.STORED_DEPTH_LIMIT - 2, leaf: poison.TOO_DEEP_PLACEHOLDER });
+    assert.equal(ev[0].data.final_text, "done");
+    assert.equal(ev[0].data.api_key, "<redacted>");
+    assert.deepEqual(ev[0].data.skills_used, { "inline-skill": 1 }, "rewritten by the completion, still bounded");
+    const jobs = (await q("SELECT event_data FROM claw_evolution_jobs WHERE session_id = $1", [SESSION])).rows;
+    assert.equal(jobs.length, 1, "its evolution job is queued");
+    assert.equal(nestedLeaf(jobs[0].event_data).leaf, poison.TOO_DEEP_PLACEHOLDER, "with the bounded copy");
+    assert.equal((await q("SELECT status FROM claw_tasks WHERE task_id = $1", [RUN])).rows[0].status, "completed");
+    const turns = (await q("SELECT role, content FROM claw_conversation_turns WHERE session_id = $1", [SESSION])).rows;
+    assert.ok(turns.some((t) => t.role === "assistant" && String(t.content).includes("done")), JSON.stringify(turns));
+
+    const kept = await quarantined();
+    assert.equal(kept.length, 1, "the original is kept");
+    assert.equal(kept[0].reason, "bounded");
+    assert.equal(kept[0].event_type, "exec_complete");
+    assert.equal(kept[0].event_id, "claw-920");
+    assert.match(String(kept[0].last_error), /^54001: /);
+    const original = JSON.parse(Buffer.from(kept[0].payload).toString("utf8")) as Record<string, unknown>;
+    assert.equal(nestedLeaf(original).depth, depth, "whole");
+    assert.equal(original.api_key, "<redacted>", "masked");
+
+    // A redelivery (its ack lost) is the same completion: nothing is written twice.
+    assert.equal(await deliver(SESSION, 920, completion, { deliveryCount: 2 }), "ack");
+    assert.equal((await storedData(SESSION)).filter((r) => r.event === "exec_complete").length, 1);
+    assert.equal((await quarantined()).length, 1);
+    assert.equal((await q("SELECT count(*)::int AS n FROM claw_conversation_turns WHERE session_id = $1 AND role = 'assistant'", [SESSION])).rows[0].n,
+      turns.filter((t) => t.role === "assistant").length);
+  });
+
+  test("a bounded completion whose original cannot be kept is retried, and runs once it can be", async () => {
+    await q(`CREATE FUNCTION poison_test_refuse_copy() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN RAISE EXCEPTION 'quarantine refused for the test' USING ERRCODE = '57P01'; END $$`);
+    await q("CREATE TRIGGER poison_test_refuse_copy BEFORE INSERT ON claw_event_quarantine FOR EACH ROW EXECUTE FUNCTION poison_test_refuse_copy()");
+    const completion = deeplyNested("exec_complete", 17_000, "x", {
+      session_id: SESSION, task_id: RUN, message_id: "m1", user_id: "u1", final_text: "done", failed: false, run_claim: 1,
+    });
+    try {
+      assert.equal(await deliver(SESSION, 930, completion), "nak");
+      assert.equal((await q("SELECT status FROM claw_tasks WHERE task_id = $1", [RUN])).rows[0].status, "running", "not run without its copy");
+    } finally {
+      await q("DROP TRIGGER poison_test_refuse_copy ON claw_event_quarantine");
+      await q("DROP FUNCTION poison_test_refuse_copy()");
+    }
+    assert.equal(await deliver(SESSION, 930, completion, { deliveryCount: 2 }), "ack");
+    assert.equal((await quarantined())[0]?.reason, "bounded");
+    const ev = (await q("SELECT processed_at FROM claw_session_events WHERE event = 'exec_complete'")).rows;
+    assert.equal(ev.length, 1);
+    assert.notEqual(ev[0].processed_at, null);
+    assert.equal((await q("SELECT status FROM claw_tasks WHERE task_id = $1", [RUN])).rows[0].status, "completed");
+  });
 
   test("any other event nested that deep is stored as well", async () => {
     assert.equal(await deliver(SESSION, 910, deeplyNested("toolUsed", 13_000, "x", { message_id: "m1", status: "end" })), "ack");

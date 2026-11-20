@@ -74,6 +74,7 @@ describe("event consumer over JetStream: a poison event", { skip, timeout: 120_0
 
     const consumer = await import("../src/events/consumer.js");
     consumer.tombstoneReader.has = async () => false;
+    consumer.completionPorts.maybeSummarize = async () => {};
     consumerLoop = consumer.startEventConsumer({ signal: stopConsumer.signal });
     consumerLoop.catch(() => {});
     // The durable delivers only what is published after it exists.
@@ -169,6 +170,43 @@ describe("event consumer over JetStream: a poison event", { skip, timeout: 120_0
     }, 10_000);
     assert.equal(await gauge("claw_api_event_consumer_consecutive_failures"), 0);
     assert.equal(await gauge("claw_api_event_quarantined_total"), 1, "only the unstorable one, from the test before");
+  });
+
+  test("a completion nested deeper than Postgres parses is run on its first delivery, with a bounded copy", async () => {
+    const session = "js-deep";
+    const run = "run-js-deep";
+    await q(`INSERT INTO claw_sessions (session_id, name, user_id, mode, agent_status, agent_gate_message_id, config)
+             VALUES ($1, 'deep', 'u1', 'claw', 'running', 'm1', '{}'::jsonb)`, [session]);
+    await q(`INSERT INTO claw_tasks (task_id, session_id, name, status, origin, executor, metadata, claim_count,
+                                     queued_at, run_time_epoch_at, started_at, lease_owner, lease_expires_at)
+             VALUES ($1, $2, 'chat', 'running', 'chat', 'brain', '{"message_id": "m1", "user_id": "u1"}'::jsonb, 1,
+                     NOW() - interval '60 seconds', NOW() - interval '60 seconds', NOW() - interval '60 seconds',
+                     'brain-a', NOW() + interval '60 seconds')`, [run, session]);
+    // 17,000 levels: Postgres answers 54001 for the whole event; about 100 KB, inside a NATS payload.
+    let inner = '"x"';
+    for (let i = 0; i < 17_000; i++) inner = `{"a":${inner}}`;
+    const head = JSON.stringify({
+      type: "exec_complete", session_id: session, task_id: run, message_id: "m1", user_id: "u1",
+      final_text: "done", failed: false, run_claim: 1,
+    });
+    const wire = `${head.slice(0, -1)},"tool_stats":{"bash":{"calls":1,"input":${inner}}}}`;
+    const seq = (await natsMod.js.publish(`events.${session}`, natsMod.sc.encode(wire), { msgID: crypto.randomUUID() })).seq;
+
+    // Inside the first redelivery delay: it was not refused and retried.
+    await until("the run completed", async () =>
+      (await q("SELECT status FROM claw_tasks WHERE task_id = $1", [run])).rows[0].status === "completed", 4_000, 100);
+    const ev = (await q("SELECT processed_at, data FROM claw_session_events WHERE session_id = $1", [session])).rows;
+    assert.equal(ev.length, 1);
+    assert.notEqual(ev[0].processed_at, null);
+    let v: unknown = ev[0].data.tool_stats.bash.input;
+    while (v && typeof v === "object") v = (v as { a: unknown }).a;
+    assert.equal(v, poison.TOO_DEEP_PLACEHOLDER);
+    const kept = (await q("SELECT reason, stream_seq, deliveries FROM claw_event_quarantine WHERE session_id = $1", [session])).rows;
+    assert.deepEqual(kept.map((r) => [r.reason, Number(r.stream_seq), r.deliveries]), [["bounded", seq, 1]]);
+    await until("an empty backlog", async () => {
+      const b = await poison.readEventConsumerBacklog(natsMod.jsm, natsMod.EVENT_STREAM, "api-consumer");
+      return b.ackPending === 0 && b.pending === 0 ? b : null;
+    }, 10_000);
   });
 
   test("the oldest pending age skips a range a session deletion purged from the stream", async () => {
