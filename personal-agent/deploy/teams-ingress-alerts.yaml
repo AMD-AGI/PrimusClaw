@@ -1,0 +1,221 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Grafana alerts for the Teams ingress Function, for the grafana-operator (Grafana instance labelled
+# dashboards=monitoring). The ingress logs to its Application Insights resource, so the rules query it through an Azure
+# Monitor data source, and route to the same contact point as the personal agent's other rule groups.
+#
+# A message the ingress cannot queue is lost unless Teams retries it, so both rules page at once:
+#   - teams-ingress-requests-failing: more than 2 requests to the messages function answered 499 or above in 5 minutes
+#     (a 499 is a request the Bot Framework stopped waiting for; a 500 is one the ingress could not queue).
+#   - teams-ingress-enqueue-failed: any "failed to enqueue activity" line or inbound_enqueue_failed record
+#     (src/health.ts) in 5 minutes, which also catches a single failure the first rule lets through.
+#
+# Before applying, once:
+#   1. An Entra application (service principal) with the "Monitoring Reader" role on the Application Insights resource
+#      (reading its logs needs no more), and a client secret for it.
+#   2. Its tenant id, client id and secret in a Secret next to Grafana:
+#        kubectl -n primus-safe create secret generic teams-ingress-monitor-reader \
+#          --from-literal=tenantId=... --from-literal=clientId=... --from-literal=clientSecret=...
+#
+# Apply (APP_INSIGHTS_RESOURCE_ID is the resource's ARM id, /subscriptions/.../providers/microsoft.insights/components/
+# <name>; only that variable is substituted):
+#   APP_INSIGHTS_RESOURCE_ID=/subscriptions/... envsubst '${APP_INSIGHTS_RESOURCE_ID}' < teams-ingress-alerts.yaml \
+#     | kubectl -n primus-safe apply -f -
+# Rollback:
+#   kubectl -n primus-safe delete grafanaalertrulegroup teams-ingress
+#   kubectl -n primus-safe delete grafanadatasource teams-ingress-app-insights
+#   kubectl -n primus-safe delete grafanafolder teams-ingress
+#
+# Without Grafana, the same two queries work as Azure Monitor log search alert rules on the Application Insights
+# resource (frequency 1 minute, window 5 minutes; "failed" greater than 2, and "n" greater than 0).
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaFolder
+metadata:
+  name: teams-ingress
+  namespace: primus-safe
+spec:
+  allowCrossNamespaceImport: false
+  instanceSelector:
+    matchLabels:
+      dashboards: monitoring
+  title: Teams ingress
+  uid: teams-ingress
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDatasource
+metadata:
+  name: teams-ingress-app-insights
+  namespace: primus-safe
+spec:
+  allowCrossNamespaceImport: false
+  instanceSelector:
+    matchLabels:
+      dashboards: monitoring
+  valuesFrom:
+    - targetPath: jsonData.tenantId
+      valueFrom:
+        secretKeyRef:
+          name: teams-ingress-monitor-reader
+          key: tenantId
+    - targetPath: jsonData.clientId
+      valueFrom:
+        secretKeyRef:
+          name: teams-ingress-monitor-reader
+          key: clientId
+    - targetPath: secureJsonData.clientSecret
+      valueFrom:
+        secretKeyRef:
+          name: teams-ingress-monitor-reader
+          key: clientSecret
+  datasource:
+    name: Teams ingress (Application Insights)
+    uid: teams-ingress-app-insights
+    type: grafana-azure-monitor-datasource
+    access: proxy
+    jsonData:
+      azureAuthType: clientsecret
+      cloudName: azuremonitor
+      tenantId: ${tenantId}
+      clientId: ${clientId}
+    secureJsonData:
+      clientSecret: ${clientSecret}
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaAlertRuleGroup
+metadata:
+  name: teams-ingress
+  namespace: primus-safe
+spec:
+  allowCrossNamespaceImport: false
+  folderRef: teams-ingress
+  instanceSelector:
+    matchLabels:
+      dashboards: monitoring
+  interval: 1m
+  name: teams-ingress
+  rules:
+    - uid: teams-ingress-requests-failing
+      title: Teams messages are not being queued
+      condition: B
+      for: 0s
+      noDataState: OK
+      execErrState: Error
+      labels:
+        component: teams-ingress
+        severity: critical
+        team: primus-claw
+      annotations:
+        summary: The Teams ingress answers messages with 499 or 5xx
+        description:
+          More than 2 requests to the ingress's messages function in the last 5 minutes were answered 499 (the
+          Bot Framework gave up waiting) or 500 (the activity could not be queued). Those messages are lost unless Teams
+          retries them. Check the ingress's traces for inbound_client_reset and inbound_enqueue_failed records (error and
+          code) and the inbound Service Bus namespace's health.
+        runbook: https://github.com/AMD-AGI/PrimusClaw/blob/main/personal-agent/deploy/teams-ingress-alerts.yaml
+      notificationSettings:
+        receiver: autopilot-grafana-alerting-autopilot-fle
+        group_by:
+          - alertname
+          - grafana_folder
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 4h
+      data:
+        - refId: A
+          datasourceUid: teams-ingress-app-insights
+          relativeTimeRange:
+            from: 300
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: grafana-azure-monitor-datasource
+              uid: teams-ingress-app-insights
+            queryType: Azure Log Analytics
+            azureLogAnalytics:
+              resources:
+                - ${APP_INSIGHTS_RESOURCE_ID}
+              resultFormat: table
+              query: |-
+                requests
+                | where timestamp > ago(5m)
+                | where name == "messages" and toint(resultCode) >= 499
+                | summarize failed = count()
+        - refId: B
+          datasourceUid: __expr__
+          model:
+            refId: B
+            datasource:
+              type: __expr__
+              uid: __expr__
+            type: threshold
+            expression: A
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 2
+    - uid: teams-ingress-enqueue-failed
+      title: The Teams ingress could not queue an activity
+      condition: B
+      for: 0s
+      noDataState: OK
+      execErrState: Error
+      labels:
+        component: teams-ingress
+        severity: critical
+        team: primus-claw
+      annotations:
+        summary: The Teams ingress failed to put an activity on the inbound queue
+        description: The ingress logged "failed to enqueue activity" or an inbound_enqueue_failed record in the last 5
+          minutes, after retrying the send on new Service Bus clients. The message was answered with a 500 (Teams
+          retries it) or a card action with the unavailable card. The record's error, code and consecutive_failures say
+          whether it is one blip or every message.
+        runbook: https://github.com/AMD-AGI/PrimusClaw/blob/main/personal-agent/deploy/teams-ingress-alerts.yaml
+      notificationSettings:
+        receiver: autopilot-grafana-alerting-autopilot-fle
+        group_by:
+          - alertname
+          - grafana_folder
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 4h
+      data:
+        - refId: A
+          datasourceUid: teams-ingress-app-insights
+          relativeTimeRange:
+            from: 300
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: grafana-azure-monitor-datasource
+              uid: teams-ingress-app-insights
+            queryType: Azure Log Analytics
+            azureLogAnalytics:
+              resources:
+                - ${APP_INSIGHTS_RESOURCE_ID}
+              resultFormat: table
+              query: |-
+                traces
+                | where timestamp > ago(5m)
+                | where message has "failed to enqueue activity" or message has "inbound_enqueue_failed"
+                | summarize n = count()
+        - refId: B
+          datasourceUid: __expr__
+          model:
+            refId: B
+            datasource:
+              type: __expr__
+              uid: __expr__
+            type: threshold
+            expression: A
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0

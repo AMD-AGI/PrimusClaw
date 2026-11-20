@@ -20,6 +20,10 @@ const RULE =
   "the Bot Connector host rule is the worker's (@primusclaw/personal-agent-teams/connector-hosts), which reads a " +
   "serviceUrl as fetch() does (WHATWG URL), not as Python's urlsplit";
 
+// A failed send (the fake's error is a connection error) throws the whole client away, not only its sender, and a send
+// has three attempts, not two: a client whose connection is stuck closing hangs every sender opened on it.
+const SEND = "a failed send is retried on a new Service Bus client, up to three attempts";
+
 /**
  * The cases whose answer differs from the Python Function's, the fields that differ, and why. Every other case answers
  * exactly as it did.
@@ -52,6 +56,32 @@ export const EXPECTED: Readonly<Record<string, { fields: readonly string[]; why:
   "token: malformed allow-list entries": {
     fields: ["logs"],
     why: "the worker's rule logs an ignored entry as one line with its fields as JSON",
+  },
+  "send fails once, retried": {
+    fields: ["built", "logs"],
+    why: `${SEND}; the one retry is on a new client, so a second one is built, and the warning names it`,
+  },
+  "send fails twice: 500": {
+    fields: ["built", "logs", "sent", "status"],
+    why: `${SEND}; the third attempt, on a third client, gets the message through: a 200 where Python gave up`,
+  },
+  "card action, send fails twice: unavailable card": {
+    fields: ["body", "built", "logs", "sent"],
+    why: `${SEND}; the third attempt gets the action through: the placeholder card where Python had the unavailable one`,
+  },
+  "card action, nothing set: unavailable card": {
+    fields: ["body", "json", "status"],
+    why:
+      "a card action that cannot be queued is an empty 500, which the Bot Framework retries, as any other activity is: " +
+      "Python's unavailable card in a 200 ended the invoke, so the click never reached the worker",
+  },
+  "feedback, send fails twice: 500": {
+    fields: ["built", "logs", "sent", "status"],
+    why: `${SEND}; the third attempt gets the feedback through: a 200 where Python gave up`,
+  },
+  "outbound: ack, the bus fails": {
+    fields: ["built", "logs", "sent"],
+    why: `${SEND}; the third attempt gets the delivery ack through where Python dropped it`,
   },
   "outbound: outbound serviceUrl https://[v1.x.botframework.com]/": {
     fields: ["logs", "raised", "server"],

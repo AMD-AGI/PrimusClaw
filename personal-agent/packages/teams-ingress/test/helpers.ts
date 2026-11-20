@@ -146,6 +146,7 @@ export class RecordingBus implements ServiceBusFactory {
           close: () => Promise.resolve(),
         };
       },
+      close: () => Promise.resolve(),
     };
   }
 }
