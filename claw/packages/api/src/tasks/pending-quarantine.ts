@@ -158,25 +158,18 @@ export async function recordPendingDrainFailure(
  */
 async function quarantinePendingMessage(row: FailedPendingRow): Promise<boolean> {
   const messageId = queuedMessageId(row.pendingId);
-  const moved = (await db.query(
-    `WITH moved AS (
-       DELETE FROM claw_pending_messages p
-        WHERE p.id = $1
-          AND NOT EXISTS (
-            SELECT 1 FROM claw_tasks t
-             WHERE t.task_id = p.dispatch_task_id
-               AND t.status IN ('queued','preparing','running','cancelling'))
-       RETURNING p.id, p.session_id, p.user_id, p.content, p.created_at,
-                 p.drain_first_failed_at, p.drain_failures, p.drain_last_error
-     )
-     INSERT INTO ${PENDING_QUARANTINE_TABLE}
-       (id, session_id, user_id, message_id, content, queued_at, first_failed_at, attempts, last_error)
-     SELECT id, session_id, user_id, $2, content, created_at, drain_first_failed_at, drain_failures, drain_last_error
-       FROM moved
-     ON CONFLICT (id) DO NOTHING
-     RETURNING id, attempts, last_error, EXTRACT(EPOCH FROM (NOW() - queued_at))::int AS queued_for_sec`,
-    [row.pendingId, messageId],
-  )).rows[0] as { attempts: number; last_error: string | null; queued_for_sec: number } | undefined;
+  let moved: { attempts: number; last_error: string | null; queued_for_sec: number } | undefined;
+  try {
+    moved = await moveToQuarantine(row.pendingId, messageId);
+  } catch (err) {
+    // The row is still queued, which is where a failed move must leave it: the
+    // next attempt is counted again and tries the move again.
+    logger.warn(
+      { err: String(err), sessionId: row.sessionId, pendingId: row.pendingId },
+      "pending.quarantine_move_failed",
+    );
+    return false;
+  }
   if (!moved) {
     logger.warn({ sessionId: row.sessionId, pendingId: row.pendingId }, "pending.quarantine_deferred");
     return false;
@@ -196,6 +189,32 @@ async function quarantinePendingMessage(row: FailedPendingRow): Promise<boolean>
     content: row.content,
   });
   return true;
+}
+
+/** The move itself: one statement, so the row is in exactly one of the two tables. */
+async function moveToQuarantine(
+  pendingId: number,
+  messageId: string,
+): Promise<{ attempts: number; last_error: string | null; queued_for_sec: number } | undefined> {
+  return (await db.query(
+    `WITH moved AS (
+       DELETE FROM claw_pending_messages p
+        WHERE p.id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM claw_tasks t
+             WHERE t.task_id = p.dispatch_task_id
+               AND t.status IN ('queued','preparing','running','cancelling'))
+       RETURNING p.id, p.session_id, p.user_id, p.content, p.created_at,
+                 p.drain_first_failed_at, p.drain_failures, p.drain_last_error
+     )
+     INSERT INTO ${PENDING_QUARANTINE_TABLE}
+       (id, session_id, user_id, message_id, content, queued_at, first_failed_at, attempts, last_error)
+     SELECT id, session_id, user_id, $2, content, created_at, drain_first_failed_at, drain_failures, drain_last_error
+       FROM moved
+     ON CONFLICT (id) DO NOTHING
+     RETURNING id, attempts, last_error, EXTRACT(EPOCH FROM (NOW() - queued_at))::int AS queued_for_sec`,
+    [pendingId, messageId],
+  )).rows[0] as { attempts: number; last_error: string | null; queued_for_sec: number } | undefined;
 }
 
 interface QuarantinedRow {
