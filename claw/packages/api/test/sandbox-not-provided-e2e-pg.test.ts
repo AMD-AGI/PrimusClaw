@@ -95,6 +95,8 @@ const PEM_CRED = [
 
 type Mode = "rejected" | "rejected_echo" | "forbidden" | "admin_failed" | "create_5xx" | "unschedulable" | "queued";
 let mode: Mode = "rejected";
+/** How many times Brain put the run back for a retry. */
+let naks = 0;
 /** Every request the fake SaFE received: method, path, and the create's body. */
 let safeCalls: Array<{ method: string; path: string; body?: Record<string, unknown> }> = [];
 let safe: Server;
@@ -342,6 +344,8 @@ after(async () => {
  */
 async function runOnce(
   withRequest: (request: ExecuteRequest) => void = () => {},
+  /** Run it as the claim it is (`/v1/runs`), after the row was claimed this many times before. */
+  claimsBefore?: number,
 ): Promise<{ sessionId: string; runId: string; request: ExecuteRequest }> {
   const { claimRunById } = await import("../src/tasks/run-claim.js");
   let request: ExecuteRequest | null = null;
@@ -361,6 +365,9 @@ async function runOnce(
   assert.equal(response.statusCode, 200, response.body);
   assert.equal(published.length, 1);
   const doorbell = published[0]!;
+  if (claimsBefore !== undefined) {
+    await client.query("UPDATE claw_tasks SET claim_count = $2 WHERE task_id = $1", [doorbell.task_id, claimsBefore]);
+  }
   const claimed = await claimRunById(doorbell.task_id, "brain-e2e");
   assert.ok(claimed && typeof claimed === "object" && "request" in claimed, `claimed: ${JSON.stringify(claimed)}`);
   request = claimed.request;
@@ -371,14 +378,19 @@ async function runOnce(
      VALUES (gen_random_uuid(), $1, 'https://hooks.example.com/claw', 'x', ARRAY['run.failed','run.completed'])`, [USER],
   );
   await client.query("UPDATE claw_tasks SET run_time_epoch_at = NOW() - interval '2 hours' WHERE task_id = $1", [doorbell.task_id]);
-  await runBrain(request, doorbell.session_id, request.message_id ?? doorbell.message_id);
+  await runBrain(
+    request, doorbell.session_id, request.message_id ?? doorbell.message_id,
+    claimsBefore === undefined ? null : { claimCount: claimed.claimCount },
+  );
   return { sessionId: doorbell.session_id, runId: doorbell.task_id, request };
 }
 
 /** Run `request` as a brain that took it off the queue does, and wait for its completion to be consumed. */
-async function runBrain(request: ExecuteRequest, sessionId: string, messageId: string): Promise<void> {
-  const msg = { seq: 1, redelivered: false, info: { deliveryCount: 1 }, ack() {}, nak() {}, term() {}, working() {} } as unknown as JsMsg;
-  await brain.runHandleTask(msg, request, sessionId, `lock.${sessionId}`, messageId, USER, new AbortController());
+async function runBrain(
+  request: ExecuteRequest, sessionId: string, messageId: string, claim: { claimCount: number } | null = null,
+): Promise<void> {
+  const msg = { seq: 1, redelivered: false, info: { deliveryCount: 1 }, ack() {}, nak() { naks += 1; }, term() {}, working() {} } as unknown as JsMsg;
+  await brain.runHandleTask(msg, request, sessionId, `lock.${sessionId}`, messageId, USER, new AbortController(), claim);
   assert.deepEqual(consumerErrors, []);
 }
 
@@ -528,6 +540,33 @@ test("E3 a create answered 5xx: sandbox_create_failed, with the status", { skip 
     for (const c of credentials) assert.ok(!String(text).includes(c), `a value the sandbox's env was sent left the run unmasked: ${text}`);
   }
   assert.match(String(s.run.terminal.failure_message), /<redacted>/, "the echoed env is in the message, masked");
+});
+
+test("E3c a claimed run whose create keeps answering 5xx: its last claim fails it as sandbox_create_failed, not max_retries_exceeded", { skip }, async () => {
+  mode = "create_5xx";
+  const { TASK_POISON_DELIVERY_COUNT } = await import("../src/config.js");
+  // A run that opens its sandbox up front, so a failed create is retried rather than told to the model.
+  const upFront = (request: ExecuteRequest) => {
+    Object.assign(request, { mode: "script", script: { steps: [{ kind: "bash", command: "make" }] } });
+  };
+  // With claims left, the run is put back for another one.
+  naks = 0;
+  const early = await runOnce(upFront, 0);
+  assert.equal(naks, 1, "retried");
+  const { rows: [kept] } = await client.query("SELECT status, failure_reason FROM claw_tasks WHERE task_id = $1", [early.runId]);
+  assert.notEqual(kept!.status, "failed", JSON.stringify(kept));
+  // The claim before the one the API fails as max_retries_exceeded is the run's last.
+  published = [];
+  const { sessionId, runId } = await runOnce(upFront, TASK_POISON_DELIVERY_COUNT - 2);
+  const s = await seen(sessionId, runId);
+  assert.equal(s.run.terminal.class, "failed", JSON.stringify(s.run.terminal));
+  assert.equal(s.run.terminal.failure_reason, "sandbox_create_failed");
+  assert.match(s.run.terminal.failure_message,
+    new RegExp(`^Create Hands failed: HTTP 503 upstream connect error .*\\(failed on ${TASK_POISON_DELIVERY_COUNT - 1} attempts\\)$`));
+  assert.equal(s.row.status, "failed");
+  assert.equal(s.row.failure_reason, "sandbox_create_failed");
+  assert.equal(s.notice?.type, "run.failed");
+  assert.ok(String(s.notice!.summary).startsWith("sandbox_create_failed: Create Hands failed: HTTP 503"), s.notice!.summary);
 });
 
 /** Whether any piece of `secret` of 8 characters or more appears in `text`: a cut credential leaves its prefix. */
