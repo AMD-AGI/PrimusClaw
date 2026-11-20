@@ -550,25 +550,31 @@ async function processEventDelivery(
 ): Promise<void> {
     // subject layout: "events.{sessionId}"
     const sessionId = storableText(msg.subject.split(".")[1] ?? "");
-    let event: Record<string, unknown>;
-    let sanitised = false;
+    // Only the bytes decide `unparseable`: text that is not JSON, or JSON that
+    // is not an object. Both fail the same way on every delivery.
+    let parsed: unknown;
     try {
-      const parsed: unknown = JSON.parse(sc.decode(msg.data));
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("event is not a JSON object");
-      // The write boundary: every string Postgres cannot store (NUL, a lone
-      // surrogate) is replaced here, before anything below writes it.
-      const storable = storableEvent(parsed as Record<string, unknown>);
-      event = storable.event;
-      sanitised = storable.replaced > 0;
-      if (storable.replaced) {
-        logger.warn(
-          { sessionId, type: event.type, seq: d.seq, replaced: storable.replaced },
-          "event-consumer.unstorable_characters_replaced",
-        );
-      }
+      parsed = JSON.parse(sc.decode(msg.data));
     } catch {
+      parsed = undefined;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       await setAside(msg, "unparseable", d);
       return;
+    }
+    // The write boundary: every string Postgres cannot store (NUL, a lone
+    // surrogate) is replaced here, before anything below writes it. Outside the
+    // try above on purpose: were it ever to throw, the event is still valid
+    // JSON, and a throw here is answered with a nak by `consumeEventDelivery`
+    // (retried, never set aside -- a completion least of all).
+    const storable = storableEvent(parsed as Record<string, unknown>);
+    const event = storable.event;
+    const sanitised = storable.replaced > 0;
+    if (storable.replaced) {
+      logger.warn(
+        { sessionId, type: event.type, seq: d.seq, replaced: storable.replaced },
+        "event-consumer.unstorable_characters_replaced",
+      );
     }
     logger.info({ sessionId, type: event.type, seq: (msg as any).seq }, "event-consumer.msg_received");
 

@@ -179,6 +179,10 @@ release version, and its `appVersion` stays `latest`.
   is not JSON is kept there too rather than dropped unrecorded. Nothing else is set aside, however often or however long
   it has failed: the backlog an outage of the database or the tombstone bucket leaves, and a completion waiting on its
   session's lock or on its run notification, are retried until they succeed, as before. A completion is never set aside.
+  Making an event storable, and masking the stored copy (`redactStoredValue`), no longer recurse: an event nested deeper
+  than the call stack (a few thousand levels, which `JSON.parse` and the database both take) is stored and, as a
+  completion, processed, where it used to be retried for ever. A `__proto__` key in an event stays a key of the stored
+  copy instead of being dropped.
 - Claw: an event a connector posts whose text holds a NUL (terminal output carries them) or half of a surrogate pair is
   now stored, with each such character replaced by U+FFFD, in keys and values alike. Until now PostgreSQL's `jsonb`
   refused the whole batch (`unsupported Unicode escape sequence`) and the API answered `500`; the connector posted the same

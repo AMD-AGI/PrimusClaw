@@ -159,6 +159,73 @@ describe("event consumer: unstorable input and poison events", { skip }, () => {
     assert.equal((await q("SELECT status FROM claw_tasks WHERE task_id = $1", [RUN])).rows[0].status, "completed");
   });
 
+  /** `{"type": ...,"tool_stats":{"bash":{"input":{"a":{"a":...leaf}}}}}`, as wire text: the nesting a tool-call input can carry. */
+  function deeplyNested(type: string, depth: number, leaf: string, extra: Record<string, unknown> = {}): Uint8Array {
+    let inner = JSON.stringify(leaf);
+    for (let i = 0; i < depth; i++) inner = `{"a":${inner}}`;
+    const head = JSON.stringify({ type, ...extra });
+    return new TextEncoder().encode(`${head.slice(0, -1)},"tool_stats":{"bash":{"calls":1,"input":${inner}}}}`);
+  }
+  /** The depth of `tool_stats.bash.input` in a stored row, and the string at its bottom, read without recursion. */
+  function nestedLeaf(data: Record<string, unknown>): { depth: number; leaf: unknown } {
+    let v: unknown = (data.tool_stats as { bash: { input: unknown } }).bash.input;
+    let depth = 0;
+    while (v && typeof v === "object") { v = (v as { a: unknown }).a; depth++; }
+    return { depth, leaf: v };
+  }
+
+  // Far deeper than a recursive copy goes (about 3,300 levels on Node's default stack), and Postgres stores all of them.
+  for (const depth of [5_000, 13_000]) {
+    test(`a completion nested ${depth} levels deep is stored and processed, not set aside`, async () => {
+      const completion = deeplyNested("exec_complete", depth, `deep${NUL}`, {
+        session_id: SESSION, task_id: RUN, message_id: "m1", user_id: "u1",
+        final_text: "done", failed: false, run_claim: 1, prompt: "hi",
+      });
+      assert.equal(await deliver(SESSION, 900, completion), "ack");
+      assert.equal((await quarantined()).length, 0, "nothing is set aside");
+      const ev = (await q("SELECT processed_at, data FROM claw_session_events WHERE event = 'exec_complete'")).rows;
+      assert.equal(ev.length, 1, "the completion is stored");
+      assert.notEqual(ev[0].processed_at, null, "the completion ran");
+      assert.deepEqual(nestedLeaf(ev[0].data), { depth, leaf: "deep�" }, "stored whole, and sanitised at the bottom");
+      assert.equal((await q("SELECT status FROM claw_tasks WHERE task_id = $1", [RUN])).rows[0].status, "completed");
+      const turns = (await q("SELECT role, content FROM claw_conversation_turns WHERE session_id = $1", [SESSION])).rows;
+      assert.ok(turns.some((t) => t.role === "assistant" && String(t.content).includes("done")), JSON.stringify(turns));
+    });
+  }
+
+  test("any other event nested that deep is stored as well", async () => {
+    assert.equal(await deliver(SESSION, 910, deeplyNested("toolUsed", 13_000, "x", { message_id: "m1", status: "end" })), "ack");
+    const rows = await storedData(SESSION);
+    assert.equal(rows.length, 1);
+    assert.deepEqual(nestedLeaf(rows[0].data), { depth: 13_000, leaf: "x" });
+    assert.equal((await quarantined()).length, 0);
+  });
+
+  test("a top-level __proto__ key stays a key: it supplies no type, and the event is stored", async () => {
+    // Were the copy to take `__proto__` as its prototype, `event.type` would read `toolTextDelta`, which is acked unstored.
+    const wire = `{"__proto__":{"type":"${consumer.TOOL_TEXT_DELTA_EVENT}"},"message_id":"m1","content":"a\\u0000b"}`;
+    assert.equal(await deliver(SESSION, 920, new TextEncoder().encode(wire)), "ack");
+    const rows = (await q(
+      "SELECT event, data ? '__proto__' AS kept, data->'__proto__'->>'type' AS t, data->>'content' AS content FROM claw_session_events WHERE session_id = $1",
+      [SESSION],
+    )).rows;
+    assert.deepEqual(rows, [{ event: "message", kept: true, t: consumer.TOOL_TEXT_DELTA_EVENT, content: "a�b" }]);
+  });
+
+  for (const [name, note] of [["with a NUL elsewhere in the event", "a\\u0000b"], ["in an event with nothing to replace", "ab"]]) {
+    test(`a nested __proto__ key is stored as a key, ${name}`, async () => {
+      const wire = `{"type":"toolUsed","message_id":"m1","status":"end","input":{"__proto__":{"cmd":"ls"},"cwd":"/"},"note":"${note}"}`;
+      assert.equal(await deliver(SESSION, 930, new TextEncoder().encode(wire)), "ack");
+      const rows = (await q(
+        "SELECT data->'input' AS input, data->>'note' AS note FROM claw_session_events WHERE session_id = $1 AND event = 'toolUsed'",
+        [SESSION],
+      )).rows;
+      assert.equal(rows.length, 1);
+      assert.deepEqual(Object.entries(rows[0].input), [["cwd", "/"], ["__proto__", { cmd: "ls" }]]);
+      assert.equal(rows[0].note, note === "ab" ? "ab" : "a�b");
+    });
+  }
+
   test("CONTROL: the same characters straight into jsonb are refused, which is what the consumer prevents", async () => {
     await assert.rejects(q("SELECT $1::jsonb", [JSON.stringify({ a: NUL })]), (e: { code?: string }) => e.code === "22P05");
     await assert.rejects(q("SELECT $1::jsonb", [JSON.stringify({ a: LONE_HIGH })]), (e: { code?: string }) => e.code === "22P02");
@@ -177,6 +244,14 @@ describe("event consumer: unstorable input and poison events", { skip }, () => {
     assert.ok(kept.startsWith('{"type":"toolUsed","output":"') && kept.endsWith("<redacted> and then"), kept);
     assert.ok(!kept.includes("abcdefghijklmnopqrstuvwxyz0123456789"), "the credential is masked");
     assert.equal(await metric("claw_api_event_quarantined_total", 'reason="unparseable"') - before, 1);
+  });
+
+  test("JSON that is not an object is kept in quarantine as unparseable too", async () => {
+    assert.equal(await deliver(SESSION, 32, new TextEncoder().encode('["toolUsed"]')), "ack");
+    const rows = (await q("SELECT reason, payload FROM claw_event_quarantine")).rows;
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].reason, "unparseable");
+    assert.equal(Buffer.from(rows[0].payload).toString("utf8"), '["toolUsed"]');
   });
 
   /**

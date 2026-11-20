@@ -46,15 +46,38 @@ function storableString(s: string, count: { n: number }): string {
   return s.replace(UNSTORABLE_ALL, () => { count.n++; return REPLACEMENT_CHARACTER; });
 }
 
-function storableValue(v: unknown, count: { n: number }): unknown {
-  if (typeof v === "string") return storableString(v, count);
-  if (Array.isArray(v)) return v.map((item) => storableValue(item, count));
-  if (v && typeof v === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(v)) out[storableString(key, count)] = storableValue(value, count);
-    return out;
+/** Define `key` as an own data field of `out`: an assignment under `__proto__` would set its prototype instead. */
+function defineField(out: object, key: string, value: unknown): void {
+  Object.defineProperty(out, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
+/**
+ * A copy of a parsed JSON value with `storableString` applied to every string
+ * and key. Iterative, not recursive: `JSON.parse` takes nesting far deeper than
+ * the call stack does (a few thousand levels), and Postgres stores it, so a
+ * recursive copy would throw on an event that is otherwise fine. Every key is
+ * defined as an own field (`defineField`), so a `__proto__` key in the JSON
+ * stays a key of the copy, as it is of the parsed object.
+ */
+function storableValue(root: unknown, count: { n: number }): unknown {
+  const pending: Array<[source: object, copy: object]> = [];
+  const copyOf = (v: unknown): unknown => {
+    if (typeof v === "string") return storableString(v, count);
+    if (!v || typeof v !== "object") return v;
+    const copy: object = Array.isArray(v) ? new Array<unknown>(v.length) : {};
+    pending.push([v, copy]);
+    return copy;
+  };
+  const out = copyOf(root);
+  for (let next = pending.pop(); next; next = pending.pop()) {
+    const [source, copy] = next;
+    if (Array.isArray(source)) {
+      for (let i = 0; i < source.length; i++) (copy as unknown[])[i] = copyOf(source[i]);
+    } else {
+      for (const [key, value] of Object.entries(source)) defineField(copy, storableString(key, count), copyOf(value));
+    }
   }
-  return v;
+  return out;
 }
 
 /**

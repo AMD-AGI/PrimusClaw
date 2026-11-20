@@ -132,20 +132,41 @@ const IDENTIFIER_KEY_RE = /^(?:id|[A-Za-z0-9_]*_id|[A-Za-z0-9]*[a-z0-9]Id)$/;
 /** An identifier is one token: a value with whitespace in it, or a long one, is content and is masked as usual. */
 const IDENTIFIER_VALUE_RE = /^[^\s]{1,256}$/;
 
-function walk(value: unknown, key?: string): unknown {
-  if (typeof value === "string") {
-    if (key !== undefined && IDENTIFIER_KEY_RE.test(key) && IDENTIFIER_VALUE_RE.test(value)) return storableText(value);
-    return redactStoredText(value).text;
-  }
-  if (Array.isArray(value)) return value.map((item) => walk(item));
-  if (!value || typeof value !== "object") return value;
-  if (value instanceof Date) return value;
-  const out: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    // A switch or a count under such a name (`{"token": false}`) keeps its type, an empty value has nothing to leak, and one
-    // brain already masked stays as brain wrote it.
-    const holds = (typeof child === "string" && child !== "" && child !== "[REDACTED]") || (!!child && typeof child === "object");
-    out[storableText(key)] = holds && isSensitiveKey(key, child) ? "<redacted>" : walk(child, key);
+/**
+ * Iterative, not recursive: `JSON.parse` takes nesting far deeper than the call stack does (a few thousand levels), and Postgres
+ * stores it, so a recursive walk would throw on a value that is otherwise fine. Every key is defined as an own field of the copy:
+ * in parsed JSON `__proto__` is an ordinary key, and an assignment under that name would set the copy's prototype instead (and the
+ * key would be lost).
+ */
+function walk(root: unknown): unknown {
+  const pending: Array<[source: object, copy: object]> = [];
+  const copyOf = (value: unknown, key?: string): unknown => {
+    if (typeof value === "string") {
+      if (key !== undefined && IDENTIFIER_KEY_RE.test(key) && IDENTIFIER_VALUE_RE.test(value)) return storableText(value);
+      return redactStoredText(value).text;
+    }
+    if (!value || typeof value !== "object") return value;
+    if (value instanceof Date) return value;
+    const copy: object = Array.isArray(value) ? new Array<unknown>(value.length) : {};
+    pending.push([value, copy]);
+    return copy;
+  };
+  const out = copyOf(root);
+  for (let next = pending.pop(); next; next = pending.pop()) {
+    const [source, copy] = next;
+    if (Array.isArray(source)) {
+      for (let i = 0; i < source.length; i++) (copy as unknown[])[i] = copyOf(source[i]);
+      continue;
+    }
+    for (const [key, child] of Object.entries(source as Record<string, unknown>)) {
+      // A switch or a count under such a name (`{"token": false}`) keeps its type, an empty value has nothing to leak, and one
+      // brain already masked stays as brain wrote it.
+      const holds = (typeof child === "string" && child !== "" && child !== "[REDACTED]") || (!!child && typeof child === "object");
+      Object.defineProperty(copy, storableText(key), {
+        value: holds && isSensitiveKey(key, child) ? "<redacted>" : copyOf(child, key),
+        enumerable: true, writable: true, configurable: true,
+      });
+    }
   }
   return out;
 }
