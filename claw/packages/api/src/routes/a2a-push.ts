@@ -41,6 +41,7 @@
 // ---------------------------------------------------------------------------
 
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import pino from "pino";
 import { db } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
@@ -48,7 +49,7 @@ import { decryptUserEnvValue, encryptUserEnvValue } from "../crypto/user-env.js"
 import { sanitizeSessionEvent } from "../events/store.js";
 import { storableJson } from "../notifications/storable-json.js";
 import { httpTransport, type Transport } from "../notifications/transport.js";
-import { guardWebhookUrl, type Resolver } from "../notifications/url-guard.js";
+import { defaultResolver, guardWebhookUrl, type Resolver } from "../notifications/url-guard.js";
 import { a2aPushAllowedHosts, a2aPushAllowedHostsOnly, a2aPushEnabled } from "./a2a-flags.js";
 import { loadLatestRunOfSession, loadRun, loadRunEvents, loadRunOfSessionMessage } from "./a2a-store.js";
 import {
@@ -79,7 +80,18 @@ export const MAX_DELIVERY_ATTEMPTS = 8;
 export const DEAD_LETTER_RETENTION_DAYS = 14;
 /** Spec 4.3.3 recommends 10-30 s per request. */
 export const WEBHOOK_TIMEOUT_MS = 15_000;
-const CLAIM_LEASE_SECONDS = 120;
+/** How long a claim holds a head; after it another replica may claim the row again. */
+export const CLAIM_LEASE_SECONDS = 120;
+/**
+ * The whole of one send, from the claim to the last byte (config read, name
+ * resolution, connect, response), ends inside this, or nothing is sent. Well
+ * under the lease, so no attempt of a head is still on the wire when another
+ * replica may claim it again and go on to its successors: the receiver could
+ * otherwise get a notification after the one written behind it.
+ */
+export const SEND_DEADLINE_MS = 45_000;
+/** Less than this left before the deadline: the request is not started. */
+const MIN_SEND_WINDOW_MS = 1_000;
 const CLAIM_BATCH = 20;
 
 export const NOTIFICATION_TOKEN_HEADER = "X-A2A-Notification-Token";
@@ -405,6 +417,21 @@ export interface DeliveryDeps {
   resolve?: Resolver;
   allowedHosts?: Set<string>;
   allowedHostsOnly?: boolean;
+  /** Overrides {@link SEND_DEADLINE_MS}, for tests. */
+  sendDeadlineMs?: number;
+}
+
+class DeadlineExceeded extends Error {
+  constructor() { super("deadline"); }
+}
+
+/** `work`, or a rejection once `ms` have passed; the work itself is not cancelled. */
+function within<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new DeadlineExceeded()), Math.max(0, ms));
+  });
+  return Promise.race([work, expired]).finally(() => clearTimeout(timer));
 }
 
 interface Claimed {
@@ -412,9 +439,18 @@ interface Claimed {
   task_id: string;
   config_id: string;
   payload: StreamResponse;
+  /** Also the claim's fence: a later claim of the row raises it. */
   attempts: number;
   final: boolean;
 }
+
+/**
+ * The condition every write of an attempt's outcome carries: the row is still
+ * open and still under this claim. A replica that claimed it again after the
+ * lease ran out has raised `attempts`, so a late answer from the earlier claim
+ * changes nothing (it would otherwise, say, cut the new claim's lease short).
+ */
+const FENCE = "id = $1 AND attempts = $2 AND delivered_at IS NULL AND dropped_at IS NULL";
 
 async function claimDue(): Promise<Claimed[]> {
   // Per configuration the oldest undelivered row goes first, and only it:
@@ -442,6 +478,15 @@ async function claimDue(): Promise<Claimed[]> {
   )).rows as Claimed[];
 }
 
+/** Close a row under its claim. False when another claim has it now, or it is already closed. */
+async function closeRow(row: Claimed, column: "delivered_at" | "dropped_at", status: string): Promise<boolean> {
+  const r = await db.query(
+    `UPDATE claw_a2a_push_outbox SET ${column} = NOW(), last_status = $3 WHERE ${FENCE}`,
+    [row.id, row.attempts, status],
+  );
+  return (r.rowCount ?? 0) > 0;
+}
+
 /** A finished task's configuration goes with its last notification. */
 async function retireIfFinal(row: Claimed): Promise<void> {
   if (row.final) {
@@ -452,64 +497,88 @@ async function retireIfFinal(row: Claimed): Promise<void> {
 /**
  * Set a notification aside: its outbox row is closed, so the next one of its
  * webhook becomes the head, and a copy is kept in the dead letters, which
- * outlive the config. One statement, so a row is never closed without its
- * record. The log line names the row, not what it says.
+ * outlive the config. The close and the copy are one statement, so a row is
+ * not closed without its record when the record can be written. When it cannot
+ * (the dead-letter write keeps failing), the row is closed anyway, on its own:
+ * a head that could never be set aside would hold every notification behind it
+ * for good. Its payload stays on the closed outbox row while the config lives,
+ * and its status says no record was kept. The log lines name the row, not what
+ * it says.
  */
 async function quarantine(row: Claimed, status: string): Promise<void> {
-  await db.query(
-    `WITH moved AS (
-       UPDATE claw_a2a_push_outbox SET dropped_at = NOW(), last_status = $2
-        WHERE id = $1 AND delivered_at IS NULL AND dropped_at IS NULL
-       RETURNING id, task_id, config_id, dedupe_key, payload, final, attempts, created_at
-     )
-     INSERT INTO claw_a2a_push_dead_letters
-       (outbox_id, task_id, config_id, dedupe_key, payload, final, attempts, last_status, created_at)
-     SELECT id, task_id, config_id, dedupe_key, payload, final, attempts, $3, created_at FROM moved
-     ON CONFLICT (outbox_id) DO NOTHING`,
-    [row.id, `quarantined:${status}`, status],
-  );
+  const ids = { outboxId: row.id, taskId: row.task_id, configId: row.config_id, attempts: row.attempts, status, final: row.final };
+  let closed: boolean;
+  try {
+    const r = await db.query(
+      `WITH moved AS (
+         UPDATE claw_a2a_push_outbox SET dropped_at = NOW(), last_status = $3
+          WHERE ${FENCE}
+         RETURNING id, task_id, config_id, dedupe_key, payload, final, attempts, created_at
+       ), kept AS (
+         INSERT INTO claw_a2a_push_dead_letters
+           (outbox_id, task_id, config_id, dedupe_key, payload, final, attempts, last_status, created_at)
+         SELECT id, task_id, config_id, dedupe_key, payload, final, attempts, $4, created_at FROM moved
+         ON CONFLICT (outbox_id) DO NOTHING
+       )
+       SELECT COUNT(*)::int AS n FROM moved`,
+      [row.id, row.attempts, `quarantined:${status}`, status],
+    );
+    closed = Number((r.rows[0] as { n: number }).n) > 0;
+  } catch (err) {
+    // The SQLSTATE only: a database error's text can quote the row.
+    logger.error({ ...ids, code: (err as { code?: unknown }).code ?? "unknown" }, "a2a_push.dead_letter_failed");
+    closed = await closeRow(row, "dropped_at", `quarantined_unrecorded:${status}`);
+  }
+  // Another claim has the row now, or it is closed already: that one answers for it.
+  if (!closed) return;
   metrics.onA2aPushDelivery("quarantined");
-  logger.warn(
-    { outboxId: row.id, taskId: row.task_id, configId: row.config_id, attempts: row.attempts, status, final: row.final },
-    "a2a_push.quarantined",
-  );
+  logger.warn(ids, "a2a_push.quarantined");
   await retireIfFinal(row);
 }
 
-async function sendOne(row: Claimed, deps: DeliveryDeps): Promise<boolean> {
+/**
+ * One attempt at a claimed head. `deadline` (a `performance.now()` reading,
+ * taken before the claim) bounds all of it: name resolution has no timeout of
+ * its own, and a request is only started with time left before it.
+ */
+async function sendOne(row: Claimed, deps: DeliveryDeps, deadline: number): Promise<boolean> {
+  const left = () => deadline - performance.now();
   const config = (await db.query(
     `SELECT url, token_enc, auth_scheme, auth_credentials_enc FROM claw_a2a_push_configs
       WHERE task_id = $1 AND config_id = $2`,
     [row.task_id, row.config_id],
   )).rows[0] as Record<string, string | null> | undefined;
   if (!config) {
-    await db.query(
-      "UPDATE claw_a2a_push_outbox SET dropped_at = NOW(), last_status = 'config_gone' WHERE id = $1", [row.id],
-    );
-    metrics.onA2aPushDelivery("dropped");
+    if (await closeRow(row, "dropped_at", "config_gone")) metrics.onA2aPushDelivery("dropped");
     return false;
   }
   let status: string;
   try {
+    const resolve = deps.resolve ?? defaultResolver;
     const target = await guardPushUrl(
       String(config.url), deps.allowedHosts ?? a2aPushAllowedHosts(),
-      deps.allowedHostsOnly ?? a2aPushAllowedHostsOnly(), deps.resolve,
+      deps.allowedHostsOnly ?? a2aPushAllowedHostsOnly(),
+      // A lookup that does not come back in time is a name that does not resolve right now.
+      (host) => within(resolve(host), left()),
     );
     if (!target.ok) {
       status = `refused:${target.reason}`;
+    } else if (left() < MIN_SEND_WINDOW_MS) {
+      // Too late to start: the lease may run out while the request is on the wire.
+      throw new DeadlineExceeded();
     } else {
       const headers: Record<string, string> = { "content-type": NOTIFICATION_CONTENT_TYPE };
       if (config.token_enc) headers[NOTIFICATION_TOKEN_HEADER] = decryptUserEnvValue(config.token_enc);
       if (config.auth_scheme && config.auth_credentials_enc) {
         headers.authorization = `${config.auth_scheme} ${decryptUserEnvValue(config.auth_credentials_enc)}`;
       }
-      const code = await (deps.transport ?? httpTransport)({
-        target, headers, body: JSON.stringify(row.payload), timeoutMs: WEBHOOK_TIMEOUT_MS,
-      });
+      const timeoutMs = Math.min(WEBHOOK_TIMEOUT_MS, left());
+      const code = await within((deps.transport ?? httpTransport)({
+        target, headers, body: JSON.stringify(row.payload), timeoutMs,
+      }), timeoutMs);
       if (code >= 200 && code < 300) {
-        await db.query(
-          "UPDATE claw_a2a_push_outbox SET delivered_at = NOW(), last_status = $2 WHERE id = $1", [row.id, String(code)],
-        );
+        // Not closed: another claim has the row (this answer came back after the lease); it answers for it.
+        if (!await closeRow(row, "delivered_at", String(code))) return false;
         metrics.onA2aPushDelivery("delivered");
         await retireIfFinal(row);
         return true;
@@ -523,21 +592,19 @@ async function sendOne(row: Claimed, deps: DeliveryDeps): Promise<boolean> {
   if (status.startsWith("refused:") && status !== "refused:unresolvable_host") {
     // A refused URL stays refused (the host now resolves somewhere private, or
     // the operator took it off the list), so it is not retried.
-    await db.query(
-      "UPDATE claw_a2a_push_outbox SET dropped_at = NOW(), last_status = $2 WHERE id = $1", [row.id, status],
-    );
+    if (!await closeRow(row, "dropped_at", status)) return false;
     metrics.onA2aPushDelivery("dropped");
     logger.warn({ configId: row.config_id, status }, "a2a_push.dropped");
     await retireIfFinal(row);
   } else if (row.attempts >= MAX_DELIVERY_ATTEMPTS) {
     await quarantine(row, status);
   } else {
-    metrics.onA2aPushDelivery("retried");
     const wait = RETRY_BACKOFF_SECONDS[Math.min(row.attempts - 1, RETRY_BACKOFF_SECONDS.length - 1)];
-    await db.query(
-      `UPDATE claw_a2a_push_outbox SET next_attempt_at = NOW() + make_interval(secs => $2), last_status = $3 WHERE id = $1`,
-      [row.id, wait, status],
+    const r = await db.query(
+      `UPDATE claw_a2a_push_outbox SET next_attempt_at = NOW() + make_interval(secs => $3), last_status = $4 WHERE ${FENCE}`,
+      [row.id, row.attempts, wait, status],
     );
+    if (r.rowCount) metrics.onA2aPushDelivery("retried");
   }
   return false;
 }
@@ -546,6 +613,8 @@ async function sendOne(row: Claimed, deps: DeliveryDeps): Promise<boolean> {
 export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: number; failed: number }> {
   let delivered = 0;
   let failed = 0;
+  // Read before the claim, so the deadline cannot fall after the lease the claim sets.
+  const deadline = performance.now() + (deps.sendDeadlineMs ?? SEND_DEADLINE_MS);
   // The claim takes one row per configuration, so these are all different receivers.
   await Promise.all((await claimDue()).map(async (row) => {
     // Claimed again with every attempt already used: the last one never came
@@ -556,7 +625,7 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
       failed += 1;
       return;
     }
-    if (await sendOne(row, deps)) delivered += 1; else failed += 1;
+    if (await sendOne(row, deps, deadline)) delivered += 1; else failed += 1;
   }));
   return { delivered, failed };
 }

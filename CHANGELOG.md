@@ -169,7 +169,10 @@ release version, and its `appVersion` stays `latest`.
   gets what it was owed. A notification whose text holds a NUL character or a lone UTF-16 surrogate, which PostgreSQL's
   `jsonb` refuses, is stored with U+FFFD in their place instead of failing the write and losing the notification. New
   metrics: `claw_a2a_push_delivery_total{outcome}`, `claw_a2a_push_quarantined_total`,
-  `claw_a2a_push_head_consecutive_failures` and `claw_a2a_push_oldest_pending_age_seconds`. See "Push
+  `claw_a2a_push_head_consecutive_failures` and `claw_a2a_push_oldest_pending_age_seconds`. A notification is set
+  aside even when its dead-letter copy cannot be written (it is then closed as `quarantined_unrecorded:<status>`). Each
+  delivery attempt, name lookup included, now ends within 45 seconds, inside the 120-second claim lease, so a lookup
+  that hangs can no longer let another replica send the next notification before a late copy of this one. See "Push
   notifications" in `claw/docs/a2a.md`.
 
 - Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its

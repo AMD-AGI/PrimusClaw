@@ -17,7 +17,9 @@
  *   P6 the callback guard, at creation and again at delivery
  *   P7 a run that ends without a completion event (the sweeper's closes) still gets its final notification
  *   P8 poison: what PostgreSQL cannot store is made storable, and a notification that keeps failing is set
- *      aside after a bounded number of attempts while the ones behind it go, in order, over real HTTP
+ *      aside after a bounded number of attempts while the ones behind it go, in order, over real HTTP; a send
+ *      ends inside its deadline, a late answer cannot touch a newer claim, and a head is set aside even when
+ *      its dead letter cannot be written
  */
 
 import assert from "node:assert/strict";
@@ -929,6 +931,149 @@ describe("A2A push notifications", { skip }, () => {
         assert.deepEqual([dead.task_id, dead.final, dead.last_status], [t.taskId, true, "http_422"]);
         assert.equal(dead.payload.statusUpdate.status.state, "TASK_STATE_COMPLETED");
       } finally {
+        await hook.close();
+      }
+    });
+
+    const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+    async function until(what: string, ok: () => boolean | Promise<boolean>, ms = 5000) {
+      const end = Date.now() + ms;
+      while (!(await ok())) {
+        if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+        await sleep(10);
+      }
+    }
+    /** As a lease running out does: the claimed head is due again, for another replica to take. */
+    const expireLeases = () => query("UPDATE claw_a2a_push_outbox SET next_attempt_at = NOW() WHERE delivered_at IS NULL AND dropped_at IS NULL");
+
+    test("a send whose name lookup hangs ends inside the deadline, so it is not on the wire when another replica takes the head", async () => {
+      const hook = await receiver();
+      try {
+        const t = await liveTask();
+        // A named host (resolved at delivery, unlike the loopback literal), on the operator's list.
+        const url = hook.url.replace("127.0.0.1", "hooks.internal");
+        await storeConfig(t, url);
+        await record(t.sessionId, { type: "statusUpdate", agentStatus: "running" }, 1101);
+        await record(t.sessionId, { type: "permissionRequest", actionId: "toolu_after", tool: "bash", input: {} }, 1102);
+
+        // Replica A: its resolver answers only when released, as a stuck DNS server would, much later.
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => { release = resolve; });
+        let asked = false;
+        const stuck = async () => { asked = true; await released; return [{ address: "127.0.0.1", family: 4 }]; };
+        let aSettled = false;
+        const a = push.deliverDue({ resolve: stuck, sendDeadlineMs: 300 }).finally(() => { aSettled = true; });
+        await until("replica A to claim the head", () => asked);
+        await until("replica A to give the attempt up at its deadline", () => aSettled, 3000);
+        assert.deepEqual(await a, { delivered: 0, failed: 1 });
+        const head = (await outbox())[0];
+        assert.equal(head.last_status, "refused:unresolvable_host", "the hung lookup counts as a name that does not resolve now");
+        assert.equal(head.delivered_at, null);
+
+        // The lease runs out; replica B, whose lookups answer, takes the head and then the next one.
+        const fast = async () => [{ address: "127.0.0.1", family: 4 }];
+        await expireLeases();
+        assert.equal((await push.deliverDue({ resolve: fast })).delivered, 1);
+        assert.equal((await push.deliverDue({ resolve: fast })).delivered, 1);
+        // The lookup A started finally answers: nothing of A's goes out after B's.
+        release();
+        await sleep(200);
+        assert.deepEqual(hook.seen.map((s) => label(s.body)), ["WORKING", "INPUT_REQUIRED:toolu_after"], "each once, in the order written");
+      } finally {
+        await hook.close();
+      }
+    });
+
+    test("an answer that comes back after its claim was replaced does not touch the claim that replaced it", async () => {
+      // A receiver that answers only when told to, so two attempts can be open at once.
+      const answers: Array<(status: number) => void> = [];
+      const server: Server = createServer((req, res) => {
+        req.resume();
+        req.on("end", () => answers.push((status) => { res.statusCode = status; res.end(); }));
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const t = await liveTask();
+        await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/hook` });
+        await record(t.sessionId, { type: "statusUpdate", agentStatus: "running" }, 1201);
+
+        const a = push.deliverDue({ sendDeadlineMs: 10_000 });
+        await until("replica A's request", () => answers.length === 1);
+        await expireLeases();
+        const b = push.deliverDue({ sendDeadlineMs: 10_000 });
+        await until("replica B's request", () => answers.length === 2);
+        const leaseOfB = (await query("SELECT attempts, next_attempt_at FROM claw_a2a_push_outbox")).rows[0];
+        assert.equal(leaseOfB.attempts, 2);
+
+        // A's attempt fails late: its backoff would make the row due in a second, under B's open request.
+        answers[0](500);
+        assert.deepEqual(await a, { delivered: 0, failed: 1 });
+        const row = (await query("SELECT attempts, next_attempt_at, last_status FROM claw_a2a_push_outbox")).rows[0];
+        assert.equal(row.attempts, 2);
+        assert.equal(row.next_attempt_at.getTime(), leaseOfB.next_attempt_at.getTime(), "B's lease is as B's claim set it");
+        assert.equal(row.last_status, null, "A's answer is not recorded over B's claim");
+
+        answers[1](200);
+        assert.deepEqual(await b, { delivered: 1, failed: 0 });
+        const [done] = await outbox();
+        assert.ok(done.delivered_at);
+        assert.equal(done.last_status, "200");
+      } finally {
+        for (const answer of answers) answer(200);
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    test("a head is set aside even when its dead letter cannot be written, and the ones behind it go", async () => {
+      const hook = await receiver((raw) => (raw.includes("toolu_poison") ? 500 : 200));
+      // The dead-letter table refuses every write, as a full disk would.
+      await query(`CREATE OR REPLACE FUNCTION test_refuse_dead_letter() RETURNS trigger LANGUAGE plpgsql
+                     AS $$ BEGIN RAISE EXCEPTION 'could not extend file' USING ERRCODE = '53100'; END $$`);
+      await query("CREATE TRIGGER test_refuse_dead_letter BEFORE INSERT ON claw_a2a_push_dead_letters FOR EACH ROW EXECUTE FUNCTION test_refuse_dead_letter()");
+      try {
+        const t = await liveTask();
+        await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: hook.url });
+        await record(t.sessionId, { type: "permissionRequest", actionId: "toolu_poison", tool: "bash", input: {} }, 1301);
+        await record(t.sessionId, { type: "decisionResult", actionId: "toolu_poison", decision: "deny" }, 1302);
+        await record(t.sessionId, { type: "permissionRequest", actionId: "toolu_next", tool: "bash", input: {} }, 1303);
+        const quarantinedBefore = await metricValue("claw_a2a_push_quarantined_total");
+
+        for (let i = 0; i < push.MAX_DELIVERY_ATTEMPTS; i += 1) await pass();
+        assert.equal(hook.seen.length, push.MAX_DELIVERY_ATTEMPTS);
+        const poison = (await outbox())[0];
+        assert.ok(poison.dropped_at, "closed although its record could not be kept");
+        assert.equal(poison.last_status, "quarantined_unrecorded:http_500");
+        assert.equal(poison.payload.statusUpdate.status.message.parts[1].data.actionId, "toolu_poison", "the payload stays on the closed row");
+        assert.equal((await deadLetters()).length, 0);
+        assert.equal(await metricValue("claw_a2a_push_quarantined_total"), quarantinedBefore + 1);
+
+        for (let i = 0; i < 3; i += 1) await pass();
+        assert.deepEqual(hook.seen.slice(push.MAX_DELIVERY_ATTEMPTS).map((s) => label(s.body)), ["WORKING", "INPUT_REQUIRED:toolu_next"]);
+      } finally {
+        await query("DROP TRIGGER IF EXISTS test_refuse_dead_letter ON claw_a2a_push_dead_letters");
+        await query("DROP FUNCTION IF EXISTS test_refuse_dead_letter()");
+        await hook.close();
+      }
+    });
+
+    test("an unfinished last attempt is set aside without a resend even when its dead letter cannot be written", async () => {
+      const hook = await receiver();
+      await query(`CREATE OR REPLACE FUNCTION test_refuse_dead_letter() RETURNS trigger LANGUAGE plpgsql
+                     AS $$ BEGIN RAISE EXCEPTION 'could not extend file' USING ERRCODE = '53100'; END $$`);
+      await query("CREATE TRIGGER test_refuse_dead_letter BEFORE INSERT ON claw_a2a_push_dead_letters FOR EACH ROW EXECUTE FUNCTION test_refuse_dead_letter()");
+      try {
+        const t = await liveTask();
+        await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: hook.url });
+        await record(t.sessionId, { type: "permissionRequest", actionId: "toolu_crash", tool: "bash", input: {} }, 1401);
+        await record(t.sessionId, { type: "decisionResult", actionId: "toolu_crash", decision: "allow" }, 1402);
+        await query("UPDATE claw_a2a_push_outbox SET attempts = $1, next_attempt_at = NOW() WHERE dedupe_key = '1401:0'", [push.MAX_DELIVERY_ATTEMPTS]);
+        assert.deepEqual(await pass(), { delivered: 0, failed: 1 });
+        assert.equal((await outbox())[0].last_status, "quarantined_unrecorded:attempt_unfinished");
+        await pass();
+        assert.deepEqual(hook.seen.map((s) => label(s.body)), ["WORKING"], "not resent, and the next one went");
+      } finally {
+        await query("DROP TRIGGER IF EXISTS test_refuse_dead_letter ON claw_a2a_push_dead_letters");
+        await query("DROP FUNCTION IF EXISTS test_refuse_dead_letter()");
         await hook.close();
       }
     });

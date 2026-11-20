@@ -132,7 +132,17 @@ aside so the ones behind it are sent: its outbox row is closed, a copy is kept i
 `a2a_push.quarantined` with the task, config and status but not the content. A
 receiver that is down for longer therefore loses at most one notification per
 twenty minutes and gets the rest, still in order, once it is back; a final
-notification set aside still retires its config. Text that PostgreSQL cannot
+notification set aside still retires its config. If the copy cannot be written
+(the dead-letter table refuses it, say on a full disk), the row is closed anyway
+with `last_status = quarantined_unrecorded:<status>` and the payload kept on it,
+and `a2a_push.dead_letter_failed` is logged: a head that could not be set aside
+would hold its webhook for good.
+
+Each attempt, from its claim to the end of the request, including the name
+lookup, ends within 45 seconds or is abandoned and retried; a claim's lease is
+120 seconds, so no attempt is still being sent when another replica can claim the
+same notification and go on to the next. A late answer from an attempt whose
+lease ran out is not recorded over the newer claim. Text that PostgreSQL cannot
 store (a NUL character, a lone UTF-16 surrogate) is replaced with U+FFFD when the
 notification is written, rather than failing the write.
 
