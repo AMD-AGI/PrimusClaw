@@ -192,9 +192,12 @@ describe("event consumer over JetStream: a poison event", { skip, timeout: 120_0
     const wire = `${head.slice(0, -1)},"tool_stats":{"bash":{"calls":1,"input":${inner}}}}`;
     const seq = (await natsMod.js.publish(`events.${session}`, natsMod.sc.encode(wire), { msgID: crypto.randomUUID() })).seq;
 
-    // Inside the first redelivery delay: it was not refused and retried.
-    await until("the run completed", async () =>
-      (await q("SELECT status FROM claw_tasks WHERE task_id = $1", [run])).rows[0].status === "completed", 4_000, 100);
+    // Inside the first redelivery delay: it was not refused and retried. The completion marker (`processed_at`) is
+    // written after the run is closed, so it is the one waited for; the run must be closed by then.
+    await until("the completion marked processed", async () =>
+      (await q("SELECT 1 FROM claw_session_events WHERE session_id = $1 AND processed_at IS NOT NULL", [session])).rowCount === 1,
+      4_000, 100);
+    assert.equal((await q("SELECT status FROM claw_tasks WHERE task_id = $1", [run])).rows[0].status, "completed");
     const ev = (await q("SELECT processed_at, data FROM claw_session_events WHERE session_id = $1", [session])).rows;
     assert.equal(ev.length, 1);
     assert.notEqual(ev[0].processed_at, null);

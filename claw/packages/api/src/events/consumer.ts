@@ -61,7 +61,7 @@ import { withCompletionLock } from "./completion-lock.js";
 import type { LeaderLease } from "../infra/leader-lock.js";
 import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
 import {
-  depthBoundedEvent, eventDeliveryHealth, quarantineEventDelivery, startEventBacklogGauges, storableEvent, storableText,
+  depthBoundedEvent, STORED_DEPTH_LIMITS, eventDeliveryHealth, quarantineEventDelivery, startEventBacklogGauges, storableEvent, storableText,
 } from "./poison.js";
 
 /** Brain's event for a streaming tool call's text so far (`ExecuteRequest.stream_tool_text`); never stored. */
@@ -454,6 +454,9 @@ const UNSTORABLE_PG_CODES = new Set([
   "54001", // statement too complex (nesting deeper than the server's stack)
 ]);
 
+/** Postgres's stack depth limit: the only refusal a completion is stored bounded for. */
+const STACK_DEPTH_EXCEEDED = "54001";
+
 /**
  * One delivery: refuse a deleted session before any write, otherwise persist.
  *
@@ -680,21 +683,34 @@ async function processEventDelivery(
       try {
         insertResult = await insertRow(event);
       } catch (e: any) {
-        const bounded = event.type === "exec_complete" && UNSTORABLE_PG_CODES.has(e?.code || "")
-          ? depthBoundedEvent(event) : null;
-        if (!bounded?.cut) throw e;
-        // A completion Postgres refused for its nesting (54001: deeper than its parser's stack, about 13,000 levels by
-        // default). It is never set aside -- its turn and its run notice would be left undone -- and no retry stores it
-        // whole. So a copy with every level past `STORED_DEPTH_LIMIT` replaced is stored, and it is that copy the
-        // completion below runs on: the turn's writes would refuse the same nesting. The original, masked, is kept in
-        // quarantine (reason `bounded`) before the completion runs; a copy that cannot be written throws to the nak
-        // below, and the redelivery finds the bounded row already stored.
+        if (event.type !== "exec_complete" || e?.code !== STACK_DEPTH_EXCEEDED) throw e;
+        // A completion Postgres refused for its nesting (54001: deeper than its parser's stack, about 13,000 levels with
+        // the default `max_stack_depth`). It is never set aside -- its turn and its run notice would be left undone --
+        // and no retry stores it whole. So a copy with every level past a limit replaced is stored, and it is that copy
+        // the completion below runs on: the turn's writes would refuse the same nesting. The limit is not fixed: a
+        // server with a smaller `max_stack_depth` refuses a shallower copy too, so each limit in `STORED_DEPTH_LIMITS`
+        // is tried in turn until one is stored. The original, masked, is kept in quarantine (reason `bounded`) before
+        // the completion runs; a copy that cannot be written throws to the nak below, and the redelivery finds the
+        // bounded row already stored (the same limits are tried in the same order, so it is the same copy).
         eventDeliveryHealth.noteError(d.seq, e);
+        let bounded: { event: Record<string, unknown>; cut: number; limit: number; result: Awaited<ReturnType<typeof insertRow>> } | null = null;
+        for (const limit of STORED_DEPTH_LIMITS) {
+          const copy = depthBoundedEvent(event, limit);
+          if (!copy.cut) continue; // nothing that deep: the same event Postgres just refused
+          try {
+            bounded = { ...copy, limit, result: await insertRow(copy.event) };
+            break;
+          } catch (e2: any) {
+            if (e2?.code !== STACK_DEPTH_EXCEEDED) throw e2;
+          }
+        }
+        // Not one limit both cut something and was stored: retried like any other refusal.
+        if (!bounded) throw e;
+        insertResult = bounded.result;
         logger.warn(
-          { sessionId, eventId, type: event.type, code: e.code, cut: bounded.cut },
+          { sessionId, eventId, type: event.type, code: e.code, cut: bounded.cut, limit: bounded.limit },
           "event-consumer.completion_stored_depth_bounded",
         );
-        insertResult = await insertRow(bounded.event);
         await quarantineEventDelivery({
           eventId, sessionId, subject: msg.subject, seq: d.seq, eventType: "exec_complete", reason: "bounded",
           deliveries: d.deliveries, publishedMs: d.publishedMs, lastError: eventDeliveryHealth.takeError(d.seq),

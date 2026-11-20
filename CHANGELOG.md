@@ -205,9 +205,10 @@ release version, and its `appVersion` stays `latest`.
   it has failed: the backlog an outage of the database or the tombstone bucket leaves, and a completion waiting on its
   session's lock or on its run notification, are retried until they succeed, as before. A completion is never set aside.
   One the database refuses for its nesting (54001, past about 13,000 levels with the default `max_stack_depth`) is
-  stored and run with a copy cut off at 1,000 levels (each deeper object replaced with `"[nested too deep to store]"`),
-  so its turn is written and its run closed on its first delivery; the original is kept in `claw_event_quarantine` with
-  reason `bounded`.
+  stored and run with a copy cut off at 1,000 levels (each deeper object replaced with `"[nested too deep to store]"`;
+  at 100, then 10, when a server with a smaller `max_stack_depth` refuses that copy too), so its turn is written and its
+  run closed on its first delivery; the original is kept in `claw_event_quarantine` with reason `bounded`, counted and
+  logged once however often it is redelivered.
   Making an event storable, and masking the stored copy (`redactStoredValue`), no longer recurse: an event nested deeper
   than the call stack (a few thousand levels, which `JSON.parse` and the database both take) is stored and, as a
   completion, processed, where it used to be retried for ever. A `__proto__` key in an event stays a key of the stored

@@ -112,6 +112,14 @@ export function storableEvent(event: Record<string, unknown>): { event: Record<s
  */
 export const STORED_DEPTH_LIMIT = 1_000;
 
+/**
+ * The limits tried in turn, deepest first, until a copy is stored. The depth
+ * Postgres parses follows `max_stack_depth`, which a server may set as low as
+ * 100kB, where it refuses a copy 1,000 levels deep too (about 600 is its
+ * ceiling there). The shallowest keeps every field a completion is read for.
+ */
+export const STORED_DEPTH_LIMITS: readonly number[] = [STORED_DEPTH_LIMIT, 100, 10];
+
 /** What stands in for each object or array cut off below `STORED_DEPTH_LIMIT`. */
 export const TOO_DEEP_PLACEHOLDER = "[nested too deep to store]";
 
@@ -241,13 +249,14 @@ export interface QuarantinedDelivery {
  * the caller then naks, and the event is not dropped.
  */
 export async function quarantineEventDelivery(q: QuarantinedDelivery): Promise<void> {
-  await db.query(
+  const res = await db.query(
     `INSERT INTO claw_event_quarantine
        (event_id, session_id, subject, stream_seq, event_type, reason, deliveries, last_error, payload, published_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (event_id, session_id) DO UPDATE
        SET deliveries = GREATEST(claw_event_quarantine.deliveries, EXCLUDED.deliveries),
-           last_error = COALESCE(EXCLUDED.last_error, claw_event_quarantine.last_error)`,
+           last_error = COALESCE(EXCLUDED.last_error, claw_event_quarantine.last_error)
+     RETURNING (xmax = 0) AS inserted`,
     [
       q.eventId, storableText(q.sessionId), storableText(q.subject), q.seq ?? null,
       q.eventType === null ? null : storableText(q.eventType).slice(0, 200), q.reason, q.deliveries,
@@ -255,8 +264,15 @@ export async function quarantineEventDelivery(q: QuarantinedDelivery): Promise<v
       q.publishedMs === undefined ? null : new Date(q.publishedMs),
     ],
   );
-  metrics.onEventQuarantined(q.reason);
   eventDeliveryHealth.setAside(q.seq);
+  // A redelivery of one already kept (a bounded completion retried while its session's lock is held or its run notice
+  // is owed) only advances its row's `deliveries`: it is counted and logged once, when it was first kept.
+  if (res.rows[0]?.inserted === false) {
+    logger.debug({ sessionId: q.sessionId, eventId: q.eventId, seq: q.seq, reason: q.reason, deliveries: q.deliveries },
+      "event-consumer.quarantine_redelivered");
+    return;
+  }
+  metrics.onEventQuarantined(q.reason);
   logger.error(
     {
       sessionId: q.sessionId, eventId: q.eventId, seq: q.seq, type: q.eventType, reason: q.reason,

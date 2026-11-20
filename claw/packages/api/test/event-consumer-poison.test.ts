@@ -264,6 +264,55 @@ describe("event consumer: unstorable input and poison events", { skip }, () => {
     assert.equal((await q("SELECT status FROM claw_tasks WHERE task_id = $1", [RUN])).rows[0].status, "completed");
   });
 
+  // A server with a small `max_stack_depth` (it may be as low as 100kB) refuses a copy 1,000 levels deep as well. Stood in
+  // for by a trigger that refuses, with the parser's own 54001, every stored completion longer than a 100-level copy is.
+  test("a completion whose 1,000-level copy is refused too is stored with a shallower one, and processed once", async () => {
+    await q(`CREATE FUNCTION poison_test_refuse_deep() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF NEW.event = 'exec_complete' AND length(NEW.data::text) > 3000 THEN
+                 RAISE EXCEPTION 'stack depth limit exceeded (for the test)' USING ERRCODE = '54001';
+               END IF;
+               RETURN NEW;
+             END $$`);
+    await q("CREATE TRIGGER poison_test_refuse_deep BEFORE INSERT ON claw_session_events FOR EACH ROW EXECUTE FUNCTION poison_test_refuse_deep()");
+    const before = await metric("claw_api_event_quarantined_total", 'reason="bounded"');
+    const completion = deeplyNested("exec_complete", 17_000, "x", {
+      session_id: SESSION, task_id: RUN, message_id: "m1", user_id: "u1", final_text: "done", failed: false, run_claim: 1,
+    });
+    try {
+      assert.equal(await deliver(SESSION, 940, completion), "ack", "on its first delivery");
+      const ev = (await q("SELECT processed_at, data FROM claw_session_events WHERE event = 'exec_complete'")).rows;
+      assert.equal(ev.length, 1, "the completion is stored");
+      assert.notEqual(ev[0].processed_at, null, "the completion ran");
+      assert.deepEqual(nestedLeaf(ev[0].data), { depth: poison.STORED_DEPTH_LIMITS[1] - 2, leaf: poison.TOO_DEEP_PLACEHOLDER });
+      assert.equal((await q("SELECT status FROM claw_tasks WHERE task_id = $1", [RUN])).rows[0].status, "completed");
+      const kept = await quarantined();
+      assert.equal(kept.length, 1);
+      assert.equal(kept[0].reason, "bounded");
+      assert.match(String(kept[0].last_error), /^54001: /);
+
+      // A redelivery (its ack lost) finds the same shallower copy stored: nothing written twice, and counted once.
+      assert.equal(await deliver(SESSION, 940, completion, { deliveryCount: 2 }), "ack");
+      assert.equal((await storedData(SESSION)).filter((r) => r.event === "exec_complete").length, 1);
+      assert.deepEqual((await quarantined()).map((r) => [r.reason, r.deliveries]), [["bounded", 2]]);
+      assert.equal(await metric("claw_api_event_quarantined_total", 'reason="bounded"') - before, 1);
+    } finally {
+      await q("DROP TRIGGER poison_test_refuse_deep ON claw_session_events");
+      await q("DROP FUNCTION poison_test_refuse_deep()");
+    }
+  });
+
+  test("a completion refused for its nesting at every bounded depth is retried, never set aside", async () => {
+    await q("INSERT INTO poison_test_refuse (session_id, code, types) VALUES ($1, '54001', ARRAY['exec_complete'])", [SESSION]);
+    const completion = deeplyNested("exec_complete", 17_000, "x", {
+      session_id: SESSION, task_id: RUN, message_id: "m1", user_id: "u1", final_text: "done", failed: false, run_claim: 1,
+    });
+    assert.equal(await deliver(SESSION, 950, completion, { deliveryCount: 30, publishedAgoMs: 3_600_000 }), "nak");
+    assert.equal((await storedData(SESSION)).length, 0);
+    assert.equal((await quarantined()).length, 0);
+    assert.equal((await q("SELECT status FROM claw_tasks WHERE task_id = $1", [RUN])).rows[0].status, "running");
+  });
+
   test("any other event nested that deep is stored as well", async () => {
     assert.equal(await deliver(SESSION, 910, deeplyNested("toolUsed", 13_000, "x", { message_id: "m1", status: "end" })), "ack");
     const rows = await storedData(SESSION);
