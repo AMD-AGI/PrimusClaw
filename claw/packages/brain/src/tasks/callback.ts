@@ -19,6 +19,7 @@ import { decodeRunTimeReport } from "@claw/protocol";
 import pino from "pino";
 import type { SandboxEntry } from "../sandbox/keepalive.js";
 import { sendWithTransientRetry } from "../infra/transient-http.js";
+import { metrics } from "../infra/metrics.js";
 
 const logger = pino({ name: "task-callback" });
 
@@ -34,6 +35,24 @@ export const AGENT_DONE_TRANSIENT_DELAYS_MS: readonly number[] = [250, 500, 1_00
 export class AgentDoneDeliveryError extends Error {
   override readonly name = "AgentDoneDeliveryError";
 }
+
+/**
+ * The API refused the result itself, and then refused the failure sent in its
+ * place.
+ *
+ * Deliberately not an {@link AgentDoneDeliveryError}: every caller answers that
+ * one with a nak, and a nak resends a body the API has already said it cannot
+ * store. This one ends the delivery instead (`quarantineAgentDone`).
+ */
+export class AgentDoneRejectedError extends Error {
+  override readonly name = "AgentDoneRejectedError";
+  constructor(readonly status: number, readonly sqlstate: string | null) {
+    super(`agent_done callback refused with HTTP ${status}${sqlstate ? ` (SQLSTATE ${sqlstate})` : ""}`);
+  }
+}
+
+/** The failure reason a run is closed with when the API could not store its result. */
+export const RESULT_UNSTORABLE_REASON = "result_unstorable";
 
 interface AgentDoneBody {
   task_id?: string;
@@ -555,6 +574,56 @@ function withoutPayload(body: AgentDoneBody): AgentDoneBody {
   return downgraded;
 }
 
+/**
+ * The body sent in place of one the API refused to store (HTTP 422).
+ *
+ * The run is closed as failed, with a code and a sentence, and nothing else
+ * from the original body: whatever the database refused is somewhere in it, so
+ * sending any of it again is sending the refusal again. `turns` and
+ * `error_count` go too, since a count out of range for its column is one of the
+ * refusals. The attempt report stays, bounded, because without it a stale
+ * attempt could close a run somebody else now holds.
+ */
+function refusedResultBody(body: AgentDoneBody, sqlstate: string | null): AgentDoneBody {
+  return {
+    task_id: body.task_id ? truncateField(body.task_id, "task id") : body.task_id,
+    run_time: boundedAttemptReport(body.run_time),
+    final_text: "",
+    captures: {},
+    artifacts: [],
+    abort_reason: "error",
+    failure_reason: RESULT_UNSTORABLE_REASON,
+    failure_message: "The run finished but the API could not store its result"
+      + (sqlstate ? ` (SQLSTATE ${sqlstate})` : "")
+      + ", so the run is recorded as failed instead of being run again.",
+  };
+}
+
+/** The error code the API's `agent_done` route answers when the database refused the values. */
+export const UNSTORABLE_RESULT_ERROR = "unstorable_result";
+
+/**
+ * Whether a 422 is the API's refusal of the values, and the SQLSTATE it names.
+ *
+ * Only a body carrying `error: "unstorable_result"` is that refusal. Any other
+ * 422 (a proxy, an ingress or a request validator in front of the route) says
+ * nothing about whether the database can store the result, so it is handled
+ * like any other failed attempt rather than turning a good run into a failure.
+ * The SQLSTATE is kept only when it has the shape a SQLSTATE has.
+ */
+async function storeRefusal(resp: Response): Promise<{ sqlstate: string | null } | null> {
+  let parsed: unknown;
+  try {
+    parsed = await resp.json();
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const { error, sqlstate } = parsed as { error?: unknown; sqlstate?: unknown };
+  if (error !== UNSTORABLE_RESULT_ERROR) return null;
+  return { sqlstate: typeof sqlstate === "string" && /^[0-9A-Z]{5}$/.test(sqlstate) ? sqlstate : null };
+}
+
 /** The platform half of the body, present only when there is something to say. */
 function platformFields(result: ExecuteResult): Partial<AgentDoneBody> {
   const f = result.platformFacts;
@@ -571,6 +640,8 @@ export async function postAgentDone(
   request: ExecuteRequest,
   result: ExecuteResult,
   runTime?: RunTimeReport,
+  /** When this result was first written to the outbox, for the oldest-pending gauge. */
+  pendingSinceMs?: number,
 ): Promise<void> {
   if (!request.task_id || !request.callback_url) return;
   const url = `${request.callback_url}/agent_done`;
@@ -601,7 +672,9 @@ export async function postAgentDone(
   let lastError: Error | undefined;
   let payload = body;
   let shed = false;
+  let refused = false;
   let maxAttempts = 3;
+  metrics.onAgentDonePending(request.task_id, pendingSinceMs);
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       // Each of the three attempts rides out an API pod swap on its own
@@ -619,7 +692,30 @@ export async function postAgentDone(
         delaysMs: AGENT_DONE_TRANSIENT_DELAYS_MS,
         onRetry: (n, why) => logger.warn({ taskId: request.task_id, attempt, transientRetry: n, why }, "agent_done.transient_retry"),
       });
-      if (resp.ok) return;
+      if (resp.ok) {
+        metrics.onAgentDoneDelivered(request.task_id);
+        return;
+      }
+      metrics.onAgentDoneFailedAttempt(String(resp.status));
+      // A 422 carrying `unstorable_result` is the API saying the database
+      // refused this body's values: a resend is the same refusal. Replace the
+      // result with a failure that carries none of it, once; if that is
+      // refused too, stop here rather than spend the delivery budget re-running
+      // the run to send it again. Any other 422 is an ordinary failed attempt.
+      const refusal = resp.status === 422 ? await storeRefusal(resp) : null;
+      if (refusal) {
+        const { sqlstate } = refusal;
+        if (refused) {
+          metrics.onAgentDoneSettled(request.task_id);
+          throw new AgentDoneRejectedError(resp.status, sqlstate);
+        }
+        payload = refusedResultBody(body, sqlstate);
+        refused = true;
+        if (attempt === maxAttempts) maxAttempts++;
+        logger.error({ taskId: request.task_id, sqlstate }, "agent_done.result_refused_sending_failure");
+        lastError = new Error(`agent_done callback returned HTTP ${resp.status}`);
+        continue;
+      }
       // 413 is the one status a retry cannot help with: the body is too large
       // and will be exactly as large next time. Shed it once and retry that,
       // rather than spending the remaining attempts proving the point.
@@ -634,8 +730,9 @@ export async function postAgentDone(
       }
       lastError = new Error(`agent_done callback returned HTTP ${resp.status}`);
     } catch (error) {
-      if (error instanceof AgentDoneDeliveryError) throw error;
+      if (error instanceof AgentDoneDeliveryError || error instanceof AgentDoneRejectedError) throw error;
       lastError = error instanceof Error ? error : new Error(String(error));
+      metrics.onAgentDoneFailedAttempt("network");
     }
     logger.warn(
       { taskId: request.task_id, attempt, err: lastError.message },
