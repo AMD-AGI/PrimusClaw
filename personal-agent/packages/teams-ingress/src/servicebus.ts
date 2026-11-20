@@ -28,6 +28,7 @@ function wrap(client: ServiceBusClient): QueueClient {
         close: () => sender.close(),
       };
     },
+    close: () => client.close(),
   };
 }
 

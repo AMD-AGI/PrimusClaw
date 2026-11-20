@@ -15,6 +15,34 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## Unreleased
+
+### Added
+
+- `deploy/teams-ingress-alerts.yaml`: Grafana alert rules over the ingress's Application Insights, more than 2 requests to
+  `messages` answered `499` or above in 5 minutes, and any failed enqueue, with the data source they need
+  ([quick start](docs/quickstart.md#4-the-ingress), "Alerts").
+
+### Changed
+
+- `@primusclaw/personal-agent-teams-ingress`: `QueueClient` (what a `ServiceBusFactory` returns) has a `close()`, which
+  the ingress calls on a client it throws away. A factory of one's own must add it.
+
+### Fixed
+
+- The Teams ingress gets messages through again after the Service Bus connection under its kept client dies. Until now a
+  failed send was retried on a new sender of the same client; when the client's connection was stuck closing, every
+  sender opened on it waited the whole 20 s deadline, so every message on that instance was lost (answered `500`, or
+  `499` once the Bot Framework stopped waiting) until the Function app was restarted. A failed send now throws away the
+  whole client when the failure is about the connection (any failure but a Service Bus error about the message or the
+  queue, such as `MessageSizeExceeded`), each attempt ends after 4 s, and a send has up to three attempts within a 12 s
+  deadline, inside the 15 s the Bot Framework waits, so a message that still cannot be queued is a `500` that Teams
+  retries. The queue message id stays the activity id, which the worker dedupes on.
+- The ingress reports its send path: one `inbound_enqueue_failed` record (logger `ingress_health`) per send that fails
+  after its retries, one `inbound_client_reset` per client thrown away and one `inbound_enqueue_recovered` on the first
+  success after failures, each with the instance's running counts (`Ingress.health.counters`). Never the message, the
+  error text or a setting.
+
 ## 0.10.4
 
 A patch release: the card for a merge or approval held for its owner, the terminal's own questions said in the chat, streams
