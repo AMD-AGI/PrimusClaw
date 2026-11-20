@@ -20,6 +20,13 @@
  *   D7  the delivery gauges: backlog age and size by queue, per-connector series only for connectors behind or failing now,
  *       the notification outbox's oldest waiting row and failing subscriptions, the post outcomes
  *   D8  only one replica sweeps at a time
+ *   D9  the heartbeat and the events batch are answered without waiting on their delivery-health writes: with the rows locked
+ *       they still answer at once, at most DELIVERY_WRITE_CONCURRENCY writes wait on the database, a connector's reports queued
+ *       meanwhile land as its latest one, and everything lands once the lock is gone
+ *   D10 a connector restarted mid-stall reports no failure (its count is of the new run) while its backlog still waits: not
+ *       "recovered" until a batch gets through
+ *   D11 a notice is marked said only once said: a replica that died between the sweep and the saying, or an owner with no
+ *       assistant to say it through, is told by a later sweep, once
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -96,9 +103,9 @@ describe("remote delivery health", { skip }, () => {
   }
 
   type Res = { status: number; body: any };
-  async function call(user: string, method: string, path: string, body?: unknown): Promise<Res> {
+  async function call(user: string, method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<Res> {
     const r = await fetch(base + path, {
-      method, headers: { "x-test-user": user, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      method, signal, headers: { "x-test-user": user, ...(body === undefined ? {} : { "content-type": "application/json" }) },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     return { status: r.status, body: await r.json().catch(() => null) };
@@ -109,8 +116,11 @@ describe("remote delivery health", { skip }, () => {
     return r.body.data.connector_id;
   }
   /** A heartbeat as the connector sends it, with its outbox report (`outbox`), or none (a connector from before it). */
-  const heartbeat = (user: string, cid: string, outbox?: unknown) =>
-    call(user, "POST", `/v1/remote-agents/connectors/${cid}/heartbeat`, { version: "0.2.3", agents: [AGENT], cmd_cursor: null, ...(outbox === undefined ? {} : { outbox }) });
+  /** The answer, once what it left to be written off the request path (`deliveryWritesIdle`) has landed too. */
+  const settled = async (r: Promise<Res>): Promise<Res> => { const out = await r; await health.deliveryWritesIdle(); return out; };
+  const heartbeatNow = (user: string, cid: string, outbox?: unknown, signal?: AbortSignal) =>
+    call(user, "POST", `/v1/remote-agents/connectors/${cid}/heartbeat`, { version: "0.2.3", agents: [AGENT], cmd_cursor: null, ...(outbox === undefined ? {} : { outbox }) }, signal);
+  const heartbeat = (user: string, cid: string, outbox?: unknown) => settled(heartbeatNow(user, cid, outbox));
   const report = (o: { pending?: number; oldestMs?: number; failures?: number; failingMs?: number; lastError?: string | null; sessions?: Array<[string, number, number]> } = {}) => ({
     pending: o.pending ?? 0, oldest_age_ms: o.oldestMs ?? 0, failures: o.failures ?? 0, failing_ms: o.failingMs ?? 0,
     last_error: o.lastError ?? null, sessions: (o.sessions ?? []).map(([sid, pending, age]) => ({ session_id: sid, pending, oldest_age_ms: age })),
@@ -128,8 +138,9 @@ describe("remote delivery health", { skip }, () => {
     session_id: sid, seq, type: "agent_message_chunk", ts: Date.now(), data: { content: { type: "text", text } },
   });
   const turnEnd = (sid: string, seq: number) => ({ session_id: sid, seq, type: "turn_end", ts: Date.now(), data: { stopReason: "end_turn" } });
-  const post = (user: string, cid: string, events: unknown[]) =>
-    call(user, "POST", `/v1/remote-agents/connectors/${cid}/events`, { batch_id: `b-${randomUUID().slice(0, 8)}`, events });
+  const postNow = (user: string, cid: string, events: unknown[], signal?: AbortSignal) =>
+    call(user, "POST", `/v1/remote-agents/connectors/${cid}/events`, { batch_id: `b-${randomUUID().slice(0, 8)}`, events }, signal);
+  const post = (user: string, cid: string, events: unknown[]) => settled(postNow(user, cid, events));
 
   const row = async (cid: string) => (await w.q("SELECT * FROM claw_remote_delivery_health WHERE connector_id = $1", [cid]))[0];
   const says = async (userId: string) => (await w.q("SELECT text FROM claw_assistant_says WHERE user_id = $1 ORDER BY created_at", [userId])).map((r) => String(r.text));
@@ -228,7 +239,12 @@ describe("remote delivery health", { skip }, () => {
     assert.deepEqual(await says("bob"), [
       "Replies from the sessions on your dev environment build-host are delayed (7 waiting, the oldest for 3 min). They are being retried; you will be told when they get through.",
     ]);
-    // Draining (posts succeed, events still waiting) is recovery: the failures are what was told.
+    // Draining (posts get through, events still waiting) is recovery: the failures are what was told. A clean report alone is not
+    // (see D10); the batch that got through is.
+    await heartbeat("bob", cid, report({ pending: 4, oldestMs: 1_000, failures: 0 }));
+    assert.deepEqual((await sweep()).notices, [], "no batch got through yet");
+    const sid = await session("bob", cid);
+    assert.equal((await post("bob", cid, [chunk(sid, 1, "the build is green"), turnEnd(sid, 2)])).status, 200);
     await heartbeat("bob", cid, report({ pending: 4, oldestMs: 1_000, failures: 0 }));
     assert.deepEqual((await sweep()).notices.map((n) => n.kind), ["recovered"]);
     assert.equal((await says("bob"))[1], "Replies from the sessions on your dev environment build-host are getting through again; the delayed ones are being delivered now.");
@@ -279,6 +295,8 @@ describe("remote delivery health", { skip }, () => {
     assert.equal((await says("bob")).length, 1);
     // Recovered, and the first "back" fails too: tried again, said once.
     calls = 0;
+    const sid = await session("alice", a);
+    assert.equal((await post("alice", a, [chunk(sid, 1, "done"), turnEnd(sid, 2)])).status, 200);
     await heartbeat("alice", a, report());
     await sweep();
     assert.equal((await row(a)).stall_notice, "back_pending");
@@ -363,5 +381,110 @@ describe("remote delivery health", { skip }, () => {
       await holder.end();
     }
     assert.equal((await sweep()).notices.length, 1);
+  });
+  test("D9 the routes answer without waiting on their delivery-health writes, with bounded writes behind them", async () => {
+    const cids: string[] = [];
+    for (let i = 0; i < 10; i++) cids.push(await connector(i % 2 ? "bob" : "alice", `box-${i}`));
+    const cid = cids[0];
+    const sid = await session("alice", cid);
+    // Every connector has its row, and the first one a failing answer of Claw's to clear (so a stored batch writes).
+    for (const [i, c] of cids.entries()) await heartbeat(i % 2 ? "bob" : "alice", c, report({ pending: 1, oldestMs: 1_000 }));
+    assert.equal((await post("alice", cid, [chunk(sid, 1, POISON)])).status, 500);
+    assert.equal((await row(cid)).api_failures, 1);
+    const holder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+    await holder.connect();
+    const waiting = async () => Number((await w.q(
+      `SELECT COUNT(*)::int AS n FROM pg_stat_activity
+        WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%claw_remote_delivery_health%'`,
+    ))[0].n);
+    try {
+      await holder.query("BEGIN");
+      await holder.query("SELECT 1 FROM claw_remote_delivery_health FOR UPDATE");
+      // A heartbeat and a stored batch, each answered at once although what they record cannot be written.
+      const t0 = Date.now();
+      const hb = await heartbeatNow("alice", cid, report({ pending: 2, oldestMs: 5_000 }), AbortSignal.timeout(3_000));
+      assert.equal(hb.status, 200);
+      const ok = await postNow("alice", cid, [chunk(sid, 1, "the fix is in"), turnEnd(sid, 2)], AbortSignal.timeout(3_000));
+      assert.equal(ok.status, 200, JSON.stringify(ok.body));
+      assert.ok(Date.now() - t0 < 2_000, `answered in ${Date.now() - t0} ms`);
+      // Every other connector's heartbeat too, and three more reports of the first one's, the last saying 9 wait.
+      for (const [i, c] of cids.entries()) {
+        if (i) assert.equal((await heartbeatNow(i % 2 ? "bob" : "alice", c, report({ pending: 10 + i, oldestMs: 1_000 }), AbortSignal.timeout(3_000))).status, 200);
+      }
+      for (const n of [7, 8, 9]) assert.equal((await heartbeatNow("alice", cid, report({ pending: n, oldestMs: 1_000 }), AbortSignal.timeout(3_000))).status, 200);
+      // The writes wait on the lock, never more than the bound of them at once.
+      const deadline = Date.now() + 5_000;
+      while ((await waiting()) < health.DELIVERY_WRITE_CONCURRENCY && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+      assert.equal(await waiting(), health.DELIVERY_WRITE_CONCURRENCY);
+      await new Promise((r) => setTimeout(r, 200));
+      assert.equal(await waiting(), health.DELIVERY_WRITE_CONCURRENCY, "no more than the bound pile up");
+      await holder.query("COMMIT");
+    } finally {
+      await holder.query("ROLLBACK").catch(() => undefined);
+      await holder.end();
+    }
+    await health.deliveryWritesIdle();
+    const first = await row(cid);
+    assert.equal(first.pending, 9, "the connector's latest report");
+    assert.equal(first.api_failures, 0, "the stored batch cleared Claw's failing answer");
+    for (const [i, c] of cids.entries()) if (i) assert.equal((await row(c)).pending, 10 + i);
+  });
+
+  test("D10 a connector restarted mid-stall is not told it recovered until a batch gets through", async () => {
+    const cid = await connector("bob", "build-host");
+    const s1 = randomUUID();
+    // Its posts never reach Claw (a proxy drops them), for three minutes: told.
+    await heartbeat("bob", cid, report({ pending: 7, oldestMs: 200_000, failures: 9, failingMs: 190_000, lastError: "network", sessions: [[s1, 7, 200_000]] }));
+    assert.deepEqual((await sweep()).notices.map((n) => n.kind), ["delayed"]);
+    // Restarted: the outbox is read back from disk (its events count from the new run's start) and the new run has failed no
+    // post yet, the shape its first heartbeat has.
+    await heartbeat("bob", cid, report({ pending: 7, oldestMs: 2_000, failures: 0, sessions: [[s1, 7, 2_000]] }));
+    assert.deepEqual((await sweep()).notices, [], "nothing got through: not recovered");
+    assert.equal((await row(cid)).stall_state, "stalled");
+    // Its posts still fail.
+    await heartbeat("bob", cid, report({ pending: 7, oldestMs: 30_000, failures: 2, failingMs: 25_000, lastError: "network", sessions: [[s1, 7, 30_000]] }));
+    assert.deepEqual((await sweep()).notices, []);
+    // The network is back: the batch gets through, then the report is clean.
+    const sid = await session("bob", cid);
+    assert.equal((await post("bob", cid, [chunk(sid, 1, "replies after the restart"), turnEnd(sid, 2)])).status, 200);
+    await heartbeat("bob", cid, report());
+    assert.deepEqual((await sweep()).notices.map((n) => n.kind), ["recovered"]);
+    assert.equal((await says("bob")).length, 2);
+  });
+
+  test("D11 a notice is marked said only once it is said, and is said once", async () => {
+    const a = await connector("alice", "dev-box");
+    await heartbeat("alice", a, report({ pending: 1, oldestMs: 180_000, failures: 3, failingMs: 180_000, lastError: "http_500" }));
+    // The replica that swept died before saying it: the sweep's half committed, the saying never ran.
+    const handed = await health.sweepDeliveryHealth();
+    assert.equal(handed.notices.length, 1);
+    assert.equal((await row(a)).stall_notice, "pending", "not marked said before it is said");
+    // Another replica within the retry interval leaves it to the one saying it.
+    assert.deepEqual((await sweep()).notices, []);
+    assert.deepEqual(await says("alice"), []);
+    const expire = () => w.q("UPDATE claw_remote_delivery_health SET stall_notice_at = NOW() - interval '2 minutes' WHERE connector_id = $1", [a]);
+    await expire();
+    const again = await sweep();
+    assert.deepEqual(again.notices.map((n) => n.kind), ["delayed"]);
+    assert.equal((await says("alice")).length, 1);
+    assert.equal((await row(a)).stall_notice, "sent");
+    // Died after saying it, before marking it: said again by the next sweep, which says nothing twice.
+    await w.q("UPDATE claw_remote_delivery_health SET stall_notice = 'pending', stall_notice_at = NOW() - interval '2 minutes' WHERE connector_id = $1", [a]);
+    await sweep();
+    assert.equal((await says("alice")).length, 1);
+    assert.equal((await row(a)).stall_notice, "sent");
+    // Bob has no assistant when his replies stall: nothing said, and it stays to be said.
+    const b = await connector("bob", "build-host");
+    const assistant = (await w.q("SELECT row_to_json(a) AS r FROM claw_assistants a WHERE user_id = 'bob'"))[0].r;
+    await w.q("DELETE FROM claw_assistants WHERE user_id = 'bob'");
+    await heartbeat("bob", b, report({ pending: 2, oldestMs: 300_000, failures: 4, failingMs: 300_000, lastError: "network" }));
+    assert.deepEqual((await sweep()).notices.map((n) => n.owner), ["bob"]);
+    assert.equal((await row(b)).stall_notice, "pending");
+    // Once he has one, a later sweep tells him.
+    await w.q("INSERT INTO claw_assistants SELECT * FROM json_populate_record(NULL::claw_assistants, $1::json)", [JSON.stringify(assistant)]);
+    await w.q("UPDATE claw_remote_delivery_health SET stall_notice_at = NOW() - interval '2 minutes' WHERE connector_id = $1", [b]);
+    await sweep();
+    assert.equal((await says("bob")).length, 1);
+    assert.equal((await row(b)).stall_notice, "sent");
   });
 });

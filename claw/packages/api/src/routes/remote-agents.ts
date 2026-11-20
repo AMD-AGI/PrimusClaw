@@ -45,7 +45,7 @@ import * as store from "../remote-agents/store.js";
 import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
 import { startTerminalWaitSweep, TERMINAL_WAIT_NOTICE_MS } from "../remote-agents/terminal-waits.js";
-import { DELIVERY_SWEEP_MS, noteEventsPost, recordOutboxReport, startDeliveryHealthSweep } from "../remote-agents/delivery-health.js";
+import { DELIVERY_SWEEP_MS, deliveryWritesIdle, noteEventsPost, recordOutboxReport, startDeliveryHealthSweep } from "../remote-agents/delivery-health.js";
 import { metrics } from "../infra/metrics.js";
 import { closeCardsOfConnector } from "../assistant/devenv-tools.js";
 import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
@@ -257,6 +257,13 @@ async function serveSse(
 export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: RemoteAgentOptions = {}): Promise<void> {
   if (!CLAW_REMOTE_AGENTS_ENABLED) return;
   const waker = opts.waker ?? new Waker();
+  // The delivery-health writes the routes below leave running (`remote-agents/delivery-health.ts`) get a few seconds to land on
+  // shutdown, before the pool closes; they are advice, so a shutdown never waits longer for them.
+  app.addHook("onClose", async () => {
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([deliveryWritesIdle(), new Promise<void>((resolve) => { timer = setTimeout(resolve, 5_000); timer.unref(); })]);
+    clearTimeout(timer);
+  });
   // Every loop below is started through `startBackgroundLoops`, so CLAW_API_BACKGROUND=off starts none of them.
   const loops: BackgroundLoop<RemoteAgentBackgroundLoopName>[] = [];
   loops.push({
@@ -494,9 +501,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const hb = parseHeartbeat(req.body);
     if (!hb.ok) return fail(reply, 400, hb.error);
     const undelivered = await store.recordHeartbeat(connector.connector_id, owner, hb.value);
-    // What its outbox holds (`remote-agents/delivery-health.ts`): advice, never a reason to fail the heartbeat that carries it.
-    await recordOutboxReport(String(connector.connector_id), owner, hb.value.outbox)
-      .catch((err) => logger.warn({ err: (err as Error)?.message, connectorId: connector.connector_id }, "remote_agents.outbox_report_failed"));
+    // What its outbox holds (`remote-agents/delivery-health.ts`): advice, written off the request path, never a reason to fail or
+    // hold up the heartbeat that carries it.
+    recordOutboxReport(String(connector.connector_id), owner, hb.value.outbox);
     await sayUndelivered(undelivered, (sid) => waker.wake(`s:${sid}`));
     // Below the recommended version the answer says so, with the command that upgrades it; a connector may print it.
     const verdict = versionVerdict(hb.value.version ?? (connector.version as string | null));
@@ -527,13 +534,13 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       // every time is seen as the stall it is, by its owner and by the alert rules, instead of only in a log line per retry.
       metrics.onRemoteEventsPost("server_error");
       const code = typeof (err as { code?: unknown })?.code === "string" ? `pg_${(err as { code: string }).code}` : "error";
-      await noteEventsPost(cid, owner, { ok: false, error: code })
-        .catch((e) => logger.warn({ err: (e as Error)?.message, connectorId: cid }, "remote_agents.events_failure_note_failed"));
+      // Written off the request path: the answer never waits on its own observation.
+      noteEventsPost(cid, owner, { ok: false, error: code });
       throw err;
     }
     metrics.onRemoteEventsPost("ok");
-    await noteEventsPost(cid, owner, { ok: true })
-      .catch((e) => logger.warn({ err: (e as Error)?.message, connectorId: cid }, "remote_agents.events_failure_note_failed"));
+    // A batch that carried something got through; an empty one (no event to move) is no evidence either way.
+    if (batch.value.events.length || batch.value.rejected.length) noteEventsPost(cid, owner, { ok: true });
     for (const sid of result.touched) waker.wake(`s:${sid}`);
     // The assistant's view of the work (`assistant/remote-items.ts`): after the events are stored, and never a reason to refuse them.
     // Every session the batch was for, not only those that gained an event: a retry of a batch whose events were stored but not

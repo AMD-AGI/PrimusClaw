@@ -15,11 +15,14 @@
  *  - Claw's own answers on `POST .../events` (`noteEventsPost`): a 5xx counted per connector, reset by the next success. It
  *    sees a stall even from a connector too old to report.
  *
+ * Both are written off the request path ({@link DeliveryWrites}): a heartbeat or a batch is never held up by its own observation.
+ *
  * A sweep, every few seconds on whichever replica takes the lock, holds each connector as `ok` or `stalled`. Stalled: posts
  * have failed for {@link STALL_NOTICE_MS} (2 minutes) on the connector's fresh report while events wait, or Claw has answered
  * its posts with a 5xx for that long and did so recently. On the step to stalled the owner is told once, through their
- * assistant, that the replies are delayed and being retried; when the posts succeed again (positive evidence: a report with no
- * failure and no failing answer of Claw's) they are told once that they get through. A connector that went quiet meanwhile
+ * assistant, that the replies are delayed and being retried; when the posts succeed again (positive evidence: a batch Claw stored
+ * after the stall began, and since then a report with no failure and no failing answer of Claw's) they are told once that they
+ * get through. A notice is marked said only after it was said, and handed out again until it is. A connector that went quiet meanwhile
  * (offline: its report is stale) stays stalled and is told nothing more here -- presence (`presence.ts`) says it went offline.
  *
  * The same rows feed the delivery gauges (`sampleDeliveryHealth`, `infra/metrics.ts`) the alert rules read.
@@ -47,46 +50,138 @@ const NAME_MAX = 64;
 
 const clampInt = (n: number): number => Math.max(0, Math.min(2_000_000_000, Math.floor(n)));
 
+/** How many delivery-health writes run at once on this replica, at most. They are advice and must never crowd out the work. */
+export const DELIVERY_WRITE_CONCURRENCY = 4;
+/** How many connectors may have a write waiting; a write beyond it is dropped (and counted in a log line), not queued. */
+export const DELIVERY_WRITE_MAX_WAITING = 10_000;
+
 /**
- * Record a connector's outbox report (`RemoteOutboxReport`). Null (a connector from before the report, or a malformed one)
- * records nothing. Ages become instants on Claw's clock, so the connector's clock never matters.
+ * The delivery-health writes, off the request path: a heartbeat or an events batch is answered without waiting for them, so a
+ * slow or locked `claw_remote_delivery_health` never holds up the replies it is there to watch. At most
+ * {@link DELIVERY_WRITE_CONCURRENCY} run at once, one at a time per key (so a connector's writes land in the order they were
+ * made), and what waits behind a running write is merged into one write (the latest report; the outcomes counted), so a
+ * connector that posts faster than the database answers costs one write in flight and one waiting, never a growing queue.
  */
-export async function recordOutboxReport(connectorId: string, owner: string, report: RemoteOutboxReport | null | undefined): Promise<void> {
+class DeliveryWrites {
+  private readonly waiting = new Map<string, { value: unknown; write: (v: unknown) => Promise<void> }>();
+  private readonly running = new Set<string>();
+  private readonly ready: string[] = [];
+  private active = 0;
+  private idlers: Array<() => void> = [];
+  dropped = 0;
+
+  constructor(readonly limit: number, readonly maxWaiting: number) {}
+
+  enqueue<T>(key: string, next: (prev: T | undefined) => T, write: (v: T) => Promise<void>): void {
+    const had = this.waiting.get(key);
+    if (!had && this.waiting.size >= this.maxWaiting) {
+      if (this.dropped++ % 1000 === 0) logger.warn({ dropped: this.dropped, waiting: this.waiting.size }, "remote_agents.delivery_write_dropped");
+      return;
+    }
+    this.waiting.set(key, { value: next(had?.value as T | undefined), write: write as (v: unknown) => Promise<void> });
+    if (!had && !this.running.has(key)) this.ready.push(key);
+    this.pump();
+  }
+
+  private pump(): void {
+    while (this.active < this.limit && this.ready.length) {
+      const key = this.ready.shift() as string;
+      const job = this.waiting.get(key);
+      if (!job) continue;
+      this.waiting.delete(key);
+      this.running.add(key);
+      this.active += 1;
+      void job.write(job.value)
+        .catch((err) => logger.warn({ err: (err as Error)?.message, key }, "remote_agents.delivery_write_failed"))
+        .finally(() => {
+          this.active -= 1;
+          this.running.delete(key);
+          if (this.waiting.has(key)) this.ready.push(key);
+          this.pump();
+          if (this.active === 0 && this.waiting.size === 0) for (const f of this.idlers.splice(0)) f();
+        });
+    }
+  }
+
+  /** Resolves once nothing is running or waiting: for a clean shutdown, and for tests that read what was written. */
+  idle(): Promise<void> {
+    if (this.active === 0 && this.waiting.size === 0) return Promise.resolve();
+    return new Promise((resolve) => this.idlers.push(resolve));
+  }
+}
+
+const writes = new DeliveryWrites(DELIVERY_WRITE_CONCURRENCY, DELIVERY_WRITE_MAX_WAITING);
+
+/** Resolves once every delivery-health write asked for so far has been made (or has failed). */
+export const deliveryWritesIdle = (): Promise<void> => writes.idle();
+
+/**
+ * Record a connector's outbox report (`RemoteOutboxReport`), off the request path ({@link DeliveryWrites}). Null (a connector
+ * from before the report, or a malformed one) records nothing. Ages become instants on Claw's clock, counted from when the report
+ * arrived (not from when the write runs), so the connector's clock never matters and neither does a write that waited.
+ */
+export function recordOutboxReport(connectorId: string, owner: string, report: RemoteOutboxReport | null | undefined): void {
   if (!report) return;
+  const at = Date.now();
+  writes.enqueue<{ report: RemoteOutboxReport; at: number }>(`report:${connectorId}`, () => ({ report, at }), (v) => writeOutboxReport(connectorId, owner, v.report, v.at));
+}
+
+async function writeOutboxReport(connectorId: string, owner: string, report: RemoteOutboxReport, at: number): Promise<void> {
+  const waited = clampInt(Date.now() - at);
   const sessions = report.sessions.map((s) => ({ session_id: s.sessionId, pending: clampInt(s.pending), oldest_age_ms: clampInt(s.oldestAgeMs) }));
   await db.query(
     `INSERT INTO claw_remote_delivery_health AS h
             (connector_id, owner_user_id, reported_at, pending, oldest_since, post_failures, post_failing_since, post_last_error, sessions)
-     VALUES ($1, $2, NOW(), $3, CASE WHEN $3 > 0 THEN NOW() - make_interval(secs => $4::float8 / 1000) END,
-             $5, CASE WHEN $5 > 0 THEN NOW() - make_interval(secs => $6::float8 / 1000) END, CASE WHEN $5 > 0 THEN $7 END, $8::jsonb)
+     VALUES ($1, $2, NOW() - make_interval(secs => $9::float8 / 1000), $3,
+             CASE WHEN $3 > 0 THEN NOW() - make_interval(secs => ($4::float8 + $9::float8) / 1000) END,
+             $5, CASE WHEN $5 > 0 THEN NOW() - make_interval(secs => ($6::float8 + $9::float8) / 1000) END, CASE WHEN $5 > 0 THEN $7 END, $8::jsonb)
      ON CONFLICT (connector_id) DO UPDATE SET
        reported_at = EXCLUDED.reported_at, pending = EXCLUDED.pending, oldest_since = EXCLUDED.oldest_since,
        post_failures = EXCLUDED.post_failures, post_failing_since = EXCLUDED.post_failing_since,
        post_last_error = EXCLUDED.post_last_error, sessions = EXCLUDED.sessions`,
     [connectorId, owner, clampInt(report.pending), clampInt(report.oldestAgeMs), clampInt(report.failures), clampInt(report.failingMs),
-      report.lastError, JSON.stringify(sessions)],
+      report.lastError, JSON.stringify(sessions), waited],
   );
 }
 
-/** What Claw answered a connector's `POST .../events`: `ok`, or the failure (a PostgreSQL error code, or `error`). */
-export async function noteEventsPost(connectorId: string, owner: string, outcome: { ok: true } | { ok: false; error: string }): Promise<void> {
-  if (outcome.ok) {
-    // Written only when there is something to clear: every successful batch would otherwise write a row.
+/**
+ * Claw's answers to one connector's batches not yet written: `reset` when one succeeded (what failed before it is cleared), then
+ * the failures after it, and the last of their errors.
+ */
+interface ApiOutcomes { reset: boolean; failures: number; error: string | null }
+
+/**
+ * What Claw answered a connector's `POST .../events` (`ok`, or the failure: a PostgreSQL error code, or `error`), recorded off
+ * the request path ({@link DeliveryWrites}), in order per connector.
+ */
+export function noteEventsPost(connectorId: string, owner: string, outcome: { ok: true } | { ok: false; error: string }): void {
+  const error = outcome.ok ? null : /^[A-Za-z0-9_]{1,32}$/.test(outcome.error) ? outcome.error : "error";
+  writes.enqueue<ApiOutcomes>(
+    `api:${connectorId}`,
+    (prev) => outcome.ok ? { reset: true, failures: 0, error: null } : { reset: prev?.reset ?? false, failures: (prev?.failures ?? 0) + 1, error },
+    (v) => writeApiOutcomes(connectorId, owner, v),
+  );
+}
+
+async function writeApiOutcomes(connectorId: string, owner: string, v: ApiOutcomes): Promise<void> {
+  if (v.failures === 0) {
+    // Written only when there is something to clear or a stall to end: every successful batch would otherwise write a row.
+    // `api_ok_at` is the evidence the sweep ends a stall on: a batch got through after it began.
     await db.query(
-      `UPDATE claw_remote_delivery_health SET api_failures = 0, api_failing_since = NULL, api_last_error = NULL
-        WHERE connector_id = $1 AND api_failures <> 0`,
+      `UPDATE claw_remote_delivery_health SET api_failures = 0, api_failing_since = NULL, api_last_error = NULL, api_ok_at = NOW()
+        WHERE connector_id = $1 AND (api_failures <> 0 OR stall_state = 'stalled')`,
       [connectorId],
     );
     return;
   }
-  const error = /^[A-Za-z0-9_]{1,32}$/.test(outcome.error) ? outcome.error : "error";
   await db.query(
-    `INSERT INTO claw_remote_delivery_health AS h (connector_id, owner_user_id, api_failures, api_failing_since, api_failed_at, api_last_error)
-     VALUES ($1, $2, 1, NOW(), NOW(), $3)
+    `INSERT INTO claw_remote_delivery_health AS h (connector_id, owner_user_id, api_failures, api_failing_since, api_failed_at, api_last_error, api_ok_at)
+     VALUES ($1, $2, $3, NOW(), NOW(), $4, CASE WHEN $5 THEN NOW() END)
      ON CONFLICT (connector_id) DO UPDATE SET
-       api_failures = h.api_failures + 1, api_failing_since = COALESCE(h.api_failing_since, NOW()), api_failed_at = NOW(),
-       api_last_error = EXCLUDED.api_last_error`,
-    [connectorId, owner, error],
+       api_failures = CASE WHEN $5 THEN 0 ELSE h.api_failures END + EXCLUDED.api_failures,
+       api_failing_since = CASE WHEN $5 THEN NOW() ELSE COALESCE(h.api_failing_since, NOW()) END, api_failed_at = NOW(),
+       api_last_error = EXCLUDED.api_last_error, api_ok_at = CASE WHEN $5 THEN NOW() ELSE h.api_ok_at END`,
+    [connectorId, owner, v.failures, v.error, v.reset],
   );
 }
 
@@ -142,14 +237,23 @@ export function deliveryNoticeText(n: DeliveryNotice, lang: "zh" | "en"): string
 export const deliveryNoticeKey = (n: Pick<DeliveryNotice, "kind" | "connectorId" | "episode">): string =>
   `remote-delivery-${n.kind}:${n.connectorId}:${n.episode}`;
 
+/** How long a notice handed out to be said is left to its sender before another sweep says it again (its key says it once). */
+export const NOTICE_RETRY_MS = 60 * 1000;
+
 /**
  * One sweep: judge every connector with a delivery row, and decide what to tell. Runs under a transaction-scoped advisory lock,
  * so two replicas never sweep at once; one that finds it held does nothing (`swept: false`).
+ *
+ * A notice is `pending` (`back_pending`) until it has been said: the sweep hands it out and stamps `stall_notice_at`, and only
+ * {@link runDeliveryHealthSweep}, once the owner's assistant has it, marks it `sent` (`back_sent`). One that was not said -- the
+ * replica died between, the store failed, there was no assistant to say it through -- is handed out again after
+ * `noticeRetryMs`; its deterministic key ({@link deliveryNoticeKey}) makes a second attempt of one that was said say nothing.
  */
-export async function sweepDeliveryHealth(opts: { stallAfterMs?: number; reportFreshMs?: number; apiFreshMs?: number } = {}): Promise<DeliverySweepResult> {
+export async function sweepDeliveryHealth(opts: { stallAfterMs?: number; reportFreshMs?: number; apiFreshMs?: number; noticeRetryMs?: number } = {}): Promise<DeliverySweepResult> {
   const stallAfter = (opts.stallAfterMs ?? STALL_NOTICE_MS) / 1000;
   const fresh = (opts.reportFreshMs ?? REPORT_FRESH_MS) / 1000;
   const apiFresh = (opts.apiFreshMs ?? API_FAILURE_FRESH_MS) / 1000;
+  const retry = (opts.noticeRetryMs ?? NOTICE_RETRY_MS) / 1000;
   return inTransaction(async (q) => {
     const got = (await q("SELECT pg_try_advisory_xact_lock($1, hashtext('delivery-health')) AS got", [LOCK_NS])).rows[0]?.got;
     if (!got) return { swept: false, stalled: 0, recovered: 0, notices: [] };
@@ -162,8 +266,13 @@ export async function sweepDeliveryHealth(opts: { stallAfterMs?: number; reportF
               -- Claw has answered its posts with a failure for long enough, and still does.
               (h.api_failures > 0 AND h.api_failing_since <= NOW() - make_interval(secs => $1::float8)
                  AND h.api_failed_at > NOW() - make_interval(secs => $3::float8)) AS api_stall,
-              -- Positive evidence that they get through: nothing failing on either side.
-              (h.post_failures = 0 AND h.api_failures = 0) AS clear,
+              -- Positive evidence that they get through: a batch Claw stored after the stall began, and nothing failing on either
+              -- side since. A clean report alone is not: a connector restarted mid-stall reports no failure (its count is of this
+              -- run) while the batch that stalled still waits on its disk. The connector posts its oldest events first, so a batch
+              -- that got through is the one that stalled, or one behind it.
+              (h.post_failures = 0 AND h.api_failures = 0 AND h.api_ok_at > h.stall_since) AS clear,
+              -- A notice handed out and not marked said yet, whose sender may still be saying it.
+              (h.stall_notice_at > NOW() - make_interval(secs => $4::float8)) AS notice_in_flight,
               CASE WHEN h.reported_at > NOW() - make_interval(secs => $2::float8) THEN h.pending END AS pending,
               CASE WHEN h.reported_at > NOW() - make_interval(secs => $2::float8) AND h.oldest_since IS NOT NULL
                    THEN FLOOR(EXTRACT(EPOCH FROM NOW() - h.oldest_since) / 60)::int END AS oldest_minutes,
@@ -173,18 +282,19 @@ export async function sweepDeliveryHealth(opts: { stallAfterMs?: number; reportF
         WHERE h.stall_state = 'stalled' OR h.stall_notice IN ('pending', 'back_pending')
            OR h.post_failures > 0 OR h.api_failures > 0
         ORDER BY h.connector_id`,
-      [stallAfter, fresh, apiFresh],
+      [stallAfter, fresh, apiFresh, retry],
     )).rows as Array<Record<string, any>>;
     const notices: DeliveryNotice[] = [];
     let stalled = 0;
     let recovered = 0;
+    const handOut = (connectorId: string) => q("UPDATE claw_remote_delivery_health SET stall_notice_at = NOW() WHERE connector_id = $1", [connectorId]);
     for (const r of rows) {
       const base = { connectorId: r.connector_id as string, owner: r.owner_user_id as string, name: r.name as string };
       const stall = r.reported_stall === true || r.api_stall === true;
       if (r.revoked_at) {
         // Removed by its owner: nothing to retry, nothing to tell.
         if (r.stall_state !== "ok" || r.stall_notice) {
-          await q("UPDATE claw_remote_delivery_health SET stall_state = 'ok', stall_since = NULL, stall_notice = NULL WHERE connector_id = $1", [r.connector_id]);
+          await q("UPDATE claw_remote_delivery_health SET stall_state = 'ok', stall_since = NULL, stall_notice = NULL, stall_notice_at = NULL WHERE connector_id = $1", [r.connector_id]);
         }
         continue;
       }
@@ -193,8 +303,8 @@ export async function sweepDeliveryHealth(opts: { stallAfterMs?: number; reportF
         const episode = Number(r.stall_episode) + 1;
         const detail = { pending: r.pending ?? null, oldest_minutes: r.oldest_minutes ?? null, sessions: r.sessions ?? null };
         await q(
-          `UPDATE claw_remote_delivery_health SET stall_state = 'stalled', stall_since = NOW(), stall_notice = 'sent', stall_episode = $2,
-                  stall_detail = $3::jsonb WHERE connector_id = $1`,
+          `UPDATE claw_remote_delivery_health SET stall_state = 'stalled', stall_since = NOW(), stall_notice = 'pending', stall_notice_at = NOW(),
+                  stall_episode = $2, stall_detail = $3::jsonb WHERE connector_id = $1`,
           [r.connector_id, episode, JSON.stringify(detail)],
         );
         notices.push({ ...base, kind: "delayed", episode, pending: detail.pending, oldestMinutes: detail.oldest_minutes, sessions: detail.sessions });
@@ -202,26 +312,27 @@ export async function sweepDeliveryHealth(opts: { stallAfterMs?: number; reportF
       }
       if (r.stall_state === "stalled" && !stall && r.clear === true) {
         recovered += 1;
-        // "Get through again" only to someone who was told they did not (`back_sent`; back to `back_pending` if it could not be stored).
-        const told = r.stall_notice === "sent";
+        // "Get through again" only to someone who was told they did not: said, or being said right now.
+        const told = r.stall_notice === "sent" || (r.stall_notice === "pending" && r.notice_in_flight === true);
         await q(
-          "UPDATE claw_remote_delivery_health SET stall_state = 'ok', stall_since = NULL, stall_notice = $2 WHERE connector_id = $1",
-          [r.connector_id, told ? "back_sent" : null],
+          `UPDATE claw_remote_delivery_health SET stall_state = 'ok', stall_since = NULL, stall_notice = $2,
+                  stall_notice_at = CASE WHEN $3 THEN NOW() END WHERE connector_id = $1`,
+          [r.connector_id, told ? "back_pending" : null, told],
         );
         if (told) notices.push({ ...base, kind: "recovered", episode: Number(r.stall_episode), pending: null, oldestMinutes: null, sessions: null });
         continue;
       }
-      if (r.stall_state === "stalled" && r.stall_notice === "pending") {
+      if (r.stall_state === "stalled" && r.stall_notice === "pending" && r.notice_in_flight !== true) {
         const d = (r.stall_detail ?? {}) as Record<string, number | null>;
-        await q("UPDATE claw_remote_delivery_health SET stall_notice = 'sent' WHERE connector_id = $1", [r.connector_id]);
+        await handOut(r.connector_id);
         notices.push({
           ...base, kind: "delayed", episode: Number(r.stall_episode),
           pending: d.pending ?? null, oldestMinutes: d.oldest_minutes ?? null, sessions: d.sessions ?? null,
         });
         continue;
       }
-      if (r.stall_state === "ok" && r.stall_notice === "back_pending") {
-        await q("UPDATE claw_remote_delivery_health SET stall_notice = 'back_sent' WHERE connector_id = $1", [r.connector_id]);
+      if (r.stall_state === "ok" && r.stall_notice === "back_pending" && r.notice_in_flight !== true) {
+        await handOut(r.connector_id);
         notices.push({ ...base, kind: "recovered", episode: Number(r.stall_episode), pending: null, oldestMinutes: null, sessions: null });
       }
     }
@@ -262,26 +373,33 @@ export const deliveryPorts: {
 };
 
 /**
- * One sweep and its notices. A notice that fails to be stored is put back to be tried by the next sweep (its key makes a
- * second attempt say nothing twice), as long as the connector is still in the episode it was about. One owner's failure never
- * holds up the next owner's notice.
+ * One sweep and its notices. A notice is marked said only once the owner's assistant has it; one that failed, or that found no
+ * assistant to say it through, stays pending and is handed out again by a later sweep (`noticeRetryMs`), as long as the
+ * connector is still in the episode it was about. One owner's failure never holds up the next owner's notice.
  */
 export async function runDeliveryHealthSweep(opts: Parameters<typeof sweepDeliveryHealth>[0] = {}): Promise<DeliverySweepResult> {
   const out = await sweepDeliveryHealth(opts);
   for (const n of out.notices) {
+    // Said: marked so. Failed: no longer in flight, tried again by the next sweep. No assistant to say it through: left to
+    // `noticeRetryMs` (one may be set up meanwhile).
+    let mark: "said" | "failed" | null = null;
     try {
       const told = await deliveryPorts.tell(n);
+      mark = told ? "said" : null;
       metrics.onDeliveryStallNotice(n.kind, told ? "told" : "no_assistant");
       logger.info({ owner: n.owner, connectorId: n.connectorId, kind: n.kind, episode: n.episode, told }, "remote_agents.delivery_notice");
     } catch (err) {
+      mark = "failed";
       metrics.onDeliveryStallNotice(n.kind, "failed");
       logger.warn({ err: (err as Error)?.message, connectorId: n.connectorId, kind: n.kind }, "remote_agents.delivery_notice_failed");
-      const [from, to] = n.kind === "delayed" ? ["sent", "pending"] : ["back_sent", "back_pending"];
-      await db.query(
-        "UPDATE claw_remote_delivery_health SET stall_notice = $3 WHERE connector_id = $1 AND stall_episode = $2 AND stall_notice = $4",
-        [n.connectorId, n.episode, to, from],
-      ).catch((e) => logger.warn({ err: (e as Error)?.message, connectorId: n.connectorId }, "remote_agents.delivery_notice_requeue_failed"));
     }
+    if (!mark) continue;
+    const [from, to] = n.kind === "delayed" ? ["pending", "sent"] : ["back_pending", "back_sent"];
+    await db.query(
+      `UPDATE claw_remote_delivery_health SET stall_notice = CASE WHEN $5 THEN $3 ELSE stall_notice END, stall_notice_at = NULL
+        WHERE connector_id = $1 AND stall_episode = $2 AND stall_notice = $4`,
+      [n.connectorId, n.episode, to, from, mark === "said"],
+    ).catch((e) => logger.warn({ err: (e as Error)?.message, connectorId: n.connectorId }, "remote_agents.delivery_notice_mark_failed"));
   }
   if (out.stalled || out.recovered) logger.info({ stalled: out.stalled, recovered: out.recovered }, "remote_agents.delivery_swept");
   return out;
