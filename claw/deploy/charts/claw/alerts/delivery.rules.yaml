@@ -1,0 +1,99 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Delivery stalls: what is on its way to a person and is not getting through.
+# Shipped with the chart as a PrometheusRule (templates/prometheusrule.yaml,
+# `prometheusRule.enabled`), and evaluated by promtool against synthetic stalls
+# in claw/deploy/promql/delivery-alerts.test.yaml -- this file is the one both
+# read, so what is tested is what is deployed.
+#
+# Every API replica reports the same deployment-wide numbers for the gauges read
+# from the database, so each rule takes max() over replicas, never sum(). The
+# thresholds are about ten minutes: the person whose replies are stuck is told
+# in chat after two (remote-agents/delivery-health.ts), the operator after ten.
+groups:
+  - name: claw-delivery
+    rules:
+      # Any queue whose oldest waiting item has waited ten minutes: the remote
+      # events a connector has not got through (its own report), and the
+      # notification outbox (rows tried or due, not held ones).
+      - alert: ClawDeliveryBacklogStale
+        expr: max by (queue) (claw_delivery_backlog_oldest_age_seconds) > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Claw {{ $labels.queue }}: the oldest undelivered item has waited {{ $value | humanizeDuration }}"
+          description: "Items in the {{ $labels.queue }} queue are not being delivered. See the Claw delivery dashboard; for remote_events, claw_remote_connector_backlog_age_seconds names the connectors."
+      - alert: ClawDeliveryBacklogStaleCritical
+        expr: max by (queue) (claw_delivery_backlog_oldest_age_seconds) > 1800
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Claw {{ $labels.queue }}: the oldest undelivered item has waited {{ $value | humanizeDuration }}"
+          description: "Nothing in the {{ $labels.queue }} queue has got through for over half an hour."
+      # One connector whose events have waited ten minutes while its posts fail
+      # (one batch refused on every retry, and every reply behind it waiting).
+      - alert: ClawRemoteConnectorStalled
+        expr: |
+          max by (connector_id) (claw_remote_connector_backlog_age_seconds) > 600
+          and on (connector_id)
+          max by (connector_id) (claw_remote_connector_post_failures) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Connector {{ $labels.connector_id }}: events not delivered for {{ $value | humanizeDuration }}"
+          description: "The connector's event posts keep failing; its owner has been told in chat. Look at claw_remote_delivery_health for the connector and at the API log for remote_agents.events failures."
+      # Claw itself answers one connector's posts with a 5xx, again and again. Seen
+      # even for a connector too old to report its outbox.
+      - alert: ClawRemoteEventsRefused
+        expr: max by (connector_id) (claw_remote_connector_post_failures{side="api"}) >= 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Connector {{ $labels.connector_id }}: Claw has failed {{ $value }} event posts in a row"
+          description: "The API answers this connector's event batches with a server error on every retry. claw_remote_delivery_health.api_last_error says which database error."
+      # A fifth of all event batches failing, across connectors.
+      - alert: ClawRemoteEventsFailureRate
+        expr: |
+          sum(rate(claw_remote_events_post_total{outcome="server_error"}[10m]))
+            / sum(rate(claw_remote_events_post_total[10m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Claw: {{ $value | humanizePercentage }} of connector event batches fail"
+          description: "The remote-agents events route is failing for many connectors at once."
+      # People have been told their replies are delayed, and still are, ten
+      # minutes on.
+      - alert: ClawRemoteDeliveryStalled
+        expr: max(claw_remote_delivery_stalled) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Claw: {{ $value }} connector(s) held as stalled for over ten minutes"
+          description: "The delivery-health sweep holds these connectors' replies as not getting through, and their owners were told."
+      # The durable event consumer retrying one message for ten minutes: what it
+      # carries (a completion, a session's status) never lands.
+      - alert: ClawEventConsumerRedeliveryStuck
+        expr: max(claw_api_event_redelivery_oldest_age_seconds) > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Claw event consumer: one message redelivered for {{ $value | humanizeDuration }}"
+          description: "The api-consumer keeps naking a message. Search the API log for event-consumer errors on the session it names."
+      # A notification receiver failing twenty times in a row: its subscription is
+      # switched off after a day of failures, and everything for it waits.
+      - alert: ClawNotificationSubscriptionFailing
+        expr: max(claw_notification_subscription_failures_max) >= 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Claw: a notification subscription has failed {{ $value }} deliveries in a row"
+          description: "A receiver (the chat bot) is not taking notifications. It is disabled after 24 hours of failures; see claw_notification_subscriptions."

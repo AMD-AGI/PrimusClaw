@@ -54,6 +54,7 @@ import { redactStoredValue } from "@claw/utils";
 import pino from "pino";
 import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
 import { metrics } from "../infra/metrics.js";
+import { trackDelivery } from "./redelivery.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
@@ -188,7 +189,7 @@ export async function startEventConsumer(): Promise<void> {
   logger.info({ subject, consumerName }, "event-consumer.started");
 
   for await (const msg of iter) {
-    await consumeEventDelivery(msg);
+    await consumeEventDelivery(trackDelivery(msg));
   }
 }
 
