@@ -17,7 +17,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.3 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.10.3 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.10.4 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
 The Teams app package (its manifest `version`) is not covered by these rules.
@@ -180,6 +180,26 @@ release version, and its `appVersion` stays `latest`.
 - Claw API: a message whose text or request carries a NUL character or a lone UTF-16 surrogate is now queued with
   U+FFFD in its place. PostgreSQL stores neither (TEXT refuses the NUL byte; `jsonb` refuses the `\u0000` escape and a
   lone surrogate escape), so such a message used to be refused with a server error when the session was busy.
+- Claw: an event a connector posts whose text holds a NUL (terminal output carries them) or half of a surrogate pair is
+  now stored, with each such character replaced by U+FFFD, in keys and values alike. Until now PostgreSQL's `jsonb`
+  refused the whole batch (`unsupported Unicode escape sequence`) and the API answered `500`; the connector posted the same
+  batch again for ever and every later event of that machine, of every session, waited behind it: prompts reached the
+  agents and no answer was ever shown. The same holds for what else a connector or a person sends on this path (an
+  agent's `capabilities` in a heartbeat, a prompt, the audit trail of a permission request) and for what the API stores
+  through `redactStoredValue` and `redactStoredText` (session events, an assistant's inbound messages). An event the
+  database still refuses for its value is now refused alone, as `unstorable` in the answer's `rejected` with its `index`
+  and `seq`, and the rest of its batch is stored; deployed connectors already drop such an event and go on.
+- Connector: one event Claw cannot take no longer holds up the events behind it. A batch Claw answers `500` three times
+  in a row (or a `4xx` that is not about the credential, the route or the rate, once) is posted in halves, always the
+  earliest events first so that no session's event goes before an earlier one of it, down to the event that fails it.
+  That event is posted again with its NULs and unpaired surrogates replaced by U+FFFD; when Claw still refuses it alone,
+  twice in a row, saying it is the event's fault (a `4xx`, or a `500` whose SQLSTATE in `code` is class 22 or 54, as
+  `22P05` was), while it takes an empty post each time, it is set aside: removed from the outbox, written to
+  `quarantine.jsonl` in the state directory and logged once, by session, number and type, never its content. An outage
+  (no answer, `502`, `503`, `504`, `429`, or a `500` to an empty post too) never sets an event aside, and neither does a
+  `500` that names nothing about the event (a deadlock, a lost database connection): a Claw that fails now and then
+  would otherwise narrow the search onto an event that was fine, a turn's end as likely as any, and drop it. Events are also made storable where
+  they are made, so a NUL an agent prints never reaches Claw.
 - Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its
   own run, the person is now told how it ended, once, in their language. Until now a review under the `fully_auto` mode
   that approved and merged closed its item silently: the person got only the generic "Run completed" notice and had to
@@ -270,6 +290,19 @@ release version, and its `appVersion` stays `latest`.
   the chat, and to look at the terminal before sending it again; a connector before 0.1.22, which did not recognise a
   pasted message of several lines, is also told to upgrade. A prompt a connector passes on in Claude Code's
   `<pasted_content>` block is shown as the text that was pasted.
+
+- Claw: a task's result that contains U+0000 (a script printing a C string, a model echoing a binary file) or an unpaired
+  UTF-16 surrogate is stored, with those characters replaced by U+FFFD and everything else kept. Until now Postgres
+  refused the whole `agent_done` write, the API answered 500, and Brain resent the same result on every delivery of the
+  task's message until the poison guard failed the run, many minutes later, as `max_retries_exceeded`. A result the
+  database still refuses for its values (SQLSTATE 22021, 22P05, 22P02 or 22003, for example a count out of range) is
+  now answered 422 with `error: unstorable_result`, and Brain reports the run as failed with `failure_reason: result_unstorable` on the same delivery
+  instead of retrying it; any other 422 is retried as before. If even that report is refused, Brain keeps the result in its checkpoint bucket under
+  `task-quarantine.<task_id>`, logs the task id and status without the content, and settles the message so the tasks
+  behind it keep flowing; the API's sweeper fails the row. New metrics: `claw_api_agent_done_sanitized_total`,
+  `claw_api_agent_done_refused_total{sqlstate}`, `claw_brain_agent_done_failures_total{status}`,
+  `claw_brain_agent_done_consecutive_failures`, `claw_brain_agent_done_oldest_pending_seconds` and
+  `claw_brain_agent_done_quarantined_total{reason}`.
 
 ## [0.5.8] - 2026-11-18
 

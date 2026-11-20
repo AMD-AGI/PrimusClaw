@@ -9,6 +9,7 @@ export {
   type RedactResult, type ScanHit,
 } from "./security/redact-secrets.js";
 export { redactStoredText, redactStoredValue } from "./security/stored-secrets.js";
+export { storableText, storableJson, storableJsonText, UNSTORABLE_REPLACEMENT } from "./security/storable.js";
 export { isSensitiveKey } from "./security/sensitive-keys.js";
 export { coerceToolInput, isPlainObject } from "./tool-input.js";
 export {
