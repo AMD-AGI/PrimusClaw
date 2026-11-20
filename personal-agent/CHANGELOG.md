@@ -42,6 +42,9 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   signing-key fetches may take up to 15 s and 30 s, and a request held past the Bot Framework's wait lost its message as
   a `499`; it is now a `500` at the deadline (Teams retries it, and the keys fetched meanwhile are cached). The queue
   message id stays the activity id, which the worker dedupes on.
+- A card action (`adaptiveCard/action`) the ingress cannot queue is answered `500`, which the Bot Framework retries, like
+  any other activity. Until now it was answered `200` with a "temporarily unavailable" card, which ended the invoke: the
+  click never reached the worker and was not retried. `UNAVAILABLE_CARD` stays exported but the ingress no longer sends it.
 - The ingress reports its send path: one `inbound_enqueue_failed` record (logger `ingress_health`) per send that fails
   after its retries, one `inbound_client_reset` per client thrown away and one `inbound_enqueue_recovered` on the first
   success after failures, each with the instance's running counts (`Ingress.health.counters`). Never the message, the

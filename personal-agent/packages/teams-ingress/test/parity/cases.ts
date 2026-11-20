@@ -69,6 +69,12 @@ export const EXPECTED: Readonly<Record<string, { fields: readonly string[]; why:
     fields: ["body", "built", "logs", "sent"],
     why: `${SEND}; the third attempt gets the action through: the placeholder card where Python had the unavailable one`,
   },
+  "card action, nothing set: unavailable card": {
+    fields: ["body", "json", "status"],
+    why:
+      "a card action that cannot be queued is an empty 500, which the Bot Framework retries, as any other activity is: " +
+      "Python's unavailable card in a 200 ended the invoke, so the click never reached the worker",
+  },
   "feedback, send fails twice: 500": {
     fields: ["built", "logs", "sent", "status"],
     why: `${SEND}; the third attempt gets the feedback through: a 200 where Python gave up`,

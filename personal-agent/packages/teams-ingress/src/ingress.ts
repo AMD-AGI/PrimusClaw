@@ -64,15 +64,7 @@ import {
 } from "./py.js";
 import { dumps, loads, plain, type PyValue } from "./py-json.js";
 import { boundedId, type QueueClient, type QueueMessage, type QueueSender, type ServiceBusFactory } from "./queue.js";
-import {
-  cardResponse,
-  empty,
-  EMPTY_INVOKE_RESULT,
-  jsonReply,
-  PLACEHOLDER_CARD,
-  type Reply,
-  UNAVAILABLE_CARD,
-} from "./replies.js";
+import { cardResponse, empty, EMPTY_INVOKE_RESULT, jsonReply, PLACEHOLDER_CARD, type Reply } from "./replies.js";
 import {
   INBOUND_IDENTITY_PREFIX,
   namespaceHost,
@@ -489,8 +481,9 @@ export class Ingress {
       await this.enqueue(activity, body, correlationId, log, arrived);
     } catch (error) {
       log.error("failed to enqueue activity", error);
-      if (path === "deferred") return cardResponse(UNAVAILABLE_CARD);
-      // Returning 500 lets Teams retry the message; the worker dedupes on activity.id so a retry cannot double-process.
+      // A 500 lets the Bot Framework retry the activity, a card action included: an unavailable card in a 200 would end
+      // the invoke there and the click would never reach the worker. The worker dedupes on activity.id, so a retry
+      // cannot double-process.
       return empty(500);
     }
     return path === "deferred" ? cardResponse(PLACEHOLDER_CARD) : empty(200);

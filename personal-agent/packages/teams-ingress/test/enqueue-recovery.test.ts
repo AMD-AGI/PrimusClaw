@@ -18,7 +18,7 @@ import { ServiceBusError } from "@azure/service-bus";
 import { HEALTH_LOGGER, isConnectionFailure } from "../src/health.js";
 import { type Ingress, SEND_ATTEMPT_SECONDS, SEND_ATTEMPTS, SEND_DEADLINE_SECONDS } from "../src/ingress.js";
 import { type QueueClient, type QueueMessage, type QueueSender, type ServiceBusFactory } from "../src/queue.js";
-import { type Caplog, FULL_ENV, json, load, MESSAGE, nth, post } from "./helpers.js";
+import { type Caplog, FULL_ENV, load, MESSAGE, nth, post } from "./helpers.js";
 
 /** @azure/abort-controller's AbortError, as the SDK throws it from a sender whose link was closed. */
 class AbortError extends Error {
@@ -398,12 +398,17 @@ test("waiting for a start-up prefetch that never finishes is bounded by the dead
   assert.equal(health(log).filter((r) => r["event"] === "inbound_enqueue_failed").length, 1);
 });
 
-test("a card action that cannot be queued gets the unavailable card", async () => {
-  const { ingress } = make([["hang"], ["hang"]], { attempt: 0.05, deadline: 0.4 });
+test("a card action that cannot be queued is a 500 the Bot Framework retries, and the retry is queued once", async () => {
+  const { fleet, ingress } = make([["hang"], ["hang"], ["ok"]], { attempt: 0.05, deadline: 0.4 });
   ingress.sendAttempts = 2;
-  const reply = await post(ingress, { ...MESSAGE, type: "invoke", name: "adaptiveCard/action" });
-  assert.equal(reply.status, 200);
-  assert.match(JSON.stringify(json(reply)), /The agent is temporarily unavailable/);
+  const action = { ...MESSAGE, type: "invoke", name: "adaptiveCard/action" };
+  const reply = await post(ingress, action);
+  assert.equal(reply.status, 500);
+  assert.equal(reply.body.length, 0, "no card in the failure: a 200 would end the invoke and lose the click");
+  assert.deepEqual(fleet.queued, []);
+  const retried = await post(ingress, action);
+  assert.equal(retried.status, 200);
+  assert.equal(fleet.queued.length, 1);
 });
 
 // --- the start-up prefetch and a reset --------------------------------------------------------------------------------
