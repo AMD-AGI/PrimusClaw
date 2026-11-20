@@ -20,7 +20,7 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { REMOTE_AGENT_LIMITS } from "./protocol.js";
+import { REMOTE_AGENT_LIMITS, REMOTE_OUTBOX_REPORT_MAX_SESSIONS } from "./protocol.js";
 import { DiskQueue, writeWhole, type WriteReport } from "./statefile.js";
 
 export interface OutEvent {
@@ -74,6 +74,11 @@ export class Outbox {
   private readonly meta = new Map<string, Meta>();
   private readonly bytes = new Map<string, number>();
   private readonly closed = new Set<string>();
+  /**
+   * When each event was queued in this run (`now()`), for how long the oldest has waited ({@link backlog}). An event loaded from
+   * disk counts from when this run started: its `ts` is when the agent said it, which can be long before it was queued.
+   */
+  private readonly queuedAt = new WeakMap<OutEvent, number>();
   /** Events queued whose line is not written yet: not handed out to be posted until it is. */
   private readonly unwritten = new Set<OutEvent>();
   private readonly disk: DiskQueue;
@@ -149,6 +154,8 @@ export class Outbox {
     }
     loaded.sort((a, b) => (at.get(a) ?? 0) - (at.get(b) ?? 0) || (a.session_id < b.session_id ? -1 : a.session_id > b.session_id ? 1 : a.seq - b.seq));
     this.queue = loaded;
+    const started = this.now();
+    for (const ev of loaded) this.queuedAt.set(ev, started);
     for (const ev of loaded) this.bytes.set(ev.session_id, (this.bytes.get(ev.session_id) ?? 0) + JSON.stringify(ev).length);
   }
 
@@ -165,6 +172,7 @@ export class Outbox {
     this.meta.set(sessionId, meta);
     const line = JSON.stringify(ev);
     this.unwritten.add(ev);
+    this.queuedAt.set(ev, this.now());
     this.persist(ev, line, after);
     this.queue.push(ev);
     this.bytes.set(sessionId, (this.bytes.get(sessionId) ?? 0) + line.length);
@@ -228,6 +236,28 @@ export class Outbox {
     await this.writeMeta(sessionId);
     const mine = this.queue.filter((e) => e.session_id === sessionId && !this.unwritten.has(e));
     await writeWhole(this.eventsFile(sessionId), mine.map((e) => JSON.stringify(e) + "\n").join(""));
+  }
+
+  /**
+   * How long what is queued has waited: the oldest event overall, and per session (the longest waiting first, at most
+   * `maxSessions`). Every event counts, written or not: a reply stuck behind a slow disk is as late as one stuck behind Claw.
+   */
+  backlog(maxSessions: number = REMOTE_OUTBOX_REPORT_MAX_SESSIONS): { pending: number; oldestAgeMs: number; sessions: Array<{ sessionId: string; pending: number; oldestAgeMs: number }> } {
+    const now = this.now();
+    const bySession = new Map<string, { pending: number; oldest: number }>();
+    let oldest = now;
+    for (const ev of this.queue) {
+      const at = this.queuedAt.get(ev) ?? now;
+      oldest = Math.min(oldest, at);
+      const s = bySession.get(ev.session_id) ?? { pending: 0, oldest: at };
+      s.pending++;
+      s.oldest = Math.min(s.oldest, at);
+      bySession.set(ev.session_id, s);
+    }
+    const sessions = [...bySession].map(([sessionId, s]) => ({ sessionId, pending: s.pending, oldestAgeMs: Math.max(0, now - s.oldest) }))
+      .sort((a, b) => b.oldestAgeMs - a.oldestAgeMs || (a.sessionId < b.sessionId ? -1 : 1))
+      .slice(0, maxSessions);
+    return { pending: this.queue.length, oldestAgeMs: Math.max(0, now - oldest), sessions };
   }
 
   /** The oldest events not yet acknowledged, in the order they were appended, up to the first not yet written. */

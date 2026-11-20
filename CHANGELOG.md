@@ -16,8 +16,8 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 | Release | Tag | Current version |
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
-| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.3 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.10.3 |
+| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.0 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.10.4 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
 The Teams app package (its manifest `version`) is not covered by these rules.
@@ -133,6 +133,22 @@ release version, and its `appVersion` stays `latest`.
   machine's own command as its `upgrade_command`. Connectors before this one cannot upgrade themselves: upgrade them once
   by hand. See "Upgrades" in `connector/README.md`.
 
+- Claw: stall detection for the queues that carry replies to a person. The connector reports its event outbox with
+  every heartbeat (`outbox`: events waiting, the oldest's age, failed posts in a row and since when, the last error, and
+  up to 20 sessions with events waiting); the API counts, per connector, the event batches it answers with a 5xx. When a
+  connector's posts have failed for 2 minutes, its owner is told once in chat that the replies from the sessions on that
+  machine are delayed and being retried, and once more when they get through again. New metrics:
+  `claw_delivery_backlog_oldest_age_seconds` and `claw_delivery_backlog_size` (by `queue`: `remote_events`,
+  `notification_outbox`), `claw_remote_connector_backlog_age_seconds` and `claw_remote_connector_post_failures` (by
+  `connector_id`, only for connectors behind or failing now), `claw_remote_delivery_stalled`,
+  `claw_remote_events_post_total`, `claw_api_event_redelivered_total`, `claw_api_event_redelivery_oldest_age_seconds`,
+  `claw_notification_subscriptions_failing`, `claw_notification_subscription_failures_max` and
+  `claw_delivery_stall_notices_total`. The chart ships alert rules for them as a PrometheusRule
+  (`prometheusRule.enabled`, off by default; thresholds around ten minutes) and a "Claw — Delivery" Grafana dashboard
+  (with `grafanaDashboard.enabled`). The rules are evaluated by promtool against synthetic stalls in CI. A connector
+  from before this reports nothing and is judged on the API's count alone. See "Replies that do not get through" in
+  `claw/docs/remote-agents.md`.
+
 - Claw: `POST /v1/sessions` accepts an optional `placement.nodeLabels`, a map of node label key to value that every
   sandbox of the session requires. It is sent to SaFE as the workload's `customerLabels` (a required node affinity), kept
   with the session, and applied to every sandbox the session creates, a rebuilt or reclaimed one, a queued message's
@@ -179,6 +195,15 @@ release version, and its `appVersion` stays `latest`.
   set aside as `unsent:<status>` (a gap of more than 50 seconds between such passes, as when no worker ran, starts the
   hour again), and one written before the upgrade is sent at least once more before it can be set aside. See "Push
   notifications" in `claw/docs/a2a.md`.
+- Claw: in the SaFE deployment mode with `LLM_KEY_SOURCE=platformKey`, a caller signed in with an `ak-` key (in
+  `Authorization: Bearer`, `x-api-key` or a download URL) or a default session cookie has their email again:
+  `GET /v1/me` answers it and the request's user carries it, as in 0.5.8. Since 0.5.9 the API no longer asked SaFE's
+  verification for the virtual key in that mode, and that request is what makes SaFE fill in the account's email from
+  the user record, so every such caller came back with no email and no virtual key (an SSO session cookie kept its
+  email, not the virtual key). Both keys are asked for in every mode again. A new contract test drives every credential
+  SaFE verifies through the auth middleware and `GET /v1/me` against a fake SaFE that answers the way SaFE's apiserver
+  does, and compares the verify request, the request's user and the `/v1/me` document, field for field, with values
+  recorded from the 0.5.8 code.
 - Claw: an event a connector posts whose text holds a NUL (terminal output carries them) or half of a surrogate pair is
   now stored, with each such character replaced by U+FFFD, in keys and values alike. Until now PostgreSQL's `jsonb`
   refused the whole batch (`unsupported Unicode escape sequence`) and the API answered `500`; the connector posted the same
@@ -290,6 +315,19 @@ release version, and its `appVersion` stays `latest`.
   the chat, and to look at the terminal before sending it again; a connector before 0.1.22, which did not recognise a
   pasted message of several lines, is also told to upgrade. A prompt a connector passes on in Claude Code's
   `<pasted_content>` block is shown as the text that was pasted.
+
+- Claw: a task's result that contains U+0000 (a script printing a C string, a model echoing a binary file) or an unpaired
+  UTF-16 surrogate is stored, with those characters replaced by U+FFFD and everything else kept. Until now Postgres
+  refused the whole `agent_done` write, the API answered 500, and Brain resent the same result on every delivery of the
+  task's message until the poison guard failed the run, many minutes later, as `max_retries_exceeded`. A result the
+  database still refuses for its values (SQLSTATE 22021, 22P05, 22P02 or 22003, for example a count out of range) is
+  now answered 422 with `error: unstorable_result`, and Brain reports the run as failed with `failure_reason: result_unstorable` on the same delivery
+  instead of retrying it; any other 422 is retried as before. If even that report is refused, Brain keeps the result in its checkpoint bucket under
+  `task-quarantine.<task_id>`, logs the task id and status without the content, and settles the message so the tasks
+  behind it keep flowing; the API's sweeper fails the row. New metrics: `claw_api_agent_done_sanitized_total`,
+  `claw_api_agent_done_refused_total{sqlstate}`, `claw_brain_agent_done_failures_total{status}`,
+  `claw_brain_agent_done_consecutive_failures`, `claw_brain_agent_done_oldest_pending_seconds` and
+  `claw_brain_agent_done_quarantined_total{reason}`.
 
 ## [0.5.8] - 2026-11-18
 

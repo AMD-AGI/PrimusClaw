@@ -1,0 +1,571 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus",
+      "description": "The Prometheus-compatible store that scrapes the Claw API /metrics endpoint."
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    },
+    {
+      "type": "panel",
+      "id": "timeseries",
+      "name": "Time series",
+      "version": ""
+    }
+  ],
+  "uid": null,
+  "title": "Claw — Delivery",
+  "description": "Whether what is on its way to a person gets through: every queue's oldest waiting item, the connectors whose events are behind or failing, the event consumer's redeliveries and the notification receivers. The alert rules in alerts/delivery.rules.yaml read the same series.",
+  "tags": [
+    "claw",
+    "api",
+    "delivery"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Every queue",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Oldest undelivered item, by queue",
+      "description": "How long the oldest item still waiting to be delivered has waited (claw_delivery_backlog_oldest_age_seconds), max over API replicas: they all read the same database. remote_events is what connectors report they have not got through; notification_outbox is rows tried or due and not delivered (held rows are not counted). Normal is near zero. The red line is the ten minutes at which ClawDeliveryBacklogStale fires.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "A",
+          "expr": "max by (queue) (claw_delivery_backlog_oldest_age_seconds)",
+          "legendFormat": "{{queue}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Items waiting, by queue",
+      "description": "How many items wait to be delivered (claw_delivery_backlog_size). A count that rises while the age above rises too is a stall; a count that rises and falls with a flat age is traffic.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "A",
+          "expr": "max by (queue) (claw_delivery_backlog_size)",
+          "legendFormat": "{{queue}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "row",
+      "title": "Connectors (remote agents)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "panels": []
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Connectors behind",
+      "description": "For each connector behind or failing now, how long its oldest unacknowledged event has waited (claw_remote_connector_backlog_age_seconds, from its heartbeat report). Healthy connectors export no series, so an empty panel is the good state. ClawRemoteConnectorStalled fires at ten minutes while its posts fail.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "A",
+          "expr": "max by (connector_id) (claw_remote_connector_backlog_age_seconds)",
+          "legendFormat": "{{connector_id}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Failed event posts in a row",
+      "description": "Consecutive failed event posts per connector: side=connector as the connector reports them (includes network and proxy failures Claw never sees), side=api as Claw answered them with a 5xx. One batch refused on every retry climbs on both sides.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "A",
+          "expr": "max by (connector_id, side) (claw_remote_connector_post_failures)",
+          "legendFormat": "{{connector_id}} {{side}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Event batches posted, by outcome",
+      "description": "Batches connectors posted to the events route per second, by how the API answered (claw_remote_events_post_total): ok, client_error (malformed, not retried), server_error (retried by the connector).",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(claw_remote_events_post_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Stalled connectors, and what their owners were told",
+      "description": "Connectors the delivery-health sweep holds as stalled (claw_remote_delivery_stalled), and the chat notices sent per hour (claw_delivery_stall_notices_total): delayed after two minutes of failing posts, recovered once they get through. outcome=failed is retried by the next sweep.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "A",
+          "expr": "max(claw_remote_delivery_stalled)",
+          "legendFormat": "stalled"
+        },
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "B",
+          "expr": "sum by (kind, outcome) (increase(claw_delivery_stall_notices_total[1h]))",
+          "legendFormat": "notices {{kind}} {{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Event consumer and notifications",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Event consumer redeliveries",
+      "description": "The durable event consumer (api-consumer): how long the message it has retried longest has been naked (claw_api_event_redelivery_oldest_age_seconds), and redeliveries per second. A rising age is one message the consumer cannot get past; ClawEventConsumerRedeliveryStuck fires at ten minutes.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "A",
+          "expr": "max(claw_api_event_redelivery_oldest_age_seconds)",
+          "legendFormat": "oldest retried (s)"
+        },
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "B",
+          "expr": "sum(rate(claw_api_event_redelivered_total[5m]))",
+          "legendFormat": "redeliveries/s"
+        },
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "C",
+          "expr": "sum by (outcome) (rate(claw_api_event_persisted_total[5m]))",
+          "legendFormat": "persisted {{outcome}}/s"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Notification subscriptions failing",
+      "description": "Enabled notification subscriptions whose receiver fails now, and the most consecutive failures of any (claw_notification_subscription_failures_max). A subscription is switched off after 24 hours of failures; ClawNotificationSubscriptionFailing fires at twenty in a row.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "A",
+          "expr": "max(claw_notification_subscriptions_failing)",
+          "legendFormat": "failing subscriptions"
+        },
+        {
+          "datasource": "${DS_PROMETHEUS}",
+          "refId": "B",
+          "expr": "max(claw_notification_subscription_failures_max)",
+          "legendFormat": "most failures in a row"
+        }
+      ]
+    }
+  ]
+}
