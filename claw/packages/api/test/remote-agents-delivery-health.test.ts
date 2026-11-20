@@ -28,6 +28,9 @@
  *       "recovered" until a batch gets through
  *   D11 a notice is marked said only once said: a replica that died between the sweep and the saying, or an owner with no
  *       assistant to say it through, is told by a later sweep, once
+ *   D14 a stall that ends while its "delayed" is still being said is not told it recovered unless that was said: not when the
+ *       replica died before saying it, nor when there was no assistant to say it through (one set up meanwhile); yes when it
+ *       was said and the replica died before marking it
  */
 import assert from "node:assert/strict";
 import test, { after, before, beforeEach, describe } from "node:test";
@@ -495,6 +498,66 @@ describe("remote delivery health", { skip }, () => {
     await w.q("UPDATE claw_remote_delivery_health SET api_failures = 2, api_failing_since = NOW() - interval '30 seconds', api_failed_at = NOW() WHERE connector_id = $1", [cid]);
     assert.deepEqual((await sweep()).notices, []);
     assert.equal((await row(cid)).stall_state, "stalled");
+  });
+
+  test("D14 a stall that ends while its notice is being said is told it recovered only if the delay was said", async () => {
+    const recovered = "Replies from the sessions on your dev environment build-host are getting through again; the delayed ones are being delivered now.";
+    // Posts dropped on the way for two and a half minutes (only the report says so), then the backlog drains: the D12 shape.
+    const stallThenDrain = async (cid: string) => {
+      await heartbeat("bob", cid, report({ pending: 2, oldestMs: 150_000, failures: 4, failingMs: 150_000, lastError: "network" }));
+      const handed = await health.sweepDeliveryHealth();
+      assert.deepEqual(handed.notices.map((n) => n.kind), ["delayed"]);
+      return handed.notices[0];
+    };
+    const expire = (cid: string) => w.q("UPDATE claw_remote_delivery_health SET stall_notice_at = NOW() - interval '2 minutes' WHERE connector_id = $1", [cid]);
+
+    // 1. The replica that swept died after its commit, before saying it. The backlog drains within the retry interval.
+    const c1 = await connector("bob", "build-host");
+    await stallThenDrain(c1);
+    await heartbeat("bob", c1, report());
+    assert.deepEqual((await sweep()).notices, [], "not 'recovered' while the 'delayed' may still be being said");
+    assert.equal((await row(c1)).stall_state, "stalled");
+    assert.deepEqual(await says("bob"), []);
+    await expire(c1);
+    await heartbeat("bob", c1, report());
+    assert.deepEqual((await sweep()).notices, [], "never told it was delayed: not told it recovered");
+    const r1 = await row(c1);
+    assert.deepEqual([r1.stall_state, r1.stall_notice, r1.stall_notice_at], ["ok", null, null]);
+    assert.deepEqual(await says("bob"), []);
+    assert.deepEqual(await outboxTexts("bob"), [], "nothing reached bob's chat channel");
+    assert.equal((await health.sampleDeliveryHealth()).stalled, 0);
+    await sweep();
+    assert.deepEqual(await says("bob"), []);
+
+    // 2. No assistant to say it through when it stalled; one is set up within the retry interval, as the backlog drains.
+    const c2 = await connector("bob", "build-host");
+    const assistant = (await w.q("SELECT row_to_json(a) AS r FROM claw_assistants a WHERE user_id = 'bob'"))[0].r;
+    await w.q("DELETE FROM claw_assistants WHERE user_id = 'bob'");
+    await heartbeat("bob", c2, report({ pending: 2, oldestMs: 150_000, failures: 4, failingMs: 150_000, lastError: "network" }));
+    assert.deepEqual((await sweep()).notices.map((n) => n.kind), ["delayed"]);
+    assert.equal((await row(c2)).stall_notice, "pending", "nobody to say it through");
+    await w.q("INSERT INTO claw_assistants SELECT * FROM json_populate_record(NULL::claw_assistants, $1::json)", [JSON.stringify(assistant)]);
+    await heartbeat("bob", c2, report());
+    assert.deepEqual((await sweep()).notices, []);
+    await expire(c2);
+    await heartbeat("bob", c2, report());
+    assert.deepEqual((await sweep()).notices, []);
+    assert.equal((await row(c2)).stall_state, "ok");
+    assert.deepEqual(await says("bob"), []);
+
+    // 3. Said, and the replica died before marking it: the stall ends once the interval runs out, and he is told it recovered.
+    const c3 = await connector("bob", "build-host");
+    const notice = await stallThenDrain(c3);
+    assert.equal(await realTell(notice), true);
+    assert.equal((await row(c3)).stall_notice, "pending", "not marked");
+    await heartbeat("bob", c3, report());
+    assert.deepEqual((await sweep()).notices, []);
+    await expire(c3);
+    await heartbeat("bob", c3, report());
+    assert.deepEqual((await sweep()).notices.map((n) => n.kind), ["recovered"]);
+    assert.deepEqual((await says("bob")).slice(1), [recovered]);
+    assert.equal((await says("bob")).length, 2);
+    assert.equal((await row(c3)).stall_notice, "back_sent");
   });
 
   test("D11 a notice is marked said only once it is said, and is said once", async () => {

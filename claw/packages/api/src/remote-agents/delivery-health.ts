@@ -22,7 +22,8 @@
  * its posts with a 5xx for that long and did so recently. On the step to stalled the owner is told once, through their
  * assistant, that the replies are delayed and being retried; when the posts succeed again (positive evidence: a batch Claw stored
  * after the stall began, or a fresh report made after it began with nothing waiting; and no failure reported and no failing
- * answer of Claw's) they are told once that they get through. A notice is marked said only after it was said, and handed out
+ * answer of Claw's) they are told once that they get through -- only if they were told it was delayed: a stall that ends while
+ * its "delayed" is still being said waits for that to settle. A notice is marked said only after it was said, and handed out
  * again until it is. A connector that went quiet meanwhile
  * (offline: its report is stale) stays stalled and is told nothing more here -- presence (`presence.ts`) says it went offline.
  *
@@ -318,9 +319,14 @@ export async function sweepDeliveryHealth(opts: { stallAfterMs?: number; reportF
         continue;
       }
       if (r.stall_state === "stalled" && !stall && r.clear === true) {
+        // "Get through again" only to someone who was told they did not. A "delayed" handed out and not settled yet may or may
+        // not be said (its sender may have died, or found no assistant): the stall ends once its sender has marked it, or its
+        // time has run out, never on the guess that it was said.
+        if (r.stall_notice === "pending" && r.notice_in_flight === true) continue;
         recovered += 1;
-        // "Get through again" only to someone who was told they did not: said, or being said right now.
-        const told = r.stall_notice === "sent" || (r.stall_notice === "pending" && r.notice_in_flight === true);
+        // Said: marked so, or stored though never marked (its sender died between the saying and the marking).
+        const told = r.stall_notice === "sent"
+          || (r.stall_notice === "pending" && await delayedNoticeStored(q, base.owner, base.connectorId, Number(r.stall_episode)));
         await q(
           `UPDATE claw_remote_delivery_health SET stall_state = 'ok', stall_since = NULL, stall_notice = $2,
                   stall_notice_at = CASE WHEN $3 THEN NOW() END WHERE connector_id = $1`,
@@ -345,6 +351,17 @@ export async function sweepDeliveryHealth(opts: { stallAfterMs?: number; reportF
     }
     return { swept: true, stalled, recovered, notices };
   });
+}
+
+/**
+ * Whether an episode's "delayed" notice was stored for its owner, read by its deterministic say id ({@link deliveryNoticeKey}, as
+ * `recordSystemNotice` stores it): what the owner was told, whatever the notice's mark says. False without the assistant's table.
+ */
+async function delayedNoticeStored(q: Querier, owner: string, connectorId: string, episode: number): Promise<boolean> {
+  if (!(await q("SELECT to_regclass('claw_assistant_says') IS NOT NULL AS ok")).rows[0]?.ok) return false;
+  const { deterministicEventId } = await import("../notifications/outbox.js");
+  const sayId = deterministicEventId("assistant.notice", owner, deliveryNoticeKey({ kind: "delayed", connectorId, episode }));
+  return (await q("SELECT 1 FROM claw_assistant_says WHERE say_id = $1 AND user_id = $2", [sayId, owner])).rows.length > 0;
 }
 
 /** The language the owner last wrote to their assistant in, Chinese or (failing that) English. */
