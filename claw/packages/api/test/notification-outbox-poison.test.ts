@@ -20,6 +20,8 @@
  *   P9 a receiver behind a load balancer with one bad backend -- still on the old secret (401 bad_signature) or with its clock
  *      off (401 stale_timestamp) -- never quarantines a good row that keeps landing on it while the rest succeed; it is
  *      delivered once the backend is fixed
+ *   P10 refusals broken by any other failure (a 503, a 401) start over: a good row refused a few times during one rollout,
+ *      then failing otherwise for over an hour, is not quarantined by one refusal during a later rollout; it is delivered
  *
  * Skipped without DATABASE_URL, and a skip is not a pass.
  */
@@ -325,6 +327,59 @@ describe("notification outbox: poison rows", { skip }, () => {
     assert.equal(received.filter((r) => r.eventId === bad).length, 3);
     assert.equal((await subRow(sub)).consecutive_failures, 0);
     assert.equal(await sample("claw_notification_quarantined_total"), before);
+  });
+
+  for (const between of [503, 401]) test(`P10 a ${between} between refusals starts the count and the hour again: a good row refused during two rollouts is not quarantined`, async () => {
+    // Rollout 1: an old backend whose ClawEvent schema does not know this event's type or field answers 400 bad_event to it, the
+    // rest flowing. Then the receiver fails it otherwise (a ${between}) for over an hour. Rollout 2: one more 400. Before, the four
+    // isolated refusals and a first refusal over an hour ago were still on the row, and that one 400 quarantined a good event.
+    const sub = await subscribe();
+    const ev = eventIdOf("t-new-field", "completed");
+    let mode: "refuse" | "other" | "take" = "refuse";
+    answer = (eventId) => (eventId !== ev ? 200 : mode === "refuse" ? 400 : mode === "other" ? between : 200);
+    await finishRun("t-new-field", "completed");
+    const before = await sample("claw_notification_quarantined_total", 'reason="isolated_failures"');
+    const row = async () => (await q("SELECT * FROM claw_notification_outbox WHERE event_id = $1", [ev]))[0];
+    let n = 0;
+    /** Another of the person's runs ends and is delivered, then the row is tried again: its failure is the row's own. */
+    const round = async () => {
+      await finishRun(`t-other-${n++}`, "completed");
+      await makeDue();
+      await deliver();
+    };
+    // Rollout 1: the first refusal, then QUARANTINE_AFTER_ISOLATED_FAILURES - 1 isolated ones -- one short of quarantine.
+    for (let i = 0; i < outbox.QUARANTINE_AFTER_ISOLATED_FAILURES; i++) await round();
+    let r = await row();
+    assert.equal(r.isolated_failures, outbox.QUARANTINE_AFTER_ISOLATED_FAILURES - 1);
+    assert.ok(r.refused_since);
+    // Then a failure that is not a refusal, more than once, while the rest flows.
+    mode = "other";
+    for (let i = 0; i < 3; i++) await round();
+    r = await row();
+    assert.equal(r.last_status, `http_${between}`);
+    assert.equal(r.isolated_failures, 0, "the run of refusals ended");
+    assert.equal(r.refused_since, null);
+    // Over an hour later (as the row's own clock records it), rollout 2: one more refusal, isolated.
+    await q(
+      `UPDATE claw_notification_outbox SET created_at = created_at - make_interval(mins => $1::int + 1),
+              refused_since = refused_since - make_interval(mins => $1::int + 1) WHERE event_id = $2`,
+      [outbox.QUARANTINE_AFTER_REFUSING_MINUTES, ev],
+    );
+    mode = "refuse";
+    await round();
+    r = await row();
+    assert.equal(r.last_status, "http_400");
+    assert.equal(r.quarantined_at, null, "one refusal after the run was broken does not quarantine");
+    assert.equal(r.dropped_at, null);
+    assert.equal(r.isolated_failures, 1);
+    // The new backend is everywhere: it takes the event.
+    mode = "take";
+    await round();
+    r = await row();
+    assert.ok(r.delivered_at, "delivered");
+    assert.equal(await sample("claw_notification_quarantined_total", 'reason="isolated_failures"') - before, 0);
+    assert.equal(received.filter((x) => x.status === 200 && x.eventId !== ev).length, n, "the rest flowed, each once");
+    assert.equal((await subRow(sub)).enabled, true);
   });
 
   test("P6 the gauges read the table: a stalled row's age and the rows pending; 0 once it clears", async () => {

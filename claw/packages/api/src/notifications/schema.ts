@@ -77,7 +77,8 @@ export async function ensureNotificationSchema(client: pg.PoolClient): Promise<v
   await client.query("ALTER TABLE claw_notification_outbox ADD COLUMN IF NOT EXISTS last_failed_at TIMESTAMPTZ");
   await client.query("ALTER TABLE claw_notification_outbox ADD COLUMN IF NOT EXISTS isolated_failures INT NOT NULL DEFAULT 0");
   await client.query("ALTER TABLE claw_notification_outbox ADD COLUMN IF NOT EXISTS quarantined_at TIMESTAMPTZ");
-  // The row's first refusal (outbox.ts, `refusedForGood`): a row is quarantined only after it has been refused for a while.
+  // The first refusal of the row's current run of refusals (outbox.ts, `refusedForGood`): a row is quarantined only after it has
+  // been refused for a while, with no other kind of failure in between.
   await client.query("ALTER TABLE claw_notification_outbox ADD COLUMN IF NOT EXISTS refused_since TIMESTAMPTZ");
   // When the receiver last took one of the subscription's rows: what makes a row's failure its own (outbox.ts, `recordFailure`).
   await client.query("ALTER TABLE claw_notification_subscriptions ADD COLUMN IF NOT EXISTS last_delivered_at TIMESTAMPTZ");

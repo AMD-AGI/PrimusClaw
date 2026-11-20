@@ -212,7 +212,8 @@ release version, and its `appVersion` stays `latest`.
   (`storableJson` and `storableText` in `@claw/utils`).
 - Claw notifications: one notification the receiver refuses for good no longer retries for a day. A row the receiver
   refuses at least five times for its body (`400`, `413`, `415` or `422`), each time after it has taken another of the
-  subscription's notifications, and for at least an hour since its first refusal, is quarantined: it is no longer sent,
+  subscription's notifications, and for at least an hour since its first refusal, with no other failure in between (a
+  5xx, a `401` or a timeout starts the count and the hour again), is quarantined: it is no longer sent,
   it is kept in `claw_notification_outbox` with `quarantined_at` set as the record of what was not delivered, and the
   `notification.quarantined` log line names the event, the receiver's answer and the reason, never what the
   notification says. No single answer quarantines a row, a `422` included, and no other 4xx counts: a `401`

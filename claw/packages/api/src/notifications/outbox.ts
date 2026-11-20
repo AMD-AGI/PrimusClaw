@@ -72,7 +72,7 @@ export const SUBSCRIPTION_DISABLE_AFTER_HOURS = GIVE_UP_AFTER_HOURS;
  */
 export const QUARANTINE_AFTER_ISOLATED_FAILURES = 5;
 /**
- * And how long the receiver must have been refusing the row (from its first refusal) before it is quarantined. Five isolated
+ * And how long the receiver must have been refusing the row (from the first refusal of an unbroken run of them) before it is quarantined. Five isolated
  * refusals take about ten minutes of the backoff above, and that is as long as a rolling deploy of the receiver can last: a
  * backend that is still the old version may refuse an event the new one takes, and a row that kept landing on it would be set
  * aside for a refusal that was the deploy's, not the event's. An hour of refusals across the receiver's own successes is not a
@@ -472,7 +472,10 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
     // A refusal is the row's own when the receiver delivered another of the subscription's rows since this row last failed: the
     // receiver works, and it is this event it refuses. The first failure is never counted (there is no "since" yet), and a
     // failure that is not a refusal (`refusedForGood`) never is: the receiver may take the row on a later try. `refused_since` is
-    // the row's first refusal, what `QUARANTINE_AFTER_REFUSING_MINUTES` is measured from.
+    // the first refusal of the row's current run of refusals, what `QUARANTINE_AFTER_REFUSING_MINUTES` is measured from.
+    // Only an unbroken run counts: any other failure (a 5xx, a 401, a timeout) ends it, and both counters start again. A good
+    // event refused a few times during one rollout of the receiver (an old backend's schema refusing a new type or field), then
+    // failing otherwise for an hour, must not be quarantined by one refusal during the next rollout.
     const updated = (await db.query(
       `UPDATE claw_notification_outbox o
           SET next_attempt_at = NOW() + make_interval(secs => CASE
@@ -482,12 +485,12 @@ async function recordFailure(row: Claimed, status: string): Promise<void> {
                      AND p.delivered_at IS NULL AND p.dropped_at IS NULL AND p.attempts > 0)
                 THEN LEAST($2::int, $5::int) ELSE $2::int END),
               last_status = $3,
-              isolated_failures = o.isolated_failures + CASE
-                WHEN $6::boolean AND o.last_failed_at IS NOT NULL AND (
+              isolated_failures = CASE WHEN NOT $6::boolean THEN 0 ELSE o.isolated_failures + CASE
+                WHEN o.last_failed_at IS NOT NULL AND (
                   SELECT s.last_delivered_at FROM claw_notification_subscriptions s WHERE s.subscription_id = o.subscription_id
-                ) > o.last_failed_at THEN 1 ELSE 0 END,
+                ) > o.last_failed_at THEN 1 ELSE 0 END END,
               last_failed_at = NOW(),
-              refused_since = CASE WHEN $6::boolean THEN COALESCE(o.refused_since, NOW()) ELSE o.refused_since END
+              refused_since = CASE WHEN $6::boolean THEN COALESCE(o.refused_since, NOW()) ELSE NULL END
         WHERE o.id = $1
         RETURNING o.isolated_failures,
                   (o.refused_since IS NOT NULL AND o.refused_since <= NOW() - make_interval(mins => $7::int)) AS refused_long`,
