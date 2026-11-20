@@ -18,6 +18,9 @@
 //   R3 a 500 is still retried three times and ends as a delivery error
 //   R4 the health metrics: failures by status, consecutive failures reset by a
 //      success, and the oldest pending result's age
+//   R5 a 422 that is not the API's `unstorable_result` (a request validator or
+//      an ingress in front of the route) is an ordinary failed attempt: the
+//      result is resent as it was, never replaced by `result_unstorable`
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -49,8 +52,11 @@ function result(over: Partial<ExecuteResult> = {}): ExecuteResult {
   } as ExecuteResult;
 }
 
+/** What the API's `agent_done` route answers when the database refused the values. */
+const UNSTORABLE_422 = { ok: false, error: "unstorable_result", sqlstate: "22003" };
+
 /** A callback endpoint answering each request with the next status in `statuses`. */
-async function api(statuses: number[]) {
+async function api(statuses: number[], body422: unknown = UNSTORABLE_422) {
   const bodies: Array<Record<string, unknown>> = [];
   const server = createServer((req, res) => {
     let raw = "";
@@ -58,9 +64,9 @@ async function api(statuses: number[]) {
     req.on("end", () => {
       bodies.push(JSON.parse(raw));
       const status = statuses[Math.min(bodies.length - 1, statuses.length - 1)]!;
-      res.writeHead(status, { "Content-Type": "application/json" });
+      res.writeHead(status, { "Content-Type": status === 422 && typeof body422 === "string" ? "text/html" : "application/json" });
       res.end(status === 422
-        ? JSON.stringify({ ok: false, error: "unstorable_result", sqlstate: "22003" })
+        ? (typeof body422 === "string" ? body422 : JSON.stringify(body422))
         : JSON.stringify({ ok: status < 300 }));
     });
   });
@@ -155,3 +161,44 @@ test("R4 failures by status, consecutive failures, and the oldest pending result
     await failing.close();
   }
 });
+
+// Other 422 bodies a request can meet before the route answers: Fastify's
+// validation error shape, a JSON body with a SQLSTATE but some other error
+// code, and an ingress's HTML page.
+const OTHER_422_BODIES: Array<[string, unknown]> = [
+  ["a request validator", {
+    statusCode: 422, code: "FST_ERR_VALIDATION", error: "Unprocessable Entity",
+    message: "body/run_time must be object",
+  }],
+  ["another error code", { ok: false, error: "idempotency_key_reused", sqlstate: "22003" }],
+  ["an ingress page", "<html><body><h1>422 Unprocessable Entity</h1></body></html>"],
+];
+
+for (const [name, body422] of OTHER_422_BODIES) {
+  test(`R5 a 422 from ${name} resends the result as it was`, async () => {
+    const endpoint = await api([422, 200], body422);
+    try {
+      await postAgentDone(endpoint.request(`t-r5-${name.replace(/\W+/g, "-")}`), result({ turns: 1 }));
+      assert.equal(endpoint.bodies.length, 2);
+      const [first, second] = endpoint.bodies;
+      assert.deepEqual(second, first, "the retry is the same result, not a replacement");
+      assert.equal(second!.final_text, SECRET_OUTPUT);
+      assert.notEqual(second!.failure_reason, RESULT_UNSTORABLE_REASON, "a good run is not reported failed");
+    } finally {
+      await endpoint.close();
+    }
+  });
+
+  test(`R5 a 422 from ${name} every time ends as a delivery error after three attempts`, async () => {
+    const endpoint = await api([422], body422);
+    try {
+      const err = await postAgentDone(endpoint.request(`t-r5b-${name.replace(/\W+/g, "-")}`), result({ turns: 1 }))
+        .then(() => null, (e: unknown) => e);
+      assert.ok(err instanceof AgentDoneDeliveryError, `expected a delivery error (naked, resent), got ${String(err)}`);
+      assert.equal(endpoint.bodies.length, 3);
+      for (const b of endpoint.bodies) assert.equal(b.final_text, SECRET_OUTPUT);
+    } finally {
+      await endpoint.close();
+    }
+  });
+}

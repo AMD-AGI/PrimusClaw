@@ -599,14 +599,29 @@ function refusedResultBody(body: AgentDoneBody, sqlstate: string | null): AgentD
   };
 }
 
-/** The SQLSTATE a 422 names, when it names one in the shape a SQLSTATE has. */
-async function refusalSqlState(resp: Response): Promise<string | null> {
+/** The error code the API's `agent_done` route answers when the database refused the values. */
+export const UNSTORABLE_RESULT_ERROR = "unstorable_result";
+
+/**
+ * Whether a 422 is the API's refusal of the values, and the SQLSTATE it names.
+ *
+ * Only a body carrying `error: "unstorable_result"` is that refusal. Any other
+ * 422 (a proxy, an ingress or a request validator in front of the route) says
+ * nothing about whether the database can store the result, so it is handled
+ * like any other failed attempt rather than turning a good run into a failure.
+ * The SQLSTATE is kept only when it has the shape a SQLSTATE has.
+ */
+async function storeRefusal(resp: Response): Promise<{ sqlstate: string | null } | null> {
+  let parsed: unknown;
   try {
-    const parsed = await resp.json() as { sqlstate?: unknown };
-    return typeof parsed.sqlstate === "string" && /^[0-9A-Z]{5}$/.test(parsed.sqlstate) ? parsed.sqlstate : null;
+    parsed = await resp.json();
   } catch {
     return null;
   }
+  if (!parsed || typeof parsed !== "object") return null;
+  const { error, sqlstate } = parsed as { error?: unknown; sqlstate?: unknown };
+  if (error !== UNSTORABLE_RESULT_ERROR) return null;
+  return { sqlstate: typeof sqlstate === "string" && /^[0-9A-Z]{5}$/.test(sqlstate) ? sqlstate : null };
 }
 
 /** The platform half of the body, present only when there is something to say. */
@@ -682,12 +697,14 @@ export async function postAgentDone(
         return;
       }
       metrics.onAgentDoneFailedAttempt(String(resp.status));
-      // 422 is the API saying the database refused this body's values: a
-      // resend is the same refusal. Replace the result with a failure that
-      // carries none of it, once; if that is refused too, stop here rather than
-      // spend the delivery budget re-running the run to send it again.
-      if (resp.status === 422) {
-        const sqlstate = await refusalSqlState(resp);
+      // A 422 carrying `unstorable_result` is the API saying the database
+      // refused this body's values: a resend is the same refusal. Replace the
+      // result with a failure that carries none of it, once; if that is
+      // refused too, stop here rather than spend the delivery budget re-running
+      // the run to send it again. Any other 422 is an ordinary failed attempt.
+      const refusal = resp.status === 422 ? await storeRefusal(resp) : null;
+      if (refusal) {
+        const { sqlstate } = refusal;
         if (refused) {
           metrics.onAgentDoneSettled(request.task_id);
           throw new AgentDoneRejectedError(resp.status, sqlstate);

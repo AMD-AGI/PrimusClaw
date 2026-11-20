@@ -34,6 +34,10 @@
  *   P3 a replayed result refused twice is quarantined the same way
  *   P4 a quarantine record that cannot be written leaves the result in the
  *      outbox and naks, rather than settling with no copy kept
+ *   P5 a 422 that is not the route's `unstorable_result` (a request validator
+ *      in front of it) is an ordinary failed attempt: once, and the result
+ *      lands completed as it was; every time, and the delivery is naked with
+ *      the result kept in the outbox, never closed as `result_unstorable`
  */
 
 import assert from "node:assert/strict";
@@ -64,6 +68,8 @@ let apiMetrics: typeof import("../src/infra/metrics.js");
 const outputs = new Map<string, ExecuteResult>();
 /** Task ids whose callbacks are refused outright, as by a field nothing can make storable. */
 const refuseAll = new Set<string>();
+/** Task ids whose next N callbacks meet a 422 from a request validator in front of the route. */
+const validatorRejects = new Map<string, number>();
 const store = new Map<string, Uint8Array>();
 /** Keys whose writes the bucket refuses, as a full or unreachable bucket does. */
 const failingPuts = new Set<string>();
@@ -94,6 +100,15 @@ before(async () => {
     const taskId = (req.params as { taskId?: string } | undefined)?.taskId;
     if (taskId && refuseAll.has(taskId)) {
       return reply.status(422).send({ ok: false, error: "unstorable_result", sqlstate: "22P05" });
+    }
+    const left = taskId ? validatorRejects.get(taskId) ?? 0 : 0;
+    if (taskId && left > 0) {
+      validatorRejects.set(taskId, left - 1);
+      // Fastify's own validation-error shape, at the status a validator configured for 422 sends.
+      return reply.status(422).send({
+        statusCode: 422, code: "FST_ERR_VALIDATION", error: "Unprocessable Entity",
+        message: "body/run_time must be object",
+      });
     }
   });
   await registerInternalTaskRoutes(app);
@@ -311,4 +326,34 @@ test("P4 a quarantine that cannot be written keeps the outbox and naks", { skip 
   assert.deepEqual(await deliver(request), ["nak:5000"]);
   const kept = JSON.parse(dec.decode(store.get("task-result.t-quarantine-unwritable")!)) as { finalText: string };
   assert.equal(kept.finalText, "the only copy", "the result is still in the outbox for the redelivery");
+});
+
+test("P5 a 422 that is not unstorable_result is retried, never closes the run as unstorable", { skip }, async () => {
+  const refusedBefore = await metricValue(brainMetrics.registry, "claw_brain_agent_done_quarantined_total", { reason: "refused" });
+
+  const once = await seedTask("t-validator-once");
+  outputs.set("t-validator-once", scriptResult("a good run's output"));
+  validatorRejects.set("t-validator-once", 1);
+  assert.deepEqual(await deliver(once), ["ack"]);
+  const landed = await row("t-validator-once");
+  assert.equal(landed.status, "completed", "the retry carried the result, not a failure in its place");
+  assert.equal(landed.output, "a good run's output");
+  assert.equal(landed.failure_reason, null);
+  assert.equal(store.has("task-result.t-validator-once"), false);
+
+  const always = await seedTask("t-validator-always");
+  outputs.set("t-validator-always", scriptResult("still a good run"));
+  validatorRejects.set("t-validator-always", Number.POSITIVE_INFINITY);
+  const verdicts = await deliver(always);
+  assert.equal(verdicts.length, 1);
+  assert.match(verdicts[0]!, /^nak:/, "an ordinary failed delivery is naked for redelivery");
+  assert.equal((await row("t-validator-always")).status, "running", "not closed as result_unstorable");
+  const kept = JSON.parse(dec.decode(store.get("task-result.t-validator-always")!)) as { finalText: string };
+  assert.equal(kept.finalText, "still a good run", "the result stays in the outbox for the redelivery");
+  assert.equal(store.has("task-quarantine.t-validator-always"), false, "nothing is set aside");
+  assert.equal(
+    await metricValue(brainMetrics.registry, "claw_brain_agent_done_quarantined_total", { reason: "refused" }),
+    refusedBefore,
+  );
+  validatorRejects.delete("t-validator-always");
 });

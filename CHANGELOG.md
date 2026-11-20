@@ -257,8 +257,8 @@ release version, and its `appVersion` stays `latest`.
   refused the whole `agent_done` write, the API answered 500, and Brain resent the same result on every delivery of the
   task's message until the poison guard failed the run, many minutes later, as `max_retries_exceeded`. A result the
   database still refuses for its values (SQLSTATE 22021, 22P05, 22P02 or 22003, for example a count out of range) is
-  now answered 422, and Brain reports the run as failed with `failure_reason: result_unstorable` on the same delivery
-  instead of retrying it. If even that report is refused, Brain keeps the result in its checkpoint bucket under
+  now answered 422 with `error: unstorable_result`, and Brain reports the run as failed with `failure_reason: result_unstorable` on the same delivery
+  instead of retrying it; any other 422 is retried as before. If even that report is refused, Brain keeps the result in its checkpoint bucket under
   `task-quarantine.<task_id>`, logs the task id and status without the content, and settles the message so the tasks
   behind it keep flowing; the API's sweeper fails the row. New metrics: `claw_api_agent_done_sanitized_total`,
   `claw_api_agent_done_refused_total{sqlstate}`, `claw_brain_agent_done_failures_total{status}`,
