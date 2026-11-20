@@ -85,6 +85,8 @@ export async function ensureA2aPushSchema(client: pg.PoolClient): Promise<void> 
       attempts        INT NOT NULL DEFAULT 0,
       claims          INT NOT NULL DEFAULT 0,
       unsent_since    TIMESTAMPTZ,
+      unsent_passes   INT NOT NULL DEFAULT 0,
+      unsent_last_at  TIMESTAMPTZ,
       next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       delivered_at    TIMESTAMPTZ,
       dropped_at      TIMESTAMPTZ,
@@ -118,7 +120,12 @@ export async function ensureA2aPushSchema(client: pg.PoolClient): Promise<void> 
       END IF;
     END $$`);
   // Since when every claim of the row has ended before its receiver was asked.
-  await client.query("ALTER TABLE claw_a2a_push_outbox ADD COLUMN IF NOT EXISTS unsent_since TIMESTAMPTZ");
+  // How many such passes there have been, and when the last one ended.
+  await client.query(`
+    ALTER TABLE claw_a2a_push_outbox
+      ADD COLUMN IF NOT EXISTS unsent_since TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS unsent_passes INT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS unsent_last_at TIMESTAMPTZ`);
   await client.query(
     `CREATE INDEX IF NOT EXISTS idx_a2a_push_outbox_due
        ON claw_a2a_push_outbox(next_attempt_at)

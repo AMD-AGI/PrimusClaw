@@ -1116,9 +1116,9 @@ describe("A2A push notifications", { skip }, () => {
         await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: hook.url });
         await record(t.sessionId, { type: "permissionRequest", actionId: "toolu_legacy", tool: "bash", input: {} }, 1701);
         const [open] = await outbox();
-        // The table as the release before this one left it: no claims, no unsent_since, and every claim (a config read
+        // The table as the release before this one left it: no claims, no unsent_* columns, and every claim (a config read
         // that failed included) counted as an attempt, past the limit for a head its receiver was asked of far fewer times.
-        await query("ALTER TABLE claw_a2a_push_outbox DROP COLUMN claims, DROP COLUMN unsent_since");
+        await query("ALTER TABLE claw_a2a_push_outbox DROP COLUMN claims, DROP COLUMN unsent_since, DROP COLUMN unsent_passes, DROP COLUMN unsent_last_at");
         await query("UPDATE claw_a2a_push_outbox SET attempts = $1", [push.MAX_DELIVERY_ATTEMPTS + 4]);
         await query(
           `INSERT INTO claw_a2a_push_outbox (task_id, config_id, dedupe_key, payload, attempts, delivered_at, last_status)
@@ -1220,11 +1220,17 @@ describe("A2A push notifications", { skip }, () => {
         assert.deepEqual([after.attempts, after.unsent_since], [1, null], "a pass that reached the receiver clears it");
         await query("UPDATE claw_a2a_push_configs SET url = $1", [hook.url.replace("127.0.0.1", "hooks.internal")]);
 
-        // Hung again, for UNSENT_GIVE_UP_SECONDS: the next hung pass sets it aside instead of trying again for ever.
+        // Hung again, for UNSENT_GIVE_UP_SECONDS: once it has also had UNSENT_GIVE_UP_PASSES passes, the next hung
+        // pass sets it aside instead of trying again for ever.
+        assert.equal(push.UNSENT_GIVE_UP_PASSES, 3);
         await expireLeases();
         await push.deliverDue({ resolve: hung, sendDeadlineMs: 100 });
         assert.equal((await deadLetters()).length, 0, "not yet");
         await query("UPDATE claw_a2a_push_outbox SET unsent_since = NOW() - make_interval(secs => $1), next_attempt_at = NOW() WHERE id = $2", [push.UNSENT_GIVE_UP_SECONDS, head.id]);
+        assert.deepEqual(await push.deliverDue({ resolve: hung, sendDeadlineMs: 100 }), { delivered: 0, failed: 1 });
+        assert.equal((await deadLetters()).length, 0, "an hour old, but only its second pass: not yet");
+        assert.equal((await query("SELECT unsent_passes FROM claw_a2a_push_outbox WHERE id = $1", [head.id])).rows[0].unsent_passes, 2);
+        await query("UPDATE claw_a2a_push_outbox SET next_attempt_at = NOW() WHERE id = $1", [head.id]);
         assert.deepEqual(await push.deliverDue({ resolve: hung, sendDeadlineMs: 100 }), { delivered: 0, failed: 1 });
         const [dead] = await deadLetters();
         assert.deepEqual([dead.last_status, dead.attempts], ["unsent:refused:unresolvable_host", 1]);
@@ -1233,6 +1239,69 @@ describe("A2A push notifications", { skip }, () => {
         // The lookup answers again: the next notification goes, in order.
         assert.deepEqual(await push.deliverDue({ resolve: fast }), { delivered: 1, failed: 0 });
         assert.deepEqual(hook.seen.map((s) => label(s.body)), ["WORKING"]);
+      } finally {
+        await hook.close();
+      }
+    });
+
+    test("a head claimed long after its last unsent pass starts its unsent clock again: an hour with no worker is not an hour unsent", async () => {
+      const hook = await receiver();
+      try {
+        const t = await liveTask();
+        await storeConfig(t, hook.url.replace("127.0.0.1", "hooks.internal"));
+        await record(t.sessionId, { type: "permissionRequest", actionId: "toolu_idle", tool: "bash", input: {} }, 2001);
+        const hung = () => new Promise<never>(() => { /* a DNS server that never answers */ });
+        const fast = async () => [{ address: "127.0.0.1", family: 4 }];
+        const [head] = (await query("SELECT id FROM claw_a2a_push_outbox ORDER BY id")).rows;
+        // Unsent for over an hour and many passes, but the last of them ended well before this claim (no worker ran).
+        await query(
+          `UPDATE claw_a2a_push_outbox SET unsent_since = NOW() - make_interval(secs => $1), unsent_passes = 50,
+                  unsent_last_at = NOW() - make_interval(secs => $2), next_attempt_at = NOW() WHERE id = $3`,
+          [push.UNSENT_GIVE_UP_SECONDS * 2, push.UNSENT_GAP_RESET_SECONDS * 4, head.id],
+        );
+        assert.deepEqual(await push.deliverDue({ resolve: hung, sendDeadlineMs: 100 }), { delivered: 0, failed: 1 });
+        assert.equal((await deadLetters()).length, 0, "not set aside");
+        const row = (await query(
+          `SELECT attempts, unsent_passes, unsent_since > NOW() - interval '1 minute' AS fresh,
+                  unsent_last_at > NOW() - make_interval(secs => $2) AS last_fresh FROM claw_a2a_push_outbox WHERE id = $1`,
+          [head.id, push.UNSENT_GAP_RESET_SECONDS],
+        )).rows[0];
+        assert.deepEqual([row.attempts, row.unsent_passes, row.fresh, row.last_fresh], [0, 1, true, true],
+          "the clock and the pass count started again, and this pass is the last unsent one");
+
+        // The receiver is reachable again: it gets the notification.
+        await query("UPDATE claw_a2a_push_outbox SET next_attempt_at = NOW() WHERE id = $1", [head.id]);
+        assert.deepEqual(await push.deliverDue({ resolve: fast }), { delivered: 1, failed: 0 });
+        assert.deepEqual(hook.seen.map((s) => label(s.body)), ["INPUT_REQUIRED:toolu_idle"]);
+      } finally {
+        await hook.close();
+      }
+    });
+
+    test("a head past its unsent give-up whose pass reaches the receiver is retried, not set aside, and its unsent clock clears", async () => {
+      const hook = await receiver(() => 503);
+      try {
+        const t = await liveTask();
+        await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: hook.url });
+        await record(t.sessionId, { type: "permissionRequest", actionId: "toolu_reached", tool: "bash", input: {} }, 2101);
+        const [head] = (await query("SELECT id FROM claw_a2a_push_outbox ORDER BY id")).rows;
+        // Every condition for the unsent give-up holds as the pass claims it.
+        await query(
+          `UPDATE claw_a2a_push_outbox SET unsent_since = NOW() - make_interval(secs => $1), unsent_passes = $2,
+                  unsent_last_at = NOW(), next_attempt_at = NOW() WHERE id = $3`,
+          [push.UNSENT_GIVE_UP_SECONDS * 2, push.UNSENT_GIVE_UP_PASSES, head.id],
+        );
+        assert.deepEqual(await push.deliverDue(), { delivered: 0, failed: 1 });
+        assert.equal(hook.seen.length, 1, "its receiver was asked");
+        assert.equal((await deadLetters()).length, 0, "a pass that reached the receiver is an attempt, not an unsent pass");
+        const row = (await query(
+          "SELECT attempts, dropped_at, last_status, unsent_since, unsent_passes, unsent_last_at FROM claw_a2a_push_outbox WHERE id = $1",
+          [head.id],
+        )).rows[0];
+        assert.deepEqual(
+          [row.attempts, row.dropped_at, row.last_status, row.unsent_since, row.unsent_passes, row.unsent_last_at],
+          [1, null, "http_503", null, 0, null],
+        );
       } finally {
         await hook.close();
       }

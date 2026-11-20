@@ -133,9 +133,11 @@ found. A pass that never got that far (the database too slow or failing to read
 the config, a name lookup cut off by the deadline) is tried again five seconds
 later without using one, so a database that is slow for a while cannot set aside
 a notification whose receiver is healthy. A notification that has gone an hour
-without any pass reaching its receiver (a name lookup that hangs every time) is
-set aside all the same, as `unsent:<status>`, so it cannot hold its webhook for
-good. A notification written before this release, whose count also included
+and at least three passes without any pass reaching its receiver (a name lookup
+that hangs every time) is set aside all the same, as `unsent:<status>`, so it
+cannot hold its webhook for good. A pass that comes more than 50 seconds after
+the previous one that did not reach the receiver starts that hour again, so time
+in which no worker ran (an outage of the API) does not count toward it. A notification written before this release, whose count also included
 passes that never reached the receiver, is sent at least once more before it
 can be set aside. When it is set aside, its outbox row
 is closed, a copy is kept in

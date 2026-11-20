@@ -102,6 +102,19 @@ export const NOT_SENT_RETRY_SECONDS = 5;
  * nothing.
  */
 export const UNSENT_GIVE_UP_SECONDS = 3600;
+/**
+ * And it has had at least this many passes in that time, this one included: an
+ * hour with few passes is an hour the head was barely tried, not one it was
+ * tried and could not be sent.
+ */
+export const UNSENT_GIVE_UP_PASSES = 3;
+/**
+ * A head claimed this long after its last not-sent pass starts the clock again:
+ * no worker tried it in between (they were all down, or busy elsewhere), so
+ * that time is not time it went unsent. Ten retry intervals: a hung pass ends
+ * at its deadline and the next claim follows within a few seconds.
+ */
+export const UNSENT_GAP_RESET_SECONDS = 10 * NOT_SENT_RETRY_SECONDS;
 const CLAIM_BATCH = 20;
 
 export const NOTIFICATION_TOKEN_HEADER = "X-A2A-Notification-Token";
@@ -461,8 +474,10 @@ interface Claimed {
   attempts: number;
   final: boolean;
   /**
-   * Every claim of the row since its last attempt (UNSENT_GIVE_UP_SECONDS or
-   * more) ended before its receiver was asked.
+   * Every claim of the row since its last attempt ended before its receiver was
+   * asked, for UNSENT_GIVE_UP_SECONDS or more, with no gap of
+   * UNSENT_GAP_RESET_SECONDS between them, and this one makes at least
+   * UNSENT_GIVE_UP_PASSES of them.
    */
   unsent_expired: boolean;
 }
@@ -489,7 +504,13 @@ async function claimDue(): Promise<Claimed[]> {
      )
      UPDATE claw_a2a_push_outbox o
         SET claims = o.claims + 1,
-            next_attempt_at = NOW() + make_interval(secs => $2)
+            next_attempt_at = NOW() + make_interval(secs => $2),
+            -- Claimed long after its last not-sent pass: nobody tried it in
+            -- between, so the time it has gone unsent starts again.
+            unsent_since = CASE WHEN o.unsent_last_at <= NOW() - make_interval(secs => $4)
+                                THEN NULL ELSE o.unsent_since END,
+            unsent_passes = CASE WHEN o.unsent_last_at <= NOW() - make_interval(secs => $4)
+                                 THEN 0 ELSE o.unsent_passes END
       WHERE o.id IN (
         SELECT id FROM claw_a2a_push_outbox
          WHERE id IN (SELECT id FROM heads) AND next_attempt_at <= NOW()
@@ -497,8 +518,9 @@ async function claimDue(): Promise<Claimed[]> {
          LIMIT $1
          FOR UPDATE SKIP LOCKED)
       RETURNING o.id, o.task_id, o.config_id, o.payload, o.claims, o.attempts, o.final,
-                COALESCE(o.unsent_since <= NOW() - make_interval(secs => $3), FALSE) AS unsent_expired`,
-    [CLAIM_BATCH, CLAIM_LEASE_SECONDS, UNSENT_GIVE_UP_SECONDS],
+                (COALESCE(o.unsent_since <= NOW() - make_interval(secs => $3), FALSE)
+                 AND o.unsent_passes + 1 >= $5) AS unsent_expired`,
+    [CLAIM_BATCH, CLAIM_LEASE_SECONDS, UNSENT_GIVE_UP_SECONDS, UNSENT_GAP_RESET_SECONDS, UNSENT_GIVE_UP_PASSES],
   )).rows as Claimed[];
 }
 
@@ -659,8 +681,8 @@ async function sendOne(row: Claimed, deps: DeliveryDeps, deadline: number): Prom
     await quarantine(row, status, attempts);
   } else if (attempts === row.attempts && row.unsent_expired) {
     // Not sent again, and no claim has reached the receiver for
-    // UNSENT_GIVE_UP_SECONDS (its name lookup hangs every time): set aside, so
-    // the ones behind it go.
+    // UNSENT_GIVE_UP_SECONDS over at least UNSENT_GIVE_UP_PASSES passes (its
+    // name lookup hangs every time): set aside, so the ones behind it go.
     await quarantine(row, `unsent:${status}`, attempts);
   } else {
     const sent = attempts > row.attempts;
@@ -676,7 +698,9 @@ async function sendOne(row: Claimed, deps: DeliveryDeps, deadline: number): Prom
       `UPDATE claw_a2a_push_outbox
           SET next_attempt_at = NOW() + make_interval(secs => $3), last_status = $4, attempts = $5,
               claims = claims + 1,
-              unsent_since = CASE WHEN $6::boolean THEN NULL ELSE COALESCE(unsent_since, NOW()) END
+              unsent_since = CASE WHEN $6::boolean THEN NULL ELSE COALESCE(unsent_since, NOW()) END,
+              unsent_passes = CASE WHEN $6::boolean THEN 0 ELSE unsent_passes + 1 END,
+              unsent_last_at = CASE WHEN $6::boolean THEN NULL ELSE NOW() END
         WHERE ${FENCE}`,
       [row.id, row.claims, wait, status, attempts, sent],
     );
