@@ -645,15 +645,11 @@ export async function readOutboxHealth(): Promise<NotificationOutboxHealth> {
        (SELECT COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at))), 0)::float8 FROM claw_notification_outbox
          WHERE delivered_at IS NULL AND dropped_at IS NULL AND subscription_id IS NOT NULL) AS oldest_pending_age_seconds,
        (SELECT COUNT(*)::int FROM claw_notification_outbox
-         WHERE delivered_at IS NULL AND dropped_at IS NULL AND subscription_id IS NOT NULL) AS pending,
-       (SELECT COALESCE(MAX(consecutive_failures), 0)::int FROM claw_notification_subscriptions WHERE enabled) AS max_consecutive_failures,
-       (SELECT COUNT(*)::int FROM claw_notification_subscriptions WHERE enabled AND consecutive_failures > 0) AS failing_subscriptions`,
+         WHERE delivered_at IS NULL AND dropped_at IS NULL AND subscription_id IS NOT NULL) AS pending`,
   )).rows[0] as Record<string, unknown>;
   return {
     oldestPendingAgeSeconds: Math.max(0, Number(row.oldest_pending_age_seconds)),
     pending: Number(row.pending),
-    maxConsecutiveFailures: Number(row.max_consecutive_failures),
-    failingSubscriptions: Number(row.failing_subscriptions),
   };
 }
 

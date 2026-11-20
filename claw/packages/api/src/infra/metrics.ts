@@ -389,8 +389,6 @@ const notificationReadFailedTotal = new Counter({
 export interface NotificationOutboxHealth {
   oldestPendingAgeSeconds: number;
   pending: number;
-  maxConsecutiveFailures: number;
-  failingSubscriptions: number;
 }
 let notificationOutboxReader: (() => Promise<NotificationOutboxHealth>) | null = null;
 let notificationOutboxRead: { at: number; reading: Promise<NotificationOutboxHealth | null> } | null = null;
@@ -427,26 +425,9 @@ const notificationPending = new Gauge({
     if (r) this.set(r.pending);
   },
 });
-const notificationConsecutiveFailures = new Gauge({
-  name: "claw_notification_subscription_consecutive_failures",
-  help: "The longest run of failed deliveries without a success, over the enabled notification subscriptions.",
-  registers: [registry],
-  async collect() {
-    const r = await readNotificationOutbox();
-    if (r) this.set(r.maxConsecutiveFailures);
-  },
-});
-const notificationFailingSubscriptions = new Gauge({
-  name: "claw_notification_subscriptions_failing",
-  help: "Enabled notification subscriptions whose last delivery failed.",
-  registers: [registry],
-  async collect() {
-    const r = await readNotificationOutbox();
-    if (r) this.set(r.failingSubscriptions);
-  },
-});
-// (registered by construction; nothing else refers to them)
-void [notificationOldestPendingAge, notificationPending, notificationConsecutiveFailures, notificationFailingSubscriptions];
+// (registered by construction; nothing else refers to them. The failing subscriptions are the delivery-health sample's
+// `claw_notification_subscriptions_failing` and `claw_notification_subscription_failures_max`, below.)
+void [notificationOldestPendingAge, notificationPending];
 
 // A marker ahead of the clock is pod skew, not a negative wait, so it clamps
 // to zero rather than entering the first bucket as a measurement nobody took.
@@ -456,6 +437,166 @@ function sojournSeconds(markerIso: string | null | undefined): number | null {
   if (Number.isNaN(started)) return null;
   return Math.max(0, (Date.now() - started) / 1000);
 }
+
+// ---------------------------------------------------------------------------
+// Delivery health: whether what is on its way to a person is getting through (a connector's events once refused for
+// hours with nobody told). One naming for every queue, so one alert rule covers them all
+// (claw/deploy/charts/claw/alerts/delivery.rules.yaml).
+//
+// The backlog gauges are read from the database on a scrape (`setDeliverySampler`, `remote-agents/delivery-health.ts`),
+// so every replica reports the same deployment-wide numbers; the rules take max() over replicas. `connector_id` is a
+// label only on the per-connector gauges, and only for a connector that is behind or failing right now (at most
+// DELIVERY_SAMPLE_MAX_CONNECTORS of them): a healthy fleet exports none of those series.
+// ---------------------------------------------------------------------------
+
+/** The queues the delivery gauges name. */
+export const DELIVERY_QUEUES = ["remote_events", "notification_outbox"] as const;
+export type DeliveryQueue = (typeof DELIVERY_QUEUES)[number];
+export const DELIVERY_SAMPLE_MAX_CONNECTORS = 50;
+
+export interface DeliverySample {
+  backlog: Array<{ queue: DeliveryQueue; oldestAgeSeconds: number; size: number }>;
+  /** Connectors behind or failing now, the worst first. */
+  connectors: Array<{ connectorId: string; backlogAgeSeconds: number; postFailures: number; apiFailures: number }>;
+  /** Connectors the delivery-health sweep holds as stalled. */
+  stalled: number;
+  /** Notification subscriptions failing now, and the most consecutive failures of any (null without notifications). */
+  subscriptions: { failing: number; failuresMax: number } | null;
+}
+
+let deliverySampler: (() => Promise<DeliverySample | null>) | null = null;
+let deliverySampled: { at: number; value: Promise<DeliverySample | null> } | null = null;
+/** One read per scrape: every gauge below shares it, and a second scrape within this long reuses it. */
+const DELIVERY_SAMPLE_TTL_MS = 5_000;
+
+async function deliverySample(): Promise<DeliverySample | null> {
+  if (!deliverySampler) return null;
+  if (!deliverySampled || Date.now() - deliverySampled.at > DELIVERY_SAMPLE_TTL_MS) {
+    const sampler = deliverySampler;
+    // A read that fails reports nothing (the gauges go absent, which `absent()`-free rules read as no data), never a stale zero.
+    deliverySampled = { at: Date.now(), value: sampler().catch(() => null) };
+  }
+  return deliverySampled.value;
+}
+
+const deliveryBacklogOldestAge = new Gauge({
+  name: "claw_delivery_backlog_oldest_age_seconds",
+  help: "How long the oldest item still waiting to be delivered has waited, by queue.",
+  labelNames: ["queue"] as const,
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    for (const b of s?.backlog ?? []) this.set({ queue: b.queue }, b.oldestAgeSeconds);
+  },
+});
+const deliveryBacklogSize = new Gauge({
+  name: "claw_delivery_backlog_size",
+  help: "Items still waiting to be delivered, by queue.",
+  labelNames: ["queue"] as const,
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    for (const b of s?.backlog ?? []) this.set({ queue: b.queue }, b.size);
+  },
+});
+const remoteConnectorBacklogAge = new Gauge({
+  name: "claw_remote_connector_backlog_age_seconds",
+  help: "How long the oldest event a connector has not got through has waited, for connectors behind or failing now.",
+  labelNames: ["connector_id"] as const,
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    for (const c of s?.connectors ?? []) this.set({ connector_id: c.connectorId }, c.backlogAgeSeconds);
+  },
+});
+const remoteConnectorPostFailures = new Gauge({
+  name: "claw_remote_connector_post_failures",
+  help: "Consecutive failed event posts of a connector, as the connector reports them and as the API answered them, for connectors failing now.",
+  labelNames: ["connector_id", "side"] as const,
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    for (const c of s?.connectors ?? []) {
+      this.set({ connector_id: c.connectorId, side: "connector" }, c.postFailures);
+      this.set({ connector_id: c.connectorId, side: "api" }, c.apiFailures);
+    }
+  },
+});
+const remoteDeliveryStalled = new Gauge({
+  name: "claw_remote_delivery_stalled",
+  help: "Connectors whose events have not got through for longer than the notice threshold, as the delivery-health sweep holds them.",
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    if (s) this.set(s.stalled);
+  },
+});
+const notificationSubscriptionsFailing = new Gauge({
+  name: "claw_notification_subscriptions_failing",
+  help: "Enabled notification subscriptions whose receiver is failing now.",
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    if (s?.subscriptions) this.set(s.subscriptions.failing);
+  },
+});
+const notificationSubscriptionFailuresMax = new Gauge({
+  name: "claw_notification_subscription_failures_max",
+  help: "The most consecutive failed deliveries of any enabled notification subscription.",
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    if (s?.subscriptions) this.set(s.subscriptions.failuresMax);
+  },
+});
+
+// Every batch a connector posted to `POST /v1/remote-agents/connectors/:cid/events`, by how the API answered it: stored
+// (`ok`), refused as malformed (`client_error`), or failed (`server_error`, a 5xx the connector retries).
+export type RemoteEventsPostOutcome = "ok" | "client_error" | "server_error";
+const remoteEventsPostTotal = new Counter({
+  name: "claw_remote_events_post_total",
+  help: "Event batches posted by connectors, by how the API answered them.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
+// A delivery of the durable event consumer (`api-consumer`) that JetStream had delivered before (a nak or an ack timeout),
+// and how long the longest-redelivered message still being retried has been (`events/redelivery.ts`).
+const eventRedeliveredTotal = new Counter({
+  name: "claw_api_event_redelivered_total",
+  help: "Event consumer deliveries that were redeliveries of a message delivered before.",
+  registers: [registry],
+});
+let redeliveryOldestAge: () => number = () => 0;
+const eventRedeliveryOldestAge = new Gauge({
+  name: "claw_api_event_redelivery_oldest_age_seconds",
+  help: "How long the event consumer has been redelivering the message it has retried longest without acknowledging it; 0 when none.",
+  registers: [registry],
+  collect() {
+    this.set(redeliveryOldestAge());
+  },
+});
+
+// What the delivery-health sweep told a person about their replies (`remote-agents/delivery-health.ts`): that they are
+// delayed, or that they get through again; `told`, or `no_assistant` (nobody to say it through), or `failed` (retried).
+export type DeliveryNoticeKind = "delayed" | "recovered";
+export type DeliveryNoticeOutcome = "told" | "no_assistant" | "failed";
+const deliveryStallNoticesTotal = new Counter({
+  name: "claw_delivery_stall_notices_total",
+  help: "Notices to a person that their replies are delayed or get through again, by kind and outcome.",
+  labelNames: ["kind", "outcome"] as const,
+  registers: [registry],
+});
+// Referenced so a gauge read only by its collect() is not reported unused.
+void [deliveryBacklogOldestAge, deliveryBacklogSize, remoteConnectorBacklogAge, remoteConnectorPostFailures, remoteDeliveryStalled,
+  notificationSubscriptionsFailing, notificationSubscriptionFailuresMax, eventRedeliveryOldestAge];
 
 export const metrics = {
   /** Handed to the identity client at construction; see @claw/utils identity/. */
@@ -515,6 +656,24 @@ export const metrics = {
   },
   onRunDispatchHeld(cause: DispatchHeldCause): void {
     runDispatchHeldTotal.inc({ cause });
+  },
+
+  /** Where the delivery gauges read their numbers from; null stops reading (a test, or a process going down). */
+  setDeliverySampler(sampler: (() => Promise<DeliverySample | null>) | null): void {
+    deliverySampler = sampler;
+    deliverySampled = null;
+  },
+  onRemoteEventsPost(outcome: RemoteEventsPostOutcome): void {
+    remoteEventsPostTotal.inc({ outcome });
+  },
+  onEventRedelivered(): void {
+    eventRedeliveredTotal.inc();
+  },
+  setRedeliveryOldestAge(read: () => number): void {
+    redeliveryOldestAge = read;
+  },
+  onDeliveryStallNotice(kind: DeliveryNoticeKind, outcome: DeliveryNoticeOutcome): void {
+    deliveryStallNoticesTotal.inc({ kind, outcome });
   },
 
   onRunClaim(mode: ClaimMode, outcome: ClaimOutcome): void {

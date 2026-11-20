@@ -88,7 +88,8 @@ import { startPluginExpirySweeper } from "./marketplace/plugin-expiry.js";
 import { archiveIdleSessions } from "./sessions/archive.js";
 import { DEFAULT_RETENTION_RUN, runSessionRetentionOnce } from "./sessions/retention.js";
 import { cleanupOrphanSkillFiles, cleanupOldPatterns, cleanupExpiredSkillDrafts, cleanupOldSkillChanges } from "./marketplace/skill-service.js";
-import { registry as metricsRegistry } from "./infra/metrics.js";
+import { metrics, registry as metricsRegistry } from "./infra/metrics.js";
+import { sampleDeliveryHealth } from "./remote-agents/delivery-health.js";
 import { assertRolloutConfigAtStartup } from "./startup/rollout-config.js";
 import { apiBackgroundLoops, logBackgroundOff, startBackgroundLoops } from "./startup/background.js";
 import pino from "pino";
@@ -376,6 +377,9 @@ async function main() {
     return { status: "ok", service: "api-v2" };
   });
 
+  // The delivery gauges (`claw_delivery_backlog_*`, the stalled connectors, the failing subscriptions) read the database on a
+  // scrape: `remote-agents/delivery-health.ts`. Every replica reads the same numbers; the alert rules take max().
+  metrics.setDeliverySampler(() => sampleDeliveryHealth());
   // Prometheus scrape endpoint (text/plain Prom exposition).
   app.get("/metrics", async (_req, reply) => {
     reply.type(metricsRegistry.contentType);

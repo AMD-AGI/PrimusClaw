@@ -13,7 +13,7 @@
  *   P3 a receiver that is down quarantines nothing, however long, and gets everything on recovery
  *   P4 a receiver that refuses everything (a wrong secret) quarantines nothing
  *   P5 a single 422 quarantines nothing: the row is retried, and delivered when the receiver takes it
- *   P6 the outbox gauges read the table: oldest pending age, failing subscriptions, consecutive failures
+ *   P6 the outbox gauges read the table: oldest pending age and rows pending
  *   P7 the personal agent's 503s for an event it cannot take *yet* (a run's end while that chat's turn still answers, a copy
  *      in flight elsewhere, a send that failed) never quarantine it, however long the rest flows; it is delivered after
  *   P8 a NUL or a lone surrogate nested deeper than the sanitiser's walk is stored as U+FFFD too
@@ -327,7 +327,7 @@ describe("notification outbox: poison rows", { skip }, () => {
     assert.equal(await sample("claw_notification_quarantined_total"), before);
   });
 
-  test("P6 the gauges read the table: a stalled row's age, the failing subscriptions, their longest streak; 0 once it clears", async () => {
+  test("P6 the gauges read the table: a stalled row's age and the rows pending; 0 once it clears", async () => {
     await subscribe();
     answer = () => 503;
     await finishRun("t-1", "completed");
@@ -340,8 +340,6 @@ describe("notification outbox: poison rows", { skip }, () => {
     const age = await sample("claw_notification_outbox_oldest_pending_age_seconds");
     assert.ok(age >= 3599 && age < 3700, `oldest pending age ${age}`);
     assert.equal(await sample("claw_notification_outbox_pending"), 2);
-    assert.equal(await sample("claw_notification_subscriptions_failing"), 1);
-    assert.equal(await sample("claw_notification_subscription_consecutive_failures"), 6);
     answer = () => 200;
     await deliver();
     // A quarantined row from a day ago, and one of a deleted subscription waiting for the next: neither is pending delivery.
@@ -353,8 +351,6 @@ describe("notification outbox: poison rows", { skip }, () => {
     await new Promise((r) => setTimeout(r, 1100));
     assert.equal(await sample("claw_notification_outbox_oldest_pending_age_seconds"), 0);
     assert.equal(await sample("claw_notification_outbox_pending"), 0);
-    assert.equal(await sample("claw_notification_subscriptions_failing"), 0);
-    assert.equal(await sample("claw_notification_subscription_consecutive_failures"), 0);
     assert.ok(await sample("claw_notification_delivery_total", 'outcome="delivered"') >= 2);
   });
 

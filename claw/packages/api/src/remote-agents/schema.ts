@@ -203,6 +203,39 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
       PRIMARY KEY (connector_id, agent_id, ref)
     )
   `);
+  // Whether each connector's events get through, as it reports and as Claw answered it, and what its owner was told (`delivery-health.ts`).
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_remote_delivery_health (
+      connector_id       UUID PRIMARY KEY REFERENCES claw_remote_connectors(connector_id) ON DELETE CASCADE,
+      owner_user_id      TEXT NOT NULL,
+      -- The connector's last outbox report (RemoteOutboxReport), when it arrived, and the times it gave as ages turned into instants.
+      reported_at        TIMESTAMPTZ,
+      pending            INT NOT NULL DEFAULT 0,
+      oldest_since       TIMESTAMPTZ,
+      post_failures      INT NOT NULL DEFAULT 0,
+      post_failing_since TIMESTAMPTZ,
+      post_last_error    TEXT,
+      sessions           JSONB NOT NULL DEFAULT '[]'::jsonb,
+      -- Claw's own answers to its posts: 5xx in a row, since when, the last one, and what it was.
+      api_failures       INT NOT NULL DEFAULT 0,
+      api_failing_since  TIMESTAMPTZ,
+      api_failed_at      TIMESTAMPTZ,
+      api_last_error     TEXT,
+      -- The last batch Claw stored while this row had something to clear or a stall to end: what a stall ends on.
+      api_ok_at          TIMESTAMPTZ,
+      -- The sweep's judgement, and what the owner was told about it (NULL, pending, sent, back_pending, back_sent); a pending
+      -- notice is marked sent only once said, and stall_notice_at is when it was last handed out to be said.
+      stall_state        TEXT NOT NULL DEFAULT 'ok' CHECK (stall_state IN ('ok', 'stalled')),
+      stall_since        TIMESTAMPTZ,
+      stall_notice       TEXT,
+      stall_episode      BIGINT NOT NULL DEFAULT 0,
+      stall_detail       JSONB,
+      stall_notice_at    TIMESTAMPTZ
+    )
+  `);
+  await client.query(`
+    ALTER TABLE claw_remote_delivery_health ADD COLUMN IF NOT EXISTS api_ok_at TIMESTAMPTZ, ADD COLUMN IF NOT EXISTS stall_notice_at TIMESTAMPTZ
+  `);
   // Pairing a machine with a one-time code, and the grants the codes were traded for (`pairing.ts`).
   await ensurePairingSchema((text, params) => client.query(text, params));
 }

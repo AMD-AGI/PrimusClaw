@@ -37,7 +37,7 @@ session), or an access token from the identity provider (see
 | Route | Purpose |
 |---|---|
 | `POST /v1/remote-agents/connectors` | Register `{name, version?}`; returns `connector_id`. At most 5 per user. |
-| `POST .../connectors/:cid/heartbeat` | Every 30 s: `{version?, agents:[{agent_id, kind, name, capabilities?}], cmd_cursor?}`. Replaces the advertised agent list; `cmd_cursor` lets the server forget commands up to it. |
+| `POST .../connectors/:cid/heartbeat` | Every 30 s: `{version?, agents:[{agent_id, kind, name, capabilities?}], cmd_cursor?, outbox?}`. Replaces the advertised agent list; `cmd_cursor` lets the server forget commands up to it; `outbox` reports the connector's unacknowledged events (see "Replies that do not get through" below). |
 | `GET .../connectors/:cid/commands` | The command stream; each `id:` is the connector's `cmd_seq`. On every connect the server sends every command it still holds, in order. It holds a command until a heartbeat's `cmd_cursor` covers it, so a `Last-Event-ID` (or `?after=`) is validated but never skips one: the id of the last frame a client received does not prove it acted on it. A connector skips what it already did, by `cmd_seq` or `cmd_id`. |
 | `POST .../connectors/:cid/events` | `{batch_id, events:[{session_id, seq, type, ts, data}]}`. Answers `{acked:{session_id: highest stored seq}, rejected:[{index, session_id, seq, reason}]}`. |
 | `POST .../connectors/:cid/commands/:cmd_id/confirm` | Before a connector carries out a command it received late, it asks whether it may. Body (optional): `{received_late?, why?, session_id?}`; `received_late` (default `true`) says the command was already past the live TTL when it reached the connector; `session_id` is the command's session. Answers `{cmd_id, status}`, where `status` is `live` (run it), `session_closed`, `cancelled` (a prompt, and a `cancel` or `close` of its session was queued after it), `expired` (it reached the connector past the live TTL: never one received in time that then waited on the machine) or `gone` (Claw no longer holds it). Closing a session deletes its acting commands, so for one of those the answer is `session_closed` when `session_id` names a closed session of this connector's, and `gone` otherwise. Only `live` may run. A revoked connector gets `401 revoked`, as on every connector-side route. An answer about a command Claw holds is audited (`command.confirmed`, `command.refused_late`); one about an id it does not hold is not. See "A command received late" below. |
@@ -329,6 +329,32 @@ above). A newer stream for the same
 connector replaces the older, which receives `event: superseded` and ends. When a
 connector is revoked its stream receives `event: revoked` and ends, and every
 connector-side route answers `401 revoked`.
+
+**Replies that do not get through.** Every heartbeat carries the connector's account of its
+event outbox, `outbox: {pending, oldest_age_ms, failures, failing_ms, last_error, sessions}`:
+how many events wait to be acknowledged, how long the oldest has waited, how many posts in a
+row failed and for how long, how the last one failed (`http_<status>`, `network` or
+`error`), and up to 20 sessions with events waiting (`{session_id, pending, oldest_age_ms}`,
+the longest waiting first). The server also counts, per connector, the event batches it
+answered with a 5xx. Both go to `claw_remote_delivery_health`, written after the answer
+(never holding up the heartbeat or the batch), at most four writes at a time per replica. A
+malformed report is ignored; it never fails the heartbeat, and a connector that sends none is
+judged on the server's count alone.
+
+Every 15 s one API replica (an advisory lock picks it) holds each connector as delivering or
+stalled. Stalled: the connector's fresh report says its posts have failed for 2 minutes
+while events wait, or the server has answered its posts with a 5xx for 2 minutes and still
+does. When the assistant is on, the owner is told once, through their assistant, that the
+replies from the sessions on that machine are delayed and being retried (with how many wait
+and for how long, when the connector reported it), and told once more when a batch from it
+is stored again, or its fresh report says nothing waits any more, and nothing has failed on
+either side since (a clean report with events still waiting is not enough: a connector
+restarted mid-stall reports no failure while its backlog still waits). A notice counts as
+told only once the assistant has it; until then a later sweep tries again, and its key keeps
+it from being said twice. A connector that goes offline while stalled is told nothing more
+here; presence, below, reports that it went. The same rows feed the `claw_delivery_*` and
+`claw_remote_connector_*` metrics, which the chart's alert rules read
+(`prometheusRule.enabled`, `claw/deploy/charts/claw/alerts/delivery.rules.yaml`).
 
 **Presence over time.** Every 15 s one API replica (an advisory lock picks it) compares
 each connector with the presence it last recorded and writes every change it sees to

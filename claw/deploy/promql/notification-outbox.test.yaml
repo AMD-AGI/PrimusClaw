@@ -45,7 +45,7 @@ tests:
               description: >-
                 The oldest notification still to be delivered has waited 22m 0s. Check the
                 receiver of the failing subscription (claw_notification_subscriptions_failing,
-                claw_notification_subscription_consecutive_failures) and claw-api's "notification." log lines.
+                claw_notification_subscription_failures_max) and claw-api's "notification." log lines.
       # 41 minutes in: delivered: resolved.
       - eval_time: 41m
         alertname: ClawNotificationOutboxStalled

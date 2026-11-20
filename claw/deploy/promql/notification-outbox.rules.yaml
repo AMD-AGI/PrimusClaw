@@ -26,7 +26,7 @@ groups:
           description: >-
             The oldest notification still to be delivered has waited {{ $value | humanizeDuration }}. Check the
             receiver of the failing subscription (claw_notification_subscriptions_failing,
-            claw_notification_subscription_consecutive_failures) and claw-api's "notification." log lines.
+            claw_notification_subscription_failures_max) and claw-api's "notification." log lines.
 
       # A notification was set aside instead of delivered: the receiver kept refusing its body (400, 413, 415, 422) for an
       # hour while it took the subscription's other rows. The row is kept (quarantined_at in claw_notification_outbox).

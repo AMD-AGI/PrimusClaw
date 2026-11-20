@@ -1,0 +1,33 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+{{- /*
+Prometheus Operator alert rules for delivery stalls: alerts/delivery.rules.yaml,
+read as it is. That file is also what claw/deploy/promql/delivery-alerts.test.yaml
+evaluates with promtool, so the rules deployed are the rules tested.
+
+Off by default, like serviceMonitor: the monitoring.coreos.com CRDs may not be
+installed. Gated on the value alone, for the reason servicemonitor.yaml gives:
+asking for alerts on a cluster that cannot take them should fail the apply, not
+render nothing. The VictoriaMetrics Operator's converter turns a PrometheusRule
+into a VMRule, as it does a ServiceMonitor.
+
+The rules read metrics the API exports, so they need the API scraped
+(serviceMonitor.enabled, or a scrape of your own).
+*/ -}}
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "primus-claw.fullname" . }}-delivery
+  {{- with .Values.prometheusRule.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "primus-claw.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- .Files.Get "alerts/delivery.rules.yaml" | nindent 2 }}
+{{- end }}

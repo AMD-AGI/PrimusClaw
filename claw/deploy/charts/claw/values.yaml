@@ -800,6 +800,19 @@ serviceMonitor:
   relabelings: []
   metricRelabelings: []
 
+# Prometheus Operator alert rules for delivery stalls (alerts/delivery.rules.yaml):
+# a queue whose oldest item has waited ten minutes, a connector whose events keep
+# failing, the event consumer retrying one message, a failing notification
+# receiver. Off by default because the monitoring.coreos.com CRDs may not be
+# installed; needs the API scraped (serviceMonitor above, or your own).
+prometheusRule:
+  enabled: false
+  # Leave empty to create it in the release namespace.
+  namespace: ""
+  # Extra labels, e.g. the release label a kube-prometheus-stack install uses
+  # to decide which rules it loads.
+  labels: {}
+
 # Grafana dashboards for the Brain metrics, shipped as ConfigMaps the Grafana
 # sidecar can discover. Off by default: the chart cannot tell whether a sidecar
 # is watching, and an unread 250KB ConfigMap in every namespace is worse than
