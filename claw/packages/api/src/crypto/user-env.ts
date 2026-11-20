@@ -93,6 +93,17 @@ export function encryptUserEnvValue(plaintext: string): string {
  *   - truncated blob
  *   - GCM auth-tag mismatch (tamper detection)
  */
+/**
+ * Whether `b64` is too short to be a sealed value at all, under any key.
+ *
+ * The one fault of a sealed value that is in its bytes alone. A tag that does
+ * not authenticate is not: it is also what a replica holding a different key
+ * sees, while a replica with the right key opens the same value.
+ */
+export function sealedValueTooShort(b64: string): boolean {
+  return Buffer.from(b64, "base64").length < 1 + NONCE_LEN + TAG_LEN;
+}
+
 export function decryptUserEnvValue(b64: string): string {
   const key = getKey();
   const blob = Buffer.from(b64, "base64");

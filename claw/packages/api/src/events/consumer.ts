@@ -47,8 +47,11 @@ import {
   markChatRunRunning, closeChatRun, gateNamesEndedTurnSql, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
 } from "../tasks/chat-run.js";
-import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
-import { applySealedCredentials } from "../tasks/run-secrets.js";
+import { dispatchPendingMessage } from "../tasks/pending-dispatch.js";
+import {
+  CREDENTIALS_UNREADABLE, quarantineUnsendablePending, recordPendingDrainFailure,
+} from "../tasks/pending-quarantine.js";
+import { applySealedCredentials, RunCredentialFault } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
 import { redactStoredText, redactStoredValue } from "@claw/utils";
 import pino from "pino";
@@ -1059,12 +1062,23 @@ async function turnOfChatRow(sessionId: string, taskId: string): Promise<string 
 /**
  * Put the pending row's sealed credentials on the task, or end that turn.
  *
- * A blob that will not open is permanent for the row that carries it, and the
- * throw used to escape `handleComplete`: the event was naked with
- * `processed_at` still null and redelivered every ten seconds, failing
- * identically, so one unreadable row wedged the drain for every session behind
- * it. Ended the way an admission refusal is instead -- the reader is told, the
- * queue entry goes -- because no retry can make the ciphertext readable.
+ * The throw used to escape `handleComplete` with nothing to bound it: the event
+ * was naked with `processed_at` still null and redelivered every ten seconds,
+ * failing identically, so one unreadable row wedged the drain for every session
+ * behind it.
+ *
+ * A blob no replica can open (`RunCredentialFault.permanent`: too short to be
+ * sealed, or opened to something that is not our JSON) is quarantined at once
+ * (tasks/pending-quarantine.ts): it leaves the queue, is counted, and the
+ * reader is told -- once, and by the sweeper if the notice cannot be published
+ * now. A row that cannot be moved is a failed drain like any other, raised to
+ * be counted on the row and retried.
+ *
+ * Any other failure to open it -- a tag that does not authenticate, a key not
+ * loaded -- is also what a replica with a stale or missing key sees while the
+ * other replicas open the same blob, so it is raised as a failed drain: counted
+ * on the row, retried by whichever replica drains next, and quarantined only
+ * once it has had its attempts.
  *
  * @returns whether the task is safe to dispatch.
  */
@@ -1077,19 +1091,18 @@ export async function applyPendingCredentials(
     applySealedCredentials(task, pending.credentials_blob);
     return true;
   } catch (err) {
-    logger.error({ err, sessionId: who.sessionId, pendingId: pending.id }, "pending.credentials_unreadable");
-    try {
-      await publishRefusedTurn({
-        sessionId: who.sessionId,
-        pendingId: pending.id,
-        userId: who.userId,
-        messageId: who.messageId,
-        prompt: pending.content ?? "",
-      } as never, "credentials_unreadable");
-      await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [pending.id]);
-    } catch (cleanupErr) {
-      logger.error({ err: cleanupErr, sessionId: who.sessionId, pendingId: pending.id }, "pending.abandon_failed");
-    }
+    const permanent = err instanceof RunCredentialFault && err.permanent;
+    logger.error(
+      { err, sessionId: who.sessionId, pendingId: pending.id, permanent },
+      "pending.credentials_unreadable",
+    );
+    if (!permanent) throw err;
+    await quarantineUnsendablePending({
+      sessionId: who.sessionId,
+      pendingId: Number(pending.id),
+      userId: who.userId,
+      content: pending.content ?? "",
+    }, err, CREDENTIALS_UNREADABLE);
     return false;
   }
 }
@@ -1729,6 +1742,30 @@ async function drainNextPendingMessage(sessionId: string, userId: string): Promi
 )).rows[0];
 
 if (pending) {
+  try {
+    await dispatchQueuedRow(sessionId, userId, pending);
+  } catch (err) {
+    // A failed send is counted on the row, and past its bound the row is moved
+    // out of the queue (tasks/pending-quarantine.ts). Until then the failure is
+    // raised exactly as before, for the nak or the next sweeper tick to retry;
+    // once the row has left, nothing is owed to it here and the drain claim
+    // goes straight on to the next message instead of failing the whole drain.
+    const verdict = await recordPendingDrainFailure({
+      sessionId, pendingId: Number(pending.id), userId: pending.user_id || userId,
+      content: typeof pending.content === "string" ? pending.content : "",
+    }, err);
+    if (verdict !== "quarantined") throw err;
+  }
+}
+}
+
+/** Send one queued row on: the body of a drain, once the row has been read. */
+async function dispatchQueuedRow(
+  sessionId: string,
+  userId: string,
+  pending: Record<string, any> & { id: number | string },
+): Promise<void> {
+  {
   // A review someone asked of the session's owner runs only while the owner still lets others act for them, asked now, and while its
   // turn budget has room; otherwise it is halted here and nothing is sent (`gateRequestedReviewTurn`).
   if (!(await (await import("../assistant/review-items.js")).gateRequestedReviewTurn(sessionId))) return;

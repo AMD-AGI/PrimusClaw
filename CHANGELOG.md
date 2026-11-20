@@ -184,6 +184,39 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw API: a queued message that can never be sent no longer holds every later message on its session behind it. A
+  message sent while the session is busy waits in that session's queue, and a drain sends only the oldest one; a
+  message whose dispatch failed every time (for example, one larger than NATS's `max_payload`) was retried on every
+  completion and every sweeper tick with no limit, and nothing after it was sent while the session read idle. Each
+  failed attempt is now counted on the queued row, and a message that has failed `PENDING_DRAIN_MAX_FAILURES` times
+  (default 5) over at least `PENDING_DRAIN_FAILURE_WINDOW_SEC` (default 600) is moved to the new
+  `claw_pending_messages_quarantine` table, with its text, sender and last error, and the next message is sent at once.
+  A failed attempt that only says NATS could not be reached (a `503`, a lost connection, or a timeout while NATS answers
+  nobody) is not counted, so a NATS outage of any length quarantines nothing: the queue waits and is sent in order once
+  NATS is back. A timeout while NATS answers everything else is the message's own and is counted, so a message whose
+  publish always times out is quarantined too. The session
+  is told once, in the turn the message would have been, that it was not sent and can be sent again; a notice that
+  cannot be published then is retried by the sweeper. An attempt NATS refused stored nothing, so it does not use up
+  the notice's attempts and the notice is retried until NATS is back; no attempt is made while NATS answers nobody,
+  and one that failed because NATS went away under it is not charged either; only once an attempt may have stored an event
+  without its acknowledgement is the notice retried for at most 30 minutes from that attempt, and given up on (logged
+  as `pending.quarantine_notice_abandoned`) after that. Each event of the notice is published under a stable id, and the
+  event stream's duplicate window is widened at start-up from the server's default of two minutes to one hour, so a
+  retry after a publish whose acknowledgement was lost does not show the user the notice twice. A message whose run may
+  still be delivered is never moved. A queued message whose sealed credentials are too short to be sealed, or open to
+  something that is not the credentials written, is quarantined at once (`credentials_unreadable`); one whose
+  credentials fail to authenticate under this replica's key, which a replica with a stale key sees while the others
+  open them, is retried like any other failure and quarantined only once it has had its attempts. Until now any such
+  failure refused and deleted the message on the first replica that could not open it. Quarantined messages are kept for `PENDING_QUARANTINE_RETENTION_DAYS` (default 30) and are deleted with their
+  session. The log line (`pending.drain_quarantined`) names the message and the error, never the text. New metrics:
+  `claw_api_pending_drain_failures_total`, `claw_api_pending_quarantined_total`,
+  `claw_api_pending_messages_consecutive_failures` (the longest failing streak of any queued message) and
+  `claw_api_pending_messages_oldest_age_seconds`. A publish the NATS client refuses as `MAX_PAYLOAD_EXCEEDED` is now
+  treated as certainly not sent, so the run row it opened is closed instead of left waiting for a delivery that never
+  happened. The API migrates the table and columns at start-up and refuses to start without them.
+- Claw API: a message whose text or request carries a NUL character or a lone UTF-16 surrogate is now queued with
+  U+FFFD in its place. PostgreSQL stores neither (TEXT refuses the NUL byte; `jsonb` refuses the `\u0000` escape and a
+  lone surrogate escape), so such a message used to be refused with a server error when the session was busy.
 - Claw: in the SaFE deployment mode with `LLM_KEY_SOURCE=platformKey`, a caller signed in with an `ak-` key (in
   `Authorization: Bearer`, `x-api-key` or a download URL) or a default session cookie has their email again:
   `GET /v1/me` answers it and the request's user carries it, as in 0.5.8. Since 0.5.9 the API no longer asked SaFE's
@@ -233,7 +266,6 @@ release version, and its `appVersion` stays `latest`.
   `500` that names nothing about the event (a deadlock, a lost database connection): a Claw that fails now and then
   would otherwise narrow the search onto an event that was fine, a turn's end as likely as any, and drop it. Events are also made storable where
   they are made, so a NUL an agent prints never reaches Claw.
-
 - Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its
   own run, the person is now told how it ended, once, in their language. Until now a review under the `fully_auto` mode
   that approved and merged closed its item silently: the person got only the generic "Run completed" notice and had to
