@@ -263,6 +263,13 @@ export async function publishRefusedTurn(
    * belonging to a sibling row that carries holder evidence.
    */
   taskId?: string,
+  /**
+   * Where an earlier, partly published attempt at this same refusal got to.
+   * Without it the refusal is published whole, which is right for a caller
+   * that tries once; a caller that retries passes it so a retry after a
+   * partial publish sends only what is still missing, never a second copy.
+   */
+  progress?: RefusedTurnProgress,
 ): Promise<void> {
   const finalText = failureReason === "workspace_bind_failed"
     ? "This message was not started: its workspace could not be prepared. "
@@ -278,21 +285,50 @@ export async function publishRefusedTurn(
     ...(taskId ? { task_id: taskId } : {}),
     ...event,
   });
-  await pendingDispatchPorts.publishSessionEvent(input.sessionId, of({
-    type: "AssistantMessage",
-    data: { content: [{ type: "text", text: finalText }] },
-  }));
-  await pendingDispatchPorts.publishSessionEvent(input.sessionId, of({ type: "ResultMessage" }));
-  await pendingDispatchPorts.publishSessionEvent(input.sessionId, of({
-    type: "exec_complete",
-    user_id: input.userId,
-    prompt: input.prompt,
-    final_text: finalText,
-    failed: true,
-    failure_reason: failureReason,
-    error_count: 0,
-    skills_used: {},
-  }));
+  const sequence = [
+    of({
+      type: "AssistantMessage",
+      data: { content: [{ type: "text", text: finalText }] },
+    }),
+    of({ type: "ResultMessage" }),
+    of({
+      type: "exec_complete",
+      user_id: input.userId,
+      prompt: input.prompt,
+      final_text: finalText,
+      failed: true,
+      failure_reason: failureReason,
+      error_count: 0,
+      skills_used: {},
+    }),
+  ];
+  for (let i = Math.max(0, progress?.published ?? 0); i < sequence.length; i++) {
+    await pendingDispatchPorts.publishSessionEvent(
+      input.sessionId,
+      sequence[i],
+      progress ? `${progress.dedupeKey}:${i}` : undefined,
+    );
+    if (progress) await progress.record(i + 1);
+  }
+}
+
+/**
+ * How far a retried refusal has got, for `publishRefusedTurn`.
+ *
+ * Two guards, because each covers what the other cannot. `published` is the
+ * durable count of events already out, recorded after each one, so a retry
+ * minutes later resumes after them. A publish that reached the stream and then
+ * failed to acknowledge, or whose count could not be recorded, is not in that
+ * count; `dedupeKey` names every event, so the stream drops that one event's
+ * second copy when the retry comes inside its duplicate window.
+ */
+export interface RefusedTurnProgress {
+  /** Events of this refusal already published, in order: 0 to 3. */
+  published: number;
+  /** Record that the first `count` events are out. */
+  record(count: number): Promise<void>;
+  /** Stable per refusal; each event is published under `<dedupeKey>:<index>`. */
+  dedupeKey: string;
 }
 
 /**

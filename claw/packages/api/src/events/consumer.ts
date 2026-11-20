@@ -47,8 +47,10 @@ import {
   markChatRunRunning, closeChatRun, gateNamesEndedTurnSql, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
 } from "../tasks/chat-run.js";
-import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
-import { recordPendingDrainFailure } from "../tasks/pending-quarantine.js";
+import { dispatchPendingMessage } from "../tasks/pending-dispatch.js";
+import {
+  CREDENTIALS_UNREADABLE, quarantineUnsendablePending, recordPendingDrainFailure,
+} from "../tasks/pending-quarantine.js";
 import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
 import { redactStoredValue } from "@claw/utils";
@@ -870,8 +872,11 @@ async function turnOfChatRow(sessionId: string, taskId: string): Promise<string 
  * throw used to escape `handleComplete`: the event was naked with
  * `processed_at` still null and redelivered every ten seconds, failing
  * identically, so one unreadable row wedged the drain for every session behind
- * it. Ended the way an admission refusal is instead -- the reader is told, the
- * queue entry goes -- because no retry can make the ciphertext readable.
+ * it. No retry can make the ciphertext readable, so the row is quarantined at
+ * once (tasks/pending-quarantine.ts): it leaves the queue, is counted, and the
+ * reader is told -- once, and by the sweeper if the notice cannot be published
+ * now. A row that cannot be moved is a failed drain like any other, raised to
+ * be counted on the row and retried.
  *
  * @returns whether the task is safe to dispatch.
  */
@@ -885,18 +890,12 @@ export async function applyPendingCredentials(
     return true;
   } catch (err) {
     logger.error({ err, sessionId: who.sessionId, pendingId: pending.id }, "pending.credentials_unreadable");
-    try {
-      await publishRefusedTurn({
-        sessionId: who.sessionId,
-        pendingId: pending.id,
-        userId: who.userId,
-        messageId: who.messageId,
-        prompt: pending.content ?? "",
-      } as never, "credentials_unreadable");
-      await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [pending.id]);
-    } catch (cleanupErr) {
-      logger.error({ err: cleanupErr, sessionId: who.sessionId, pendingId: pending.id }, "pending.abandon_failed");
-    }
+    await quarantineUnsendablePending({
+      sessionId: who.sessionId,
+      pendingId: Number(pending.id),
+      userId: who.userId,
+      content: pending.content ?? "",
+    }, err, CREDENTIALS_UNREADABLE);
     return false;
   }
 }

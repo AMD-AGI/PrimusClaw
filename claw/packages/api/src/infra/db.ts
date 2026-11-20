@@ -707,6 +707,11 @@ export function pendingQuarantineSchemaSql(): string[] {
        notice_attempts  INTEGER NOT NULL DEFAULT 0,
        notice_claimed_at TIMESTAMPTZ
      )`,
+    // How many of the notice's events are already out, so a retried notice
+    // resumes after them instead of repeating them; and which refusal the
+    // notice is, so a retry says what the first attempt would have said.
+    `ALTER TABLE ${PENDING_QUARANTINE_TABLE} ADD COLUMN IF NOT EXISTS notice_events INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE ${PENDING_QUARANTINE_TABLE} ADD COLUMN IF NOT EXISTS failure_reason TEXT`,
     `CREATE INDEX IF NOT EXISTS idx_pending_quarantine_session
        ON ${PENDING_QUARANTINE_TABLE}(session_id)`,
   ];

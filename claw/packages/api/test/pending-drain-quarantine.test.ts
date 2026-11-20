@@ -27,6 +27,12 @@
  *   Q7 a message with a NUL or a lone surrogate is queued, not refused, and the
  *      database itself refuses the raw value
  *   Q8 a deleted session takes its quarantined messages with it
+ *   Q9 a notice that failed part-way is finished on retry, never repeated:
+ *      every event reaches the session exactly once
+ *   Q10 a message whose sealed credentials will not open is quarantined and
+ *      counted at once, even when its notice cannot be published, and the
+ *      message behind it is sent
+ *   Q11 one whose move the database refuses is a counted, retried drain failure
  *
  * Skipped without DATABASE_URL, and a skip is not a pass: CI sets it.
  */
@@ -67,6 +73,10 @@ describe("a queued message that cannot be sent", { skip }, () => {
   let natsDownFor: number;
   /** Whether a session-event publish should fail. */
   let eventsDown: boolean;
+  /** Event types whose next publish fails; `lost` reaches the stream but its acknowledgement does not. */
+  let failNext: Map<string, "refused" | "lost">;
+  /** The deduplication id each session event was published under. */
+  let eventIds: Array<string | undefined>;
   let seq: number;
 
   const rows = async (text: string, params: unknown[] = []) =>
@@ -94,6 +104,8 @@ describe("a queued message that cannot be sent", { skip }, () => {
     events = [];
     natsDownFor = 0;
     eventsDown = false;
+    failNext = new Map();
+    eventIds = [];
     seq = 1000 + Math.floor(Math.random() * 1_000_000);
     Object.assign(dispatch.pendingDispatchPorts, originalPorts, {
       // The fat branch: the turn itself is the payload, so its size is what the
@@ -111,9 +123,14 @@ describe("a queued message that cannot be sent", { skip }, () => {
         published.push(JSON.parse(payload));
         return published.length;
       },
-      async publishSessionEvent(_sessionId: string, event: Record<string, unknown>): Promise<void> {
+      async publishSessionEvent(_sessionId: string, event: Record<string, unknown>, msgId?: string): Promise<void> {
         if (eventsDown) throw Object.assign(new Error("503 no responders"), { code: "503" });
+        const failure = failNext.get(String(event.type));
+        failNext.delete(String(event.type));
+        if (failure === "refused") throw Object.assign(new Error("503 no responders"), { code: "503" });
         events.push(event);
+        eventIds.push(msgId);
+        if (failure === "lost") throw Object.assign(new Error("TIMEOUT"), { code: "TIMEOUT" });
       },
     });
     Object.assign(quarantine.pendingQuarantinePorts, originalQuarantinePorts);
@@ -431,5 +448,144 @@ describe("a queued message that cannot be sent", { skip }, () => {
     const { commitSessionDeletion } = await import("../src/sessions/teardown.js");
     assert.equal(await commitSessionDeletion(SESSION), true);
     assert.equal((await rows("SELECT 1 FROM claw_pending_messages_quarantine WHERE session_id = $1", [SESSION])).length, 0);
+  });
+
+  /** Quarantine a poison message the way Q1 does, with whatever the event publishes are set to do. */
+  async function quarantinePoison(): Promise<number> {
+    const poisonId = await enqueue("p".repeat(MAX_PAYLOAD + 10));
+    await enqueue("the message behind it");
+    await completeRunningTurn();
+    await sweep();
+    await sweep();
+    await windowPasses(poisonId);
+    await sweep();
+    return poisonId;
+  }
+
+  /** Deliver every event published so far through the consumer, and count what it stored for one message. */
+  async function storedEvents(messageId: string): Promise<Record<string, number>> {
+    for (const event of events) await deliver(event);
+    const stored = await rows(
+      `SELECT event, COUNT(*)::int AS n FROM claw_session_events
+        WHERE session_id = $1 AND data->>'message_id' = $2 GROUP BY event`,
+      [SESSION, messageId],
+    );
+    return Object.fromEntries(stored.map((r) => [r.event, r.n]));
+  }
+
+  test("Q9 a notice that failed part-way is finished on retry, and nothing in it is sent twice", async () => {
+    // The reply went out; the publish after it was refused.
+    failNext.set("ResultMessage", "refused");
+    const poisonId = await quarantinePoison();
+    const messageId = `claw-pending-${poisonId}`;
+    assert.deepEqual(prompts(), ["the message behind it"]);
+    let [held] = await rows("SELECT notified_at, notice_events FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
+    assert.equal(held.notified_at, null, "an unfinished notice is left for the sweeper");
+    assert.equal(held.notice_events, 1, "and what of it went out is recorded");
+
+    // The next attempt: this time the publish reaches the stream and its
+    // acknowledgement is lost, so the attempt fails having sent it.
+    failNext.set("ResultMessage", "lost");
+    await rows("UPDATE claw_pending_messages_quarantine SET quarantined_at = NOW() - INTERVAL '2 minutes'");
+    assert.equal(await quarantine.retryQuarantineNotices(), 0);
+    [held] = await rows("SELECT notified_at, notice_events FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
+    assert.equal(held.notice_events, 1, "an unacknowledged publish is not counted as out");
+
+    // And the one after that finishes it.
+    await rows("UPDATE claw_pending_messages_quarantine SET notice_claimed_at = NOW() - INTERVAL '2 minutes'");
+    assert.equal(await quarantine.retryQuarantineNotices(), 1);
+    [held] = await rows("SELECT notified_at, notice_events FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
+    assert.ok(held.notified_at);
+    assert.equal(held.notice_events, 3);
+
+    const mine = events.map((e, i) => ({ type: e.type, id: eventIds[i], messageId: e.message_id }))
+      .filter((e) => e.messageId === messageId);
+    assert.deepEqual(mine.map((e) => e.type), ["AssistantMessage", "ResultMessage", "ResultMessage", "exec_complete"],
+      "the reply is never repeated; only the publish whose acknowledgement was lost is sent again");
+    const key = `claw_pending_messages_quarantine:${poisonId}`;
+    assert.deepEqual(mine.map((e) => e.id), [`${key}:0`, `${key}:1`, `${key}:1`, `${key}:2`],
+      "under the same id each time, which the event stream drops as a duplicate");
+
+    // What the session keeps, through the real consumer: one reply and one completion.
+    const stored = await storedEvents(messageId);
+    assert.equal(stored.AssistantMessage, 1, "the user is told once");
+    assert.equal(stored.exec_complete, 1);
+  });
+
+  /** Queue a message whose sealed credentials will not open, as a truncated blob reads. */
+  async function enqueueUnreadable(content: string): Promise<number> {
+    const id = await enqueue(content);
+    await rows("UPDATE claw_pending_messages SET credentials_blob = 'dHJ1bmNhdGVk' WHERE id = $1", [id]);
+    return id;
+  }
+
+  test("Q10 unreadable credentials quarantine the message at once and count it, even when the notice fails", async () => {
+    const badId = await enqueueUnreadable("sealed with a key that is gone");
+    await enqueue("the message behind it");
+    const failuresBefore = await counter("claw_api_pending_drain_failures_total");
+    const quarantinedBefore = await counter("claw_api_pending_quarantined_total");
+    eventsDown = true;
+
+    const delivered = await completeRunningTurn();
+    assert.equal(delivered.acks, 1, "the completion is handled, not redelivered");
+    assert.deepEqual(await queue(), [], "the unreadable message left the queue");
+    assert.deepEqual(prompts(), ["the message behind it"], "and the message behind it was sent");
+    const [held] = await rows("SELECT * FROM claw_pending_messages_quarantine WHERE id = $1", [badId]);
+    assert.ok(held, "kept, not dropped");
+    assert.equal(held.content, "sealed with a key that is gone");
+    assert.equal(held.failure_reason, "credentials_unreadable");
+    assert.equal(held.attempts, 1);
+    assert.ok(held.last_error);
+    assert.equal(held.notified_at, null);
+    assert.equal(await counter("claw_api_pending_quarantined_total") - quarantinedBefore, 1);
+    assert.equal(await counter("claw_api_pending_drain_failures_total") - failuresBefore, 1);
+    assert.equal(notices().length, 0);
+
+    // The sweeper gives the notice, once, as the refusal it is.
+    eventsDown = false;
+    await rows("UPDATE claw_pending_messages_quarantine SET quarantined_at = NOW() - INTERVAL '2 minutes'");
+    assert.equal(await quarantine.retryQuarantineNotices(), 1);
+    await rows("UPDATE claw_pending_messages_quarantine SET notice_claimed_at = NOW() - INTERVAL '1 hour'");
+    assert.equal(await quarantine.retryQuarantineNotices(), 0);
+    const told = notices();
+    assert.equal(told.length, 1);
+    assert.equal(told[0].message_id, `claw-pending-${badId}`);
+    assert.equal(told[0].failure_reason, "credentials_unreadable");
+    const stored = await storedEvents(`claw-pending-${badId}`);
+    assert.equal(stored.AssistantMessage, 1);
+    assert.equal(stored.exec_complete, 1);
+  });
+
+  test("Q11 unreadable credentials that cannot be moved are a counted, retried failure", async () => {
+    const badId = await enqueueUnreadable("the head");
+    const goodId = await enqueue("the message behind it");
+    const quarantinedBefore = await counter("claw_api_pending_quarantined_total");
+    // The database refuses the move itself, the way any failed statement would.
+    await rows(
+      `ALTER TABLE claw_pending_messages_quarantine
+         ADD CONSTRAINT q11_refuse CHECK (failure_reason IS DISTINCT FROM 'credentials_unreadable') NOT VALID`,
+    );
+    try {
+      const delivered = await completeRunningTurn();
+      assert.equal(delivered.naks, 1, "raised for a retry, as a failed drain is");
+      const q = await queue();
+      assert.deepEqual(q.map((r) => r.id), [badId, goodId], "still at the head, nothing behind it moved");
+      assert.equal(q[0].drain_failures, 1, "and the failure is counted on the row");
+      assert.match(q[0].drain_last_error, /23514|q11_refuse/);
+      assert.equal((await rows("SELECT 1 FROM claw_pending_messages_quarantine")).length, 0);
+      assert.equal(events.length, 0, "nobody is told of a refusal that did not happen");
+    } finally {
+      await rows("ALTER TABLE claw_pending_messages_quarantine DROP CONSTRAINT q11_refuse");
+    }
+
+    // The next drain moves it and goes on.
+    await sweep();
+    assert.deepEqual(await queue(), []);
+    assert.deepEqual(prompts(), ["the message behind it"]);
+    const [held] = await rows("SELECT attempts, notified_at FROM claw_pending_messages_quarantine WHERE id = $1", [badId]);
+    assert.equal(held.attempts, 2, "both attempts are on the record");
+    assert.ok(held.notified_at);
+    assert.equal(await counter("claw_api_pending_quarantined_total") - quarantinedBefore, 1);
+    assert.equal(notices().length, 1);
   });
 });

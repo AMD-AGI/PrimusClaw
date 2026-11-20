@@ -142,6 +142,41 @@ export async function recordPendingDrainFailure(
   return (await quarantinePendingMessage(row)) ? "quarantined" : "retry";
 }
 
+/** Why a queued message whose sealed credentials will not open is refused. */
+export const CREDENTIALS_UNREADABLE = "credentials_unreadable";
+
+/**
+ * Quarantine a queued message that can never be sent, at once, and tell the
+ * session: a sealed-credentials blob that will not open is permanent for the
+ * row that carries it, so no count or window is waited for.
+ *
+ * The same move and the same notice as a message that ran out of attempts, so
+ * the same guarantees hold: the row leaves the queue in one statement, the
+ * quarantine counter sees it, and the notice is given once and retried by the
+ * sweeper if it cannot be published now.
+ *
+ * @throws when the row could not be moved -- the statement failed, or a run the
+ *         row reserved is still open -- so the caller's drain fails the way any
+ *         failed drain does, is counted on the row and is retried.
+ */
+export async function quarantineUnsendablePending(
+  row: FailedPendingRow,
+  err: unknown,
+  failureReason: string,
+): Promise<void> {
+  metrics.onPendingDrainFailure();
+  const error = drainErrorSummary(err, row.content);
+  const messageId = queuedMessageId(row.pendingId);
+  const moved = await moveToQuarantine(row.pendingId, messageId, { error, failureReason });
+  if (!moved) {
+    throw Object.assign(
+      new Error(`queued message ${row.pendingId} is unsendable (${failureReason}) and its reserved run is still open`),
+      { code: "QUARANTINE_DEFERRED" },
+    );
+  }
+  await afterQuarantine(row, messageId, moved, failureReason);
+}
+
 /**
  * Move the row out of the queue and tell the session.
  *
@@ -158,7 +193,7 @@ export async function recordPendingDrainFailure(
  */
 async function quarantinePendingMessage(row: FailedPendingRow): Promise<boolean> {
   const messageId = queuedMessageId(row.pendingId);
-  let moved: { attempts: number; last_error: string | null; queued_for_sec: number } | undefined;
+  let moved: MovedRow | undefined;
   try {
     moved = await moveToQuarantine(row.pendingId, messageId);
   } catch (err) {
@@ -174,6 +209,17 @@ async function quarantinePendingMessage(row: FailedPendingRow): Promise<boolean>
     logger.warn({ sessionId: row.sessionId, pendingId: row.pendingId }, "pending.quarantine_deferred");
     return false;
   }
+  await afterQuarantine(row, messageId, moved, PENDING_DRAIN_QUARANTINED);
+  return true;
+}
+
+/** What follows a move that took the row: the counter, the page, and the notice. */
+async function afterQuarantine(
+  row: FailedPendingRow,
+  messageId: string,
+  moved: MovedRow,
+  failureReason: string,
+): Promise<void> {
   metrics.onPendingQuarantined();
   // The durable record is the row; this line is for whoever is paged. It names
   // the message and why it failed, and never what it said.
@@ -181,21 +227,30 @@ async function quarantinePendingMessage(row: FailedPendingRow): Promise<boolean>
     {
       sessionId: row.sessionId, pendingId: row.pendingId, messageId,
       attempts: moved.attempts, queuedForSec: moved.queued_for_sec, error: moved.last_error,
+      failureReason,
     },
     "pending.drain_quarantined",
   );
   await noticeQuarantined({
     id: row.pendingId, session_id: row.sessionId, user_id: row.userId, message_id: messageId,
-    content: row.content,
+    content: row.content, notice_events: 0, failure_reason: failureReason,
   });
-  return true;
 }
 
-/** The move itself: one statement, so the row is in exactly one of the two tables. */
+type MovedRow = { attempts: number; last_error: string | null; queued_for_sec: number };
+
+/**
+ * The move itself: one statement, so the row is in exactly one of the two tables.
+ *
+ * `immediate` is the failure that quarantines without waiting for its bounds:
+ * it is counted as one more attempt and recorded as the last error, since the
+ * row's own counters have not seen it.
+ */
 async function moveToQuarantine(
   pendingId: number,
   messageId: string,
-): Promise<{ attempts: number; last_error: string | null; queued_for_sec: number } | undefined> {
+  immediate?: { error: string; failureReason: string },
+): Promise<MovedRow | undefined> {
   return (await db.query(
     `WITH moved AS (
        DELETE FROM claw_pending_messages p
@@ -208,13 +263,15 @@ async function moveToQuarantine(
                  p.drain_first_failed_at, p.drain_failures, p.drain_last_error
      )
      INSERT INTO ${PENDING_QUARANTINE_TABLE}
-       (id, session_id, user_id, message_id, content, queued_at, first_failed_at, attempts, last_error)
-     SELECT id, session_id, user_id, $2, content, created_at, drain_first_failed_at, drain_failures, drain_last_error
+       (id, session_id, user_id, message_id, content, queued_at, first_failed_at, attempts, last_error,
+        failure_reason)
+     SELECT id, session_id, user_id, $2, content, created_at, COALESCE(drain_first_failed_at, NOW()),
+            drain_failures + $3, COALESCE($4, drain_last_error), $5
        FROM moved
      ON CONFLICT (id) DO NOTHING
      RETURNING id, attempts, last_error, EXTRACT(EPOCH FROM (NOW() - queued_at))::int AS queued_for_sec`,
-    [pendingId, messageId],
-  )).rows[0] as { attempts: number; last_error: string | null; queued_for_sec: number } | undefined;
+    [pendingId, messageId, immediate ? 1 : 0, immediate?.error ?? null, immediate?.failureReason ?? PENDING_DRAIN_QUARANTINED],
+  )).rows[0] as MovedRow | undefined;
 }
 
 interface QuarantinedRow {
@@ -223,6 +280,10 @@ interface QuarantinedRow {
   user_id: string | null;
   message_id: string;
   content: string;
+  /** Events of the notice already published; a retry resumes after them. */
+  notice_events: number;
+  /** The refusal the notice is; null on a row written before the column existed. */
+  failure_reason: string | null;
 }
 
 /**
@@ -230,10 +291,14 @@ interface QuarantinedRow {
  * been, ended the way a refused queued turn ends (`publishRefusedTurn`), so the
  * user sees their message and the reply that says it can be sent again.
  *
- * Once. A completion already recorded for this message id is a notice already
- * given -- by an earlier attempt whose stamp below was lost -- and is stamped
- * rather than sent again. A notice that cannot be published now is left
- * unstamped for `retryQuarantineNotices`.
+ * Once. The notice is three events published in turn, and an attempt can fail
+ * after the first or second is out; so each event is recorded on the row as it
+ * goes (`notice_events`) and a retry publishes only the ones still missing,
+ * each under a stable id the event stream deduplicates on, for the publish
+ * that went out but was not recorded. A completion already recorded for this
+ * message id is a notice already given -- by an earlier attempt whose stamp
+ * below was lost -- and is stamped rather than sent again. A notice that cannot
+ * be published now is left unstamped for `retryQuarantineNotices`.
  */
 async function noticeQuarantined(row: QuarantinedRow): Promise<boolean> {
   try {
@@ -248,7 +313,16 @@ async function noticeQuarantined(row: QuarantinedRow): Promise<boolean> {
         messageId: row.message_id,
         prompt,
         task: {},
-      }, PENDING_DRAIN_QUARANTINED);
+      }, row.failure_reason ?? PENDING_DRAIN_QUARANTINED, undefined, {
+        published: Number(row.notice_events ?? 0),
+        dedupeKey: `${PENDING_QUARANTINE_TABLE}:${row.id}`,
+        async record(count: number): Promise<void> {
+          await db.query(
+            `UPDATE ${PENDING_QUARANTINE_TABLE} SET notice_events = GREATEST(notice_events, $2) WHERE id = $1`,
+            [row.id, count],
+          );
+        },
+      });
     }
     await db.query(
       `UPDATE ${PENDING_QUARANTINE_TABLE} SET notified_at = NOW() WHERE id = $1 AND notified_at IS NULL`,
@@ -285,7 +359,8 @@ export async function retryQuarantineNotices(limit = 20): Promise<number> {
          ORDER BY quarantined_at
          LIMIT $3
          FOR UPDATE SKIP LOCKED)
-      RETURNING q.id, q.session_id, q.user_id, q.message_id, q.content, q.notice_attempts`,
+      RETURNING q.id, q.session_id, q.user_id, q.message_id, q.content, q.notice_attempts,
+                q.notice_events, q.failure_reason`,
     [NOTICE_MAX_ATTEMPTS, NOTICE_CLAIM_SEC, limit],
   )).rows as Array<QuarantinedRow & { notice_attempts: number }>;
   let sent = 0;

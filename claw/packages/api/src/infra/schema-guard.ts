@@ -160,6 +160,9 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: [
       "id", "session_id", "user_id", "message_id", "content", "attempts", "last_error",
       "notified_at", "notice_attempts", "notice_claimed_at",
+      // Absent, a notice retried after a partial publish repeats what was
+      // already sent.
+      "notice_events", "failure_reason",
     ],
   },
   {

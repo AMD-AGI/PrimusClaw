@@ -30,11 +30,21 @@ export function sanitizeSessionEvent(event: Record<string, unknown>): Record<str
   return redactPublicJson(event) as Record<string, unknown>;
 }
 
-/** Publish an event to NATS JetStream for persistence + SSE delivery. */
-export async function publishEvent(sessionId: string, event: Record<string, unknown>): Promise<void> {
+/**
+ * Publish an event to NATS JetStream for persistence + SSE delivery.
+ *
+ * `msgId`, when given, is the stream's deduplication id: a second publish under
+ * it inside the stream's duplicate window is acknowledged and dropped, which is
+ * what makes a retried publish whose first acknowledgement was lost safe.
+ */
+export async function publishEvent(
+  sessionId: string,
+  event: Record<string, unknown>,
+  msgId?: string,
+): Promise<void> {
   const subject = eventSubject(sessionId);
   const payload = sc.encode(JSON.stringify(event));
-  await js.publish(subject, payload);
+  await js.publish(subject, payload, msgId ? { msgID: msgId } : undefined);
 }
 
 // Ephemeral SSE consumer auto-GC threshold. NATS server deletes the consumer
