@@ -14,7 +14,7 @@ import test, { after, describe } from "node:test";
 import { HttpError, TransportError } from "../src/claw-client.js";
 import type { OutEvent } from "../src/outbox.js";
 import { quarantineFile } from "../src/paths.js";
-import { ISOLATE_AFTER_FAILURES, mayBeContent, PoisonFinder, SET_ASIDE_AFTER_REFUSALS } from "../src/poison.js";
+import { failureKind, ISOLATE_AFTER_FAILURES, mayBeContent, PoisonFinder, SET_ASIDE_AFTER_REFUSALS, type PoisonPlan } from "../src/poison.js";
 import { storableDeep, storableText } from "../src/redact.js";
 import { sleep, type Logger } from "../src/util.js";
 import { Harness } from "./support/harness.js";
@@ -85,13 +85,13 @@ describe("an event Claw cannot take", () => {
     // The quarantine file is written off the event loop: a moment later.
     const q = await h.claw.until("the quarantine record", () => quarantined(h).length > 0 && quarantined(h));
     assert.equal(q.length, 1);
-    assert.deepEqual({ ...q[0], at: undefined }, { at: undefined, session_id: sid, seq: bad.seq, type: "tool_call_update", reason: "http_500_Internal Server Error" });
+    assert.deepEqual({ ...q[0], at: undefined }, { at: undefined, session_id: sid, seq: bad.seq, type: "tool_call_update", reason: "http_500_22023" });
     const file = fs.readFileSync(quarantineFile(h.dirs), "utf8");
     assert.ok(!file.includes("private-output-text") && !file.includes("poison"), "no content in the quarantine file");
     assert.equal((fs.statSync(quarantineFile(h.dirs)).mode & 0o777).toString(8), "600");
     const told = warned.filter((w) => /set aside/.test(w.msg));
     assert.equal(told.length, 1, "logged once");
-    assert.deepEqual(told[0]!.extra, { session_id: sid, seq: bad.seq, type: "tool_call_update", reason: "http_500_Internal Server Error" });
+    assert.deepEqual(told[0]!.extra, { session_id: sid, seq: bad.seq, type: "tool_call_update", reason: "http_500_22023" });
     assert.ok(!JSON.stringify(warned).includes("private-output-text"), "no content in the log");
     assert.ok(h.audit().some((a) => a.kind === "event_quarantined" && a.seq === bad.seq));
     // It was found by splitting: the post that set it aside held it alone.
@@ -141,8 +141,8 @@ describe("an event Claw cannot take", () => {
     await h.connector.drained();
     h.claw.failAllPosts = true;
     h.prompt(sid, "chunks 40");
-    // Long enough to split down to one event and ask, with an empty post, whether Claw answers: it does not.
-    await h.claw.until("an empty post to be refused", () => h.claw.posts.some((p) => p.status === 500 && p.events.length === 0));
+    // Long enough to split down to one event, which a 500 that names nothing never sets aside.
+    await h.claw.until("a post of one event to be refused", () => h.claw.posts.some((p) => p.status === 500 && p.events.length === 1), 15_000);
     await sleep(300);
     h.claw.failAllPosts = false;
     await h.turnEnd(sid, 2);
@@ -155,12 +155,66 @@ describe("an event Claw cannot take", () => {
   });
 });
 
+describe("a Claw that answers 500 now and then", () => {
+  test("never sets an event aside: half the posts fail with a 500 that names no event, and every event still arrives, in order", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const other = await h.newSession();
+    await h.connector.drained();
+    const rnd = seeded(7);
+    h.claw.flaky = () => rnd() < 0.5;
+    for (let round = 1; round <= 3; round++) {
+      h.prompt(sid, "chunks 25");
+      h.prompt(other, "chunks 25");
+      await h.turnEnd(sid, round);
+      await h.turnEnd(other, round);
+    }
+    h.claw.flaky = null;
+    assert.equal(await h.connector.drained(), true);
+    const want = Array.from({ length: 3 }, () => Array.from({ length: 25 }, (_, i) => `c${i + 1}`)).flat();
+    assert.deepEqual([h.messages(sid), h.messages(other)], [want, want], "every chunk, and every turn's end");
+    for (const s of [sid, other]) {
+      const seqs = h.claw.eventsOf(s).map((e) => e.seq);
+      assert.deepEqual(seqs, Array.from({ length: seqs.length }, (_, i) => i + 1), "contiguous from 1: nothing set aside");
+    }
+    assert.ok(h.claw.posts.filter((p) => p.status === 500).length >= 10, "the 500s really came");
+    assert.deepEqual(quarantined(h), []);
+    assert.equal(h.audit().some((a) => a.kind === "event_quarantined"), false);
+    inSessionOrder(h);
+  });
+  test("a burst of such 500s, long enough to split a batch down to one event, sets nothing aside: the turn's end arrives", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    await h.connector.drained();
+    let burst = 30;
+    h.claw.flaky = () => burst-- > 0;
+    h.prompt(sid, "chunks 30");
+    await h.claw.until("the burst to end", () => burst < 0, 20_000);
+    await h.turnEnd(sid);
+    assert.equal(await h.connector.drained(), true);
+    assert.deepEqual(h.messages(sid), Array.from({ length: 30 }, (_, i) => `c${i + 1}`));
+    assert.ok(h.claw.posts.some((p) => p.status === 500 && p.events.length === 1), "the batch was split down to one event");
+    const seqs = h.claw.eventsOf(sid).map((e) => e.seq);
+    assert.deepEqual(seqs, Array.from({ length: seqs.length }, (_, i) => i + 1), "contiguous from 1: nothing set aside");
+    assert.deepEqual(quarantined(h), []);
+    inSessionOrder(h);
+  });
+});
+
 describe("PoisonFinder", () => {
   const evs = (n: number): OutEvent[] => Array.from({ length: n }, (_, i) => ({ session_id: "s", seq: i + 1, type: "t", ts: 0, data: { i } }));
-  const e500 = new HttpError(500, "Internal Server Error", "/events");
+  /** A 500 the database gave for a value it cannot hold (22P05: a NUL in jsonb), and one that names nothing (a deadlock). */
+  const e500 = new HttpError(500, "Internal Server Error", "/events", "22P05");
+  const plain500 = new HttpError(500, "Internal Server Error", "/events", "40P01");
   const all = () => true;
 
   test("which failures may be about what a post carried", () => {
+    assert.equal(failureKind(e500), "content");
+    assert.equal(failureKind(new HttpError(500, "x", "/e", "54000")), "content", "a value too large");
+    for (const e of [plain500, new HttpError(500, "Internal Server Error", "/e"), new HttpError(500, "x", "/e", "XX000")]) {
+      assert.equal(failureKind(e), "unknown", e.message);
+      assert.equal(mayBeContent(e), true, "may split a batch");
+    }
     assert.equal(mayBeContent(e500), true);
     for (const s of [400, 413, 422]) assert.equal(mayBeContent(new HttpError(s, "x", "/e")), true, String(s));
     for (const s of [401, 403, 404, 408, 409, 429, 502, 503, 504]) assert.equal(mayBeContent(new HttpError(s, "x", "/e")), false, String(s));
@@ -215,6 +269,68 @@ describe("PoisonFinder", () => {
     assert.equal(f.isolating, false, "two failures of one head and one of another are not three in a row");
   });
 
+  test("a 500 that names no event splits a batch but never sets the event it narrows to aside, however often it comes", () => {
+    const q = evs(4);
+    const f = new PoisonFinder();
+    for (let i = 0; i < ISOLATE_AFTER_FAILURES; i++) f.failed(f.plan(q, all), plain500);
+    assert.equal(f.isolating, true, "split, which costs only smaller posts");
+    let plan = f.plan(q, all);
+    for (let i = 0; i < 5 && !plan.storable; i++) { f.failed(plan, plain500); plan = f.plan(q, all); }
+    assert.deepEqual([plan.storable, plan.events.map((e) => e.seq)], [true, [1]]);
+    for (let i = 0; i < 20; i++) assert.equal(f.failed(f.plan(q, all), plain500), "retry", "no probe, so never set aside");
+    // A refusal the database names, then a plain 500, then one more: not two in a row.
+    assert.equal(f.failed(f.plan(q, all), e500), "probe");
+    assert.equal(f.probed(true), "retry");
+    assert.equal(f.failed(f.plan(q, all), plain500), "retry");
+    assert.equal(f.failed(f.plan(q, all), e500), "probe");
+    assert.equal(f.probed(true), "retry", "the count started again");
+    assert.equal(f.failed(f.plan(q, all), e500), "probe");
+    assert.equal(f.probed(true), "set_aside");
+  });
+
+  // The sender's loop, run against a Claw that fails a share of posts with a 500 that names nothing, an empty post too.
+  const simulate = (p: number, rnd: () => number, poison: Set<number>, n = 60) => {
+    const queued = evs(n);
+    const f = new PoisonFinder();
+    const setAside: number[] = [];
+    const delivered: number[] = [];
+    const post = (pl: PoisonPlan): unknown => {
+      if (rnd() < p) return plain500;
+      if (pl.events.some((e) => poison.has(e.seq))) return e500;
+      return null;
+    };
+    for (let steps = 0; queued.length > 0; steps++) {
+      assert.ok(steps < 10_000, "the loop ends");
+      const plan = f.plan(queued.slice(0, 20), (e) => queued.includes(e));
+      const err = post(plan);
+      if (!err) {
+        f.taken(plan);
+        for (const e of plan.events) { delivered.push(e.seq); queued.splice(queued.indexOf(queued.find((x) => x.seq === e.seq)!), 1); }
+        continue;
+      }
+      let v = f.failed(plan, err);
+      if (v === "probe") v = f.probed(rnd() >= p);
+      if (v === "set_aside") { const ev = plan.events[0]!; f.setAside(); setAside.push(ev.seq); queued.splice(queued.findIndex((x) => x.seq === ev.seq), 1); }
+    }
+    return { setAside, delivered };
+  };
+
+  test("simulated: 500s that name nothing, at 20% and at 50% of posts, never cost an event; an event the database refuses still goes aside", () => {
+    const rnd = seeded(42);
+    for (const p of [0, 0.2, 0.5]) {
+      for (let run = 0; run < 200; run++) {
+        const { setAside, delivered } = simulate(p, rnd, new Set());
+        assert.deepEqual(setAside, [], `p=${p} run ${run}: a fine event was set aside`);
+        assert.deepEqual(delivered, Array.from({ length: 60 }, (_, i) => i + 1), "all of them, in order");
+      }
+      for (let run = 0; run < 50; run++) {
+        const { setAside, delivered } = simulate(p, rnd, new Set([17, 41]));
+        assert.deepEqual(setAside, [17, 41], `p=${p} run ${run}`);
+        assert.deepEqual(delivered, Array.from({ length: 60 }, (_, i) => i + 1).filter((s) => s !== 17 && s !== 41));
+      }
+    }
+  });
+
   test("a suspect batch whose events were all taken meanwhile ends the search", () => {
     const q = evs(4);
     const f = new PoisonFinder();
@@ -231,3 +347,15 @@ test("storableText and storableDeep replace NUL and unpaired surrogates in keys 
   const plain = { a: "plain", n: 2 };
   assert.deepEqual(storableDeep(plain), plain);
 });
+
+/** A small deterministic random number generator (mulberry32), so a failing run is the same run again. */
+function seeded(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}

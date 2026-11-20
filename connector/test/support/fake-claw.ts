@@ -52,6 +52,11 @@ export class FakeClaw {
   refuseEvent: ((e: { session_id: string; seq: number; type: string; data: any }) => boolean) | null = null;
   /** Answer every post 500, an empty one too: Claw's database is down. */
   failAllPosts = false;
+  /**
+   * Answer a post that holds events 500 when this says so, with the body a deadlock gives (SQLSTATE 40P01, nothing about the events):
+   * a Claw that fails now and then, whatever the post carries. An empty post is always taken.
+   */
+  flaky: (() => boolean) | null = null;
   /** Every post's events (session, seq, type), in order, and its answer's status. */
   readonly posts: Array<{ status: number; events: Array<{ session_id: string; seq: number; type: string }> }> = [];
   /** Store the next N event posts but close the socket before answering (a lost acknowledgement). */
@@ -317,6 +322,7 @@ export class FakeClaw {
         if (this.failPosts > 0) { this.failPosts--; return answer(503, { ok: false, error: "unavailable" }); }
         const internal = (message: string, code: string) => answer(500, { statusCode: 500, code, error: "Internal Server Error", message });
         if (this.failAllPosts) return internal("Connection terminated unexpectedly", "ECONNRESET");
+        if (this.flaky && sent.length > 0 && this.flaky()) return internal("deadlock detected", "40P01");
         if (this.refuseUnstorable && sent.some((e) => holdsUnstorable(e?.data))) return internal("unsupported Unicode escape sequence", "22P05");
         if (this.refuseEvent && sent.some((e) => this.refuseEvent!(e))) return internal("refused for the test", "22023");
         const batch = parseEventBatch(body);

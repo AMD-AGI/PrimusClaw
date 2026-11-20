@@ -23,7 +23,7 @@ import { resolveCwd } from "./roots.js";
 import { SnapshotFile, STATE_WRITE_WAIT_MS, within, writeWhole, type WriteReport } from "./statefile.js";
 import { SessionManager, type Command } from "./manager.js";
 import { Outbox, type OutEvent } from "./outbox.js";
-import { mayBeContent, PoisonFinder } from "./poison.js";
+import { failureKind, PoisonFinder } from "./poison.js";
 import { ApprovalBroker, type HookAgent, serveApprovals } from "./approvals.js";
 import { cursorConfigDir } from "./cursor-approvals.js";
 import {
@@ -937,7 +937,7 @@ export class Connector {
         if (verdict === "set_aside") {
           const ev = batch[0]!;
           poison.setAside();
-          this.setAside(ev, e instanceof HttpError ? `http_${e.status}_${e.code}`.slice(0, 80) : "refused");
+          this.setAside(ev, e instanceof HttpError ? `http_${e.status}_${e.sqlState ?? e.code}`.slice(0, 80) : "refused");
           failures = 0;
           continue;
         }
@@ -948,9 +948,9 @@ export class Connector {
         } else {
           this.d.log.warn("posting events failed; will retry", { error: errMessage(e), pending: this.outbox.size });
         }
-        // While a batch is split, each post is a step of the search and goes after the shortest wait; once Claw is seen not to answer
-        // an empty post either, it is an outage, waited out as usual.
-        const step = poison.isolating && mayBeContent(e) && answering !== false;
+        // While a batch is split, a post Claw refused for what it carried is a step of the search and goes after the shortest wait;
+        // any other failure (a 500 that names nothing, an empty post Claw did not take either) is waited out as usual.
+        const step = poison.isolating && failureKind(e) === "content" && answering !== false;
         const wait = step ? this.timing.backoffMinMs : backoffMs(failures - 1, this.timing.backoffMinMs, this.timing.backoffMaxMs);
         await sleep(wait, this.ctl.signal);
       }

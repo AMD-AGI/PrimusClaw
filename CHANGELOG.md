@@ -174,9 +174,12 @@ release version, and its `appVersion` stays `latest`.
   in a row (or a `4xx` that is not about the credential, the route or the rate, once) is posted in halves, always the
   earliest events first so that no session's event goes before an earlier one of it, down to the event that fails it.
   That event is posted again with its NULs and unpaired surrogates replaced by U+FFFD; when Claw still refuses it alone,
-  twice, while it takes an empty post each time, it is set aside: removed from the outbox, written to `quarantine.jsonl`
-  in the state directory and logged once, by session, number and type, never its content. An outage (no answer, `502`,
-  `503`, `504`, `429`, or a `500` to an empty post too) never sets an event aside. Events are also made storable where
+  twice in a row, saying it is the event's fault (a `4xx`, or a `500` whose SQLSTATE in `code` is class 22 or 54, as
+  `22P05` was), while it takes an empty post each time, it is set aside: removed from the outbox, written to
+  `quarantine.jsonl` in the state directory and logged once, by session, number and type, never its content. An outage
+  (no answer, `502`, `503`, `504`, `429`, or a `500` to an empty post too) never sets an event aside, and neither does a
+  `500` that names nothing about the event (a deadlock, a lost database connection): a Claw that fails now and then
+  would otherwise narrow the search onto an event that was fine, a turn's end as likely as any, and drop it. Events are also made storable where
   they are made, so a NUL an agent prints never reaches Claw.
 
 - Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its
