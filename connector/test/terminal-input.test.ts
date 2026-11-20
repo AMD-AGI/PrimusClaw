@@ -20,6 +20,9 @@ import { redactText } from "../src/redact.js";
 import { echoOf, wholeLinesOf } from "../src/session.js";
 import { transcriptUpdates } from "../src/attach.js";
 import { Harness, onCleanup, onExitSync, tmpdir } from "./support/harness.js";
+import { stubUpgrader } from "./support/upgrader.js";
+import { resolveDirs } from "../src/paths.js";
+import { sleep } from "../src/util.js";
 // @ts-expect-error (a plain module shared with the stand-in terminal)
 import { bashQuestion, createFileQuestion, toolLine } from "./support/claude-question.mjs";
 
@@ -538,6 +541,44 @@ describe("typing into a terminal, through a real tmux", { skip: !hasTmux && !nee
     const prompt = await h.claw.until("the late prompt", () => h.claw.eventsOf(sid, "user_message_chunk").find((e) => e.data.update.content.text === "late one\nsecond line"));
     const reply = await h.claw.until("the reply", () => h.claw.eventsOf(sid, "agent_message_chunk").find((e) => e.data.update.content.text === "echo: [Pasted text #1 +1 lines]"));
     assert.ok(end.seq < prompt.seq && prompt.seq < reply.seq);
+  });
+
+  test("a message held in a terminal's queue (someone typing in the box) keeps the connector from upgrading itself until it went in and its turn ended", async () => {
+    const work = tmpdir("cc-work-");
+    const home = tmpdir();
+    const { up, preflights } = stubUpgrader(resolveDirs({ CLAW_CONNECTOR_HOME: home } as NodeJS.ProcessEnv), { idleMs: 150, retryMs: 300 });
+    const h = await Harness.create({
+      home, work, upgrade: up, version: "1.0.0", start: false, timing: { spectateMs: 20, spectateCheckMs: 60_000, terminalIdleMs: 2_000 } as never,
+      attach: { tmux: "tmux", sessions: [{ sessionId: REF, cwd: work, title: "In the terminal", updatedAt: "2026-11-07T10:00:00.000Z" }] },
+    });
+    hs.push(h);
+    const ended = h.start();
+    let result: string | null = null;
+    void ended.then((r) => { result = r; });
+    const t = terminal(work, h.attachDir);
+    h.setLive([{ pid: t.pid, sessionId: REF, status: "idle", cwd: work }]);
+    await until("an empty box", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "empty");
+    await h.online();
+    const sid = await h.attach(REF);
+    t.tmux("send-keys", "-t", "%0", "-l", "the person types");
+    await until("their text", () => inputBox(t.tmux("capture-pane", "-p", "-e", "-t", "%0")) === "typed");
+    const seq = h.prompt(sid, "held");
+    await h.claw.until("the queue notice", () => h.claw.eventsOf(sid, "terminal_input_queued").find((e) => e.data.cmd_seq === seq && e.data.reason === "terminal_typing"));
+    // Only the session's queue holds it: no turn has begun for it, nothing waits for an approval, the stream is open.
+    assert.equal(h.turnEnds(sid).length, 0);
+    // Claw recommends a newer version only now.
+    const hbs = h.claw.heartbeats.length;
+    h.claw.connectorVersions = { minimum: "1.0.0", recommended: "1.0.1" };
+    await h.claw.until("a heartbeat that says it waits for idle", () => h.claw.heartbeats.slice(hbs).some((b) => b.agents[0].capabilities.auto_upgrade?.state === "waiting_idle"));
+    await sleep(1500);
+    assert.equal(result, null, "no upgrade while a message waits in the terminal's queue");
+    assert.deepEqual(preflights, []);
+    assert.equal(h.connector.upgradeTarget, null);
+    t.tmux("send-keys", "-t", "%0", "C-u");
+    const end = await h.claw.until("its end", () => h.turnEnds(sid).find((e) => e.data.cmd_seq === seq), 15_000);
+    assert.equal(end.data.stopReason, "end_turn");
+    assert.equal(await ended, "upgrade");
+    assert.deepEqual(preflights, ["1.0.1"]);
   });
 
   test("a phone cancel that stops its message's turn before any answer: Claude Code puts the message back in the box, it is taken out again, and the next message goes in at once (2026-11-18)", async () => {

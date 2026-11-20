@@ -9,6 +9,8 @@
  * fails if any other file in `src/` imports that path or restates a constant.
  */
 export {
+  CONNECTOR_PACKAGE,
+  compareConnectorVersions,
   REMOTE_AGENT_LIMITS,
   REMOTE_AGENT_PROTOCOL_VERSION,
   REMOTE_AGENT_TIMING,
@@ -16,6 +18,7 @@ export {
   REMOTE_EVENT_PERMISSION_REQUEST,
   REMOTE_EVENT_PERMISSION_RESOLVED,
   REMOTE_EVENT_SESSION_CLOSED,
+  REMOTE_OUTBOX_REPORT_MAX_SESSIONS,
   isRemoteCommandType,
   parseRemoteId,
   REMOTE_COMMANDS,

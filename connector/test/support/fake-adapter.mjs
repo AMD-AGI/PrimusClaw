@@ -197,6 +197,8 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       return reply(id, { sessions: all.slice(from, from + size), ...(from + size < all.length ? { nextCursor: `offset:${from + size}` } : {}) });
     }
     case "session/new": {
+      // FAKE_NEW_GATE: a slow start; the session is made only once that file exists.
+      if (env.FAKE_NEW_GATE) while (!fs.existsSync(env.FAKE_NEW_GATE)) await new Promise((r) => setTimeout(r, 20));
       if (env.FAKE_AUTH_REQUIRED) return fail(id, -32000, "Authentication required");
       if (env.FAKE_API_KEY_AUTH === "1" && !signedIn) return fail(id, -32000, "Authentication required");
       // An agent that signs in with a variable (ANTHROPIC_API_KEY): without it, refused as the real adapters refuse.

@@ -3,6 +3,7 @@
 
 import { redactSecrets, type RedactResult } from "./redact-secrets.js";
 import { isSensitiveKey } from "./sensitive-keys.js";
+import { storableText } from "./storable.js";
 
 // The copy of a conversation the API writes to its database -- session events, conversation turns, an assistant's
 // inbound messages -- is masked here before it is written. Not the copy a model reads in the turn it arrives in: the
@@ -26,6 +27,9 @@ import { isSensitiveKey } from "./sensitive-keys.js";
 // What is not caught, stated plainly: a credential in prose with no name in front of it and no vendor shape
 // ("the password is hunter2"), and an all-letter value written YAML-style (`password: hunter`), which reads the same
 // as a type annotation. Both are the price of not rewriting ordinary conversation.
+//
+// What comes out is also storable: a NUL or an unpaired surrogate, which PostgreSQL refuses and which would fail the
+// whole INSERT, is replaced by U+FFFD (`storableText`), in keys as well as values.
 
 const SAFE_API_KEY_RE = /\bak-[A-Za-z0-9]{24,}(?:-[A-Za-z0-9]{1,16})*\b/g;
 const SHORT_BEARER_RE = /\b(Bearer\s+)(?=[A-Za-z0-9._~+/=-]*[0-9])[A-Za-z0-9._~+/=-]{8,}/gi;
@@ -89,7 +93,7 @@ function maskNamedValues(text: string): { text: string; hits: number } {
   return { text: out, hits };
 }
 
-/** Mask credential-shaped content in one string that is about to be stored. */
+/** Mask credential-shaped content in one string that is about to be stored, and make it storable (`storableText`). */
 export function redactStoredText(text: string): RedactResult {
   if (!text) return { text: "", hits: 0 };
   const base = redactSecrets(text);
@@ -104,14 +108,15 @@ export function redactStoredText(text: string): RedactResult {
   });
   const keys = maskPrivateKeys(out);
   const named = maskNamedValues(keys.text);
-  return { text: named.text, hits: hits + keys.hits + named.hits };
+  return { text: storableText(named.text), hits: hits + keys.hits + named.hits };
 }
 
 /**
  * A deep copy of a JSON-compatible value with every string masked by `redactStoredText`, and the value under a field named like a
  * credential (`isSensitiveKey`, the same judgement brain's `redactPersistedEvent` makes) replaced when it is a non-empty string or
  * a container. Keys and every other value are kept as they are, so the fields a reader routes on (`type`, ids, sequence numbers,
- * counts) are unchanged, and an identifier field's string (`IDENTIFIER_KEY_RE`) is not masked. The input is not modified.
+ * counts) are unchanged, and an identifier field's string (`IDENTIFIER_KEY_RE`) is not masked. Keys and strings alike are made storable
+ * (`storableText`): a character PostgreSQL refuses becomes U+FFFD. The input is not modified.
  */
 export function redactStoredValue<T>(value: T): T {
   return walk(value) as T;
@@ -127,20 +132,41 @@ const IDENTIFIER_KEY_RE = /^(?:id|[A-Za-z0-9_]*_id|[A-Za-z0-9]*[a-z0-9]Id)$/;
 /** An identifier is one token: a value with whitespace in it, or a long one, is content and is masked as usual. */
 const IDENTIFIER_VALUE_RE = /^[^\s]{1,256}$/;
 
-function walk(value: unknown, key?: string): unknown {
-  if (typeof value === "string") {
-    if (key !== undefined && IDENTIFIER_KEY_RE.test(key) && IDENTIFIER_VALUE_RE.test(value)) return value;
-    return redactStoredText(value).text;
-  }
-  if (Array.isArray(value)) return value.map((item) => walk(item));
-  if (!value || typeof value !== "object") return value;
-  if (value instanceof Date) return value;
-  const out: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    // A switch or a count under such a name (`{"token": false}`) keeps its type, an empty value has nothing to leak, and one
-    // brain already masked stays as brain wrote it.
-    const holds = (typeof child === "string" && child !== "" && child !== "[REDACTED]") || (!!child && typeof child === "object");
-    out[key] = holds && isSensitiveKey(key, child) ? "<redacted>" : walk(child, key);
+/**
+ * Iterative, not recursive: `JSON.parse` takes nesting far deeper than the call stack does (a few thousand levels), and Postgres
+ * stores it, so a recursive walk would throw on a value that is otherwise fine. Every key is defined as an own field of the copy:
+ * in parsed JSON `__proto__` is an ordinary key, and an assignment under that name would set the copy's prototype instead (and the
+ * key would be lost).
+ */
+function walk(root: unknown): unknown {
+  const pending: Array<[source: object, copy: object]> = [];
+  const copyOf = (value: unknown, key?: string): unknown => {
+    if (typeof value === "string") {
+      if (key !== undefined && IDENTIFIER_KEY_RE.test(key) && IDENTIFIER_VALUE_RE.test(value)) return storableText(value);
+      return redactStoredText(value).text;
+    }
+    if (!value || typeof value !== "object") return value;
+    if (value instanceof Date) return value;
+    const copy: object = Array.isArray(value) ? new Array<unknown>(value.length) : {};
+    pending.push([value, copy]);
+    return copy;
+  };
+  const out = copyOf(root);
+  for (let next = pending.pop(); next; next = pending.pop()) {
+    const [source, copy] = next;
+    if (Array.isArray(source)) {
+      for (let i = 0; i < source.length; i++) (copy as unknown[])[i] = copyOf(source[i]);
+      continue;
+    }
+    for (const [key, child] of Object.entries(source as Record<string, unknown>)) {
+      // A switch or a count under such a name (`{"token": false}`) keeps its type, an empty value has nothing to leak, and one
+      // brain already masked stays as brain wrote it.
+      const holds = (typeof child === "string" && child !== "" && child !== "[REDACTED]") || (!!child && typeof child === "object");
+      Object.defineProperty(copy, storableText(key), {
+        value: holds && isSensitiveKey(key, child) ? "<redacted>" : copyOf(child, key),
+        enumerable: true, writable: true, configurable: true,
+      });
+    }
   }
   return out;
 }

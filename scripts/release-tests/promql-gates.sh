@@ -52,3 +52,9 @@ command -v "$promtool" >/dev/null 2>&1 || {
 }
 
 "$promtool" test rules "$repo_root/claw/deploy/promql/rollout-gates.test.yaml"
+
+# The delivery-stall alerts the chart ships (claw/deploy/charts/claw/alerts),
+# checked as rules and evaluated against synthetic stalls: each fires on one
+# that lasts, stays quiet on one that does not, and resolves.
+"$promtool" check rules "$repo_root/claw/deploy/charts/claw/alerts/delivery.rules.yaml"
+"$promtool" test rules "$repo_root/claw/deploy/promql/delivery-alerts.test.yaml"

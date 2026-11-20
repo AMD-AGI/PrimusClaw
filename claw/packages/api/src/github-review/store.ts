@@ -114,6 +114,9 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
   // Whether the call was held to its session's request budget (see {@link sessionRequestCount}): false for the calls the server makes on
   // its own or on a person's answer (`skipBudget`), null on rows written before the column existed.
   `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS budgeted BOOLEAN`,
+  // The commit a merge made (`gh_pr_merge` answered merged), as GitHub gave it; null for every other call. The owner of a review that
+  // merged in its own run is told it (assistant/review-result.ts).
+  `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS merge_sha TEXT`,
 ];
 
 export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<void> {
@@ -222,6 +225,8 @@ export interface AuditFinish {
   posted?: PostedReview | null;
   /** GitHub's merge state a merge was refused on (`merge_state_not_clean`), else unset. */
   mergeState?: string | null;
+  /** The commit a merge made, when the call merged. */
+  mergeSha?: string | null;
 }
 
 /** One inline finding of a posted review: where it is, the thread GitHub opened for it (null when that could not be read) and its first words. */
@@ -245,13 +250,14 @@ export async function auditFinish(db: Queryable, id: number, f: AuditFinish): Pr
             github_requests = $5, github_request_ids = $6::jsonb, github_status = $7,
             risk_reasons = $8::jsonb, confirmation_id = $9, dry_run = $10, write = $11,
             result = $12, detail = $13, review_path = $14, review_path_reason = $15, review_mode = COALESCE($16, review_mode),
-            posted = COALESCE($17::jsonb, posted), merge_state = COALESCE($18, merge_state)
+            posted = COALESCE($17::jsonb, posted), merge_state = COALESCE($18, merge_state), merge_sha = COALESCE($19, merge_sha)
       WHERE id = $1`,
     [
       id, f.repo ?? null, f.pr ?? null, f.headSha ?? null, f.githubRequests, JSON.stringify(f.githubRequestIds.slice(-20)),
       f.githubStatus ?? null, JSON.stringify(f.riskReasons ?? []), f.confirmationId ?? null, f.dryRun, f.write,
       f.result, (f.detail ?? "").slice(0, 500), f.reviewPath ?? null, f.reviewPathReason ?? null, f.reviewMode ?? null,
       f.posted ? JSON.stringify(f.posted) : null, f.mergeState ? String(f.mergeState).slice(0, 40) : null,
+      f.mergeSha ? String(f.mergeSha).slice(0, 64) : null,
     ],
   );
 }

@@ -17,6 +17,11 @@ table	claw_pending_messages	platform_key
 table	claw_pending_messages	llm_api_key
 table	claw_pending_messages	workspace_id
 table	claw_pending_messages	dedupe_key
+table	claw_pending_messages	drain_failures
+table	claw_pending_messages_quarantine	notified_at
+table	claw_pending_messages_quarantine	notice_events
+table	claw_pending_messages_quarantine	notice_started_at
+table	claw_pending_messages_quarantine	notice_unsure_since
 table	claw_memory_entries	content_tsv
 table	claw_skills	inject_count
 table	claw_skill_files	skill_id
@@ -51,6 +56,7 @@ index	idx_tasks_status_active	-
 index	idx_tasks_session	-
 index	idx_pending_session	-
 index	uq_pending_session_dedupe	-
+index	idx_pending_quarantine_session	-
 index	idx_sessions_user	-
 index	idx_sessions_parent	-
 index	idx_sessions_deleted_walk	-

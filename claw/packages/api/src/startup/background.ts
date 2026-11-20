@@ -75,6 +75,8 @@ export const REMOTE_AGENT_BACKGROUND_LOOPS = [
   "remote_agents.presence_sweep",
   // `remote-agents/terminal-waits.ts`.
   "remote_agents.terminal_wait_sweep",
+  // `remote-agents/delivery-health.ts`.
+  "remote_agents.delivery_health_sweep",
   // Commands that were never collected (`store.expireUndelivered`).
   "remote_agents.undelivered_sweep",
   // `remote-agents/pairing-routes.ts`: unbound pairing grants.

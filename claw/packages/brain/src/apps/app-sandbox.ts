@@ -30,6 +30,7 @@ import { SAFE_API_URL, SANDBOX_DEFAULT_TIMEOUT_SECONDS, isKubernetesMode } from 
 import { sandboxNamespaceForResources } from "../sandbox/workspace-select.js";
 import {
   DEFAULT_SANDBOX_TTL_SEC, composeSandboxLabels, createSafeWorkloadSandbox, SESSION_ID_LABEL, COMPONENT_LABEL,
+  workloadPlacementMatches,
 } from "../sandbox/create-sandbox.js";
 import { fetchPlatformFacts } from "../sandbox/platform-facts-read.js";
 import { parseWorkloadListPage } from "../sandbox/multi-node/workload-parse.js";
@@ -66,6 +67,8 @@ export interface AppSandboxRun {
   sandboxWorkloadId?: string | null;
   /** The session owner's platform key: SaFE create / poll / stop. */
   platformKey: string;
+  /** Node labels the sandbox requires: the session's placement. Absent: none. */
+  nodeLabels?: Record<string, string>;
 }
 
 /**
@@ -360,7 +363,19 @@ export async function ensureAppSandbox(
     }
   };
 
-  const live = await findLiveAppSandboxes(run.runId, run.platformKey, ns, deps.fetch);
+  let live = await findLiveAppSandboxes(run.runId, run.platformKey, ns, deps.fetch);
+  if (run.nodeLabels && live.length > 0) {
+    // A run with a placement adopts only a sandbox created with it. One created without it
+    // (by a Brain that did not read the placement) runs on nodes the session excluded, so it
+    // is stopped rather than adopted, and the run gets a sandbox with the placement instead.
+    // Asked only when there is a placement: a run without one adopts exactly as it did.
+    const kept: typeof live = [];
+    for (const w of live) {
+      if (await appSandboxHasPlacement(w.id, run.platformKey, run.nodeLabels, deps.fetch)) kept.push(w);
+      else await reclaim(w.id, "placement_mismatch");
+    }
+    live = kept;
+  }
   if (live.length > 0) {
     // `live` is newest first. More than one means an earlier create was never seen
     // by the run (so it was never recorded or stopped). Which one is the run's:
@@ -443,6 +458,8 @@ export async function ensureAppSandbox(
       // leaves it when it hands the run over.
       ...(abort.signal ? { signal: abort.signal } : {}),
       ...(abort.reclaimOnAbort ? { reclaimOnAbort: abort.reclaimOnAbort } : {}),
+      // The session's placement: the run's sandbox, and every one it is rebuilt as, keeps it.
+      ...(run.nodeLabels ? { nodeLabels: run.nodeLabels } : {}),
     });
     logger.info({ runId: run.runId, workloadId: inst.id }, "app_sandbox.created");
     // The handle is built here, as on the adopt path: the provider's carries a Hands
@@ -459,6 +476,27 @@ export async function ensureAppSandbox(
     if (createdId !== undefined && !handedOver(err)) await reclaim(createdId, "create_failed");
     throw err;
   }
+}
+
+/**
+ * Whether this workload was created with exactly the run's placement, as SaFE describes it.
+ * Throws when the workload cannot be read: "could not look" must not be read as either
+ * answer, or a SaFE blip stops a good sandbox or adopts one on the wrong nodes.
+ */
+async function appSandboxHasPlacement(
+  workloadId: string,
+  apiKey: string,
+  nodeLabels: Record<string, string>,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): Promise<boolean> {
+  const resp = await fetchImpl(`${SAFE_API_URL}/api/v1/workloads/${encodeURIComponent(workloadId)}`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
+  });
+  // Gone since the list: not this run's to adopt, and stopping it again costs nothing.
+  if (resp.status === 404) return false;
+  if (resp.status !== 200) throw new Error(`app sandbox placement check failed: HTTP ${resp.status}`);
+  return workloadPlacementMatches(await resp.json().catch(() => null), nodeLabels);
 }
 
 /** Component label of a reader sandbox: made only to read a run's state directory, never to run it. */
@@ -522,6 +560,8 @@ export async function createAppReaderSandbox(
       ...(abort.signal ? { signal: abort.signal } : {}),
       // A reader is nobody's to adopt: whatever cut its wait short, it is stopped.
       reclaimOnAbort: () => true,
+      // In the session's placement too: it is a sandbox of the session like any other.
+      ...(run.nodeLabels ? { nodeLabels: run.nodeLabels } : {}),
     });
     logger.info({ runId: run.runId, workloadId: inst.id }, "app_sandbox.reader_created");
     return { instance: appSandboxInstance(run, inst.id), workloadId: inst.id, created: true };

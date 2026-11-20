@@ -15,6 +15,7 @@ import { redactDeep } from "../../src/redact.js";
 import { auditFile, resolveDirs, type Dirs } from "../../src/paths.js";
 import { silentLogger, type Logger } from "../../src/util.js";
 import { FakeClaw } from "./fake-claw.js";
+import type { AutoUpgrader } from "../../src/auto-upgrade.js";
 import { onCleanup, tmpdir } from "./tmp.js";
 import { FAST } from "./timing.js";
 
@@ -70,6 +71,10 @@ export interface HarnessOptions {
   health?: () => Promise<Report>;
   /** Where the connector logs (default: nowhere). */
   log?: Logger;
+  /** Upgrading itself (auto-upgrade.ts); absent: none. */
+  upgrade?: AutoUpgrader;
+  /** The version the connector says it is (default "test"). */
+  version?: string;
 }
 
 export class Harness {
@@ -146,7 +151,7 @@ ${o.secondToml === undefined ? "" : agent("fake2", "default", o.secondToml)}`, {
     };
     this.connector = new Connector({
       config: this.config, dirs: this.dirs, client, server: this.claw.url, audit, log: o.log ?? silentLogger,
-      version: "test", timing: { ...FAST, ...(o.timing ?? {}) }, health: o.health,
+      version: o.version ?? "test", timing: { ...FAST, ...(o.timing ?? {}) }, health: o.health, upgrade: o.upgrade,
     });
   }
 

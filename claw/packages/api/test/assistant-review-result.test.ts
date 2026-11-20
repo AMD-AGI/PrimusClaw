@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ciNamesOf, resultText, unchangedText, type ResultFacts, type UnchangedFacts } from "../src/assistant/review-result.js";
+import { approvedText, ciNamesOf, resultText, unchangedText, type ApprovedFacts, type ResultFacts, type UnchangedFacts } from "../src/assistant/review-result.js";
 
 const facts = (over: Partial<ResultFacts> = {}): ResultFacts => ({
   pr: "AMD-AGI/Primus-SaFE#873", url: "https://github.com/AMD-AGI/Primus-SaFE/pull/873", seq: 195,
@@ -82,5 +82,32 @@ test("a re-review with no new commits that posted nothing (N25, #532) says so to
     assert.match(unchangedText("unchanged", f(over), true), zh, JSON.stringify(over));
     assert.match(unchangedText("unchanged", f(over), false), en, JSON.stringify(over));
     assert.doesNotMatch(unchangedText("unchanged", f(over), true), /卡住|需要你回复/);
+  }
+});
+
+test("an approval that went through in the review's own run (N55, Primus-SaFE#885) says how it ended, in both languages", () => {
+  const f = (over: Partial<ApprovedFacts> = {}): ApprovedFacts => ({
+    pr: "AMD-AGI/Primus-SaFE#885", url: "https://github.com/AMD-AGI/Primus-SaFE/pull/885", seq: 217,
+    mergeSha: "31ef38a0c1d2e3f405162738495a6b7c8d9e0f12", reviewId: 5856903798, reviewOnly: false, notMerged: null, ...over,
+  });
+  assert.equal(approvedText("merged", f(), true), [
+    "**AMD-AGI/Primus-SaFE#885 已合入**", "",
+    "- 评审通过，已批准并合入，合入提交 `31ef38a`。",
+    "- PR：https://github.com/AMD-AGI/Primus-SaFE/pull/885",
+  ].join("\n"));
+  assert.equal(approvedText("merged", f({ mergeSha: null }), true).split("\n")[2], "- 评审通过，已批准并合入。", "no commit is made up");
+  assert.match(approvedText("merged", f(), false), /^\*\*AMD-AGI\/Primus-SaFE#885 is merged\*\*\n\n- The review passed; it was approved and merged as commit `31ef38a`\.\n- The pull request: https:\/\/github\.com\/AMD-AGI\/Primus-SaFE\/pull\/885$/);
+  assert.match(approvedText("merge_queued", f(), true), /^\*\*AMD-AGI\/Primus-SaFE#885 已批准，已进入合入队列\*\*[\s\S]*由 GitHub 按队列合入[\s\S]*pull\/885$/);
+  assert.match(approvedText("merge_queued", f(), false), /is approved and in the merge queue/);
+  const cases: Array<[Partial<ApprovedFacts>, RegExp, RegExp]> = [
+    [{ notMerged: { detail: "" } }, /已批准，但没有合入\*\*[\s\S]*原因：评审批准后没有执行合入。[\s\S]*回复 `再审 #217`/, /approved but not merged[\s\S]*made no merge call[\s\S]*`review again #217`/],
+    [{ notMerged: { detail: "dry_run" } }, /关闭了写操作/, /writes are switched off/],
+    [{ notMerged: { detail: "head_moved" } }, /合入没有成功（head_moved）/, /the merge did not go through \(head_moved\)/],
+    [{ reviewOnly: true, notMerged: { detail: "" } }, /审完了，已批准\*\*[\s\S]*只审不合，没有合入/, /is reviewed and approved[\s\S]*a review only; nothing was merged/],
+  ];
+  for (const [over, zh, en] of cases) {
+    assert.match(approvedText("approved", f(over), true), zh, JSON.stringify(over));
+    assert.match(approvedText("approved", f(over), false), en, JSON.stringify(over));
+    assert.match(approvedText("approved", f(over), true), /评审：https:\/\/github\.com\/AMD-AGI\/Primus-SaFE\/pull\/885#pullrequestreview-5856903798$/);
   }
 });

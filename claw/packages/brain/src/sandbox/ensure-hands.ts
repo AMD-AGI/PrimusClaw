@@ -53,7 +53,7 @@ import type { MultiNodeContext } from "./multi-node/types.js";
 import { writeSandboxSshKey } from "./multi-node/sandbox-key.js";
 import { getAgentSandboxProvider, getSafeWorkloadProvider } from "./factory.js";
 import {
-  DEFAULT_SANDBOX_TTL_SEC, composeSandboxLabels, createSafeWorkloadSandbox,
+  DEFAULT_SANDBOX_TTL_SEC, composeSandboxLabels, createSafeWorkloadSandbox, placementNodeLabels,
 } from "./create-sandbox.js";
 import { dagHoldsWorkload, handleIdentityKey, lookupDagHandle, releaseHandlesForWorkload, replaceDagHandle, workloadHeldByOtherDag } from "./handles.js";
 import { getHandsKv, registerHandsToken } from "./registry.js";
@@ -250,6 +250,10 @@ export function requestSpecFingerprint(
     namespace,
     withholdKeys,
     ...(isReviewProfile(request) ? { profile: "review" } : {}),
+    // As create sends it (SaFE's customerLabels): a sandbox built without the session's placement -- by a Brain
+    // that did not read it -- is rebuilt rather than reused. A placement that does not pass is refused here, so
+    // before any reuse is decided.
+    nodeLabels: placementNodeLabels(request),
   });
 }
 
@@ -2598,6 +2602,9 @@ async function provisionHands(
   if (action.kind === "none") {
     throw new Error("ensureHands called for sandbox_spec='none'; caller must short-circuit");
   }
+  // The session's placement is checked before any sandbox is looked up, reused or created: a request whose
+  // placement does not pass gets no sandbox at all, a reused one included.
+  placementNodeLabels(request);
   if (action.kind === "use") {
     // task-design.md §9.4: look the handle up in DagHandleMap; an upstream
     // node should have registered it via sandbox.create. Surface a clear
@@ -2806,6 +2813,8 @@ async function provisionHands(
   // Before the provider is called at all: a ceiling checked once the sandbox
   // exists is not a ceiling, because two provisions racing the last slot both
   // start and both are then live work nothing may evict.
+  // Before admission and the create: a placement that does not pass is refused with nothing created.
+  const sessionNodeLabels = placementNodeLabels(request);
   const hold = await admitSandbox(sessionId, options.signal);
   const onProvisioned = makeOnProvisioned({
     sessionId, namespace: nsForSandbox, apiKey, handsToken, sandboxImage, kv, hold,
@@ -2853,6 +2862,8 @@ async function provisionHands(
       // A requested review's sandbox gets none of the workspace's storage: SaFE then mounts neither the owner's directory nor the
       // workspace's volumes. Sent as false, never left out (SaFE reads an absent field as true).
       ...(isReviewProfile(request) ? { useWorkspaceStorage: false } : {}),
+      // The session's placement, on this sandbox and on every rebuild of it.
+      nodeLabels: sessionNodeLabels,
     });
   } catch (err) {
     await hold.release();

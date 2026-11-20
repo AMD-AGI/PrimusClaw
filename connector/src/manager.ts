@@ -297,6 +297,11 @@ export class SessionManager {
     for (const s of this.sessions.values()) s.resendPending();
   }
 
+  /** No command is being carried out and no session has a turn, a queued prompt or message, or a card waiting. */
+  idleNow(): boolean {
+    return this.chains.size === 0 && this.attaching.size === 0 && [...this.sessions.values()].every((s) => !s.busy);
+  }
+
   get pendingPermissions(): number {
     return [...this.sessions.values()].reduce((n, s) => n + s.pendingCount, 0);
   }

@@ -60,7 +60,7 @@ import {
 } from "@claw/protocol";
 import pino from "pino";
 
-import { db, inTransaction, type Querier } from "../infra/db.js";
+import { db, inTransaction, PENDING_QUARANTINE_TABLE, type Querier } from "../infra/db.js";
 import { applyTaskStatusTransition } from "../tasks/db.js";
 import { sessionWorkspacePrefix, workspaceOwnerId } from "../workspace/prefix.js";
 import { getS3Client, S3_LIST_PAGE_KEYS } from "../infra/s3-client.js";
@@ -723,6 +723,8 @@ export async function commitSessionDeletion(
         if (!(await opts.onlyIf(query))) throw DECLINED;
       }
       await query("DELETE FROM claw_pending_messages WHERE session_id = $1", [sessionId]);
+      // And what was quarantined out of that queue, which holds the same text.
+      await query(`DELETE FROM ${PENDING_QUARANTINE_TABLE} WHERE session_id = $1`, [sessionId]);
       // The prior state, locked before the transition writes over it. The
       // doorbell queue-exit metric below is taken from what these rows were,
       // and an UPDATE's RETURNING can only answer with what they became.
@@ -776,6 +778,8 @@ export async function commitSessionDeletion(
           [sessionId],
         );
       }
+      // A quarantined event's copy is raw conversation content with no deleted_at of its own: it goes with the session.
+      await query("DELETE FROM claw_event_quarantine WHERE session_id = $1", [sessionId]);
       await query(
         `UPDATE claw_sessions
             SET deleted_at = COALESCE(deleted_at, NOW()),

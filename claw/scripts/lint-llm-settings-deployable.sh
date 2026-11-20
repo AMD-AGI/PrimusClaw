@@ -20,10 +20,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 CONFIG=claw/packages/brain/src/config.ts
 SECRET=claw/deploy/charts/claw/templates/secret.yaml
 VALUES=claw/deploy/charts/claw/values.yaml
+HELPERS=claw/deploy/charts/claw/templates/_helpers.tpl
 DEPLOY=claw/deploy/deploy.sh
 
 # Credentials are handed to a session at run time, not baked into the release.
-EXEMPT="ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY LLM_KEY_SOURCE"
+EXEMPT="ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY"
 
 fail=0
 for name in $(grep -oE 'env\("(LLM_|PROMPT_CACHE_)[A-Z0-9_]*"' "$CONFIG" | sed 's/env("//;s/"//' | sort -u); do
@@ -35,7 +36,14 @@ for name in $(grep -oE 'env\("(LLM_|PROMPT_CACHE_)[A-Z0-9_]*"' "$CONFIG" | sed '
   fi
   # A key in the template that no default backs renders empty on a fresh
   # install, which is the same silence by a different route.
-  key=$(grep -oE "\.Values\.secret\.[a-zA-Z0-9]+" <(grep "^\s*$name:" "$SECRET") | head -1 | sed 's/.*\.//')
+  line=$(grep "^\s*$name:" "$SECRET")
+  key=$(grep -oE "\.Values\.secret\.[a-zA-Z0-9]+" <<<"$line" | head -1 | sed 's/.*\.//' || true)
+  # A value rendered through a helper maps to the secret.* key that helper reads.
+  helper=$(grep -oE 'include "[^"]+"' <<<"$line" | head -1 | sed 's/include "//;s/"$//' || true)
+  if [ -z "$key" ] && [ -n "$helper" ]; then
+    key=$(awk -v d="define \"$helper\"" 'index($0, d) {on = 1; next} on && /define "/ {exit} on' "$HELPERS" |
+      grep -oE "\.Values\.secret\.[a-zA-Z0-9]+" | head -1 | sed 's/.*\.//' || true)
+  fi
   if [ -n "$key" ] && ! grep -q "^\s*$key:" "$VALUES"; then
     echo "ERROR: $name maps to secret.$key, which $VALUES does not default"
     fail=1

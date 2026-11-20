@@ -15,6 +15,77 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## Unreleased
+
+### Added
+
+- `deploy/teams-ingress-alerts.yaml`: Grafana alert rules over the ingress's Application Insights, more than 2 requests to
+  `messages` answered `499` or above in 5 minutes, and any failed enqueue, with the data source they need
+  ([quick start](docs/quickstart.md#4-the-ingress), "Alerts").
+
+### Changed
+
+- `@primusclaw/personal-agent-teams-ingress`: `QueueClient` (what a `ServiceBusFactory` returns) has a `close()`, which
+  the ingress calls on a client it throws away. A factory of one's own must add it.
+
+### Fixed
+
+- The Teams ingress gets messages through again after the Service Bus connection under its kept client dies. Until now a
+  failed send was retried on a new sender of the same client; when the client's connection was stuck closing, every
+  sender opened on it waited the whole 20 s deadline, so every message on that instance was lost (answered `500`, or
+  `499` once the Bot Framework stopped waiting) until the Function app was restarted. A failed send now throws away the
+  whole client when the failure is about the connection (any failure but a Service Bus error about the message or the
+  queue, such as `MessageSizeExceeded`), each attempt ends after 4 s, and a send has up to three attempts within a 12 s
+  deadline counted from the request's arrival (so a slow token check on a cold instance, and the wait for the start-up
+  prefetch, come out of it), inside the 15 s the Bot Framework waits, so a message that still cannot be queued is a
+  `500` that Teams retries. The token check itself races the same deadline: on a cold instance its OpenID metadata and
+  signing-key fetches may take up to 15 s and 30 s, and a request held past the Bot Framework's wait lost its message as
+  a `499`; it is now a `500` at the deadline (Teams retries it, and the keys fetched meanwhile are cached). The queue
+  message id stays the activity id, which the worker dedupes on.
+- A card action (`adaptiveCard/action`) the ingress cannot queue is answered `500`, which the Bot Framework retries, like
+  any other activity. Until now it was answered `200` with a "temporarily unavailable" card, which ended the invoke: the
+  click never reached the worker and was not retried. `UNAVAILABLE_CARD` stays exported but the ingress no longer sends it.
+- The ingress reports its send path: one `inbound_enqueue_failed` record (logger `ingress_health`) per send that fails
+  after its retries, one `inbound_client_reset` per client thrown away and one `inbound_enqueue_recovered` on the first
+  success after failures, each with the instance's running counts (`Ingress.health.counters`). Never the message, the
+  error text or a setting.
+
+## 0.10.4
+
+A patch release: the card for a merge or approval held for its owner, the terminal's own questions said in the chat, streams
+that come back after Teams ends one, and clearer words for a message the terminal has not confirmed yet. No plugin port
+(core's `src/plugins/`) or store change. Drawing the held-merge card needs a Claw that sends it (claw-v0.5.9 and later); the
+terminal question needs `@primusclaw/connector` 0.2.3 or later.
+
+### Added
+
+- The worker's `inbound message` line for a Teams activity also says when the client sent it: `client_ts`, `server_ts`,
+  `client_lag_raw_ms`, `client_lag_ms` (only between 0 and 24 hours) and `client_msg_id` when the client gave one. Only values
+  of a timestamp's or an id's shape are logged; never the text or who sent it (#872).
+
+### Changed
+
+- The review-mode card names `fully_auto` "全自动合入（仓库自身要求的检查仍然生效）" / "Fully automatic merge (the repository's
+  own requirements still apply)" and says it covers reviews asked for in the chat (#874).
+
+### Fixed
+
+- A merge or an approval that a review the assistant started for the person's own account holds for them reaches the chat
+  as the held-write card with its button (`confirm_write`, kinds `github_merge` and `github_review`). The card says how the
+  answer ended (merged, queued, approval posted, not merged or not approved, new commits, expired, or the refusal) and is
+  given back open when Claw answers `retry`. Before, the person was told to press a card that never came (#877).
+- While a message waits for a question on the terminal, the chat says what it asks ("The terminal is waiting for your
+  confirmation: Bash command: rm -rf …", 「终端在等你确认：…」) once per question, and the floating status says "Confirm there"
+  (等你确认). When the connector says Claude Code's registry row for the terminal cannot be read, the chat says once per
+  attach that reopening the conversation with `claude --resume` makes it recognized reliably (#865).
+- When Teams refuses a streamed reply's final message with 403 `ContentStreamNotAllowed` (the person stopped the stream),
+  the conversation streams again from the next turn instead of posting progress messages and deleting them for up to
+  10 minutes. A turn that is cancelled (the chat detaches or switches away, the machine disconnects, the turn breaks off)
+  no longer leaves its progress message behind: it is deleted, or edited down to "Interrupted." (#871).
+- `terminal_input_unconfirmed` is said as a message the terminal has not confirmed yet: whatever the session answers still
+  shows in the chat, and look at the terminal before sending it again (a connector before 0.1.22 is also told to upgrade).
+  A prompt passed on in Claude Code's `<pasted_content>` block is shown as the text that was pasted (#870).
+
 ## 0.10.3
 
 A patch release: a chat attached to a session on a machine shows a long turn's progress while it runs, and a message sent to

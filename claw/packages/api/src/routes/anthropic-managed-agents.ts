@@ -42,6 +42,7 @@ import { metrics } from "../infra/metrics.js";
 import { teardownSession, TeardownRefused } from "../sessions/teardown.js";
 import pino from "pino";
 import { sandboxWorkspaceRefusal } from "../tasks/sandbox-workspaces.js";
+import { storableJson, storableText } from "@claw/utils";
 
 const logger = pino({ name: "anthropic-managed-agents" });
 
@@ -1258,10 +1259,11 @@ async function gateUserMessageTurn(
       await client.query(
         "INSERT INTO claw_pending_messages (session_id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11::jsonb, $12, $13::jsonb, $14::jsonb)",
         [
-          sessionId, messageContent, userId, config.pluginId ?? null, JSON.stringify([]),
+          // Made storable as `insertPendingMessage` makes them (@claw/utils storable.ts).
+          sessionId, storableText(messageContent), userId, config.pluginId ?? null, JSON.stringify([]),
           config.workspaceId ?? null, secrets.platform, secrets.llm, secrets.blob, null,
-          config.resources ? JSON.stringify(config.resources) : null, null,
-          JSON.stringify(secrets.userEnv), JSON.stringify(config.sessionEnv),
+          config.resources ? JSON.stringify(storableJson(config.resources)) : null, null,
+          JSON.stringify(storableJson(secrets.userEnv)), JSON.stringify(storableJson(config.sessionEnv)),
         ],
       );
       await client.query("COMMIT");

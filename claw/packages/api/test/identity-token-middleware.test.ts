@@ -96,7 +96,7 @@ describe("an identity access token through the authentication hook", () => {
     fake.introspect = (r) => (providerDown ? { status: 503, body: "down" } : { body: activeAnswer({ sub: payloadOf(r.form.get("token") ?? "").sub }) });
     // SaFE is asked about the delegated token the provider issues for the user's own, never about the user's token.
     delegations = answerDelegation(fake, es, { clientId: "svc-claw" });
-    Object.assign(process.env, { SAFE_API_URL: safe.url, AUTH_INTERNAL_TOKEN: "t" });
+    Object.assign(process.env, { SAFE_API_URL: safe.url, CLAW_AUTH_PROVIDER: "safe", AUTH_INTERNAL_TOKEN: "t" });
     delete process.env.CLAW_DEPLOY_MODE;
     ({ startIdentityClient } = await import("../src/auth/identity.js"));
     const { authMiddleware, getUser } = await import("../src/auth/middleware.js");

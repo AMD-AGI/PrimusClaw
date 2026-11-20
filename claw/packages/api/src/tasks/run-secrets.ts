@@ -21,6 +21,7 @@
 
 import {
   decryptUserEnvValue,
+  sealedValueTooShort,
   encryptUserEnvValue,
 } from "../crypto/user-env.js";
 
@@ -46,7 +47,7 @@ export function sealRunCredentials(creds: RunCredentials): string {
 /**
  * A sealed blob that will not open, whatever the reason.
  *
- * Every cause is permanent for the row that carries it: the field is gone, the
+ * Every cause is final for the run row that carries it: the field is gone, the
  * ciphertext is truncated, its version byte is one this build does not know,
  * the tag does not authenticate, or the plaintext is not the JSON we wrote.
  * They arrive as unrelated messages from three different layers, and matching
@@ -56,18 +57,40 @@ export function sealRunCredentials(creds: RunCredentials): string {
  * the case the comment named as fixed was the one still looping.
  */
 export class RunCredentialFault extends Error {
-  constructor(cause: unknown) {
+  /**
+   * Whether no replica could open this blob either: it is too short to be a
+   * sealed value, or it opened and what it holds is not the JSON we wrote.
+   * False for a tag that does not authenticate and for a missing key, which is
+   * also what a replica holding a stale or absent key sees while another
+   * replica opens the same blob. For a run row both are equally final; a
+   * queued message is quarantined at once only for a permanent one
+   * (tasks/pending-quarantine.ts), and for the other is given its attempts.
+   */
+  readonly permanent: boolean;
+
+  constructor(cause: unknown, permanent = false) {
     super(`run.claim.credentials_unreadable: ${cause instanceof Error ? cause.message : String(cause)}`);
     this.name = "RunCredentialFault";
+    this.permanent = permanent;
   }
 }
 
 export function openRunCredentials(blob: string): RunCredentials {
+  let plaintext: string;
+  try {
+    plaintext = decryptUserEnvValue(blob);
+  } catch (err) {
+    throw new RunCredentialFault(err, sealedValueTooShort(blob));
+  }
   let parsed: Record<string, unknown>;
   try {
-    parsed = JSON.parse(decryptUserEnvValue(blob)) as Record<string, unknown>;
+    parsed = JSON.parse(plaintext) as Record<string, unknown>;
   } catch (err) {
-    throw new RunCredentialFault(err);
+    // The tag authenticated, so this is what was sealed, for every key holder.
+    throw new RunCredentialFault(err, true);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new RunCredentialFault(new Error("sealed credentials are not an object"), true);
   }
   const env = parsed.session_env;
   return {

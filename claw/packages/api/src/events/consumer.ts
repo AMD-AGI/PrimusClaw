@@ -12,6 +12,7 @@ import { resolveTaskPlugin } from "../marketplace/plugins.js";
 import { buildMessages } from "../sessions/context-builder.js";
 import { sessionEffortFromRow, sessionModelFromRow } from "../sessions/session-model.js";
 import { sessionRepoFromRow } from "../sessions/session-repo.js";
+import { sessionPlacementFromRow } from "../sessions/session-placement.js";
 import { withPendingDrainClaim } from "../sessions/drain-claim.js";
 import { releaseWorkspaceSaveHold, workspaceSaveHoldSet } from "../sessions/save-hold.js";
 import {
@@ -46,18 +47,25 @@ import {
   markChatRunRunning, closeChatRun, gateNamesEndedTurnSql, gateOwnershipEnforced, queuedMessageId,
   retireDispatchReconcileForReport,
 } from "../tasks/chat-run.js";
-import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
-import { applySealedCredentials } from "../tasks/run-secrets.js";
+import { dispatchPendingMessage } from "../tasks/pending-dispatch.js";
+import {
+  CREDENTIALS_UNREADABLE, quarantineUnsendablePending, recordPendingDrainFailure,
+} from "../tasks/pending-quarantine.js";
+import { applySealedCredentials, RunCredentialFault } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
-import { redactStoredValue } from "@claw/utils";
+import { redactStoredText, redactStoredValue } from "@claw/utils";
 import pino from "pino";
 import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
-import { metrics } from "../infra/metrics.js";
+import { metrics, type EventQuarantineReason } from "../infra/metrics.js";
+import { trackDelivery } from "./redelivery.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
 import type { LeaderLease } from "../infra/leader-lock.js";
 import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
+import {
+  depthBoundedEvent, STORED_DEPTH_LIMITS, eventDeliveryHealth, quarantineEventDelivery, startEventBacklogGauges, storableEvent, storableText,
+} from "./poison.js";
 
 /** Brain's event for a streaming tool call's text so far (`ExecuteRequest.stream_tool_text`); never stored. */
 export const TOOL_TEXT_DELTA_EVENT = "toolTextDelta";
@@ -160,7 +168,7 @@ function makeEventId(seq: unknown): string {
  * Background durable consumer: listens to all events, persists to DB,
  * and triggers post-completion logic (save turns, summarize, pending messages).
  */
-export async function startEventConsumer(): Promise<void> {
+export async function startEventConsumer(opts: { signal?: AbortSignal } = {}): Promise<void> {
   const subject = "events.>";
   const consumerName = "api-consumer";
   const jsm = await nc.jetstreamManager();
@@ -183,11 +191,23 @@ export async function startEventConsumer(): Promise<void> {
   const consumer = await js.consumers.get(EVENT_STREAM, consumerName);
   const iter = await consumer.consume();
 
-  listenForCleanupNotices();
+  const cleanupSub = listenForCleanupNotices();
+  const stopGauges = startEventBacklogGauges(jsm, EVENT_STREAM, consumerName);
+  // Stops pulling, so the loop below ends once the delivery in hand is answered.
+  opts.signal?.addEventListener("abort", () => {
+    stopGauges();
+    cleanupSub.unsubscribe();
+    void iter.close().catch(() => {});
+  }, { once: true });
   logger.info({ subject, consumerName }, "event-consumer.started");
 
   for await (const msg of iter) {
-    await consumeEventDelivery(msg);
+    // `consumeEventDelivery` answers every delivery itself and does not throw;
+    // were it ever to, this loop must not end with it, since every session's
+    // events would stop with the one that threw.
+    await consumeEventDelivery(trackDelivery(msg)).catch((err) => {
+      logger.error({ err: (err as Error)?.message, seq: msg.seq }, "event-consumer.delivery_threw");
+    });
   }
 }
 
@@ -202,7 +222,7 @@ export async function startEventConsumer(): Promise<void> {
  * in that window. Core NATS, at-most-once: a missed notice only costs the
  * remaining TTL, which is how the cache behaved before this existed.
  */
-function listenForCleanupNotices(): void {
+function listenForCleanupNotices(): { unsubscribe(): void } {
   const sub = nc.subscribe("cleanup.>");
   (async () => {
     for await (const msg of sub) {
@@ -214,6 +234,7 @@ function listenForCleanupNotices(): void {
       "event-consumer.cleanup_listener_died",
     );
   });
+  return sub;
 }
 
 /**
@@ -239,6 +260,7 @@ function owedRunNotice(raw: unknown, rowId: number): RunFinished | null {
       taskIds: v.taskIds,
       outcome: v.outcome,
       ...(typeof v.failureReason === "string" ? { failureReason: v.failureReason } : {}),
+      ...(typeof v.failureMessage === "string" ? { failureMessage: v.failureMessage } : {}),
     };
   }
   logger.error({ rowId }, "notification.owed_unreadable");
@@ -418,30 +440,157 @@ async function processCompletionEvent(
   return outcome.ran ? outcome.result : "busy";
 }
 
+/** One delivery of the event stream, as `consumeEventDelivery` reads it. */
+export interface EventDelivery {
+  subject: string;
+  data: Uint8Array;
+  seq?: number;
+  info?: { streamSequence?: number; deliveryCount?: number; redeliveryCount?: number; timestampNanos?: number };
+  ack: () => void;
+  nak: (millis?: number) => void;
+}
+
+/** Postgres refusing the value itself: retrying the same event cannot succeed. */
+const UNSTORABLE_PG_CODES = new Set([
+  "22P05", // untranslatable character (a \u0000 escape in jsonb)
+  "22021", // invalid byte sequence (NUL in text)
+  "22P02", // invalid text representation (a lone surrogate escape in jsonb)
+  "54001", // statement too complex (nesting deeper than the server's stack)
+]);
+
+/** Postgres's stack depth limit: the only refusal a completion is stored bounded for. */
+const STACK_DEPTH_EXCEEDED = "54001";
+
 /**
  * One delivery: refuse a deleted session before any write, otherwise persist.
  *
  * Pulled out of the consume loop so the two properties the loop exists for --
  * the tombstone check sits in front of the INSERT, and a refusal acks rather
  * than naks -- can be pinned without a live JetStream iterator.
+ *
+ * Every delivery is answered (acked or nak'd), and none throws: a step that
+ * throws is answered with a nak. Only an event no retry can store is set aside
+ * (with a durable copy, see poison.ts): one that is not a JSON object, or one
+ * Postgres refuses for its value. Every other failure is retried however long
+ * it lasts, since an outage and a busy or owed completion look the same from
+ * here as a bad event does, and only the retry tells them apart.
  */
-export async function consumeEventDelivery(msg: {
-  subject: string;
-  data: Uint8Array;
-  seq?: number;
-  info?: { streamSequence?: number };
-  ack: () => void;
-  nak: (millis?: number) => void;
-}): Promise<void> {
-    // subject layout: "events.{sessionId}"
-    const sessionId = msg.subject.split(".")[1];
-    let event: Record<string, unknown>;
+export async function consumeEventDelivery(msg: EventDelivery): Promise<void> {
+  const seq = msg.seq ?? msg.info?.streamSequence;
+  const deliveries = msg.info?.deliveryCount ?? msg.info?.redeliveryCount ?? 1;
+  const publishedMs = typeof msg.info?.timestampNanos === "number" && msg.info.timestampNanos > 0
+    ? Math.floor(msg.info.timestampNanos / 1_000_000) : undefined;
+  let answer: "ack" | "nak" | undefined;
+  const tracked: EventDelivery = {
+    subject: msg.subject, data: msg.data, seq: msg.seq, info: msg.info,
+    ack: () => { answer ??= "ack"; msg.ack(); },
+    nak: (millis?: number) => { answer ??= "nak"; msg.nak(millis); },
+  };
+  try {
+    await processEventDelivery(tracked, { seq, deliveries, publishedMs });
+  } catch (err) {
+    eventDeliveryHealth.noteError(seq, err);
+    logger.error({ err: (err as Error)?.message, seq, subject: msg.subject }, "event-consumer.delivery_failed");
+    if (!answer) tracked.nak(5_000);
+  }
+  eventDeliveryHealth.answered(seq, answer ?? "none");
+}
+
+/**
+ * The bytes kept for a quarantined delivery: the event masked the way a stored
+ * one is (`redactStoredValue`), or the text masked when it is not JSON. A
+ * quarantined event is still conversation content at rest.
+ */
+function quarantineCopy(text: string, event?: Record<string, unknown>): Uint8Array {
+  let copy: string;
+  try {
+    copy = event ? JSON.stringify(redactStoredValue(event)) : redactStoredText(text).text;
+  } catch {
+    // An event too deeply nested to serialise again is kept as its text.
+    copy = redactStoredText(text).text;
+  }
+  return new TextEncoder().encode(copy);
+}
+
+/**
+ * Set a delivery aside: keep its copy, then ack it. A copy that cannot be
+ * written naks instead, so the event is retried rather than lost. An event of a
+ * session that has since been deleted is dropped without a copy, as the normal
+ * path would drop it.
+ */
+async function setAside(
+  msg: EventDelivery,
+  reason: EventQuarantineReason,
+  d: { seq?: number; deliveries: number; publishedMs?: number },
+  event?: Record<string, unknown>,
+): Promise<void> {
+  const sessionId = storableText(msg.subject.split(".")[1] ?? "");
+  const text = sc.decode(msg.data);
+  if (!event && reason !== "unparseable") {
     try {
-      const raw = sc.decode(msg.data).replace(/\u0000/g, "");
-      event = JSON.parse(raw);
+      const parsed: unknown = JSON.parse(text);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) event = storableEvent(parsed as Record<string, unknown>).event;
+    } catch { /* kept as text below */ }
+  }
+  const eventType = event && typeof event.type === "string" ? event.type : null;
+  const payload = quarantineCopy(text, event);
+  const deleted = await sessionWasDeleted(sessionId);
+  if (deleted === "unknown") {
+    // Neither keep a copy (the session may be gone) nor drop it (it may not be): ask again later.
+    msg.nak(TOMBSTONE_UNKNOWN_NAK_MS);
+    return;
+  }
+  if (deleted) {
+    logger.info({ sessionId, type: eventType, reason }, "event-consumer.dropped_deleted_session");
+    msg.ack();
+    return;
+  }
+  try {
+    await quarantineEventDelivery({
+      eventId: makeEventId(d.seq), sessionId, subject: msg.subject, seq: d.seq, eventType, reason,
+      deliveries: d.deliveries, publishedMs: d.publishedMs, lastError: eventDeliveryHealth.takeError(d.seq),
+      payload,
+    });
+  } catch (err) {
+    logger.error({ err: (err as Error)?.message, sessionId, seq: d.seq, reason }, "event-consumer.quarantine_failed");
+    msg.nak(5_000);
+    return;
+  }
+  msg.ack();
+}
+
+async function processEventDelivery(
+  msg: EventDelivery,
+  d: { seq?: number; deliveries: number; publishedMs?: number },
+): Promise<void> {
+    // subject layout: "events.{sessionId}"
+    const sessionId = storableText(msg.subject.split(".")[1] ?? "");
+    // Only the bytes decide `unparseable`: text that is not JSON, or JSON that
+    // is not an object. Both fail the same way on every delivery.
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(sc.decode(msg.data));
     } catch {
-      msg.ack();
+      parsed = undefined;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      await setAside(msg, "unparseable", d);
       return;
+    }
+    // The write boundary: every string Postgres cannot store (NUL, a lone
+    // surrogate) is replaced here, before anything below writes it. Outside the
+    // try above on purpose: were it ever to throw, the event is still valid
+    // JSON, and a throw here is answered with a nak by `consumeEventDelivery`
+    // (retried, never set aside -- a completion least of all).
+    const storable = storableEvent(parsed as Record<string, unknown>);
+    // Replaced only by a depth-bounded copy of a completion Postgres refused for its nesting (see the INSERT below).
+    let event = storable.event;
+    const sanitised = storable.replaced > 0;
+    if (storable.replaced) {
+      logger.warn(
+        { sessionId, type: event.type, seq: d.seq, replaced: storable.replaced },
+        "event-consumer.unstorable_characters_replaced",
+      );
     }
     logger.info({ sessionId, type: event.type, seq: (msg as any).seq }, "event-consumer.msg_received");
 
@@ -527,13 +676,53 @@ export async function consumeEventDelivery(msg: {
     // absorb that index's 23505, which would nak the message for ever.
     const isAppEvent = event.type === "appEvent";
     const appEvent = appEventIdentity(event);
+    // The stored copy has credential-shaped content masked (`redactStoredValue`); `event` itself, which the completion below and
+    // every hook after it read, is not touched.
+    const insertRow = (stored: Record<string, unknown>) => db.query(
+      `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${isAppEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
+      [eventId, sessionId, (stored.type as string) || "message", redactStoredValue(stored)],
+    );
     try {
-      // The stored copy has credential-shaped content masked (`redactStoredValue`); `event` itself, which the completion below and
-      // every hook after it read, is not touched.
-      const insertResult = await db.query(
-        `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${isAppEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
-        [eventId, sessionId, (event.type as string) || "message", redactStoredValue(event)],
-      );
+      let insertResult;
+      try {
+        insertResult = await insertRow(event);
+      } catch (e: any) {
+        if (event.type !== "exec_complete" || e?.code !== STACK_DEPTH_EXCEEDED) throw e;
+        // A completion Postgres refused for its nesting (54001: deeper than its parser's stack, about 13,000 levels with
+        // the default `max_stack_depth`). It is never set aside -- its turn and its run notice would be left undone --
+        // and no retry stores it whole. So a copy with every level past a limit replaced is stored, and it is that copy
+        // the completion below runs on: the turn's writes would refuse the same nesting. The limit is not fixed: a
+        // server with a smaller `max_stack_depth` refuses a shallower copy too, so each limit in `STORED_DEPTH_LIMITS`
+        // is tried in turn until one is stored. The original, masked, is kept in quarantine (reason `bounded`) before
+        // the completion runs; a copy that cannot be written throws to the nak below, and the redelivery finds the
+        // bounded row already stored (the same limits are tried in the same order, so it is the same copy).
+        eventDeliveryHealth.noteError(d.seq, e);
+        let bounded: { event: Record<string, unknown>; cut: number; limit: number; result: Awaited<ReturnType<typeof insertRow>> } | null = null;
+        for (const limit of STORED_DEPTH_LIMITS) {
+          const copy = depthBoundedEvent(event, limit);
+          if (!copy.cut) continue; // nothing that deep: the same event Postgres just refused
+          try {
+            bounded = { ...copy, limit, result: await insertRow(copy.event) };
+            break;
+          } catch (e2: any) {
+            if (e2?.code !== STACK_DEPTH_EXCEEDED) throw e2;
+          }
+        }
+        // Not one limit both cut something and was stored: retried like any other refusal.
+        if (!bounded) throw e;
+        insertResult = bounded.result;
+        logger.warn(
+          { sessionId, eventId, type: event.type, code: e.code, cut: bounded.cut, limit: bounded.limit },
+          "event-consumer.completion_stored_depth_bounded",
+        );
+        await quarantineEventDelivery({
+          eventId, sessionId, subject: msg.subject, seq: d.seq, eventType: "exec_complete", reason: "bounded",
+          deliveries: d.deliveries, publishedMs: d.publishedMs, lastError: eventDeliveryHealth.takeError(d.seq),
+          payload: quarantineCopy(sc.decode(msg.data), event),
+        });
+        event = bounded.event;
+      }
+      eventDeliveryHealth.stored();
       if (isAppEvent && !insertResult.rowCount) {
         logger.info({ sessionId, appTaskId: appEvent?.appTaskId, appEventId: appEvent?.eventId }, "event-consumer.app_event_duplicate_dropped");
         msg.ack();
@@ -541,6 +730,7 @@ export async function consumeEventDelivery(msg: {
       }
       if (insertResult.rowCount && insertResult.rows[0]) {
         metrics.onEventPersisted("ok");
+        if (sanitised) metrics.onEventSanitised();
         rowId = insertResult.rows[0].id;
       } else {
         const existing = await db.query(
@@ -553,11 +743,19 @@ export async function consumeEventDelivery(msg: {
       }
     } catch (e: any) {
       metrics.onEventPersisted("error");
+      eventDeliveryHealth.noteError(d.seq, e);
       const pgCode = e?.code || "";
-      if (pgCode === "22P05" || pgCode === "22021") {
-        logger.error({ err: e, sessionId, eventId }, "event-consumer.persist_poison_skipped");
-        msg.ack();
+      if (UNSTORABLE_PG_CODES.has(pgCode) && event.type !== "exec_complete") {
+        // Not expected once the event is sanitised above; if it happens anyway,
+        // no retry can store it, so it is set aside at once with its copy.
+        logger.error({ sessionId, eventId, type: event.type, code: pgCode }, "event-consumer.persist_unstorable");
+        await setAside(msg, "unstorable", d, event);
       } else {
+        // A completion is never set aside, unstorable or not: its row is what
+        // `processCompletionEvent` stamps, and acking it without one would end
+        // the run's turn and its `run.completed` notice with nothing done. One
+        // refused for its nesting was stored bounded above; any other failure
+        // is retried, and the gauge and this log line show it.
         logger.error({ err: e, sessionId }, "event-consumer.persist_failed");
         msg.nak(5000);
       }
@@ -591,6 +789,7 @@ export async function consumeEventDelivery(msg: {
         // stamp in `processCompletionEvent`, which is the statement that makes
         // this comment true.
         logger.error({ err: e, sessionId }, "event-consumer.complete_failed");
+        eventDeliveryHealth.noteError(d.seq, e);
         msg.nak(10_000);
         return;
       }
@@ -864,12 +1063,23 @@ async function turnOfChatRow(sessionId: string, taskId: string): Promise<string 
 /**
  * Put the pending row's sealed credentials on the task, or end that turn.
  *
- * A blob that will not open is permanent for the row that carries it, and the
- * throw used to escape `handleComplete`: the event was naked with
- * `processed_at` still null and redelivered every ten seconds, failing
- * identically, so one unreadable row wedged the drain for every session behind
- * it. Ended the way an admission refusal is instead -- the reader is told, the
- * queue entry goes -- because no retry can make the ciphertext readable.
+ * The throw used to escape `handleComplete` with nothing to bound it: the event
+ * was naked with `processed_at` still null and redelivered every ten seconds,
+ * failing identically, so one unreadable row wedged the drain for every session
+ * behind it.
+ *
+ * A blob no replica can open (`RunCredentialFault.permanent`: too short to be
+ * sealed, or opened to something that is not our JSON) is quarantined at once
+ * (tasks/pending-quarantine.ts): it leaves the queue, is counted, and the
+ * reader is told -- once, and by the sweeper if the notice cannot be published
+ * now. A row that cannot be moved is a failed drain like any other, raised to
+ * be counted on the row and retried.
+ *
+ * Any other failure to open it -- a tag that does not authenticate, a key not
+ * loaded -- is also what a replica with a stale or missing key sees while the
+ * other replicas open the same blob, so it is raised as a failed drain: counted
+ * on the row, retried by whichever replica drains next, and quarantined only
+ * once it has had its attempts.
  *
  * @returns whether the task is safe to dispatch.
  */
@@ -882,19 +1092,18 @@ export async function applyPendingCredentials(
     applySealedCredentials(task, pending.credentials_blob);
     return true;
   } catch (err) {
-    logger.error({ err, sessionId: who.sessionId, pendingId: pending.id }, "pending.credentials_unreadable");
-    try {
-      await publishRefusedTurn({
-        sessionId: who.sessionId,
-        pendingId: pending.id,
-        userId: who.userId,
-        messageId: who.messageId,
-        prompt: pending.content ?? "",
-      } as never, "credentials_unreadable");
-      await db.query("DELETE FROM claw_pending_messages WHERE id = $1", [pending.id]);
-    } catch (cleanupErr) {
-      logger.error({ err: cleanupErr, sessionId: who.sessionId, pendingId: pending.id }, "pending.abandon_failed");
-    }
+    const permanent = err instanceof RunCredentialFault && err.permanent;
+    logger.error(
+      { err, sessionId: who.sessionId, pendingId: pending.id, permanent },
+      "pending.credentials_unreadable",
+    );
+    if (!permanent) throw err;
+    await quarantineUnsendablePending({
+      sessionId: who.sessionId,
+      pendingId: Number(pending.id),
+      userId: who.userId,
+      content: pending.content ?? "",
+    }, err, CREDENTIALS_UNREADABLE);
     return false;
   }
 }
@@ -1040,6 +1249,12 @@ async function handleComplete(
   const runFailure = !failed && !interrupted ? runFailureOf(event) : null;
   const runFailed = Boolean(failed) || runFailure !== null;
   const runFailureReason = failed ? String(failure_reason ?? "agent_error") : runFailure?.reason;
+  // What the run failed with, for a person: a turn that answered carries it as
+  // `run_failure_message`, a failed one whose sandbox could not be provided as
+  // `failure_message` (the platform's account, masked by the worker).
+  const runFailureMessage = runFailure
+    ? runFailure.message
+    : failed && typeof (event as any).failure_message === "string" ? String((event as any).failure_message).slice(0, 2000) : "";
   // Null rather than "" when absent: the unique index over the turns is partial
   // on this column, so an empty string would put every turn of every caller that
   // sends no message id into one index entry and let the first one written
@@ -1071,7 +1286,7 @@ async function handleComplete(
       runFailed ? runFailureReason : undefined,
       {
         taskId: provenance ?? undefined, runClaim: runClaimOf(event),
-        ...(runFailure ? { failureMessage: runFailure.message } : {}),
+        ...(runFailureMessage ? { failureMessage: runFailureMessage } : {}),
       },
     );
     endedRunIds = closed.length ? closed : (provenance ? [provenance] : []);
@@ -1361,6 +1576,7 @@ async function handleComplete(
       taskIds: endedRunIds,
       outcome: runFailed ? "failed" : "completed",
       ...(runFailed ? { failureReason: runFailureReason } : {}),
+      ...(runFailed && runFailureMessage ? { failureMessage: runFailureMessage } : {}),
     };
     try {
       await completionPorts.recordRunFinished(notice);
@@ -1529,11 +1745,35 @@ async function drainNextPendingMessage(sessionId: string, userId: string): Promi
   // A worker's report queued for the assistant waits behind what its user sent: the user is waiting for an answer,
   // and the report is on the board already, where the turn answering the user reads it.
   const pending = (await db.query(
-  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT effort FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_effort, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo FROM claw_pending_messages WHERE session_id = $1 ORDER BY starts_with(content, $2), created_at LIMIT 1",
+  "SELECT id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist, (SELECT model FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_model, (SELECT effort FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_effort, (SELECT config->'repo' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_repo, (SELECT config->'placement' FROM claw_sessions WHERE session_id = claw_pending_messages.session_id AND deleted_at IS NULL) AS session_placement FROM claw_pending_messages WHERE session_id = $1 ORDER BY starts_with(content, $2), created_at LIMIT 1",
   [sessionId, WORK_EVENT_PREFIX],
 )).rows[0];
 
 if (pending) {
+  try {
+    await dispatchQueuedRow(sessionId, userId, pending);
+  } catch (err) {
+    // A failed send is counted on the row, and past its bound the row is moved
+    // out of the queue (tasks/pending-quarantine.ts). Until then the failure is
+    // raised exactly as before, for the nak or the next sweeper tick to retry;
+    // once the row has left, nothing is owed to it here and the drain claim
+    // goes straight on to the next message instead of failing the whole drain.
+    const verdict = await recordPendingDrainFailure({
+      sessionId, pendingId: Number(pending.id), userId: pending.user_id || userId,
+      content: typeof pending.content === "string" ? pending.content : "",
+    }, err);
+    if (verdict !== "quarantined") throw err;
+  }
+}
+}
+
+/** Send one queued row on: the body of a drain, once the row has been read. */
+async function dispatchQueuedRow(
+  sessionId: string,
+  userId: string,
+  pending: Record<string, any> & { id: number | string },
+): Promise<void> {
+  {
   // A review someone asked of the session's owner runs only while the owner still lets others act for them, asked now, and while its
   // turn budget has room; otherwise it is halted here and nothing is sent (`gateRequestedReviewTurn`).
   if (!(await (await import("../assistant/review-items.js")).gateRequestedReviewTurn(sessionId))) return;
@@ -1629,6 +1869,9 @@ if (pending) {
   // The session's bound repository, as the immediate path attaches it.
   const pendingRepo = sessionRepoFromRow({ repo: pending.session_repo }, sessionId);
   if (pendingRepo) task.repo = pendingRepo;
+  // Where the session's sandboxes may run, as the immediate path attaches it.
+  const pendingPlacement = sessionPlacementFromRow({ placement: pending.session_placement }, sessionId);
+  if (pendingPlacement) task.placement = pendingPlacement;
   const credentialsReadable = await applyPendingCredentials(task, pending, {
     sessionId, userId: pendingUserId, messageId: pendingMessageId,
   });

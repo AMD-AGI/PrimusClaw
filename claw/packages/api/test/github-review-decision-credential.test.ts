@@ -87,7 +87,7 @@ describe("a held merge is answered by a signed-in person, not by a key", () => {
 
   before(async () => {
     safe = await startSafe();
-    Object.assign(process.env, { SAFE_API_URL: safe.url, AUTH_INTERNAL_TOKEN: "t" });
+    Object.assign(process.env, { SAFE_API_URL: safe.url, CLAW_AUTH_PROVIDER: "safe", AUTH_INTERNAL_TOKEN: "t" });
     delete process.env.CLAW_DEPLOY_MODE;
     delete process.env.CLAW_INSECURE_DEV_AUTH;
     delete process.env.CLAW_IDENTITY_TOKEN_AUTH_ENABLED;
