@@ -45,9 +45,9 @@ function walk(value: unknown): unknown {
     const json: unknown = toJSON.call(value);
     if (json !== value) return walk(json);
   }
-  const out: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) out[storableText(key)] = walk(child);
-  return out;
+  // Built with fromEntries, which defines each key as the copy's own field: in parsed JSON `__proto__` is an ordinary key, and an
+  // assignment under that name would set the copy's prototype instead (and the key would be lost).
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, child]) => [storableText(key), walk(child)]));
 }
 
 /** `JSON.stringify` of {@link storableJson}: a parameter for a `$n::jsonb` placeholder that PostgreSQL accepts. */

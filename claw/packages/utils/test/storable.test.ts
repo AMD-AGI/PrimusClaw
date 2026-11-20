@@ -31,6 +31,14 @@ test("storableJson walks keys and values at any depth, keeps non-strings, and do
   assert.ok(!/\\u0000|\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f])/i.test(storableJsonText(input)), "nothing PostgreSQL's jsonb refuses is left in the text");
 });
 
+test("a `__proto__` key in parsed JSON stays a field of the copy and never becomes its prototype", () => {
+  const input = JSON.parse('{"__proto__": {"polluted": "x\\u0000"}, "a": 1}') as Record<string, unknown>;
+  const out = storableJson(input) as Record<string, unknown>;
+  assert.equal(Object.getPrototypeOf(out), Object.prototype);
+  assert.equal((out as { polluted?: unknown }).polluted, undefined);
+  assert.deepEqual(JSON.parse(storableJsonText(input)), JSON.parse(`{"__proto__": {"polluted": "x${R}"}, "a": 1}`));
+});
+
 test("what redactStoredText and redactStoredValue hand to an INSERT is storable", () => {
   assert.equal(redactStoredText("out\u0000put").text, `out${R}put`);
   assert.deepEqual(redactStoredValue({ message_id: "m\u0000", ["k\u0000"]: "v\uD800", password: "hunter2" }),
