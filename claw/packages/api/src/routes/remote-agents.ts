@@ -503,6 +503,10 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const posted = [...new Set([...result.touched, ...Object.keys(result.acked)])];
     if (posted.length) await noteRemoteEvents(owner, posted);
     const rejected = [...batch.value.rejected, ...result.rejected].sort((a, b) => a.index - b.index);
+    // Refused because the database could not hold it (`store.insertEvents`): the rest of the batch was stored. Named by number only.
+    for (const r of result.rejected) {
+      if (r.reason === "unstorable") logger.warn({ owner, connectorId: connector.connector_id, sessionId: r.session_id, seq: r.seq }, "remote_agents.event_unstorable");
+    }
     return reply.send({ ok: true, data: { batch_id: batch.value.batchId, acked: result.acked, rejected } });
   });
 

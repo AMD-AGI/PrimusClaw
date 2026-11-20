@@ -52,6 +52,8 @@ export const pauseFile = (d: Dirs) => path.join(d.state, "paused");
 export const stopRequestFile = (d: Dirs) => path.join(d.state, "stop-requested.json");
 export const auditFile = (d: Dirs) => path.join(d.state, "audit.jsonl");
 export const outboxDir = (d: Dirs) => path.join(d.state, "outbox");
+/** Events Claw would not take, set aside unsent (session, number, type and why: never the content). One JSON line each. */
+export const quarantineFile = (d: Dirs) => path.join(d.state, "quarantine.jsonl");
 export const logDir = (d: Dirs) => path.join(d.state, "logs");
 export const disconnectsFile = (d: Dirs) => path.join(d.state, "disconnects.jsonl");
 export const needsLoginFile = (d: Dirs) => path.join(d.state, "needs-login.json");

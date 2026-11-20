@@ -9,6 +9,7 @@
  * its id: the row is simply not found.
  */
 import { randomUUID } from "node:crypto";
+import { storableJsonText } from "@claw/utils";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import {
@@ -53,7 +54,7 @@ export function writeAudit(q: Querier, e: AuditEntry): Promise<unknown> {
   return q(
     `INSERT INTO claw_remote_audit (owner_user_id, connector_id, agent_id, session_id, action, actor, client, detail)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
-    [e.owner, e.connectorId ?? null, e.agentId ?? null, e.sessionId ?? null, e.action, e.actor, e.client ?? null, JSON.stringify(e.detail ?? {})],
+    [e.owner, e.connectorId ?? null, e.agentId ?? null, e.sessionId ?? null, e.action, e.actor, e.client ?? null, storableJsonText(e.detail ?? {})],
   );
 }
 
@@ -358,7 +359,7 @@ async function revokeIn(
       `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
        SELECT sid, $2, $3, NOW(), $4::jsonb FROM unnest($1::uuid[]) AS sid
        ON CONFLICT (session_id, seq) DO NOTHING`,
-      [closed, REVOKED_CLOSE_SEQ, REMOTE_EVENT_SESSION_CLOSED, JSON.stringify({ reason, by: "claw" })],
+      [closed, REVOKED_CLOSE_SEQ, REMOTE_EVENT_SESSION_CLOSED, storableJsonText({ reason, by: "claw" })],
     );
   }
   await writeAudit(q, {
@@ -392,7 +393,7 @@ export async function recordHeartbeat(connectorId: string, owner: string, hb: Re
          VALUES ($1, $2, $3, $4, $5, $6::jsonb)
          ON CONFLICT (connector_id, agent_id) DO UPDATE
            SET kind = EXCLUDED.kind, name = EXCLUDED.name, capabilities = EXCLUDED.capabilities, updated_at = NOW()`,
-        [connectorId, a.agent_id, owner, a.kind, a.name, JSON.stringify(a.capabilities)],
+        [connectorId, a.agent_id, owner, a.kind, a.name, storableJsonText(a.capabilities)],
       );
     }
     return undelivered;
@@ -519,7 +520,7 @@ export async function expireUndelivered(
       `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
        SELECT session_id, $2, $3, NOW(), $4::jsonb FROM claw_remote_sessions WHERE session_id = $1 AND connector_id = $5
        ON CONFLICT (session_id, seq) DO NOTHING`,
-      [r.session_id, -Number(r.cmd_seq), type, JSON.stringify({ ...data, by: "claw" }), r.connector_id],
+      [r.session_id, -Number(r.cmd_seq), type, storableJsonText({ ...data, by: "claw" }), r.connector_id],
     );
     if (added.rowCount) touched.set(r.session_id!, { owner: r.owner, session_id: r.session_id! });
   };
@@ -749,7 +750,7 @@ export async function enqueueCommand(q: Querier, c: NewCommand): Promise<{ inser
   const row = (await q(
     `INSERT INTO claw_remote_commands (connector_id, cmd_seq, cmd_id, session_id, type, payload)
      VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING cmd_seq, cmd_id, session_id::text AS session_id, type, payload`,
-    [c.connectorId, seq, c.cmdId, c.sessionId, c.type, JSON.stringify(c.payload)],
+    [c.connectorId, seq, c.cmdId, c.sessionId, c.type, storableJsonText(c.payload)],
   )).rows[0];
   return { inserted: true, row };
 }
@@ -886,17 +887,7 @@ export async function ingestEvents(
     const touched = new Set<string>();
     const closed = new Set<string>();
     if (accepted.length) {
-      const inserted = (await q(
-        `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
-         SELECT s, n, t, to_timestamp(ms / 1000.0), d
-           FROM unnest($1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::jsonb[]) AS u(s, n, t, ms, d)
-         ON CONFLICT (session_id, seq) DO NOTHING
-         RETURNING session_id::text AS session_id, seq, type, data`,
-        [
-          accepted.map((e) => e.session_id), accepted.map((e) => e.seq), accepted.map((e) => e.type),
-          accepted.map((e) => e.ts), accepted.map((e) => JSON.stringify(e.data)),
-        ],
-      )).rows;
+      const inserted = await insertEvents(q, accepted, rejected);
       for (const row of inserted) {
         touched.add(row.session_id);
         const d = (row.data ?? {}) as Record<string, any>;
@@ -932,6 +923,61 @@ export async function ingestEvents(
 }
 
 const str = (v: unknown, max = 128): string | null => (typeof v === "string" ? v.slice(0, max) : null);
+
+const INSERT_EVENTS_SQL = `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
+  SELECT s, n, t, to_timestamp(ms / 1000.0), d
+    FROM unnest($1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::jsonb[]) AS u(s, n, t, ms, d)
+  ON CONFLICT (session_id, seq) DO NOTHING
+  RETURNING session_id::text AS session_id, seq, type, data`;
+
+/**
+ * Whether an error is about the value a statement was given (SQLSTATE class 22, data exception: a character, a number or a time
+ * PostgreSQL cannot hold; class 54, a value too deep or too large), not about the database: such an error names one event, and
+ * the next attempt fails the same way. Anything else (a lost connection, a deadlock, a full disk) is the batch's, and retried.
+ */
+export function isUnstorableValueError(err: unknown): boolean {
+  const code = typeof err === "object" && err !== null ? (err as { code?: unknown }).code : undefined;
+  return typeof code === "string" && (code.startsWith("22") || code.startsWith("54"));
+}
+
+/**
+ * Store a batch's accepted events in one statement, with every string made storable (`storableJsonText`: a NUL or an unpaired
+ * surrogate, which `jsonb` refuses, becomes U+FFFD). Should the statement still fail on a value, each event is stored on its own
+ * and one that fails that way is refused (`unstorable`, with its index and seq, added to `rejected`) while the rest are kept: one
+ * event a connector cannot change must not fail the batch it is in, nor every batch after it, which it would otherwise head for
+ * ever. Each attempt runs under a savepoint, so a failed one leaves the transaction usable.
+ */
+async function insertEvents(q: Querier, accepted: ParsedRemoteEvent[], rejected: RemoteEventRejection[]): Promise<Row[]> {
+  const params = (evs: ParsedRemoteEvent[]) => [
+    evs.map((e) => e.session_id), evs.map((e) => e.seq), evs.map((e) => e.type), evs.map((e) => e.ts), evs.map((e) => storableJsonText(e.data)),
+  ];
+  const attempt = async (evs: ParsedRemoteEvent[]): Promise<Row[]> => {
+    await q("SAVEPOINT remote_events");
+    try {
+      const rows = (await q(INSERT_EVENTS_SQL, params(evs))).rows;
+      await q("RELEASE SAVEPOINT remote_events");
+      return rows;
+    } catch (err) {
+      await q("ROLLBACK TO SAVEPOINT remote_events");
+      throw err;
+    }
+  };
+  try {
+    return await attempt(accepted);
+  } catch (err) {
+    if (!isUnstorableValueError(err)) throw err;
+  }
+  const rows: Row[] = [];
+  for (const e of accepted) {
+    try {
+      rows.push(...await attempt([e]));
+    } catch (err) {
+      if (!isUnstorableValueError(err)) throw err;
+      rejected.push({ index: e.index, session_id: e.session_id, seq: e.seq, reason: "unstorable" });
+    }
+  }
+  return rows;
+}
 
 export async function listAudit(owner: string, filter: { sessionId: string | null; connectorId: string | null }, limit: number): Promise<Row[]> {
   return (await direct(
@@ -1040,7 +1086,7 @@ async function notePrompt(q: Querier, r: IssueRequest, cmdSeq: number): Promise<
   await q(
     `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
      VALUES ($1, $2, $3, NOW(), $4::jsonb) ON CONFLICT (session_id, seq) DO NOTHING`,
-    [r.sessionId, userPromptSeq(cmdSeq), REMOTE_EVENT_USER_PROMPT, JSON.stringify(data)],
+    [r.sessionId, userPromptSeq(cmdSeq), REMOTE_EVENT_USER_PROMPT, storableJsonText(data)],
   );
 }
 
