@@ -28,6 +28,8 @@ import pino from "pino";
 import { handleBackendMcpRequest, type JsonRpcRequest } from "../backend-mcp/index.js";
 import type { BackendMcpCtx } from "../backend-mcp/index.js";
 import { applyAgentDone, type AgentDonePayload } from "../tasks/lifecycle.js";
+import { unstorableSqlState } from "../tasks/storable.js";
+import { metrics } from "../infra/metrics.js";
 import { getTask, transitionStatus } from "../tasks/db.js";
 import { markFinishOnlyHandedOver, settleFinishedAppRun } from "../tasks/sweeper.js";
 import { parseSandboxHandle, type SandboxHandle } from "../tasks/sandbox-handle.js";
@@ -1266,7 +1268,7 @@ function registerAgentDoneRoute(app: FastifyInstance): void {
   app.post<{ Params: { taskId: string }; Body: AgentDoneBody }>(
     "/v1/internal/tasks/:taskId/agent_done",
     { preHandler: internalTaskAuth("dispatched") },
-    async (req) => {
+    async (req, reply) => {
       const { taskId } = req.params;
       const body = req.body ?? {};
       logger.info(
@@ -1279,7 +1281,20 @@ function registerAgentDoneRoute(app: FastifyInstance): void {
         },
         "task.agent_done.received",
       );
-      await applyAgentDone(taskId, body);
+      try {
+        await applyAgentDone(taskId, body);
+      } catch (err) {
+        // The database refused the values themselves, so the same body fails
+        // the same way however often it is sent. A 500 told Brain to resend it,
+        // and every resend re-ran the delivery until its budget ran out. 422
+        // says the body is the problem; Brain then reports the run as failed
+        // with a body that carries none of it. Logged without the values.
+        const sqlstate = unstorableSqlState(err);
+        if (!sqlstate) throw err;
+        metrics.onAgentDoneRefused(sqlstate);
+        logger.error({ taskId, sqlstate }, "task.agent_done.unstorable");
+        return reply.status(422).send({ ok: false, error: "unstorable_result", sqlstate });
+      }
       return { ok: true };
     },
   );

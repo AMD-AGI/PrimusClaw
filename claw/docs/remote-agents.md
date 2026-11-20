@@ -58,7 +58,10 @@ Events are stored once per `(session_id, seq)`; a repeat is ignored and a gap is
 allowed. A malformed event is refused alone and named in `rejected`, so one bad
 event cannot block the good ones behind it; retrying a rejected event cannot help.
 One event's `data` is at most 64 KB, and a request body at most the API's 4 MiB
-limit. Credentials in `data` are masked before storage.
+limit. Credentials in `data` are masked before storage, and a character
+PostgreSQL cannot store (U+0000, an unpaired surrogate) is replaced by U+FFFD, in
+keys and values. An event the database still refuses for its content is refused
+alone, as `unstorable`, and the rest of its batch is stored.
 
 Special event types: `permissionRequest` (`data.actionId`, `data.options[].optionId`),
 `permission_resolved` (`data.actionId`, `data.optionId`, `data.by`), and

@@ -34,6 +34,7 @@
  */
 import { randomUUID } from "node:crypto";
 import pino from "pino";
+import { storableJsonText } from "@claw/utils";
 import {
   REMOTE_AGENT_LIMITS, REMOTE_COMMANDS, REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED,
   REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_ASKS, type TerminalAsks,
@@ -295,7 +296,7 @@ export async function noteRemoteCancel(owner: string, sessionId: string, mark: n
     const before = Math.min(1, last ? last.n : Math.max(0, Number(item.params?.open_turns) || 0));
     cancels.push({ after: mark, before, n: 0, seqs: openSeqs ? [...openSeqs] : [] });
     await q("UPDATE claw_work_items SET params = params || $2::jsonb, updated_at = NOW() WHERE item_id = $1",
-      [item.item_id, JSON.stringify({ cancels })]);
+      [item.item_id, storableJsonText({ cancels })]);
   });
 }
 
@@ -350,7 +351,7 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
       await q(
         `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, last_report_kind, worker_session_id, kind, params)
          VALUES ($1, $2, $3, $4, 'in_progress', 'progress', $5, 'remote', $6::jsonb)`,
-        [itemId, p.owner, seq, title, worker, JSON.stringify(params)],
+        [itemId, p.owner, seq, title, worker, storableJsonText(params)],
       );
       await q(
         `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
@@ -392,7 +393,7 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
               pending_question = CASE WHEN board_state = 'needs_you' THEN pending_question ELSE NULL END,
               generation = generation + 1, params = params || $3::jsonb, updated_at = NOW()
         WHERE item_id = $1`,
-      [open.item_id, title, JSON.stringify(patch)],
+      [open.item_id, title, storableJsonText(patch)],
     );
     await q(
       `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
@@ -630,7 +631,7 @@ async function terminalItem(q: Querier, owner: string, sessionId: string): Promi
   await q(
     `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, last_report_kind, worker_session_id, kind, params)
      VALUES ($1, $2, $3, $4, 'in_progress', 'progress', $5, 'remote', $6::jsonb) ON CONFLICT (worker_session_id) DO NOTHING`,
-    [itemId, owner, seq, remoteTitle(machine, remoteAgentName(params), asked, lang), remoteWorkerSessionId(sessionId), JSON.stringify(params)],
+    [itemId, owner, seq, remoteTitle(machine, remoteAgentName(params), asked, lang), remoteWorkerSessionId(sessionId), storableJsonText(params)],
   );
   await q(`INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
            SELECT $1, 'created', 'remote', 0, NULL WHERE EXISTS (SELECT 1 FROM claw_work_items WHERE item_id = $1)`, [itemId]);
@@ -741,7 +742,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       await q(
         `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary, question, result)
          SELECT item_id, $2, 'remote', generation, $3, $4, $5::jsonb FROM claw_work_items WHERE item_id = $1`,
-        [item.item_id, ev.kind, ev.summary, ev.question ?? null, ev.result === undefined ? null : JSON.stringify(ev.result)],
+        [item.item_id, ev.kind, ev.summary, ev.question ?? null, ev.result === undefined ? null : storableJsonText(ev.result)],
       );
     };
     // The item ends with this turn's end: answered, with the end of the agent's answer.
@@ -821,7 +822,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
           },
         });
       }
-      await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, JSON.stringify(p)]);
+      await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, storableJsonText(p)]);
       return notices;
     }
     for (const e of events) {
@@ -857,7 +858,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
           await q(
             `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary, result)
              SELECT item_id, 'answer', 'remote', generation, $2, $3::jsonb FROM claw_work_items WHERE item_id = $1`,
-            [item.item_id, [said, tailOf(whole, ANSWER_EVENT_MAX)].filter(Boolean).join(" ") || null, JSON.stringify({ stop_reason: stop || null, remote_event_id: e.id, cmd_seq: seq })],
+            [item.item_id, [said, tailOf(whole, ANSWER_EVENT_MAX)].filter(Boolean).join(" ") || null, storableJsonText({ stop_reason: stop || null, remote_event_id: e.id, cmd_seq: seq })],
           );
           // (one notice per time the item needs the user: this is another)
           if (p.origin === "assistant") await q("UPDATE claw_work_items SET attention_seq = attention_seq + 1, updated_at = NOW() WHERE item_id = $1", [item.item_id]);
@@ -998,7 +999,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         if (unfinished) tell(`closed:${e.id}`, "closed", remoteNotice("closed", p, item.seq, ""));
       }
     }
-    await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, JSON.stringify(p)]);
+    await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, storableJsonText(p)]);
     return notices;
   });
 }

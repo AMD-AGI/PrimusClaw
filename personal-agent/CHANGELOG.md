@@ -15,6 +15,42 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## 0.10.4
+
+A patch release: the card for a merge or approval held for its owner, the terminal's own questions said in the chat, streams
+that come back after Teams ends one, and clearer words for a message the terminal has not confirmed yet. No plugin port
+(core's `src/plugins/`) or store change. Drawing the held-merge card needs a Claw that sends it (claw-v0.5.9 and later); the
+terminal question needs `@primusclaw/connector` 0.2.3 or later.
+
+### Added
+
+- The worker's `inbound message` line for a Teams activity also says when the client sent it: `client_ts`, `server_ts`,
+  `client_lag_raw_ms`, `client_lag_ms` (only between 0 and 24 hours) and `client_msg_id` when the client gave one. Only values
+  of a timestamp's or an id's shape are logged; never the text or who sent it (#872).
+
+### Changed
+
+- The review-mode card names `fully_auto` "全自动合入（仓库自身要求的检查仍然生效）" / "Fully automatic merge (the repository's
+  own requirements still apply)" and says it covers reviews asked for in the chat (#874).
+
+### Fixed
+
+- A merge or an approval that a review the assistant started for the person's own account holds for them reaches the chat
+  as the held-write card with its button (`confirm_write`, kinds `github_merge` and `github_review`). The card says how the
+  answer ended (merged, queued, approval posted, not merged or not approved, new commits, expired, or the refusal) and is
+  given back open when Claw answers `retry`. Before, the person was told to press a card that never came (#877).
+- While a message waits for a question on the terminal, the chat says what it asks ("The terminal is waiting for your
+  confirmation: Bash command: rm -rf …", 「终端在等你确认：…」) once per question, and the floating status says "Confirm there"
+  (等你确认). When the connector says Claude Code's registry row for the terminal cannot be read, the chat says once per
+  attach that reopening the conversation with `claude --resume` makes it recognized reliably (#865).
+- When Teams refuses a streamed reply's final message with 403 `ContentStreamNotAllowed` (the person stopped the stream),
+  the conversation streams again from the next turn instead of posting progress messages and deleting them for up to
+  10 minutes. A turn that is cancelled (the chat detaches or switches away, the machine disconnects, the turn breaks off)
+  no longer leaves its progress message behind: it is deleted, or edited down to "Interrupted." (#871).
+- `terminal_input_unconfirmed` is said as a message the terminal has not confirmed yet: whatever the session answers still
+  shows in the chat, and look at the terminal before sending it again (a connector before 0.1.22 is also told to upgrade).
+  A prompt passed on in Claude Code's `<pasted_content>` block is shown as the text that was pasted (#870).
+
 ## 0.10.3
 
 A patch release: a chat attached to a session on a machine shows a long turn's progress while it runs, and a message sent to

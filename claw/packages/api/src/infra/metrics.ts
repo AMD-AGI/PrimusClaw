@@ -103,6 +103,21 @@ const eventPersistedTotal = new Counter({
   labelNames: ["outcome"] as const,
   registers: [registry],
 });
+// A run's result carried characters Postgres refuses (U+0000, a lone
+// surrogate) and they were replaced so the result could land.
+const agentDoneSanitizedTotal = new Counter({
+  name: "claw_api_agent_done_sanitized_total",
+  help: "agent_done callbacks whose text had unstorable characters replaced with U+FFFD before the write.",
+  registers: [registry],
+});
+// A result the database still refused for its values, answered 422 so the
+// sender stops resending it. Rising means a field the sanitiser does not cover.
+const agentDoneRefusedTotal = new Counter({
+  name: "claw_api_agent_done_refused_total",
+  help: "agent_done callbacks refused with 422 because the database rejected their values, by SQLSTATE.",
+  labelNames: ["sqlstate"] as const,
+  registers: [registry],
+});
 
 // A worker's report refused because its run is no longer the item's current one (stopped, replaced or
 // overtaken): the fencing doing its job, and the number to watch if reports seem to go missing.
@@ -531,6 +546,12 @@ export const metrics = {
   } satisfies IdentityMetrics,
   setIdentityClientEnabled(enabled: boolean): void {
     identityClientEnabled.set(enabled ? 1 : 0);
+  },
+  onAgentDoneSanitized(): void {
+    agentDoneSanitizedTotal.inc();
+  },
+  onAgentDoneRefused(sqlstate: string): void {
+    agentDoneRefusedTotal.inc({ sqlstate });
   },
   onSessionCreated(outcome: "ok" | "error"): void {
     sessionCreatedTotal.inc({ outcome });
