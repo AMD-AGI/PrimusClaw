@@ -281,6 +281,65 @@ test("the whole send ends at its deadline however many attempts are left", async
   assert.deepEqual(fleet.started, [1], "no attempt is started once the deadline has passed");
 });
 
+test("the deadline counts from the request's arrival: a slow token check leaves the send only what is left", async () => {
+  // A cold instance: the token check fetches the OpenID metadata and the signing keys first, and then every attempt on
+  // the Service Bus fails. The 500 must still come inside the deadline from arrival, not the token check plus a deadline.
+  const { fleet, ingress, log } = make([["hang"], ["hang"], ["hang"]], { attempt: 0.15, deadline: 0.6 });
+  ingress.validate = () =>
+    new Promise((resolve) => {
+      setTimeout(() => {
+        resolve({});
+      }, 400);
+    });
+  const [reply, ms] = await timed(() => post(ingress, MESSAGE));
+  assert.equal(reply.status, 500);
+  assert.ok(ms >= 400, `took ${String(ms)} ms`);
+  assert.ok(ms < 600 + 120, `took ${String(ms)} ms: the token check's 400 ms came out of the 600 ms deadline`);
+  assert.deepEqual(fleet.started, [1, 1], "two attempts fit in the 200 ms left, not three");
+  assert.deepEqual(fleet.queued, []);
+  const failed = health(log).filter((r) => r["event"] === "inbound_enqueue_failed");
+  assert.equal(failed.length, 1);
+  assert.equal(nth(failed, 0)["attempts"], 2);
+});
+
+test("a token check that used the whole deadline is a 500 at once, with no send started", async () => {
+  const { fleet, ingress, log } = make([["ok"]], { attempt: 0.15, deadline: 0.2 });
+  ingress.validate = () =>
+    new Promise((resolve) => {
+      setTimeout(() => {
+        resolve({});
+      }, 300);
+    });
+  const [reply, ms] = await timed(() => post(ingress, MESSAGE));
+  assert.equal(reply.status, 500);
+  assert.ok(ms < 300 + 100, `took ${String(ms)} ms`);
+  assert.equal(fleet.clients.length, 0, "no client is opened for a send that cannot finish in time");
+  assert.equal(fleet.queued.length, 0);
+  const failed = health(log).filter((r) => r["event"] === "inbound_enqueue_failed");
+  assert.deepEqual(
+    failed.map((r) => [r["attempts"], r["error"]]),
+    [[0, "TimeoutError"]],
+  );
+  // A send on its own (the delivery ack) has no request to count from: its deadline starts at the call.
+  await ingress.sendInbound({ ...queueMessage(), messageId: "ack-1" }, undefined, "ack");
+  assert.deepEqual(
+    fleet.queued.map((q) => q.messageId),
+    ["ack-1"],
+  );
+});
+
+test("waiting for a start-up prefetch that never finishes is bounded by the deadline too", async () => {
+  const { fleet, ingress, log } = make([["ok"]], { attempt: 0.15, deadline: 0.3 });
+  ingress.prefetchWaitSeconds = 3;
+  ingress.prefetch = new Promise<void>(() => undefined);
+  const [reply, ms] = await timed(() => post(ingress, MESSAGE));
+  assert.equal(reply.status, 500);
+  assert.ok(ms < 300 + 150, `took ${String(ms)} ms: the 3 s prefetch wait was not cut to the deadline`);
+  assert.deepEqual(fleet.started, [], "no send is started once the deadline has passed");
+  assert.deepEqual(fleet.queued, []);
+  assert.equal(health(log).filter((r) => r["event"] === "inbound_enqueue_failed").length, 1);
+});
+
 test("a card action that cannot be queued gets the unavailable card", async () => {
   const { ingress } = make([["hang"], ["hang"]], { attempt: 0.05, deadline: 0.4 });
   ingress.sendAttempts = 2;
@@ -323,4 +382,15 @@ function prefetchWith(ingress: Ingress, opened: Promise<void>): Promise<void> {
     };
   };
   return ingress.prefetchSender();
+}
+
+/** A message for sendInbound itself, shaped like the activity the ingress queues. */
+function queueMessage(): QueueMessage {
+  return {
+    body: Buffer.from(JSON.stringify(MESSAGE), "utf8"),
+    contentType: "application/json",
+    correlationId: "c1",
+    sessionId: "s1",
+    messageId: "m1",
+  };
 }

@@ -90,8 +90,9 @@ const ACK_ONLY_INVOKES: ReadonlySet<string> = new Set(["message/submitAction"]);
 // How long a message waits for the start-up prefetch to finish opening the sender before opening one itself.
 export const PREFETCH_WAIT_SECONDS = 3.0;
 
-// How long a message may take to reach the inbound queue, every attempt and the SDK's retries included, before it is
-// a 500 that Teams retries. Inside the 15 s the Bot Framework waits for an answer (a request still running then is
+// How long a message may take to reach the inbound queue, counted from the request's arrival (so the token check, whose
+// first run on a cold instance fetches the OpenID metadata and the signing keys, comes out of it), every attempt and the
+// SDK's retries included, before it is a 500 that Teams retries. Inside the 15 s the Bot Framework waits for an answer (a request still running then is
 // dropped by the caller, a 499, and the message is lost rather than retried), and well inside host.json's
 // functionTimeout (30 s), whose expiry restarts the worker and with it every other request on the instance.
 export const SEND_DEADLINE_SECONDS = 12.0;
@@ -338,17 +339,23 @@ export class Ingress {
    * Sends on one instance run concurrently on the shared sender (the SDK's sender takes concurrent sends), so a send
    * that hangs holds up only its own request. Only the request whose send failed discards the sender or client, and
    * only while it is still the instance's, so a request never throws away one another request has just opened.
-   * `kind` names what is sent in the health records ("activity", or "ack" for a delivery ack).
+   * `kind` names what is sent in the health records ("activity", or "ack" for a delivery ack). `arrived` is when the
+   * request that sends it arrived (performance.now()): the deadline counts from then, so time the request spent before
+   * the send (the token check) is not given to the send again. Without it the deadline counts from the call.
    */
-  async sendInbound(message: QueueMessage, log: Logger = this.logs.app, kind = "activity"): Promise<void> {
+  async sendInbound(
+    message: QueueMessage,
+    log: Logger = this.logs.app,
+    kind = "activity",
+    arrived?: number,
+  ): Promise<void> {
     const started = this.clock.monotonic();
-    const deadline = AbortSignal.timeout(this.sendDeadlineSeconds * 1000);
-    if (this.inbound === null && this.prefetch !== null && !this.prefetchDone) {
-      // A cold instance: the prefetch is already opening the sender, and a second one would only race it.
-      await Promise.race([this.prefetch, sleep(this.prefetchWaitSeconds * 1000)]);
-    }
+    // On the same clock as the timers that enforce it, not this.clock (a test's clock need not move with them).
+    const remaining = this.sendDeadlineSeconds * 1000 - (arrived === undefined ? 0 : performance.now() - arrived);
+    const deadline = AbortSignal.timeout(Math.max(0, Math.ceil(remaining))); // whole milliseconds, or it throws
     let attempt = 0;
     try {
+      await this.readyToSend(remaining, deadline);
       for (;;) {
         attempt += 1;
         const client = this.client(log);
@@ -370,6 +377,26 @@ export class Ingress {
     } catch (error) {
       this.health.enqueueFailed(log.sink, { kind, error, attempts: attempt, started });
       throw error;
+    }
+  }
+
+  /**
+   * Before the first attempt: throws when the request has no time left for one (`remaining` ms of the deadline), and on
+   * a cold instance waits for the start-up prefetch to open the sender, but not past `deadline`.
+   */
+  private async readyToSend(remaining: number, deadline: AbortSignal): Promise<void> {
+    if (remaining <= 0) {
+      // The request used its whole budget before the send: answer now, while Teams still waits and retries a 500.
+      throw new DOMException("the inbound send deadline passed before the send began", "TimeoutError");
+    }
+    if (this.inbound === null && this.prefetch !== null && !this.prefetchDone) {
+      // A cold instance: the prefetch is already opening the sender, and a second one would only race it. The wait ends
+      // with the deadline too, so a prefetch that hangs cannot hold the request past it.
+      const opened = Promise.race([this.prefetch, sleep(this.prefetchWaitSeconds * 1000)]);
+      await beforeDeadline(opened, deadline).catch(() => undefined);
+    }
+    if (deadline.aborted) {
+      throw new DOMException("the inbound send deadline passed waiting for the start-up prefetch", "TimeoutError");
     }
   }
 
@@ -423,6 +450,7 @@ export class Ingress {
   async messages(req: Request, sink?: LogSink): Promise<Reply> {
     const logs = sink === undefined ? this.logs : this.logsFor(sink);
     this.logPrefetchOnce(logs.app);
+    const arrived = performance.now();
     const body = parseBody(req.body);
     const activity = body instanceof Map ? (plain(body) as JsonObject) : null;
 
@@ -431,11 +459,11 @@ export class Ingress {
     if (refused !== null) return refused;
     if (activity === null || body === null) return empty(400);
 
-    return this.route(req, activity, body, logs.app);
+    return this.route(req, activity, body, logs.app, arrived);
   }
 
   /** An authenticated activity: queue it (or answer a synchronous invoke at once), and the reply Teams gets. */
-  private async route(req: Request, activity: JsonObject, body: PyValue, log: Logger): Promise<Reply> {
+  private async route(req: Request, activity: JsonObject, body: PyValue, log: Logger, arrived: number): Promise<Reply> {
     const correlationId = req.headers.get("x-correlation-id") || this.uuid();
     const { path, name } = pathOf(activity);
     if (path === "sync") {
@@ -444,7 +472,7 @@ export class Ingress {
       return jsonReply(EMPTY_INVOKE_RESULT);
     }
     try {
-      await this.enqueue(activity, body, correlationId, log);
+      await this.enqueue(activity, body, correlationId, log, arrived);
     } catch (error) {
       log.error("failed to enqueue activity", error);
       if (path === "deferred") return cardResponse(UNAVAILABLE_CARD);
@@ -486,12 +514,16 @@ export class Ingress {
     return this.auth.validateToken(authorization, kw.appId);
   }
 
-  /** Queue the activity, raw, on its conversation's session. `node` is the parsed document it came from. */
+  /**
+   * Queue the activity, raw, on its conversation's session. `node` is the parsed document it came from; `arrived` is
+   * when its request arrived (sendInbound).
+   */
   async enqueue(
     activity: JsonObject,
     node: PyValue,
     correlationId: string,
     log: Logger = this.logs.app,
+    arrived?: number,
   ): Promise<void> {
     // Ordering is only guaranteed within a session, and a conversation is the unit that needs it. The queue requires
     // sessions.
@@ -508,6 +540,8 @@ export class Ingress {
         messageId: truthy(activityId) ? boundedId(str(activityId)) : this.uuid(),
       },
       log,
+      "activity",
+      arrived,
     );
   }
 

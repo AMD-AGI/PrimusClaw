@@ -36,8 +36,9 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   `499` once the Bot Framework stopped waiting) until the Function app was restarted. A failed send now throws away the
   whole client when the failure is about the connection (any failure but a Service Bus error about the message or the
   queue, such as `MessageSizeExceeded`), each attempt ends after 4 s, and a send has up to three attempts within a 12 s
-  deadline, inside the 15 s the Bot Framework waits, so a message that still cannot be queued is a `500` that Teams
-  retries. The queue message id stays the activity id, which the worker dedupes on.
+  deadline counted from the request's arrival (so a slow token check on a cold instance, and the wait for the start-up
+  prefetch, come out of it), inside the 15 s the Bot Framework waits, so a message that still cannot be queued is a
+  `500` that Teams retries. The queue message id stays the activity id, which the worker dedupes on.
 - The ingress reports its send path: one `inbound_enqueue_failed` record (logger `ingress_health`) per send that fails
   after its retries, one `inbound_client_reset` per client thrown away and one `inbound_enqueue_recovered` on the first
   success after failures, each with the instance's running counts (`Ingress.health.counters`). Never the message, the
