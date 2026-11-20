@@ -1,4 +1,4 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-export const VERSION = "0.2.4";
+export const VERSION = "0.3.0";
