@@ -667,6 +667,62 @@ export function pendingMessageDedupeSchemaSql(): string[] {
   ];
 }
 
+/**
+ * Where a queued message goes when it cannot be sent.
+ *
+ * The queue is FIFO per session and a drain takes only the oldest row, so one
+ * message that can never be dispatched holds every later message on its session
+ * behind it, and is retried on every completion and every sweeper tick for as
+ * long as it is there. `tasks/pending-quarantine.ts` counts each failed attempt
+ * on the row and, past a bound, moves the row here and tells the session.
+ */
+export const PENDING_QUARANTINE_TABLE = "claw_pending_messages_quarantine";
+
+/**
+ * The failure columns on the queue and the quarantine table, returned rather
+ * than executed so a test builds these very statements and not a copy of them.
+ *
+ * Additive and defaulted, so a replica from the previous image keeps writing
+ * and draining the queue without knowing about either. The quarantine keeps the
+ * message text and who sent it, and none of the queue row's credentials: it is
+ * a record for the user and an operator, not something that is ever replayed.
+ */
+export function pendingQuarantineSchemaSql(): string[] {
+  return [
+    `ALTER TABLE claw_pending_messages ADD COLUMN IF NOT EXISTS drain_failures INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE claw_pending_messages ADD COLUMN IF NOT EXISTS drain_first_failed_at TIMESTAMPTZ`,
+    `ALTER TABLE claw_pending_messages ADD COLUMN IF NOT EXISTS drain_last_error TEXT`,
+    `CREATE TABLE IF NOT EXISTS ${PENDING_QUARANTINE_TABLE} (
+       id               INTEGER PRIMARY KEY,
+       session_id       TEXT NOT NULL,
+       user_id          TEXT,
+       message_id       TEXT NOT NULL,
+       content          TEXT NOT NULL,
+       queued_at        TIMESTAMPTZ,
+       first_failed_at  TIMESTAMPTZ,
+       quarantined_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+       attempts         INTEGER NOT NULL,
+       last_error       TEXT,
+       notified_at      TIMESTAMPTZ,
+       notice_attempts  INTEGER NOT NULL DEFAULT 0,
+       notice_claimed_at TIMESTAMPTZ
+     )`,
+    // How many of the notice's events are already out, so a retried notice
+    // resumes after them instead of repeating them; and which refusal the
+    // notice is, so a retry says what the first attempt would have said.
+    `ALTER TABLE ${PENDING_QUARANTINE_TABLE} ADD COLUMN IF NOT EXISTS notice_events INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE ${PENDING_QUARANTINE_TABLE} ADD COLUMN IF NOT EXISTS failure_reason TEXT`,
+    // When the notice attempt under way began, and when the first attempt that
+    // may have stored an event without recording it began: a notice that has
+    // no such attempt is retried for as long as NATS is away, one that has is
+    // retried only while the event stream still remembers that copy.
+    `ALTER TABLE ${PENDING_QUARANTINE_TABLE} ADD COLUMN IF NOT EXISTS notice_started_at TIMESTAMPTZ`,
+    `ALTER TABLE ${PENDING_QUARANTINE_TABLE} ADD COLUMN IF NOT EXISTS notice_unsure_since TIMESTAMPTZ`,
+    `CREATE INDEX IF NOT EXISTS idx_pending_quarantine_session
+       ON ${PENDING_QUARANTINE_TABLE}(session_id)`,
+  ];
+}
+
 // Disjoint from ACTIVE_CHAT_TURN_SQL by origin, so the two unique indexes
 // never constrain the same row. No status filter: a repeated pair must answer
 // with the existing execution however that execution ended, or a client
@@ -1714,6 +1770,10 @@ export async function initDb(): Promise<void> {
     // without a valid unique index, since an index that is not there enforces
     // nothing and a retry would then queue the message twice without a sound.
     for (const sql of pendingMessageDedupeSchemaSql()) await client.query(sql).catch(() => {});
+    // What isolates a message that cannot be sent (tasks/pending-quarantine.ts).
+    // Discarding errors like the rest of this block; `assertSchema` names the
+    // columns and the table, so a deployment without them refuses to start.
+    for (const sql of pendingQuarantineSchemaSql()) await client.query(sql).catch(() => {});
 
     // Long-term memory entries (Phase 1)
     await client.query(`

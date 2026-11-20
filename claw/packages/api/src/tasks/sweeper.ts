@@ -67,6 +67,7 @@ import {
   parseDispatchCompensationRecord, SWEEPABLE_RUN_STATUSES, UNSUPPORTED_RECEIPT_SQL,
 } from "./chat-run.js";
 import { sweepAssistant } from "../assistant/sweep.js";
+import { observePendingQueue, pruneQuarantinedMessages, retryQuarantineNotices } from "./pending-quarantine.js";
 
 const logger = pino({ name: "task-sweeper" });
 
@@ -3314,6 +3315,12 @@ export async function sweeperTick(): Promise<void> {
   // Before the orphan drain: a save whose finish no replica released it for is released and drained here.
   await runContained("sweeper.finished_workspace_saves_failed", () => releaseFinishedWorkspaceSaves(drainOldestPendingMessage));
   await runContained("sweeper.orphaned_pending_drain_failed", drainOrphanedPendingMessages);
+  // After the orphan drain, which is where a message that keeps failing is
+  // quarantined: a notice its quarantine could not publish is retried here, and
+  // the gauges then read the queue as the drains above left it.
+  await runContained("sweeper.quarantine_notices_failed", retryQuarantineNotices);
+  await runContained("sweeper.quarantine_prune_failed", pruneQuarantinedMessages);
+  await runContained("sweeper.pending_queue_observe_failed", observePendingQueue);
   // After the orphan drain, so a queued report is already on its way; before the session reapers, which close runs this reads.
   await runContained("sweeper.assistant_failed", sweepAssistant);
   await runContained("sweeper.orphaned_fat_runs_failed", reapOrphanedFatRuns);

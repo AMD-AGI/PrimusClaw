@@ -18,10 +18,13 @@
  * from the other side.
  *
  * So the two guesses are not symmetric, and this refuses to guess: certain
- * only when the server answered, and everything else is unknown.
+ * only when the server answered or the client never sent, and everything else
+ * is unknown.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+
+import { ErrorCode, NatsError } from "nats";
 
 import { publishCertainlyFailed } from "../src/infra/nats.js";
 
@@ -39,6 +42,13 @@ test("the server declined, and said why", () => {
     code: "404",
     api_error: { code: 404, err_code: 10060, description: "no stream matches subject" },
   })), true);
+});
+
+test("a payload over the server's limit never left the client", () => {
+  // The client compares the size with the server's max_payload before it
+  // writes anything, so the refusal is certain though no server answered. The
+  // error is the client's own, made the way the client makes it.
+  assert.equal(publishCertainlyFailed(NatsError.errorForCode(ErrorCode.MaxPayloadExceeded)), true);
 });
 
 test("a timeout is not an answer", () => {
