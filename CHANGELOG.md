@@ -176,8 +176,9 @@ release version, and its `appVersion` stays `latest`.
   X's own confirmation, and the review items' sweep no longer merges it with R's account because it is held (it reads the
   pull request with X's account only and asks R nothing). When X approved and X's merge of the current head was refused
   because X's account may not merge there (`no_merge_permission`, or the new refusal `merge_not_permitted`: GitHub
-  refused the merge with a 403, or a 405/422 or merge-queue refusal in its words for a permission, such as a protected
-  branch that restricts who may push; such a 403 was `github_error` before), the sweep asks R once per head, with the same
+  refused the merge with a 403, 405 or 422, or a merge-queue refusal, in its words for a permission, such as a protected
+  branch that restricts who may push; a 403 in other words, or one with Retry-After or a rate limit, is not one, since a
+  retry may get past it), the sweep asks R once per head, with the same
   gates as before (R wrote the pull request and may push, X's approval of the head is on GitHub, CI green, no open thread,
   merge state `CLEAN`): a `claw_github_confirmations` row of the new kind `requester_merge` whose acting user is R, sent to
   R's own assistant conversation as an `assistant.say` carrying `confirm_write` (kind `github_merge`): "X 已批准 …，但 X
