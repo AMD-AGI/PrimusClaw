@@ -177,6 +177,15 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: in the SaFE deployment mode with `LLM_KEY_SOURCE=platformKey`, a caller signed in with an `ak-` key (in
+  `Authorization: Bearer`, `x-api-key` or a download URL) or a default session cookie has their email again:
+  `GET /v1/me` answers it and the request's user carries it, as in 0.5.8. Since 0.5.9 the API no longer asked SaFE's
+  verification for the virtual key in that mode, and that request is what makes SaFE fill in the account's email from
+  the user record, so every such caller came back with no email and no virtual key (an SSO session cookie kept its
+  email, not the virtual key). Both keys are asked for in every mode again. A new contract test drives every credential
+  SaFE verifies through the auth middleware and `GET /v1/me` against a fake SaFE that answers the way SaFE's apiserver
+  does, and compares the verify request, the request's user and the `/v1/me` document, field for field, with values
+  recorded from the 0.5.8 code.
 - Claw: an event a connector posts whose text holds a NUL (terminal output carries them) or half of a surrogate pair is
   now stored, with each such character replaced by U+FFFD, in keys and values alike. Until now PostgreSQL's `jsonb`
   refused the whole batch (`unsupported Unicode escape sequence`) and the API answered `500`; the connector posted the same
