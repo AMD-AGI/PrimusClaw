@@ -28,6 +28,7 @@ import { decodeRunTimeReport } from "@claw/protocol";
 import { settleRunTime } from "./run-time-ledger.js";
 import type { ClawTaskRow, TaskStatus } from "./types.js";
 import { holdPluginForAdmission } from "../marketplace/plugin-expiry.js";
+import { type Replacements, storableJson, storableText } from "./storable.js";
 
 const logger = pino({ name: "task-lifecycle" });
 
@@ -133,7 +134,17 @@ function resolveTerminalStatus(p: AgentDonePayload): TaskStatus {
  * last user of any sandbox handle, ask the SandboxStopper to tear that
  * handle down.
  */
-export async function applyAgentDone(taskId: string, payload: AgentDonePayload): Promise<void> {
+export async function applyAgentDone(taskId: string, received: AgentDonePayload): Promise<void> {
+  // At the write boundary, so every column below gets storable text: a NUL in
+  // a run's output used to fail the whole write, and the same body failed the
+  // same way on every resend (see storable.ts). Counted and logged without the
+  // text itself.
+  const replaced: Replacements = { count: 0 };
+  const payload = storableJson(received, replaced);
+  if (replaced.count > 0) {
+    metrics.onAgentDoneSanitized();
+    logger.warn({ taskId, replaced: replaced.count }, "agent_done.unstorable_replaced");
+  }
   const task = await getTask(taskId);
   if (!task) {
     logger.warn({ taskId }, "agent_done.task_missing");
@@ -150,7 +161,8 @@ export async function applyAgentDone(taskId: string, payload: AgentDonePayload):
     turns: payload.turns ?? null,
     failure_reason: payload.failure_reason ?? null,
     error_message: (typeof payload.failure_message === "string" && payload.failure_message
-      ? payload.failure_message.slice(0, 2000)
+      // A cut can fall inside a surrogate pair; the half left behind is made storable too.
+      ? storableText(payload.failure_message.slice(0, 2000))
       : null) ?? payload.failure_reason ?? null,
   };
 
