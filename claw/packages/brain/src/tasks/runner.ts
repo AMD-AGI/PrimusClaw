@@ -85,7 +85,7 @@ class FinishOnlyHandOver extends Error {
   constructor(why: string) { super(why); this.name = "FinishOnlyHandOver"; }
 }
 import {
-  AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postAppFinishHandOver, postRunLease, postTaskRunning, sandboxForLease,
+  AgentDoneDeliveryError, AgentDoneRejectedError, postAgentDone, postAppFinishDone, postAppFinishHandOver, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
 import { taskSubject, type RunTimeReport, RUN_FAILURE_MESSAGE_FIELD, RUN_FAILURE_REASON_FIELD, WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_ID_FIELD, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD, type WorkspaceSaveFinishedEvent, type WorkspaceSaveOutcome } from "@claw/protocol";
@@ -239,6 +239,60 @@ function pendingCallbackKey(taskId: string): string {
   return `task-result.${taskId}`;
 }
 
+/** Where a result the API refused is set aside (see {@link quarantineAgentDone}). */
+export function quarantinedResultKey(taskId: string): string {
+  return `task-quarantine.${taskId}`;
+}
+
+/** What the outbox holds: the result, its final report, and when it was first stored. */
+type PendingResult = ExecuteResult & { run_time?: RunTimeReport; outbox_since_ms?: number };
+
+/**
+ * Set aside a result the API refused to store, and the failure sent in its place.
+ *
+ * Reached only after `postAgentDone` has had its 422 twice: the result, then a
+ * failure carrying none of it. Neither will be accepted on a resend, so a nak
+ * would only re-run the delivery until the poison guard ends it a couple of
+ * dozen deliveries later -- holding the run's message, or its claimed row, for
+ * all of that time. The result is kept instead, in the same bucket as the
+ * outbox it came from, under a key nothing replays, and the caller settles the
+ * delivery as it would a delivered one. The row is left to the API's sweeper,
+ * which fails a run that never reports.
+ *
+ * The log line says which task and why, and never what the result contained.
+ */
+async function quarantineAgentDone(
+  kvCkpt: KV,
+  request: ExecuteRequest,
+  pending: PendingResult,
+  err: AgentDoneRejectedError,
+): Promise<void> {
+  const taskId = request.task_id ?? "";
+  const record = {
+    task_id: taskId,
+    session_id: request.session_id,
+    reason: "refused",
+    http_status: err.status,
+    sqlstate: err.sqlstate,
+    quarantined_at: new Date().toISOString(),
+    result: pending,
+  };
+  const encoded = sc.encode(JSON.stringify(record));
+  let stored = true;
+  await kvCkpt.put(quarantinedResultKey(taskId), encoded).catch((e) => {
+    stored = false;
+    logger.error({ err: (e as Error).message, taskId }, "task.agent_done_quarantine_write_failed");
+  });
+  metrics.onAgentDoneQuarantined("refused");
+  logger.error(
+    {
+      taskId, sessionId: request.session_id, httpStatus: err.status, sqlstate: err.sqlstate,
+      resultBytes: encoded.length, stored,
+    },
+    "task.agent_done_quarantined",
+  );
+}
+
 /**
  * Persist the terminal result before delivery. If Brain dies after execution
  * but before the callback is acknowledged, redelivery replays this result
@@ -255,9 +309,17 @@ async function deliverAgentDone(
     return;
   }
   const key = pendingCallbackKey(request.task_id);
-  const pending = runTime ? { ...result, run_time: runTime } : result;
+  const sinceMs = Date.now();
+  const pending: PendingResult = { ...result, ...(runTime ? { run_time: runTime } : {}), outbox_since_ms: sinceMs };
   await kvCkpt.put(key, sc.encode(JSON.stringify(pending)));
-  await fx().postAgentDone(request, result, runTime);
+  try {
+    await fx().postAgentDone(request, result, runTime, sinceMs);
+  } catch (err) {
+    // Returning settles the delivery: every caller acks and clears the outbox
+    // next, which is what a refused result needs, since resending it cannot help.
+    if (!(err instanceof AgentDoneRejectedError)) throw err;
+    await quarantineAgentDone(kvCkpt, request, pending, err);
+  }
 }
 
 async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteRequest): Promise<void> {
@@ -1068,9 +1130,9 @@ async function replayPendingCallback(
   // fresh execution, exactly as when the key was never written.
   if (entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return false;
 
-  let stored: ExecuteResult & { run_time?: RunTimeReport };
+  let stored: PendingResult;
   try {
-    stored = JSON.parse(sc.decode(entry.value)) as ExecuteResult & { run_time?: RunTimeReport };
+    stored = JSON.parse(sc.decode(entry.value)) as PendingResult;
   } catch (err) {
     // deliverAgentDone writes only JSON, so this entry holds no result that can
     // be replayed, and retrying cannot make it parse. Drop it and run this
@@ -1084,10 +1146,15 @@ async function replayPendingCallback(
   }
 
   try {
-    const { run_time: runTime, ...result } = stored;
-    await fx().postAgentDone(request, result, runTime);
+    const { run_time: runTime, outbox_since_ms: sinceMs, ...result } = stored;
+    try {
+      await fx().postAgentDone(request, result, runTime, typeof sinceMs === "number" ? sinceMs : undefined);
+      logger.info({ taskId: request.task_id }, "task.agent_done_replayed");
+    } catch (err) {
+      if (!(err instanceof AgentDoneRejectedError)) throw err;
+      await quarantineAgentDone(kvCkpt, request, stored, err);
+    }
     await ackAndClearCallback(msg, kvCkpt, request);
-    logger.info({ taskId: request.task_id }, "task.agent_done_replayed");
   } catch (err) {
     logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_failed");
     msg.nak(5_000);

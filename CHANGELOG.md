@@ -252,6 +252,19 @@ release version, and its `appVersion` stays `latest`.
   pasted message of several lines, is also told to upgrade. A prompt a connector passes on in Claude Code's
   `<pasted_content>` block is shown as the text that was pasted.
 
+- Claw: a task's result that contains U+0000 (a script printing a C string, a model echoing a binary file) or an unpaired
+  UTF-16 surrogate is stored, with those characters replaced by U+FFFD and everything else kept. Until now Postgres
+  refused the whole `agent_done` write, the API answered 500, and Brain resent the same result on every delivery of the
+  task's message until the poison guard failed the run, many minutes later, as `max_retries_exceeded`. A result the
+  database still refuses for its values (SQLSTATE 22021, 22P05, 22P02 or 22003, for example a count out of range) is
+  now answered 422, and Brain reports the run as failed with `failure_reason: result_unstorable` on the same delivery
+  instead of retrying it. If even that report is refused, Brain keeps the result in its checkpoint bucket under
+  `task-quarantine.<task_id>`, logs the task id and status without the content, and settles the message so the tasks
+  behind it keep flowing; the API's sweeper fails the row. New metrics: `claw_api_agent_done_sanitized_total`,
+  `claw_api_agent_done_refused_total{sqlstate}`, `claw_brain_agent_done_failures_total{status}`,
+  `claw_brain_agent_done_consecutive_failures`, `claw_brain_agent_done_oldest_pending_seconds` and
+  `claw_brain_agent_done_quarantined_total{reason}`.
+
 ## [0.5.8] - 2026-11-18
 
 Image `docker.io/primussafe/claw:202611181714` (commit f227c209), released as `docker.io/rocm/primusclaw:claw-0.5.8`. A patch
