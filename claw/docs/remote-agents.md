@@ -333,17 +333,21 @@ how many events wait to be acknowledged, how long the oldest has waited, how man
 row failed and for how long, how the last one failed (`http_<status>`, `network` or
 `error`), and up to 20 sessions with events waiting (`{session_id, pending, oldest_age_ms}`,
 the longest waiting first). The server also counts, per connector, the event batches it
-answered with a 5xx. Both go to `claw_remote_delivery_health`. A malformed report is
-ignored; it never fails the heartbeat, and a connector that sends none is judged on the
-server's count alone.
+answered with a 5xx. Both go to `claw_remote_delivery_health`, written after the answer
+(never holding up the heartbeat or the batch), at most four writes at a time per replica. A
+malformed report is ignored; it never fails the heartbeat, and a connector that sends none is
+judged on the server's count alone.
 
 Every 15 s one API replica (an advisory lock picks it) holds each connector as delivering or
 stalled. Stalled: the connector's fresh report says its posts have failed for 2 minutes
 while events wait, or the server has answered its posts with a 5xx for 2 minutes and still
 does. When the assistant is on, the owner is told once, through their assistant, that the
 replies from the sessions on that machine are delayed and being retried (with how many wait
-and for how long, when the connector reported it), and told once more when its posts succeed
-again. A connector that goes offline while stalled is told nothing more here; presence,
+and for how long, when the connector reported it), and told once more when a batch from it
+is stored again and nothing has failed on either side since (a clean report alone is not
+enough: a connector restarted mid-stall reports no failure while its backlog still waits). A
+notice counts as told only once the assistant has it; until then a later sweep tries again,
+and its key keeps it from being said twice. A connector that goes offline while stalled is told nothing more here; presence,
 below, reports that it went. The same rows feed the `claw_delivery_*` and
 `claw_remote_connector_*` metrics, which the chart's alert rules read
 (`prometheusRule.enabled`, `claw/deploy/charts/claw/alerts/delivery.rules.yaml`).
