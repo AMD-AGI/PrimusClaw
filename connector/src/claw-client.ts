@@ -95,7 +95,7 @@ export class ClawClient {
   }
 
   /** The answer's `data`: `connector_version` in it when this connector is older than Claw recommends (auto-upgrade.ts). */
-  async heartbeat(cid: string, hb: { version: string; agents: RemoteAgentDescriptor[]; cmd_cursor: number | null }): Promise<Record<string, unknown>> {
+  async heartbeat(cid: string, hb: { version: string; agents: RemoteAgentDescriptor[]; cmd_cursor: number | null; outbox?: Record<string, unknown> }): Promise<Record<string, unknown>> {
     return this.json("POST", `/v1/remote-agents/connectors/${cid}/heartbeat`, hb);
   }
 

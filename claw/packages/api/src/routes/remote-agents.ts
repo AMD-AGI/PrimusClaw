@@ -45,6 +45,8 @@ import * as store from "../remote-agents/store.js";
 import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
 import { startTerminalWaitSweep, TERMINAL_WAIT_NOTICE_MS } from "../remote-agents/terminal-waits.js";
+import { DELIVERY_SWEEP_MS, noteEventsPost, recordOutboxReport, startDeliveryHealthSweep } from "../remote-agents/delivery-health.js";
+import { metrics } from "../infra/metrics.js";
 import { closeCardsOfConnector } from "../assistant/devenv-tools.js";
 import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
@@ -79,6 +81,10 @@ export interface RemoteAgentOptions {
   offlineNoticeMs?: number;
   /** How long a conversation open in a terminal waits for its person before they are told. */
   terminalWaitNoticeMs?: number;
+  /** How often this replica sweeps delivery health (`remote-agents/delivery-health.ts`); zero or less runs no sweep. */
+  deliverySweepMs?: number;
+  /** How long a connector's events must have failed before its owner is told their replies are delayed. */
+  deliveryStallNoticeMs?: number;
   /** Pairing a machine with a one-time code (`remote-agents/pairing-routes.ts`). */
   pairing?: PairingRouteOptions;
   /**
@@ -325,6 +331,17 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       app.addHook("onClose", async () => stop());
     },
   });
+  // Whether each connector's events get through, and telling its owner once when they have not for two minutes (and once when
+  // they do again): `remote-agents/delivery-health.ts`. A lock makes each sweep one replica's.
+  const deliverySweepMs = opts.deliverySweepMs ?? DELIVERY_SWEEP_MS;
+  loops.push({
+    name: "remote_agents.delivery_health_sweep",
+    when: deliverySweepMs > 0,
+    start: () => {
+      const stop = startDeliveryHealthSweep({ sweepMs: deliverySweepMs, stallAfterMs: opts.deliveryStallNoticeMs });
+      app.addHook("onClose", async () => stop());
+    },
+  });
   // A command accepted while its machine still looked online (a laptop closed within the online window) and never collected:
   // every replica looks as often as presence is swept, whether or not the machine ever comes back; a delete hands each to one.
   const undeliveredSweepMs = opts.undeliveredSweepMs ?? PRESENCE_SWEEP_MS;
@@ -477,6 +494,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const hb = parseHeartbeat(req.body);
     if (!hb.ok) return fail(reply, 400, hb.error);
     const undelivered = await store.recordHeartbeat(connector.connector_id, owner, hb.value);
+    // What its outbox holds (`remote-agents/delivery-health.ts`): advice, never a reason to fail the heartbeat that carries it.
+    await recordOutboxReport(String(connector.connector_id), owner, hb.value.outbox)
+      .catch((err) => logger.warn({ err: (err as Error)?.message, connectorId: connector.connector_id }, "remote_agents.outbox_report_failed"));
     await sayUndelivered(undelivered, (sid) => waker.wake(`s:${sid}`));
     // Below the recommended version the answer says so, with the command that upgrades it; a connector may print it.
     const verdict = versionVerdict(hb.value.version ?? (connector.version as string | null));
@@ -492,10 +512,28 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const connector = await ownConnector(req, reply, owner);
     if (!connector) return;
     const batch = parseEventBatch(req.body);
-    if (!batch.ok) return fail(reply, 400, batch.error);
+    if (!batch.ok) {
+      metrics.onRemoteEventsPost("client_error");
+      return fail(reply, 400, batch.error);
+    }
     // Second line of defence behind the connector's own scrub of what leaves the machine.
     const events = batch.value.events.map((e) => ({ ...e, data: redactPublicJson(e.data) as Record<string, unknown> }));
-    const result = await store.ingestEvents(connector as { connector_id: string; owner_user_id: string }, events, getAuthMethod(req));
+    const cid = String(connector.connector_id);
+    let result: Awaited<ReturnType<typeof store.ingestEvents>>;
+    try {
+      result = await store.ingestEvents(connector as { connector_id: string; owner_user_id: string }, events, getAuthMethod(req));
+    } catch (err) {
+      // Answered with a 5xx, which the connector retries: counted per connector (`delivery-health.ts`), so a batch that fails
+      // every time is seen as the stall it is, by its owner and by the alert rules, instead of only in a log line per retry.
+      metrics.onRemoteEventsPost("server_error");
+      const code = typeof (err as { code?: unknown })?.code === "string" ? `pg_${(err as { code: string }).code}` : "error";
+      await noteEventsPost(cid, owner, { ok: false, error: code })
+        .catch((e) => logger.warn({ err: (e as Error)?.message, connectorId: cid }, "remote_agents.events_failure_note_failed"));
+      throw err;
+    }
+    metrics.onRemoteEventsPost("ok");
+    await noteEventsPost(cid, owner, { ok: true })
+      .catch((e) => logger.warn({ err: (e as Error)?.message, connectorId: cid }, "remote_agents.events_failure_note_failed"));
     for (const sid of result.touched) waker.wake(`s:${sid}`);
     // The assistant's view of the work (`assistant/remote-items.ts`): after the events are stored, and never a reason to refuse them.
     // Every session the batch was for, not only those that gained an event: a retry of a batch whose events were stored but not

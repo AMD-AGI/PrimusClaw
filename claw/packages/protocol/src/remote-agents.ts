@@ -178,6 +178,68 @@ export interface RemoteHeartbeat {
   agents: RemoteAgentDescriptor[];
   /** Highest `cmd_seq` the connector has fully handled; the server may forget up to it. */
   cmdCursor: number | null;
+  /** What the connector holds that Claw has not acknowledged yet (`outbox` on the wire); absent from an older connector. */
+  outbox?: RemoteOutboxReport | null;
+}
+
+/** Sessions an outbox report names at most, the longest waiting first. */
+export const REMOTE_OUTBOX_REPORT_MAX_SESSIONS = 20;
+
+/** One session's part of an outbox report. */
+export interface RemoteOutboxSession {
+  sessionId: string;
+  /** Its events not acknowledged yet. */
+  pending: number;
+  /** How long the oldest of them has waited, in milliseconds. */
+  oldestAgeMs: number;
+}
+
+/**
+ * The connector's own account of its event outbox, sent with every heartbeat (`outbox`, snake_case on the wire): how many
+ * events wait, how long the oldest has, and how many posts in a row failed and for how long. It is what tells Claw that a
+ * machine's replies are not getting through when the reason is on Claw's side (a batch Claw keeps refusing with a 5xx) as
+ * well as when it is not (a proxy, a network). Only ever a report: a malformed one is ignored, never a reason to refuse the
+ * heartbeat that carries it.
+ */
+export interface RemoteOutboxReport {
+  pending: number;
+  oldestAgeMs: number;
+  /** Consecutive failed posts; 0 once a post succeeded. */
+  failures: number;
+  /** How long ago the first of those failures was, in milliseconds; 0 with no failure. */
+  failingMs: number;
+  /** What the last failure was: `http_<status>`, `network` or `error`; null with no failure. */
+  lastError: string | null;
+  /** The sessions with events waiting, the longest waiting first, at most {@link REMOTE_OUTBOX_REPORT_MAX_SESSIONS}. */
+  sessions: RemoteOutboxSession[];
+}
+
+/** A day: an age or a duration beyond it is clamped, so a skewed or hostile report cannot overflow anything. */
+const OUTBOX_MAX_MS = 86_400_000;
+const OUTBOX_ERROR_RE = /^(?:http_[1-5]\d\d|network|error)$/;
+
+/**
+ * The heartbeat's `outbox`, or null when it is absent or malformed. Total, like every parser here, and lenient by design: a
+ * report is advice about delivery, and a heartbeat refused over it would take the machine offline.
+ */
+export function parseOutboxReport(raw: unknown): RemoteOutboxReport | null {
+  if (!isObject(raw)) return null;
+  const { pending, oldest_age_ms: oldest, failures, failing_ms: failing, last_error: lastError, sessions } = raw;
+  if (!isCount(pending) || !isCount(oldest) || !isCount(failures) || !isCount(failing)) return null;
+  const out: RemoteOutboxSession[] = [];
+  if (Array.isArray(sessions)) {
+    for (const s of sessions.slice(0, REMOTE_OUTBOX_REPORT_MAX_SESSIONS)) {
+      if (!isObject(s)) continue;
+      const sid = parseRemoteId(s.session_id);
+      if (!sid || !isCount(s.pending) || !isCount(s.oldest_age_ms)) continue;
+      out.push({ sessionId: sid, pending: s.pending, oldestAgeMs: Math.min(s.oldest_age_ms, OUTBOX_MAX_MS) });
+    }
+  }
+  return {
+    pending, oldestAgeMs: Math.min(oldest, OUTBOX_MAX_MS), failures, failingMs: Math.min(failing, OUTBOX_MAX_MS),
+    lastError: typeof lastError === "string" && OUTBOX_ERROR_RE.test(lastError) ? lastError : null,
+    sessions: out,
+  };
 }
 
 function parseVersion(v: unknown): Parsed<string | null> {
@@ -223,7 +285,7 @@ export function parseHeartbeat(body: unknown): Parsed<RemoteHeartbeat> {
     if (!isCount(body.cmd_cursor)) return fail("invalid_cmd_cursor");
     cmdCursor = body.cmd_cursor;
   }
-  return { ok: true, value: { version, agents, cmdCursor } };
+  return { ok: true, value: { version, agents, cmdCursor, outbox: parseOutboxReport(body.outbox) } };
 }
 
 export interface RemoteEventIn {

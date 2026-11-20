@@ -113,6 +113,22 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: stall detection for the queues that carry replies to a person. The connector reports its event outbox with
+  every heartbeat (`outbox`: events waiting, the oldest's age, failed posts in a row and since when, the last error, and
+  up to 20 sessions with events waiting); the API counts, per connector, the event batches it answers with a 5xx. When a
+  connector's posts have failed for 2 minutes, its owner is told once in chat that the replies from the sessions on that
+  machine are delayed and being retried, and once more when they get through again. New metrics:
+  `claw_delivery_backlog_oldest_age_seconds` and `claw_delivery_backlog_size` (by `queue`: `remote_events`,
+  `notification_outbox`), `claw_remote_connector_backlog_age_seconds` and `claw_remote_connector_post_failures` (by
+  `connector_id`, only for connectors behind or failing now), `claw_remote_delivery_stalled`,
+  `claw_remote_events_post_total`, `claw_api_event_redelivered_total`, `claw_api_event_redelivery_oldest_age_seconds`,
+  `claw_notification_subscriptions_failing`, `claw_notification_subscription_failures_max` and
+  `claw_delivery_stall_notices_total`. The chart ships alert rules for them as a PrometheusRule
+  (`prometheusRule.enabled`, off by default; thresholds around ten minutes) and a "Claw — Delivery" Grafana dashboard
+  (with `grafanaDashboard.enabled`). The rules are evaluated by promtool against synthetic stalls in CI. A connector
+  from before this reports nothing and is judged on the API's count alone. See "Replies that do not get through" in
+  `claw/docs/remote-agents.md`.
+
 - Connector: a connector that runs as a service upgrades itself to the version Claw recommends (on by default; off with
   `claw-connector auto-upgrade off`, `auto_upgrade = false` in `agents.toml`, or `CLAW_CONNECTOR_AUTO_UPGRADE=0`). It
   takes exactly the recommended version (never `latest`, never down, never a prerelease or a new major version; below
