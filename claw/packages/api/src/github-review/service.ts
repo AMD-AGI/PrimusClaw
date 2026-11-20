@@ -368,19 +368,22 @@ const MERGE_PERMISSION_RE = /not authori[sz]ed to (?:push|merge)|not (?:allowed|
 /** The audit tool of a merge made with the requester's own account on their yes (`requester_merge`): never one of the reviewer's merges. */
 export const REQUESTER_MERGE_TOOL = "gh_pr_merge_as_requester";
 
-/** The refusal code of a merge GitHub refused because the acting account may not merge there (`MERGE_PERMISSION_RE`, or a plain 403). */
+/** The refusal code of a merge GitHub refused because the acting account may not merge there, in GitHub's words (`MERGE_PERMISSION_RE`). */
 export const MERGE_NOT_PERMITTED = "merge_not_permitted";
 
 /**
- * A merge GitHub refused for a permission reason, as its own refusal (`MERGE_NOT_PERMITTED`), or null for any other answer: a 403 that is
- * not a rate limit nor the missing `workflow` scope, or a 405/422 (and a merge queue's GraphQL refusal) in GitHub's words for a permission.
+ * A merge GitHub refused for a permission reason, as its own refusal (`MERGE_NOT_PERMITTED`), or null for any other answer. Only a 403, 405
+ * or 422 (and a merge queue's GraphQL refusal) in GitHub's words for a permission counts. A 403 alone does not: GitHub also answers 403 for
+ * a passing refusal (a rate limit, an abuse-detection limit with Retry-After and other words) that a retry clears, and a permission
+ * refusal is what lets the requester's own account be offered, so one the reviewer would get past by retrying must never be one. A 403 that
+ * is a rate limit, carries Retry-After, or is the missing `workflow` scope is never one either.
  */
 function mergePermissionRefusal(err: unknown, approved?: boolean): Refusal | null {
   const words = err instanceof GithubGraphqlError ? err.detail : err instanceof GithubError ? err.message : null;
   if (words === null || isWorkflowScopeRefusal(words)) return null;
-  const plain403 = err instanceof GithubError && err.status === 403 && !err.rateLimited;
+  if (err instanceof GithubError && (err.rateLimited || err.retryAfterSeconds !== undefined)) return null;
   const said = (err instanceof GithubGraphqlError || (err instanceof GithubError && [403, 405, 422].includes(err.status))) && MERGE_PERMISSION_RE.test(words);
-  if (!plain403 && !said) return null;
+  if (!said) return null;
   return new Refusal("merge_not_permitted", `GitHub refused the merge for a permission reason: ${words}`, {
     github_request_id: err instanceof GithubError ? err.requestId : undefined,
     ...(approved === undefined ? {} : { approved_by_this_call: approved }),

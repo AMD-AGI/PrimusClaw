@@ -646,6 +646,8 @@ describe("Q a base branch with a merge queue", () => {
       [403, "Resource not accessible by personal access token", {}, "merge_not_permitted"],
       [422, "Validation Failed", {}, "enqueue_refused"],
       [403, "You have exceeded a secondary rate limit", { "retry-after": "30" }, "github_rate_limited"],
+      [403, "You have triggered an abuse detection mechanism. Please wait a few minutes before you try again.", { "retry-after": "60" }, "enqueue_refused"],
+      [403, "Forbidden", {}, "enqueue_refused"],
       [503, "Service Unavailable", {}, "github_error"],
     ];
     for (const [status, message, headers, code] of cases) {

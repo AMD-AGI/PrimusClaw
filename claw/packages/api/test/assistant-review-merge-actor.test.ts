@@ -20,6 +20,8 @@
  *   MA4 不合 leaves it unmerged and ends the item; she is not asked again for that head
  *   MA5 合入 after a gate shut (CI red, a new commit) merges nothing and says why
  *   MA6 alice did not write the pull request: she is never asked, and nothing is ever merged with her account, not even on a yes
+ *   MA7 GitHub refused bob's merge with a 403 that is not a permission (an abuse-detection limit with Retry-After, a bare "Forbidden"):
+ *       bob may merge once it passes, so alice is never asked and her account is never fetched
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -38,6 +40,11 @@ const BOB = "u-bob";
 const FIXTURE = join(import.meta.dirname, "fixtures/github-requester-merge-card.outbox.json");
 /** GitHub's answer to a merge by an account a protected branch does not let push (405, as `PUT /pulls/{n}/merge` gives it). */
 const NOT_AUTHORIZED = { status: 405, message: "You're not authorized to push to this branch. Visit https://docs.github.com/articles/about-protected-branches/ for more information." };
+/** GitHub's passing 403s for a merge: a retry gets past them, so neither says bob may not merge. */
+const PASSING_403S = [
+  { status: 403, message: "You have triggered an abuse detection mechanism. Please wait a few minutes before you try again.", headers: { "retry-after": "60" } },
+  { status: 403, message: "Forbidden" },
+];
 const CHAT_TYPES = ["run.completed", "run.failed", "assistant.say", "work_item.needs_you", "assistant.action", "approval.requested"];
 
 describe("whose account merges a review asked of someone else", { skip }, () => {
@@ -357,5 +364,29 @@ describe("whose account merges a review asked of someone else", { skip }, () => 
     const answer = await press(ALICE, c.id, "allow");
     assert.deepEqual([answer.data?.status, answer.data?.reason], ["refused", "requester_not_author"], JSON.stringify(answer));
     assert.equal(puts().length, 0, "nothing merged with alice's account");
+  });
+
+  test("MA7 a 403 that is not a permission (abuse detection with Retry-After, a bare Forbidden) is not bob's missing permission: alice is never asked and her account never fetched", async () => {
+    for (const answer of PASSING_403S) {
+      await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_assistant_messages, claw_sessions, claw_github_confirmations, claw_github_audit, claw_github_review_settings, claw_github_write_locks, claw_notification_outbox, claw_notification_subscriptions CASCADE");
+      gh = new fake.FakeGithub();
+      resolved = [];
+      const r = await askBob("fully_auto");
+      gh.mergeAnswers = [answer];
+      const merged = await bobReviews(r, "low");
+      assert.equal(merged.status, "refused", JSON.stringify(merged));
+      assert.notEqual(merged.reason, "merge_not_permitted", `${answer.message}: ${JSON.stringify(merged)}`);
+      assert.equal(puts().length, 1);
+      assert.equal(puts()[0]!.authorization, `Bearer ${env.TOKEN}`, "bob's merge, with bob's account");
+      const [audit] = await w.q("SELECT detail FROM claw_github_audit WHERE tool = 'gh_pr_merge' ORDER BY id DESC LIMIT 1");
+      assert.notEqual(audit?.detail, "merge_not_permitted", answer.message);
+      gh.calls.length = 0;
+      for (let i = 0; i < 3; i++) await sweep();
+      assert.deepEqual(await asks(r.sessionId), [], `alice is never asked after "${answer.message}"`);
+      assert.deepEqual(await cardsTo(ALICE), [], answer.message);
+      assert.equal(asAlice().length, 0, answer.message);
+      assert.ok(!resolved.includes(ALICE), `alice's credential was never fetched after "${answer.message}": ${resolved.join(",")}`);
+      assert.ok(puts().every((c) => c.authorization === `Bearer ${env.TOKEN}`), "any merge the sweep makes is bob's");
+    }
   });
 });
