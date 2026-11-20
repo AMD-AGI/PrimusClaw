@@ -72,3 +72,31 @@ export function redactDeep<T>(value: T): T {
   }
   return value;
 }
+
+/** What replaces a character Claw's database cannot store. */
+export const UNSTORABLE_REPLACEMENT = "�";
+/** U+0000, a high surrogate with no low one after it, a low surrogate with no high one before it. */
+const UNSTORABLE_RE = /\u0000|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
+ * `text` with every character Claw's database refuses replaced by U+FFFD: a NUL (terminal output carries them) and half of
+ * a surrogate pair (a cut made in UTF-16 units through an emoji). PostgreSQL's `jsonb` refuses both, and one such character
+ * used to fail the whole batch it was posted in, again on every retry, with every later event queued behind it.
+ */
+export function storableText(text: string): string {
+  UNSTORABLE_RE.lastIndex = 0;
+  if (!UNSTORABLE_RE.test(text)) return text;
+  UNSTORABLE_RE.lastIndex = 0;
+  return text.replace(UNSTORABLE_RE, UNSTORABLE_REPLACEMENT);
+}
+
+/** A copy of `value` with {@link storableText} applied to every string inside it, keys included. */
+export function storableDeep<T>(value: T): T {
+  if (typeof value === "string") return storableText(value) as T;
+  if (Array.isArray(value)) return value.map((v) => storableDeep(v)) as T;
+  if (value && typeof value === "object") {
+    // fromEntries, as in redactDeep: `__proto__` in parsed JSON is an ordinary key.
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [storableText(k), storableDeep(v)])) as T;
+  }
+  return value;
+}
