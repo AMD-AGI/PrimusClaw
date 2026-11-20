@@ -113,6 +113,13 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: metrics for the API's event consumer: `claw_api_event_consumer_consecutive_failures` (deliveries this replica
+  retried since it last stored or set aside an event), `claw_api_event_quarantined_total{reason}` (`unparseable`,
+  `unstorable`, `bounded`), `claw_api_event_sanitised_total` (events stored with a character replaced), and, read from the server every 30 seconds,
+  `claw_api_event_consumer_ack_pending`, `claw_api_event_consumer_pending` and
+  `claw_api_event_consumer_oldest_pending_age_seconds` (how long the oldest event not yet acknowledged has waited; 0 when
+  none is).
+
 - Connector: a connector that runs as a service upgrades itself to the version Claw recommends (on by default; off with
   `claw-connector auto-upgrade off`, `auto_upgrade = false` in `agents.toml`, or `CLAW_CONNECTOR_AUTO_UPGRADE=0`). It
   takes exactly the recommended version (never `latest`, never down, never a prerelease or a new major version; below
@@ -219,6 +226,26 @@ release version, and its `appVersion` stays `latest`.
   SaFE verifies through the auth middleware and `GET /v1/me` against a fake SaFE that answers the way SaFE's apiserver
   does, and compares the verify request, the request's user and the `/v1/me` document, field for field, with values
   recorded from the 0.5.8 code.
+- Claw: one event the database cannot store no longer stalls the API's event consumer. A NUL character or a lone
+  UTF-16 surrogate in an event (a tool's output, a model's text) is now replaced with U+FFFD where the event is parsed,
+  before anything is written, so the event is stored and a completion carrying one still runs (its turn is written and
+  its run is closed) instead of being skipped. The two clean-ups that existed did nothing: they ran over JSON text, where
+  both characters are escapes. An event the database still refuses for its value (SQLSTATE 22P05, 22021, 22P02 or
+  54001) is set aside on its first delivery instead of being retried for ever: a copy of it, sanitised and with
+  credential-shaped content masked as a stored event is, goes to the new `claw_event_quarantine` table (deleted with its
+  session), a log line `event-consumer.quarantined` without its content says so, and it is acknowledged. An event that
+  is not JSON is kept there too rather than dropped unrecorded. Nothing else is set aside, however often or however long
+  it has failed: the backlog an outage of the database or the tombstone bucket leaves, and a completion waiting on its
+  session's lock or on its run notification, are retried until they succeed, as before. A completion is never set aside.
+  One the database refuses for its nesting (54001, past about 13,000 levels with the default `max_stack_depth`) is
+  stored and run with a copy cut off at 1,000 levels (each deeper object replaced with `"[nested too deep to store]"`;
+  at 100, then 10, when a server with a smaller `max_stack_depth` refuses that copy too), so its turn is written and its
+  run closed on its first delivery; the original is kept in `claw_event_quarantine` with reason `bounded`, counted and
+  logged once however often it is redelivered.
+  Making an event storable, and masking the stored copy (`redactStoredValue`), no longer recurse: an event nested deeper
+  than the call stack (a few thousand levels, which `JSON.parse` and the database both take) is stored and, as a
+  completion, processed, where it used to be retried for ever. A `__proto__` key in an event stays a key of the stored
+  copy instead of being dropped.
 - Claw: an event a connector posts whose text holds a NUL (terminal output carries them) or half of a surrogate pair is
   now stored, with each such character replaced by U+FFFD, in keys and values alike. Until now PostgreSQL's `jsonb`
   refused the whole batch (`unsupported Unicode escape sequence`) and the API answered `500`; the connector posted the same

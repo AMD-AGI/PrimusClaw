@@ -1529,6 +1529,31 @@ export const MIGRATION_LOCK_POLICY: MigrationLockPolicy = {
 };
 
 /** Run schema migrations on startup. */
+/**
+ * Events the consumer set aside rather than retry for ever (events/poison.ts): one that is not
+ * JSON, one the database refused after sanitising, or one that kept failing while other events
+ * were stored. The event is kept, sanitised and with credential-shaped content masked like a
+ * stored event, in a bytea, so it can be inspected or replayed. Hard-deleted with its session (sessions/teardown.ts). Exported so a test harness
+ * builds the table from this statement rather than from a copy of it.
+ */
+export const EVENT_QUARANTINE_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS claw_event_quarantine (
+    id              BIGSERIAL PRIMARY KEY,
+    event_id        TEXT NOT NULL,
+    session_id      TEXT NOT NULL,
+    UNIQUE (event_id, session_id),
+    subject         TEXT NOT NULL,
+    stream_seq      BIGINT,
+    event_type      TEXT,
+    reason          TEXT NOT NULL,
+    deliveries      INTEGER NOT NULL,
+    last_error      TEXT,
+    payload         BYTEA NOT NULL,
+    published_at    TIMESTAMPTZ,
+    quarantined_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )
+`;
+
 export async function initDb(): Promise<void> {
   const client = lockBoundedMigrationClient(await pool.connect(), MIGRATION_LOCK_POLICY);
   try {
@@ -1571,6 +1596,8 @@ export async function initDb(): Promise<void> {
         deleted_at  TIMESTAMPTZ
       )
     `);
+
+    await client.query(EVENT_QUARANTINE_TABLE_SQL);
 
     // One row per one-time data migration that has finished, so a start that
     // finds its row skips the pass instead of re-reading a table to find out

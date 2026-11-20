@@ -29,7 +29,12 @@
  * does with a claim belongs in the live environment.
  */
 
-import { clawTasksSchemaSql, db, pendingQuarantineSchemaSql } from "../src/infra/db.js";
+import {
+  clawTasksSchemaSql,
+  db,
+  EVENT_QUARANTINE_TABLE_SQL,
+  pendingQuarantineSchemaSql,
+} from "../src/infra/db.js";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 import { sealRunCredentials } from "../src/tasks/run-secrets.js";
 
@@ -249,6 +254,7 @@ const TABLES = [
   "claw_task_edges",
   "claw_sessions",
   "claw_session_events",
+  "claw_event_quarantine",
   "claw_pending_messages",
   "claw_pending_messages_quarantine",
   "claw_workspaces",
@@ -284,6 +290,8 @@ export async function startHarness(): Promise<Harness> {
   // The queue's failure columns and its quarantine, from the production
   // migration for the same reason: every drain that fails writes them.
   for (const sql of pendingQuarantineSchemaSql()) await pg.exec(sql);
+  // Session deletion removes a session's quarantined events (sessions/teardown.ts).
+  await pg.exec(EVENT_QUARANTINE_TABLE_SQL);
 
   const original = db.query;
   const originalConnect = db.pool.connect;

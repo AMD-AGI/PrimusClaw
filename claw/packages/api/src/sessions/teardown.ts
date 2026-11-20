@@ -778,6 +778,8 @@ export async function commitSessionDeletion(
           [sessionId],
         );
       }
+      // A quarantined event's copy is raw conversation content with no deleted_at of its own: it goes with the session.
+      await query("DELETE FROM claw_event_quarantine WHERE session_id = $1", [sessionId]);
       await query(
         `UPDATE claw_sessions
             SET deleted_at = COALESCE(deleted_at, NOW()),
