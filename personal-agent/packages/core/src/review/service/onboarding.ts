@@ -225,7 +225,8 @@ export class ReviewerOnboarding {
 
   /**
    * This person's state, read again: a step further than they were told is answered with the next one (once, whoever
-   * reads it first); all done, each asker is told where they asked.
+   * reads it first); all done, each asker is told where they asked. A step that could not be said is claimed back, so
+   * the next read (their next message, or the sweep) says it.
    */
   async advance(userId: string): Promise<void> {
     const store = this.deps.store.reviewDelegation;
@@ -233,17 +234,37 @@ export class ReviewerOnboarding {
     if (!open.length) return;
     const now = await this.progress(userId);
     if (now === undefined) return;
+    const rank = RANK[now];
     // (whoever raises the told step first says it: a sweep and a message that read the same news say it once)
-    if (!store.claimOnboardingStep(userId, RANK[now])) return;
+    if (!store.claimOnboardingStep(userId, rank)) return;
+    const unclaim = (rows: readonly ReviewOnboarding[]) => {
+      for (const row of rows)
+        if (row.toldRank < rank) store.releaseOnboardingStep(row.onboardingId, rank, row.toldRank);
+    };
     if (now === "ready") {
-      await this.ready(store.openReviewOnboardings(userId));
+      // (read again: one asked since is owed the news too; one not read before is claimed back to nothing told)
+      const before = new Map(open.map((o) => [o.onboardingId, o.toldRank]));
+      await this.ready(store.openReviewOnboardings(userId), rank, (id) => before.get(id) ?? 0);
       return;
     }
+    let said = false;
+    try {
+      said = await this.tell(userId, open, now);
+    } finally {
+      if (!said) unclaim(open);
+    }
+  }
+
+  /** The step `now` said in the reviewer's own chat; false when that chat could not be reached. */
+  private async tell(userId: string, open: readonly ReviewOnboarding[], now: OnboardingStep): Promise<boolean> {
     const kept = open.flatMap((row) => keptOf(row) ?? []);
     const first = kept[0];
-    if (first === undefined) return;
+    if (first === undefined) return false;
     const chat = await personalChat(this.deps, first.actor, this.via(first));
-    if (chat === undefined) return;
+    if (chat === undefined) {
+      this.deps.logger.info("a reviewer's next step waits for their chat to be reachable");
+      return false;
+    }
     const person: UserRef = { id: userId, channelUserId: first.actor.channelUserId, name: first.actor.name, email: "" };
     const steps = stepsShown(!this.linked(userId));
     // (never reached before: what was asked, with every step; else the next one)
@@ -256,22 +277,33 @@ export class ReviewerOnboarding {
       : t.next(names(kept), steps, now);
     await say(this.deps, chat, text);
     await this.stepCard(chat, person, now);
+    return true;
   }
 
   private via(kept: Kept): ConversationRef | undefined {
     return this.deps.restoreRef(kept.asked);
   }
 
-  /** Every step is done: each asker, where they asked, hears it with the button that asks again; the reviewer hears it too. */
-  private async ready(open: readonly ReviewOnboarding[]): Promise<void> {
+  /**
+   * Every step is done: each asker, where they asked, hears it with the button that asks again, and only then is the
+   * request marked told; one that could not be told is claimed back (from `rank`) and told on the next read. The
+   * reviewer hears it too.
+   */
+  private async ready(
+    open: readonly ReviewOnboarding[],
+    rank: number,
+    toldBefore: (onboardingId: string) => number,
+  ): Promise<void> {
+    const store = this.deps.store.reviewDelegation;
     const told: Kept[] = [];
     for (const row of open) {
-      if (!this.deps.store.reviewDelegation.finishReviewOnboarding(row.onboardingId)) continue;
       const kept = keptOf(row);
-      if (kept === undefined) continue;
-      told.push(kept);
-      const where = stored(this.deps, kept.asked);
-      if (where === undefined) continue;
+      const where = kept === undefined ? undefined : stored(this.deps, kept.asked);
+      // (nowhere to tell, now or later: done)
+      if (kept === undefined || where === undefined) {
+        store.finishReviewOnboarding(row.onboardingId);
+        continue;
+      }
       const pulls = kept.pulls.map(shortName).join(", ");
       const text = t.ready(kept.actor.name || "对方", pulls, kept.merge);
       const retry = {
@@ -286,7 +318,10 @@ export class ReviewerOnboarding {
         );
       } catch (err) {
         this.deps.logger.warn("the asker could not be told that the reviewer is ready", { error: errorName(err) });
+        store.releaseOnboardingStep(row.onboardingId, rank, toldBefore(row.onboardingId));
+        continue;
       }
+      if (store.finishReviewOnboarding(row.onboardingId)) told.push(kept);
     }
     const first = told[0];
     if (first === undefined) return;

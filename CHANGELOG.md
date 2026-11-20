@@ -228,7 +228,10 @@ release version, and its `appVersion` stays `latest`.
   done hears "<name> 已完成授权，可以开始代审了" where they asked, with a button that starts the same request again (same
   pull requests, same merge flag, the same handoff within a day) through every check, so nothing starts without the
   reviewer's authorization on. A reviewer who declines, or turns the authorization off while asked, is not asked again,
-  and the asker is told once. The reviewer's first message stays at most once a day.
+  and the asker is told once. The reviewer's first message stays at most once a day. A step that could not be said (the
+  reviewer's chat not reachable yet, or a send that failed) is said on the next read rather than counted as said, and the
+  asker's "ready" message is marked sent only once it went out. Asked again for the same pull requests, a button sent for
+  the earlier request no longer starts the new one.
 - Claw: in the SaFE deployment mode with `LLM_KEY_SOURCE=platformKey`, a caller signed in with an `ak-` key (in
   `Authorization: Bearer`, `x-api-key` or a download URL) or a default session cookie has their email again:
   `GET /v1/me` answers it and the request's user carries it, as in 0.5.8. Since 0.5.9 the API no longer asked SaFE's

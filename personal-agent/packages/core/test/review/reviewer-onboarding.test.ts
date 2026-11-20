@@ -432,3 +432,76 @@ test("a reviewer who could not be reached is sent every step on their next messa
   assert.ok(!bob.includes("Next is step"), bob);
   assert.ok(notes(world, BOB_DM).some((n) => n.buttons.some((b) => b.op === "bind")));
 });
+
+/** Every send into `conversation` fails, as a channel that refuses it does, until the returned function is called. */
+function failSends(world: ReviewWorld, conversation: string): () => void {
+  const surface = world.surface as unknown as { conversation: (ref: { id: string }) => { send: unknown } };
+  const real = surface.conversation.bind(world.surface);
+  surface.conversation = (ref) => {
+    const made = real(ref);
+    if (ref.id === conversation) made.send = () => Promise.reject(new Error("the channel refused it"));
+    return made;
+  };
+  return () => {
+    surface.conversation = real;
+  };
+}
+
+test("a reviewer not reachable when the sweep first reads them is still sent every step on their next message", async () => {
+  const world = reviewWorld();
+  clawReviewsOverHttp(world);
+  world.identity.know("aad-b", "u-bob", null);
+  const surface = world.surface as unknown as { reachable: Set<string> };
+  surface.reachable = new Set(["aad-a"]);
+  await asked(world, `请 {Bob} 帮我 review 合入 ${PR}`);
+  assert.ok(saidIn(world.surface, CONV).includes("请 Bob 在 1:1 里给我发任意一条消息"));
+  // (the sweep runs within a minute of the ask; Bob still cannot be reached, so nothing is claimed as said)
+  await world.service.sweepOnboarding();
+  await world.service.sweepOnboarding();
+  assert.equal(saidIn(world.surface, BOB_DM), "");
+  surface.reachable = new Set(["aad-a", "aad-b"]);
+  await says(world, BOB, "你好");
+  await world.service.sweepOnboarding();
+  const bob = saidIn(world.surface, BOB_DM);
+  assert.equal(times(world, BOB_DM, "Alice asked me in a group chat to review and merge"), 1, bob);
+  assert.ok(bob.includes("2. Connect GitHub: send me `/github bind` here") && bob.includes("<- this step now"), bob);
+  assert.equal(notes(world, BOB_DM).filter((n) => n.buttons.some((b) => b.op === "bind")).length, 1);
+});
+
+test("a next step whose message failed is sent on the next read, once", async () => {
+  const world = reviewWorld();
+  clawReviewsOverHttp(world);
+  bobUnknown(world);
+  await asked(world, `请 {Bob} 帮我 review 合入 ${PR}`);
+  bobConfirms(world);
+  const restore = failSends(world, BOB_DM);
+  await world.service.sweepOnboarding();
+  assert.equal(times(world, BOB_DM, "Next is step 2 of 3"), 0);
+  restore();
+  await world.service.sweepOnboarding();
+  await says(world, BOB, "hi");
+  await world.service.sweepOnboarding();
+  assert.equal(times(world, BOB_DM, "Next is step 2 of 3"), 1, saidIn(world.surface, BOB_DM));
+  assert.equal(notes(world, BOB_DM).filter((n) => n.buttons.some((b) => b.op === "bind")).length, 1);
+});
+
+test("an asker who could not be told the reviewer is ready is told on the next read, once, and the retry works", async () => {
+  const world = reviewWorld();
+  const http = clawReviewsOverHttp(world);
+  world.identity.know("aad-b", "u-bob", "bob-gh", false);
+  await asked(world, `请 {Bob} 帮我 review 合入 ${PR}`);
+  const restore = failSends(world, CONV);
+  await says(world, BOB, "/github auto-merge on");
+  await world.service.sweepOnboarding();
+  restore();
+  assert.equal(notes(world, CONV).filter((n) => n.text.includes(READY)).length, 0);
+  assert.equal(times(world, BOB_DM, "All steps are done"), 0, "the reviewer hears it once the asker has");
+  await world.service.sweepOnboarding();
+  await world.service.sweepOnboarding();
+  assert.equal(notes(world, CONV).filter((n) => n.text.includes(READY)).length, 1);
+  assert.equal(times(world, BOB_DM, "All steps are done. I told Alice"), 1);
+  await press(world, ALICE, GROUP, button(world, CONV, "retry"));
+  await settleFollows(world);
+  assert.equal(http.requests.length, 1);
+  assert.equal(http.requests[0]?.headers["x-acting-as-token"], "tok-aad-b");
+});

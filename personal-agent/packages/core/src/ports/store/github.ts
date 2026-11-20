@@ -113,7 +113,8 @@ export interface ReviewDelegationRepository {
   releaseGithubNotice(userId: string, kind: string): void;
   /**
    * Keeps (or refreshes) what waits for `actorId` to finish their steps, one per reviewer, asker and pull requests: an
-   * earlier one of the same three keeps its id, takes this request and told rank, and is owed to the asker again. Drops
+   * earlier one of the same three takes this id (a button sent for the earlier request no longer answers), this request
+   * and told rank, and is owed to the asker again. Drops
    * those older than REVIEW_ONBOARDING_KEEP_SECONDS. The kept row.
    */
   saveReviewOnboarding(onboarding: {
@@ -131,6 +132,8 @@ export interface ReviewDelegationRepository {
   onboardingReviewers(): string[];
   /** Raises the told rank of every open one of `actorId` below `rank`; true for the one caller that raised any. */
   claimOnboardingStep(actorId: string, rank: number): boolean;
+  /** Undoes a claim whose step could not be said: this one back to `to` while it is open and still at `from`. */
+  releaseOnboardingStep(onboardingId: string, from: number, to: number): void;
   /** Marks it done (the asker is to be told); true for the one caller that marked it. */
   finishReviewOnboarding(onboardingId: string): boolean;
   dropReviewOnboarding(onboardingId: string): void;

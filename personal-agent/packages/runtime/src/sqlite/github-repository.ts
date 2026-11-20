@@ -234,11 +234,12 @@ export class SqliteReviewDelegationRepository implements ReviewDelegationReposit
     const { db } = this.ctx;
     const now = this.ctx.now();
     db.run("DELETE FROM review_onboarding WHERE created_at < ?", now - REVIEW_ONBOARDING_KEEP_SECONDS);
-    // (asked again: the same row, with the latest request and the step the reviewer is at now, owed to the asker again)
+    // (asked again: the same row with the latest request and the step the reviewer is at now, owed to the asker again,
+    // under the new id so that a button sent for the earlier request does not start this one)
     db.run(
       "INSERT INTO review_onboarding (onboarding_id, actor_aad, requester_aad, pulls, request_json, told_rank, created_at) " +
         "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (actor_aad, requester_aad, pulls) DO UPDATE SET " +
-        "request_json = excluded.request_json, told_rank = excluded.told_rank, done = 0, created_at = excluded.created_at",
+        "onboarding_id = excluded.onboarding_id, request_json = excluded.request_json, told_rank = excluded.told_rank, done = 0, created_at = excluded.created_at",
       o.onboardingId,
       o.actorId,
       o.requesterId,
@@ -295,6 +296,15 @@ export class SqliteReviewDelegationRepository implements ReviewDelegationReposit
         rank,
         this.ctx.now() - REVIEW_ONBOARDING_KEEP_SECONDS,
       ) > 0
+    );
+  }
+
+  releaseOnboardingStep(onboardingId: string, from: number, to: number): void {
+    this.ctx.db.run(
+      "UPDATE review_onboarding SET told_rank = ? WHERE onboarding_id = ? AND told_rank = ? AND done = 0",
+      to,
+      onboardingId,
+      from,
     );
   }
 
