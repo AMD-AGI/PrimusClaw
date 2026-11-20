@@ -560,6 +560,7 @@ describe("a queued message that cannot be sent", { skip }, () => {
     const badId = await enqueueUnreadable("the head");
     const goodId = await enqueue("the message behind it");
     const quarantinedBefore = await counter("claw_api_pending_quarantined_total");
+    const failuresBefore = await counter("claw_api_pending_drain_failures_total");
     // The database refuses the move itself, the way any failed statement would.
     await rows(
       `ALTER TABLE claw_pending_messages_quarantine
@@ -586,6 +587,7 @@ describe("a queued message that cannot be sent", { skip }, () => {
     assert.equal(held.attempts, 2, "both attempts are on the record");
     assert.ok(held.notified_at);
     assert.equal(await counter("claw_api_pending_quarantined_total") - quarantinedBefore, 1);
+    assert.equal(await counter("claw_api_pending_drain_failures_total") - failuresBefore, 2, "one per attempt");
     assert.equal(notices().length, 1);
   });
 });

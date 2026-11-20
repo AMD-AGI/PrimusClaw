@@ -164,7 +164,6 @@ export async function quarantineUnsendablePending(
   err: unknown,
   failureReason: string,
 ): Promise<void> {
-  metrics.onPendingDrainFailure();
   const error = drainErrorSummary(err, row.content);
   const messageId = queuedMessageId(row.pendingId);
   const moved = await moveToQuarantine(row.pendingId, messageId, { error, failureReason });
@@ -174,6 +173,9 @@ export async function quarantineUnsendablePending(
       { code: "QUARANTINE_DEFERRED" },
     );
   }
+  // Counted here only once the row has moved: a throw above is counted by the
+  // caller's drain, as every failed drain is, and must not be counted twice.
+  metrics.onPendingDrainFailure();
   await afterQuarantine(row, messageId, moved, failureReason);
 }
 
