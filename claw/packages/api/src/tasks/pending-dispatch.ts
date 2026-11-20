@@ -60,6 +60,9 @@ import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/st
 
 const logger = pino({ name: "pending-dispatch" });
 
+/** The failure reason on the turn a quarantined queued message ends with (tasks/pending-quarantine.ts). */
+export const PENDING_DRAIN_QUARANTINED = "pending_drain_quarantined";
+
 /**
  * How many times a queued message may be refused a workspace before it is
  * abandoned.
@@ -264,8 +267,11 @@ export async function publishRefusedTurn(
   const finalText = failureReason === "workspace_bind_failed"
     ? "This message was not started: its workspace could not be prepared. "
       + "Nothing ran, and it can be sent again."
-    : "This message was not started: the cluster refused it. "
-      + "Nothing ran, and it can be sent again.";
+    : failureReason === PENDING_DRAIN_QUARANTINED
+      ? "This message was not started: it could not be sent after repeated attempts. "
+        + "Nothing ran, and it can be sent again."
+      : "This message was not started: the cluster refused it. "
+        + "Nothing ran, and it can be sent again.";
   const of = (event: Record<string, unknown>): Record<string, unknown> => ({
     session_id: input.sessionId,
     message_id: input.messageId,

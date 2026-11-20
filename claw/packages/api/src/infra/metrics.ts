@@ -346,6 +346,30 @@ const identityClientEnabled = new Gauge({
   registers: [registry],
 });
 
+// The per-session message queue (`claw_pending_messages`). The two gauges are
+// read from the table on every sweeper tick, by every replica, so they describe
+// the queue rather than this process: alert on max() across replicas.
+const pendingDrainFailuresTotal = new Counter({
+  name: "claw_api_pending_drain_failures_total",
+  help: "Attempts to send on a queued message that failed and left it queued.",
+  registers: [registry],
+});
+const pendingQuarantinedTotal = new Counter({
+  name: "claw_api_pending_quarantined_total",
+  help: "Queued messages moved out of their session's queue after repeated failures to send them.",
+  registers: [registry],
+});
+const pendingConsecutiveFailures = new Gauge({
+  name: "claw_api_pending_messages_consecutive_failures",
+  help: "Most consecutive failed attempts to send any one message still queued; 0 when every queued message is flowing.",
+  registers: [registry],
+});
+const pendingOldestAgeSeconds = new Gauge({
+  name: "claw_api_pending_messages_oldest_age_seconds",
+  help: "Age of the oldest message still queued behind a session; 0 when nothing is queued.",
+  registers: [registry],
+});
+
 // A marker ahead of the clock is pod skew, not a negative wait, so it clamps
 // to zero rather than entering the first bucket as a measurement nobody took.
 function sojournSeconds(markerIso: string | null | undefined): number | null {
@@ -475,5 +499,15 @@ export const metrics = {
   },
   onUserSkillSave(op: "create" | "update" | "draft" | "delete" | "disable" | "enable" | "undo", outcome: string): void {
     userSkillSaveTotal.inc({ op, outcome });
+  },
+  onPendingDrainFailure(): void {
+    pendingDrainFailuresTotal.inc();
+  },
+  onPendingQuarantined(): void {
+    pendingQuarantinedTotal.inc();
+  },
+  setPendingQueueState(consecutiveFailures: number, oldestAgeSeconds: number): void {
+    pendingConsecutiveFailures.set(Math.max(0, consecutiveFailures));
+    pendingOldestAgeSeconds.set(Math.max(0, oldestAgeSeconds));
   },
 };

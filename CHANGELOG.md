@@ -161,6 +161,25 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw API: a queued message that can never be sent no longer holds every later message on its session behind it. A
+  message sent while the session is busy waits in that session's queue, and a drain sends only the oldest one; a
+  message whose dispatch failed every time (for example, one larger than NATS's `max_payload`) was retried on every
+  completion and every sweeper tick with no limit, and nothing after it was sent while the session read idle. Each
+  failed attempt is now counted on the queued row, and a message that has failed `PENDING_DRAIN_MAX_FAILURES` times
+  (default 5) over at least `PENDING_DRAIN_FAILURE_WINDOW_SEC` (default 600) is moved to the new
+  `claw_pending_messages_quarantine` table, with its text, sender and last error, and the next message is sent at once.
+  The session is told once, in the turn the message would have been, that it was not sent and can be sent again; a
+  notice that cannot be published then is retried by the sweeper. A message whose run may still be delivered is never
+  moved. Quarantined messages are kept for `PENDING_QUARANTINE_RETENTION_DAYS` (default 30) and are deleted with their
+  session. The log line (`pending.drain_quarantined`) names the message and the error, never the text. New metrics:
+  `claw_api_pending_drain_failures_total`, `claw_api_pending_quarantined_total`,
+  `claw_api_pending_messages_consecutive_failures` (the longest failing streak of any queued message) and
+  `claw_api_pending_messages_oldest_age_seconds`. A publish the NATS client refuses as `MAX_PAYLOAD_EXCEEDED` is now
+  treated as certainly not sent, so the run row it opened is closed instead of left waiting for a delivery that never
+  happened. The API migrates the table and columns at start-up and refuses to start without them.
+- Claw API: a message whose text or request carries a NUL character or a lone UTF-16 surrogate is now queued with
+  U+FFFD in its place. PostgreSQL stores neither (TEXT refuses the NUL byte; `jsonb` refuses the `\u0000` escape and a
+  lone surrogate escape), so such a message used to be refused with a server error when the session was busy.
 - Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its
   own run, the person is now told how it ended, once, in their language. Until now a review under the `fully_auto` mode
   that approved and merged closed its item silently: the person got only the generic "Run completed" notice and had to

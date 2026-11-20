@@ -235,9 +235,10 @@ export function tombstoneTtlMs(
  * already has: whatever the first copy is going to do it is going to do, and
  * anything the caller tore down on the way out is torn down under it.
  *
- * Only two answers are certain, and both come from the server having answered.
+ * Only three answers are certain. Two come from the server having answered:
  * `503` is nobody answering at all, so nothing was stored; an `api_error` is
- * the server declining, and it says why. Everything else -- timeouts, a
+ * the server declining, and it says why. The third is the client refusing a
+ * payload over the server's `max_payload` before sending it. Everything else -- timeouts, a
  * connection that went away mid-request -- is unknown, and is reported as
  * unknown rather than guessed, because the two guesses are not symmetric: one
  * leaves a spare row behind, the other loses the message.
@@ -274,7 +275,12 @@ export async function taskDeliverySettlement(): Promise<
 
 export function publishCertainlyFailed(err: unknown): boolean {
   const e = err as { code?: string; api_error?: unknown } | null;
-  return e?.code === "503" || e?.api_error !== undefined;
+  // A third certain answer, and the only one that comes from this side: the
+  // client checks the size against the server's `max_payload` before it writes
+  // a byte, and refuses with MAX_PAYLOAD_EXCEEDED, so nothing went out. Read as
+  // unknown it left the run open on every attempt, so a queued message too large
+  // to send was never settled and never counted towards its quarantine.
+  return e?.code === "503" || e?.code === "MAX_PAYLOAD_EXCEEDED" || e?.api_error !== undefined;
 }
 
 /**

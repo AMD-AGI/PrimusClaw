@@ -48,6 +48,7 @@ import {
   retireDispatchReconcileForReport,
 } from "../tasks/chat-run.js";
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
+import { recordPendingDrainFailure } from "../tasks/pending-quarantine.js";
 import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
 import { redactStoredValue } from "@claw/utils";
@@ -1535,6 +1536,30 @@ async function drainNextPendingMessage(sessionId: string, userId: string): Promi
 )).rows[0];
 
 if (pending) {
+  try {
+    await dispatchQueuedRow(sessionId, userId, pending);
+  } catch (err) {
+    // A failed send is counted on the row, and past its bound the row is moved
+    // out of the queue (tasks/pending-quarantine.ts). Until then the failure is
+    // raised exactly as before, for the nak or the next sweeper tick to retry;
+    // once the row has left, nothing is owed to it here and the drain claim
+    // goes straight on to the next message instead of failing the whole drain.
+    const verdict = await recordPendingDrainFailure({
+      sessionId, pendingId: Number(pending.id), userId: pending.user_id || userId,
+      content: typeof pending.content === "string" ? pending.content : "",
+    }, err);
+    if (verdict !== "quarantined") throw err;
+  }
+}
+}
+
+/** Send one queued row on: the body of a drain, once the row has been read. */
+async function dispatchQueuedRow(
+  sessionId: string,
+  userId: string,
+  pending: Record<string, any> & { id: number | string },
+): Promise<void> {
+  {
   // A review someone asked of the session's owner runs only while the owner still lets others act for them, asked now, and while its
   // turn budget has room; otherwise it is halted here and nothing is sent (`gateRequestedReviewTurn`).
   if (!(await (await import("../assistant/review-items.js")).gateRequestedReviewTurn(sessionId))) return;

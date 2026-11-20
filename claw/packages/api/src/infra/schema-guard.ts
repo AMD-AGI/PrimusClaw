@@ -147,6 +147,19 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "dedupe_key",
       // Named by every queue insert and read back by the drain, like `topology`.
       "tools_allowlist",
+      // Absent, a message that can never be sent cannot be counted, so it is
+      // never quarantined and holds every later message on its session behind
+      // it for good (tasks/pending-quarantine.ts).
+      "drain_failures", "drain_first_failed_at", "drain_last_error",
+    ],
+  },
+  {
+    table: "claw_pending_messages_quarantine",
+    // Absent, the move that isolates such a message fails, and it stays at the
+    // head of its session's queue.
+    columns: [
+      "id", "session_id", "user_id", "message_id", "content", "attempts", "last_error",
+      "notified_at", "notice_attempts", "notice_claimed_at",
     ],
   },
   {
