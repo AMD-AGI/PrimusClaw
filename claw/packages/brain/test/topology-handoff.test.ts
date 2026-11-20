@@ -8,6 +8,7 @@ import {
   applyMultiNodeExternalEnv,
   buildTopologyHandoff,
   hasSshKeyFile,
+  usesTopologyHandoff,
   writeTopologyHandoff,
   TOPOLOGY_HANDOFF_DIR,
   TOPOLOGY_HANDOFF_PATH,
@@ -41,6 +42,7 @@ const INFERA: MultiNodeContext = {
   sshPrivateKey: PEM,
   sshKeyPath: "/tmp/primus-claw-mn-ssh-key",
   sshPortBase: 2222,
+  routerIps: ["10.0.0.1"],
   prefillIps: ["10.0.0.2", "10.0.0.6"],
   decodeIps: ["10.0.0.3"],
   workerIps: ["10.0.0.4"],
@@ -78,6 +80,7 @@ test("infera: every legacy variable equals its handoff field", () => {
   assert.equal(env.HYPERLOOM_MN_EXT_SERVICE_URL, handoff.service_url, "service_url");
   assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, i.ssh_key_file, "infera.ssh_key_file");
   assert.equal(env.HYPERLOOM_MN_EXT_SSH_PORT, String(i.ssh_port_base), "infera.ssh_port_base");
+  assert.equal(env.HYPERLOOM_MN_EXT_ROUTER_IPS, i.router_ips?.join(","), "infera.router_ips");
   assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, i.prefill_ips.join(","), "infera.prefill_ips");
   assert.equal(env.HYPERLOOM_MN_EXT_DECODE_IPS, i.decode_ips.join(","), "infera.decode_ips");
   assert.equal(env.HYPERLOOM_MN_EXT_WORKER_IPS, i.worker_ips.join(","), "infera.worker_ips");
@@ -92,6 +95,23 @@ test("infera with empty role lists: file keeps empty arrays, legacy vars stay un
   assert.deepEqual(handoff.infera?.prefill_ips, []);
   assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, undefined);
   assert.equal(env.HYPERLOOM_MN_EXT_WORKER_IPS, "10.0.0.9");
+});
+
+test("atomesh and sglangrouter use no topology handoff file", () => {
+  for (const backend of ["atomesh", "sglangrouter"] as const) {
+    const ctx: MultiNodeContext = {
+      backend,
+      provider: "safe",
+      name: `msg1-${backend}`,
+      namespace: "ws",
+      nodeCount: 2,
+      gpusPerNode: 8,
+      serviceUrl: `http://msg1-${backend}.ws.svc.cluster.local:8000`,
+    };
+    assert.equal(usesTopologyHandoff(ctx), false, backend);
+    assert.throws(() => buildTopologyHandoff(ctx), /node list/, backend);
+  }
+  assert.ok(usesTopologyHandoff(RAYJOB) && usesTopologyHandoff(INFERA));
 });
 
 test("handoff documents validate against the schema", () => {

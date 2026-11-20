@@ -3,7 +3,7 @@
 
 /**
  * Multi-node provider for `CLAW_DEPLOY_MODE=safe`: the cluster is a SaFE
- * workload (RayJob or InferaDeployment) created with the requesting user's
+ * workload (RayJob, InferaDeployment, Atom, or SGLangRouter) created with the requesting user's
  * platform key, exactly as Hyperloom's own `multi_node` CLI would create it.
  *
  * Everything goes through the SaFE API; Brain never talks to Kubernetes. The
@@ -24,7 +24,7 @@ import {
 } from "../../config.js";
 import { normalizeWorkloadTimeout, resolveSandboxImageFromRequest } from "../ensure-hands.js";
 import {
-  assertMultiNodeInferaModel,
+  assertMultiNodeModel,
   ephemeralGiPerNode,
   resolveTopology,
   type MultiNodePromptSpec,
@@ -36,10 +36,16 @@ import { placementNodeLabels, workloadPlacementMatches } from "../create-sandbox
 import { ACTIVE_PHASES, TERMINAL_PHASES, waitForWorkloadReady, type WorkloadWaitDeps } from "../workload-wait.js";
 import { parseWorkloadListPage, type WorkloadRef } from "./workload-parse.js";
 import {
+  ATOM_ROUTER_PORT,
+  buildAtomWorkloadBody,
   buildInferaWorkloadBody,
+  buildSGLangRouterWorkloadBody,
   buildRayJobWorkloadBody,
   inferaFrontendPort,
   inferaSshPortBase,
+  sshPortForPod,
+  PD_ENGINE_DECODE_PORT,
+  PD_ENGINE_PREFILL_PORT,
   RAYJOB_SERVER_PORT,
   SESSION_ENV,
 } from "./safe-body.js";
@@ -76,7 +82,7 @@ const SESSION_MAX_PAGES = 20;
  * SaFE kinds that are GPU clusters. Used to spare the session's own sandbox,
  * which carries the same `CLAW_SESSION_ID` env and would otherwise be swept.
  */
-const CLUSTER_KINDS = new Set(["RayJob", "InferaDeployment"]);
+const CLUSTER_KINDS = new Set(["RayJob", "InferaDeployment", "Atom", "SGLangRouter"]);
 
 /** Where the Infera private key is materialised inside the sandbox. */
 const SANDBOX_SSH_KEY_PATH = "/tmp/primus-claw-mn-ssh-key";
@@ -418,7 +424,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
   ): Promise<MultiNodeContext> {
     const spec = resolveTopology(request);
     if (!spec) throw new Error("SafeMultiNodeProvider.ensure called for a single-node request");
-    assertMultiNodeInferaModel(spec);
+    assertMultiNodeModel(spec);
 
     const messageId = request.message_id?.trim();
     if (!messageId) throw new Error("multi-node request requires message_id");
@@ -444,7 +450,7 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
     const displayName = multiNodeWorkloadName(messageId, spec.backend);
     // Derived rather than random, so adopting a redelivered message's workload
     // reproduces the key its pods already trust (see sandbox/multi-node/ssh-key.ts).
-    const keypair = spec.backend === "infera"
+    const keypair = spec.backend !== "rayjob"
       ? deriveSessionKeypair(AUTH_INTERNAL_TOKEN, `${sessionId}:${messageId}`, `primus-claw-${sessionId}`)
       : null;
 
@@ -722,6 +728,25 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
         pdPrefillTp: spec.pdPrefillTp,
         pdDecodeTp: spec.pdDecodeTp,
       });
+    } else if (spec.backend === "atomesh" || spec.backend === "sglangrouter") {
+      const pd = {
+        ...common,
+        model: spec.model,
+        framework: spec.framework,
+        kvTransferBackend: spec.kvTransferBackend,
+        pdMode: spec.pdMode,
+        pdPrefillNodes: spec.pdPrefillNodes,
+        pdDecodeNodes: spec.pdDecodeNodes,
+        pdPrefillTp: spec.pdPrefillTp,
+        pdDecodeTp: spec.pdDecodeTp,
+        serverArgs: spec.serverArgs,
+        pdPrefillExtraArgs: spec.pdPrefillExtraArgs,
+        pdDecodeExtraArgs: spec.pdDecodeExtraArgs,
+        pdIbDevice: spec.pdIbDevice,
+        sshAuthorizedKey: keypair?.authorizedKey,
+        sshPortBase: inferaSshPortBase(displayName),
+      };
+      body = spec.backend === "atomesh" ? buildAtomWorkloadBody(pd) : buildSGLangRouterWorkloadBody(pd);
     } else {
       body = buildRayJobWorkloadBody(common);
     }
@@ -817,10 +842,14 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       logPrefix: "mn.safe",
       isReady: (detail) => {
         if (String(detail.phase ?? "").toLowerCase() !== "running") return false;
-        if (spec.backend !== "infera") return true;
+        // Atom and SGLangRouter report Running only after router, prefill and
+        // decode are all up; their pod IPs, the router's included, are still
+        // needed for the node list. Infera needs live GPU pod IPs as well.
+        if (spec.backend === "rayjob") return true;
         return gpuPodsReady(
           discoverRolePods(detail, spec.pdMode, inferaSshPortBase(displayName)),
           spec.pdMode,
+          { requireRouter: spec.backend === "atomesh" || spec.backend === "sglangrouter" },
         );
       },
       onGiveUp: async ({ reason }) => {
@@ -903,6 +932,37 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       };
     }
 
+    if (spec.backend === "atomesh" || spec.backend === "sglangrouter") {
+      const sshPort = inferaSshPortBase(displayName);
+      const groups = discoverRolePods(detail, "disaggregated", sshPort);
+      return {
+        ...base,
+        serviceUrl: `http://${host}:${ATOM_ROUTER_PORT}`,
+        prefillUrl: `http://${workloadId}-prefill.${namespace}.svc.cluster.local:${PD_ENGINE_PREFILL_PORT}`,
+        decodeUrl: `http://${workloadId}-decode.${namespace}.svc.cluster.local:${PD_ENGINE_DECODE_PORT}`,
+        sshPrivateKey: keypair?.privateKeyPem,
+        sshKeyPath: SANDBOX_SSH_KEY_PATH,
+        sshPortBase: sshPort,
+        sshPorts: {
+          router: groups.frontend.map(() => sshPortForPod("frontend", null, sshPort)),
+          prefill: groups.prefill.map(() => sshPortForPod("prefill", null, sshPort)),
+          decode: groups.decode.map(() => sshPortForPod("decode", null, sshPort)),
+        },
+        routerIps: groups.frontend.map((p) => p.podIp),
+        prefillIps: groups.prefill.map((p) => p.podIp),
+        decodeIps: groups.decode.map((p) => p.podIp),
+        pdLaunch: {
+          model: spec.model,
+          kvTransferBackend: spec.kvTransferBackend,
+          prefillTp: spec.pdPrefillTp,
+          decodeTp: spec.pdDecodeTp,
+          serverArgs: spec.serverArgs,
+          prefillExtraArgs: spec.pdPrefillExtraArgs,
+          decodeExtraArgs: spec.pdDecodeExtraArgs,
+        },
+      };
+    }
+
     const sshPortBase = inferaSshPortBase(displayName);
     const groups: RolePodGroups = discoverRolePods(detail, spec.pdMode, sshPortBase);
     return {
@@ -911,9 +971,27 @@ export class SafeMultiNodeProvider implements MultiNodeProvider {
       sshPrivateKey: keypair?.privateKeyPem,
       sshKeyPath: SANDBOX_SSH_KEY_PATH,
       sshPortBase,
+      sshPorts: {
+        router: groups.frontend.map((p) => p.sshPort),
+        prefill: groups.prefill.map((p) => p.sshPort),
+        decode: groups.decode.map((p) => p.sshPort),
+        worker: groups.worker.map((p) => p.sshPort),
+      },
+      routerIps: groups.frontend.map((p) => p.podIp),
       prefillIps: groups.prefill.map((p) => p.podIp),
       decodeIps: groups.decode.map((p) => p.podIp),
       workerIps: groups.worker.map((p) => p.podIp),
+      pdLaunch: {
+        model: spec.model,
+        framework: spec.framework,
+        mode: spec.pdMode,
+        kvTransferBackend: spec.kvTransferBackend,
+        prefillTp: spec.pdPrefillTp,
+        decodeTp: spec.pdDecodeTp,
+        serverArgs: spec.serverArgs,
+        prefillExtraArgs: spec.pdPrefillExtraArgs,
+        decodeExtraArgs: spec.pdDecodeExtraArgs,
+      },
     };
   }
 }

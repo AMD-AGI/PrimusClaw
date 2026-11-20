@@ -3,8 +3,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { applyMultiNodeExternalEnv } from "../src/sandbox/params.js";
-import type { MultiNodeContext } from "../src/sandbox/multi-node/types.js";
+import { applyMultiNodeExternalEnv, buildNodeList, MN_NODE_LIST_ENV, usesTopologyHandoff } from "../src/sandbox/params.js";
+import { SandboxFailure } from "../src/sandbox/errors.js";
+import type { MultiNodeContext, MultiNodeNodeList } from "../src/sandbox/multi-node/types.js";
 
 const RAYJOB_CTX: MultiNodeContext = {
   backend: "rayjob",
@@ -63,6 +64,128 @@ test("rayjob env points Hyperloom at the head's dashboard/GCS control plane", ()
   assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, undefined);
 });
 
+const PD_CTX: MultiNodeContext = {
+  backend: "sglangrouter",
+  provider: "safe",
+  name: "msg1",
+  namespace: "test-workspace",
+  nodeCount: 3,
+  gpusPerNode: 8,
+  serviceUrl: "http://msg1.test-workspace.svc.cluster.local:8000",
+  prefillUrl: "http://msg1-prefill.test-workspace.svc.cluster.local:8010",
+  decodeUrl: "http://msg1-decode.test-workspace.svc.cluster.local:8020",
+  sshPrivateKey: "-----BEGIN OPENSSH PRIVATE KEY-----\nSECRETKEYBODY\n-----END OPENSSH PRIVATE KEY-----\n",
+  sshKeyPath: "/tmp/primus-claw-mn-ssh-key",
+  sshPortBase: 25032,
+  sshPorts: { router: [25052], prefill: [25032], decode: [25042, 25042] },
+  routerIps: ["10.0.0.1"],
+  prefillIps: ["10.0.0.2"],
+  decodeIps: ["10.0.0.3", "10.0.0.4"],
+  pdLaunch: {
+    model: "/models/DeepSeek-R1",
+    kvTransferBackend: "mori",
+    prefillTp: 8,
+    decodeTp: 0,
+    serverArgs: "--mem-fraction-static 0.8",
+    prefillExtraArgs: "",
+    decodeExtraArgs: "--max-running-requests 256",
+  },
+};
+
+function nodeListOf(env: Record<string, string>): MultiNodeNodeList {
+  return JSON.parse(env[MN_NODE_LIST_ENV]!) as MultiNodeNodeList;
+}
+
+test("sglangrouter and atomesh hand the cluster over as one node list", () => {
+  for (const [backend, framework, frontend] of [
+    ["sglangrouter", "sglang", "sglang-router"],
+    ["atomesh", "atom", "atomesh"],
+  ] as const) {
+    const env: Record<string, string> = { SAFE_API_URL: "https://safe.example" };
+    applyMultiNodeExternalEnv(env, { ...PD_CTX, backend });
+    assert.equal(env.SAFE_API_URL, undefined);
+    assert.deepEqual(nodeListOf(env), {
+      framework,
+      frontend,
+      model: "/models/DeepSeek-R1",
+      service_url: PD_CTX.serviceUrl,
+      prefill_url: PD_CTX.prefillUrl,
+      decode_url: PD_CTX.decodeUrl,
+      router: { host: "10.0.0.1", ssh_port: 25052 },
+      prefill: [{ host: "10.0.0.2", ssh_port: 25032 }],
+      decode: [{ host: "10.0.0.3", ssh_port: 25042 }, { host: "10.0.0.4", ssh_port: 25042 }],
+      gpus_per_node: 8,
+      launch_mode: "in_place",
+      ssh: { port: 25032, user: "root", key_file: "/tmp/primus-claw-mn-ssh-key" },
+      transfer_backend: "mori",
+      topology: {
+        prefill: { tp: 8, ep: null, dp_attention: null },
+        decode: { tp: null, ep: null, dp_attention: null },
+      },
+      config: {
+        prefill_args: "--mem-fraction-static 0.8",
+        decode_args: "--mem-fraction-static 0.8 --max-running-requests 256",
+        router_args: "",
+      },
+    });
+    assert.ok(!env[MN_NODE_LIST_ENV]!.includes("SECRETKEYBODY"), "the key is passed by path only");
+  }
+});
+
+test("sglangrouter and atomesh set no variable but the node list", () => {
+  for (const legacyTopologyEnv of [true, false]) {
+    const env: Record<string, string> = {};
+    applyMultiNodeExternalEnv(env, PD_CTX, { legacyTopologyEnv });
+    for (const name of [
+      "TOPOLOGY_HANDOFF_FILE",
+      "INFERENCE_OPTIMIZER_MN_BACKEND",
+      "INFERENCE_OPTIMIZER_NODES",
+      "HYPERLOOM_MN_EXT_SERVICE_URL",
+      "HYPERLOOM_MN_EXT_PREFILL_URL",
+      "HYPERLOOM_MN_EXT_DECODE_URL",
+      "HYPERLOOM_MN_EXT_SSH_KEY",
+      "HYPERLOOM_MN_EXT_SSH_PORT",
+      "HYPERLOOM_MN_EXT_ROUTER_IPS",
+      "HYPERLOOM_MN_EXT_PREFILL_IPS",
+      "HYPERLOOM_MN_EXT_DECODE_IPS",
+      "HYPERLOOM_MN_EXT_WORKER_IPS",
+    ]) {
+      assert.equal(env[name], undefined, name);
+    }
+  }
+});
+
+test("the node list leaves out what the prompt did not set", () => {
+  const nodeList = buildNodeList({
+    ...PD_CTX,
+    sshPrivateKey: undefined,
+    pdLaunch: { ...PD_CTX.pdLaunch!, prefillTp: 0, serverArgs: "", decodeExtraArgs: "", kvTransferBackend: "" },
+  });
+  assert.ok(nodeList);
+  assert.equal(nodeList.ssh, undefined, "no ssh block without a written key file");
+  const bare = buildNodeList({ ...PD_CTX, prefillUrl: undefined, decodeUrl: undefined });
+  assert.equal(bare?.prefill_url, undefined);
+  assert.equal(bare?.decode_url, undefined);
+  assert.equal(nodeList.topology, undefined);
+  assert.equal(nodeList.config, undefined);
+  assert.equal(nodeList.transfer_backend, undefined);
+});
+
+test("atomesh and sglangrouter without router, prefill or decode hosts fail instead of handing nothing over", () => {
+  for (const backend of ["atomesh", "sglangrouter"] as const) {
+    for (const missing of [{ routerIps: [] }, { prefillIps: [] }, { decodeIps: undefined }, { pdLaunch: undefined }]) {
+      const env: Record<string, string> = {};
+      assert.throws(
+        () => applyMultiNodeExternalEnv(env, { ...PD_CTX, backend, ...missing }),
+        (e: unknown) => e instanceof SandboxFailure && e.code === "mn_handoff_incomplete",
+        JSON.stringify(missing),
+      );
+      assert.equal(env[MN_NODE_LIST_ENV], undefined, JSON.stringify(missing));
+    }
+  }
+  assert.equal(buildNodeList(INFERA_CTX), undefined, "an infera cluster without a launch request has no node list");
+});
+
 test("infera env exposes the SSH control plane and per-role pod IPs", () => {
   const env: Record<string, string> = { SAFE_API_URL: "https://safe.example" };
   applyMultiNodeExternalEnv(env, INFERA_CTX);
@@ -92,4 +215,100 @@ test("aggregated infera reports worker IPs instead of prefill/decode", () => {
   });
   assert.equal(env.HYPERLOOM_MN_EXT_WORKER_IPS, "10.0.0.4,10.0.0.5");
   assert.equal(env.HYPERLOOM_MN_EXT_PREFILL_IPS, undefined);
+});
+
+const INFERA_PD_CTX: MultiNodeContext = {
+  ...INFERA_CTX,
+  sshPrivateKey: PD_CTX.sshPrivateKey,
+  routerIps: ["10.0.0.1"],
+  sshPorts: { router: [2242], prefill: [2222], decode: [2232] },
+  pdLaunch: { ...PD_CTX.pdLaunch!, framework: "sglang", mode: "disaggregated" },
+};
+
+test("infera hands an infera.engine.sglang cluster over as a node list behind its frontend", () => {
+  const env: Record<string, string> = { SAFE_API_URL: "https://safe.example" };
+  applyMultiNodeExternalEnv(env, INFERA_PD_CTX);
+  assert.deepEqual(nodeListOf(env), {
+    framework: "sglang",
+    frontend: "infera",
+    model: "/models/DeepSeek-R1",
+    service_url: INFERA_CTX.serviceUrl,
+    mode: "disaggregated",
+    router: { host: "10.0.0.1", ssh_port: 2242 },
+    prefill: [{ host: "10.0.0.2", ssh_port: 2222 }],
+    decode: [{ host: "10.0.0.3", ssh_port: 2232 }],
+    gpus_per_node: 8,
+    launch_mode: "direct",
+    ssh: { port: 2222, user: "root", key_file: "/tmp/primus-claw-mn-ssh-key" },
+    transfer_backend: "mori",
+    topology: {
+      prefill: { tp: 8, ep: null, dp_attention: null },
+      decode: { tp: null, ep: null, dp_attention: null },
+    },
+    config: {
+      prefill_args: "--mem-fraction-static 0.8",
+      decode_args: "--mem-fraction-static 0.8 --max-running-requests 256",
+      router_args: "",
+    },
+  });
+  assert.ok(!env[MN_NODE_LIST_ENV]!.includes("SECRETKEYBODY"), "the key is passed by path only");
+});
+
+test("an infera cluster with a node list also keeps the topology handoff and the legacy variables", () => {
+  const env: Record<string, string> = {};
+  applyMultiNodeExternalEnv(env, INFERA_PD_CTX, { legacyTopologyEnv: true });
+  assert.ok(env[MN_NODE_LIST_ENV]);
+  assert.equal(env.TOPOLOGY_HANDOFF_FILE, "/tmp/claw-topology/topology.json");
+  assert.equal(env.HYPERLOOM_MN_EXT_SERVICE_URL, INFERA_CTX.serviceUrl);
+  assert.equal(env.HYPERLOOM_MN_EXT_SSH_KEY, "/tmp/primus-claw-mn-ssh-key");
+  assert.equal(env.INFERENCE_OPTIMIZER_MN_BACKEND, "infera");
+  assert.equal(usesTopologyHandoff(INFERA_PD_CTX), true);
+});
+
+test("aggregated infera names worker hosts and the server args as the workers' args", () => {
+  const nodeList = buildNodeList({
+    ...INFERA_PD_CTX,
+    routerIps: [],
+    prefillIps: [],
+    decodeIps: [],
+    workerIps: ["10.0.0.4", "10.0.0.5"],
+    sshPorts: { worker: [2222, 2223] },
+    pdLaunch: { ...INFERA_PD_CTX.pdLaunch!, mode: "aggregated" },
+  });
+  assert.ok(nodeList);
+  assert.equal(nodeList.mode, "aggregated");
+  assert.equal(nodeList.router, undefined);
+  assert.equal(nodeList.prefill, undefined);
+  assert.deepEqual(nodeList.worker, [
+    { host: "10.0.0.4", ssh_port: 2222 },
+    { host: "10.0.0.5", ssh_port: 2223 },
+  ]);
+  assert.deepEqual(nodeList.config, { worker_args: "--mem-fraction-static 0.8", router_args: "" });
+  assert.equal(nodeList.transfer_backend, undefined);
+  assert.equal(nodeList.topology, undefined);
+});
+
+test("infera without an sglang engine or its role pods keeps the topology handoff", () => {
+  for (const ctx of [
+    { ...INFERA_PD_CTX, pdLaunch: { ...INFERA_PD_CTX.pdLaunch!, framework: "vllm" } },
+    { ...INFERA_PD_CTX, decodeIps: [] },
+    { ...INFERA_PD_CTX, pdLaunch: { ...INFERA_PD_CTX.pdLaunch!, mode: "aggregated" as const } },
+  ]) {
+    const env: Record<string, string> = {};
+    applyMultiNodeExternalEnv(env, ctx, { legacyTopologyEnv: true });
+    assert.equal(env[MN_NODE_LIST_ENV], undefined);
+    assert.equal(env.INFERENCE_OPTIMIZER_MN_BACKEND, "infera");
+    assert.equal(usesTopologyHandoff(ctx), true);
+  }
+});
+
+test("co-located prefill and decode pods sharing a node IP keep their own ssh ports", () => {
+  const nodeList = buildNodeList({
+    ...INFERA_PD_CTX,
+    prefillIps: ["10.0.0.5"],
+    decodeIps: ["10.0.0.5"],
+    sshPorts: { router: [2242], prefill: [2222], decode: [2232] },
+  });
+  assert.deepEqual(nodeList?.prefill, [{ host: "10.0.0.5", ssh_port: 2222 }]);
+  assert.deepEqual(nodeList?.decode, [{ host: "10.0.0.5", ssh_port: 2232 }]);
 });

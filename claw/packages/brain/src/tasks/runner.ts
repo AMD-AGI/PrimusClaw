@@ -72,8 +72,8 @@ import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
 import {
-  SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf, sandboxOpenFailureOf,
-  sandboxUnavailableOf, oneLineText,
+  SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf, sandboxFailureOf,
+  sandboxOpenFailureOf, sandboxUnavailableOf, oneLineText,
 } from "../sandbox/errors.js";
 import { placementNodeLabels } from "../sandbox/create-sandbox.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
@@ -4720,7 +4720,9 @@ class TaskRunner {
     const rawMsg = String(err?.message || err);
     // A SandboxProvisionTerminalError carries an authoritative machine reason
     // (e.g. sandbox_workload_terminal); else fall back to the message-regex classifier.
-    const sandboxReason = provisionTerminalOf(err)?.reason ?? classifySandboxFailure(rawMsg);
+    const sandboxReason = sandboxFailureOf(err)?.code
+      ?? provisionTerminalOf(err)?.reason
+      ?? classifySandboxFailure(rawMsg);
     // The platform's account of a sandbox that could not be provided, carried
     // beside the code to the run row, the A2A task and the notification, so a
     // caller can tell a refusal from a crash. Masked on the way out, as below.
