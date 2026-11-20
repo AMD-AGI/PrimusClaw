@@ -149,7 +149,10 @@ notification set aside still retires its config. If the copy cannot be written
 (the dead-letter table refuses it, say on a full disk), the row is closed anyway
 with `last_status = quarantined_unrecorded:<status>` and the payload kept on it,
 and `a2a_push.dead_letter_failed` is logged: a head that could not be set aside
-would hold its webhook for good.
+would hold its webhook for good. Such a row is then the only copy of the
+notification, so its config is not retired by the task's final notification
+(deleting the config would delete the row with it); it stays until an operator
+has dealt with the row.
 
 Each attempt, from its claim to the end of the request, including the config
 read and the name lookup, ends within 45 seconds or is abandoned and retried; a claim's lease is

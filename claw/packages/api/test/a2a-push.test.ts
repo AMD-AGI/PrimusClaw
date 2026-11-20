@@ -1361,6 +1361,47 @@ describe("A2A push notifications", { skip }, () => {
       }
     });
 
+    test("a notification set aside without its dead letter keeps its config, so the only copy is not deleted", async () => {
+      // A final notification set aside unrecorded, and one before a final that is
+      // then delivered: neither retires the config, which would take the row along.
+      for (const finalPoisoned of [true, false]) {
+        await query("DELETE FROM claw_a2a_push_outbox");
+        await query("DELETE FROM claw_a2a_push_configs");
+        const hook = await receiver((raw) => (finalPoisoned || raw.includes("toolu_poison") ? 500 : 200));
+        await query(`CREATE OR REPLACE FUNCTION test_refuse_dead_letter() RETURNS trigger LANGUAGE plpgsql
+                       AS $$ BEGIN RAISE EXCEPTION 'could not extend file' USING ERRCODE = '53100'; END $$`);
+        await query("CREATE TRIGGER test_refuse_dead_letter BEFORE INSERT ON claw_a2a_push_dead_letters FOR EACH ROW EXECUTE FUNCTION test_refuse_dead_letter()");
+        try {
+          const t = await liveTask();
+          await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: hook.url });
+          if (!finalPoisoned) {
+            await record(t.sessionId, { type: "permissionRequest", actionId: "toolu_poison", tool: "bash", input: {} }, 1501);
+          }
+          await query("UPDATE claw_tasks SET status = 'completed', completed_at = NOW() WHERE task_id = $1", [t.taskId]);
+          assert.equal(await record(t.sessionId, { type: "exec_complete", message_id: t.messageId }, 1502), 1);
+          for (let i = 0; i < push.MAX_DELIVERY_ATTEMPTS + 2; i += 1) await pass();
+
+          const rows = await outbox();
+          const kept = rows.filter((r) => String(r.last_status).startsWith("quarantined_unrecorded:"));
+          assert.equal(kept.length, 1, `the unrecorded row is still there (final poisoned: ${finalPoisoned})`);
+          assert.ok(kept[0].dropped_at);
+          assert.equal(kept[0].final, finalPoisoned);
+          if (finalPoisoned) {
+            assert.equal(kept[0].payload.statusUpdate.status.state, "TASK_STATE_COMPLETED");
+          } else {
+            assert.equal(kept[0].payload.statusUpdate.status.message.parts[1].data.actionId, "toolu_poison");
+            assert.ok(rows.find((r) => r.final)?.delivered_at, "the final notification was delivered");
+          }
+          assert.equal(await configCount(), 1, "the config stays while its row is the only copy");
+          assert.equal((await deadLetters()).length, 0);
+        } finally {
+          await query("DROP TRIGGER IF EXISTS test_refuse_dead_letter ON claw_a2a_push_dead_letters");
+          await query("DROP FUNCTION IF EXISTS test_refuse_dead_letter()");
+          await hook.close();
+        }
+      }
+    });
+
     test("the backlog gauges read the oldest owed notification and the most-tried head", async () => {
       const t = await liveTask();
       await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: HOOK });

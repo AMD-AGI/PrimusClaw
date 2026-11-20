@@ -538,10 +538,22 @@ async function closeRow(
   return (r.rowCount ?? 0) > 0;
 }
 
-/** A finished task's configuration goes with its last notification. */
+/**
+ * A finished task's configuration goes with its last notification, unless one
+ * of its notifications was set aside without a dead-letter record: that closed
+ * outbox row is then the only copy of the payload, and deleting the config
+ * would take it along (the outbox rows cascade). The config stays until an
+ * operator has dealt with that row.
+ */
 async function retireIfFinal(row: Claimed): Promise<void> {
   if (row.final) {
-    await db.query("DELETE FROM claw_a2a_push_configs WHERE task_id = $1 AND config_id = $2", [row.task_id, row.config_id]);
+    await db.query(
+      `DELETE FROM claw_a2a_push_configs c WHERE c.task_id = $1 AND c.config_id = $2
+          AND NOT EXISTS (SELECT 1 FROM claw_a2a_push_outbox o
+                           WHERE o.task_id = c.task_id AND o.config_id = c.config_id
+                             AND starts_with(o.last_status, 'quarantined_unrecorded:'))`,
+      [row.task_id, row.config_id],
+    );
   }
 }
 
@@ -552,8 +564,8 @@ async function retireIfFinal(row: Claimed): Promise<void> {
  * not closed without its record when the record can be written. When it cannot
  * (the dead-letter write keeps failing), the row is closed anyway, on its own:
  * a head that could never be set aside would hold every notification behind it
- * for good. Its payload stays on the closed outbox row while the config lives,
- * and its status says no record was kept. The log lines name the row, not what
+ * for good. Its payload stays on the closed outbox row, which keeps its config
+ * from being retired (retireIfFinal), and its status says no record was kept. The log lines name the row, not what
  * it says.
  */
 async function quarantine(row: Claimed, status: string, attempts: number): Promise<void> {

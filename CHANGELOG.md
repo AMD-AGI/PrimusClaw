@@ -186,7 +186,8 @@ release version, and its `appVersion` stays `latest`.
   `jsonb` refuses, is stored with U+FFFD in their place instead of failing the write and losing the notification. New
   metrics: `claw_a2a_push_delivery_total{outcome}`, `claw_a2a_push_quarantined_total`,
   `claw_a2a_push_head_consecutive_failures` and `claw_a2a_push_oldest_pending_age_seconds`. A notification is set
-  aside even when its dead-letter copy cannot be written (it is then closed as `quarantined_unrecorded:<status>`). Each
+  aside even when its dead-letter copy cannot be written (it is then closed as `quarantined_unrecorded:<status>`,
+  and its config is kept so the row, the only copy left, is not deleted with it). Each
   delivery attempt, config read and name lookup included, now ends within 45 seconds, inside the 120-second claim lease,
   so a lookup that hangs can no longer let another replica send the next notification before a late copy of this one.
   Only an attempt that reached the receiver (a request started, or its name looked up and not found) counts toward
