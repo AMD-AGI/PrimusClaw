@@ -12,6 +12,12 @@
  * outbox holds one row per (configuration, notification), unique on a key
  * derived from the event that caused it so a redelivered event records nothing
  * twice.
+ *
+ * A notification that keeps failing is set aside after a bounded number of
+ * attempts so the ones behind it are sent: its outbox row is closed and a copy
+ * goes to `claw_a2a_push_dead_letters`. That table has no key into the
+ * configurations, so the record outlives the config (which goes with its
+ * task's last notification, and its outbox rows with it).
  */
 import type pg from "pg";
 
@@ -82,5 +88,22 @@ export async function ensureA2aPushSchema(client: pg.PoolClient): Promise<void> 
     `CREATE INDEX IF NOT EXISTS idx_a2a_push_outbox_due
        ON claw_a2a_push_outbox(next_attempt_at)
        WHERE delivered_at IS NULL AND dropped_at IS NULL`,
+  );
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_a2a_push_dead_letters (
+      outbox_id      BIGINT PRIMARY KEY,
+      task_id        TEXT NOT NULL,
+      config_id      TEXT NOT NULL,
+      dedupe_key     TEXT NOT NULL,
+      payload        JSONB NOT NULL,
+      final          BOOLEAN NOT NULL,
+      attempts       INT NOT NULL,
+      last_status    TEXT,
+      created_at     TIMESTAMPTZ NOT NULL,
+      quarantined_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await client.query(
+    "CREATE INDEX IF NOT EXISTS idx_a2a_push_dead_letters_quarantined ON claw_a2a_push_dead_letters(quarantined_at)",
   );
 }

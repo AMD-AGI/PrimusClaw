@@ -123,8 +123,25 @@ when the config is created and again at every delivery, which connects to the
 address that was checked. With `CLAW_A2A_PUSH_ALLOWED_HOSTS_ONLY=true` the list
 is the whole of it: a host it does not name is refused even when it is public, at
 creation and again at every delivery, for a deployment whose receivers are all its
-own. Delivery is at least once and in order per config,
-retried with backoff and abandoned after an hour.
+own. Delivery is at least once and in order per config, retried with backoff
+(1, 5, 30, then every 300 seconds).
+
+A notification that fails eight times in a row (about twenty minutes) is set
+aside so the ones behind it are sent: its outbox row is closed, a copy is kept in
+`claw_a2a_push_dead_letters` for 14 days, and the API logs
+`a2a_push.quarantined` with the task, config and status but not the content. A
+receiver that is down for longer therefore loses at most one notification per
+twenty minutes and gets the rest, still in order, once it is back; a final
+notification set aside still retires its config. Text that PostgreSQL cannot
+store (a NUL character, a lone UTF-16 surrogate) is replaced with U+FFFD when the
+notification is written, rather than failing the write.
+
+| Metric | What it says |
+|---|---|
+| `claw_a2a_push_delivery_total{outcome}` | Attempts by outcome: `delivered`, `retried`, `dropped` (config gone, URL refused), `quarantined` |
+| `claw_a2a_push_quarantined_total` | Notifications set aside after every attempt failed |
+| `claw_a2a_push_head_consecutive_failures` | The most attempts any webhook's oldest undelivered notification has used |
+| `claw_a2a_push_oldest_pending_age_seconds` | Age of the oldest notification still owed; 0 when none is |
 
 ## Not supported
 

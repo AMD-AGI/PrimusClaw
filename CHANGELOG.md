@@ -161,6 +161,17 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: an A2A push notification that its webhook keeps refusing no longer holds back every later notification for that
+  webhook for up to an hour. After eight failed attempts (about twenty minutes) it is set aside: its outbox row is
+  closed, a copy is kept in the new `claw_a2a_push_dead_letters` table for 14 days, the log line
+  `a2a_push.quarantined` names it without its content, and the next notification is sent, still in order. A
+  notification is no longer dropped just because it is an hour old, so a receiver that comes back after a longer outage
+  gets what it was owed. A notification whose text holds a NUL character or a lone UTF-16 surrogate, which PostgreSQL's
+  `jsonb` refuses, is stored with U+FFFD in their place instead of failing the write and losing the notification. New
+  metrics: `claw_a2a_push_delivery_total{outcome}`, `claw_a2a_push_quarantined_total`,
+  `claw_a2a_push_head_consecutive_failures` and `claw_a2a_push_oldest_pending_age_seconds`. See "Push
+  notifications" in `claw/docs/a2a.md`.
+
 - Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its
   own run, the person is now told how it ended, once, in their language. Until now a review under the `fully_auto` mode
   that approved and merged closed its item silently: the person got only the generic "Run completed" notice and had to

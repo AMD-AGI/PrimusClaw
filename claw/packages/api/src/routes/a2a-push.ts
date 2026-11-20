@@ -26,6 +26,10 @@
 //   - Delivery is at least once, durable (an outbox row per notification) and
 //     retried with backoff; a config is dropped with its task's final
 //     notification ("MUST persist until task completion or explicit deletion").
+//     A webhook gets its notifications in the order they were written, so one
+//     that keeps failing would hold every later one back: after
+//     MAX_DELIVERY_ATTEMPTS it is set aside (a copy kept in
+//     claw_a2a_push_dead_letters) and the next one is sent.
 //     The final notification is owed to every run that ends, whoever closed
 //     it: the completion event writes it when it arrives, and
 //     `enqueueFinalForClosedRuns` writes it for a run that was closed without
@@ -39,8 +43,10 @@
 import { randomUUID } from "node:crypto";
 import pino from "pino";
 import { db } from "../infra/db.js";
+import { metrics } from "../infra/metrics.js";
 import { decryptUserEnvValue, encryptUserEnvValue } from "../crypto/user-env.js";
 import { sanitizeSessionEvent } from "../events/store.js";
+import { storableJson } from "../notifications/storable-json.js";
 import { httpTransport, type Transport } from "../notifications/transport.js";
 import { guardWebhookUrl, type Resolver } from "../notifications/url-guard.js";
 import { a2aPushAllowedHosts, a2aPushAllowedHostsOnly, a2aPushEnabled } from "./a2a-flags.js";
@@ -62,8 +68,15 @@ export const FINAL_RECONCILE_GRACE_SECONDS = 15;
 const RECONCILE_EVERY_MS = 10_000;
 /** Seconds to wait after the Nth failed attempt; the last step repeats. */
 export const RETRY_BACKOFF_SECONDS = [1, 5, 30, 300];
-/** A notification still undelivered this long after it was written is dropped. */
-export const GIVE_UP_AFTER_SECONDS = 3600;
+/**
+ * Attempts a notification gets before it is set aside so the ones behind it can
+ * go. With the backoff above that is about twenty minutes of trying; a
+ * receiver that is down for longer loses at most one notification per twenty
+ * minutes to the dead letters, and gets the rest, in order, when it is back.
+ */
+export const MAX_DELIVERY_ATTEMPTS = 8;
+/** How long a set-aside notification is kept for inspection. */
+export const DEAD_LETTER_RETENTION_DAYS = 14;
 /** Spec 4.3.3 recommends 10-30 s per request. */
 export const WEBHOOK_TIMEOUT_MS = 15_000;
 const CLAIM_LEASE_SECONDS = 120;
@@ -243,6 +256,10 @@ interface Notification { key: string; payload: StreamResponse; final?: boolean }
  * order given (delivery is by id) and two writers racing on the same final pass
  * cannot interleave them. A config deleted since the caller read it is simply
  * not matched.
+ *
+ * The payload is made storable first: a NUL or a lone surrogate anywhere in it
+ * (an event's text can carry either) would make `jsonb` refuse the whole
+ * statement, and every notification of the pass with it.
  */
 async function enqueue(taskId: string, configIds: string[], items: Notification[]): Promise<void> {
   if (!configIds.length || !items.length) return;
@@ -254,7 +271,7 @@ async function enqueue(taskId: string, configIds: string[], items: Notification[
       WHERE c.task_id = $1 AND c.config_id = ANY($2::text[])
       ORDER BY c.config_id, i.ord
      ON CONFLICT (task_id, config_id, dedupe_key) DO NOTHING`,
-    [taskId, configIds, items.map((i) => i.key), items.map((i) => JSON.stringify(i.payload)), items.map((i) => i.final ?? false)],
+    [taskId, configIds, items.map((i) => i.key), items.map((i) => JSON.stringify(storableJson(i.payload))), items.map((i) => i.final ?? false)],
   );
   kickWorker();
 }
@@ -397,13 +414,13 @@ interface Claimed {
   payload: StreamResponse;
   attempts: number;
   final: boolean;
-  expired: boolean;
 }
 
 async function claimDue(): Promise<Claimed[]> {
   // Per configuration the oldest undelivered row goes first, and only it:
   // notifications for one webhook arrive in the order they were written. A head
-  // that is backing off, or leased to another replica, holds its successors.
+  // that is backing off, or leased to another replica, holds its successors,
+  // for at most MAX_DELIVERY_ATTEMPTS attempts (sendOne, deliverDue).
   return (await db.query(
     `WITH heads AS (
        SELECT DISTINCT ON (task_id, config_id) id
@@ -420,9 +437,8 @@ async function claimDue(): Promise<Claimed[]> {
          ORDER BY next_attempt_at
          LIMIT $1
          FOR UPDATE SKIP LOCKED)
-      RETURNING o.id, o.task_id, o.config_id, o.payload, o.attempts, o.final,
-                o.created_at < NOW() - make_interval(secs => $3) AS expired`,
-    [CLAIM_BATCH, CLAIM_LEASE_SECONDS, GIVE_UP_AFTER_SECONDS],
+      RETURNING o.id, o.task_id, o.config_id, o.payload, o.attempts, o.final`,
+    [CLAIM_BATCH, CLAIM_LEASE_SECONDS],
   )).rows as Claimed[];
 }
 
@@ -431,6 +447,33 @@ async function retireIfFinal(row: Claimed): Promise<void> {
   if (row.final) {
     await db.query("DELETE FROM claw_a2a_push_configs WHERE task_id = $1 AND config_id = $2", [row.task_id, row.config_id]);
   }
+}
+
+/**
+ * Set a notification aside: its outbox row is closed, so the next one of its
+ * webhook becomes the head, and a copy is kept in the dead letters, which
+ * outlive the config. One statement, so a row is never closed without its
+ * record. The log line names the row, not what it says.
+ */
+async function quarantine(row: Claimed, status: string): Promise<void> {
+  await db.query(
+    `WITH moved AS (
+       UPDATE claw_a2a_push_outbox SET dropped_at = NOW(), last_status = $2
+        WHERE id = $1 AND delivered_at IS NULL AND dropped_at IS NULL
+       RETURNING id, task_id, config_id, dedupe_key, payload, final, attempts, created_at
+     )
+     INSERT INTO claw_a2a_push_dead_letters
+       (outbox_id, task_id, config_id, dedupe_key, payload, final, attempts, last_status, created_at)
+     SELECT id, task_id, config_id, dedupe_key, payload, final, attempts, $3, created_at FROM moved
+     ON CONFLICT (outbox_id) DO NOTHING`,
+    [row.id, `quarantined:${status}`, status],
+  );
+  metrics.onA2aPushDelivery("quarantined");
+  logger.warn(
+    { outboxId: row.id, taskId: row.task_id, configId: row.config_id, attempts: row.attempts, status, final: row.final },
+    "a2a_push.quarantined",
+  );
+  await retireIfFinal(row);
 }
 
 async function sendOne(row: Claimed, deps: DeliveryDeps): Promise<boolean> {
@@ -443,6 +486,7 @@ async function sendOne(row: Claimed, deps: DeliveryDeps): Promise<boolean> {
     await db.query(
       "UPDATE claw_a2a_push_outbox SET dropped_at = NOW(), last_status = 'config_gone' WHERE id = $1", [row.id],
     );
+    metrics.onA2aPushDelivery("dropped");
     return false;
   }
   let status: string;
@@ -466,6 +510,7 @@ async function sendOne(row: Claimed, deps: DeliveryDeps): Promise<boolean> {
         await db.query(
           "UPDATE claw_a2a_push_outbox SET delivered_at = NOW(), last_status = $2 WHERE id = $1", [row.id, String(code)],
         );
+        metrics.onA2aPushDelivery("delivered");
         await retireIfFinal(row);
         return true;
       }
@@ -475,15 +520,19 @@ async function sendOne(row: Claimed, deps: DeliveryDeps): Promise<boolean> {
     status = `error:${err instanceof Error ? err.message.slice(0, 80) : "unknown"}`;
   }
   // A name that does not resolve may resolve in a minute; a refused address stays refused.
-  if (row.expired || (status.startsWith("refused:") && status !== "refused:unresolvable_host")) {
+  if (status.startsWith("refused:") && status !== "refused:unresolvable_host") {
     // A refused URL stays refused (the host now resolves somewhere private, or
     // the operator took it off the list), so it is not retried.
     await db.query(
       "UPDATE claw_a2a_push_outbox SET dropped_at = NOW(), last_status = $2 WHERE id = $1", [row.id, status],
     );
+    metrics.onA2aPushDelivery("dropped");
     logger.warn({ configId: row.config_id, status }, "a2a_push.dropped");
     await retireIfFinal(row);
+  } else if (row.attempts >= MAX_DELIVERY_ATTEMPTS) {
+    await quarantine(row, status);
   } else {
+    metrics.onA2aPushDelivery("retried");
     const wait = RETRY_BACKOFF_SECONDS[Math.min(row.attempts - 1, RETRY_BACKOFF_SECONDS.length - 1)];
     await db.query(
       `UPDATE claw_a2a_push_outbox SET next_attempt_at = NOW() + make_interval(secs => $2), last_status = $3 WHERE id = $1`,
@@ -499,9 +548,47 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
   let failed = 0;
   // The claim takes one row per configuration, so these are all different receivers.
   await Promise.all((await claimDue()).map(async (row) => {
+    // Claimed again with every attempt already used: the last one never came
+    // back (the process died sending it, which a payload can cause), so it is
+    // not given another.
+    if (row.attempts > MAX_DELIVERY_ATTEMPTS) {
+      await quarantine(row, "attempt_unfinished");
+      failed += 1;
+      return;
+    }
     if (await sendOne(row, deps)) delivered += 1; else failed += 1;
   }));
   return { delivered, failed };
+}
+
+/**
+ * Read the backlog into the gauges: the most attempts any webhook's head has
+ * used (a head that is past the first few is one that keeps failing), and the
+ * age of the oldest notification still owed. Returns them, for tests.
+ */
+export async function refreshA2aPushBacklog(): Promise<{ headConsecutiveFailures: number; oldestPendingAgeSeconds: number }> {
+  const row = (await db.query(
+    `WITH heads AS (
+       SELECT DISTINCT ON (task_id, config_id) attempts, created_at
+         FROM claw_a2a_push_outbox
+        WHERE delivered_at IS NULL AND dropped_at IS NULL
+        ORDER BY task_id, config_id, id
+     )
+     SELECT COALESCE(MAX(attempts), 0)::int AS failures,
+            COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(created_at)), 0)::float8 AS oldest
+       FROM heads`,
+  )).rows[0] as { failures: number; oldest: number };
+  const out = { headConsecutiveFailures: Number(row.failures), oldestPendingAgeSeconds: Math.max(0, Number(row.oldest)) };
+  metrics.setA2aPushBacklog(out.headConsecutiveFailures, out.oldestPendingAgeSeconds);
+  return out;
+}
+
+/** Dead letters are kept for inspection, not for ever. */
+export async function pruneA2aPushDeadLetters(retentionDays = DEAD_LETTER_RETENTION_DAYS): Promise<number> {
+  const r = await db.query(
+    "DELETE FROM claw_a2a_push_dead_letters WHERE quarantined_at < NOW() - make_interval(days => $1)", [retentionDays],
+  );
+  return r.rowCount ?? 0;
 }
 
 const POLL_MS = 2000;
@@ -518,6 +605,8 @@ function tick(): void {
     if (Date.now() - lastReconcileAt >= RECONCILE_EVERY_MS) {
       lastReconcileAt = Date.now();
       await enqueueFinalForClosedRuns().catch((err) => logger.error({ err }, "a2a_push.reconcile_failed"));
+      await refreshA2aPushBacklog().catch((err) => logger.error({ err }, "a2a_push.backlog_read_failed"));
+      await pruneA2aPushDeadLetters().catch((err) => logger.error({ err }, "a2a_push.dead_letter_prune_failed"));
     }
     return deliverDue();
   })()
