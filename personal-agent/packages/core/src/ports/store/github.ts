@@ -85,6 +85,8 @@ export interface ReviewOnboarding {
   readonly toldRank: number;
   /** The asker was told the reviewer is ready. */
   readonly done: boolean;
+  /** The reviewer said no: the asker is owed (or is being told) that, and nothing waits for the reviewer. */
+  readonly declined: boolean;
   readonly createdAt: number;
 }
 
@@ -137,4 +139,12 @@ export interface ReviewDelegationRepository {
   /** Marks it done (the asker is to be told); true for the one caller that marked it. */
   finishReviewOnboarding(onboardingId: string): boolean;
   dropReviewOnboarding(onboardingId: string): void;
+  /** Marks an open one declined (the asker is owed that); true for the one caller that marked it. */
+  declineReviewOnboarding(onboardingId: string): boolean;
+  /** The declined ones whose asker is not yet told (of `actorId`, or of everyone), oldest first. */
+  declinedReviewOnboardings(actorId?: string): ReviewOnboarding[];
+  /** Takes a declined one to tell its asker; true for the one caller that took it. */
+  claimDeclinedOnboarding(onboardingId: string): boolean;
+  /** Gives back a declined one whose asker could not be told, for the next sweep. */
+  releaseDeclinedOnboarding(onboardingId: string): void;
 }

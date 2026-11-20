@@ -169,15 +169,34 @@ export class Notices {
     kind: string,
     send: (chat: Conversation) => Promise<void>,
   ): Promise<boolean> {
+    return (await this.onceADayOutcome(person, via, kind, send)) !== "failed";
+  }
+
+  /**
+   * As `onceADay`, telling apart sent now ("sent"), held back because a notice of this kind already went to them today
+   * ("earlier": what that one said may not be this), and not sent ("failed").
+   */
+  async onceADayOutcome(
+    person: Actor,
+    via: ConversationRef,
+    kind: string,
+    send: (chat: Conversation) => Promise<void>,
+  ): Promise<"sent" | "earlier" | "failed"> {
     const delegation = this.deps.store.reviewDelegation;
-    if (!delegation.claimGithubNotice(person.userId, kind, BIND_NOTICE_SECONDS)) return true;
-    const chat = await personalChat(this.deps, person, via);
+    if (!delegation.claimGithubNotice(person.userId, kind, BIND_NOTICE_SECONDS)) return "earlier";
+    if (await this.toPerson(person, via, send)) return "sent";
+    delegation.releaseGithubNotice(person.userId, kind);
+    return "failed";
+  }
+
+  /** Sends what `send` says into the person's own chat, with no daily limit; true when it went. */
+  async toPerson(person: Actor, via: ConversationRef, send: (chat: Conversation) => Promise<void>): Promise<boolean> {
     try {
+      const chat = await personalChat(this.deps, person, via);
       if (chat === undefined) throw new Error("no 1:1 chat with this person");
       await send(chat);
     } catch (err) {
       this.deps.logger.warn("the steps for a person a review needs could not be sent", { error: errorName(err) });
-      delegation.releaseGithubNotice(person.userId, kind);
       return false;
     }
     return true;

@@ -505,3 +505,92 @@ test("an asker who could not be told the reviewer is ready is told on the next r
   assert.equal(http.requests.length, 1);
   assert.equal(http.requests[0]?.headers["x-acting-as-token"], "tok-aad-b");
 });
+
+/** Every note card (a step's buttons) sent into `conversation` fails; plain text still goes. */
+function failCards(world: ReviewWorld, conversation: string): void {
+  const surface = world.surface as unknown as {
+    conversation: (ref: { id: string }) => { send: (message: OutMessage) => Promise<unknown> };
+  };
+  const real = surface.conversation.bind(world.surface);
+  surface.conversation = (ref) => {
+    const made = real(ref);
+    if (ref.id !== conversation) return made;
+    const send = made.send.bind(made);
+    made.send = (message) =>
+      message.body.type === "view" && message.body.view.name === "note"
+        ? Promise.reject(new Error("the channel refused the card"))
+        : send(message);
+    return made;
+  };
+}
+
+test("a step whose text went but whose card failed is not said again, by the sweep or by the reviewer's messages", async () => {
+  const world = reviewWorld();
+  clawReviewsOverHttp(world);
+  bobUnknown(world);
+  await asked(world, `请 {Bob} 帮我 review 合入 ${PR}`);
+  failCards(world, BOB_DM);
+  bobConfirms(world);
+  for (let i = 0; i < 5; i += 1) await world.service.sweepOnboarding();
+  await says(world, BOB, "hi");
+  assert.equal(times(world, BOB_DM, "Next is step 2 of 3"), 1, saidIn(world.surface, BOB_DM));
+  assert.equal(notes(world, BOB_DM).filter((n) => n.buttons.some((b) => b.op === "bind")).length, 0);
+
+  // The first message too: its card failing does not leave the steps unsaid for the sweep to say again
+  const first = reviewWorld();
+  clawReviewsOverHttp(first);
+  first.identity.know("aad-b", "u-bob", "bob-gh", false);
+  failCards(first, BOB_DM);
+  await asked(first, `请 {Bob} 帮我 review 合入 ${PR}`);
+  assert.ok(saidIn(first.surface, CONV).includes(STEP3), saidIn(first.surface, CONV));
+  assert.ok(saidIn(first.surface, CONV).includes("我已私信 TA 这几步"), saidIn(first.surface, CONV));
+  for (let i = 0; i < 5; i += 1) await first.service.sweepOnboarding();
+  await says(first, BOB, "hi");
+  assert.equal(times(first, BOB_DM, "as you; I have done nothing yet"), 1, saidIn(first.surface, BOB_DM));
+  assert.equal(times(first, BOB_DM, "Next is step"), 0);
+});
+
+test("a step held back by the daily limit for another notice is still sent, once, and the asker hears it was", async () => {
+  const world = reviewWorld();
+  clawReviewsOverHttp(world);
+  world.identity.know("aad-b", "u-bob", "bob-gh", false);
+  // (earlier today Bob was sent a GitHub notice of the same kind for something else)
+  assert.ok(world.store.reviewDelegation.claimGithubNotice("aad-b", "bind", 86_400));
+  await asked(world, `请 {Bob} 帮我 review 合入 ${PR}`);
+  assert.equal(times(world, BOB_DM, "as you; I have done nothing yet"), 1, saidIn(world.surface, BOB_DM));
+  assert.ok(saidIn(world.surface, BOB_DM).includes("<- this step now"));
+  assert.equal(notes(world, BOB_DM).filter((n) => n.buttons.some((b) => b.op === "auto_merge_on")).length, 1);
+  assert.ok(saidIn(world.surface, CONV).includes(STEP3));
+  assert.ok(saidIn(world.surface, CONV).includes("我已私信 TA 这几步"), saidIn(world.surface, CONV));
+  // Asked again, and read again: nothing more for Bob
+  await asked(world, `请 {Bob} 帮我 review 合入 ${PR2}`, ALICE, "g2");
+  await world.service.sweepOnboarding();
+  await says(world, BOB, "hi");
+  assert.equal(times(world, BOB_DM, "as you; I have done nothing yet"), 1);
+  assert.equal(notes(world, BOB_DM).filter((n) => n.buttons.some((b) => b.op === "auto_merge_on")).length, 1);
+  // ...and he can do it from there
+  await press(world, BOB, dm(BOB_DM), button(world, BOB_DM, "auto_merge_on"));
+  assert.equal(notes(world, CONV).filter((n) => n.text.includes(READY)).length, 2);
+});
+
+test("an asker who could not be told the reviewer said no is told on the next sweep, once", async () => {
+  const world = reviewWorld();
+  const http = clawReviewsOverHttp(world);
+  world.identity.know("aad-b", "u-bob", "bob-gh", false);
+  await asked(world, `请 {Bob} 帮我 review 合入 ${PR}`);
+  const decline = button(world, BOB_DM, "decline");
+  const restore = failSends(world, CONV);
+  await press(world, BOB, dm(BOB_DM), decline);
+  await world.service.sweepOnboarding();
+  restore();
+  assert.equal(times(world, CONV, "选择暂不开启代审授权"), 0);
+  await world.service.sweepOnboarding();
+  assert.equal(times(world, CONV, `Bob 选择暂不开启代审授权，所以 ${PR} 的代审不会开始`), 1);
+  await world.service.sweepOnboarding();
+  await says(world, BOB, "/github auto-merge off");
+  assert.equal(times(world, CONV, "选择暂不开启代审授权"), 1);
+  // Nothing waits for Bob any more, and nothing starts
+  assert.equal(times(world, BOB_DM, "Next is step"), 0);
+  assert.equal(notes(world, CONV).filter((n) => n.text.includes(READY)).length, 0);
+  assert.deepEqual(reviews(http), []);
+});

@@ -41,6 +41,14 @@ function confirmation(row: Row): GithubConfirmation {
   };
 }
 
+/**
+ * `review_onboarding.done`: 0 open, 1 the asker told the reviewer is ready, 2 declined with the asker not yet told,
+ * 3 declined and being told (back to 2 when that fails).
+ */
+const ONBOARDING_DONE = 1;
+const ONBOARDING_DECLINED = 2;
+const ONBOARDING_DECLINED_TELLING = 3;
+
 const ONBOARDING_COLUMNS = "onboarding_id, actor_aad, requester_aad, pulls, request_json, told_rank, done, created_at";
 
 function onboarding(row: Row): ReviewOnboarding {
@@ -51,7 +59,8 @@ function onboarding(row: Row): ReviewOnboarding {
     pulls: col.str(row, "pulls"),
     request: storedObject(col.str(row, "request_json")) ?? {},
     toldRank: col.num(row, "told_rank"),
-    done: col.bool(row, "done"),
+    done: col.num(row, "done") === ONBOARDING_DONE,
+    declined: col.num(row, "done") >= ONBOARDING_DECLINED,
     createdAt: col.num(row, "created_at"),
   };
 }
@@ -316,5 +325,41 @@ export class SqliteReviewDelegationRepository implements ReviewDelegationReposit
 
   dropReviewOnboarding(onboardingId: string): void {
     this.ctx.db.run("DELETE FROM review_onboarding WHERE onboarding_id = ?", onboardingId);
+  }
+
+  declineReviewOnboarding(onboardingId: string): boolean {
+    return this.moveOnboarding(onboardingId, 0, ONBOARDING_DECLINED);
+  }
+
+  declinedReviewOnboardings(actorId?: string): ReviewOnboarding[] {
+    const since = this.ctx.now() - REVIEW_ONBOARDING_KEEP_SECONDS;
+    const where = actorId === undefined ? "" : " AND actor_aad = ?";
+    return this.ctx.db
+      .all(
+        `SELECT ${ONBOARDING_COLUMNS} FROM review_onboarding WHERE done = ? AND created_at >= ?${where} ORDER BY created_at, rowid`,
+        ONBOARDING_DECLINED,
+        since,
+        ...(actorId === undefined ? [] : [actorId]),
+      )
+      .map(onboarding);
+  }
+
+  claimDeclinedOnboarding(onboardingId: string): boolean {
+    return this.moveOnboarding(onboardingId, ONBOARDING_DECLINED, ONBOARDING_DECLINED_TELLING);
+  }
+
+  releaseDeclinedOnboarding(onboardingId: string): void {
+    this.moveOnboarding(onboardingId, ONBOARDING_DECLINED_TELLING, ONBOARDING_DECLINED);
+  }
+
+  private moveOnboarding(onboardingId: string, from: number, to: number): boolean {
+    return (
+      this.ctx.db.run(
+        "UPDATE review_onboarding SET done = ? WHERE onboarding_id = ? AND done = ?",
+        to,
+        onboardingId,
+        from,
+      ) === 1
+    );
   }
 }

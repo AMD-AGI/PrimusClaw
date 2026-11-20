@@ -151,10 +151,21 @@ export class ReviewerOnboarding {
       merge: ask.merge,
     };
     const person: UserRef = { id: actor.userId, channelUserId: actor.channelUserId, name: actor.name, email: "" };
-    const sent = await this.notices.onceADay(actor, ctx.conversation.ref, "bind", async (chat) => {
+    const store = this.deps.store.reviewDelegation;
+    // (the furthest step an earlier ask of theirs, still open, has already told them)
+    const prior = Math.max(0, ...store.openReviewOnboardings(actor.userId).map((o) => o.toldRank));
+    const send = async (chat: Conversation) => {
       await say(this.deps, chat, t.first(asked, steps, step));
-      await this.stepCard(chat, person, step);
-    });
+      await this.cardAfterText(chat, person, step);
+    };
+    let sent = prior >= RANK[step];
+    if (!sent) {
+      const outcome = await this.notices.onceADayOutcome(actor, ctx.conversation.ref, "bind", send);
+      // (a notice that went earlier today did not say this step, or no open ask would be short of it: said now, once)
+      sent =
+        outcome === "sent" ||
+        (outcome === "earlier" && (await this.notices.toPerson(actor, ctx.conversation.ref, send)));
+    }
     const request: JsonObject = {
       actor: { ...actor },
       requester: { userId: ctx.sender.id, name: ctx.sender.name, channelUserId: ctx.sender.channelUserId },
@@ -167,16 +178,28 @@ export class ReviewerOnboarding {
       group: ctx.group,
       where: ctx.group ? ctx.message.conversationName : "",
     };
-    this.deps.store.reviewDelegation.saveReviewOnboarding({
+    store.saveReviewOnboarding({
       onboardingId: this.random.hexId(),
       actorId: actor.userId,
       requesterId: ctx.sender.id,
       pulls: pulls.map(shortName).join(" "),
       request,
       // (not reached: their next message, or the sweep, sends the steps)
-      toldRank: sent ? RANK[step] : 0,
+      toldRank: sent ? RANK[step] : prior,
     });
     await say(this.deps, ctx.conversation, t.missing(actor.name || "对方", steps, step, sent, ctx.group));
+  }
+
+  /**
+   * What goes with a step, after its text went: a card that could not be sent is not worth saying the step again for
+   * (the text names what to type), so it is only logged and the step counts as said.
+   */
+  private async cardAfterText(chat: Conversation, person: UserRef, step: OnboardingStep): Promise<void> {
+    try {
+      await this.stepCard(chat, person, step);
+    } catch (err) {
+      this.deps.logger.warn("the card under a reviewer's step could not be sent", { error: errorName(err) });
+    }
   }
 
   /** What goes with a step: the identity card, or a button that does the step. */
@@ -212,8 +235,13 @@ export class ReviewerOnboarding {
     void task.finally(() => this.running.delete(task));
   }
 
-  /** Every reviewer something waits for, read again. */
+  /** Every reviewer something waits for, read again; every asker still owed a reviewer's no, told. */
   async sweep(): Promise<void> {
+    try {
+      await this.tellDeclined(this.deps.store.reviewDelegation.declinedReviewOnboardings());
+    } catch (err) {
+      this.deps.logger.warn("an asker could not be told that the reviewer said no", { error: errorName(err) });
+    }
     for (const userId of this.deps.store.reviewDelegation.onboardingReviewers()) {
       try {
         await this.advance(userId);
@@ -276,7 +304,8 @@ export class ReviewerOnboarding {
         )
       : t.next(names(kept), steps, now);
     await say(this.deps, chat, text);
-    await this.stepCard(chat, person, now);
+    // (said once the text is out: a card that fails after it does not send the step again)
+    await this.cardAfterText(chat, person, now);
     return true;
   }
 
@@ -333,20 +362,37 @@ export class ReviewerOnboarding {
     }
   }
 
-  /** The reviewer turned their standing authorization off, or said not now: each asker waiting on them is told, once. */
+  /**
+   * The reviewer turned their standing authorization off, or said not now: each asker waiting on them is told, once. Each
+   * is marked declined first (nothing waits for the reviewer any more), and stays owed to its asker until the telling
+   * went, so a send that fails is tried again by the sweep.
+   */
   async declined(userId: string): Promise<void> {
     const store = this.deps.store.reviewDelegation;
-    for (const row of store.openReviewOnboardings(userId)) {
-      if (!store.finishReviewOnboarding(row.onboardingId)) continue;
-      store.dropReviewOnboarding(row.onboardingId);
+    for (const row of store.openReviewOnboardings(userId)) store.declineReviewOnboarding(row.onboardingId);
+    await this.tellDeclined(store.declinedReviewOnboardings(userId));
+  }
+
+  /** Each asker owed a reviewer's no is told it where they asked (once, whoever takes it first); then it is dropped. */
+  private async tellDeclined(rows: readonly ReviewOnboarding[]): Promise<void> {
+    const store = this.deps.store.reviewDelegation;
+    for (const row of rows) {
+      if (!store.claimDeclinedOnboarding(row.onboardingId)) continue;
       const kept = keptOf(row);
       const where = kept === undefined ? undefined : stored(this.deps, kept.asked);
-      if (kept === undefined || where === undefined) continue;
+      // (nowhere to tell, now or later: done)
+      if (kept === undefined || where === undefined) {
+        store.dropReviewOnboarding(row.onboardingId);
+        continue;
+      }
       try {
         await say(this.deps, where, t.refused(kept.actor.name || "对方", kept.pulls.map(shortName).join(", ")));
       } catch (err) {
         this.deps.logger.warn("the asker could not be told that the reviewer said no", { error: errorName(err) });
+        store.releaseDeclinedOnboarding(row.onboardingId);
+        continue;
       }
+      store.dropReviewOnboarding(row.onboardingId);
     }
   }
 
@@ -380,7 +426,7 @@ export class ReviewerOnboarding {
   private async retryClick(click: ClickRoute, id: string): Promise<void> {
     const store = this.deps.store.reviewDelegation;
     const row = id ? store.getReviewOnboarding(id) : null;
-    const kept = row === null || !row.done ? undefined : keptOf(row);
+    const kept = row === null || !row.done || row.declined ? undefined : keptOf(row);
     if (row === null || kept === undefined) {
       await click.settle(t.retryGone);
       return;

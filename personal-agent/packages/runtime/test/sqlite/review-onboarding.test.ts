@@ -91,3 +91,37 @@ test("a claimed step that could not be said is released, only while it is still 
   repo.releaseOnboardingStep("o-1", 3, 0);
   assert.equal(repo.getReviewOnboarding("o-1")?.toldRank, 3, "a done one is not reopened");
 });
+
+test("a declined row waits for nothing from the reviewer, is taken once to tell its asker, and given back when that fails", () => {
+  const { store } = openTestStore();
+  const repo = store.reviewDelegation;
+  repo.saveReviewOnboarding(row("o-1"));
+  repo.saveReviewOnboarding(row("o-2", "aad-c", "o/r#2"));
+  assert.equal(repo.declineReviewOnboarding("o-1"), true);
+  assert.equal(repo.declineReviewOnboarding("o-1"), false, "declined once");
+  assert.deepEqual(
+    repo.openReviewOnboardings("aad-b").map((o) => o.onboardingId),
+    ["o-2"],
+  );
+  assert.equal(repo.claimOnboardingStep("aad-b", 5), true);
+  assert.equal(repo.getReviewOnboarding("o-1")?.toldRank, 1, "a declined row is not claimed as a step");
+  const declined = repo.declinedReviewOnboardings();
+  assert.deepEqual(
+    declined.map((o) => [o.onboardingId, o.declined, o.done]),
+    [["o-1", true, false]],
+  );
+  assert.deepEqual(repo.declinedReviewOnboardings("aad-x"), []);
+  assert.equal(repo.claimDeclinedOnboarding("o-1"), true);
+  assert.equal(repo.claimDeclinedOnboarding("o-1"), false, "taken once");
+  assert.deepEqual(repo.declinedReviewOnboardings("aad-b"), [], "not owed while being told");
+  repo.releaseDeclinedOnboarding("o-1");
+  assert.deepEqual(
+    repo.declinedReviewOnboardings("aad-b").map((o) => o.onboardingId),
+    ["o-1"],
+  );
+  assert.equal(repo.claimDeclinedOnboarding("o-2"), false, "an open row is not declined");
+  // Asked again: open again, under the new id
+  repo.saveReviewOnboarding(row("o-3"));
+  assert.deepEqual(repo.declinedReviewOnboardings(), []);
+  assert.equal(repo.getReviewOnboarding("o-3")?.declined, false);
+});
