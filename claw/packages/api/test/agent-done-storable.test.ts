@@ -37,6 +37,15 @@ test("every string in a JSON value is made storable, keys included", () => {
   assert.equal(input["k\u0000"][0], "x\uD83D", "the input is not modified");
 });
 
+test("a __proto__ key in a body stays a key", () => {
+  const body = JSON.parse('{"__proto__": {"polluted": true}, "a": "x\\u0000"}') as Record<string, unknown>;
+  const out = storableJson(body) as Record<string, unknown>;
+  assert.equal(Object.getPrototypeOf(out), Object.prototype);
+  assert.equal((out as { polluted?: unknown }).polluted, undefined);
+  assert.deepEqual(Object.keys(out), ["__proto__", "a"]);
+  assert.equal(out.a, `x${R}`);
+});
+
 test("only the SQLSTATEs a resend cannot change are unstorable", () => {
   for (const code of ["22021", "22P05", "22P02", "22003"]) assert.equal(unstorableSqlState({ code }), code);
   for (const code of ["40001", "57P01", "53300", "23505", undefined]) assert.equal(unstorableSqlState({ code }), null);
