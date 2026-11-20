@@ -1356,7 +1356,7 @@ export function classifySandboxFailure(msg: string): string | null {
   if (/platformKey is required/i.test(msg)) return "sandbox_auth_missing";
   if (/sandbox_image/i.test(msg) && /missing/i.test(msg)) return "sandbox_image_missing";
   if (/GPU_TEMPLATE_SPEC_PATH/i.test(msg)) return "sandbox_template_missing";
-  if (/Create Hands failed: HTTP/i.test(msg)) return "sandbox_create_failed";
+  if (/Create Hands failed\b/i.test(msg)) return "sandbox_create_failed";
   if (/Hands workload .* entered terminal phase/i.test(msg)) return "sandbox_workload_terminal";
   if (/Hands health check failed/i.test(msg)) return "sandbox_health_failed";
   if (/bootstrap\.(mkdir_workspace|install_nodejs|start_hands)/i.test(msg)) return "sandbox_bootstrap_failed";

@@ -184,6 +184,20 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: a run whose sandbox the platform did not create or schedule now ends failed, with a stable `failure_reason` and
+  the platform's own words as its message, on `GET /v1/runs`, the run row, the session's events (a `sandboxStatus`
+  event with `status: failed`), the A2A task status (the message carries `metadata.failure_reason`) and the `run.failed`
+  notification (its summary is `<code>: <message>`). Until now a create that SaFE refused (for example its admission
+  webhook's QoS ceiling: "timeout 64800 exceeds the qos limit of 10800 seconds for scope Sandbox") was treated as a
+  retryable error, and the run ended `class: exited` with no exit code and an empty `failure_reason`; so did a workload
+  that failed before it was ready, and a create that failed with a 5xx. The codes: `sandbox_rejected` (SaFE answered the
+  create with a 4xx other than 403, 408, 425 or 429: the same request is not sent again within the run),
+  `sandbox_create_failed` (a 5xx, or no answer), the workload's terminal code (for example `sandbox_workload_terminal`,
+  with the `AdminFailed` condition's reason and message), `sandbox_unschedulable` and `sandbox_pending_timeout`. When a
+  refusal is about the timeout, the message also says the timeout the run asked for and the one Claw sent (Claw adds
+  3600 s to stop the run cleanly) and, when only that hour is over the platform's limit, the largest timeout that fits.
+  A run that is refused the workspace (403) still carries on without a sandbox and is not failed for it. The platform's
+  text is bounded and masked like every other value the run sends.
 - Claw: in the SaFE deployment mode with `LLM_KEY_SOURCE=platformKey`, a caller signed in with an `ak-` key (in
   `Authorization: Bearer`, `x-api-key` or a download URL) or a default session cookie has their email again:
   `GET /v1/me` answers it and the request's user carries it, as in 0.5.8. Since 0.5.9 the API no longer asked SaFE's

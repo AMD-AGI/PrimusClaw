@@ -257,6 +257,7 @@ function owedRunNotice(raw: unknown, rowId: number): RunFinished | null {
       taskIds: v.taskIds,
       outcome: v.outcome,
       ...(typeof v.failureReason === "string" ? { failureReason: v.failureReason } : {}),
+      ...(typeof v.failureMessage === "string" ? { failureMessage: v.failureMessage } : {}),
     };
   }
   logger.error({ rowId }, "notification.owed_unreadable");
@@ -1235,6 +1236,12 @@ async function handleComplete(
   const runFailure = !failed && !interrupted ? runFailureOf(event) : null;
   const runFailed = Boolean(failed) || runFailure !== null;
   const runFailureReason = failed ? String(failure_reason ?? "agent_error") : runFailure?.reason;
+  // What the run failed with, for a person: a turn that answered carries it as
+  // `run_failure_message`, a failed one whose sandbox could not be provided as
+  // `failure_message` (the platform's account, masked by the worker).
+  const runFailureMessage = runFailure
+    ? runFailure.message
+    : failed && typeof (event as any).failure_message === "string" ? String((event as any).failure_message).slice(0, 2000) : "";
   // Null rather than "" when absent: the unique index over the turns is partial
   // on this column, so an empty string would put every turn of every caller that
   // sends no message id into one index entry and let the first one written
@@ -1266,7 +1273,7 @@ async function handleComplete(
       runFailed ? runFailureReason : undefined,
       {
         taskId: provenance ?? undefined, runClaim: runClaimOf(event),
-        ...(runFailure ? { failureMessage: runFailure.message } : {}),
+        ...(runFailureMessage ? { failureMessage: runFailureMessage } : {}),
       },
     );
     endedRunIds = closed.length ? closed : (provenance ? [provenance] : []);
@@ -1556,6 +1563,7 @@ async function handleComplete(
       taskIds: endedRunIds,
       outcome: runFailed ? "failed" : "completed",
       ...(runFailed ? { failureReason: runFailureReason } : {}),
+      ...(runFailed && runFailureMessage ? { failureMessage: runFailureMessage } : {}),
     };
     try {
       await completionPorts.recordRunFinished(notice);

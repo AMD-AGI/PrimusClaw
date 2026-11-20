@@ -72,7 +72,7 @@ import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
 import {
-  SANDBOX_CAPACITY_FAILURE_REASONS, SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf,
+  SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf, sandboxOpenFailureOf,
   sandboxUnavailableOf,
 } from "../sandbox/errors.js";
 import { placementNodeLabels } from "../sandbox/create-sandbox.js";
@@ -1654,6 +1654,14 @@ class TaskRunner {
    * the next message of the session tries afresh.
    */
   private sandboxUnavailable: unknown = null;
+  /**
+   * What the last failed open of this run's sandbox ended with, until an open
+   * succeeds. A failure the next tool may retry past (a create the platform
+   * answered 5xx, a workload that failed before it was ready) is not latched in
+   * `sandboxUnavailable`, but a run that asked and never got a sandbox did not do
+   * the work it needed one for either; see `provisionFailure`.
+   */
+  private lastOpenFailure: unknown = null;
   private resumeMetricsRecorded = false;
   // Set by the first successful reap, which a terminal path may do early to
   // keep a still-writing process out of its snapshot; the release on the way
@@ -2998,7 +3006,11 @@ class TaskRunner {
     // cached and how a rebuild is not undone: `recreateHands` replaces
     // `this.hands` without coming through here, so a retained promise would keep
     // handing out the sandbox the rebuild has already destroyed.
-    this.handsAttach = this.openSandbox(prestart).catch(async (err: unknown) => {
+    this.handsAttach = this.openSandbox(prestart).then((hands) => {
+      this.lastOpenFailure = null;
+      return hands;
+    }, async (err: unknown) => {
+      this.lastOpenFailure = err;
       await this.settleUnavailableOpen(err);
       throw err;
     }).finally(() => {
@@ -3021,23 +3033,29 @@ class TaskRunner {
 
   /**
    * Why this run ended without the sandbox it asked for, when it did: a tool asked
-   * for one, the platform had no capacity for it (SANDBOX_CAPACITY_FAILURE_REASONS:
-   * no node took the pod, the wait for capacity ran out, it never became ready)
-   * and none was opened after. The model was told and wrote its answer
-   * without one, so the turn ends as usual; but none of the work that needed the
-   * sandbox ran, and the run is recorded as failed for that reason, with the
-   * platform's account of it, so a caller reading the run sees why rather than a
-   * clean ending with no exit code.
+   * for one and the platform did not provide it -- it refused the create
+   * (`sandbox_rejected`, e.g. an admission webhook's QoS ceiling), the create
+   * failed (`sandbox_create_failed`), the workload failed before it was ready
+   * (AdminFailed), no node took the pod, or the wait for capacity ran out -- and
+   * none was opened after. The model was told and wrote its answer without one,
+   * so the turn ends as usual; but none of the work that needed the sandbox ran,
+   * and the run is recorded as failed for that reason, with the platform's
+   * account of it, so a caller reading the run sees why
+   * rather than a clean ending with no exit code.
    *
    * A prestarted open that failed with nothing asking for it is not this: the run
    * never needed the sandbox. Nor is an account the platform refuses a sandbox to:
-   * such a run carries on without one by design.
+   * such a run carries on without one by design (see `sandboxOpenFailureOf`).
    */
   private provisionFailure(): { reason: string; message: string } | null {
-    if (!this.sandboxClaimed || this.hands || !this.sandboxUnavailable) return null;
-    const terminal = sandboxUnavailableOf(this.sandboxUnavailable);
-    if (!terminal || !SANDBOX_CAPACITY_FAILURE_REASONS.has(terminal.reason)) return null;
-    return { reason: terminal.reason, message: String(terminal.message ?? "").slice(0, 2000) };
+    if (!this.sandboxClaimed || this.hands) return null;
+    const err = this.sandboxUnavailable ?? this.lastOpenFailure;
+    if (!err) return null;
+    const failure = sandboxOpenFailureOf(err, classifySandboxFailure);
+    if (!failure) return null;
+    // Bounded here; the run's secrets are masked on the way out, as for every
+    // event (`onEvent`) and callback (`redactEgressPayload`) this run sends.
+    return { reason: failure.reason, message: failure.message.slice(0, 2000) };
   }
 
   /**
@@ -3847,6 +3865,13 @@ class TaskRunner {
         "task.ended_without_sandbox",
       );
       result = { ...result, abortReason: "error", failureReason: provisionFailure.reason, failureMessage: provisionFailure.message };
+      // In the session's events too, where a client following the session reads
+      // why the sandbox it was shown starting never came (the completion itself
+      // is not forwarded to clients).
+      await this.onEvent({
+        type: "sandboxStatus", status: "failed", reason: provisionFailure.reason, message: provisionFailure.message,
+        message_id: this.messageId,
+      }).catch(() => { /* a status event must not fail the run */ });
     }
     const completion: Record<string, unknown> = {
       type: "exec_complete",
@@ -4694,6 +4719,10 @@ class TaskRunner {
     // A SandboxProvisionTerminalError carries an authoritative machine reason
     // (e.g. sandbox_workload_terminal); else fall back to the message-regex classifier.
     const sandboxReason = provisionTerminalOf(err)?.reason ?? classifySandboxFailure(rawMsg);
+    // The platform's account of a sandbox that could not be provided, carried
+    // beside the code to the run row, the A2A task and the notification, so a
+    // caller can tell a refusal from a crash. Masked on the way out, as below.
+    const sandboxFailureMessage = sandboxReason ? rawMsg.slice(0, 2000) : undefined;
     if (sandboxReason) {
       await this.onEvent({
         type: "sandboxStatus",
@@ -4768,6 +4797,7 @@ class TaskRunner {
       final_text: finalText,
       failed: true,
       failure_reason: taskFailure.reason,
+      ...(sandboxFailureMessage ? { failure_message: sandboxFailureMessage } : {}),
       turns: partialTurns,
       elapsed_ms: elapsedMsAtFailure,
       token_usage: partialTokenUsage,
@@ -4802,6 +4832,7 @@ class TaskRunner {
           elapsedMs: elapsedMsAtFailure,
           abortReason: "error",
           failureReason: sandboxReason || rawMsg.slice(0, 500),
+          ...(sandboxFailureMessage ? { failureMessage: sandboxFailureMessage } : {}),
           ...(err instanceof AppRunFailedError && err.captures ? { captures: err.captures } : {}),
         }),
         runtimeSecrets(this.request, this.platformKey),

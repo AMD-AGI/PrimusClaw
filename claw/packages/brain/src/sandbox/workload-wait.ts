@@ -25,7 +25,7 @@ import { sleep } from "@claw/utils";
 import {
   SAFE_API_URL, SANDBOX_POLL_TIMEOUT_MS, SANDBOX_PENDING_TIMEOUT_MS, SANDBOX_START_TIMEOUT_MS,
 } from "../config.js";
-import { SandboxProvisionTerminalError, classifyWorkloadTerminalReason } from "./errors.js";
+import { SandboxProvisionTerminalError, classifyWorkloadTerminalReason, workloadTerminalText } from "./errors.js";
 import { cleanPlatformText, readWaitingState, type WaitingState } from "./workload-stall.js";
 
 const logger = pino({ name: "workload-wait" });
@@ -561,7 +561,10 @@ export async function waitForWorkloadReady(
       const reason = classifyWorkloadTerminalReason(detail);
       const status = phase === "stopped" ? "stopped" : "failed";
       await opts.onTerminal?.({ phase, status, reason }).catch(() => {});
-      return await giveUp(reason, phase, `workload ${workloadId} entered terminal phase=${phase}`);
+      // With the platform's account of why (the AdminFailed condition's message):
+      // without it a caller reads that the sandbox failed, never why.
+      const said = workloadTerminalText(detail);
+      return await giveUp(reason, phase, `workload ${workloadId} entered terminal phase=${phase}${said ? ` (${said})` : ""}`);
     }
 
     // What the platform says the workload is waiting for, if it is waiting. Read
