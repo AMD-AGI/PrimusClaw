@@ -53,7 +53,7 @@ import { randomUUID } from "node:crypto";
 import { redactStoredText, redactStoredValue } from "@claw/utils";
 import pino from "pino";
 import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
-import { metrics } from "../infra/metrics.js";
+import { metrics, type EventQuarantineReason } from "../infra/metrics.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
@@ -461,10 +461,11 @@ const UNSTORABLE_PG_CODES = new Set([
  * than naks -- can be pinned without a live JetStream iterator.
  *
  * Every delivery is answered (acked or nak'd), and none throws: a step that
- * throws is answered with a nak. A delivery that has failed for long enough
- * while other events are being stored is set aside instead of processed (see
- * `eventQuarantinePolicy`), with a durable copy, so it cannot hold up the
- * consumer for the life of the stream.
+ * throws is answered with a nak. Only an event no retry can store is set aside
+ * (with a durable copy, see poison.ts): one that is not a JSON object, or one
+ * Postgres refuses for its value. Every other failure is retried however long
+ * it lasts, since an outage and a busy or owed completion look the same from
+ * here as a bad event does, and only the retry tells them apart.
  */
 export async function consumeEventDelivery(msg: EventDelivery): Promise<void> {
   const seq = msg.seq ?? msg.info?.streamSequence;
@@ -478,11 +479,7 @@ export async function consumeEventDelivery(msg: EventDelivery): Promise<void> {
     nak: (millis?: number) => { answer ??= "nak"; msg.nak(millis); },
   };
   try {
-    if (eventDeliveryHealth.shouldQuarantine({ seq, deliveries, publishedMs })) {
-      await setAside(tracked, "retries_exhausted", { seq, deliveries, publishedMs });
-    } else {
-      await processEventDelivery(tracked, { seq, deliveries, publishedMs });
-    }
+    await processEventDelivery(tracked, { seq, deliveries, publishedMs });
   } catch (err) {
     eventDeliveryHealth.noteError(seq, err);
     logger.error({ err: (err as Error)?.message, seq, subject: msg.subject }, "event-consumer.delivery_failed");
@@ -499,7 +496,7 @@ export async function consumeEventDelivery(msg: EventDelivery): Promise<void> {
  */
 async function setAside(
   msg: EventDelivery,
-  reason: "unparseable" | "unstorable" | "retries_exhausted",
+  reason: EventQuarantineReason,
   d: { seq?: number; deliveries: number; publishedMs?: number },
   event?: Record<string, unknown>,
 ): Promise<void> {
@@ -554,6 +551,7 @@ async function processEventDelivery(
     // subject layout: "events.{sessionId}"
     const sessionId = storableText(msg.subject.split(".")[1] ?? "");
     let event: Record<string, unknown>;
+    let sanitised = false;
     try {
       const parsed: unknown = JSON.parse(sc.decode(msg.data));
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("event is not a JSON object");
@@ -561,8 +559,8 @@ async function processEventDelivery(
       // surrogate) is replaced here, before anything below writes it.
       const storable = storableEvent(parsed as Record<string, unknown>);
       event = storable.event;
+      sanitised = storable.replaced > 0;
       if (storable.replaced) {
-        metrics.onEventSanitised();
         logger.warn(
           { sessionId, type: event.type, seq: d.seq, replaced: storable.replaced },
           "event-consumer.unstorable_characters_replaced",
@@ -663,7 +661,7 @@ async function processEventDelivery(
         `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${isAppEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
         [eventId, sessionId, (event.type as string) || "message", redactStoredValue(event)],
       );
-      eventDeliveryHealth.stored(d.seq);
+      eventDeliveryHealth.stored();
       if (isAppEvent && !insertResult.rowCount) {
         logger.info({ sessionId, appTaskId: appEvent?.appTaskId, appEventId: appEvent?.eventId }, "event-consumer.app_event_duplicate_dropped");
         msg.ack();
@@ -671,6 +669,7 @@ async function processEventDelivery(
       }
       if (insertResult.rowCount && insertResult.rows[0]) {
         metrics.onEventPersisted("ok");
+        if (sanitised) metrics.onEventSanitised();
         rowId = insertResult.rows[0].id;
       } else {
         const existing = await db.query(
@@ -685,12 +684,16 @@ async function processEventDelivery(
       metrics.onEventPersisted("error");
       eventDeliveryHealth.noteError(d.seq, e);
       const pgCode = e?.code || "";
-      if (UNSTORABLE_PG_CODES.has(pgCode)) {
+      if (UNSTORABLE_PG_CODES.has(pgCode) && event.type !== "exec_complete") {
         // Not expected once the event is sanitised above; if it happens anyway,
         // no retry can store it, so it is set aside at once with its copy.
         logger.error({ sessionId, eventId, type: event.type, code: pgCode }, "event-consumer.persist_unstorable");
         await setAside(msg, "unstorable", d, event);
       } else {
+        // A completion is never set aside, unstorable or not: its row is what
+        // `processCompletionEvent` stamps, and acking it without one would end
+        // the run's turn and its `run.completed` notice with nothing done. It
+        // is retried, and the gauge and this log line show it.
         logger.error({ err: e, sessionId }, "event-consumer.persist_failed");
         msg.nak(5000);
       }

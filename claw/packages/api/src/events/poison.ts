@@ -10,11 +10,16 @@
  *   JavaScript string can hold: U+0000 (in `text` and as the `\u0000` escape in
  *   `jsonb`) and a lone UTF-16 surrogate (a `\udXXX` escape `jsonb` will not
  *   parse). Either one used to fail the event's INSERT for every delivery.
- * - `eventDeliveryHealth` with `quarantineEventDelivery`: an event that keeps
- *   failing is set aside, with a durable copy in `claw_event_quarantine`, once
- *   it has had a bounded number of deliveries -- but only while other events are
- *   being stored, so an outage of the database (where every event fails) never
- *   quarantines anything.
+ * - `quarantineEventDelivery`: an event no retry can store is set aside, with
+ *   a durable copy in `claw_event_quarantine`. Only two kinds are: one that is
+ *   not a JSON object, and one Postgres refused for its value after it was made
+ *   storable (consumer.ts, `UNSTORABLE_PG_CODES`). Both are properties of the
+ *   bytes, so the same delivery fails the same way every time. Nothing is set
+ *   aside for how often or how long it has failed: an outage of the database or
+ *   of the tombstone bucket fails every event for as long as it lasts, and a
+ *   completion is redelivered for as long as its session's lock is held or its
+ *   run notice is owed, and each of those must be retried, never dropped.
+ *   `eventDeliveryHealth` keeps the run of failures for the gauge.
  * - `readEventConsumerBacklog`: the consumer's backlog as the server sees it,
  *   for the gauges that show a stall before a user does.
  */
@@ -78,46 +83,10 @@ export function storableText(s: string): string {
   return storableString(s, { n: 0 });
 }
 
-/**
- * When an event that keeps failing is set aside. All three must hold.
- *
- * - `maxDeliveries`: it has been delivered more than this many times.
- * - `minAgeMs`: it was published at least this long ago. Deliveries alone
- *   are not enough, because a completion that only waits on its session's lock
- *   is redelivered every second; this is the time any one retry loop in the
- *   consumer is given to recover on its own.
- * - `healthyWindowMs`: some other event was stored within this window. This is
- *   what separates a poison event from an outage: when the database or the
- *   tombstone bucket is down, every event fails, nothing else is stored, and
- *   nothing is set aside -- the events wait for the dependency, as before.
- *
- * A field rather than constants so a test can shorten the waits.
- */
-export const eventQuarantinePolicy = {
-  maxDeliveries: 20,
-  minAgeMs: 15 * 60_000,
-  healthyWindowMs: 5 * 60_000,
-};
-
 /** How the consumer's last few deliveries went, in this process. */
 class EventDeliveryHealth {
-  private lastStored: { seq: number | undefined; at: number } | null = null;
   private consecutive = 0;
   private readonly lastError = new Map<number, string>();
-
-  /**
-   * Whether this delivery should be set aside instead of processed. Asked
-   * before processing rather than after a failure, so an event that kills the
-   * process on every attempt is caught too: its next delivery, after the
-   * restart, is set aside once the events behind it are flowing again.
-   */
-  shouldQuarantine(d: { seq?: number; deliveries: number; publishedMs?: number }, now = Date.now()): boolean {
-    const p = eventQuarantinePolicy;
-    if (!(d.deliveries > p.maxDeliveries)) return false;
-    if (d.publishedMs !== undefined && now - d.publishedMs < p.minAgeMs) return false;
-    const last = this.lastStored;
-    return !!last && last.seq !== d.seq && now - last.at <= p.healthyWindowMs;
-  }
 
   /**
    * An event was written to `claw_session_events`: the signal that the
@@ -125,8 +94,7 @@ class EventDeliveryHealth {
    * without one (a streaming preview, a deleted session's) says nothing about
    * whether events can be stored.
    */
-  stored(seq: number | undefined, now = Date.now()): void {
-    this.lastStored = { seq, at: now };
+  stored(): void {
     this.setConsecutive(0);
   }
 
@@ -177,7 +145,6 @@ class EventDeliveryHealth {
 
   /** For tests: forget everything. */
   reset(): void {
-    this.lastStored = null;
     this.lastError.clear();
     this.setConsecutive(0);
   }

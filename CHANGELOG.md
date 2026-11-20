@@ -115,7 +115,7 @@ release version, and its `appVersion` stays `latest`.
 
 - Claw: metrics for the API's event consumer: `claw_api_event_consumer_consecutive_failures` (deliveries this replica
   retried since it last stored or set aside an event), `claw_api_event_quarantined_total{reason}` (`unparseable`,
-  `unstorable`, `retries_exhausted`), `claw_api_event_sanitised_total`, and, read from the server every 30 seconds,
+  `unstorable`), `claw_api_event_sanitised_total` (events stored with a character replaced), and, read from the server every 30 seconds,
   `claw_api_event_consumer_ack_pending`, `claw_api_event_consumer_pending` and
   `claw_api_event_consumer_oldest_pending_age_seconds` (how long the oldest event not yet acknowledged has waited; 0 when
   none is).
@@ -172,12 +172,13 @@ release version, and its `appVersion` stays `latest`.
   UTF-16 surrogate in an event (a tool's output, a model's text) is now replaced with U+FFFD where the event is parsed,
   before anything is written, so the event is stored and a completion carrying one still runs (its turn is written and
   its run is closed) instead of being skipped. The two clean-ups that existed did nothing: they ran over JSON text, where
-  both characters are escapes. An event that keeps failing for another reason is set aside once it has been delivered
-  more than 20 times over at least 15 minutes while other events are being stored: a copy of it, sanitised and with
+  both characters are escapes. An event the database still refuses for its value (SQLSTATE 22P05, 22021, 22P02 or
+  54001) is set aside on its first delivery instead of being retried for ever: a copy of it, sanitised and with
   credential-shaped content masked as a stored event is, goes to the new `claw_event_quarantine` table (deleted with its
-  session), a log line `event-consumer.quarantined` without its content says so, and it is acknowledged. While nothing
-  else is being stored (the database is down) nothing is set aside, and events wait as before. An event that is not JSON
-  is kept there too rather than dropped unrecorded.
+  session), a log line `event-consumer.quarantined` without its content says so, and it is acknowledged. An event that
+  is not JSON is kept there too rather than dropped unrecorded. Nothing else is set aside, however often or however long
+  it has failed: the backlog an outage of the database or the tombstone bucket leaves, and a completion waiting on its
+  session's lock or on its run notification, are retried until they succeed, as before. A completion is never set aside.
 
 - Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its
   own run, the person is now told how it ended, once, in their language. Until now a review under the `fully_auto` mode
