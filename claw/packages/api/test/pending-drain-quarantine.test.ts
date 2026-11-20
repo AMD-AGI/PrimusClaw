@@ -51,6 +51,8 @@
  *   Q18 a notice is not attempted while NATS answers nobody, and one whose
  *       attempt timed out because NATS went away is not charged for it; it is
  *       given, once, when NATS is back
+ *   Q19 a message that failed as many times as the bound allows, but inside
+ *       the window, and then recovers is sent, not refused as spent
  *
  * Skipped without DATABASE_URL, and a skip is not a pass: CI sets it.
  */
@@ -924,6 +926,27 @@ describe("a queued message that cannot be sent", { skip }, () => {
     assert.ok(held.notified_at);
     assert.equal(notices().length, 1);
     assert.equal(notices()[0].message_id, `claw-pending-${slowId}`);
+  });
+
+  test("Q19 a message that fails its bound of times inside the window and then recovers is sent, not refused as spent", async () => {
+    const slowId = await enqueue("the turn that times out for a while");
+    await enqueue("the message behind it");
+    timesOut = (prompt) => prompt.startsWith("the turn that times out");
+
+    await completeRunningTurn();
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (attempt > 1) await sweep();
+      assert.equal((await queue())[0].drain_failures, attempt, "each timeout is counted while the streams answer");
+      await reapUndeliveredRun(slowId);
+    }
+
+    // Failed as often as the bound allows, but the window has not passed.
+    timesOut = () => false;
+    await sweep();
+    assert.deepEqual(prompts(), ["the turn that times out for a while"], "sent once it goes through, in order");
+    assert.deepEqual((await queue()).map((r) => r.content), ["the message behind it"]);
+    assert.equal((await rows("SELECT 1 FROM claw_pending_messages_quarantine")).length, 0, "nothing quarantined");
+    assert.equal(notices().length, 0, "nobody is told a good message was refused");
   });
 
   /**
