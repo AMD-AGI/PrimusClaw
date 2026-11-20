@@ -300,6 +300,34 @@ export function publishCertainlyFailed(err: unknown): boolean {
 }
 
 /**
+ * The NATS client's codes for a request that found nobody to answer it: no
+ * stream responding on the subject (`503`), no reply in time, or no connection
+ * to send it on.
+ */
+const NATS_UNREACHABLE_CODES = new Set([
+  "503", "TIMEOUT", "CONNECTION_REFUSED", "CONNECTION_CLOSED", "CONNECTION_TIMEOUT", "DISCONNECT",
+  "CONNECTION_DRAINING",
+]);
+
+/**
+ * Whether a failure says NATS could not be reached, and nothing about what was
+ * being sent.
+ *
+ * Every queued message on a cluster fails the same way while NATS is away, and
+ * passes again when it is back, so such a failure is no evidence that a
+ * message is the one that cannot be sent (tasks/pending-quarantine.ts). Only
+ * errors from the NATS client itself: a database or application error that
+ * happens to carry one of these codes says nothing about NATS.
+ *
+ * This is not the same question as `publishCertainlyFailed`: a timeout means
+ * NATS did not answer, and says nothing about whether the message was stored.
+ */
+export function natsUnreachable(err: unknown): boolean {
+  const e = err as { name?: unknown; code?: unknown } | null | undefined;
+  return e?.name === "NatsError" && typeof e.code === "string" && NATS_UNREACHABLE_CODES.has(e.code);
+}
+
+/**
  * Follow the fleet's asserted doorbell-semantics floor.
  *
  * Re-read on every delivery rather than cached from the first, and a watch that

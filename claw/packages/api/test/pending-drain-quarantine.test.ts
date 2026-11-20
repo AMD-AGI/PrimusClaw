@@ -35,8 +35,14 @@
  *   Q11 one whose move the database refuses is a counted, retried drain failure
  *   Q12 one sealed under a key this replica does not hold is retried within its
  *       bounds, not quarantined at once, and the replica that holds the key sends it
- *   Q13 a notice still unsent past the retry horizon is given up on, never
- *       published after the event stream has forgotten its ids
+ *   Q13 a notice that may have stored an event is retried up to the horizon,
+ *       and given up on past it, never published after the event stream has
+ *       forgotten its ids; one that never could have is given whenever NATS
+ *       is back, past the horizon and past its attempts
+ *   Q14 a NATS outage longer than both bounds quarantines nothing: every queued
+ *       message waits, and is sent in order once NATS is back
+ *   Q15 a notice attempt that never recorded its outcome is read as one that
+ *       may have stored an event
  *
  * Skipped without DATABASE_URL, and a skip is not a pass: CI sets it.
  */
@@ -55,6 +61,11 @@ const USER = "u-poison";
 const RUNNING_TURN = "m-running";
 /** NATS's default `max_payload`. */
 const MAX_PAYLOAD = 1024 * 1024;
+
+/** An error as the nats.js client raises it: a `NatsError` with the client's code. */
+function natsError(code: "503" | "TIMEOUT"): Error {
+  return Object.assign(new Error(code === "503" ? "503" : "TIMEOUT"), { name: "NatsError", code });
+}
 
 describe("a queued message that cannot be sent", { skip }, () => {
   let h: AdmissionCluster;
@@ -118,7 +129,7 @@ describe("a queued message that cannot be sent", { skip }, () => {
       async publish(_subject: string, payload: string): Promise<number> {
         if (natsDownFor > 0) {
           natsDownFor -= 1;
-          throw Object.assign(new Error("503 no responders"), { code: "503" });
+          throw natsError("503");
         }
         // What the nats.js client does before writing a byte (protocol.js).
         if (Buffer.byteLength(payload) > MAX_PAYLOAD) {
@@ -128,13 +139,13 @@ describe("a queued message that cannot be sent", { skip }, () => {
         return published.length;
       },
       async publishSessionEvent(_sessionId: string, event: Record<string, unknown>, msgId?: string): Promise<void> {
-        if (eventsDown) throw Object.assign(new Error("503 no responders"), { code: "503" });
+        if (eventsDown) throw natsError("503");
         const failure = failNext.get(String(event.type));
         failNext.delete(String(event.type));
-        if (failure === "refused") throw Object.assign(new Error("503 no responders"), { code: "503" });
+        if (failure === "refused") throw natsError("503");
         events.push(event);
         eventIds.push(msgId);
-        if (failure === "lost") throw Object.assign(new Error("TIMEOUT"), { code: "TIMEOUT" });
+        if (failure === "lost") throw natsError("TIMEOUT");
       },
     });
     Object.assign(quarantine.pendingQuarantinePorts, originalQuarantinePorts);
@@ -673,16 +684,33 @@ describe("a queued message that cannot be sent", { skip }, () => {
     assert.equal(notices()[0].failure_reason, "credentials_unreadable");
   });
 
-  /** Quarantine a poison whose notice could not be published, and age the quarantine by `ageSec`. */
-  async function unsentNoticeAged(ageSec: number): Promise<number> {
-    eventsDown = true;
+  /**
+   * Quarantine a poison whose notice could not be published, and age the
+   * quarantine, and the attempt that failed, by `ageSec`. `refused`: NATS said
+   * no stream was there, so nothing was stored. `lost`: the reply reached the
+   * stream and its acknowledgement did not.
+   */
+  async function unsentNoticeAged(ageSec: number, failure: "refused" | "lost"): Promise<number> {
+    if (failure === "refused") eventsDown = true;
+    else failNext.set("AssistantMessage", "lost");
     const poisonId = await quarantinePoison();
     eventsDown = false;
-    const [held] = await rows("SELECT notified_at, notice_events FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
+    failNext.clear();
+    const [held] = await rows(
+      "SELECT notified_at, notice_events, notice_started_at, notice_unsure_since, notice_attempts FROM claw_pending_messages_quarantine WHERE id = $1",
+      [poisonId],
+    );
     assert.equal(held.notified_at, null);
     assert.equal(held.notice_events, 0);
+    assert.equal(held.notice_started_at, null, "the attempt's outcome is recorded");
+    assert.equal(held.notice_attempts, 0);
+    if (failure === "refused") assert.equal(held.notice_unsure_since, null, "a refused publish stored nothing");
+    else assert.ok(held.notice_unsure_since, "an unacknowledged publish may be on the stream");
     await rows(
-      "UPDATE claw_pending_messages_quarantine SET quarantined_at = NOW() - make_interval(secs => $2) WHERE id = $1",
+      `UPDATE claw_pending_messages_quarantine
+          SET quarantined_at = quarantined_at - make_interval(secs => $2),
+              notice_unsure_since = notice_unsure_since - make_interval(secs => $2)
+        WHERE id = $1`,
       [poisonId, ageSec],
     );
     return poisonId;
@@ -694,25 +722,124 @@ describe("a queued message that cannot be sent", { skip }, () => {
       quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC * 1000 <= nats.EVENT_STREAM_DUPLICATE_WINDOW_MS / 2,
       "the horizon leaves half the stream's duplicate window for a slow publish",
     );
-    const poisonId = await unsentNoticeAged(quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC - 30);
+    const poisonId = await unsentNoticeAged(quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC - 30, "lost");
+    events = [];
+    eventIds = [];
     assert.equal(await quarantine.retryQuarantineNotices(), 1);
     assert.equal(notices().length, 1);
     const [held] = await rows("SELECT notified_at FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
     assert.ok(held.notified_at);
   });
 
-  test("Q13b a notice still unsent past the horizon is given up on, never published", async () => {
-    // The event stream may have forgotten the ids an earlier attempt stored
+  test("Q13b a notice that may have stored an event is given up on past the horizon, never published", async () => {
+    // The event stream may have forgotten the ids the earlier attempt stored
     // under, so a retry now could tell the user twice.
-    const poisonId = await unsentNoticeAged(quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC + 30);
+    const poisonId = await unsentNoticeAged(quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC + 30, "lost");
+    events = [];
     assert.equal(await quarantine.retryQuarantineNotices(), 0);
-    assert.equal(notices().length, 0, "nothing is published past the horizon");
-    assert.equal(events.length, 0);
+    assert.equal(events.length, 0, "nothing is published past the horizon");
     const [held] = await rows("SELECT notified_at, notice_attempts FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
     assert.equal(held.notified_at, null);
     assert.equal(held.notice_attempts, 10, "marked given up on, so no later sweep picks it up");
     await rows("UPDATE claw_pending_messages_quarantine SET notice_claimed_at = NULL");
     assert.equal(await quarantine.retryQuarantineNotices(), 0);
     assert.equal(events.length, 0);
+  });
+
+  test("Q13c a notice NATS refused for longer than the horizon and every attempt is given once NATS is back", async () => {
+    const poisonId = await unsentNoticeAged(30, "refused");
+    const quarantinedAt = async () =>
+      (await rows("SELECT notified_at, notice_attempts, notice_unsure_since FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]))[0];
+
+    // NATS stays away: a sweeper retry a minute apart, three times as many as
+    // the attempts a notice is given, reaching well past the horizon.
+    eventsDown = true;
+    for (let i = 0; i < 30; i++) {
+      await rows(
+        `UPDATE claw_pending_messages_quarantine
+            SET quarantined_at = quarantined_at - INTERVAL '61 seconds',
+                notice_claimed_at = notice_claimed_at - INTERVAL '61 seconds'
+          WHERE id = $1`,
+        [poisonId],
+      );
+      assert.equal(await quarantine.retryQuarantineNotices(), 0);
+    }
+    let held = await quarantinedAt();
+    assert.equal(held.notified_at, null);
+    assert.equal(held.notice_unsure_since, null, "no attempt stored anything");
+    assert.ok(held.notice_attempts < 10, "a refused attempt is not one of the notice's attempts");
+    const [age] = await rows("SELECT EXTRACT(EPOCH FROM NOW() - quarantined_at)::int AS sec FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
+    assert.ok(age.sec > quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC, "past the horizon");
+    assert.equal(events.length, 0);
+
+    // NATS is back: the user is told, once.
+    eventsDown = false;
+    await rows("UPDATE claw_pending_messages_quarantine SET notice_claimed_at = notice_claimed_at - INTERVAL '61 seconds' WHERE id = $1", [poisonId]);
+    assert.equal(await quarantine.retryQuarantineNotices(), 1);
+    held = await quarantinedAt();
+    assert.ok(held.notified_at);
+    assert.equal(notices().length, 1);
+    assert.equal(notices()[0].message_id, `claw-pending-${poisonId}`);
+    const stored = await storedEvents(`claw-pending-${poisonId}`);
+    assert.equal(stored.AssistantMessage, 1, "the user is told once");
+    assert.equal(stored.exec_complete, 1);
+  });
+
+  test("Q14 a NATS outage longer than both bounds quarantines nothing, and the queue is sent in order once it is back", async () => {
+    const firstId = await enqueue("first queued");
+    await enqueue("second queued");
+    natsDownFor = Number.MAX_SAFE_INTEGER;
+
+    // Twice the attempts, and past the window: what a twenty-minute outage
+    // looks like to the queue's head.
+    const delivered = await completeRunningTurn();
+    assert.equal(delivered.naks, 1, "a failed drain still asks for a retry");
+    for (let i = 0; i < 5; i++) await sweep();
+    await windowPasses(firstId);
+    for (let i = 0; i < 5; i++) await sweep();
+    const q = await queue();
+    assert.deepEqual(q.map((r) => r.content), ["first queued", "second queued"], "nothing left the queue");
+    assert.equal(q[0].drain_failures, 0, "an unreachable NATS is not counted against the message");
+    assert.match(q[0].drain_last_error, /NatsError:503/, "but is recorded on it");
+    assert.equal((await rows("SELECT 1 FROM claw_pending_messages_quarantine")).length, 0);
+    assert.equal(events.length, 0, "nobody is told a good message was refused");
+    assert.equal(published.length, 0);
+
+    // NATS is back: the head is sent, first.
+    natsDownFor = 0;
+    await sweep();
+    assert.deepEqual(prompts(), ["first queued"]);
+    assert.deepEqual((await queue()).map((r) => r.content), ["second queued"]);
+  });
+
+  test("Q15 a notice attempt that never recorded its outcome may have stored an event", async () => {
+    // The attempt's replica died between its publish and the record of it.
+    const poisonId = await unsentNoticeAged(30, "refused");
+    await rows(
+      `UPDATE claw_pending_messages_quarantine
+          SET notice_started_at = NOW() - INTERVAL '2 minutes', notice_claimed_at = NOW() - INTERVAL '2 minutes'
+        WHERE id = $1`,
+      [poisonId],
+    );
+    eventsDown = true;
+    assert.equal(await quarantine.retryQuarantineNotices(), 0);
+    let [held] = await rows("SELECT notice_unsure_since, notice_attempts FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
+    assert.ok(held.notice_unsure_since, "the unrecorded attempt is taken as one that may have stored an event");
+    assert.equal(held.notice_attempts, 0, "this attempt itself was refused, and is not counted");
+
+    // So the horizon applies from that attempt, and past it the notice is given up on.
+    eventsDown = false;
+    await rows(
+      `UPDATE claw_pending_messages_quarantine
+          SET notice_unsure_since = notice_unsure_since - make_interval(secs => $2),
+              notice_claimed_at = notice_claimed_at - INTERVAL '2 minutes'
+        WHERE id = $1`,
+      [poisonId, quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC],
+    );
+    assert.equal(await quarantine.retryQuarantineNotices(), 0);
+    assert.equal(events.length, 0);
+    [held] = await rows("SELECT notified_at, notice_attempts FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
+    assert.equal(held.notified_at, null);
+    assert.equal(held.notice_attempts, 10);
   });
 });

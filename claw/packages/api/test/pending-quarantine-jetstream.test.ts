@@ -23,6 +23,10 @@
  *      notice retry horizon
  *   J2 a notice event stored without an acknowledgement and retried after the
  *      server's default window is stored once
+ *   J3 with the streams unavailable for longer than every bound -- the drain's
+ *      count and window, the notice's attempts and its horizon -- a good queued
+ *      message is not quarantined and is sent once they are back, and the
+ *      poison's notice is given, once, then too
  *
  * Skipped without DATABASE_URL and CLAW_CHAOS_NATS_SERVER, and a skip is not a
  * pass: the rolling-restart CI job sets both and checks the pass count.
@@ -181,5 +185,113 @@ describe("a quarantine notice against JetStream", { skip }, () => {
     }
     assert.deepEqual(stored, { AssistantMessage: 1, ResultMessage: 1, exec_complete: 1 },
       "the user is told once");
+  });
+
+  test("J3 streams unavailable past every bound: the good message waits and is sent, the poison's notice is given once", async () => {
+    const session = "s-jetstream-outage";
+    const running = "m-outage-running";
+    await rows(
+      `INSERT INTO claw_sessions (session_id, user_id, agent_status, agent_gate_message_id) VALUES ($1, $2, 'running', $3)`,
+      [session, USER, running],
+    );
+    await rows(
+      `INSERT INTO claw_tasks (task_id, session_id, name, status, origin, executor, metadata, input, prompt, queued_at, started_at)
+       VALUES ('run-outage', $1, 'chat', 'running', 'chat', 'brain', $2::jsonb, '{}'::jsonb, 'first', NOW(), NOW())`,
+      [session, JSON.stringify({ message_id: running, user_id: USER, dispatch: "fat" })],
+    );
+    const submit = await import("../src/sessions/submit-message.js");
+    const secrets = await import("../src/tasks/run-secrets.js");
+    const consumer = await import("../src/events/consumer.js");
+    const sweeper = await import("../src/tasks/sweeper.js");
+    const enqueue = async (content: string) => (await submit.insertPendingMessage(h.app.db.db, {
+      sessionId: session, content, userId: USER, toolIds: [],
+      secrets: secrets.pendingSecretColumns({ llmKey: "vk", platformKey: "pk", userEnv: {}, doorbell: false }),
+      sessionEnv: {},
+    })).id!;
+    const poisonId = await enqueue("p".repeat(probe.info!.max_payload + 10));
+    const goodId = await enqueue("the message behind it");
+    const poisonMessage = `claw-pending-${poisonId}`;
+    const goodMessage = `claw-pending-${goodId}`;
+
+    // JetStream stops answering for both streams the API publishes to: what a
+    // lost stream leader looks like to a client, a 503 from the real server.
+    const jsm = await probe.jetstreamManager();
+    const configs = await Promise.all([nats.EVENT_STREAM, nats.TASK_STREAM].map(async (n) => (await jsm.streams.info(n)).config));
+    for (const c of configs) await jsm.streams.delete(c.name);
+    const refusal = await nats.js.publish(`events.${session}`, nats.sc.encode("{}")).then(() => null, (e) => e);
+    assert.ok(nats.natsUnreachable(refusal) && nats.publishCertainlyFailed(refusal),
+      `the real client's refusal is the one the code classifies: ${refusal?.name}:${refusal?.code}`);
+
+    await consumer.consumeEventDelivery({
+      subject: `events.${session}`,
+      data: nats.sc.encode(JSON.stringify({
+        type: "exec_complete", session_id: session, task_id: "run-outage", user_id: USER,
+        message_id: running, prompt: "first", final_text: "done", failed: false, error_count: 0, skills_used: {},
+      })),
+      seq: 100,
+      ack: () => {},
+      nak: () => {},
+    });
+    await sweeper.drainOrphanedPendingMessages();
+    let [held] = await rows("SELECT notified_at, notice_events, notice_unsure_since FROM claw_pending_messages_quarantine WHERE id = $1", [poisonId]);
+    assert.ok(held, "the poison was quarantined by the real drain");
+    assert.equal(held.notified_at, null, "its notice could not be published");
+    assert.equal(held.notice_unsure_since, null, "and stored nothing");
+
+    // Twenty minutes and more of it, compressed: the drain's sweeps, and the
+    // notice's retries a minute apart, past its attempts and its horizon.
+    for (let i = 0; i < 40; i++) {
+      await rows(
+        `UPDATE claw_pending_messages_quarantine
+            SET quarantined_at = quarantined_at - INTERVAL '61 seconds',
+                notice_claimed_at = notice_claimed_at - INTERVAL '61 seconds'
+          WHERE id = $1`,
+        [poisonId],
+      );
+      await rows(
+        "UPDATE claw_pending_messages SET drain_first_failed_at = drain_first_failed_at - INTERVAL '61 seconds' WHERE id = $1",
+        [goodId],
+      );
+      await sweeper.drainOrphanedPendingMessages();
+      assert.equal(await quarantine.retryQuarantineNotices(), 0);
+    }
+    const [queued] = await rows("SELECT drain_failures, drain_last_error FROM claw_pending_messages WHERE id = $1", [goodId]);
+    assert.ok(queued, "the good message is still queued, not quarantined");
+    assert.equal(queued.drain_failures, 0);
+    assert.match(queued.drain_last_error, /NatsError:503/);
+    assert.equal((await rows("SELECT 1 FROM claw_pending_messages_quarantine WHERE id = $1", [goodId])).length, 0);
+    [held] = await rows(
+      "SELECT notified_at, notice_attempts, EXTRACT(EPOCH FROM NOW() - quarantined_at)::int AS age FROM claw_pending_messages_quarantine WHERE id = $1",
+      [poisonId],
+    );
+    assert.equal(held.notified_at, null);
+    assert.ok(held.age > quarantine.QUARANTINE_NOTICE_RETRY_HORIZON_SEC, "past the horizon");
+    assert.ok(held.notice_attempts < 10, "and the refused attempts did not use up the notice's");
+
+    // The streams are back.
+    for (const c of configs) await jsm.streams.add(c);
+    await rows("UPDATE claw_pending_messages_quarantine SET notice_claimed_at = notice_claimed_at - INTERVAL '61 seconds' WHERE id = $1", [poisonId]);
+    assert.equal(await quarantine.retryQuarantineNotices(), 1, "the user is told");
+    await sweeper.drainOrphanedPendingMessages();
+    assert.equal((await rows("SELECT 1 FROM claw_pending_messages WHERE session_id = $1", [session])).length, 0,
+      "and the good message is sent");
+
+    // What the streams hold, read back from the server.
+    const stored: Record<string, number> = {};
+    const tasks: string[] = [];
+    for (const name of [nats.EVENT_STREAM, nats.TASK_STREAM]) {
+      const state = (await jsm.streams.info(name)).state;
+      for (let seq = state.first_seq; seq <= state.last_seq && state.messages > 0; seq++) {
+        const m = await jsm.streams.getMessage(name, { seq }).catch(() => null);
+        if (!m) continue;
+        const body = m.json<Record<string, unknown>>();
+        if (name === nats.EVENT_STREAM && body.message_id === poisonMessage) {
+          stored[String(body.type)] = (stored[String(body.type)] ?? 0) + 1;
+        }
+        if (name === nats.TASK_STREAM && body.session_id === session) tasks.push(String(body.message_id));
+      }
+    }
+    assert.deepEqual(stored, { AssistantMessage: 1, ResultMessage: 1, exec_complete: 1 }, "the notice, once");
+    assert.deepEqual(tasks, [goodMessage], "the good message, once");
   });
 });

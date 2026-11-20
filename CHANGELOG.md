@@ -168,9 +168,13 @@ release version, and its `appVersion` stays `latest`.
   failed attempt is now counted on the queued row, and a message that has failed `PENDING_DRAIN_MAX_FAILURES` times
   (default 5) over at least `PENDING_DRAIN_FAILURE_WINDOW_SEC` (default 600) is moved to the new
   `claw_pending_messages_quarantine` table, with its text, sender and last error, and the next message is sent at once.
-  The session is told once, in the turn the message would have been, that it was not sent and can be sent again; a
-  notice that cannot be published then is retried by the sweeper for up to 30 minutes, and given up on (logged as
-  `pending.quarantine_notice_abandoned`) after that. Each event of the notice is published under a stable id, and the
+  A failed attempt that only says NATS could not be reached (a `503`, a timeout, a lost connection) is not counted, so
+  a NATS outage of any length quarantines nothing: the queue waits and is sent in order once NATS is back. The session
+  is told once, in the turn the message would have been, that it was not sent and can be sent again; a notice that
+  cannot be published then is retried by the sweeper. An attempt NATS refused stored nothing, so it does not use up
+  the notice's attempts and the notice is retried until NATS is back; only once an attempt may have stored an event
+  without its acknowledgement is the notice retried for at most 30 minutes from that attempt, and given up on (logged
+  as `pending.quarantine_notice_abandoned`) after that. Each event of the notice is published under a stable id, and the
   event stream's duplicate window is widened at start-up from the server's default of two minutes to one hour, so a
   retry after a publish whose acknowledgement was lost does not show the user the notice twice. A message whose run may
   still be delivered is never moved. A queued message whose sealed credentials are too short to be sealed, or open to

@@ -35,7 +35,7 @@ import pino from "pino";
 import { envInt } from "../config.js";
 import { db, PENDING_QUARANTINE_TABLE } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
-import { EVENT_STREAM_DUPLICATE_WINDOW_MS } from "../infra/nats.js";
+import { EVENT_STREAM_DUPLICATE_WINDOW_MS, natsUnreachable, publishCertainlyFailed } from "../infra/nats.js";
 import { completionAlreadyPublished } from "../events/store.js";
 import { queuedMessageId } from "./chat-run.js";
 import { PENDING_DRAIN_QUARANTINED, publishRefusedTurn } from "./pending-dispatch.js";
@@ -53,24 +53,35 @@ export const PENDING_DRAIN_MAX_FAILURES = envInt("PENDING_DRAIN_MAX_FAILURES", 5
  */
 export const PENDING_DRAIN_FAILURE_WINDOW_SEC = envInt("PENDING_DRAIN_FAILURE_WINDOW_SEC", 600, { min: 0 });
 
-/** Attempts at telling the session, after the first, before the notice is given up on. */
+/**
+ * Attempts at telling the session, after the first, before the notice is given
+ * up on. An attempt NATS refused because no stream answered is not one of
+ * them: it stored nothing and says nothing about the notice, so a notice
+ * outlasts a NATS outage of any length and is given once NATS is back.
+ */
 const NOTICE_MAX_ATTEMPTS = 10;
 
 /** How long a claimed notice is left to the replica that claimed it. */
 const NOTICE_CLAIM_SEC = 60;
 
 /**
- * How long after its quarantine a notice may still be published: half the
- * event stream's duplicate window.
+ * How long a notice may still be retried once an attempt at it may have stored
+ * an event it did not record: half the event stream's duplicate window.
  *
  * Each event of a notice goes out under a stable id, and a retry is safe only
  * while the stream still remembers the copy an earlier attempt may have stored
  * without being acknowledged; past the window the same id is stored again and
- * the user is told twice. Every copy is published at or after `quarantined_at`,
- * so a retry that starts within this horizon reaches the stream well inside the
- * window of any earlier copy, with the other half left for a slow publish. The
- * ten attempts a minute apart fit inside it; a notice still unsent past it is
- * given up on rather than risk the second copy.
+ * the user is told twice. Every such copy is published at or after the start
+ * of the attempt that sent it (`notice_unsure_since`), so a retry that starts
+ * within this horizon of it reaches the stream well inside the window of that
+ * copy, with the other half left for a slow publish. The ten attempts a minute
+ * apart fit inside it; a notice still unsent past it is given up on rather than
+ * risk the second copy.
+ *
+ * A notice no attempt could have stored anything of -- every failure certain,
+ * a refused publish or a failure before the first publish -- has no copy for a
+ * late retry to repeat, so the horizon does not apply to it: it is retried
+ * until it is given, however long NATS is away.
  */
 export const QUARANTINE_NOTICE_RETRY_HORIZON_SEC = Math.floor(EVENT_STREAM_DUPLICATE_WINDOW_MS / 2_000);
 
@@ -128,6 +139,22 @@ export async function recordPendingDrainFailure(
 ): Promise<"quarantined" | "retry"> {
   metrics.onPendingDrainFailure();
   const error = drainErrorSummary(err, row.content);
+  if (natsUnreachable(err)) {
+    // Not counted. While NATS is away every queued message fails this way and
+    // every one is sent once it is back, so the failure says nothing about this
+    // message; counted, a NATS outage longer than the window would quarantine
+    // good messages that the queue used to hold and send. The error is still
+    // recorded on the row, for whoever is looking at a stalled queue.
+    await db.query(
+      "UPDATE claw_pending_messages SET drain_last_error = $2 WHERE id = $1",
+      [row.pendingId, error],
+    ).catch(() => {});
+    logger.warn(
+      { sessionId: row.sessionId, pendingId: row.pendingId, error },
+      "pending.drain_failed_nats_unreachable",
+    );
+    return "retry";
+  }
   let counted: { drain_failures: number; window_spent: boolean } | undefined;
   try {
     counted = (await db.query(
@@ -254,13 +281,20 @@ async function afterQuarantine(
     },
     "pending.drain_quarantined",
   );
-  await noticeQuarantined({
+  const quarantined: QuarantinedRow = {
     id: row.pendingId, session_id: row.sessionId, user_id: row.userId, message_id: messageId,
     content: row.content, notice_events: 0, failure_reason: failureReason,
-  });
+  };
+  await settleNoticeAttempt(quarantined, moved.notice_started_at, await noticeQuarantined(quarantined));
 }
 
-type MovedRow = { attempts: number; last_error: string | null; queued_for_sec: number };
+type MovedRow = {
+  attempts: number;
+  last_error: string | null;
+  queued_for_sec: number;
+  /** The first notice attempt, begun by the move itself: its token for `settleNoticeAttempt`. */
+  notice_started_at: string;
+};
 
 /**
  * The move itself: one statement, so the row is in exactly one of the two tables.
@@ -288,12 +322,13 @@ async function moveToQuarantine(
      )
      INSERT INTO ${PENDING_QUARANTINE_TABLE}
        (id, session_id, user_id, message_id, content, queued_at, first_failed_at, attempts, last_error,
-        failure_reason)
+        failure_reason, notice_started_at)
      SELECT id, session_id, user_id, $2, content, created_at, COALESCE(drain_first_failed_at, NOW()),
-            drain_failures + $3, COALESCE($4, drain_last_error), $5
+            drain_failures + $3, COALESCE($4, drain_last_error), $5, NOW()
        FROM moved
      ON CONFLICT (id) DO NOTHING
-     RETURNING id, attempts, last_error, EXTRACT(EPOCH FROM (NOW() - queued_at))::int AS queued_for_sec`,
+     RETURNING id, attempts, last_error, EXTRACT(EPOCH FROM (NOW() - queued_at))::int AS queued_for_sec,
+               notice_started_at::text AS notice_started_at`,
     [pendingId, messageId, immediate ? 1 : 0, immediate?.error ?? null, failureReason],
   )).rows[0] as MovedRow | undefined;
 }
@@ -311,6 +346,17 @@ interface QuarantinedRow {
 }
 
 /**
+ * How a notice attempt ended.
+ *
+ * `sent`: the session has been told. `refused`: NATS answered that no stream
+ * is there to take it, so nothing of this attempt was stored. `certain`: it
+ * failed, and nothing it may have stored is missing from `notice_events`.
+ * `unsure`: an event of it may be on the stream without being recorded, so a
+ * retry is safe only inside the stream's duplicate window.
+ */
+type NoticeOutcome = "sent" | "refused" | "certain" | "unsure";
+
+/**
  * Tell the session its message was not sent: the turn the message would have
  * been, ended the way a refused queued turn ends (`publishRefusedTurn`), so the
  * user sees their message and the reply that says it can be sent again.
@@ -320,18 +366,24 @@ interface QuarantinedRow {
  * goes (`notice_events`) and a retry publishes only the ones still missing,
  * each under a stable id the event stream deduplicates on, for the publish
  * that went out but was not recorded. The stream remembers an id only for its
- * duplicate window, so retries stop at `QUARANTINE_NOTICE_RETRY_HORIZON_SEC`,
- * well inside it. A completion already recorded for this
- * message id is a notice already given -- by an earlier attempt whose stamp
- * below was lost -- and is stamped rather than sent again. A notice that cannot
- * be published now is left unstamped for `retryQuarantineNotices`.
+ * duplicate window, so once an attempt may have left such a copy, retries stop
+ * at `QUARANTINE_NOTICE_RETRY_HORIZON_SEC` after it, well inside the window. A
+ * completion already recorded for this message id is a notice already given --
+ * by an earlier attempt whose stamp below was lost -- and is stamped rather
+ * than sent again. A notice that cannot be published now is left unstamped for
+ * `retryQuarantineNotices`.
  */
-async function noticeQuarantined(row: QuarantinedRow): Promise<boolean> {
+async function noticeQuarantined(row: QuarantinedRow): Promise<NoticeOutcome> {
+  // Where the attempt is when it fails. Before the first publish and after the
+  // last record nothing unrecorded can be on the stream; a publish the server
+  // certainly refused stored nothing; anything else may have.
+  let stage: "before" | "publishing" | "recording" | "stamping" = "before";
   try {
     if (!await completionAlreadyPublished(row.session_id, row.message_id)) {
       const prompt = row.content.length > NOTICE_PROMPT_MAX_CHARS
         ? `${row.content.slice(0, NOTICE_PROMPT_MAX_CHARS)}\n[...]`
         : row.content;
+      stage = "publishing";
       await pendingQuarantinePorts.publishRefusedTurn({
         sessionId: row.session_id,
         pendingId: row.id,
@@ -343,39 +395,82 @@ async function noticeQuarantined(row: QuarantinedRow): Promise<boolean> {
         published: Number(row.notice_events ?? 0),
         dedupeKey: `${PENDING_QUARANTINE_TABLE}:${row.id}`,
         async record(count: number): Promise<void> {
+          stage = "recording";
           await db.query(
             `UPDATE ${PENDING_QUARANTINE_TABLE} SET notice_events = GREATEST(notice_events, $2) WHERE id = $1`,
             [row.id, count],
           );
+          stage = "publishing";
         },
       });
     }
+    stage = "stamping";
     await db.query(
       `UPDATE ${PENDING_QUARANTINE_TABLE} SET notified_at = NOW() WHERE id = $1 AND notified_at IS NULL`,
       [row.id],
     );
-    return true;
+    return "sent";
   } catch (err) {
+    const outcome: NoticeOutcome = stage === "before" || stage === "stamping"
+      ? "certain"
+      : stage === "publishing" && publishCertainlyFailed(err)
+        ? (natsUnreachable(err) ? "refused" : "certain")
+        : "unsure";
     logger.warn(
-      { err: String(err), sessionId: row.session_id, pendingId: row.id },
+      { err: String(err), sessionId: row.session_id, pendingId: row.id, outcome },
       "pending.quarantine_notice_failed",
     );
-    return false;
+    return outcome;
+  }
+}
+
+/**
+ * Record how a notice attempt ended, on the attempt it was: a replica that took
+ * the notice over while this attempt was slow has begun its own, and this one's
+ * outcome is no longer the row's to record.
+ *
+ * An attempt whose outcome is never recorded here -- its replica died, or this
+ * statement failed -- is read by the next claim as one that may have stored an
+ * event (`notice_started_at` is still set), which is the safe reading.
+ */
+async function settleNoticeAttempt(row: QuarantinedRow, startedAt: string, outcome: NoticeOutcome): Promise<void> {
+  try {
+    await db.query(
+      `UPDATE ${PENDING_QUARANTINE_TABLE}
+          SET notice_started_at = NULL,
+              notice_attempts = CASE WHEN $3 = 'refused' THEN GREATEST(notice_attempts - 1, 0)
+                                     ELSE notice_attempts END,
+              notice_unsure_since = CASE WHEN $3 = 'unsure'
+                                         THEN COALESCE(notice_unsure_since, notice_started_at)
+                                         ELSE notice_unsure_since END
+        WHERE id = $1 AND notice_started_at = $2::timestamptz`,
+      [row.id, startedAt, outcome],
+    );
+  } catch (err) {
+    logger.warn(
+      { err: String(err), sessionId: row.session_id, pendingId: row.id, outcome },
+      "pending.quarantine_notice_unsettled",
+    );
   }
 }
 
 /**
  * Give the notices that could not be published when their message was
- * quarantined another try, a bounded number of times.
+ * quarantined another try.
  *
- * Only within `QUARANTINE_NOTICE_RETRY_HORIZON_SEC` of the quarantine, the span
- * the event stream's duplicate window covers; a notice older than that is
- * marked given up on and logged, never published.
+ * A bounded number of times, not counting attempts NATS refused outright; and,
+ * once an attempt may have stored an event it did not record, only within
+ * `QUARANTINE_NOTICE_RETRY_HORIZON_SEC` of that attempt, the span the event
+ * stream's duplicate window covers. A notice past either bound is marked given
+ * up on and logged, never published. A notice no attempt could have stored
+ * anything of is retried for as long as it takes.
  *
  * Every replica's sweeper runs this, so a notice is claimed before it is sent:
  * the claim is a time on the row that keeps the others off it for a minute,
  * and the completion check in `noticeQuarantined` covers the replica whose
- * stamp was lost after its publish went out.
+ * stamp was lost after its publish went out. A claim that finds an earlier
+ * attempt still marked as started -- its replica died, or its outcome was never
+ * recorded -- takes that attempt as one that may have stored an event.
  */
 export async function retryQuarantineNotices(limit = 20): Promise<number> {
   // Past the horizon a retry could store a second copy of an event the stream
@@ -385,9 +480,10 @@ export async function retryQuarantineNotices(limit = 20): Promise<number> {
         SET notice_attempts = GREATEST(notice_attempts, $1)
       WHERE notified_at IS NULL
         AND notice_attempts < $1
-        AND quarantined_at <= NOW() - make_interval(secs => $2)
+        AND COALESCE(notice_claimed_at, quarantined_at) <= NOW() - make_interval(secs => $3)
+        AND COALESCE(notice_unsure_since, notice_started_at) <= NOW() - make_interval(secs => $2)
       RETURNING id, session_id, notice_attempts, notice_events`,
-    [NOTICE_MAX_ATTEMPTS, QUARANTINE_NOTICE_RETRY_HORIZON_SEC],
+    [NOTICE_MAX_ATTEMPTS, QUARANTINE_NOTICE_RETRY_HORIZON_SEC, NOTICE_CLAIM_SEC],
   )).rows as Array<{ id: number; session_id: string; notice_attempts: number; notice_events: number }>;
   for (const row of expired) {
     logger.error(
@@ -400,24 +496,28 @@ export async function retryQuarantineNotices(limit = 20): Promise<number> {
   }
   const claimed = (await db.query(
     `UPDATE ${PENDING_QUARANTINE_TABLE} q
-        SET notice_attempts = notice_attempts + 1, notice_claimed_at = NOW()
+        SET notice_attempts = notice_attempts + 1, notice_claimed_at = NOW(),
+            notice_unsure_since = COALESCE(notice_unsure_since, notice_started_at),
+            notice_started_at = NOW()
       WHERE q.id IN (
         SELECT id FROM ${PENDING_QUARANTINE_TABLE}
          WHERE notified_at IS NULL
            AND notice_attempts < $1
            AND COALESCE(notice_claimed_at, quarantined_at) <= NOW() - make_interval(secs => $2)
-           AND quarantined_at > NOW() - make_interval(secs => $4)
+           AND COALESCE(notice_unsure_since, notice_started_at, NOW()) > NOW() - make_interval(secs => $4)
          ORDER BY quarantined_at
          LIMIT $3
          FOR UPDATE SKIP LOCKED)
       RETURNING q.id, q.session_id, q.user_id, q.message_id, q.content, q.notice_attempts,
-                q.notice_events, q.failure_reason`,
+                q.notice_events, q.failure_reason, q.notice_started_at::text AS notice_started_at`,
     [NOTICE_MAX_ATTEMPTS, NOTICE_CLAIM_SEC, limit, QUARANTINE_NOTICE_RETRY_HORIZON_SEC],
-  )).rows as Array<QuarantinedRow & { notice_attempts: number }>;
+  )).rows as Array<QuarantinedRow & { notice_attempts: number; notice_started_at: string }>;
   let sent = 0;
   for (const row of claimed) {
-    if (await noticeQuarantined(row)) sent += 1;
-    else if (row.notice_attempts >= NOTICE_MAX_ATTEMPTS) {
+    const outcome = await noticeQuarantined(row);
+    await settleNoticeAttempt(row, row.notice_started_at, outcome);
+    if (outcome === "sent") sent += 1;
+    else if (outcome !== "refused" && row.notice_attempts >= NOTICE_MAX_ATTEMPTS) {
       logger.error(
         { sessionId: row.session_id, pendingId: row.id, attempts: row.notice_attempts },
         "pending.quarantine_notice_abandoned",

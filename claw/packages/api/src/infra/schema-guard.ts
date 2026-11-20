@@ -163,6 +163,9 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       // Absent, a notice retried after a partial publish repeats what was
       // already sent.
       "notice_events", "failure_reason",
+      // Absent, a notice cannot tell an attempt that may have stored an event
+      // from one NATS refused, and is given up on during a long NATS outage.
+      "notice_started_at", "notice_unsure_since",
     ],
   },
   {

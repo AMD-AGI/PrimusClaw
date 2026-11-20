@@ -712,6 +712,12 @@ export function pendingQuarantineSchemaSql(): string[] {
     // notice is, so a retry says what the first attempt would have said.
     `ALTER TABLE ${PENDING_QUARANTINE_TABLE} ADD COLUMN IF NOT EXISTS notice_events INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE ${PENDING_QUARANTINE_TABLE} ADD COLUMN IF NOT EXISTS failure_reason TEXT`,
+    // When the notice attempt under way began, and when the first attempt that
+    // may have stored an event without recording it began: a notice that has
+    // no such attempt is retried for as long as NATS is away, one that has is
+    // retried only while the event stream still remembers that copy.
+    `ALTER TABLE ${PENDING_QUARANTINE_TABLE} ADD COLUMN IF NOT EXISTS notice_started_at TIMESTAMPTZ`,
+    `ALTER TABLE ${PENDING_QUARANTINE_TABLE} ADD COLUMN IF NOT EXISTS notice_unsure_since TIMESTAMPTZ`,
     `CREATE INDEX IF NOT EXISTS idx_pending_quarantine_session
        ON ${PENDING_QUARANTINE_TABLE}(session_id)`,
   ];
