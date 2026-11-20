@@ -42,9 +42,11 @@ export function storableJson<T>(value: T): T {
   if (typeof value === "string") return storableText(value) as T;
   if (Array.isArray(value)) return value.map((v) => storableJson(v)) as T;
   if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[storableText(k)] = storableJson(v);
-    return out as T;
+    // `fromEntries` defines each key as an own property, so a key named
+    // `__proto__` stays data and cannot reach the new object's prototype.
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [storableText(k), storableJson(v)]),
+    ) as T;
   }
   return value;
 }

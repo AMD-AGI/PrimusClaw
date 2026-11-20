@@ -39,3 +39,11 @@ test("only strings are touched, and every string in a JSON value is", () => {
   const json = JSON.stringify(storableJson({ v: "\uDC00\u0000" }));
   assert.ok(!/\\u0000|\\udc00/i.test(json), "no escape jsonb refuses survives the round trip");
 });
+
+test("a key named __proto__ stays a key and reaches nothing else", () => {
+  const parsed = JSON.parse('{"__proto__": {"polluted": "a\\u0000"}, "ok": 1}') as Record<string, unknown>;
+  const out = storableJson(parsed) as Record<string, unknown>;
+  assert.equal(Object.getPrototypeOf(out), Object.prototype);
+  assert.equal(({} as Record<string, unknown>).polluted, undefined);
+  assert.equal(JSON.stringify(out), '{"__proto__":{"polluted":"a\uFFFD"},"ok":1}');
+});
