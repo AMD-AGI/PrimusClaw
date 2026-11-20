@@ -258,8 +258,8 @@ export async function runContract(): Promise<ContractRecord> {
     await app.register(cookie);
     app.addHook("preHandler", authMiddleware);
     await registerMeRoutes(app);
-    // A file-download path, so the download-URL key is accepted, that answers with the request user.
-    app.get("/v1/sessions/:id/files/*", async (req) => getUser(req));
+    // A file-download path, so the download-URL key is accepted, that answers with the request user as JSON.
+    app.get("/v1/sessions/:id/files/*", async (req, reply) => reply.type("application/json").send(JSON.stringify(getUser(req))));
     await app.ready();
 
     const verifyBodies = (from: number) => safe.seen.slice(from)
