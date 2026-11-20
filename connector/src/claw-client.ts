@@ -14,8 +14,12 @@ export class RevokedError extends Error {
 }
 /** The server answered, with a status that is not a success. */
 export class HttpError extends Error {
-  constructor(readonly status: number, readonly code: string, readonly path: string) {
-    super(`${path} answered ${status} ${code}`);
+  /**
+   * `sqlState`: the PostgreSQL SQLSTATE an answer of 500 carried in `code` (the API's default error body does, when the error came
+   * from the database), kept only when it is one: five digits or capitals, never a message.
+   */
+  constructor(readonly status: number, readonly code: string, readonly path: string, readonly sqlState?: string) {
+    super(`${path} answered ${status} ${code}${sqlState ? ` (${sqlState})` : ""}`);
   }
 }
 /** The network failed or the stream went silent. */
@@ -73,7 +77,7 @@ export class ClawClient {
         throw new TransportError(`${method} ${path}: ${errMessage(e)}`);
       }
       if (res.status !== 401) return res;
-      const err = await errorCode(res);
+      const { error: err } = await errorBody(res);
       if (err === "revoked") throw new RevokedError();
       // Maybe the access token simply expired: get a fresh one once.
       if (attempt === 0) { this.o.tokens.invalidate(); continue; }
@@ -83,7 +87,7 @@ export class ClawClient {
 
   private async json(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const res = await this.send(method, path, body, signal);
-    if (!res.ok) throw new HttpError(res.status, await errorCode(res), path);
+    if (!res.ok) throw await httpError(res, path);
     const parsed: unknown = await res.json().catch(() => null);
     return isObject(parsed) && isObject(parsed.data) ? parsed.data : {};
   }
@@ -167,12 +171,12 @@ export class ClawClient {
         throw new TransportError(timedOut ? `no response for ${opts.watchdogMs} ms` : `GET ${path}: ${errMessage(e)}`);
       }
       if (res.status === 401) {
-        const err = await errorCode(res);
+        const { error: err } = await errorBody(res);
         if (err === "revoked") throw new RevokedError();
         this.o.tokens.invalidate();
         throw new HttpError(401, err, path);
       }
-      if (!res.ok || !res.body) throw new HttpError(res.status, await errorCode(res), path);
+      if (!res.ok || !res.body) throw await httpError(res, path);
       try {
         for await (const frame of readSse(res.body, arm)) yield frame;
       } catch (e) {
@@ -187,7 +191,19 @@ export class ClawClient {
   }
 }
 
-async function errorCode(res: Response): Promise<string> {
+/** An answer that is not OK as an {@link HttpError}. */
+async function httpError(res: Response, path: string): Promise<HttpError> {
+  const { error, sqlState } = await errorBody(res);
+  return new HttpError(res.status, error, path, sqlState);
+}
+
+/**
+ * What an error answer says: Claw's `error` (`http_<status>` when it has none), and the SQLSTATE in `code` when there is one there
+ * (a 500 the database caused, in the API's default error body).
+ */
+async function errorBody(res: Response): Promise<{ error: string; sqlState?: string }> {
   const body: unknown = await res.json().catch(() => null);
-  return isObject(body) && typeof body.error === "string" ? body.error : `http_${res.status}`;
+  const error = isObject(body) && typeof body.error === "string" ? body.error : `http_${res.status}`;
+  const code = isObject(body) ? body.code : undefined;
+  return typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? { error, sqlState: code } : { error };
 }

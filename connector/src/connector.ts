@@ -22,14 +22,15 @@ import { recordDisconnect } from "./health.js";
 import { resolveCwd } from "./roots.js";
 import { SnapshotFile, STATE_WRITE_WAIT_MS, within, writeWhole, type WriteReport } from "./statefile.js";
 import { SessionManager, type Command } from "./manager.js";
-import { Outbox } from "./outbox.js";
+import { Outbox, type OutEvent } from "./outbox.js";
+import { failureKind, PoisonFinder } from "./poison.js";
 import { ApprovalBroker, type HookAgent, serveApprovals } from "./approvals.js";
 import { cursorConfigDir } from "./cursor-approvals.js";
 import {
-  childrenFile, identityFile, identityKeepFile, logDir, outboxDir, pauseFile, pidFile, sessionsFile, type Dirs,
+  childrenFile, identityFile, identityKeepFile, logDir, outboxDir, pauseFile, pidFile, quarantineFile, sessionsFile, type Dirs,
 } from "./paths.js";
 import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, type RemoteAgentDescriptor } from "./protocol.js";
-import { redactDeep } from "./redact.js";
+import { redactDeep, storableDeep } from "./redact.js";
 import { DEFAULT_SESSION_TIMING, type SessionEnv, type SessionTiming } from "./session.js";
 import { SessionStore } from "./session-store.js";
 import type { SseFrame } from "./sse.js";
@@ -307,6 +308,9 @@ export const isAuthRefusal = (e: unknown): boolean => e instanceof HttpError && 
 export const isDefinitiveRefusal = (e: unknown): boolean => isAuthRefusal(e) && !/^http_\d+$/.test((e as HttpError).code);
 
 /** Failures that pass by themselves: no connection, a provider that is down or busy. */
+/** A new batch's id. */
+const batchId = (): string => `b-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+
 export function isTransient(e: unknown): boolean {
   return e instanceof TransientAuthError || e instanceof TransportError || (e instanceof HttpError && (e.status >= 500 || e.status === 429));
 }
@@ -487,9 +491,12 @@ export class Connector {
     }
   }
 
-  /** Every event leaves through here: scrubbed of credential shapes, numbered, written to disk, then posted. */
+  /**
+   * Every event leaves through here: scrubbed of credential shapes and of characters Claw cannot store (a NUL from a terminal, half a
+   * surrogate pair), numbered, written to disk, then posted.
+   */
   private emit(sessionId: string, type: string, data: Record<string, unknown>, after?: Promise<unknown>, at?: number): void {
-    this.outbox.append(sessionId, type, redactDeep(data), at, after);
+    this.outbox.append(sessionId, type, storableDeep(redactDeep(data)), at, after);
     if (type === "session_closed") this.outbox.markClosed(sessionId);
     this.wakeSender?.();
   }
@@ -883,9 +890,13 @@ export class Connector {
     }
   }
 
-  /** Post events in batches, one request at a time and in order, until everything is acknowledged. */
+  /**
+   * Post events in batches, one request at a time and in order, until everything is acknowledged. An event Claw cannot take does
+   * not hold up the ones behind it: the batch it fails is split until it is found, and it is set aside (poison.ts).
+   */
   private async sender(): Promise<void> {
     let failures = 0;
+    const poison = new PoisonFinder();
     while (!this.ctl.signal.aborted) {
       if (this.outbox.size === 0) {
         await new Promise<void>((resolve) => {
@@ -896,30 +907,79 @@ export class Connector {
         });
         continue;
       }
-      if (this.outbox.size < this.timing.batchMax) await sleep(this.timing.batchMs, this.ctl.signal);
+      if (this.outbox.size < this.timing.batchMax && !poison.isolating) await sleep(this.timing.batchMs, this.ctl.signal);
       if (this.ctl.signal.aborted) break;
-      const batch = this.outbox.pending(this.timing.batchMax);
+      const plan = poison.plan(this.outbox.pending(this.timing.batchMax), (e) => this.outbox.holds(e));
+      const batch = plan.events;
       // Queued but not written yet (the disk is slow): looked at again shortly.
       if (batch.length === 0) { await sleep(this.timing.batchMs, this.ctl.signal); continue; }
       try {
-        const ack = await this.d.client.postEvents(this.cid, `b-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`, batch);
+        const ack = await this.d.client.postEvents(this.cid, batchId(), batch);
+        poison.taken(plan);
         this.outbox.ack(ack.acked);
         for (const r of ack.rejected) {
           const ev = batch[r.index];
           if (!ev) continue;
           // Refused for good (retrying cannot help): forget it, but not silently.
-          this.outbox.drop(ev.session_id, ev.seq);
           this.d.audit.record("event_rejected", { session_id: ev.session_id, seq: ev.seq, type: ev.type, reason: r.reason });
+          this.setAside(ev, `rejected_${r.reason}`.slice(0, 80));
         }
         failures = 0;
       } catch (e) {
         if (this.isRevocation(e)) return void (await this.onRevoked(e));
         this.noteOutage(e);
         failures++;
-        this.d.log.warn("posting events failed; will retry", { error: errMessage(e), pending: this.outbox.size });
-        await sleep(backoffMs(failures - 1, this.timing.backoffMinMs, this.timing.backoffMaxMs), this.ctl.signal);
+        const wasIsolating = poison.isolating;
+        let verdict = poison.failed(plan, e);
+        // Asked only once the search is down to one event, so an outage costs one empty post per retry.
+        const answering = verdict === "probe" ? await this.takesEmptyPost() : null;
+        if (answering !== null) verdict = poison.probed(answering);
+        if (verdict === "set_aside") {
+          const ev = batch[0]!;
+          poison.setAside();
+          this.setAside(ev, e instanceof HttpError ? `http_${e.status}_${e.sqlState ?? e.code}`.slice(0, 80) : "refused");
+          failures = 0;
+          continue;
+        }
+        if (poison.isolating && !wasIsolating) {
+          this.d.log.warn("posting events keeps failing on what they carry; posting them in smaller parts to find the one Claw cannot take", {
+            error: errMessage(e), events: batch.length,
+          });
+        } else {
+          this.d.log.warn("posting events failed; will retry", { error: errMessage(e), pending: this.outbox.size });
+        }
+        // While a batch is split, a post Claw refused for what it carried is a step of the search and goes after the shortest wait;
+        // any other failure (a 500 that names nothing, an empty post Claw did not take either) is waited out as usual.
+        const step = poison.isolating && failureKind(e) === "content" && answering !== false;
+        const wait = step ? this.timing.backoffMinMs : backoffMs(failures - 1, this.timing.backoffMinMs, this.timing.backoffMaxMs);
+        await sleep(wait, this.ctl.signal);
       }
     }
+  }
+
+  /** Whether Claw takes an empty post: it and its database answer, so a post that fails is failed by what it carries. */
+  private async takesEmptyPost(): Promise<boolean> {
+    try {
+      await this.d.client.postEvents(this.cid, batchId(), []);
+      return true;
+    } catch (e) {
+      this.noteOutage(e);
+      return false;
+    }
+  }
+
+  /**
+   * Forget an event Claw will not take, so that the ones behind it go: removed from the outbox, written to the quarantine file and
+   * logged once, by its session, number and type (never its content, which may be anything the agent printed).
+   */
+  private setAside(ev: OutEvent, reason: string): void {
+    this.outbox.drop(ev.session_id, ev.seq);
+    const record = { at: new Date().toISOString(), session_id: ev.session_id, seq: ev.seq, type: ev.type, reason };
+    this.d.log.warn("an event Claw would not take was set aside unsent", { session_id: ev.session_id, seq: ev.seq, type: ev.type, reason });
+    this.d.audit.record("event_quarantined", { session_id: ev.session_id, seq: ev.seq, type: ev.type, reason });
+    void fsp.appendFile(quarantineFile(this.d.dirs), JSON.stringify(record) + "\n", { mode: 0o600 }).catch((err) => {
+      this.d.log.warn("writing the quarantine file failed", { error: errMessage(err) });
+    });
   }
 
   /** Report a change in the conversations on this machine (see {@link ConnectorTiming.sessionsWatchMs}) without waiting for the heartbeat. */

@@ -106,6 +106,21 @@ const eventPersistedTotal = new Counter({
   labelNames: ["outcome"] as const,
   registers: [registry],
 });
+// A run's result carried characters Postgres refuses (U+0000, a lone
+// surrogate) and they were replaced so the result could land.
+const agentDoneSanitizedTotal = new Counter({
+  name: "claw_api_agent_done_sanitized_total",
+  help: "agent_done callbacks whose text had unstorable characters replaced with U+FFFD before the write.",
+  registers: [registry],
+});
+// A result the database still refused for its values, answered 422 so the
+// sender stops resending it. Rising means a field the sanitiser does not cover.
+const agentDoneRefusedTotal = new Counter({
+  name: "claw_api_agent_done_refused_total",
+  help: "agent_done callbacks refused with 422 because the database rejected their values, by SQLSTATE.",
+  labelNames: ["sqlstate"] as const,
+  registers: [registry],
+});
 
 // The event consumer's own health (events/poison.ts). Consecutive failures is this replica's run of deliveries answered
 // with a retry since it last stored an event or set one aside; an outage or a poison event shows here first. Quarantined is an event set aside with a
@@ -413,6 +428,12 @@ export const metrics = {
   } satisfies IdentityMetrics,
   setIdentityClientEnabled(enabled: boolean): void {
     identityClientEnabled.set(enabled ? 1 : 0);
+  },
+  onAgentDoneSanitized(): void {
+    agentDoneSanitizedTotal.inc();
+  },
+  onAgentDoneRefused(sqlstate: string): void {
+    agentDoneRefusedTotal.inc({ sqlstate });
   },
   onSessionCreated(outcome: "ok" | "error"): void {
     sessionCreatedTotal.inc({ outcome });
