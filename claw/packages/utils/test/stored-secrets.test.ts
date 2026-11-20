@@ -131,3 +131,23 @@ test("a long line with no credential is scanned in linear time", () => {
   redactStoredText(long);
   assert.ok(Date.now() - started < 2_000, "scan took too long");
 });
+
+test("a value nested deeper than the call stack is copied whole and still masked at the bottom", () => {
+  // JSON.parse takes this; a recursive walk ran out of stack at about 3,300 levels.
+  const depth = 20_000;
+  let text = JSON.stringify({ token: SAFE_KEY, note: `see ${SAFE_KEY}` });
+  for (let i = 0; i < depth; i++) text = `{"a":[${text}]}`;
+  let v: unknown = redactStoredValue(JSON.parse(text));
+  let levels = 0;
+  while (v && typeof v === "object" && "a" in v) { v = (v as { a: unknown[] }).a[0]; levels++; }
+  assert.equal(levels, depth);
+  assert.deepEqual(v, { token: "<redacted>", note: "see <redacted>" });
+});
+
+test("a __proto__ key in parsed JSON stays an own key of the copy, at the top and nested", () => {
+  const parsed = JSON.parse('{"__proto__":{"type":"x"},"input":{"__proto__":{"cmd":"ls"}}}') as Record<string, unknown>;
+  const copy = redactStoredValue(parsed);
+  assert.equal(Object.getPrototypeOf(copy), Object.prototype);
+  assert.equal((copy as { type?: unknown }).type, undefined, "the key supplies no inherited field");
+  assert.equal(JSON.stringify(copy), '{"__proto__":{"type":"x"},"input":{"__proto__":{"cmd":"ls"}}}');
+});

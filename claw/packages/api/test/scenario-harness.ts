@@ -29,7 +29,7 @@
  * does with a claim belongs in the live environment.
  */
 
-import { clawTasksSchemaSql, db } from "../src/infra/db.js";
+import { clawTasksSchemaSql, db, EVENT_QUARANTINE_TABLE_SQL } from "../src/infra/db.js";
 import { initUserEnvCrypto } from "../src/crypto/user-env.js";
 import { sealRunCredentials } from "../src/tasks/run-secrets.js";
 
@@ -249,6 +249,7 @@ const TABLES = [
   "claw_task_edges",
   "claw_sessions",
   "claw_session_events",
+  "claw_event_quarantine",
   "claw_pending_messages",
   "claw_workspaces",
   "resources",
@@ -280,6 +281,8 @@ export async function startHarness(): Promise<Harness> {
   for (const sql of clawTasksSchemaSql()) {
     await pg.exec(sql).catch(() => { /* idempotent, exactly as initDb treats it */ });
   }
+  // Session deletion removes a session's quarantined events (sessions/teardown.ts).
+  await pg.exec(EVENT_QUARANTINE_TABLE_SQL);
 
   const original = db.query;
   const originalConnect = db.pool.connect;

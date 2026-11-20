@@ -50,16 +50,19 @@ import {
 import { dispatchPendingMessage, publishRefusedTurn } from "../tasks/pending-dispatch.js";
 import { applySealedCredentials } from "../tasks/run-secrets.js";
 import { randomUUID } from "node:crypto";
-import { redactStoredValue } from "@claw/utils";
+import { redactStoredText, redactStoredValue } from "@claw/utils";
 import pino from "pino";
 import { TOOL_TEXT_VOID_EVENT } from "../assistant/router-speed.js";
-import { metrics } from "../infra/metrics.js";
+import { metrics, type EventQuarantineReason } from "../infra/metrics.js";
 import { trackDelivery } from "./redelivery.js";
 import { publishSummaryIfCurrent } from "./summary.js";
 import { completionAlreadyProcessed } from "./store.js";
 import { withCompletionLock } from "./completion-lock.js";
 import type { LeaderLease } from "../infra/leader-lock.js";
 import { isSandboxOnlyRun, recordCompletionTurns } from "./completion-turns.js";
+import {
+  depthBoundedEvent, STORED_DEPTH_LIMITS, eventDeliveryHealth, quarantineEventDelivery, startEventBacklogGauges, storableEvent, storableText,
+} from "./poison.js";
 
 /** Brain's event for a streaming tool call's text so far (`ExecuteRequest.stream_tool_text`); never stored. */
 export const TOOL_TEXT_DELTA_EVENT = "toolTextDelta";
@@ -162,7 +165,7 @@ function makeEventId(seq: unknown): string {
  * Background durable consumer: listens to all events, persists to DB,
  * and triggers post-completion logic (save turns, summarize, pending messages).
  */
-export async function startEventConsumer(): Promise<void> {
+export async function startEventConsumer(opts: { signal?: AbortSignal } = {}): Promise<void> {
   const subject = "events.>";
   const consumerName = "api-consumer";
   const jsm = await nc.jetstreamManager();
@@ -185,11 +188,23 @@ export async function startEventConsumer(): Promise<void> {
   const consumer = await js.consumers.get(EVENT_STREAM, consumerName);
   const iter = await consumer.consume();
 
-  listenForCleanupNotices();
+  const cleanupSub = listenForCleanupNotices();
+  const stopGauges = startEventBacklogGauges(jsm, EVENT_STREAM, consumerName);
+  // Stops pulling, so the loop below ends once the delivery in hand is answered.
+  opts.signal?.addEventListener("abort", () => {
+    stopGauges();
+    cleanupSub.unsubscribe();
+    void iter.close().catch(() => {});
+  }, { once: true });
   logger.info({ subject, consumerName }, "event-consumer.started");
 
   for await (const msg of iter) {
-    await consumeEventDelivery(trackDelivery(msg));
+    // `consumeEventDelivery` answers every delivery itself and does not throw;
+    // were it ever to, this loop must not end with it, since every session's
+    // events would stop with the one that threw.
+    await consumeEventDelivery(trackDelivery(msg)).catch((err) => {
+      logger.error({ err: (err as Error)?.message, seq: msg.seq }, "event-consumer.delivery_threw");
+    });
   }
 }
 
@@ -204,7 +219,7 @@ export async function startEventConsumer(): Promise<void> {
  * in that window. Core NATS, at-most-once: a missed notice only costs the
  * remaining TTL, which is how the cache behaved before this existed.
  */
-function listenForCleanupNotices(): void {
+function listenForCleanupNotices(): { unsubscribe(): void } {
   const sub = nc.subscribe("cleanup.>");
   (async () => {
     for await (const msg of sub) {
@@ -216,6 +231,7 @@ function listenForCleanupNotices(): void {
       "event-consumer.cleanup_listener_died",
     );
   });
+  return sub;
 }
 
 /**
@@ -420,30 +436,157 @@ async function processCompletionEvent(
   return outcome.ran ? outcome.result : "busy";
 }
 
+/** One delivery of the event stream, as `consumeEventDelivery` reads it. */
+export interface EventDelivery {
+  subject: string;
+  data: Uint8Array;
+  seq?: number;
+  info?: { streamSequence?: number; deliveryCount?: number; redeliveryCount?: number; timestampNanos?: number };
+  ack: () => void;
+  nak: (millis?: number) => void;
+}
+
+/** Postgres refusing the value itself: retrying the same event cannot succeed. */
+const UNSTORABLE_PG_CODES = new Set([
+  "22P05", // untranslatable character (a \u0000 escape in jsonb)
+  "22021", // invalid byte sequence (NUL in text)
+  "22P02", // invalid text representation (a lone surrogate escape in jsonb)
+  "54001", // statement too complex (nesting deeper than the server's stack)
+]);
+
+/** Postgres's stack depth limit: the only refusal a completion is stored bounded for. */
+const STACK_DEPTH_EXCEEDED = "54001";
+
 /**
  * One delivery: refuse a deleted session before any write, otherwise persist.
  *
  * Pulled out of the consume loop so the two properties the loop exists for --
  * the tombstone check sits in front of the INSERT, and a refusal acks rather
  * than naks -- can be pinned without a live JetStream iterator.
+ *
+ * Every delivery is answered (acked or nak'd), and none throws: a step that
+ * throws is answered with a nak. Only an event no retry can store is set aside
+ * (with a durable copy, see poison.ts): one that is not a JSON object, or one
+ * Postgres refuses for its value. Every other failure is retried however long
+ * it lasts, since an outage and a busy or owed completion look the same from
+ * here as a bad event does, and only the retry tells them apart.
  */
-export async function consumeEventDelivery(msg: {
-  subject: string;
-  data: Uint8Array;
-  seq?: number;
-  info?: { streamSequence?: number };
-  ack: () => void;
-  nak: (millis?: number) => void;
-}): Promise<void> {
-    // subject layout: "events.{sessionId}"
-    const sessionId = msg.subject.split(".")[1];
-    let event: Record<string, unknown>;
+export async function consumeEventDelivery(msg: EventDelivery): Promise<void> {
+  const seq = msg.seq ?? msg.info?.streamSequence;
+  const deliveries = msg.info?.deliveryCount ?? msg.info?.redeliveryCount ?? 1;
+  const publishedMs = typeof msg.info?.timestampNanos === "number" && msg.info.timestampNanos > 0
+    ? Math.floor(msg.info.timestampNanos / 1_000_000) : undefined;
+  let answer: "ack" | "nak" | undefined;
+  const tracked: EventDelivery = {
+    subject: msg.subject, data: msg.data, seq: msg.seq, info: msg.info,
+    ack: () => { answer ??= "ack"; msg.ack(); },
+    nak: (millis?: number) => { answer ??= "nak"; msg.nak(millis); },
+  };
+  try {
+    await processEventDelivery(tracked, { seq, deliveries, publishedMs });
+  } catch (err) {
+    eventDeliveryHealth.noteError(seq, err);
+    logger.error({ err: (err as Error)?.message, seq, subject: msg.subject }, "event-consumer.delivery_failed");
+    if (!answer) tracked.nak(5_000);
+  }
+  eventDeliveryHealth.answered(seq, answer ?? "none");
+}
+
+/**
+ * The bytes kept for a quarantined delivery: the event masked the way a stored
+ * one is (`redactStoredValue`), or the text masked when it is not JSON. A
+ * quarantined event is still conversation content at rest.
+ */
+function quarantineCopy(text: string, event?: Record<string, unknown>): Uint8Array {
+  let copy: string;
+  try {
+    copy = event ? JSON.stringify(redactStoredValue(event)) : redactStoredText(text).text;
+  } catch {
+    // An event too deeply nested to serialise again is kept as its text.
+    copy = redactStoredText(text).text;
+  }
+  return new TextEncoder().encode(copy);
+}
+
+/**
+ * Set a delivery aside: keep its copy, then ack it. A copy that cannot be
+ * written naks instead, so the event is retried rather than lost. An event of a
+ * session that has since been deleted is dropped without a copy, as the normal
+ * path would drop it.
+ */
+async function setAside(
+  msg: EventDelivery,
+  reason: EventQuarantineReason,
+  d: { seq?: number; deliveries: number; publishedMs?: number },
+  event?: Record<string, unknown>,
+): Promise<void> {
+  const sessionId = storableText(msg.subject.split(".")[1] ?? "");
+  const text = sc.decode(msg.data);
+  if (!event && reason !== "unparseable") {
     try {
-      const raw = sc.decode(msg.data).replace(/\u0000/g, "");
-      event = JSON.parse(raw);
+      const parsed: unknown = JSON.parse(text);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) event = storableEvent(parsed as Record<string, unknown>).event;
+    } catch { /* kept as text below */ }
+  }
+  const eventType = event && typeof event.type === "string" ? event.type : null;
+  const payload = quarantineCopy(text, event);
+  const deleted = await sessionWasDeleted(sessionId);
+  if (deleted === "unknown") {
+    // Neither keep a copy (the session may be gone) nor drop it (it may not be): ask again later.
+    msg.nak(TOMBSTONE_UNKNOWN_NAK_MS);
+    return;
+  }
+  if (deleted) {
+    logger.info({ sessionId, type: eventType, reason }, "event-consumer.dropped_deleted_session");
+    msg.ack();
+    return;
+  }
+  try {
+    await quarantineEventDelivery({
+      eventId: makeEventId(d.seq), sessionId, subject: msg.subject, seq: d.seq, eventType, reason,
+      deliveries: d.deliveries, publishedMs: d.publishedMs, lastError: eventDeliveryHealth.takeError(d.seq),
+      payload,
+    });
+  } catch (err) {
+    logger.error({ err: (err as Error)?.message, sessionId, seq: d.seq, reason }, "event-consumer.quarantine_failed");
+    msg.nak(5_000);
+    return;
+  }
+  msg.ack();
+}
+
+async function processEventDelivery(
+  msg: EventDelivery,
+  d: { seq?: number; deliveries: number; publishedMs?: number },
+): Promise<void> {
+    // subject layout: "events.{sessionId}"
+    const sessionId = storableText(msg.subject.split(".")[1] ?? "");
+    // Only the bytes decide `unparseable`: text that is not JSON, or JSON that
+    // is not an object. Both fail the same way on every delivery.
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(sc.decode(msg.data));
     } catch {
-      msg.ack();
+      parsed = undefined;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      await setAside(msg, "unparseable", d);
       return;
+    }
+    // The write boundary: every string Postgres cannot store (NUL, a lone
+    // surrogate) is replaced here, before anything below writes it. Outside the
+    // try above on purpose: were it ever to throw, the event is still valid
+    // JSON, and a throw here is answered with a nak by `consumeEventDelivery`
+    // (retried, never set aside -- a completion least of all).
+    const storable = storableEvent(parsed as Record<string, unknown>);
+    // Replaced only by a depth-bounded copy of a completion Postgres refused for its nesting (see the INSERT below).
+    let event = storable.event;
+    const sanitised = storable.replaced > 0;
+    if (storable.replaced) {
+      logger.warn(
+        { sessionId, type: event.type, seq: d.seq, replaced: storable.replaced },
+        "event-consumer.unstorable_characters_replaced",
+      );
     }
     logger.info({ sessionId, type: event.type, seq: (msg as any).seq }, "event-consumer.msg_received");
 
@@ -529,13 +672,53 @@ export async function consumeEventDelivery(msg: {
     // absorb that index's 23505, which would nak the message for ever.
     const isAppEvent = event.type === "appEvent";
     const appEvent = appEventIdentity(event);
+    // The stored copy has credential-shaped content masked (`redactStoredValue`); `event` itself, which the completion below and
+    // every hook after it read, is not touched.
+    const insertRow = (stored: Record<string, unknown>) => db.query(
+      `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${isAppEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
+      [eventId, sessionId, (stored.type as string) || "message", redactStoredValue(stored)],
+    );
     try {
-      // The stored copy has credential-shaped content masked (`redactStoredValue`); `event` itself, which the completion below and
-      // every hook after it read, is not touched.
-      const insertResult = await db.query(
-        `INSERT INTO claw_session_events (event_id, session_id, event, data) VALUES ($1, $2, $3, $4) ON CONFLICT ${isAppEvent ? "" : "(event_id, session_id) "}DO NOTHING RETURNING id`,
-        [eventId, sessionId, (event.type as string) || "message", redactStoredValue(event)],
-      );
+      let insertResult;
+      try {
+        insertResult = await insertRow(event);
+      } catch (e: any) {
+        if (event.type !== "exec_complete" || e?.code !== STACK_DEPTH_EXCEEDED) throw e;
+        // A completion Postgres refused for its nesting (54001: deeper than its parser's stack, about 13,000 levels with
+        // the default `max_stack_depth`). It is never set aside -- its turn and its run notice would be left undone --
+        // and no retry stores it whole. So a copy with every level past a limit replaced is stored, and it is that copy
+        // the completion below runs on: the turn's writes would refuse the same nesting. The limit is not fixed: a
+        // server with a smaller `max_stack_depth` refuses a shallower copy too, so each limit in `STORED_DEPTH_LIMITS`
+        // is tried in turn until one is stored. The original, masked, is kept in quarantine (reason `bounded`) before
+        // the completion runs; a copy that cannot be written throws to the nak below, and the redelivery finds the
+        // bounded row already stored (the same limits are tried in the same order, so it is the same copy).
+        eventDeliveryHealth.noteError(d.seq, e);
+        let bounded: { event: Record<string, unknown>; cut: number; limit: number; result: Awaited<ReturnType<typeof insertRow>> } | null = null;
+        for (const limit of STORED_DEPTH_LIMITS) {
+          const copy = depthBoundedEvent(event, limit);
+          if (!copy.cut) continue; // nothing that deep: the same event Postgres just refused
+          try {
+            bounded = { ...copy, limit, result: await insertRow(copy.event) };
+            break;
+          } catch (e2: any) {
+            if (e2?.code !== STACK_DEPTH_EXCEEDED) throw e2;
+          }
+        }
+        // Not one limit both cut something and was stored: retried like any other refusal.
+        if (!bounded) throw e;
+        insertResult = bounded.result;
+        logger.warn(
+          { sessionId, eventId, type: event.type, code: e.code, cut: bounded.cut, limit: bounded.limit },
+          "event-consumer.completion_stored_depth_bounded",
+        );
+        await quarantineEventDelivery({
+          eventId, sessionId, subject: msg.subject, seq: d.seq, eventType: "exec_complete", reason: "bounded",
+          deliveries: d.deliveries, publishedMs: d.publishedMs, lastError: eventDeliveryHealth.takeError(d.seq),
+          payload: quarantineCopy(sc.decode(msg.data), event),
+        });
+        event = bounded.event;
+      }
+      eventDeliveryHealth.stored();
       if (isAppEvent && !insertResult.rowCount) {
         logger.info({ sessionId, appTaskId: appEvent?.appTaskId, appEventId: appEvent?.eventId }, "event-consumer.app_event_duplicate_dropped");
         msg.ack();
@@ -543,6 +726,7 @@ export async function consumeEventDelivery(msg: {
       }
       if (insertResult.rowCount && insertResult.rows[0]) {
         metrics.onEventPersisted("ok");
+        if (sanitised) metrics.onEventSanitised();
         rowId = insertResult.rows[0].id;
       } else {
         const existing = await db.query(
@@ -555,11 +739,19 @@ export async function consumeEventDelivery(msg: {
       }
     } catch (e: any) {
       metrics.onEventPersisted("error");
+      eventDeliveryHealth.noteError(d.seq, e);
       const pgCode = e?.code || "";
-      if (pgCode === "22P05" || pgCode === "22021") {
-        logger.error({ err: e, sessionId, eventId }, "event-consumer.persist_poison_skipped");
-        msg.ack();
+      if (UNSTORABLE_PG_CODES.has(pgCode) && event.type !== "exec_complete") {
+        // Not expected once the event is sanitised above; if it happens anyway,
+        // no retry can store it, so it is set aside at once with its copy.
+        logger.error({ sessionId, eventId, type: event.type, code: pgCode }, "event-consumer.persist_unstorable");
+        await setAside(msg, "unstorable", d, event);
       } else {
+        // A completion is never set aside, unstorable or not: its row is what
+        // `processCompletionEvent` stamps, and acking it without one would end
+        // the run's turn and its `run.completed` notice with nothing done. One
+        // refused for its nesting was stored bounded above; any other failure
+        // is retried, and the gauge and this log line show it.
         logger.error({ err: e, sessionId }, "event-consumer.persist_failed");
         msg.nak(5000);
       }
@@ -593,6 +785,7 @@ export async function consumeEventDelivery(msg: {
         // stamp in `processCompletionEvent`, which is the statement that makes
         // this comment true.
         logger.error({ err: e, sessionId }, "event-consumer.complete_failed");
+        eventDeliveryHealth.noteError(d.seq, e);
         msg.nak(10_000);
         return;
       }

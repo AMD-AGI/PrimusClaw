@@ -307,6 +307,20 @@ jobs:
           # A skipped suite passes too; this job exists to run it.
           grep -q "^ℹ pass 8$" "$RUNNER_TEMP/chaos.log"
 
+      # The same real JetStream and Postgres, for the event consumer: an unstorable event is set aside with a durable
+      # copy and does not hold up the events published after it, a completion nested deeper than Postgres parses runs on a
+      # bounded copy, and an event failing for any other reason is retried, never set aside
+      # (claw/packages/api/test/event-consumer-poison-jetstream.test.ts).
+      # The package shards skip it for the same reason: they have no nats-server.
+      - name: Event consumer poison events over JetStream
+        working-directory: claw/packages/api
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+        run: |
+          set -euo pipefail
+          npx --no-install tsx --test --test-reporter=spec test/event-consumer-poison-jetstream.test.ts | tee "$RUNNER_TEMP/poison.log"
+          grep -q "^ℹ pass 4$" "$RUNNER_TEMP/poison.log"
+
   connector:
     name: Connector (TypeScript)
     runs-on: ubuntu-latest
