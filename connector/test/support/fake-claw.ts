@@ -43,6 +43,17 @@ export class FakeClaw {
   outageRefusals = 0;
   /** Refuse (name in `rejected`, as the real server does) every event of this type. */
   rejectType: string | null = null;
+  /**
+   * Answer a post 500 when any event in it holds a NUL or an unpaired surrogate, the way Claw's API did before it made such text
+   * storable: PostgreSQL's jsonb refused the whole INSERT (the body is the one that API sent, measured).
+   */
+  refuseUnstorable = false;
+  /** Answer a post 500 when any event in it matches, whatever is done to its text: an event Claw can never take. */
+  refuseEvent: ((e: { session_id: string; seq: number; type: string; data: any }) => boolean) | null = null;
+  /** Answer every post 500, an empty one too: Claw's database is down. */
+  failAllPosts = false;
+  /** Every post's events (session, seq, type), in order, and its answer's status. */
+  readonly posts: Array<{ status: number; events: Array<{ session_id: string; seq: number; type: string }> }> = [];
   /** Store the next N event posts but close the socket before answering (a lost acknowledgement). */
   loseAcks = 0;
   readonly commands: Array<{ seq: number; payload: Record<string, unknown> }> = [];
@@ -299,7 +310,15 @@ export class FakeClaw {
         } });
       }
       case "events": {
-        if (this.failPosts > 0) { this.failPosts--; return this.json(res, 503, { ok: false, error: "unavailable" }); }
+        const sent = Array.isArray((body as any)?.events) ? (body as any).events as any[] : [];
+        const post = { status: 200, events: sent.map((e) => ({ session_id: e?.session_id, seq: e?.seq, type: e?.type })) };
+        this.posts.push(post);
+        const answer = (status: number, b: unknown) => { post.status = status; return this.json(res, status, b); };
+        if (this.failPosts > 0) { this.failPosts--; return answer(503, { ok: false, error: "unavailable" }); }
+        const internal = (message: string, code: string) => answer(500, { statusCode: 500, code, error: "Internal Server Error", message });
+        if (this.failAllPosts) return internal("Connection terminated unexpectedly", "ECONNRESET");
+        if (this.refuseUnstorable && sent.some((e) => holdsUnstorable(e?.data))) return internal("unsupported Unicode escape sequence", "22P05");
+        if (this.refuseEvent && sent.some((e) => this.refuseEvent!(e))) return internal("refused for the test", "22023");
         const batch = parseEventBatch(body);
         if (!batch.ok) return this.json(res, 400, { ok: false, error: batch.error });
         const acked: Record<string, number> = {};
@@ -314,7 +333,7 @@ export class FakeClaw {
         }
         this.wake();
         if (this.loseAcks > 0) { this.loseAcks--; req.socket.destroy(); return; }
-        return this.json(res, 200, { ok: true, data: { batch_id: batch.value.batchId, acked, rejected: refused } });
+        return answer(200, { ok: true, data: { batch_id: batch.value.batchId, acked, rejected: refused } });
       }
       case "commands": {
         this.streamHeaders.push(req.headers);
@@ -356,4 +375,13 @@ export class FakeClaw {
     }
     return this.json(res, 404, { ok: false, error: "not_found" });
   }
+}
+
+/** Whether a parsed JSON value holds, in a key or a string, a character PostgreSQL's jsonb refuses (a NUL, an unpaired surrogate). */
+function holdsUnstorable(v: unknown): boolean {
+  const bad = (t: string) => /\u0000|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(t);
+  if (typeof v === "string") return bad(v);
+  if (Array.isArray(v)) return v.some(holdsUnstorable);
+  if (v && typeof v === "object") return Object.entries(v).some(([k, x]) => bad(k) || holdsUnstorable(x));
+  return false;
 }

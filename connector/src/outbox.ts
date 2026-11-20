@@ -244,6 +244,11 @@ export class Outbox {
     return this.queue.length;
   }
 
+  /** Whether this event (as `pending` handed it out) is still queued: not acknowledged, dropped or shed. */
+  holds(ev: OutEvent): boolean {
+    return this.queue.includes(ev);
+  }
+
   /** The server stored everything up to `acked[session]`. */
   ack(acked: Record<string, number>): void {
     const touched = new Set<string>();
