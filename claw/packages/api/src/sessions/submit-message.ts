@@ -48,7 +48,7 @@ import { workspaceSaveHeldSql } from "./save-hold.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
 import { DRAIN_UNDER_WAY_SQL } from "./drain-claim.js";
 import { dispatchTaskToBrain, newChatMessageId } from "./dispatch.js";
-import { storableJson, storableOptionalText, storableText } from "../infra/storable-text.js";
+import { storableJson, storableText } from "@claw/utils";
 
 // The name the route logged these records under before they moved, so a filter an
 // operator already has keeps matching them.
@@ -201,20 +201,21 @@ export async function insertPendingMessage(
 ): Promise<{ id: number | null; deduplicated: boolean }> {
   // Every value is made storable here, at the one statement that writes the
   // queue: a NUL or a lone surrogate anywhere in the request fails the whole
-  // insert (see infra/storable-text.ts), so a message carrying one would be
+  // insert (see @claw/utils storable.ts), so a message carrying one would be
   // refused outright rather than queued. U+FFFD in its place is what the user
   // sees of that character, and nothing else in the request changes.
+  const optional = <T>(value: T): T => (typeof value === "string" ? storableText(value) : value) as T;
   const params: unknown[] = [
     row.sessionId,
     storableText(row.content),
     storableText(row.userId),
     row.pluginId ?? null,
     JSON.stringify(row.toolIds.length ? row.toolIds : []),
-    storableOptionalText(row.workspaceId ?? null),
-    storableOptionalText(row.secrets.platform),
-    storableOptionalText(row.secrets.llm),
-    storableOptionalText(row.secrets.blob),
-    storableOptionalText(row.image ?? null),
+    optional(row.workspaceId ?? null),
+    optional(row.secrets.platform),
+    optional(row.secrets.llm),
+    optional(row.secrets.blob),
+    optional(row.image ?? null),
     row.resource ? JSON.stringify(storableJson(row.resource)) : null,
     row.timeout ?? null,
     JSON.stringify(storableJson(row.secrets.userEnv)),
@@ -223,7 +224,7 @@ export async function insertPendingMessage(
     row.toolsAllowlist?.length ? JSON.stringify(storableJson(row.toolsAllowlist)) : null,
   ];
   const keyed = row.dedupeKey !== undefined;
-  if (keyed) params.push(storableOptionalText(row.dedupeKey));
+  if (keyed) params.push(optional(row.dedupeKey));
   const inserted = await q.query(
     "INSERT INTO claw_pending_messages (session_id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist"
     + (keyed ? ", dedupe_key" : "")
