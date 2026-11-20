@@ -18,8 +18,9 @@
  *   P7 a run that ends without a completion event (the sweeper's closes) still gets its final notification
  *   P8 poison: what PostgreSQL cannot store is made storable, and a notification that keeps failing is set
  *      aside after a bounded number of attempts while the ones behind it go, in order, over real HTTP; a send
- *      ends inside its deadline, a late answer cannot touch a newer claim, and a head is set aside even when
- *      its dead letter cannot be written
+ *      ends inside its deadline, a late answer cannot touch a newer claim, a claim that never reached the
+ *      receiver (a slow or failing database) uses no attempt, and a head is set aside even when its dead
+ *      letter cannot be written
  */
 
 import assert from "node:assert/strict";
@@ -139,7 +140,7 @@ describe("A2A push notifications", { skip }, () => {
     );
   }
   const configCount = async () => Number((await query("SELECT COUNT(*)::int AS n FROM claw_a2a_push_configs")).rows[0].n);
-  const outbox = async () => (await query("SELECT dedupe_key, payload, final, attempts, delivered_at, dropped_at, last_status FROM claw_a2a_push_outbox ORDER BY id")).rows as Array<Record<string, any>>;
+  const outbox = async () => (await query("SELECT dedupe_key, payload, final, attempts, next_attempt_at, delivered_at, dropped_at, last_status FROM claw_a2a_push_outbox ORDER BY id")).rows as Array<Record<string, any>>;
 
   describe("P2 the four methods", () => {
     test("create, get, list and delete a config, and never a secret back", async () => {
@@ -468,6 +469,7 @@ describe("A2A push notifications", { skip }, () => {
       assert.equal(s.requests.length, 0);
       const [row] = await outbox();
       assert.equal(row.last_status, "refused:unresolvable_host");
+      assert.equal(row.attempts, 1, "a name looked up and not found is the receiver's attempt");
       assert.equal(row.dropped_at, null, "DNS failing for a moment does not end the notification");
       await query("UPDATE claw_a2a_push_outbox SET next_attempt_at = NOW()");
       assert.deepEqual(await push.deliverDue({ transport: s.transport as never, resolve: hostResolver() }), { delivered: 1, failed: 0 });
@@ -968,6 +970,7 @@ describe("A2A push notifications", { skip }, () => {
         assert.deepEqual(await a, { delivered: 0, failed: 1 });
         const head = (await outbox())[0];
         assert.equal(head.last_status, "refused:unresolvable_host", "the hung lookup counts as a name that does not resolve now");
+        assert.equal(head.attempts, 0, "a lookup the deadline cut short asked nobody, so it uses no attempt");
         assert.equal(head.delivered_at, null);
 
         // The lease runs out; replica B, whose lookups answer, takes the head and then the next one.
@@ -999,17 +1002,19 @@ describe("A2A push notifications", { skip }, () => {
 
         const a = push.deliverDue({ sendDeadlineMs: 10_000 });
         await until("replica A's request", () => answers.length === 1);
+        const whileOnTheWire = (await query("SELECT claims, attempts FROM claw_a2a_push_outbox")).rows[0];
+        assert.deepEqual(whileOnTheWire, { claims: 1, attempts: 1 }, "the attempt is recorded before the request, so a sender that dies in it has used it");
         await expireLeases();
         const b = push.deliverDue({ sendDeadlineMs: 10_000 });
         await until("replica B's request", () => answers.length === 2);
-        const leaseOfB = (await query("SELECT attempts, next_attempt_at FROM claw_a2a_push_outbox")).rows[0];
-        assert.equal(leaseOfB.attempts, 2);
+        const leaseOfB = (await query("SELECT claims, attempts, next_attempt_at FROM claw_a2a_push_outbox")).rows[0];
+        assert.deepEqual([leaseOfB.claims, leaseOfB.attempts], [2, 2]);
 
         // A's attempt fails late: its backoff would make the row due in a second, under B's open request.
         answers[0](500);
         assert.deepEqual(await a, { delivered: 0, failed: 1 });
-        const row = (await query("SELECT attempts, next_attempt_at, last_status FROM claw_a2a_push_outbox")).rows[0];
-        assert.equal(row.attempts, 2);
+        const row = (await query("SELECT claims, attempts, next_attempt_at, last_status FROM claw_a2a_push_outbox")).rows[0];
+        assert.deepEqual([row.claims, row.attempts], [2, 2]);
         assert.equal(row.next_attempt_at.getTime(), leaseOfB.next_attempt_at.getTime(), "B's lease is as B's claim set it");
         assert.equal(row.last_status, null, "A's answer is not recorded over B's claim");
 
@@ -1021,6 +1026,84 @@ describe("A2A push notifications", { skip }, () => {
       } finally {
         for (const answer of answers) answer(200);
         await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    /** Hold the config table as a long migration or a stuck vacuum would: every read of a config waits until `release`. */
+    async function holdConfigs() {
+      const holder = await harness.connect();
+      await holder.query("BEGIN");
+      await holder.query("LOCK TABLE claw_a2a_push_configs IN ACCESS EXCLUSIVE MODE");
+      return async () => { await holder.query("ROLLBACK"); await holder.end(); };
+    }
+    const CONFIG_READ_WAITING = `FROM pg_stat_activity
+       WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'SELECT url, token_enc%'`;
+
+    test("a database too slow to read the config inside the deadline uses none of a healthy receiver's attempts", async () => {
+      // A receiver at an address literal, which no name lookup slows: the database alone eats the deadline.
+      const hook = await receiver();
+      try {
+        const t = await liveTask();
+        await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: hook.url });
+        await record(t.sessionId, { type: "statusUpdate", agentStatus: "running" }, 1501);
+        // More slow passes than there are attempts: each claim's config read outlasts its deadline.
+        for (let i = 0; i <= push.MAX_DELIVERY_ATTEMPTS; i += 1) {
+          const release = await holdConfigs();
+          let held = true;
+          const freed = sleep(1200).then(() => { held = false; return release(); });
+          const r = await push.deliverDue({ sendDeadlineMs: 400 });
+          // The attempt ends at its deadline, not when the database answers: it is not still going when the lease runs out.
+          assert.equal(held, true, `slow pass ${i + 1} ended inside its deadline`);
+          await freed;
+          assert.deepEqual(r, { delivered: 0, failed: 1 }, `slow pass ${i + 1}`);
+          await expireLeases();
+        }
+        assert.equal(hook.seen.length, 0, "nothing could be sent while the database was slow");
+        const [row] = await outbox();
+        assert.equal(row.attempts, 0, "a claim that never reached the receiver uses no attempt");
+        assert.equal(row.dropped_at, null);
+        assert.match(row.last_status, /^error:deadline/);
+        assert.equal((await deadLetters()).length, 0, "not set aside");
+
+        // The database is quick again: the notification goes, on its first real attempt.
+        assert.deepEqual(await push.deliverDue(), { delivered: 1, failed: 0 });
+        assert.deepEqual(hook.seen.map((s) => label(s.body)), ["WORKING"]);
+        assert.equal((await outbox())[0].attempts, 1);
+      } finally {
+        await hook.close();
+      }
+    });
+
+    test("a config read the database fails (as a statement timeout does) uses no attempt and leaves no claim to expire", async () => {
+      const hook = await receiver();
+      try {
+        const t = await liveTask();
+        await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: hook.url });
+        await record(t.sessionId, { type: "statusUpdate", agentStatus: "running" }, 1601);
+        for (let i = 0; i <= push.MAX_DELIVERY_ATTEMPTS; i += 1) {
+          const release = await holdConfigs();
+          try {
+            const settled = push.deliverDue().then((r) => r, (err: unknown) => err);
+            await until("the config read to wait", async () => (await query(`SELECT COUNT(*)::int AS n ${CONFIG_READ_WAITING}`)).rows[0].n === 1);
+            // Cancelled the way statement_timeout cancels it: SQLSTATE 57014.
+            await query(`SELECT pg_cancel_backend(pid) ${CONFIG_READ_WAITING}`);
+            assert.deepEqual(await settled, { delivered: 0, failed: 1 }, `failed read ${i + 1} is an outcome, not a lost claim`);
+          } finally {
+            await release();
+          }
+          const [row] = await outbox();
+          assert.match(row.last_status, /^error:canceling statement/);
+          assert.equal(row.attempts, 0, "no attempt used");
+          assert.ok(row.next_attempt_at.getTime() - Date.now() <= push.NOT_SENT_RETRY_SECONDS * 1000,
+            "tried again soon, not after the claim's lease");
+          await expireLeases();
+        }
+        assert.equal(hook.seen.length, 0);
+        assert.equal((await deadLetters()).length, 0, "not set aside, nor taken for an unfinished attempt");
+        assert.deepEqual(await push.deliverDue(), { delivered: 1, failed: 0 });
+        assert.deepEqual(hook.seen.map((s) => label(s.body)), ["WORKING"]);
+      } finally {
+        await hook.close();
       }
     });
 

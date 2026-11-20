@@ -171,8 +171,10 @@ release version, and its `appVersion` stays `latest`.
   metrics: `claw_a2a_push_delivery_total{outcome}`, `claw_a2a_push_quarantined_total`,
   `claw_a2a_push_head_consecutive_failures` and `claw_a2a_push_oldest_pending_age_seconds`. A notification is set
   aside even when its dead-letter copy cannot be written (it is then closed as `quarantined_unrecorded:<status>`). Each
-  delivery attempt, name lookup included, now ends within 45 seconds, inside the 120-second claim lease, so a lookup
-  that hangs can no longer let another replica send the next notification before a late copy of this one. See "Push
+  delivery attempt, config read and name lookup included, now ends within 45 seconds, inside the 120-second claim lease,
+  so a lookup that hangs can no longer let another replica send the next notification before a late copy of this one.
+  Only an attempt that reached the receiver (a request started, or its name looked up and not found) counts toward
+  the eight, so a slow or failing database cannot set aside a notification whose receiver is healthy. See "Push
   notifications" in `claw/docs/a2a.md`.
 - Claw: an event a connector posts whose text holds a NUL (terminal output carries them) or half of a surrogate pair is
   now stored, with each such character replaced by U+FFFD, in keys and values alike. Until now PostgreSQL's `jsonb`

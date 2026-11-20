@@ -92,6 +92,12 @@ export const CLAIM_LEASE_SECONDS = 120;
 export const SEND_DEADLINE_MS = 45_000;
 /** Less than this left before the deadline: the request is not started. */
 const MIN_SEND_WINDOW_MS = 1_000;
+/**
+ * When a claim ends before its receiver was asked (the database was too slow, or
+ * failed, to read the config or record the attempt), the head is tried again
+ * after this, without using an attempt.
+ */
+export const NOT_SENT_RETRY_SECONDS = 5;
 const CLAIM_BATCH = 20;
 
 export const NOTIFICATION_TOKEN_HEADER = "X-A2A-Notification-Token";
@@ -439,7 +445,15 @@ interface Claimed {
   task_id: string;
   config_id: string;
   payload: StreamResponse;
-  /** Also the claim's fence: a later claim of the row raises it. */
+  /** The claim's fence: a later claim of the row raises it. */
+  claims: number;
+  /**
+   * Attempts used so far: times its receiver was asked (a request started, or
+   * its name looked up and not found). A claim alone uses none, so a database
+   * too slow to get as far as the receiver cannot use up a healthy receiver's
+   * budget. Raised in the database before a request starts, so a send the
+   * process dies in is counted.
+   */
   attempts: number;
   final: boolean;
 }
@@ -447,10 +461,10 @@ interface Claimed {
 /**
  * The condition every write of an attempt's outcome carries: the row is still
  * open and still under this claim. A replica that claimed it again after the
- * lease ran out has raised `attempts`, so a late answer from the earlier claim
+ * lease ran out has raised `claims`, so a late answer from the earlier claim
  * changes nothing (it would otherwise, say, cut the new claim's lease short).
  */
-const FENCE = "id = $1 AND attempts = $2 AND delivered_at IS NULL AND dropped_at IS NULL";
+const FENCE = "id = $1 AND claims = $2 AND delivered_at IS NULL AND dropped_at IS NULL";
 
 async function claimDue(): Promise<Claimed[]> {
   // Per configuration the oldest undelivered row goes first, and only it:
@@ -465,7 +479,7 @@ async function claimDue(): Promise<Claimed[]> {
         ORDER BY task_id, config_id, id
      )
      UPDATE claw_a2a_push_outbox o
-        SET attempts = o.attempts + 1,
+        SET claims = o.claims + 1,
             next_attempt_at = NOW() + make_interval(secs => $2)
       WHERE o.id IN (
         SELECT id FROM claw_a2a_push_outbox
@@ -473,16 +487,21 @@ async function claimDue(): Promise<Claimed[]> {
          ORDER BY next_attempt_at
          LIMIT $1
          FOR UPDATE SKIP LOCKED)
-      RETURNING o.id, o.task_id, o.config_id, o.payload, o.attempts, o.final`,
+      RETURNING o.id, o.task_id, o.config_id, o.payload, o.claims, o.attempts, o.final`,
     [CLAIM_BATCH, CLAIM_LEASE_SECONDS],
   )).rows as Claimed[];
 }
 
-/** Close a row under its claim. False when another claim has it now, or it is already closed. */
-async function closeRow(row: Claimed, column: "delivered_at" | "dropped_at", status: string): Promise<boolean> {
+/**
+ * Close a row under its claim, recording `attempts` when given. False when
+ * another claim has it now, or it is already closed.
+ */
+async function closeRow(
+  row: Claimed, column: "delivered_at" | "dropped_at", status: string, attempts?: number,
+): Promise<boolean> {
   const r = await db.query(
-    `UPDATE claw_a2a_push_outbox SET ${column} = NOW(), last_status = $3 WHERE ${FENCE}`,
-    [row.id, row.attempts, status],
+    `UPDATE claw_a2a_push_outbox SET ${column} = NOW(), last_status = $3, attempts = COALESCE($4::int, attempts) WHERE ${FENCE}`,
+    [row.id, row.claims, status, attempts ?? null],
   );
   return (r.rowCount ?? 0) > 0;
 }
@@ -505,13 +524,13 @@ async function retireIfFinal(row: Claimed): Promise<void> {
  * and its status says no record was kept. The log lines name the row, not what
  * it says.
  */
-async function quarantine(row: Claimed, status: string): Promise<void> {
-  const ids = { outboxId: row.id, taskId: row.task_id, configId: row.config_id, attempts: row.attempts, status, final: row.final };
+async function quarantine(row: Claimed, status: string, attempts: number): Promise<void> {
+  const ids = { outboxId: row.id, taskId: row.task_id, configId: row.config_id, attempts, status, final: row.final };
   let closed: boolean;
   try {
     const r = await db.query(
       `WITH moved AS (
-         UPDATE claw_a2a_push_outbox SET dropped_at = NOW(), last_status = $3
+         UPDATE claw_a2a_push_outbox SET dropped_at = NOW(), last_status = $3, attempts = $5
           WHERE ${FENCE}
          RETURNING id, task_id, config_id, dedupe_key, payload, final, attempts, created_at
        ), kept AS (
@@ -521,13 +540,13 @@ async function quarantine(row: Claimed, status: string): Promise<void> {
          ON CONFLICT (outbox_id) DO NOTHING
        )
        SELECT COUNT(*)::int AS n FROM moved`,
-      [row.id, row.attempts, `quarantined:${status}`, status],
+      [row.id, row.claims, `quarantined:${status}`, status, attempts],
     );
     closed = Number((r.rows[0] as { n: number }).n) > 0;
   } catch (err) {
     // The SQLSTATE only: a database error's text can quote the row.
     logger.error({ ...ids, code: (err as { code?: unknown }).code ?? "unknown" }, "a2a_push.dead_letter_failed");
-    closed = await closeRow(row, "dropped_at", `quarantined_unrecorded:${status}`);
+    closed = await closeRow(row, "dropped_at", `quarantined_unrecorded:${status}`, attempts);
   }
   // Another claim has the row now, or it is closed already: that one answers for it.
   if (!closed) return;
@@ -538,35 +557,65 @@ async function quarantine(row: Claimed, status: string): Promise<void> {
 
 /**
  * One attempt at a claimed head. `deadline` (a `performance.now()` reading,
- * taken before the claim) bounds all of it: name resolution has no timeout of
- * its own, and a request is only started with time left before it.
+ * taken before the claim) bounds all of it, the config read included: name
+ * resolution has no timeout of its own, and a request is only started with time
+ * left before it.
+ *
+ * Only an attempt that reached the receiver uses one of its
+ * MAX_DELIVERY_ATTEMPTS: a request that was started, or a lookup of its name
+ * that answered that there is none. A claim that ends before that (the config
+ * read or the attempt's own record was slow or failed, a lookup was cut off by
+ * the deadline) is tried again with its count as the claim found it, so a
+ * database that is slow for a while cannot set aside a notification whose
+ * receiver is healthy.
  */
 async function sendOne(row: Claimed, deps: DeliveryDeps, deadline: number): Promise<boolean> {
   const left = () => deadline - performance.now();
-  const config = (await db.query(
-    `SELECT url, token_enc, auth_scheme, auth_credentials_enc FROM claw_a2a_push_configs
-      WHERE task_id = $1 AND config_id = $2`,
-    [row.task_id, row.config_id],
-  )).rows[0] as Record<string, string | null> | undefined;
-  if (!config) {
-    if (await closeRow(row, "dropped_at", "config_gone")) metrics.onA2aPushDelivery("dropped");
-    return false;
-  }
+  // The attempts the row has used once this one ends: one more only if the receiver was asked.
+  let attempts = row.attempts;
   let status: string;
   try {
+    const config = (await within(db.query(
+      `SELECT url, token_enc, auth_scheme, auth_credentials_enc FROM claw_a2a_push_configs
+        WHERE task_id = $1 AND config_id = $2`,
+      [row.task_id, row.config_id],
+    ), left())).rows[0] as Record<string, string | null> | undefined;
+    if (!config) {
+      if (await closeRow(row, "dropped_at", "config_gone")) metrics.onA2aPushDelivery("dropped");
+      return false;
+    }
     const resolve = deps.resolve ?? defaultResolver;
+    let lookupCut = false;
     const target = await guardPushUrl(
       String(config.url), deps.allowedHosts ?? a2aPushAllowedHosts(),
       deps.allowedHostsOnly ?? a2aPushAllowedHostsOnly(),
       // A lookup that does not come back in time is a name that does not resolve right now.
-      (host) => within(resolve(host), left()),
+      (host) => within(resolve(host), left()).catch((err: unknown) => {
+        if (err instanceof DeadlineExceeded) lookupCut = true;
+        throw err;
+      }),
     );
     if (!target.ok) {
       status = `refused:${target.reason}`;
+      // The receiver's name was looked up and there is none: that is its attempt.
+      // One the deadline cut short asked nobody.
+      if (target.reason === "unresolvable_host" && !lookupCut) attempts = row.attempts + 1;
     } else if (left() < MIN_SEND_WINDOW_MS) {
       // Too late to start: the lease may run out while the request is on the wire.
       throw new DeadlineExceeded();
     } else {
+      // Counted before the request starts, so a send the process dies in (which
+      // a payload can cause) has used its attempt when the head is claimed again.
+      const counted = await within(db.query(
+        `UPDATE claw_a2a_push_outbox SET attempts = attempts + 1 WHERE ${FENCE} RETURNING attempts`,
+        [row.id, row.claims],
+      ), left());
+      // Another claim has the row now, or it is closed: that one answers for it.
+      if (!counted.rowCount) return false;
+      // Recording it took the time a request needed: not sent, and the outcome
+      // below sets the count back to what the claim found.
+      if (left() < MIN_SEND_WINDOW_MS) throw new DeadlineExceeded();
+      attempts = Number((counted.rows[0] as { attempts: number }).attempts);
       const headers: Record<string, string> = { "content-type": NOTIFICATION_CONTENT_TYPE };
       if (config.token_enc) headers[NOTIFICATION_TOKEN_HEADER] = decryptUserEnvValue(config.token_enc);
       if (config.auth_scheme && config.auth_credentials_enc) {
@@ -596,13 +645,18 @@ async function sendOne(row: Claimed, deps: DeliveryDeps, deadline: number): Prom
     metrics.onA2aPushDelivery("dropped");
     logger.warn({ configId: row.config_id, status }, "a2a_push.dropped");
     await retireIfFinal(row);
-  } else if (row.attempts >= MAX_DELIVERY_ATTEMPTS) {
-    await quarantine(row, status);
+  } else if (attempts >= MAX_DELIVERY_ATTEMPTS) {
+    await quarantine(row, status, attempts);
   } else {
-    const wait = RETRY_BACKOFF_SECONDS[Math.min(row.attempts - 1, RETRY_BACKOFF_SECONDS.length - 1)];
+    const wait = attempts > row.attempts
+      ? RETRY_BACKOFF_SECONDS[Math.min(attempts - 1, RETRY_BACKOFF_SECONDS.length - 1)]
+      : NOT_SENT_RETRY_SECONDS;
+    // The count is written, not added to: a claim that recorded an attempt and
+    // then sent nothing gives it back here.
     const r = await db.query(
-      `UPDATE claw_a2a_push_outbox SET next_attempt_at = NOW() + make_interval(secs => $3), last_status = $4 WHERE ${FENCE}`,
-      [row.id, row.attempts, wait, status],
+      `UPDATE claw_a2a_push_outbox SET next_attempt_at = NOW() + make_interval(secs => $3), last_status = $4, attempts = $5
+        WHERE ${FENCE}`,
+      [row.id, row.claims, wait, status, attempts],
     );
     if (r.rowCount) metrics.onA2aPushDelivery("retried");
   }
@@ -618,10 +672,11 @@ export async function deliverDue(deps: DeliveryDeps = {}): Promise<{ delivered: 
   // The claim takes one row per configuration, so these are all different receivers.
   await Promise.all((await claimDue()).map(async (row) => {
     // Claimed again with every attempt already used: the last one never came
-    // back (the process died sending it, which a payload can cause), so it is
-    // not given another.
-    if (row.attempts > MAX_DELIVERY_ATTEMPTS) {
-      await quarantine(row, "attempt_unfinished");
+    // back (the process died sending it, which a payload can cause; a last
+    // attempt that came back would have set the head aside), so it is not
+    // given another.
+    if (row.attempts >= MAX_DELIVERY_ATTEMPTS) {
+      await quarantine(row, "attempt_unfinished", row.attempts);
       failed += 1;
       return;
     }

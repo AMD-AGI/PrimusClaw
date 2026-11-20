@@ -127,7 +127,13 @@ own. Delivery is at least once and in order per config, retried with backoff
 (1, 5, 30, then every 300 seconds).
 
 A notification that fails eight times in a row (about twenty minutes) is set
-aside so the ones behind it are sent: its outbox row is closed, a copy is kept in
+aside so the ones behind it are sent. An attempt counts when its receiver was
+asked: a request was started, or the receiver's name was looked up and not
+found. A pass that never got that far (the database too slow or failing to read
+the config, a name lookup cut off by the deadline) is tried again five seconds
+later without using one, so a database that is slow for a while cannot set aside
+a notification whose receiver is healthy. When it is set aside, its outbox row
+is closed, a copy is kept in
 `claw_a2a_push_dead_letters` for 14 days, and the API logs
 `a2a_push.quarantined` with the task, config and status but not the content. A
 receiver that is down for longer therefore loses at most one notification per
@@ -138,8 +144,8 @@ with `last_status = quarantined_unrecorded:<status>` and the payload kept on it,
 and `a2a_push.dead_letter_failed` is logged: a head that could not be set aside
 would hold its webhook for good.
 
-Each attempt, from its claim to the end of the request, including the name
-lookup, ends within 45 seconds or is abandoned and retried; a claim's lease is
+Each attempt, from its claim to the end of the request, including the config
+read and the name lookup, ends within 45 seconds or is abandoned and retried; a claim's lease is
 120 seconds, so no attempt is still being sent when another replica can claim the
 same notification and go on to the next. A late answer from an attempt whose
 lease ran out is not recorded over the newer claim. Text that PostgreSQL cannot

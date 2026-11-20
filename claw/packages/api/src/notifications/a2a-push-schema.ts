@@ -74,6 +74,7 @@ export async function ensureA2aPushSchema(client: pg.PoolClient): Promise<void> 
       payload         JSONB NOT NULL,
       final           BOOLEAN NOT NULL DEFAULT FALSE,
       attempts        INT NOT NULL DEFAULT 0,
+      claims          INT NOT NULL DEFAULT 0,
       next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       delivered_at    TIMESTAMPTZ,
       dropped_at      TIMESTAMPTZ,
@@ -84,6 +85,20 @@ export async function ensureA2aPushSchema(client: pg.PoolClient): Promise<void> 
       UNIQUE (task_id, config_id, dedupe_key)
     )
   `);
+  // A claim is counted apart from an attempt (a claim that never reached the
+  // receiver uses no attempt). A row written before keeps its attempts and
+  // starts its claims, the claim fence, from them.
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'claw_a2a_push_outbox' AND column_name = 'claims') THEN
+        ALTER TABLE claw_a2a_push_outbox ADD COLUMN claims INT NOT NULL DEFAULT 0;
+        UPDATE claw_a2a_push_outbox SET claims = attempts;
+      END IF;
+    END $$`);
   await client.query(
     `CREATE INDEX IF NOT EXISTS idx_a2a_push_outbox_due
        ON claw_a2a_push_outbox(next_attempt_at)
