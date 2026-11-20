@@ -1,7 +1,10 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-/** SaFE deploy mode with LLM_KEY_SOURCE=platformKey: LLM calls use the platform key, and SaFE's verify is not asked for the virtual key. */
+/**
+ * SaFE deploy mode with LLM_KEY_SOURCE=platformKey: LLM calls use the platform key, and SaFE's verify is still asked
+ * for the virtual key, as in every mode: that request is also what makes SaFE report the email of an `ak-` key's owner.
+ */
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -34,8 +37,8 @@ test("an explicit LLM_KEY_SOURCE=platformKey is kept in SaFE deploy mode", () =>
   assert.equal(config.LLM_KEY_SOURCE, "platformKey");
 });
 
-test("SaFE's verify is asked for the platform key only", async () => {
+test("SaFE's verify is asked for both keys, so it reports the owner's email", async () => {
   const body = await verifyBodyOf(new SafeClient("http://safe.test"));
   assert.equal(body.includePlatformKey, true);
-  assert.equal(body.includeVirtualKey, undefined);
+  assert.equal(body.includeVirtualKey, true);
 });
