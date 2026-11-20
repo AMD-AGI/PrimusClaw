@@ -180,7 +180,8 @@ release version, and its `appVersion` stays `latest`.
   branch that restricts who may push; a 403 in other words, or one with Retry-After or a rate limit, is not one, since a
   retry may get past it), the sweep asks R once per head, with the same
   gates as before (R wrote the pull request and may push, X's approval of the head is on GitHub, CI green, no open thread,
-  merge state `CLEAN`): a `claw_github_confirmations` row of the new kind `requester_merge` whose acting user is R, sent to
+  merge state `CLEAN`, strictly: unlike X's own merge, `UNSTABLE` is not read as open even when only checks the base
+  branch does not require failed): a `claw_github_confirmations` row of the new kind `requester_merge` whose acting user is R, sent to
   R's own assistant conversation as an `assistant.say` carrying `confirm_write` (kind `github_merge`): "X 已批准 …，但 X
   没有合入权限；要用你自己的账号合入吗？" with 合入 and 不合 (or `批准 #<ref>` / `拒绝 #<ref>`). R's yes, through the
   same decision routes as any held write, reads every gate again and the head must be the one R was asked about; then R's
