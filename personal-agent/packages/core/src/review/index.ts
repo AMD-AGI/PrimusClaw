@@ -10,6 +10,7 @@ export { REVIEW_MODE_NAMES, isReviewMode, type ReviewMode } from "./review-turn.
 export { connectionsText, UNKNOWN, type ConnectionsInput } from "./connect/connections.js";
 export { GithubReview } from "./service/github-review.js";
 export { ReviewHandoffAction, type HandoffActionDeps } from "./service/handoff-action.js";
+export { ONBOARDING_SWEEP_MS } from "./service/onboarding.js";
 export type { ReviewDeps, ReviewHost, StartReviewTurn, Guard, Audit, FollowWire, RestoreRef } from "./service/deps.js";
 export type { PostWorkCard } from "./service/notices.js";
 export {

@@ -34,6 +34,7 @@ import { CARD_SWEEP_MS, ItemCards } from "./item-cards.js";
 import { ReviewItems } from "./items.js";
 import { ReviewLaunch } from "./launch.js";
 import { Notices, type PostWorkCard } from "./notices.js";
+import { ONBOARDING_CLICK, ReviewerOnboarding } from "./onboarding.js";
 import { RequestReader } from "./request.js";
 import { ReviewerReader } from "./reviewer.js";
 import { ReviewChecks, type RequestContext } from "./start.js";
@@ -63,6 +64,7 @@ export class GithubReview {
   private readonly held: HeldWrites;
   private readonly checks: ReviewChecks;
   private readonly launch: ReviewLaunch;
+  private readonly onboarding: ReviewerOnboarding;
 
   constructor(
     private readonly deps: ReviewDeps,
@@ -81,7 +83,17 @@ export class GithubReview {
     this.held = new HeldWrites(deps, this.notices, this.account);
     this.turns.offerHeld = (review, item, asked) => this.held.offer(review, item, asked);
     this.launch = new ReviewLaunch(deps, this.items, this.notices, this.cards, this.follows, this.turns);
-    this.checks = new ReviewChecks(deps, this.reviewers, this.items, this.notices, (s, held, handed) =>
+    this.onboarding = new ReviewerOnboarding(
+      deps,
+      this.notices,
+      random,
+      (ctx, ask, actor) => this.checks.request(ctx, ask, actor),
+      (sender, args, conversation) => this.account.command(sender, args, conversation),
+    );
+    // (a step done here is answered with the next one; turning the authorization off tells whoever waits on it)
+    this.account.changed = (userId, change) =>
+      change === "delegation_off" ? this.onboarding.declined(userId) : this.onboarding.advance(userId);
+    this.checks = new ReviewChecks(deps, this.reviewers, this.items, this.notices, this.onboarding, (s, held, handed) =>
       this.launch.launch(s, held, handed),
     );
     this.turns.retryAsItem = (review, s) => this.launch.asItem(review, s);
@@ -90,6 +102,7 @@ export class GithubReview {
   /** Settles when the background work started so far (device flows, follows, hints) has ended. For tests. */
   async idle(): Promise<void> {
     await Promise.all([this.account.idle(), this.follows.idle(), this.connect.idle()]);
+    await this.onboarding.idle();
   }
 
   /** Which channel id is whose, from a message of theirs: a mention in a group can then be read without the member list. */
@@ -97,6 +110,13 @@ export class GithubReview {
     const sender = message.sender;
     if (sender.channelUserId)
       this.deps.store.members.rememberMember(sender.channelUserId, sender.id, sender.name, sender.email);
+    // (a reviewer something waits for may have done a step elsewhere: the identity service says nothing when they do)
+    this.onboarding.activity(sender.id);
+  }
+
+  /** The reviewers a review waits for, read again: each step done is answered with the next (every ONBOARDING_SWEEP_MS). */
+  sweepOnboarding(): Promise<void> {
+    return this.onboarding.sweep();
   }
 
   private context(route: MessageRoute): RequestContext {
@@ -349,7 +369,7 @@ export class GithubReview {
       clicks: [
         {
           // (the action's `verb` is its card data's `primusclaw` kind, as the adapter reads it; never the channel's verb)
-          verbs: ["github_mode", "github_confirm", "github_connect"],
+          verbs: ["github_mode", "github_confirm", "github_connect", ONBOARDING_CLICK],
           beforeCredential: async (click: ClickRoute) => {
             await this.click(click);
             return true;
@@ -363,7 +383,9 @@ export class GithubReview {
     const data = click.action.data;
     const settle = (card: Parameters<ClickRoute["settle"]>[0], fallback?: string): Promise<boolean> =>
       click.settle(card, fallback === undefined ? {} : { fallback });
-    if (data.primusclaw === "github_mode") await this.account.modeClick(click.sender, data, settle, click.conversation);
+    if (data.primusclaw === ONBOARDING_CLICK) await this.onboarding.click(click);
+    else if (data.primusclaw === "github_mode")
+      await this.account.modeClick(click.sender, data, settle, click.conversation);
     else if (data.primusclaw === "github_confirm")
       await this.held.click(click.sender, data, settle, click.conversation);
     else await this.connect.dismiss(click.sender, data, click.lang(), settle);

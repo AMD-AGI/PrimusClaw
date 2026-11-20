@@ -26,10 +26,6 @@ export const reviewStartText = {
   unsureWhoFull: (bot: string) =>
     `我不确定你请的是谁，所以没有开始 review。请写出 reviewer 的全名，例如 ${howToAsk(bot)}`,
   githubUnknown: (who: string) => `暂时无法确认 ${who} 的 GitHub 绑定，请稍后再试。`,
-  notAuthorized: (who: string, merge: boolean) =>
-    `${who} 还没有授权我代 TA ${merge ? "review 合入" : "review"}（需要 TA 在 1:1 里发 \`/github auto-merge on\` 开启一次长期授权），我不会动用 TA 的 GitHub 账号，所以没有开始 review。请 ${who} 授权后再 @ 我一次。`,
-  reviewerNotLinked: (who: string, bot: string) =>
-    `${who} 还没有在 ${bot} 里连接自己的 Primus key（1:1 里发 \`/link\`），代 TA review 要用 TA 自己的账号和模型额度，所以没有开始 review。请 ${who} 先连接，然后再 @ 我一次。`,
   reviewerNotConnected: (who: string, bot: string) =>
     `${who} 还没有通过 Primus 身份服务连接 ${bot}，我没法以 TA 的身份开始，所以没有开始 review。请 ${who} 先在 1:1 里完成连接，然后再 @ 我一次。`,
   reviewerPlatformDown: (who: string) =>

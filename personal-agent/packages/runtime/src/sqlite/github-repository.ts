@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 /** GitHub review delegation on SQLite (tables `github_confirmations`, `acting_sessions`, `review_notices`,
- * `asker_follows`, `github_notices`). */
+ * `asker_follows`, `github_notices`, `review_onboarding`). */
 import {
   ACTING_SESSION_KEEP_SECONDS,
+  REVIEW_ONBOARDING_KEEP_SECONDS,
   type AskerFollow,
   type ConfirmationState,
   type GithubConfirmation,
@@ -13,6 +14,7 @@ import {
   type NewGithubConfirmation,
   type ReviewDelegationRepository,
   type ReviewNotice,
+  type ReviewOnboarding,
 } from "@primusclaw/personal-agent";
 
 import type { StoreContext } from "./context.js";
@@ -36,6 +38,21 @@ function confirmation(row: Row): GithubConfirmation {
     createdAt: col.num(row, "created_at"),
     kind: col.str(row, "kind"),
     event: col.str(row, "event"),
+  };
+}
+
+const ONBOARDING_COLUMNS = "onboarding_id, actor_aad, requester_aad, pulls, request_json, told_rank, done, created_at";
+
+function onboarding(row: Row): ReviewOnboarding {
+  return {
+    onboardingId: col.str(row, "onboarding_id"),
+    actorId: col.str(row, "actor_aad"),
+    requesterId: col.str(row, "requester_aad"),
+    pulls: col.str(row, "pulls"),
+    request: storedObject(col.str(row, "request_json")) ?? {},
+    toldRank: col.num(row, "told_rank"),
+    done: col.bool(row, "done"),
+    createdAt: col.num(row, "created_at"),
   };
 }
 
@@ -204,5 +221,90 @@ export class SqliteReviewDelegationRepository implements ReviewDelegationReposit
 
   releaseGithubNotice(userId: string, kind: string): void {
     this.ctx.db.run("DELETE FROM github_notices WHERE aad_id = ? AND kind = ?", userId, kind);
+  }
+
+  saveReviewOnboarding(o: {
+    readonly onboardingId: string;
+    readonly actorId: string;
+    readonly requesterId: string;
+    readonly pulls: string;
+    readonly request: JsonObject;
+    readonly toldRank: number;
+  }): ReviewOnboarding {
+    const { db } = this.ctx;
+    const now = this.ctx.now();
+    db.run("DELETE FROM review_onboarding WHERE created_at < ?", now - REVIEW_ONBOARDING_KEEP_SECONDS);
+    // (asked again: the same row, with the latest request and the step the reviewer is at now, owed to the asker again)
+    db.run(
+      "INSERT INTO review_onboarding (onboarding_id, actor_aad, requester_aad, pulls, request_json, told_rank, created_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (actor_aad, requester_aad, pulls) DO UPDATE SET " +
+        "request_json = excluded.request_json, told_rank = excluded.told_rank, done = 0, created_at = excluded.created_at",
+      o.onboardingId,
+      o.actorId,
+      o.requesterId,
+      o.pulls,
+      pyJsonDumps(o.request),
+      o.toldRank,
+      now,
+    );
+    const row = db.get(
+      `SELECT ${ONBOARDING_COLUMNS} FROM review_onboarding WHERE actor_aad = ? AND requester_aad = ? AND pulls = ?`,
+      o.actorId,
+      o.requesterId,
+      o.pulls,
+    );
+    if (row === undefined) throw new Error("the review onboarding row was not kept");
+    return onboarding(row);
+  }
+
+  getReviewOnboarding(onboardingId: string): ReviewOnboarding | null {
+    const row = this.ctx.db.get(
+      `SELECT ${ONBOARDING_COLUMNS} FROM review_onboarding WHERE onboarding_id = ? AND created_at >= ?`,
+      onboardingId,
+      this.ctx.now() - REVIEW_ONBOARDING_KEEP_SECONDS,
+    );
+    return row ? onboarding(row) : null;
+  }
+
+  openReviewOnboardings(actorId: string): ReviewOnboarding[] {
+    return this.ctx.db
+      .all(
+        `SELECT ${ONBOARDING_COLUMNS} FROM review_onboarding WHERE actor_aad = ? AND done = 0 AND created_at >= ? ` +
+          "ORDER BY created_at, rowid",
+        actorId,
+        this.ctx.now() - REVIEW_ONBOARDING_KEEP_SECONDS,
+      )
+      .map(onboarding);
+  }
+
+  onboardingReviewers(): string[] {
+    return this.ctx.db
+      .all(
+        "SELECT DISTINCT actor_aad FROM review_onboarding WHERE done = 0 AND created_at >= ? ORDER BY actor_aad",
+        this.ctx.now() - REVIEW_ONBOARDING_KEEP_SECONDS,
+      )
+      .map((r) => col.str(r, "actor_aad"));
+  }
+
+  claimOnboardingStep(actorId: string, rank: number): boolean {
+    return (
+      this.ctx.db.run(
+        "UPDATE review_onboarding SET told_rank = ? WHERE actor_aad = ? AND done = 0 AND told_rank < ? AND created_at >= ?",
+        rank,
+        actorId,
+        rank,
+        this.ctx.now() - REVIEW_ONBOARDING_KEEP_SECONDS,
+      ) > 0
+    );
+  }
+
+  finishReviewOnboarding(onboardingId: string): boolean {
+    return (
+      this.ctx.db.run("UPDATE review_onboarding SET done = 1 WHERE onboarding_id = ? AND done = 0", onboardingId) === 1
+    );
+  }
+
+  dropReviewOnboarding(onboardingId: string): void {
+    this.ctx.db.run("DELETE FROM review_onboarding WHERE onboarding_id = ?", onboardingId);
   }
 }
