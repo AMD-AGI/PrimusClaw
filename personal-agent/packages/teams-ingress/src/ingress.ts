@@ -451,11 +451,25 @@ export class Ingress {
     const logs = sink === undefined ? this.logs : this.logsFor(sink);
     this.logPrefetchOnce(logs.app);
     const arrived = performance.now();
+    const started = this.clock.monotonic();
     const body = parseBody(req.body);
     const activity = body instanceof Map ? (plain(body) as JsonObject) : null;
 
-    // Authenticate before anything else is decided, so an unauthenticated caller gets a 401 whatever it sent.
-    const refused = await this.authenticate(req, activity, logs.sink);
+    // Authenticate before anything else is decided, so an unauthenticated caller gets a 401 whatever it sent. The token
+    // check races the request's send deadline: on a cold instance it fetches the OpenID metadata and then the signing
+    // keys (up to 15 s and 30 s, src/keys.ts), and a request still running when the Bot Framework stops waiting is
+    // dropped (a 499) and its message lost. At the deadline it is a 500, which says nothing about the token and which
+    // Teams retries; the fetch carries on in the background and its keys are cached for the retry.
+    const deadline = AbortSignal.timeout(Math.max(1, Math.ceil(this.sendDeadlineSeconds * 1000)));
+    let refused: Reply | null;
+    try {
+      refused = await beforeDeadline(this.authenticate(req, activity, logs.sink), deadline);
+    } catch (error) {
+      if (!deadline.aborted || error !== deadline.reason) throw error;
+      this.health.enqueueFailed(logs.sink, { kind: "activity", error, attempts: 0, started });
+      logs.app.error("failed to enqueue activity: the token check did not finish before the send deadline", error);
+      return empty(500);
+    }
     if (refused !== null) return refused;
     if (activity === null || body === null) return empty(400);
 

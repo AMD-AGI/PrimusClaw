@@ -328,6 +328,64 @@ test("a token check that used the whole deadline is a 500 at once, with no send 
   );
 });
 
+test(
+  "a token check that never finishes is a 500 at the deadline, and nothing is queued",
+  { timeout: 5000 },
+  async () => {
+    // A cold instance whose OpenID metadata or key fetch hangs (they may take 15 s and 30 s): the Bot Framework stops
+    // waiting at 15 s, and a request still running then is a 499 and a lost message. The deadline must end it with a 500.
+    const { fleet, ingress, log } = make([["ok"]], { attempt: 0.15, deadline: 0.3 });
+    ingress.validate = () => new Promise<never>(() => undefined);
+    const [reply, ms] = await timed(() => post(ingress, MESSAGE));
+    assert.equal(reply.status, 500);
+    assert.ok(ms >= 250, `took ${String(ms)} ms`);
+    assert.ok(ms < 300 + 150, `took ${String(ms)} ms: the hung token check held the request past its deadline`);
+    assert.equal(fleet.clients.length, 0, "no client is opened for an unauthenticated request");
+    assert.deepEqual(fleet.queued, []);
+    const failed = health(log).filter((r) => r["event"] === "inbound_enqueue_failed");
+    assert.deepEqual(
+      failed.map((r) => [r["kind"], r["attempts"], r["error"]]),
+      [["activity", 0, "TimeoutError"]],
+    );
+    assert.ok(Number(nth(failed, 0)["elapsed_ms"]) >= 250, "elapsed_ms counts from the request's arrival");
+    assert.ok(log.records.some((r) => r.message.startsWith("failed to enqueue activity")));
+    assert.equal(ingress.health.counters.enqueueFailures, 1);
+  },
+);
+
+test(
+  "a token check that finishes after the deadline queues nothing: the 500 stands and Teams retries",
+  { timeout: 5000 },
+  async () => {
+    const { fleet, ingress } = make([["ok"]], { attempt: 0.15, deadline: 0.2 });
+    let finished = false;
+    ingress.validate = () =>
+      new Promise((resolve) => {
+        setTimeout(() => {
+          finished = true;
+          resolve({});
+        }, 350);
+      });
+    const reply = await post(ingress, MESSAGE);
+    assert.equal(reply.status, 500);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.ok(finished);
+    assert.equal(fleet.clients.length, 0, "the late token check does not go on to send");
+    assert.deepEqual(fleet.queued, []);
+    // The retry, with the keys now cached, goes through once.
+    ingress.validate = () => Promise.resolve({});
+    assert.equal((await post(ingress, MESSAGE)).status, 200);
+    assert.equal(fleet.queued.length, 1);
+  },
+);
+
+test("an unexpected token-check error within the deadline still throws (a 500 from the host), as before", async () => {
+  const { fleet, ingress } = make([["ok"]], { attempt: 0.15, deadline: 0.3 });
+  ingress.validate = () => Promise.reject(new Error("boom"));
+  await assert.rejects(() => post(ingress, MESSAGE), /boom/);
+  assert.equal(fleet.clients.length, 0);
+});
+
 test("waiting for a start-up prefetch that never finishes is bounded by the deadline too", async () => {
   const { fleet, ingress, log } = make([["ok"]], { attempt: 0.15, deadline: 0.3 });
   ingress.prefetchWaitSeconds = 3;
