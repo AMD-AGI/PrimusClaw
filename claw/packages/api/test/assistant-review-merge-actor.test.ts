@@ -24,6 +24,8 @@
  *       bob may merge once it passes, so alice is never asked and her account is never fetched
  *   MA8 GitHub's merge state is UNSTABLE (only a check the base branch does not require failed): bob's own merge goes ahead as GitHub
  *       would, but alice's account needs CLEAN: she is not asked while it is UNSTABLE, and 合入 pressed while it is merges nothing
+ *   MA9 the base branch has a merge queue: alice's account needs CLEAN there too. While the state is UNSTABLE or BLOCKED she is not
+ *       asked, and 合入 pressed while it is puts nothing in the queue
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -392,6 +394,43 @@ describe("whose account merges a review asked of someone else", { skip }, () => 
     const answer = await press(ALICE, s.askId, "allow");
     assert.deepEqual([answer.data?.status, answer.data?.reason], ["refused", "merge_state_not_clean"], JSON.stringify(answer));
     assert.equal(puts().length, 0, "nothing merged with alice's account");
+  });
+
+  test("MA9 a merge queue does not lift the CLEAN gate: alice is not asked while it is UNSTABLE or BLOCKED, and 合入 pressed then queues nothing", async () => {
+    const reset = async () => {
+      await w.q("TRUNCATE claw_work_item_events, claw_work_items, claw_assistant_says, claw_pending_messages, claw_tasks, claw_assistants, claw_assistant_messages, claw_sessions, claw_github_confirmations, claw_github_audit, claw_github_review_settings, claw_github_write_locks, claw_notification_outbox, claw_notification_subscriptions CASCADE");
+      gh = new fake.FakeGithub();
+      resolved = [];
+    };
+    for (const mergeStateStatus of ["UNSTABLE", "BLOCKED"]) {
+      // Not CLEAN before she is asked: bob's merge was refused for a permission, then the queue is on and the state is not CLEAN.
+      await reset();
+      const r = await askBob("fully_auto");
+      gh.mergeAnswers = [NOT_AUTHORIZED];
+      const merged = await bobReviews(r, "low");
+      assert.deepEqual([merged.status, merged.reason], ["refused", "merge_not_permitted"], JSON.stringify(merged));
+      gh.graphql.isMergeQueueEnabled = true;
+      gh.graphql.mergeStateStatus = mergeStateStatus;
+      if (mergeStateStatus === "UNSTABLE") gh.statuses = [{ context: "codecov/patch", state: "failure" }];
+      gh.calls.length = 0;
+      for (let i = 0; i < 3; i++) assert.equal(await sweep(), 0);
+      assert.deepEqual(await asks(r.sessionId), [], `never asked through a merge queue while the merge state is ${mergeStateStatus}`);
+      assert.deepEqual(await cardsTo(ALICE), [], mergeStateStatus);
+      assert.equal(gh.enqueues.length, 0, `nothing queued while ${mergeStateStatus}`);
+      assert.equal(puts().length, 0, mergeStateStatus);
+      // Not CLEAN after she was asked: her 合入 reads it again and puts nothing in the queue.
+      await reset();
+      const s = await bobCannotMerge();
+      gh.graphql.isMergeQueueEnabled = true;
+      gh.graphql.mergeStateStatus = mergeStateStatus;
+      if (mergeStateStatus === "UNSTABLE") gh.statuses = [{ context: "codecov/patch", state: "failure" }];
+      gh.calls.length = 0;
+      const answer = await press(ALICE, s.askId, "allow");
+      assert.deepEqual([answer.data?.status, answer.data?.reason], ["refused", "merge_state_not_clean"], `${mergeStateStatus}: ${JSON.stringify(answer)}`);
+      assert.equal(gh.enqueues.length, 0, `nothing queued with alice's account while ${mergeStateStatus}`);
+      assert.equal(puts().length, 0, mergeStateStatus);
+      assert.equal(asAlice().filter((c) => c.method !== "GET" && c.path !== "/graphql").length, 0, mergeStateStatus);
+    }
   });
 
   test("MA7 a 403 that is not a permission (abuse detection with Retry-After, a bare Forbidden) is not bob's missing permission: alice is never asked and her account never fetched", async () => {

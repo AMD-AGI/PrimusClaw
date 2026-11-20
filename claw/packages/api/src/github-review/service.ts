@@ -1013,9 +1013,10 @@ export class GithubReview {
     }
     state = await this.settleMergeState(ctx, ref, pr, state, false);
     const queue = this.viaQueue(ctx, state);
-    // Strictly CLEAN for the requester's account: unlike the reviewer's own merge (`mergeStateOpen`), an UNSTABLE state is never read as
-    // open here, not even when only checks the base branch does not require failed.
-    if (!state.queueEntry && !queue && state.mergeStateStatus !== "CLEAN") {
+    // Strictly CLEAN for the requester's account, through a merge queue or not: unlike the reviewer's own merge (`mergeStateOpen`), an
+    // UNSTABLE state is never read as open here, not even when only checks the base branch does not require failed. Only a pull request
+    // already in the queue (put there by a person) passes, since nothing is written for it.
+    if (!state.queueEntry && state.mergeStateStatus !== "CLEAN") {
       return waiting("merge_state_not_clean", `GitHub's merge state is ${state.mergeStateStatus} (review decision ${state.reviewDecision ?? "none"}), not CLEAN`);
     }
     const method = (["squash", "merge", "rebase"] as const).find((m) => repo.methods.includes(m));
