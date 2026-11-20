@@ -19,8 +19,10 @@
  *   P8 poison: what PostgreSQL cannot store is made storable, and a notification that keeps failing is set
  *      aside after a bounded number of attempts while the ones behind it go, in order, over real HTTP; a send
  *      ends inside its deadline, a late answer cannot touch a newer claim, a claim that never reached the
- *      receiver (a slow or failing database) uses no attempt, and a head is set aside even when its dead
- *      letter cannot be written
+ *      receiver (a slow or failing database) uses no attempt (nor does a count that arrives after its claim
+ *      gave it back), a head that goes unsent for too long (a lookup that hangs on every pass) is set aside all the
+ *      same, a row from before claims were counted apart is sent once more, and a head is set aside even when its
+ *      dead letter cannot be written
  */
 
 import assert from "node:assert/strict";
@@ -1101,6 +1103,135 @@ describe("A2A push notifications", { skip }, () => {
         assert.equal(hook.seen.length, 0);
         assert.equal((await deadLetters()).length, 0, "not set aside, nor taken for an unfinished attempt");
         assert.deepEqual(await push.deliverDue(), { delivered: 1, failed: 0 });
+        assert.deepEqual(hook.seen.map((s) => label(s.body)), ["WORKING"]);
+      } finally {
+        await hook.close();
+      }
+    });
+
+    test("a row written before claims were counted apart is sent at least once more, not taken for an unfinished attempt", async () => {
+      const hook = await receiver(() => 500);
+      try {
+        const t = await liveTask();
+        await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: hook.url });
+        await record(t.sessionId, { type: "permissionRequest", actionId: "toolu_legacy", tool: "bash", input: {} }, 1701);
+        const [open] = await outbox();
+        // The table as the release before this one left it: no claims, no unsent_since, and every claim (a config read
+        // that failed included) counted as an attempt, past the limit for a head its receiver was asked of far fewer times.
+        await query("ALTER TABLE claw_a2a_push_outbox DROP COLUMN claims, DROP COLUMN unsent_since");
+        await query("UPDATE claw_a2a_push_outbox SET attempts = $1", [push.MAX_DELIVERY_ATTEMPTS + 4]);
+        await query(
+          `INSERT INTO claw_a2a_push_outbox (task_id, config_id, dedupe_key, payload, attempts, delivered_at, last_status)
+           SELECT task_id, config_id, 'legacy-done', payload, $1, NOW(), '200' FROM claw_a2a_push_outbox WHERE dedupe_key = $2`,
+          [push.MAX_DELIVERY_ATTEMPTS + 4, open.dedupe_key],
+        );
+        const { ensureA2aPushSchema } = await import("../src/notifications/a2a-push-schema.js");
+        const client = await harness.app.db.db.pool.connect();
+        try { await ensureA2aPushSchema(client); } finally { client.release(); }
+
+        const rows = (await query("SELECT dedupe_key, claims, attempts FROM claw_a2a_push_outbox ORDER BY id")).rows;
+        assert.deepEqual(rows, [
+          { dedupe_key: open.dedupe_key, claims: push.MAX_DELIVERY_ATTEMPTS + 4, attempts: push.MAX_DELIVERY_ATTEMPTS - 1 },
+          { dedupe_key: "legacy-done", claims: push.MAX_DELIVERY_ATTEMPTS + 4, attempts: push.MAX_DELIVERY_ATTEMPTS + 4 },
+        ], "the old count becomes the fence; an open row keeps one attempt; a closed row's record is left alone");
+
+        assert.deepEqual(await pass(), { delivered: 0, failed: 1 });
+        assert.deepEqual(hook.seen.map((s) => label(s.body)), ["INPUT_REQUIRED:toolu_legacy"], "its receiver was asked once more");
+        const [dead] = await deadLetters();
+        assert.deepEqual([dead.last_status, dead.attempts], ["http_500", push.MAX_DELIVERY_ATTEMPTS], "set aside on what that send answered");
+      } finally {
+        await hook.close();
+      }
+    });
+
+    test("an attempt's count that reaches the database after its claim gave the attempt back adds nothing", async () => {
+      const hook = await receiver();
+      const real = harness.app.db.db.query;
+      try {
+        const t = await liveTask();
+        await rpc("CreateTaskPushNotificationConfig", { taskId: t.taskId, url: hook.url });
+        await record(t.sessionId, { type: "statusUpdate", agentStatus: "running" }, 1801);
+        // One attempt short of the limit, so a phantom one would set it aside.
+        await query("UPDATE claw_a2a_push_outbox SET attempts = $1", [push.MAX_DELIVERY_ATTEMPTS - 1]);
+        // The count is held on its way to the database (a stalled connection) past the pass's deadline.
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => { release = resolve; });
+        let late: Promise<unknown> | undefined;
+        (harness.app.db.db as any).query = (text: string, params?: unknown[]) => {
+          if (typeof text === "string" && text.includes("SET attempts = attempts + 1")) {
+            late = released.then(() => real.call(harness.app.db.db, text, params as never));
+            return late;
+          }
+          return real.call(harness.app.db.db, text, params as never);
+        };
+        // Long enough to start a request (MIN_SEND_WINDOW_MS), so the pass gets as far as counting.
+        assert.deepEqual(await push.deliverDue({ sendDeadlineMs: 1500 }), { delivered: 0, failed: 1 });
+        (harness.app.db.db as any).query = real;
+        assert.ok(late, "the pass got as far as counting its attempt");
+        const given = (await outbox())[0];
+        assert.equal(given.attempts, push.MAX_DELIVERY_ATTEMPTS - 1, "nothing was sent, so the attempt was given back");
+        assert.match(given.last_status, /^error:deadline/);
+        // Now the count arrives.
+        release();
+        const counted = await late as { rowCount: number };
+        assert.equal(counted.rowCount, 0, "the claim it belonged to has ended");
+        assert.equal((await outbox())[0].attempts, push.MAX_DELIVERY_ATTEMPTS - 1, "no phantom attempt");
+
+        await expireLeases();
+        assert.deepEqual(await push.deliverDue(), { delivered: 1, failed: 0 }, "sent, not set aside as an unfinished attempt");
+        assert.deepEqual(hook.seen.map((s) => label(s.body)), ["WORKING"]);
+        assert.equal((await deadLetters()).length, 0);
+      } finally {
+        (harness.app.db.db as any).query = real;
+        await hook.close();
+      }
+    });
+
+    test("a head whose name lookup hangs on every pass is set aside once it has gone unsent long enough, and the ones behind it go", async () => {
+      const hook = await receiver();
+      try {
+        const t = await liveTask();
+        await storeConfig(t, hook.url.replace("127.0.0.1", "hooks.internal"));
+        await record(t.sessionId, { type: "permissionRequest", actionId: "toolu_stuck", tool: "bash", input: {} }, 1901);
+        await record(t.sessionId, { type: "decisionResult", actionId: "toolu_stuck", decision: "allow" }, 1902);
+        const hung = () => new Promise<never>(() => { /* a DNS server that never answers */ });
+        const fast = async () => [{ address: "127.0.0.1", family: 4 }];
+
+        // Hung passes use no attempt, and are not set aside while they are recent.
+        for (let i = 0; i < push.MAX_DELIVERY_ATTEMPTS + 2; i += 1) {
+          assert.deepEqual(await push.deliverDue({ resolve: hung, sendDeadlineMs: 100 }), { delivered: 0, failed: 1 });
+          await expireLeases();
+        }
+        const headRow = async () => (await query(
+          "SELECT id, attempts, dropped_at, last_status, unsent_since FROM claw_a2a_push_outbox ORDER BY id LIMIT 1",
+        )).rows[0] as Record<string, any>;
+        const head = await headRow();
+        assert.deepEqual([head.attempts, head.dropped_at, head.last_status], [0, null, "refused:unresolvable_host"]);
+        assert.ok(head.unsent_since, "it has gone unsent since its first hung pass");
+
+        // An answer from the receiver (a refusal) starts the clock again.
+        await query("UPDATE claw_a2a_push_outbox SET unsent_since = NOW() - make_interval(secs => $1) WHERE id = $2", [push.UNSENT_GIVE_UP_SECONDS - 60, head.id]);
+        const refuse = await receiver(() => 503);
+        await query("UPDATE claw_a2a_push_configs SET url = $1", [refuse.url]);
+        assert.deepEqual(await push.deliverDue({ resolve: fast }), { delivered: 0, failed: 1 });
+        await refuse.close();
+        assert.equal(refuse.seen.length, 1);
+        const after = await headRow();
+        assert.deepEqual([after.attempts, after.unsent_since], [1, null], "a pass that reached the receiver clears it");
+        await query("UPDATE claw_a2a_push_configs SET url = $1", [hook.url.replace("127.0.0.1", "hooks.internal")]);
+
+        // Hung again, for UNSENT_GIVE_UP_SECONDS: the next hung pass sets it aside instead of trying again for ever.
+        await expireLeases();
+        await push.deliverDue({ resolve: hung, sendDeadlineMs: 100 });
+        assert.equal((await deadLetters()).length, 0, "not yet");
+        await query("UPDATE claw_a2a_push_outbox SET unsent_since = NOW() - make_interval(secs => $1), next_attempt_at = NOW() WHERE id = $2", [push.UNSENT_GIVE_UP_SECONDS, head.id]);
+        assert.deepEqual(await push.deliverDue({ resolve: hung, sendDeadlineMs: 100 }), { delivered: 0, failed: 1 });
+        const [dead] = await deadLetters();
+        assert.deepEqual([dead.last_status, dead.attempts], ["unsent:refused:unresolvable_host", 1]);
+        assert.equal((await outbox())[0].last_status, "quarantined:unsent:refused:unresolvable_host");
+
+        // The lookup answers again: the next notification goes, in order.
+        assert.deepEqual(await push.deliverDue({ resolve: fast }), { delivered: 1, failed: 0 });
         assert.deepEqual(hook.seen.map((s) => label(s.body)), ["WORKING"]);
       } finally {
         await hook.close();

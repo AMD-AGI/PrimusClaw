@@ -47,6 +47,7 @@ import { db } from "../infra/db.js";
 import { metrics } from "../infra/metrics.js";
 import { decryptUserEnvValue, encryptUserEnvValue } from "../crypto/user-env.js";
 import { sanitizeSessionEvent } from "../events/store.js";
+import { MAX_DELIVERY_ATTEMPTS } from "../notifications/a2a-push-schema.js";
 import { storableJson } from "../notifications/storable-json.js";
 import { httpTransport, type Transport } from "../notifications/transport.js";
 import { defaultResolver, guardWebhookUrl, type Resolver } from "../notifications/url-guard.js";
@@ -69,13 +70,7 @@ export const FINAL_RECONCILE_GRACE_SECONDS = 15;
 const RECONCILE_EVERY_MS = 10_000;
 /** Seconds to wait after the Nth failed attempt; the last step repeats. */
 export const RETRY_BACKOFF_SECONDS = [1, 5, 30, 300];
-/**
- * Attempts a notification gets before it is set aside so the ones behind it can
- * go. With the backoff above that is about twenty minutes of trying; a
- * receiver that is down for longer loses at most one notification per twenty
- * minutes to the dead letters, and gets the rest, in order, when it is back.
- */
-export const MAX_DELIVERY_ATTEMPTS = 8;
+export { MAX_DELIVERY_ATTEMPTS };
 /** How long a set-aside notification is kept for inspection. */
 export const DEAD_LETTER_RETENTION_DAYS = 14;
 /** Spec 4.3.3 recommends 10-30 s per request. */
@@ -98,6 +93,15 @@ const MIN_SEND_WINDOW_MS = 1_000;
  * after this, without using an attempt.
  */
 export const NOT_SENT_RETRY_SECONDS = 5;
+/**
+ * A head whose claims have all ended before its receiver was asked, for this
+ * long, is set aside all the same. A name lookup that hangs past every pass's
+ * deadline uses no attempt, so without this its head (and every notification
+ * behind it) would wait for good. An hour is three times the attempts' twenty
+ * minutes: a database that is slow for a while still costs a healthy receiver
+ * nothing.
+ */
+export const UNSENT_GIVE_UP_SECONDS = 3600;
 const CLAIM_BATCH = 20;
 
 export const NOTIFICATION_TOKEN_HEADER = "X-A2A-Notification-Token";
@@ -456,6 +460,11 @@ interface Claimed {
    */
   attempts: number;
   final: boolean;
+  /**
+   * Every claim of the row since its last attempt (UNSENT_GIVE_UP_SECONDS or
+   * more) ended before its receiver was asked.
+   */
+  unsent_expired: boolean;
 }
 
 /**
@@ -487,8 +496,9 @@ async function claimDue(): Promise<Claimed[]> {
          ORDER BY next_attempt_at
          LIMIT $1
          FOR UPDATE SKIP LOCKED)
-      RETURNING o.id, o.task_id, o.config_id, o.payload, o.claims, o.attempts, o.final`,
-    [CLAIM_BATCH, CLAIM_LEASE_SECONDS],
+      RETURNING o.id, o.task_id, o.config_id, o.payload, o.claims, o.attempts, o.final,
+                COALESCE(o.unsent_since <= NOW() - make_interval(secs => $3), FALSE) AS unsent_expired`,
+    [CLAIM_BATCH, CLAIM_LEASE_SECONDS, UNSENT_GIVE_UP_SECONDS],
   )).rows as Claimed[];
 }
 
@@ -647,16 +657,28 @@ async function sendOne(row: Claimed, deps: DeliveryDeps, deadline: number): Prom
     await retireIfFinal(row);
   } else if (attempts >= MAX_DELIVERY_ATTEMPTS) {
     await quarantine(row, status, attempts);
+  } else if (attempts === row.attempts && row.unsent_expired) {
+    // Not sent again, and no claim has reached the receiver for
+    // UNSENT_GIVE_UP_SECONDS (its name lookup hangs every time): set aside, so
+    // the ones behind it go.
+    await quarantine(row, `unsent:${status}`, attempts);
   } else {
-    const wait = attempts > row.attempts
+    const sent = attempts > row.attempts;
+    const wait = sent
       ? RETRY_BACKOFF_SECONDS[Math.min(attempts - 1, RETRY_BACKOFF_SECONDS.length - 1)]
       : NOT_SENT_RETRY_SECONDS;
     // The count is written, not added to: a claim that recorded an attempt and
-    // then sent nothing gives it back here.
+    // then sent nothing gives it back here. The write also ends the claim
+    // (`claims` is raised), so the claim's own count, if it is still queued
+    // behind this write (`within` does not cancel a query), finds the fence
+    // moved and adds nothing after it.
     const r = await db.query(
-      `UPDATE claw_a2a_push_outbox SET next_attempt_at = NOW() + make_interval(secs => $3), last_status = $4, attempts = $5
+      `UPDATE claw_a2a_push_outbox
+          SET next_attempt_at = NOW() + make_interval(secs => $3), last_status = $4, attempts = $5,
+              claims = claims + 1,
+              unsent_since = CASE WHEN $6::boolean THEN NULL ELSE COALESCE(unsent_since, NOW()) END
         WHERE ${FENCE}`,
-      [row.id, row.claims, wait, status, attempts],
+      [row.id, row.claims, wait, status, attempts, sent],
     );
     if (r.rowCount) metrics.onA2aPushDelivery("retried");
   }

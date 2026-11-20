@@ -174,7 +174,9 @@ release version, and its `appVersion` stays `latest`.
   delivery attempt, config read and name lookup included, now ends within 45 seconds, inside the 120-second claim lease,
   so a lookup that hangs can no longer let another replica send the next notification before a late copy of this one.
   Only an attempt that reached the receiver (a request started, or its name looked up and not found) counts toward
-  the eight, so a slow or failing database cannot set aside a notification whose receiver is healthy. See "Push
+  the eight, so a slow or failing database cannot set aside a notification whose receiver is healthy; one that goes an
+  hour without any attempt reaching its receiver (a name lookup that hangs every time) is set aside as
+  `unsent:<status>`, and one written before the upgrade is sent at least once more before it can be set aside. See "Push
   notifications" in `claw/docs/a2a.md`.
 - Claw: an event a connector posts whose text holds a NUL (terminal output carries them) or half of a surrogate pair is
   now stored, with each such character replaced by U+FFFD, in keys and values alike. Until now PostgreSQL's `jsonb`
