@@ -33,6 +33,8 @@
  *      `since`) while the next one queues, then running, then ended
  *   R  a run whose first create was refused and whose second sandbox ran: the
  *      refusal is cleared from the row once the sandbox is Running
+ *   D  a database without the sandbox columns, or the table, which the schema
+ *      guard only warns about with app runs off: the reads still answer
  *   O  a non-app run on the same routes: `app: null`, nothing else changed
  */
 import assert from "node:assert/strict";
@@ -628,6 +630,25 @@ describe("an app run's sandbox state and outcome on the task and run routes", { 
     const row = (await q("SELECT last_exit FROM claw_app_runs WHERE task_id = $1", [r.taskId])).rows[0] as { last_exit: Json };
     assert.equal(row.last_exit.sandbox_reason, undefined, "the refusal was cleared when the sandbox ran");
     assert.deepEqual(r.app.outcome, { cause: "restarts_exhausted", returncode: 2, final: false, error: null });
+  });
+
+  test("D: a database the guard only warns about (APP_RUNS_ENABLED off): no sandbox columns, or no table, is not a failed read", async () => {
+    const r = await runToEnd(manifest());
+    const done = r.app;
+    try {
+      await q("ALTER TABLE claw_app_runs RENAME COLUMN sandbox_state TO sandbox_state_gone");
+      await q("ALTER TABLE claw_app_runs RENAME COLUMN sandbox_since TO sandbox_since_gone");
+      const { app: a } = await readBoth(r.taskId);
+      assert.deepEqual(a, { sandbox: { ...done.sandbox, since: null }, outcome: done.outcome }, "read from the run's state");
+      await q("ALTER TABLE claw_app_runs RENAME TO claw_app_runs_gone");
+      assert.equal((await readRun(r.taskId)).app, null);
+      assert.equal((await readTask(r.taskId)).app, null);
+    } finally {
+      await q("ALTER TABLE IF EXISTS claw_app_runs_gone RENAME TO claw_app_runs");
+      await q("ALTER TABLE claw_app_runs RENAME COLUMN sandbox_state_gone TO sandbox_state").catch(() => undefined);
+      await q("ALTER TABLE claw_app_runs RENAME COLUMN sandbox_since_gone TO sandbox_since").catch(() => undefined);
+    }
+    assert.deepEqual((await readBoth(r.taskId)).app, done);
   });
 
   test("O: a run that is not an app run has app null and its own placement", async () => {

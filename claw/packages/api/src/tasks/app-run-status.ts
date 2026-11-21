@@ -199,11 +199,28 @@ export function appRunStatusOf(row: StatusRow): AppRunStatus {
 export async function readAppRunStatuses(taskIds: readonly string[]): Promise<Map<string, AppRunStatus>> {
   const out = new Map<string, AppRunStatus>();
   if (taskIds.length === 0) return out;
-  const r = await db.query(
-    `SELECT task_id, state, last_exit, sandbox_workload_id, sandbox_state, sandbox_since
-       FROM claw_app_runs WHERE task_id = ANY($1::text[])`,
-    [[...taskIds]],
-  );
-  for (const row of r.rows as StatusRow[]) out.set(row.task_id, appRunStatusOf(row));
+  for (const row of await statusRows(taskIds)) out.set(row.task_id, appRunStatusOf(row));
   return out;
+}
+
+const STATUS_SQL = (sandboxColumns: string) =>
+  `SELECT task_id, state, last_exit, sandbox_workload_id, ${sandboxColumns}
+     FROM claw_app_runs WHERE task_id = ANY($1::text[])`;
+
+/**
+ * The rows, on any database the API starts on. With APP_RUNS_ENABLED off the schema
+ * guard only warns about a missing app-run column or table, and a read of a task or
+ * a run must not fail on it: without the sandbox columns the state is read from the
+ * run's (as for a row written before them), and without the table there is no status.
+ */
+async function statusRows(taskIds: readonly string[]): Promise<StatusRow[]> {
+  const params = [[...taskIds]];
+  try {
+    return (await db.query(STATUS_SQL("sandbox_state, sandbox_since"), params)).rows as StatusRow[];
+  } catch (err) {
+    const code = (err as { code?: unknown }).code;
+    if (code === "42P01") return [];
+    if (code !== "42703") throw err;
+    return (await db.query(STATUS_SQL("NULL::text AS sandbox_state, NULL::timestamptz AS sandbox_since"), params)).rows as StatusRow[];
+  }
 }
