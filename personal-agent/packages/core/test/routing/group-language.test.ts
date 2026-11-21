@@ -15,12 +15,13 @@ import { clickOf, link, message, said, world, type World } from "./world.js";
 
 const CONV = "g-1";
 
-function gmsg(text: string, options: { user?: typeof ALICE; conversation?: string } = {}) {
+function gmsg(text: string, options: { user?: typeof ALICE; conversation?: string; locale?: string } = {}) {
   return {
     ...message(text, {
       kind: "group",
       conversation: options.conversation ?? CONV,
       ...(options.user ? { user: options.user } : {}),
+      ...(options.locale ? { locale: options.locale } : {}),
     }),
     mentioned: true,
   };
@@ -215,7 +216,7 @@ test("rule 3: after /lang auto in a group that talked English, the first Chinese
   );
 });
 
-test("rule 3: a message with no words of its own follows the asker's last one in this group, else carries no line", async () => {
+test("rule 3: a message with no words of its own follows the asker's last one in this group, else is answered in English", async () => {
   for (const setting of [undefined, "auto"] as const) {
     const w = asked();
     link(w, ALICE.id, "ak-alice");
@@ -235,7 +236,13 @@ test("rule 3: a message with no words of its own follows the asker's last one in
     await w.router.settled();
     assert.deepEqual(
       w.turns.runs.map((r) => r.replyLang),
-      [undefined, "zh", "en", "zh", "en", undefined],
+      ["en", "zh", "en", "zh", "en", "en"],
+      String(setting),
+    );
+    // (the turn's own texts say the same language as the line it carries)
+    assert.deepEqual(
+      w.turns.runs.map((r) => r.lang),
+      ["en", "zh", "en", "zh", "en", "en"],
       String(setting),
     );
   }
@@ -286,6 +293,31 @@ test("rule 3: a 1:1 chat's command said in a group is refused in the language it
   w.store.groupLanguage.setGroupLanguage(CONV, "en");
   await w.router.handle(gmsg("/timezone Asia/Shanghai 请帮我设置"));
   assert.equal(inGroup(w).at(-1), "`/timezone` works only in a 1:1 chat. Please do this in a 1:1 chat with me.");
+});
+
+test("rule 3: help and fixed texts with no language of their own are in English, whatever the asker writes elsewhere", async () => {
+  for (const chose of [false, true]) {
+    const w = asked();
+    link(w, ALICE.id, "ak-alice");
+    // (she writes Chinese in her 1:1 chat, or chose it there, and her client is Chinese: none of it is read in a group)
+    if (chose) w.store.prefs.setLang(ALICE.id, "zh");
+    else w.store.prefs.learnLang(ALICE.id, "zh");
+    for (const text of ["help", "/help", ""]) {
+      await w.router.handle(gmsg(text, { locale: "zh-CN" }));
+      const help = inGroup(w).at(-1) ?? "";
+      assert.ok(help.includes("In a group, @mention"), `${String(chose)} ${JSON.stringify(text)}: ${help}`);
+      assert.ok(!hasChinese(help), `${String(chose)} ${JSON.stringify(text)}: ${help}`);
+    }
+    await w.router.handle(gmsg("/whoami", { locale: "zh-CN" }));
+    assert.ok(!hasChinese(inGroup(w).at(-1) ?? ""), "whoami in English");
+    // words of their own still pick the language: a Chinese question gets Chinese help
+    await w.router.handle(gmsg("你能做什么", { locale: "zh-CN" }));
+    assert.ok(hasChinese(inGroup(w).at(-1) ?? ""), "help asked in Chinese");
+    // and the group's own language wins over both
+    w.store.groupLanguage.setGroupLanguage(CONV, "zh");
+    await w.router.handle(gmsg("help", { locale: "en-US" }));
+    assert.ok(hasChinese(inGroup(w).at(-1) ?? ""), "help in a group set to Chinese");
+  }
 });
 
 // --- 4. the first @mention with no setting puts the card once; a pick by anyone stores it -----------------------------------

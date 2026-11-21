@@ -7,12 +7,11 @@ import { isGroupCommand, isKnownCommand } from "../commands/names.js";
 import { commandArgs, parseCommand } from "../commands/parse.js";
 import { ClawError, ClawUnreachable, isErrorWord } from "../claw/errors.js";
 import type { WorkItem } from "../claw/model.js";
-import { hasCjk } from "../language/detect.js";
 import { groupText } from "../locales/group.js";
 import type { MessageInterceptor, MessageRoute } from "../ports/routing.js";
 import type { InboundAction, InboundMessage } from "../ports/surface.js";
 import { pyLower, pySplit } from "../text/py-text.js";
-import { groupChosenLang, learnLang, type Chat } from "./chat.js";
+import { learnLang, type Chat } from "./chat.js";
 import type { SessionCommands } from "./commands-session.js";
 import type { RouterContext } from "./context.js";
 import { GROUP_LANG_VERB, type GroupLanguages } from "./group-language.js";
@@ -115,7 +114,7 @@ export class GroupRouter {
     const [first = ""] = pySplit(words.text);
     const word = pyLower(first);
     if (empty || word === "/help") {
-      const lang = chat.lang(); // (the group's language; with none, that of the words that asked)
+      const lang = chat.lang(); // (the group's language; with none, that of the words that asked, else English)
       // (`assistant`: what help says a 1:1 chat adds is what the asker's own 1:1 chat offers; nothing of their settings is shown)
       const assistant = this.ctx.deps.assistant.on(chat.sender.id);
       const groupContext = this.ctx.deps.groupHistory.kept(message.conversation.id); // (a group that said /context off keeps none)
@@ -200,15 +199,14 @@ export class GroupRouter {
         if (reviewStop === undefined || !assistant.understands(route.sender.id)) return false;
         const pulls = reviewStop(route.text);
         if (pulls.length === 0) return false;
-        await this.stopReviews(this.ctx.chatOf(route.message, route.scope), pulls, route.text);
+        await this.stopReviews(this.ctx.chatOf(route.message, route.scope), pulls);
         return true;
       },
     };
   }
 
-  private async stopReviews(chat: Chat, pulls: readonly (readonly [string, number])[], text: string): Promise<void> {
-    const zh = (groupChosenLang(this.ctx.deps.store, chat.scope) ?? (hasCjk(text) ? "zh" : "en")) === "zh";
-    const said = groupText.in(zh ? "zh" : "en");
+  private async stopReviews(chat: Chat, pulls: readonly (readonly [string, number])[]): Promise<void> {
+    const said = groupText.in(chat.lang());
     const key = await this.ctx.credentials.credential(chat, false);
     let items: WorkItem[] | undefined;
     try {
@@ -232,7 +230,7 @@ export class GroupRouter {
       const [only] = found;
       if (only === undefined) lines.push(said.stopNone({ number }));
       else if (found.length > 1) lines.push(said.stopMany({ number }));
-      else lines.push(await this.stopReview(key, only, zh));
+      else lines.push(await this.stopReview(key, only, chat.zh()));
     }
     await chat.say(lines.join("\n"));
   }

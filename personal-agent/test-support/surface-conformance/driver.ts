@@ -50,6 +50,8 @@ export interface SeenMessage {
 export interface SayOptions {
   /** In a group: the message @mentions the bot. */
   readonly mentionsBot?: boolean;
+  /** The locale of the client it was written in (default: the driver's own); a surface whose events carry none ignores it. */
+  readonly locale?: string;
 }
 
 /** One run's connection to the surface's platform (or its stand-in). */

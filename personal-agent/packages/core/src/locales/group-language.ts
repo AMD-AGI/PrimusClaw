@@ -37,7 +37,8 @@ export const groupLanguageText = defineCatalog({
     isAuto: (p: { bot: string }) =>
       `This group is answered in the language each question is asked in. @${p.bot} /lang zh or /lang en sets one.`,
     isNone: (p: { bot: string }) =>
-      `This group has no language set: each question is answered in the language it is asked in. ` +
+      `This group has no language set: each question is answered in the language it is asked in, ` +
+      `and one with no words of its own ("help", a link) in English. ` +
       `@${p.bot} /lang zh, /lang en or /lang auto sets it.`,
     usage: (p: { bot: string }) => `Usage: @${p.bot} /lang zh | en | auto (follow the asker).`,
   },
@@ -45,7 +46,8 @@ export const groupLanguageText = defineCatalog({
     isZh: (p) => `这个群用中文回复。@${p.bot} /lang en 或 /lang auto 可改。`,
     isEn: (p) => `这个群用英文回复。@${p.bot} /lang zh 或 /lang auto 可改。`,
     isAuto: (p) => `这个群按每个问题所用的语言回复。@${p.bot} /lang zh 或 /lang en 可设为固定语言。`,
-    isNone: (p) => `这个群还没设语言：每个问题按它所用的语言回复。@${p.bot} /lang zh、/lang en 或 /lang auto 可设置。`,
+    isNone: (p) =>
+      `这个群还没设语言：每个问题按它所用的语言回复，没有文字的（"help"、一个链接）用英文。@${p.bot} /lang zh、/lang en 或 /lang auto 可设置。`,
     usage: (p) => `用法：@${p.bot} /lang zh | en | auto（跟随提问者）。`,
   },
 });
