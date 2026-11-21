@@ -31,6 +31,7 @@ import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import {
   APP_GPU_RESOURCE,
+  APP_MAX_RUNTIME_SEC,
   APP_SANDBOX_ROLES,
   appGrantTemplates,
   appStopGraceSec,
@@ -486,9 +487,9 @@ export async function checkAppRunRequest(
   return { pluginId, manifest, input, resolved, plan, ...(overrides ? { overrides } : {}) };
 }
 
-/** A positive whole number of seconds, or undefined. */
+/** A positive whole number of seconds a run's deadline can be armed for, or undefined. */
 const runtimeSec = (v: unknown): number | undefined =>
-  typeof v === "number" && Number.isInteger(v) && v > 0 && v <= 2_147_483_647 ? v : undefined;
+  typeof v === "number" && Number.isInteger(v) && v > 0 && v <= APP_MAX_RUNTIME_SEC ? v : undefined;
 
 /**
  * The run's time limit in seconds: the smaller of the manifest's

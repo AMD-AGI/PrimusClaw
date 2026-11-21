@@ -767,7 +767,8 @@ export const SANDBOX_ROUTER_AUTH_ENABLED = envBool("SANDBOX_ROUTER_AUTH_ENABLED"
  * Platform caps on what an app run's grant may carry, as JSON of the grant
  * shape: `{"max_sandboxes":8,"max_gpus":8,"gpu_hours":500,"max_runtime_sec":172800}`.
  * Each grant item is the smallest of the request, the manifest's limit (where it
- * has one) and its cap; an item with none of them is unbounded. A value that is not that shape stops start-up.
+ * has one) and its cap; an item with none of them is unbounded. A value that is not that shape stops start-up, and so
+ * does a `max_runtime_sec` above `APP_MAX_RUNTIME_SEC` (2147483).
  */
 export const APP_SANDBOX_CAPS = parseAppSandboxCaps(process.env.APP_SANDBOX_CAPS);
 

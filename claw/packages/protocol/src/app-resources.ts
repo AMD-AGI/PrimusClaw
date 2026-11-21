@@ -44,6 +44,14 @@ export interface AppGrantLimits {
   max_runtime_sec?: number;
 }
 
+/**
+ * The longest time limit an app run may have, in seconds: the most a Node timer
+ * can wait (2^31 - 1 ms, about 24.8 days), so the Brain's deadline timer for the run
+ * waits it out. A request's `grant.max_runtime_sec`, a manifest's
+ * `limits.max_runtime_sec` and `APP_SANDBOX_CAPS` above it are refused.
+ */
+export const APP_MAX_RUNTIME_SEC = 2_147_483;
+
 /** The `resources` object of a create request; see {@link resolveAppResources} for which items are required. */
 export interface AppResourcesRequest {
   /** Overrides `container.image`. */
@@ -146,7 +154,8 @@ export function parseAppContainerCaps(raw: string | undefined): AppContainerCaps
 }
 const isNonNeg = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
 const isRuntimeSec = (v: unknown): v is number =>
-  typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 2_147_483_647;
+  typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= APP_MAX_RUNTIME_SEC;
+const RUNTIME_SEC_REASON = `must be a whole number of seconds >= 1 and <= ${APP_MAX_RUNTIME_SEC}`;
 const isName = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
 
 const RESOURCE_KEYS = ["image", "gpus", "workspace", "sandbox_workspace", "cpu", "memory_gi", "grant"];
@@ -169,10 +178,11 @@ export function validateAppGrantLimits(at: string, v: unknown, out: AppResources
     if (v[k] !== undefined && !isCount(v[k])) out.push({ field: `${at}.${k}`, reason: "must be a whole number >= 0" });
   }
   if (v.gpu_hours !== undefined && !isNonNeg(v.gpu_hours)) out.push({ field: `${at}.gpu_hours`, reason: "must be a number >= 0" });
-  // Whole seconds in the range the grant issuer takes: a fraction or 0 would be
-  // accepted here, then ignored by the run's deadline and refused by the issuer.
+  // Whole seconds the run's deadline can be armed for: a fraction or 0 would be
+  // accepted here, then ignored by the run's deadline and refused by the grant
+  // issuer, and a limit past APP_MAX_RUNTIME_SEC is longer than a Node timer waits.
   if (v.max_runtime_sec !== undefined && !isRuntimeSec(v.max_runtime_sec)) {
-    out.push({ field: `${at}.max_runtime_sec`, reason: "must be a whole number of seconds >= 1 and <= 2147483647" });
+    out.push({ field: `${at}.max_runtime_sec`, reason: RUNTIME_SEC_REASON });
   }
 }
 
@@ -304,6 +314,13 @@ export function resolveAppResources(
   };
   effective("resources.cpu", r.cpu, declared.cpu, (q) => q, containerCaps.cpu);
   effective("resources.memory_gi", r.memory_gi, declared.memory, (q) => q / 1024 ** 3, containerCaps.memory_gi);
+
+  // The manifest's limit is the run's time limit when it is the smaller one, so it is
+  // held to the same bound; its schema takes any positive integer.
+  const manifestRuntime = manifest.limits?.max_runtime_sec;
+  if (manifestRuntime !== undefined && !isRuntimeSec(manifestRuntime)) {
+    issues.push({ field: "manifest.limits.max_runtime_sec", reason: RUNTIME_SEC_REASON });
+  }
 
   const req: AppGrantLimits = {};
   if (r.grant !== undefined) {
