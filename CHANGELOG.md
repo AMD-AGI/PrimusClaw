@@ -113,6 +113,21 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: a plugin can let an app run change its manifest's sandbox templates. `overridable.sandbox_templates` declares,
+  per template name, which of `fromImage` (a string rule with an `enum` or a `pattern`), `per_gpu_count` (an integer
+  `enum` or range) and `resources` (a `max` Kubernetes quantity for each of `cpu`, `memory`, `ephemeralStorage` and
+  `sharedMemory`) a launch may set; `overrides.sandbox_templates` on `POST /v1/sessions/:id/tasks` (`mode: "app"`) names
+  the values, for example `{ "runner": { "fromImage": "...", "per_gpu_count": 4, "resources": { "requests": { "cpu":
+  "24", "memory": "1400Gi" } } } }`. The values are checked against the declaration and applied to a copy of the
+  manifest (the card count becomes `[n]`; `fromImage` and `resources` land where Agent Sandbox reads them; each given
+  request or limit replaces that entry; `sharedMemory` becomes `gpu.sharedMemory`), which must still validate: a request
+  above its limit, a shared memory above the memory the template will get (its memory limit, else its request, else
+  the per-card default of 224Gi times its fewest cards), or two templates of one role with the same card count is
+  refused. Quantities are compared exactly, as Kubernetes rounds them, not as floating-point numbers. A refusal is `400 plugin_overrides_invalid` naming each field, and nothing is created. The run stores and
+  grants the effective templates, records the values in `metadata.plugin_overrides`, logs only the keys, and binds them
+  to the `Idempotency-Key`. One generic plugin can so serve several model sizes instead of one plugin per size. A plugin
+  that declares nothing launches exactly as before. Agent Sandbox applies a template's `resources` and
+  `gpu.sharedMemory` from the release that reads them. See `claw/docs/plugins.md` section 4.
 - Claw: an app run (`mode: "app"`) carries an `app` block on `GET /v1/tasks/{id}` (`item.app`) and on every form of
   `GET /v1/runs` (`app`, `null` for other runs). `app.sandbox` says where the run's sandbox is -- `state` (`pending`
   while it is being created, queued or starting, `running` once the platform reports it Running, `ended`),
