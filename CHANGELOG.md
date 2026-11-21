@@ -113,6 +113,21 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: a plugin can let an app run change its manifest's sandbox templates. `overridable.sandbox_templates` declares,
+  per template name, which of `fromImage` (a string rule with an `enum` or a `pattern`), `per_gpu_count` (an integer
+  `enum` or range) and `resources` (a `max` Kubernetes quantity for each of `cpu`, `memory`, `ephemeralStorage` and
+  `sharedMemory`) a launch may set; `overrides.sandbox_templates` on `POST /v1/sessions/:id/tasks` (`mode: "app"`) names
+  the values, for example `{ "runner": { "fromImage": "...", "per_gpu_count": 4, "resources": { "requests": { "cpu":
+  "24", "memory": "1400Gi" } } } }`. The values are checked against the declaration and applied to a copy of the
+  manifest (the card count becomes `[n]`; `fromImage` and `resources` land where Agent Sandbox reads them; each given
+  request or limit replaces that entry; `sharedMemory` becomes `gpu.sharedMemory`), which must still validate: a request
+  above its limit, a shared memory above the memory limit, or two templates of one role with the same card count is
+  refused. A refusal is `400 plugin_overrides_invalid` naming each field, and nothing is created. The run stores and
+  grants the effective templates, records the values in `metadata.plugin_overrides`, logs only the keys, and binds them
+  to the `Idempotency-Key`. One generic plugin can so serve several model sizes instead of one plugin per size. A plugin
+  that declares nothing launches exactly as before. Agent Sandbox applies a template's `resources` and
+  `gpu.sharedMemory` from the release that reads them. See `claw/docs/plugins.md` section 4.
+
 - Claw: metrics for the API's event consumer: `claw_api_event_consumer_consecutive_failures` (deliveries this replica
   retried since it last stored or set aside an event), `claw_api_event_quarantined_total{reason}` (`unparseable`,
   `unstorable`, `bounded`), `claw_api_event_sanitised_total` (events stored with a character replaced), and, read from the server every 30 seconds,

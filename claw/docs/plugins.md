@@ -411,6 +411,18 @@ and is returned by every plugin read. An invalid declaration is
   "env": {
     "SOURCE_SHA": { "pattern": "^[0-9a-f]{40}$", "description": "Commit to build from" },
     "MODE": { "enum": ["fast", "full"] }
+  },
+  "sandbox_templates": {
+    "runner": {
+      "fromImage": { "enum": ["harbor.example/runner:1", "harbor.example/runner:2"] },
+      "per_gpu_count": { "enum": [2, 4, 8] },
+      "resources": {
+        "cpu": { "max": "64" },
+        "memory": { "max": "2048Gi" },
+        "ephemeralStorage": { "max": "1500Gi" },
+        "sharedMemory": { "max": "1000Gi" }
+      }
+    }
   }
 }
 ```
@@ -421,6 +433,20 @@ and is returned by every plugin read. An invalid declaration is
 | `model` | a string | String rule (below). A task runs on it; an app run gets it in every env name listed in `env` (an app run cannot override `model` when `env` is empty). |
 | `args`  | a list of strings | Appended to the app manifest's `command`. `items` is a string rule for each; `maxItems` 1-64 (default 16). |
 | `env`   | an object of name to string | One string rule per variable name the launch may set. At most 64 names. |
+| `sandbox_templates` | an object of template name to values | One declaration per template of the app manifest's `sandbox_templates` (at most 64), each naming at least one of the keys below. App runs only. |
+
+Per template, under `sandbox_templates.<name>`:
+
+| Key | Value a launch gives | Rule |
+| --- | -------------------- | ---- |
+| `fromImage` | a string | String rule (below), which must have an `enum` or a `pattern`. Becomes the template's `fromImage`. |
+| `per_gpu_count` | an integer | Integer rule: `{ "enum": [2, 4, 8] }` or `{ "minimum": 1, "maximum": 8 }` (an `enum` or a `maximum` is required; values 1-1024). Becomes the template's only card count, `[n]`. |
+| `resources` | `{ "requests": {...}, "limits": {...}, "sharedMemory": "..." }` | One `{ "max": "<quantity>" }` per resource the launch may size: `cpu`, `memory`, `ephemeralStorage` (`ephemeral-storage` in `requests`/`limits`) and `sharedMemory` (the template's `/dev/shm`). |
+
+The resource values are Kubernetes quantity strings (`"24"`, `"500m"`, `"1400Gi"`),
+each positive and at most its declared `max`. A resource with no `max` cannot be
+set, and `requests`/`limits` take only `cpu`, `memory` and `ephemeral-storage`
+(the GPU count comes from `per_gpu_count` alone).
 
 A string rule is a small JSON Schema subset: `type` (`"string"`), `enum`
 (1-256 strings), `pattern` (an ECMAScript regular expression, at most 512
@@ -436,7 +462,7 @@ stall the API: a value whose test does not finish in time is refused.
 
 | Launch | Applicable keys |
 | ------ | --------------- |
-| App run (`mode: "app"`) | `image`, `model`, `args`, `env` |
+| App run (`mode: "app"`) | `image`, `model`, `args`, `env`, `sandbox_templates` |
 | Single task (`plugin_id`, no DAG) | `image`, `model` |
 
 ```json
@@ -445,7 +471,21 @@ stall the API: a value whose test does not finish in time is refused.
   "plugin_id": 42,
   "input": { "...": "..." },
   "resources": { "gpus": 8, "workspace": "ws-a" },
-  "overrides": { "model": "model-b", "env": { "SOURCE_SHA": "0123...cdef" } }
+  "overrides": {
+    "model": "model-b",
+    "env": { "SOURCE_SHA": "0123...cdef" },
+    "sandbox_templates": {
+      "runner": {
+        "fromImage": "harbor.example/runner:2",
+        "per_gpu_count": 4,
+        "resources": {
+          "requests": { "cpu": "24", "memory": "1400Gi" },
+          "limits": { "cpu": "32", "memory": "1400Gi", "ephemeral-storage": "750Gi" },
+          "sharedMemory": "512Gi"
+        }
+      }
+    }
+  }
 }
 ```
 
@@ -461,13 +501,35 @@ refused, reported as `issues`); `overrides.image` together with
 keeps accepting any `resources.image`, as before). The plugin row itself is
 never changed by a launch.
 
+`overrides.sandbox_templates` is applied to the named templates of that copy;
+every other template is left as written:
+
+- each name must be declared and be a template of the app manifest, and each
+  key under it must be declared for that template;
+- `per_gpu_count: n` replaces the template's card counts with `[n]`, so the app's
+  `env_map.sandbox_templates` map lists the template under `n`. Two templates of
+  one role may not end up with the same count;
+- `fromImage` and `resources` are written where Agent Sandbox reads them: at the
+  top of the template, or inside `template` when the template is in that form;
+- each given request or limit replaces that one entry of the template's
+  `resources` and keeps the others; `sharedMemory` becomes `gpu.sharedMemory`;
+- the result must hold: a request may not exceed its limit (the launch's or the
+  template's own), `sharedMemory` may not exceed the memory limit (or the memory
+  request when no limit is set), and only a template with `per_gpu_count` may set
+  `sharedMemory`.
+
+The effective templates are what the run's grant hands Agent Sandbox (and what a
+later reissue or extension of the grant uses). Agent Sandbox registers a template's
+`resources` and `gpu.sharedMemory` in place of its per-card sizes only from the
+release that reads them; an earlier one keeps sizing a GPU template per card.
+
 ### Audit
 
 The checked values are recorded on the task, in
 `metadata.plugin_overrides = { plugin_id, plugin_version, values }`; an app run
 also stores the manifest it actually ran with. The API logs
-`plugin_overrides.applied` with the task, plugin, user and the overridden keys,
-never the values. For an app run, `overrides` is part of what an
+`plugin_overrides.applied` with the task, plugin, user and the overridden keys
+(`sandbox_templates.<name>.<key>` for a template), never the values. For an app run, `overrides` is part of what an
 `Idempotency-Key` is bound to; a request without it hashes as before.
 
 ---

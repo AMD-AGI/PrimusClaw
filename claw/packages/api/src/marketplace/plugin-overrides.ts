@@ -19,11 +19,16 @@
  *          it is written into the env names the declaration lists in `env`.
  *   args   extra arguments appended to an app's `command`.
  *   env    one entry per environment variable an app run may set.
+ *   sandbox_templates
+ *          per named template of an app manifest: its `fromImage`, its card
+ *          count (`per_gpu_count`) and its `resources`, each within the bounds
+ *          the declaration sets. App runs only.
  *
  * This module is pure (no database, no I/O) so the write path (db.ts) and every
  * launch path read the same rules.
  */
 import { createContext, runInContext } from "node:vm";
+import { parseQuantity } from "@claw/protocol";
 import { BadRequestError } from "../shared/errors.js";
 
 /** The surfaces a plugin is launched from. */
@@ -38,11 +43,58 @@ export interface StringRule {
   description?: string;
 }
 
+/** One integer value's rules: a list of values, or a range. */
+export interface IntegerRule {
+  type?: "integer";
+  enum?: number[];
+  minimum?: number;
+  maximum?: number;
+  description?: string;
+}
+
+/** The most a launch may ask for of one resource, as a Kubernetes quantity. */
+export interface QuantityMax {
+  max: string;
+  description?: string;
+}
+
+/** Which resources of a template a launch may size, and how far. */
+export interface TemplateResourcesRule {
+  cpu?: QuantityMax;
+  memory?: QuantityMax;
+  ephemeralStorage?: QuantityMax;
+  sharedMemory?: QuantityMax;
+  description?: string;
+}
+
+/** What a launch may change in one sandbox template of the app manifest. */
+export interface TemplateOverridable {
+  fromImage?: StringRule;
+  per_gpu_count?: IntegerRule;
+  resources?: TemplateResourcesRule;
+  description?: string;
+}
+
 export interface OverridableDeclaration {
   image?: { enum?: string[]; description?: string };
   model?: StringRule & { env?: string[] };
   args?: { type?: "array"; items?: StringRule; maxItems?: number; description?: string };
   env?: Record<string, StringRule>;
+  sandbox_templates?: Record<string, TemplateOverridable>;
+}
+
+/** A launch's sizing of one template: Kubernetes container resources, plus the template's `/dev/shm`. */
+export interface TemplateResourceValues {
+  requests?: Record<string, string>;
+  limits?: Record<string, string>;
+  sharedMemory?: string;
+}
+
+/** A launch's values for one template. */
+export interface TemplateOverrideValues {
+  fromImage?: string;
+  per_gpu_count?: number;
+  resources?: TemplateResourceValues;
 }
 
 /** A launch's requested values, after they were checked. */
@@ -51,6 +103,7 @@ export interface OverrideValues {
   model?: string;
   args?: string[];
   env?: Record<string, string>;
+  sandbox_templates?: Record<string, TemplateOverrideValues>;
 }
 
 export interface OverrideProblem {
@@ -70,6 +123,13 @@ export const OVERRIDE_LIMITS = {
   maxArgs: 64,
   defaultMaxArgs: 16,
   maxDescriptionLength: 1000,
+  /** Most templates one declaration names. */
+  maxTemplates: 64,
+  /** Largest card count a template may be given, and most entries of an integer `enum`. */
+  maxGpuCount: 1024,
+  maxIntegerEnumEntries: 64,
+  /** Longest Kubernetes quantity accepted, in characters. */
+  maxQuantityLength: 64,
   /**
    * Wall-clock budget for every `pattern` test of one launch, together. A
    * pattern is the author's and a value the caller's, and a backtracking
@@ -84,7 +144,16 @@ export const OVERRIDE_LIMITS = {
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** A name that is a valid variable name and also a special property of every object; refused outright. */
 const isEnvName = (n: unknown): n is string => typeof n === "string" && ENV_NAME_RE.test(n) && n !== "__proto__";
-const TOP_KEYS = new Set(["image", "model", "args", "env"]);
+const TOP_KEYS = new Set(["image", "model", "args", "env", "sandbox_templates"]);
+const TOP_KEYS_TEXT = "image, model, args, env or sandbox_templates";
+/** A template name, as the app manifest spells one. */
+const TEMPLATE_NAME_RE = /^[a-z][a-z0-9_-]{0,62}$/;
+const TEMPLATE_KEYS = ["fromImage", "per_gpu_count", "resources"] as const;
+/** The container resources a launch may size, by their Kubernetes name, to the declaration's key. */
+const RESOURCE_RULE_KEY: Readonly<Record<string, "cpu" | "memory" | "ephemeralStorage">> = Object.freeze(
+  Object.assign(Object.create(null), { cpu: "cpu", memory: "memory", "ephemeral-storage": "ephemeralStorage" }),
+);
+const RESOURCE_NAMES = ["cpu", "memory", "ephemeral-storage"] as const;
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v);
@@ -146,7 +215,7 @@ export function overridableDeclarationProblems(v: unknown): OverrideProblem[] {
   if (v === undefined || v === null) return out;
   if (!isPlainObject(v)) return [{ field: "overridable", reason: "must be an object" }];
   for (const k of Object.keys(v)) {
-    if (!TOP_KEYS.has(k)) out.push({ field: `overridable.${k}`, reason: "unknown key (expected image, model, args or env)" });
+    if (!TOP_KEYS.has(k)) out.push({ field: `overridable.${k}`, reason: `unknown key (expected ${TOP_KEYS_TEXT})` });
   }
   if (v.image !== undefined) {
     if (!isPlainObject(v.image)) out.push({ field: "overridable.image", reason: "must be an object" });
@@ -190,7 +259,99 @@ export function overridableDeclarationProblems(v: unknown): OverrideProblem[] {
       }
     }
   }
+  if (v.sandbox_templates !== undefined) {
+    const at = "overridable.sandbox_templates";
+    if (!isPlainObject(v.sandbox_templates)) out.push({ field: at, reason: "must be an object of template name to declaration" });
+    else {
+      const names = Object.keys(v.sandbox_templates);
+      if (names.length === 0 || names.length > OVERRIDE_LIMITS.maxTemplates) {
+        out.push({ field: at, reason: `must name 1-${OVERRIDE_LIMITS.maxTemplates} templates` });
+      }
+      for (const name of names) {
+        if (!TEMPLATE_NAME_RE.test(name)) out.push({ field: `${at}.${name}`, reason: "is not a template name" });
+        else checkTemplateDeclaration(v.sandbox_templates[name], `${at}.${name}`, out);
+      }
+    }
+  }
   return out;
+}
+
+/** A positive Kubernetes quantity, as a number; undefined for anything else. */
+function quantityOf(v: unknown): number | undefined {
+  if (typeof v !== "string" || v === "" || v.trim() !== v || v.length > OVERRIDE_LIMITS.maxQuantityLength) return undefined;
+  const n = parseQuantity(v);
+  return n !== undefined && n > 0 ? n : undefined;
+}
+
+const QUANTITY_TEXT = "must be a positive Kubernetes quantity string, such as \"64\" or \"2048Gi\"";
+
+const isCardCount = (n: unknown): n is number =>
+  Number.isSafeInteger(n) && (n as number) >= 1 && (n as number) <= OVERRIDE_LIMITS.maxGpuCount;
+
+function checkIntegerRule(v: unknown, at: string, out: OverrideProblem[]): void {
+  if (!isPlainObject(v)) {
+    out.push({ field: at, reason: "must be an object" });
+    return;
+  }
+  checkKeys(v, ["type", "enum", "minimum", "maximum", "description"], at, out);
+  if (v.type !== undefined && v.type !== "integer") out.push({ field: `${at}.type`, reason: "must be \"integer\"" });
+  const range = `an integer from 1 to ${OVERRIDE_LIMITS.maxGpuCount}`;
+  if (v.enum !== undefined && !(Array.isArray(v.enum) && v.enum.length > 0 && v.enum.length <= OVERRIDE_LIMITS.maxIntegerEnumEntries
+    && v.enum.every(isCardCount) && new Set(v.enum).size === v.enum.length)) {
+    out.push({ field: `${at}.enum`, reason: `must be 1-${OVERRIDE_LIMITS.maxIntegerEnumEntries} distinct values, each ${range}` });
+  }
+  for (const k of ["minimum", "maximum"] as const) {
+    if (v[k] !== undefined && !isCardCount(v[k])) out.push({ field: `${at}.${k}`, reason: `must be ${range}` });
+  }
+  if (v.enum === undefined && v.maximum === undefined) out.push({ field: at, reason: "needs an enum or a maximum" });
+  if (isCardCount(v.minimum) && isCardCount(v.maximum) && v.minimum > v.maximum) {
+    out.push({ field: `${at}.minimum`, reason: "must not exceed maximum" });
+  }
+  checkDescription(v, at, out);
+}
+
+function checkTemplateDeclaration(v: unknown, at: string, out: OverrideProblem[]): void {
+  if (!isPlainObject(v)) {
+    out.push({ field: at, reason: "must be an object" });
+    return;
+  }
+  checkKeys(v, [...TEMPLATE_KEYS, "description"], at, out);
+  if (TEMPLATE_KEYS.every((k) => v[k] === undefined)) {
+    out.push({ field: at, reason: "declares nothing overridable (expected fromImage, per_gpu_count or resources)" });
+  }
+  if (v.fromImage !== undefined) {
+    checkStringRule(v.fromImage, `${at}.fromImage`, out);
+    // An image is what a sandbox runs: the declaration says which, never "any".
+    if (isPlainObject(v.fromImage) && v.fromImage.enum === undefined && v.fromImage.pattern === undefined) {
+      out.push({ field: `${at}.fromImage`, reason: "needs an enum or a pattern" });
+    }
+  }
+  if (v.per_gpu_count !== undefined) checkIntegerRule(v.per_gpu_count, `${at}.per_gpu_count`, out);
+  if (v.resources !== undefined) {
+    const rat = `${at}.resources`;
+    const r = v.resources;
+    if (!isPlainObject(r)) out.push({ field: rat, reason: "must be an object" });
+    else {
+      const keys = ["cpu", "memory", "ephemeralStorage", "sharedMemory"] as const;
+      checkKeys(r, [...keys, "description"], rat, out);
+      if (keys.every((k) => r[k] === undefined)) {
+        out.push({ field: rat, reason: "declares no resource (expected cpu, memory, ephemeralStorage or sharedMemory)" });
+      }
+      for (const k of keys) {
+        const m = r[k];
+        if (m === undefined) continue;
+        if (!isPlainObject(m)) {
+          out.push({ field: `${rat}.${k}`, reason: "must be an object with max" });
+          continue;
+        }
+        checkKeys(m, ["max", "description"], `${rat}.${k}`, out);
+        if (quantityOf(m.max) === undefined) out.push({ field: `${rat}.${k}.max`, reason: QUANTITY_TEXT });
+        checkDescription(m, `${rat}.${k}`, out);
+      }
+      checkDescription(r, rat, out);
+    }
+  }
+  checkDescription(v, at, out);
 }
 
 /**
@@ -298,7 +459,7 @@ export function pluginImageRepos(images: unknown): string[] {
 
 /** What a surface can apply. */
 const APPLICABLE: Record<OverrideSurface, ReadonlySet<keyof OverrideValues>> = {
-  app: new Set(["image", "model", "args", "env"]),
+  app: new Set(["image", "model", "args", "env", "sandbox_templates"]),
   task: new Set(["image", "model"]),
 };
 
@@ -311,7 +472,7 @@ const APPLICABLE: Record<OverrideSurface, ReadonlySet<keyof OverrideValues>> = {
  */
 export function checkOverrides(
   requested: unknown,
-  plugin: { overridable?: unknown; images?: unknown },
+  plugin: { overridable?: unknown; images?: unknown; resource?: unknown },
   surface: OverrideSurface,
 ): { ok: true; values: OverrideValues } | { ok: false; problems: OverrideProblem[] } {
   if (requested === undefined || requested === null) return { ok: true, values: {} };
@@ -323,7 +484,7 @@ export function checkOverrides(
   for (const key of Object.keys(requested)) {
     const at = `overrides.${key}`;
     if (!TOP_KEYS.has(key)) {
-      out.push({ field: at, reason: "unknown key (expected image, model, args or env)" });
+      out.push({ field: at, reason: `unknown key (expected ${TOP_KEYS_TEXT})` });
       continue;
     }
     const k = key as keyof OverrideValues;
@@ -363,6 +524,9 @@ export function checkOverrides(
         if (v !== undefined) args.push(v);
       });
       if (args.length === value.length) values.args = args;
+    } else if (k === "sandbox_templates") {
+      const v = checkTemplateOverrides(value, decl.sandbox_templates!, plugin.resource, at, out, patterns);
+      if (v !== undefined) values.sandbox_templates = v;
     } else {
       if (!isPlainObject(value)) {
         out.push({ field: at, reason: "must be an object of variable name to value" });
@@ -390,6 +554,257 @@ export function checkOverrides(
   return { ok: true, values };
 }
 
+/** The sandbox templates (by name) and roles of a plugin's app manifest; none when it has no manifest. */
+function manifestTemplates(resource: unknown): { templates: Map<string, Record<string, unknown>>; roles: Record<string, unknown> } {
+  const app = isPlainObject(resource) ? resource.app : undefined;
+  const manifest = isPlainObject(app) ? app.manifest : undefined;
+  const list = isPlainObject(manifest) && Array.isArray(manifest.sandbox_templates) ? manifest.sandbox_templates : [];
+  const templates = new Map<string, Record<string, unknown>>();
+  for (const t of list) if (isPlainObject(t) && typeof t.name === "string" && !templates.has(t.name)) templates.set(t.name, t);
+  const roles = isPlainObject(manifest) && isPlainObject(manifest.sandbox_roles) ? manifest.sandbox_roles : {};
+  return { templates, roles };
+}
+
+/** The card counts a template is registered for (as the app's template map keys them). */
+function cardCounts(t: Record<string, unknown>): number[] {
+  if (Array.isArray(t.per_gpu_count) && t.per_gpu_count.length > 0) return t.per_gpu_count as number[];
+  return [typeof t.gpus === "number" && Number.isInteger(t.gpus) && t.gpus >= 0 ? t.gpus : 0];
+}
+
+/**
+ * The app is handed one template name per role and card count, so two templates
+ * of one role may not take the same count. A changed count that would collide is
+ * refused here rather than by the grant, after the run was admitted.
+ */
+function cardCountCollisions(
+  effective: Map<string, Record<string, unknown>>,
+  changed: Set<string>,
+  roles: Record<string, unknown>,
+  at: string,
+  out: OverrideProblem[],
+): void {
+  for (const [role, names] of Object.entries(roles)) {
+    if (!Array.isArray(names)) continue;
+    const taken = new Map<number, string>();
+    for (const name of names) {
+      const t = typeof name === "string" ? effective.get(name) : undefined;
+      if (!t) continue;
+      for (const n of cardCounts(t)) {
+        const other = taken.get(n);
+        if (other === undefined) taken.set(n, name);
+        else if (other !== name && (changed.has(name) || changed.has(other))) {
+          const mine = changed.has(name) ? name : other;
+          out.push({
+            field: `${at}.${mine}.per_gpu_count`,
+            reason: `role ${role} would have two templates for ${n} card(s) (${other} and ${name})`,
+          });
+        }
+      }
+    }
+  }
+}
+
+function checkTemplateOverrides(
+  value: unknown,
+  decls: Record<string, TemplateOverridable>,
+  resource: unknown,
+  at: string,
+  out: OverrideProblem[],
+  patterns: PatternJob[],
+): Record<string, TemplateOverrideValues> | undefined {
+  const { templates, roles } = manifestTemplates(resource);
+  if (!isPlainObject(value) || Object.keys(value).length === 0) {
+    out.push({ field: at, reason: "must be an object of template name to values, naming at least one template" });
+    return undefined;
+  }
+  const entries: Array<[string, TemplateOverrideValues]> = [];
+  for (const [name, given] of Object.entries(value)) {
+    const tat = `${at}.${name}`;
+    const rule = TEMPLATE_NAME_RE.test(name) && Object.hasOwn(decls, name) ? decls[name]! : undefined;
+    if (!rule) {
+      out.push({ field: tat, reason: "the plugin does not declare this template overridable" });
+      continue;
+    }
+    const template = templates.get(name);
+    if (!template) {
+      out.push({ field: tat, reason: "the app manifest has no sandbox template of this name" });
+      continue;
+    }
+    if (!isPlainObject(given) || Object.keys(given).length === 0) {
+      out.push({ field: tat, reason: "must be an object naming at least one of fromImage, per_gpu_count and resources" });
+      continue;
+    }
+    const before = out.length;
+    const tv: TemplateOverrideValues = {};
+    for (const key of Object.keys(given)) {
+      if (!(TEMPLATE_KEYS as readonly string[]).includes(key)) {
+        out.push({ field: `${tat}.${key}`, reason: "unknown key (expected fromImage, per_gpu_count or resources)" });
+      } else if (rule[key as (typeof TEMPLATE_KEYS)[number]] === undefined) {
+        out.push({ field: `${tat}.${key}`, reason: "the plugin does not declare this overridable for the template" });
+      }
+    }
+    if (given.fromImage !== undefined && rule.fromImage) {
+      const v = checkStringValue(given.fromImage, rule.fromImage, `${tat}.fromImage`, out, patterns);
+      if (v !== undefined) tv.fromImage = v;
+    }
+    if (given.per_gpu_count !== undefined && rule.per_gpu_count) {
+      const n = given.per_gpu_count;
+      const r = rule.per_gpu_count;
+      if (!isCardCount(n)) out.push({ field: `${tat}.per_gpu_count`, reason: `must be an integer from 1 to ${OVERRIDE_LIMITS.maxGpuCount}` });
+      else if (r.enum && !r.enum.includes(n)) out.push({ field: `${tat}.per_gpu_count`, reason: `must be one of ${r.enum.join(", ")}` });
+      else if ((r.minimum !== undefined && n < r.minimum) || (r.maximum !== undefined && n > r.maximum)) {
+        out.push({ field: `${tat}.per_gpu_count`, reason: `must be from ${r.minimum ?? 1} to ${r.maximum ?? OVERRIDE_LIMITS.maxGpuCount}` });
+      } else tv.per_gpu_count = n;
+    }
+    if (given.resources !== undefined && rule.resources) {
+      const r = checkTemplateResources(given.resources, rule.resources, `${tat}.resources`, out);
+      if (r !== undefined) tv.resources = r;
+    }
+    if (out.length > before) continue;
+    // What the template is with these values: a request above its limit, or a
+    // shared memory the container cannot hold, would only be refused later, by
+    // Agent Sandbox, after the run was admitted.
+    effectiveTemplateProblems(applyTemplateOverride(template, tv), tv, tat, out);
+    entries.push([name, tv]);
+  }
+  const recounted = entries.filter(([, tv]) => tv.per_gpu_count !== undefined);
+  if (recounted.length > 0) {
+    const effective = new Map(templates);
+    for (const [name, tv] of recounted) effective.set(name, { ...templates.get(name)!, per_gpu_count: [tv.per_gpu_count!] });
+    cardCountCollisions(effective, new Set(recounted.map(([name]) => name)), roles, at, out);
+  }
+  return Object.fromEntries(entries);
+}
+
+function checkTemplateResources(
+  value: unknown,
+  rule: TemplateResourcesRule,
+  at: string,
+  out: OverrideProblem[],
+): TemplateResourceValues | undefined {
+  if (!isPlainObject(value) || Object.keys(value).length === 0) {
+    out.push({ field: at, reason: "must be an object naming at least one of requests, limits and sharedMemory" });
+    return undefined;
+  }
+  const before = out.length;
+  checkKeys(value, ["requests", "limits", "sharedMemory"], at, out);
+  const res: TemplateResourceValues = {};
+  const bounded = (q: unknown, max: QuantityMax | undefined, qat: string): string | undefined => {
+    if (!max) {
+      out.push({ field: qat, reason: "the plugin declares no maximum for this resource" });
+      return undefined;
+    }
+    const n = quantityOf(q);
+    if (n === undefined) {
+      out.push({ field: qat, reason: QUANTITY_TEXT });
+      return undefined;
+    }
+    if (n > quantityOf(max.max)!) {
+      out.push({ field: qat, reason: `must be at most ${max.max}` });
+      return undefined;
+    }
+    return q as string;
+  };
+  for (const side of ["requests", "limits"] as const) {
+    const list = value[side];
+    if (list === undefined) continue;
+    if (!isPlainObject(list) || Object.keys(list).length === 0) {
+      out.push({ field: `${at}.${side}`, reason: "must be an object of resource name to quantity, naming at least one" });
+      continue;
+    }
+    const entries: Array<[string, string]> = [];
+    for (const [name, q] of Object.entries(list)) {
+      const key = RESOURCE_RULE_KEY[name];
+      if (!key) {
+        out.push({ field: `${at}.${side}.${name}`, reason: "only cpu, memory and ephemeral-storage may be set" });
+        continue;
+      }
+      const v = bounded(q, rule[key], `${at}.${side}.${name}`);
+      if (v !== undefined) entries.push([name, v]);
+    }
+    res[side] = Object.fromEntries(entries);
+  }
+  if (value.sharedMemory !== undefined) {
+    const v = bounded(value.sharedMemory, rule.sharedMemory, `${at}.sharedMemory`);
+    if (v !== undefined) res.sharedMemory = v;
+  }
+  return out.length > before ? undefined : res;
+}
+
+/** Where a template's container fields live: inside `template` in the wrapped form, else at its top (as Agent Sandbox reads it). */
+function containerOf(t: Record<string, unknown>): Record<string, unknown> {
+  const nested = t.template;
+  const named = (v: unknown) => typeof v === "string" && v !== "";
+  if (isPlainObject(nested) && (named(nested.fromImage) || !named(t.fromImage))) return nested;
+  return t;
+}
+
+/**
+ * One template with a launch's values applied. `per_gpu_count` becomes the
+ * template's only card count; `fromImage` and `resources` are written where
+ * Agent Sandbox reads them (inside `template` when the template is in that
+ * form); each given request or limit replaces that one entry, and
+ * `sharedMemory` is the template's `gpu.sharedMemory`. The input is not changed.
+ */
+export function applyTemplateOverride(template: Record<string, unknown>, v: TemplateOverrideValues): Record<string, unknown> {
+  const out: Record<string, unknown> = structuredClone(template);
+  if (v.per_gpu_count !== undefined) out.per_gpu_count = [v.per_gpu_count];
+  const container = containerOf(out);
+  if (v.fromImage !== undefined) container.fromImage = v.fromImage;
+  const r = v.resources;
+  if (r?.requests || r?.limits) {
+    const current = isPlainObject(container.resources) ? container.resources : {};
+    const merged: Record<string, unknown> = { ...current };
+    for (const side of ["requests", "limits"] as const) {
+      if (!r[side]) continue;
+      merged[side] = Object.fromEntries([
+        ...Object.entries(isPlainObject(current[side]) ? current[side] : {}),
+        ...Object.entries(r[side]),
+      ]);
+    }
+    container.resources = merged;
+  }
+  if (r?.sharedMemory !== undefined) {
+    out.gpu = { ...(isPlainObject(out.gpu) ? out.gpu : {}), sharedMemory: r.sharedMemory };
+  }
+  return out;
+}
+
+/** What the effective template could not run with, for the values a launch gave. */
+function effectiveTemplateProblems(t: Record<string, unknown>, v: TemplateOverrideValues, at: string, out: OverrideProblem[]): void {
+  const r = v.resources;
+  if (!r) return;
+  const resources = containerOf(t).resources;
+  const list = (side: string): Record<string, unknown> => {
+    const l = isPlainObject(resources) ? resources[side] : undefined;
+    return isPlainObject(l) ? l : {};
+  };
+  const requests = list("requests");
+  const limits = list("limits");
+  for (const name of RESOURCE_NAMES) {
+    if (r.requests?.[name] === undefined && r.limits?.[name] === undefined) continue;
+    const req = quantityOf(requests[name]);
+    const lim = quantityOf(limits[name]);
+    if (req !== undefined && lim !== undefined && req > lim) {
+      const side = r.requests?.[name] !== undefined ? "requests" : "limits";
+      out.push({ field: `${at}.resources.${side}.${name}`, reason: `the request ${String(requests[name])} exceeds the limit ${String(limits[name])}` });
+    }
+  }
+  if (r.sharedMemory !== undefined) {
+    const cards = t.per_gpu_count;
+    if (!Array.isArray(cards) || cards.length === 0) {
+      out.push({ field: `${at}.resources.sharedMemory`, reason: "applies only to a template with per_gpu_count" });
+    }
+    // Shared memory is charged to the container's memory: it cannot exceed the memory limit.
+    const memory = limits.memory ?? requests.memory;
+    const shm = quantityOf(r.sharedMemory)!;
+    const mem = quantityOf(memory);
+    if (mem !== undefined && shm > mem) {
+      out.push({ field: `${at}.resources.sharedMemory`, reason: `exceeds the memory limit ${String(memory)}` });
+    }
+  }
+}
+
 /** Whether any value was given. */
 export function hasOverrides(v: OverrideValues): boolean {
   return Object.keys(v).length > 0;
@@ -398,10 +813,16 @@ export function hasOverrides(v: OverrideValues): boolean {
 /**
  * The manifest an app run gets: the plugin's, with the checked overrides applied.
  * `env` and the model's env names are merged over the manifest's env, `args` are
- * appended to `command`, and `image` becomes the container's default image.
+ * appended to `command`, `image` becomes the container's default image, and each
+ * named template gets its values (see applyTemplateOverride).
  * The input is not changed.
  */
-export function applyAppOverrides<M extends { command: string[]; env?: Record<string, string>; container: { image?: string } }>(
+export function applyAppOverrides<M extends {
+  command: string[];
+  env?: Record<string, string>;
+  container: { image?: string };
+  sandbox_templates?: Array<{ name: string; [field: string]: unknown }>;
+}>(
   manifest: M,
   values: OverrideValues,
   decl: OverridableDeclaration,
@@ -420,6 +841,13 @@ export function applyAppOverrides<M extends { command: string[]; env?: Record<st
     container: values.image !== undefined ? { ...manifest.container, image: values.image } : { ...manifest.container },
   };
   if (Object.keys(env).length > 0 || manifest.env !== undefined) out.env = env;
+  const templates = values.sandbox_templates;
+  if (templates && manifest.sandbox_templates) {
+    out.sandbox_templates = manifest.sandbox_templates.map((t) => {
+      const v = Object.hasOwn(templates, t.name) ? templates[t.name] : undefined;
+      return v ? applyTemplateOverride(t, v) as typeof t : t;
+    });
+  }
   return out;
 }
 
@@ -437,5 +865,8 @@ export function overrideKeys(values: OverrideValues): string[] {
   const keys: string[] = [];
   for (const k of ["image", "model", "args"] as const) if (values[k] !== undefined) keys.push(k);
   for (const name of Object.keys(values.env ?? {})) keys.push(`env.${name}`);
+  for (const [name, v] of Object.entries(values.sandbox_templates ?? {})) {
+    for (const k of TEMPLATE_KEYS) if (v[k] !== undefined) keys.push(`sandbox_templates.${name}.${k}`);
+  }
   return keys;
 }
