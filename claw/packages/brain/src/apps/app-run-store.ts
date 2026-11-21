@@ -116,6 +116,14 @@ export interface AppRunRecord {
   task_status?: string;
   /** The run's session was deleted. Absent from an API older than the field. */
   session_deleted?: boolean;
+  /**
+   * The run's time limit in seconds, counted from `created_at`: the smaller of the
+   * manifest's `limits.max_runtime_sec` and the request's grant, as admitted (and the
+   * task's `deadline_at`). Null for a run with no limit or admitted before it was
+   * recorded; absent from an API older than the field. Either way the manifest's
+   * limit is what is left.
+   */
+  max_runtime_sec?: number | null;
 }
 
 /**

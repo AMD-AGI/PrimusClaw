@@ -48,7 +48,7 @@
  * {@link AppRunnerSeams}: event tailing and MCP registration.
  */
 import pino from "pino";
-import { APP_MANIFEST_DEFAULTS, type AppManifestV1, type AppSandboxRole, type SandboxSpecCreate } from "@claw/protocol";
+import { APP_MANIFEST_DEFAULTS, APP_MAX_STOP_GRACE_SEC, type AppManifestV1, type AppSandboxRole, type SandboxSpecCreate } from "@claw/protocol";
 import type {
   SandboxExecOptions, SandboxExecResult, SandboxInstance, SandboxStatus,
 } from "../sandbox/provider.js";
@@ -128,12 +128,8 @@ const FINISH_STEP_ATTEMPTS = 5;
 /** Consecutive failed ticks, with the store or SaFE unreachable, before finishNow gives up. */
 const FINISH_NOW_MAX_FAILURES = 60;
 const TEXT_MAX = 300;
-/**
- * Hard ceiling on the SIGTERM grace, whatever the manifest asks for: the wait
- * keeps the run's lock and its sandbox, so an application cannot name an hour
- * count of its own.
- */
-export const MAX_STOP_GRACE_SEC = 3600;
+/** Hard ceiling on the SIGTERM grace (the API's deadline backstop waits it out too). */
+export const MAX_STOP_GRACE_SEC = APP_MAX_STOP_GRACE_SEC;
 /**
  * The SIGTERM grace of a run whose session was deleted, whatever the manifest asks for.
  *
@@ -738,10 +734,15 @@ export class AppRunner {
     return run;
   }
 
-  /** `limits.max_runtime_sec` counts from the run's creation, so a takeover keeps the same deadline. */
+  /**
+   * The run's time limit counts from its creation, so a takeover keeps the same
+   * deadline. The limit is the one admitted (the smaller of the manifest's and the
+   * request's grant, the task's `deadline_at`), or the manifest's for a run that has
+   * none recorded.
+   */
   private pastDeadline(): boolean {
     if (this.rec.state === "finishing" || this.rec.state === "ended") return false;
-    const max = this.rec.manifest.limits?.max_runtime_sec;
+    const max = this.rec.max_runtime_sec ?? this.rec.manifest.limits?.max_runtime_sec;
     if (typeof max !== "number" || !(max > 0)) return false;
     const created = Date.parse(this.rec.created_at);
     return Number.isFinite(created) && this.now() >= created + max * 1000;

@@ -160,6 +160,12 @@ read it from the same place and answer the same block.
       "workload_id": "claw-1795239361812-sandbox-q8v4n",
       "since": "2026-11-21T05:41:12.384Z"
     },
+    "restarts": 4,
+    "last_exit": {
+      "returncode": 3,
+      "at": "2026-11-21T06:10:02.918Z",
+      "cause": "restarts_exhausted"
+    },
     "outcome": {
       "cause": "exited",
       "returncode": 3,
@@ -187,6 +193,31 @@ one was created (and while a replacement for a lost one is being created).
 `sandbox.since` is when the sandbox entered its state, and also moves when a new
 sandbox is started for the run; `null` for a run created before this field existed.
 `placement.workload_id` on `GET /v1/runs` names the same workload for an app run.
+
+`restarts` and `last_exit` are there while the run is alive, so an application that
+keeps crashing (and keeps being restarted, its task reading `running` all along) can
+be told from one that is running:
+
+- `restarts` is how many restarts the run has spent of the manifest's
+  `restart.max_restarts`: an exit without `final`, a launch that kept failing, or a
+  sandbox lost for a reason that is the application's. A sandbox the platform took
+  away (its node lost, no node to run on) is not counted. `0` until then.
+- `last_exit` is the last time the application stopped, or the run was stopped;
+  `null` until then (a run still waiting for its first sandbox has had nothing stop).
+  It moves on every exit. `returncode` is what the application wrote in its
+  `exit.json`, `null` when it wrote none or did not exit on its own; `at` is when the
+  run's worker saw it; `cause` is one of the closed list below. It carries no text
+  from the application: the error of the exit that ended the run is `outcome.error`.
+
+| `last_exit.cause` | What stopped |
+| --- | --- |
+| `exited` | The application exited (and was restarted, unless it wrote `final`). |
+| `start_failed` | The application could not be started. |
+| `sandbox_lost` | Its sandbox was lost, or the platform did not provide one, and a new one was asked for. |
+| `restarts_exhausted` | It stopped with no restart left; `returncode` is that last exit's. |
+| `deadline` | The run reached its time limit and was stopped. |
+| `cancelled` | The run was cancelled, or its session was deleted. |
+| `task_closed` | The run's task was closed by something other than the run. |
 
 `outcome` is `null` until the run has ended. Then:
 
@@ -219,6 +250,14 @@ A `sandbox_*` cause is reported when the run ended because it never got a sandbo
 its restart budget, or (for `sandbox_create_failed`) at its deadline. A run cancelled
 or past its deadline while merely queued reads `cancelled` or `deadline`, with
 `sandbox.state` saying where the sandbox was.
+
+An app run's time limit is the smaller of the manifest's `limits.max_runtime_sec` and
+the request's `resources.grant.max_runtime_sec`, counted from the run's creation (queue
+time included). The task's `deadline_at` is that moment, the one the run is stopped
+at with cause `deadline`, rather than the generic budget a task gets from its start;
+an app run with no limit keeps that budget. Past `deadline_at`, the application is given its
+`stop_grace_sec` (at most an hour) to stop before the deadline backstop closes the
+task, on top of the backstop's grace every task gets.
 
 The task's `failure_reason` is unchanged and still carries the same text for a person
 ("app exited final with return code 3", "app run ended: restarts exhausted"); read

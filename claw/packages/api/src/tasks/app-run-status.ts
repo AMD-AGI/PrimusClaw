@@ -17,8 +17,13 @@
  *
  *   {
  *     "sandbox": { "state": "pending" | "running" | "ended", "workload_id": string, "since": ISO time | null },
+ *     "restarts": int,
+ *     "last_exit": null | { "returncode": int | null, "at": ISO time, "cause": AppRunExitCause },
  *     "outcome": null | { "cause": AppRunCause, "returncode": int | null, "final": bool, "error": string | null }
  *   }
+ *
+ * `restarts` and `last_exit` are there while the run is alive: an application that
+ * keeps crashing is restarted by the Brain, and its task reads `running` throughout.
  */
 import { redactSecrets } from "@claw/utils";
 import { db } from "../infra/db.js";
@@ -64,6 +69,40 @@ export interface AppRunOutcomeView {
   error: string | null;
 }
 
+/**
+ * What last stopped the application, or the run, as {@link AppRunLastExitView.cause}
+ * reports it. A closed list: a `last_exit` with any other cause is not shown.
+ */
+export const APP_RUN_EXIT_CAUSES = [
+  "exited",
+  "start_failed",
+  "sandbox_lost",
+  "restarts_exhausted",
+  "deadline",
+  "cancelled",
+  "task_closed",
+] as const;
+export type AppRunExitCause = typeof APP_RUN_EXIT_CAUSES[number];
+
+/** The Brain's `last_exit.cause` (brain `AppLastExit`) as {@link AppRunExitCause}. */
+const EXIT_CAUSE_OF: Readonly<Record<string, AppRunExitCause>> = {
+  exit: "exited",
+  start_failed: "start_failed",
+  sandbox_lost: "sandbox_lost",
+  restarts_exhausted: "restarts_exhausted",
+  deadline: "deadline",
+  cancelled: "cancelled",
+  row_terminal: "task_closed",
+};
+
+export interface AppRunLastExitView {
+  /** The return code the application wrote in its `exit.json`; null when it wrote none, or it did not exit on its own. */
+  returncode: number | null;
+  /** When the Brain saw it (ISO time). */
+  at: string;
+  cause: AppRunExitCause;
+}
+
 export interface AppRunStatus {
   sandbox: {
     state: AppSandboxState;
@@ -72,6 +111,14 @@ export interface AppRunStatus {
     /** When the sandbox entered `state`; null for a run created before this was recorded. */
     since: string | null;
   };
+  /**
+   * Restarts the Brain has counted against the manifest's `restart.max_restarts`: an
+   * exit without `final`, a launch that kept failing, or a sandbox lost for a reason
+   * that is the application's. A sandbox the platform took away is not counted.
+   */
+  restarts: number;
+  /** The last time the application stopped (or the run was stopped); null until then. */
+  last_exit: AppRunLastExitView | null;
   /** How the run ended; null until it has. */
   outcome: AppRunOutcomeView | null;
 }
@@ -175,9 +222,37 @@ export function appRunOutcomeOf(state: string, lastExit: Record<string, unknown>
   };
 }
 
+/**
+ * The run's `last_exit` as {@link AppRunStatus.last_exit}: its cause, when, and the
+ * application's return code. Free text on the row (`error`, `stop_reason`, the
+ * platform's words) is never part of it.
+ *
+ * Null when the application has not stopped yet. The one record the Brain writes
+ * before that is the carrier of a sandbox create that keeps failing (cause
+ * `sandbox_lost` with neither a restart nor a platform loss counted; every other
+ * `sandbox_lost` the Brain writes counts one of them): the run has had no sandbox,
+ * so nothing has stopped.
+ */
+export function appRunLastExitOf(lastExit: Record<string, unknown> | null, restarts: number): AppRunLastExitView | null {
+  if (!lastExit) return null;
+  const cause = typeof lastExit.cause === "string" ? EXIT_CAUSE_OF[lastExit.cause] : undefined;
+  if (!cause) return null;
+  const losses = lastExit.platform_losses;
+  if (cause === "sandbox_lost" && restarts === 0 && !(typeof losses === "number" && losses > 0)) return null;
+  const at = typeof lastExit.at === "string" ? Date.parse(lastExit.at) : NaN;
+  if (!Number.isFinite(at)) return null;
+  const rc = lastExit.returncode;
+  return {
+    returncode: typeof rc === "number" && Number.isInteger(rc) ? rc : null,
+    at: new Date(at).toISOString(),
+    cause,
+  };
+}
+
 interface StatusRow {
   task_id: string;
   state: string;
+  restarts: number | string | null;
   last_exit: Record<string, unknown> | null;
   sandbox_workload_id: string | null;
   sandbox_state: string | null;
@@ -186,12 +261,16 @@ interface StatusRow {
 
 export function appRunStatusOf(row: StatusRow): AppRunStatus {
   const since = row.sandbox_since instanceof Date ? row.sandbox_since.toISOString() : row.sandbox_since ?? null;
+  const restarts = Number(row.restarts ?? 0);
+  const counted = Number.isInteger(restarts) && restarts > 0 ? restarts : 0;
   return {
     sandbox: {
       state: sandboxStateOf(row.sandbox_state, row.state),
       workload_id: row.sandbox_workload_id ?? "",
       since,
     },
+    restarts: counted,
+    last_exit: appRunLastExitOf(row.last_exit, counted),
     outcome: appRunOutcomeOf(row.state, row.last_exit),
   };
 }
@@ -209,7 +288,7 @@ export async function readAppRunStatuses(taskIds: readonly string[]): Promise<Ma
 }
 
 const STATUS_SQL = (sandboxColumns: string) =>
-  `SELECT task_id, state, last_exit, sandbox_workload_id, ${sandboxColumns}
+  `SELECT task_id, state, restarts, last_exit, sandbox_workload_id, ${sandboxColumns}
      FROM claw_app_runs WHERE task_id = ANY($1::text[])`;
 
 /**

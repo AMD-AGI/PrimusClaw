@@ -74,6 +74,13 @@ export interface AppRunView {
   task_status: string;
   /** The run's session was deleted. */
   session_deleted: boolean;
+  /**
+   * The run's time limit in seconds, counted from `created_at`: the smaller of the
+   * manifest's `limits.max_runtime_sec` and the request's grant, recorded at admission
+   * (`metadata.app_max_runtime_sec` on the task), and the task's `deadline_at`. Null
+   * for a run with no limit, or admitted before it was recorded.
+   */
+  max_runtime_sec: number | null;
 }
 
 interface RunRow {
@@ -98,18 +105,22 @@ interface RunRow {
   created_by: string | null;
   task_status: string;
   session_deleted: boolean;
+  max_runtime_sec: number | null;
 }
 
 /** The task's status as the user last saw it; see {@link AppRunView.task_status}. Reads `t.status` and `t.metadata`. */
 const TASK_STATUS_SQL = "COALESCE(t.metadata->'app_finish_prior'->>'status', t.status)";
 /** Whether the run's session is deleted; a session row that is missing altogether counts as deleted. */
 const SESSION_DELETED_SQL = `NOT EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = r.session_id AND s.deleted_at IS NULL)`;
+/** The run's time limit recorded at admission (see {@link AppRunView.max_runtime_sec}). Reads `t.metadata`. */
+const MAX_RUNTIME_SQL = `(CASE WHEN t.metadata->>'app_max_runtime_sec' ~ '^[0-9]{1,9}$'
+                               THEN (t.metadata->>'app_max_runtime_sec')::int END)`;
 
 const VIEW_SQL = `
   SELECT r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
          r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_templates, r.grant_expires_at, r.grant_revoked_at, r.created_at,
          r.created_by, t.input, t.sandbox_spec, t.workspace_id,
-         ${TASK_STATUS_SQL} AS task_status, ${SESSION_DELETED_SQL} AS session_deleted
+         ${TASK_STATUS_SQL} AS task_status, ${SESSION_DELETED_SQL} AS session_deleted, ${MAX_RUNTIME_SQL} AS max_runtime_sec
     FROM claw_app_runs r JOIN claw_tasks t ON t.task_id = r.task_id`;
 
 function toView(row: RunRow): AppRunView {
@@ -135,6 +146,7 @@ function toView(row: RunRow): AppRunView {
     user_id: row.created_by,
     task_status: row.task_status,
     session_deleted: row.session_deleted === true,
+    max_runtime_sec: typeof row.max_runtime_sec === "number" && row.max_runtime_sec > 0 ? row.max_runtime_sec : null,
   };
 }
 
@@ -322,7 +334,7 @@ export async function patchAppRun(
       RETURNING r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
                 r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_templates, r.grant_expires_at, r.grant_revoked_at, r.created_at,
                 r.created_by, t.input, t.sandbox_spec, t.workspace_id,
-                ${TASK_STATUS_SQL} AS task_status, ${SESSION_DELETED_SQL} AS session_deleted`,
+                ${TASK_STATUS_SQL} AS task_status, ${SESSION_DELETED_SQL} AS session_deleted, ${MAX_RUNTIME_SQL} AS max_runtime_sec`,
     params,
   );
   // With APP_RUNS_ENABLED off the schema guard only warns about missing app-run
