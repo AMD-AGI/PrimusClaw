@@ -8,6 +8,7 @@
 import { register, type Registrar } from "../../src/functions.js";
 import { createIngress, type Ingress } from "../../src/ingress.js";
 import { type QueueClient, type ServiceBusFactory } from "../../src/queue.js";
+import { HEALTH_LOGGER } from "../../src/health.js";
 import { type LogRecord } from "../../src/log.js";
 
 export interface Case {
@@ -71,6 +72,7 @@ function recordingBus(result: Result, failSends: number[]): ServiceBusFactory {
         close: () => Promise.resolve(),
       };
     },
+    close: () => Promise.resolve(),
   });
   return {
     fromIdentity(namespace, clientId) {
@@ -164,7 +166,9 @@ export async function runCase(c: Case): Promise<Result> {
   } catch (error) {
     result.driverError = errorText(error);
   }
-  result.logs = records.map((r) => [r.logger, r.level, r.message]);
+  // The health records (src/health.ts) are new: the Python Function had none. test/enqueue-recovery.test.ts pins them;
+  // the token check below still reads them.
+  result.logs = records.filter((r) => r.logger !== HEALTH_LOGGER).map((r) => [r.logger, r.level, r.message]);
   result.everything = records
     .map((r) => `${r.level} ${r.logger} ${r.message}${r.error === undefined ? "" : ` ${errorText(r.error)}`}`)
     .join("\n");

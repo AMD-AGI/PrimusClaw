@@ -113,6 +113,13 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: metrics for the API's event consumer: `claw_api_event_consumer_consecutive_failures` (deliveries this replica
+  retried since it last stored or set aside an event), `claw_api_event_quarantined_total{reason}` (`unparseable`,
+  `unstorable`, `bounded`), `claw_api_event_sanitised_total` (events stored with a character replaced), and, read from the server every 30 seconds,
+  `claw_api_event_consumer_ack_pending`, `claw_api_event_consumer_pending` and
+  `claw_api_event_consumer_oldest_pending_age_seconds` (how long the oldest event not yet acknowledged has waited; 0 when
+  none is).
+
 - Connector: a connector that runs as a service upgrades itself to the version Claw recommends (on by default; off with
   `claw-connector auto-upgrade off`, `auto_upgrade = false` in `agents.toml`, or `CLAW_CONNECTOR_AUTO_UPGRADE=0`). It
   takes exactly the recommended version (never `latest`, never down, never a prerelease or a new major version; below
@@ -196,6 +203,64 @@ release version, and its `appVersion` stays `latest`.
   set aside as `unsent:<status>` (a gap of more than 50 seconds between such passes, as when no worker ran, starts the
   hour again), and one written before the upgrade is sent at least once more before it can be set aside. See "Push
   notifications" in `claw/docs/a2a.md`.
+- Claw: a run whose sandbox the platform did not create or schedule now ends failed, with a stable `failure_reason` and
+  the platform's own words as its message, on `GET /v1/runs`, the run row, the session's events (a `sandboxStatus`
+  event with `status: failed`), the A2A task status (the message carries `metadata.failure_reason`) and the `run.failed`
+  notification (its summary is `<code>: <message>`). Until now a create that SaFE refused (for example its admission
+  webhook's QoS ceiling: "timeout 64800 exceeds the qos limit of 10800 seconds for scope Sandbox") was treated as a
+  retryable error, and the run ended `class: exited` with no exit code and an empty `failure_reason`; so did a workload
+  that failed before it was ready, and a create that failed with a 5xx. The codes: `sandbox_rejected` (SaFE answered the
+  create with a 4xx other than 403, 408, 425 or 429: the same request is not sent again within the run),
+  `sandbox_create_failed` (a 5xx, a 408, 425 or 429, or no answer; retried, and the run fails with it once no retry is
+  left before the run's deadline or its delivery limit, a run claimed through `/v1/runs` counting its claims, so it no
+  longer ends `max_retries_exceeded` instead), the workload's terminal code (for example `sandbox_workload_terminal`,
+  with the `AdminFailed` condition's reason and message), `sandbox_unschedulable` and `sandbox_pending_timeout`. When a
+  refusal is about the timeout, the message also says the timeout the run asked for and the one Claw sent (Claw adds
+  3600 s to stop the run cleanly) and, when only that hour is over the platform's limit, the largest timeout that fits.
+  A run that is refused the workspace (403) still carries on without a sandbox and is not failed for it. After
+  `sandbox_pending_timeout`, a deadline, `GET /v1/runs` keeps `class: killed` with `kill_reason: deadline`, as before. The
+  platform's text is bounded, kept on one line and masked like every other value the run sends; every value the
+  sandbox's env was sent is masked in it too, and in the log of the refusal, since a platform may echo the request back.
+  It is masked before it is cut or folded onto one line, and in each spelling the answer may carry a value in (as sent,
+  JSON-escaped as JavaScript and as Go write it, folded, a line at a time), so neither a credential that runs across the
+  cut, nor a multi-line one (a PEM key), nor a signed URL whose `&` the platform wrote as `\u0026` is left partly or
+  wholly in clear.
+- Claw: `redactSecrets` masks the exact values it is given before its patterns run. A pattern that matched part of such
+  a value (a hex token inside a JSON value, a URL's `user:pass@`) used to leave the rest of it, such as a password beside
+  the token or the URL's host and database, unmasked.
+- Claw API: a queued message that can never be sent no longer holds every later message on its session behind it. A
+  message sent while the session is busy waits in that session's queue, and a drain sends only the oldest one; a
+  message whose dispatch failed every time (for example, one larger than NATS's `max_payload`) was retried on every
+  completion and every sweeper tick with no limit, and nothing after it was sent while the session read idle. Each
+  failed attempt is now counted on the queued row, and a message that has failed `PENDING_DRAIN_MAX_FAILURES` times
+  (default 5) over at least `PENDING_DRAIN_FAILURE_WINDOW_SEC` (default 600) is moved to the new
+  `claw_pending_messages_quarantine` table, with its text, sender and last error, and the next message is sent at once.
+  A failed attempt that only says NATS could not be reached (a `503`, a lost connection, or a timeout while NATS answers
+  nobody) is not counted, so a NATS outage of any length quarantines nothing: the queue waits and is sent in order once
+  NATS is back. A timeout while NATS answers everything else is the message's own and is counted, so a message whose
+  publish always times out is quarantined too. The session
+  is told once, in the turn the message would have been, that it was not sent and can be sent again; a notice that
+  cannot be published then is retried by the sweeper. An attempt NATS refused stored nothing, so it does not use up
+  the notice's attempts and the notice is retried until NATS is back; no attempt is made while NATS answers nobody,
+  and one that failed because NATS went away under it is not charged either; only once an attempt may have stored an event
+  without its acknowledgement is the notice retried for at most 30 minutes from that attempt, and given up on (logged
+  as `pending.quarantine_notice_abandoned`) after that. Each event of the notice is published under a stable id, and the
+  event stream's duplicate window is widened at start-up from the server's default of two minutes to one hour, so a
+  retry after a publish whose acknowledgement was lost does not show the user the notice twice. A message whose run may
+  still be delivered is never moved. A queued message whose sealed credentials are too short to be sealed, or open to
+  something that is not the credentials written, is quarantined at once (`credentials_unreadable`); one whose
+  credentials fail to authenticate under this replica's key, which a replica with a stale key sees while the others
+  open them, is retried like any other failure and quarantined only once it has had its attempts. Until now any such
+  failure refused and deleted the message on the first replica that could not open it. Quarantined messages are kept for `PENDING_QUARANTINE_RETENTION_DAYS` (default 30) and are deleted with their
+  session. The log line (`pending.drain_quarantined`) names the message and the error, never the text. New metrics:
+  `claw_api_pending_drain_failures_total`, `claw_api_pending_quarantined_total`,
+  `claw_api_pending_messages_consecutive_failures` (the longest failing streak of any queued message) and
+  `claw_api_pending_messages_oldest_age_seconds`. A publish the NATS client refuses as `MAX_PAYLOAD_EXCEEDED` is now
+  treated as certainly not sent, so the run row it opened is closed instead of left waiting for a delivery that never
+  happened. The API migrates the table and columns at start-up and refuses to start without them.
+- Claw API: a message whose text or request carries a NUL character or a lone UTF-16 surrogate is now queued with
+  U+FFFD in its place. PostgreSQL stores neither (TEXT refuses the NUL byte; `jsonb` refuses the `\u0000` escape and a
+  lone surrogate escape), so such a message used to be refused with a server error when the session was busy.
 - Claw: in the SaFE deployment mode with `LLM_KEY_SOURCE=platformKey`, a caller signed in with an `ak-` key (in
   `Authorization: Bearer`, `x-api-key` or a download URL) or a default session cookie has their email again:
   `GET /v1/me` answers it and the request's user carries it, as in 0.5.8. Since 0.5.9 the API no longer asked SaFE's
@@ -205,6 +270,26 @@ release version, and its `appVersion` stays `latest`.
   SaFE verifies through the auth middleware and `GET /v1/me` against a fake SaFE that answers the way SaFE's apiserver
   does, and compares the verify request, the request's user and the `/v1/me` document, field for field, with values
   recorded from the 0.5.8 code.
+- Claw: one event the database cannot store no longer stalls the API's event consumer. A NUL character or a lone
+  UTF-16 surrogate in an event (a tool's output, a model's text) is now replaced with U+FFFD where the event is parsed,
+  before anything is written, so the event is stored and a completion carrying one still runs (its turn is written and
+  its run is closed) instead of being skipped. The two clean-ups that existed did nothing: they ran over JSON text, where
+  both characters are escapes. An event the database still refuses for its value (SQLSTATE 22P05, 22021, 22P02 or
+  54001) is set aside on its first delivery instead of being retried for ever: a copy of it, sanitised and with
+  credential-shaped content masked as a stored event is, goes to the new `claw_event_quarantine` table (deleted with its
+  session), a log line `event-consumer.quarantined` without its content says so, and it is acknowledged. An event that
+  is not JSON is kept there too rather than dropped unrecorded. Nothing else is set aside, however often or however long
+  it has failed: the backlog an outage of the database or the tombstone bucket leaves, and a completion waiting on its
+  session's lock or on its run notification, are retried until they succeed, as before. A completion is never set aside.
+  One the database refuses for its nesting (54001, past about 13,000 levels with the default `max_stack_depth`) is
+  stored and run with a copy cut off at 1,000 levels (each deeper object replaced with `"[nested too deep to store]"`;
+  at 100, then 10, when a server with a smaller `max_stack_depth` refuses that copy too), so its turn is written and its
+  run closed on its first delivery; the original is kept in `claw_event_quarantine` with reason `bounded`, counted and
+  logged once however often it is redelivered.
+  Making an event storable, and masking the stored copy (`redactStoredValue`), no longer recurse: an event nested deeper
+  than the call stack (a few thousand levels, which `JSON.parse` and the database both take) is stored and, as a
+  completion, processed, where it used to be retried for ever. A `__proto__` key in an event stays a key of the stored
+  copy instead of being dropped.
 - Claw: an event a connector posts whose text holds a NUL (terminal output carries them) or half of a surrogate pair is
   now stored, with each such character replaced by U+FFFD, in keys and values alike. Until now PostgreSQL's `jsonb`
   refused the whole batch (`unsupported Unicode escape sequence`) and the API answered `500`; the connector posted the same
@@ -225,7 +310,6 @@ release version, and its `appVersion` stays `latest`.
   `500` that names nothing about the event (a deadlock, a lost database connection): a Claw that fails now and then
   would otherwise narrow the search onto an event that was fine, a turn's end as likely as any, and drop it. Events are also made storable where
   they are made, so a NUL an agent prints never reaches Claw.
-
 - Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its
   own run, the person is now told how it ended, once, in their language. Until now a review under the `fully_auto` mode
   that approved and merged closed its item silently: the person got only the generic "Run completed" notice and had to

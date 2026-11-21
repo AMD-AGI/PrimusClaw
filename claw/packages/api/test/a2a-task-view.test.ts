@@ -191,6 +191,14 @@ describe("V3 the task a caller reads", () => {
     assert.equal(taskOf(run({ status: "completed" }), []).status.message, undefined);
   });
 
+  test("a failed task carries its failure code beside the text, and none when it has none", () => {
+    const failed = taskOf(run({ status: "failed", failureReason: "sandbox_rejected", errorMessage: "refused (HTTP 400)" }), []);
+    assert.equal(failed.status.message?.parts[0].text, "refused (HTTP 400)");
+    assert.deepEqual(failed.status.message?.metadata, { failure_reason: "sandbox_rejected" });
+    const uncoded = taskOf(run({ status: "failed", errorMessage: "sandbox died" }), []);
+    assert.equal(uncoded.status.message?.metadata, undefined);
+  });
+
   test("history and artifacts are what the caller asked for", () => {
     const events = [said("hi")];
     assert.equal(taskOf(run(), events, { historyLength: 0 }).history, undefined);

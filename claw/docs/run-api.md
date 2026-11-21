@@ -104,22 +104,40 @@ never became usable records one of the provisioning codes --
 `sandbox_workload_terminal`, `sandbox_exited_before_ready`, `sandbox_container_failed`,
 `sandbox_envd_exited`, `sandbox_timed_out`, `sandbox_pending_timeout`, `sandbox_unschedulable`,
 `sandbox_start_timeout`,
-`sandbox_status_unreadable`, `sandbox_gone`, `sandbox_create_failed`,
+`sandbox_status_unreadable`, `sandbox_gone`, `sandbox_create_failed`, `sandbox_rejected`,
 `sandbox_workspace_forbidden`,
 `sandbox_image_missing`, `sandbox_auth_missing`, `sandbox_template_missing`,
 `sandbox_health_failed`, `sandbox_bootstrap_failed` -- and nothing in it executed.
 
-A run whose turn asked for a sandbox that the platform had no capacity for
-(`sandbox_unschedulable`, `sandbox_pending_timeout`, `sandbox_start_timeout`) is `failed` with
-that code even when its agent went on to answer without one: the answer is in the session, but
-none of the work that needed the sandbox ran. An account the platform refuses a sandbox to
+A run whose turn asked for a sandbox and never got one is `failed` with the code of the last
+attempt even when its agent went on to answer without one: the answer is in the session, but
+none of the work that needed the sandbox ran. That covers a create the platform refused
+(`sandbox_rejected`: any 4xx but 403, 408, 425 and 429, such as an admission webhook's denial;
+it is not sent again within the run), a create that failed (`sandbox_create_failed`: a 5xx, a 408,
+425 or 429, or no answer; such a create is retried, and the run fails with this code once it has
+no retry left, or reaches its deadline while the create is failing), a workload that failed before it was ready (its terminal code, such as
+`sandbox_workload_terminal`), and no capacity (`sandbox_unschedulable`, `sandbox_pending_timeout`,
+`sandbox_start_timeout`). An account the platform refuses a sandbox to
 (`sandbox_workspace_forbidden`, `sandbox_workspace_not_allowed`) is not such a failure: its
 turns carry on without one by design.
 
+Such a run's `class` is `failed`, except after a provisioning timeout (`sandbox_pending_timeout`,
+`sandbox_timed_out`, `sandbox_start_timeout`): that is a deadline, so when the platform gave no
+other account of the sandbox (a preemption, say) the run reads `class: killed`,
+`kill_reason: deadline`. Its status is `failed` and `failure_reason` is the code either way.
+
 `failure_message` is what happened, for a person, when the run recorded more than its code:
 for a sandbox the platform could not provide, the platform's reason (for example
-`workload ... could not be scheduled: ...` or `workload ... still waiting for capacity after
-10800.0s ...`). `""` when nothing more was recorded.
+`workload ... could not be scheduled: ...`, `workload ... still waiting for capacity after
+10800.0s ...`, `workload ... entered terminal phase=failed (AdminFailed: ...)`, or
+`The platform refused to create the sandbox (HTTP 400): admission webhook "vworkload.kb.io"
+denied the request: ... timeout 64800 exceeds the qos limit of 10800 seconds for scope Sandbox
+The run asked for timeout=61200s; Claw adds 3600s to stop the run cleanly and sent
+timeout=64800s, above the platform's limit of 10800s.`; when the requested timeout fits and
+only the hour Claw adds does not, it also says the largest timeout that fits). `""` when
+nothing more was recorded. The same code and message are on the session's `sandboxStatus` event
+(`status: failed`), the A2A task's status message (text, and `metadata.failure_reason`) and
+the `run.failed` notification's `summary` (`<code>: <message>`).
 
 `exit_code` is `null` when no exit code was ever reported -- most often because the
 run's worker went away with its node. Null means unknown; it is not a success and not

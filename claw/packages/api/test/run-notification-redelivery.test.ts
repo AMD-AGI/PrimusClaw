@@ -15,6 +15,7 @@
  * Skipped without DATABASE_URL, and a skip is not a pass.
  */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test, { after, before, beforeEach, describe } from "node:test";
 
 import { postgresSkipReason } from "./support/pg-cluster.js";
@@ -72,7 +73,7 @@ describe("run notification after a failed outbox write", { skip }, () => {
     failFirst = 0;
     summaries = 0;
     (await import("../src/sessions/deleted-cache.js")).resetDeletedSessionCache();
-    for (const t of ["claw_notification_outbox", "claw_notification_subscriptions", "claw_session_events",
+    for (const t of ["claw_event_quarantine", "claw_notification_outbox", "claw_notification_subscriptions", "claw_session_events",
       "claw_conversation_turns", "claw_tasks", "claw_sessions"]) {
       await q(`DELETE FROM ${t}`);
     }
@@ -110,11 +111,23 @@ describe("run notification after a failed outbox write", { skip }, () => {
     final_text: "done", failed: false, run_claim: 2, ...extra,
   });
 
-  /** One delivery of the message at stream sequence `seq`: "ack" or "nak". */
-  async function deliverEvent(seq: number, event: Record<string, unknown>): Promise<"ack" | "nak"> {
+  /**
+   * One delivery of the message at stream sequence `seq`: "ack" or "nak". `info` is JetStream's account of it: how
+   * often it has been delivered and how long ago it was published.
+   */
+  async function deliverEvent(
+    seq: number, event: Record<string, unknown>,
+    info?: { deliveryCount: number; publishedAgoMs: number }, session = SESSION,
+  ): Promise<"ack" | "nak"> {
     let answer: "ack" | "nak" | undefined;
     await consumer.consumeEventDelivery({
-      subject: `events.${SESSION}`, data: sc.encode(JSON.stringify(event)), seq,
+      subject: `events.${session}`, data: sc.encode(JSON.stringify(event)), seq,
+      ...(info ? {
+        info: {
+          streamSequence: seq, deliveryCount: info.deliveryCount,
+          timestampNanos: (Date.now() - info.publishedAgoMs) * 1_000_000,
+        },
+      } : {}),
       ack: () => { answer ??= "ack"; }, nak: () => { answer ??= "nak"; },
     });
     await new Promise<void>((r) => setImmediate(r));
@@ -204,5 +217,49 @@ describe("run notification after a failed outbox write", { skip }, () => {
     assert.equal(ev[0].run_notification_owed, null);
     await deliver();
     assert.equal(runCompleted().length, 0);
+  });
+  // Incident N58's hardening must not drop a completion it is still working on: a stored `exec_complete` is
+  // redelivered for as long as its notice is owed or its session's lock is held, which can be many deliveries
+  // and many minutes while other events are stored around it. None of those is a poison event.
+  /** Many deliveries, published long ago: past any count or age a poison rule could use. */
+  const backlogged = { deliveryCount: 25, publishedAgoMs: 20 * 60_000 };
+  /** Another event stored in between, as a busy stream has. */
+  const storeAnother = async (seq: number) =>
+    assert.equal(await deliverEvent(seq, { type: "AssistantMessage", message_id: `m-${seq}`, content: "fine" }), "ack");
+
+  test("an owed completion redelivered many times, long after it was published, records its notice and is not set aside", async () => {
+    failFirst = 1;
+    assert.equal(await deliverEvent(7, completion(), { deliveryCount: 1, publishedAgoMs: 0 }), "nak");
+    await storeAnother(50);
+    assert.equal(await deliverEvent(7, completion(), backlogged), "ack");
+    assert.equal(writes, 2, "the redelivery recorded what was owed");
+    assert.equal((await q("SELECT count(*)::int AS n FROM claw_event_quarantine")).rows[0].n, 0);
+    const ev = (await q("SELECT run_notification_owed FROM claw_session_events WHERE event = 'exec_complete'")).rows;
+    assert.equal(ev[0].run_notification_owed, null);
+    await deliver();
+    assert.equal(runCompleted().length, 1);
+  });
+
+  test("a completion whose session's lock is held stays retried however long, then runs once the lock is free", async () => {
+    // Another replica in this session's completion: the lock `withCompletionLock` takes, held on its own connection.
+    const holder = await h.connect();
+    const digest = createHash("sha256").update(`session-completion:${SESSION}`).digest();
+    const lockId = 2 ** 52 + digest.readUIntBE(0, 6);
+    assert.equal((await holder.query("SELECT pg_try_advisory_lock($1) AS ok", [lockId])).rows[0].ok, true);
+    try {
+      assert.equal(await deliverEvent(7, completion(), { deliveryCount: 1, publishedAgoMs: 0 }), "nak");
+      await storeAnother(50);
+      assert.equal(await deliverEvent(7, completion(), backlogged), "nak", "busy: asked again, not set aside");
+      assert.equal((await q("SELECT count(*)::int AS n FROM claw_event_quarantine")).rows[0].n, 0);
+      assert.equal(summaries, 0);
+    } finally {
+      await holder.query("SELECT pg_advisory_unlock($1)", [lockId]);
+      await holder.end();
+    }
+    assert.equal(await deliverEvent(7, completion(), { ...backlogged, deliveryCount: 26 }), "ack");
+    assert.equal(summaries, 1, "the completion ran");
+    assert.equal((await q("SELECT status FROM claw_tasks WHERE task_id = $1", [RUN])).rows[0].status, "completed");
+    await deliver();
+    assert.equal(runCompleted().length, 1);
   });
 });

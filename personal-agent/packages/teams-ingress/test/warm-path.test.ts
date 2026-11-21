@@ -64,15 +64,38 @@ class Sender implements QueueSender {
   }
 }
 
-/** A ServiceBusClient that hands out Senders, failing the first sends or opens it is told to. */
-class Bus implements QueueClient {
+/**
+ * The Service Bus: every client the ingress builds (newClient) is a view of it whose senders it records, failing the
+ * first sends or opens it is told to. Closing a client closes the senders opened on it, as the SDK does.
+ */
+class Bus {
   readonly senders: Sender[] = [];
+  /** The clients built, in order, with the senders each one opened. */
+  readonly clients: { client: QueueClient; senders: Sender[]; closed: boolean }[] = [];
   readonly sent: [Sender, QueueMessage][] = [];
 
   constructor(
     private readonly failingSends: number[] = [], // per sender, in creation order: sends that raise
     private failingOpens = 0,
   ) {}
+
+  client(): QueueClient {
+    const entry = { client: undefined as unknown as QueueClient, senders: [] as Sender[], closed: false };
+    entry.client = {
+      createSender: (queue) => {
+        const sender = this.createSender(queue);
+        entry.senders.push(sender);
+        return sender;
+      },
+      close: () => {
+        entry.closed = true;
+        for (const sender of entry.senders) sender.closed = true;
+        return Promise.resolve();
+      },
+    };
+    this.clients.push(entry);
+    return entry.client;
+  }
 
   createSender(queue: string): Sender {
     const failSends = this.failingSends.shift() ?? 0;
@@ -88,7 +111,7 @@ function make(bus: Bus, overrides: Partial<Deps> = {}): { ingress: Ingress; log:
   Sender.openHook = null;
   Sender.sendHook = null;
   const { ingress, log } = load(FULL_ENV, overrides);
-  ingress.newClient = () => bus;
+  ingress.newClient = () => bus.client();
   ingress.validate = () => Promise.resolve({});
   return { ingress, log };
 }
@@ -114,21 +137,27 @@ test("test_a_failed_send_is_retried_once_on_a_new_sender", async () => {
     bus.sent.map(([s]) => s),
     [bus.senders[1]],
   );
-  assert.ok(log.text.includes("retrying once on a new sender"));
+  // The fake's error is a connection error: the client is thrown away with the sender, and the retry is on a new one.
+  assert.ok(log.text.includes("inbound send failed; retrying on a new client"));
+  assert.equal(bus.clients.length, 2);
+  assert.ok(nth(bus.clients, 0).closed && !nth(bus.clients, 1).closed);
   // The new sender is the one kept.
   assert.equal((await post(ingress, { ...MESSAGE, id: "a2" })).status, 200);
   assert.equal(bus.senders.length, 2);
 });
 
-test("test_a_message_that_fails_on_two_senders_is_a_500_and_the_next_one_starts_clean", async () => {
-  const bus = new Bus([1, 1]);
+test("test_a_message_that_fails_on_every_attempt_is_a_500_and_the_next_one_starts_clean", async () => {
+  const bus = new Bus([1, 1, 1]);
   const { ingress } = make(bus);
+  assert.equal(ingress.sendAttempts, 3);
   assert.equal((await post(ingress, MESSAGE)).status, 500);
   assert.deepEqual(bus.sent, []);
+  assert.equal(bus.senders.length, 3);
   assert.ok(bus.senders.every((s) => s.closed));
+  assert.ok(bus.clients.every((c) => c.closed));
   assert.equal(ingress.inbound, null);
   assert.equal((await post(ingress, { ...MESSAGE, id: "a2" })).status, 200);
-  assert.equal(bus.senders.length, 3);
+  assert.equal(bus.senders.length, 4);
 });
 
 test("test_the_delivery_ack_uses_the_same_sender", async () => {
@@ -197,13 +226,15 @@ test(
       (await Promise.all(replies)).map((r) => r.status),
       [200, 200],
     );
-    // The first failure replaced the sender; the second found it replaced and kept the new one.
+    // The first failure replaced the client and its sender; the second found them replaced and kept the new ones.
     assert.equal(bus.senders.length, 2);
     assert.ok(nth(bus.senders, 0).closed && !nth(bus.senders, 1).closed);
+    assert.equal(bus.clients.length, 2);
+    assert.ok(nth(bus.clients, 0).closed && !nth(bus.clients, 1).closed);
     assert.equal(ingress.inbound, bus.senders[1]);
     assert.deepEqual(ids(bus).sort(), ["a1", "a2"]);
     assert.ok(bus.sent.every(([s]) => s === bus.senders[1]));
-    assert.equal(log.text.split("retrying once on a new sender").length - 1, 2);
+    assert.equal(log.text.split("inbound send failed; retrying on a new").length - 1, 2);
   },
 );
 

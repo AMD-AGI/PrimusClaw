@@ -151,12 +151,19 @@ test("an unreadable pending blob ends that turn instead of wedging the drain", a
   const deleted: unknown[][] = [];
   const originalQuery = db.query;
   db.query = (async (text: string, params: unknown[] = []) => {
-    if (/DELETE FROM claw_pending_messages/.test(text)) deleted.push(params);
+    if (/DELETE FROM claw_pending_messages/.test(text)) {
+      deleted.push(params);
+      // The move into the quarantine took the row.
+      return { rows: [{ attempts: 1, last_error: "Error", queued_for_sec: 0 }], rowCount: 1 };
+    }
     return { rows: [], rowCount: 0 };
   }) as typeof db.query;
   const originalPublish = pendingDispatchPorts.publishSessionEvent;
   const events: Array<Record<string, unknown>> = [];
   pendingDispatchPorts.publishSessionEvent = async (_s, e) => { events.push(e); };
+  const { pendingQuarantinePorts } = await import("../src/tasks/pending-quarantine.js");
+  const originalProbe = pendingQuarantinePorts.natsStreamsAnswer;
+  pendingQuarantinePorts.natsStreamsAnswer = async () => true;
   try {
     const task: Record<string, unknown> = { prompt: "hi" };
     const ok = await applyPendingCredentials(
@@ -166,12 +173,14 @@ test("an unreadable pending blob ends that turn instead of wedging the drain", a
     );
     assert.equal(ok, false, "the turn is not dispatched");
     assert.equal("llm_api_key" in task, false, "and no empty key was put on it");
-    assert.deepEqual(deleted, [[7]], "the queue entry is dropped so it is not redelivered");
+    assert.equal(deleted.length, 1, "the queue entry leaves the queue so it is not redelivered");
+    assert.equal(deleted[0][0], 7);
     assert.ok(events.some((e) => e.failure_reason === "credentials_unreadable"),
       "and the reader is told why");
   } finally {
     db.query = originalQuery;
     pendingDispatchPorts.publishSessionEvent = originalPublish;
+    pendingQuarantinePorts.natsStreamsAnswer = originalProbe;
   }
 });
 

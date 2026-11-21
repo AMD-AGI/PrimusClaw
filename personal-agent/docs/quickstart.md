@@ -307,6 +307,14 @@ The deployment takes a minute; then a request without a token is refused, and th
 curl -s -o /dev/null -w '%{http_code}\n' -X POST "https://$host/api/messages" -d '{}'    # 401
 ```
 
+**Alerts.** A message the ingress cannot queue is answered `500` (or, for a request the Bot Framework stopped waiting
+for, recorded as `499`), and Teams' retries are its only second chance, so alert on it. Every send that fails after its
+retries logs `failed to enqueue activity` and one `inbound_enqueue_failed` record (JSON, logger `ingress_health`: the
+error's name and Service Bus code, attempts, and the instance's running counts); each Service Bus client thrown away for
+a connection failure logs `inbound_client_reset`. [`deploy/teams-ingress-alerts.yaml`](../deploy/teams-ingress-alerts.yaml)
+has two Grafana rules over the Function's Application Insights (more than 2 requests answered `499` or above in 5
+minutes; any failed enqueue), with what to set up before applying them.
+
 Set the bot's messaging endpoint (the `--endpoint` of step 2) to `https://<host>/api/messages`:
 `az bot update -g <group> -n <bot-name> --endpoint "https://$host/api/messages"`.
 
