@@ -778,6 +778,11 @@ export class AppRunner {
       // other failure (SaFE unreachable) is transient and the next tick retries,
       // which cannot duplicate a sandbox because ensure adopts a live one.
       const terminal = provisionTerminalOf(err);
+      // A wait the run's own stop cut short is not a sandbox the platform failed to
+      // give: it is never counted (with no restart left that would end the run as
+      // `restarts_exhausted` before the cancel or deadline that stopped it is written).
+      // The stop is what finishes the run (`finishNow`).
+      if (terminal?.reason === "sandbox_wait_interrupted") throw err;
       if (terminal) {
         logger.warn({ runId: this.runId, reason: terminal.reason }, "app_run.sandbox_not_provisioned");
         return this.countedRestart(

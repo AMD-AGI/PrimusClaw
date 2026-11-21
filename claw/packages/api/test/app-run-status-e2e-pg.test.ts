@@ -26,7 +26,11 @@
  *      deadline, cancelled, task_closed, no_exit_record, sandbox_rejected,
  *      sandbox_unschedulable, sandbox_create_failed (the deadline reached while
  *      every create failed), sandbox_failed (the workload failed before it was ready)
- *   F  a run cancelled while its sandbox was queued: its sandbox never reads running
+ *   F  a run cancelled, or reaching its deadline, while its sandbox was queued:
+ *      the stop writes nothing (no restart counted), its sandbox never reads
+ *      running, and the cause is the stop's
+ *   P  a sandbox lost while the application ran: back to pending (and a new
+ *      `since`) while the next one queues, then running, then ended
  *   R  a run whose first create was refused and whose second sandbox ran: the
  *      refusal is cleared from the row once the sandbox is Running
  *   O  a non-app run on the same routes: `app: null`, nothing else changed
@@ -62,8 +66,12 @@ interface SafeScript {
 let script: SafeScript = { create: "ok", poll: "running" };
 let released = false;
 let creates = 0;
-/** Live workloads: id -> the run it was created for, and whether it was stopped. */
-const workloads = new Map<string, { runId: string; stopped: boolean }>();
+/**
+ * Live workloads: id -> the run it was created for, whether it was stopped, and whether
+ * it is a reader (the small sandbox a run makes to look at its state directory after
+ * losing its own), which this stand-in always starts at once.
+ */
+const workloads = new Map<string, { runId: string; stopped: boolean; reader: boolean }>();
 
 const wid = () => `claw-${Date.now()}-sandbox-${Math.random().toString(36).slice(2, 7)}`;
 
@@ -110,7 +118,7 @@ function startFakeSafe(): Promise<{ url: string; server: Server }> {
         return res.end("upstream connect error or disconnect/reset before headers.\nreset reason: overflow");
       }
       const id = wid();
-      workloads.set(id, { runId: String(body.env?.CLAW_APP_RUN_ID ?? ""), stopped: false });
+      workloads.set(id, { runId: String(body.env?.CLAW_APP_RUN_ID ?? ""), stopped: false, reader: body.env?.CLAW_APP_RUN_ID === undefined });
       return send(200, { workloadId: id });
     }
     const one = /^\/api\/v1\/workloads\/([^/]+)(\/stop)?$/.exec(url.pathname);
@@ -119,7 +127,7 @@ function startFakeSafe(): Promise<{ url: string; server: Server }> {
       if (!w) return send(404, { errorMessage: "not found" });
       if (req.method !== "GET") { w.stopped = true; return send(200, {}); }
       if (w.stopped) return send(200, { phase: "Stopped" });
-      if (released || script.poll === "running") return send(200, { phase: "Running", pods: [{ adminNodeName: "node-a1" }] });
+      if (released || script.poll === "running" || w.reader) return send(200, { phase: "Running", pods: [{ adminNodeName: "node-a1" }] });
       if (script.poll === "admin_failed") {
         return send(200, {
           phase: "Failed",
@@ -267,13 +275,22 @@ describe("an app run's sandbox state and outcome on the task and run routes", { 
   }
 
   /** Brain's AppRunner on the run, as `createAppRunner` builds it, with commands run in a real shell. */
-  function runnerFor(taskId: string, env: Record<string, string>) {
+  function runnerFor(taskId: string, env: Record<string, string>, seen?: string[]) {
     const store = brain.httpAppRunStore({
       baseUrl: () => base,
       headers: (hasBody) => ({ authorization: `Bearer ${INTERNAL}`, ...(hasBody ? { "content-type": "application/json" } : {}) }),
       brainId: "brain-A",
       claimCount: EPOCH,
     });
+    if (seen) {
+      // After every write the runner makes, what a caller reads: the states in between included.
+      const write = store.patch.bind(store);
+      store.patch = async (...a: Parameters<typeof write>) => {
+        const rec = await write(...a);
+        seen.push(`${rec.state}:${(await readRun(taskId)).app.sandbox.state}`);
+        return rec;
+      };
+    }
     const cwd = fresh();
     const sandbox = { ...brain.realAppSandbox(store), exec: async (_i: unknown, command: string, _t: string, opts?: { env?: Record<string, string> }) => sh(command, cwd, { ...env, ...(opts?.env ?? {}) }) };
     const runner = new brain.AppRunner(taskId, OWNER_KEY, { store, sandbox: sandbox as never, tickMs: 100, claimCount: EPOCH });
@@ -521,24 +538,87 @@ describe("an app run's sandbox state and outcome on the task and run routes", { 
     assert.ok(creates >= 2, `the create was retried (${creates})`);
   });
 
-  test("F: a run cancelled while its sandbox was queued never shows a running sandbox", async () => {
+  /**
+   * A run stopped while its sandbox is queued, by the run's own signal through the
+   * real AppRunner, as the task runner stops it for a cancel or the deadline; then
+   * finished as the task runner finishes it. Nothing is patched by hand.
+   */
+  async function stopWhileQueued(cause: "cancelled" | "deadline") {
     script = { create: "ok", poll: "pending" };
     const taskId = await createRun(manifest());
-    const { runner } = runnerFor(taskId, { USER_DATA_PATH: fresh() });
+    const seen: string[] = [];
+    const { runner } = runnerFor(taskId, { USER_DATA_PATH: fresh() }, seen);
     const stop = new AbortController();
     const running = runner.run(stop.signal, { reclaimOnAbort: () => true });
     await until("a queued workload", async () => (await readRun(taskId)).app.sandbox.workload_id !== "");
     const queued = (await readRun(taskId)).app.sandbox;
+    assert.equal(queued.state, "pending");
     stop.abort();
-    await running;
-    // Finishing, as a cancel leaves the row before the finish runs: still the queued sandbox.
-    const { store } = runnerFor(taskId, {});
-    await store.patch(taskId, { state: "finishing", last_exit: { at: new Date().toISOString(), cause: "cancelled", final: false } });
-    assert.deepEqual((await readBoth(taskId)).app.sandbox, queued, "finishing does not make a queued sandbox read running");
-    await runner.finishNow("cancelled");
-    const { app: a } = await readBoth(taskId);
-    assert.equal(a.sandbox.state, "ended");
-    assert.equal(a.outcome.cause, "cancelled");
+    assert.equal((await running).kind, "aborted");
+    // The interrupted wait wrote nothing: still provisioning, no exit, the queued sandbox as it was.
+    const row = (await q("SELECT state, restarts, last_exit FROM claw_app_runs WHERE task_id = $1", [taskId])).rows[0] as Json;
+    assert.deepEqual({ state: row.state, restarts: row.restarts, last_exit: row.last_exit }, { state: "provisioning", restarts: 0, last_exit: null });
+    const after = (await readBoth(taskId)).app;
+    assert.deepEqual(after, { sandbox: queued, outcome: null }, "the stop alone changes nothing a caller sees");
+    const outcome = await runner.finishNow(cause);
+    assert.equal(outcome.success, false);
+    assert.ok(seen.includes("finishing:pending"), `the finish passed through finishing with the sandbox still pending: ${seen}`);
+    assert.ok(!seen.some((x) => x.endsWith(":running")), `never running: ${seen}`);
+    const end = (await readBoth(taskId)).app;
+    assert.equal(end.sandbox.state, "ended");
+    assert.equal(end.sandbox.workload_id, queued.workload_id);
+    assert.ok([...workloads].some(([id, w]) => id === queued.workload_id && w.stopped), "the queued workload was stopped");
+    return end;
+  }
+
+  test("F: a run cancelled while its sandbox was queued: never running, and cancelled, not restarts_exhausted", async () => {
+    const end = await stopWhileQueued("cancelled");
+    assert.deepEqual(end.outcome, { cause: "cancelled", returncode: null, final: false, error: null });
+  });
+
+  test("F: a run that reached its deadline while its sandbox was queued ends as deadline", async () => {
+    const end = await stopWhileQueued("deadline");
+    assert.deepEqual(end.outcome, { cause: "deadline", returncode: null, final: false, error: null });
+  });
+
+  test("P: a sandbox lost while the application ran: back to pending for the next one, since moved, then running again", async () => {
+    // One restart allowed, so the loss is not the end of the run.
+    const taskId = await createRun(manifest({ restart: { max_restarts: 1, backoff_sec: [1] } }));
+    const { runner } = runnerFor(taskId, { USER_DATA_PATH: fresh() });
+    const done = runner.run(AbortSignal.timeout(60_000));
+    await until("the application up", async () => (await rowState(taskId)) === "running");
+    const first = (await readBoth(taskId)).app.sandbox;
+    assert.equal(first.state, "running");
+    assert.notEqual(first.workload_id, "");
+
+    // The next sandbox queues; the platform takes this one away.
+    script = { create: "ok", poll: "pending" };
+    workloads.delete(first.workload_id);
+    await until("a second workload queued", async () => {
+      const s = (await readRun(taskId)).app.sandbox;
+      return s.workload_id !== "" && s.workload_id !== first.workload_id;
+    });
+    const again = await readBoth(taskId);
+    assert.equal(await rowState(taskId), "provisioning");
+    assert.equal(again.app.sandbox.state, "pending", "a run making a new sandbox reads pending, not running");
+    assert.ok(Date.parse(again.app.sandbox.since) > Date.parse(first.since), "since moved when the wait for the new sandbox began");
+    assert.equal(again.run.placement.workload_id, again.app.sandbox.workload_id, "placement names the new sandbox");
+    assert.equal(again.app.outcome, null);
+
+    released = true;
+    await until("the second sandbox running", async () => (await readRun(taskId)).app.sandbox.state === "running");
+    const up = (await readBoth(taskId)).app.sandbox;
+    assert.equal(up.workload_id, again.app.sandbox.workload_id);
+    assert.ok(Date.parse(up.since) > Date.parse(again.app.sandbox.since));
+
+    await until("the application up again", async () => (await rowState(taskId)) === "running");
+    const dir = ((await q("SELECT state_dir FROM claw_app_runs WHERE task_id = $1", [taskId])).rows[0] as { state_dir: string }).state_dir;
+    writeFileSync(join(dir, "go"), "");
+    assert.equal((await done).kind, "ended");
+    const end = (await readBoth(taskId)).app;
+    assert.equal(end.sandbox.state, "ended");
+    assert.equal(end.sandbox.workload_id, up.workload_id);
+    assert.deepEqual(end.outcome, { cause: "exited", returncode: 0, final: true, error: null });
   });
 
   test("R: a refused create, then a sandbox that ran: the refusal leaves the row and the cause is the application's", async () => {

@@ -125,7 +125,8 @@ release version, and its `appVersion` stays `latest`.
   `failure_reason`, which is unchanged. `placement.workload_id` on `GET /v1/runs` now names an app run's sandbox; it was
   always empty. To tell a run that never got a sandbox from one whose application failed, the run's row now records why
   it has no sandbox (the provisioning code and the platform's words, scrubbed) while it waits, until one is Running.
-  See `claw/docs/run-api.md`, "App runs".
+  A wait for a sandbox cut short by the run's own cancel or deadline is never counted as a sandbox the platform failed
+  to give, so such a run ends as `cancelled` or `deadline`. See `claw/docs/run-api.md`, "App runs".
 - Claw: metrics for the API's event consumer: `claw_api_event_consumer_consecutive_failures` (deliveries this replica
   retried since it last stored or set aside an event), `claw_api_event_quarantined_total{reason}` (`unparseable`,
   `unstorable`, `bounded`), `claw_api_event_sanitised_total` (events stored with a character replaced), and, read from the server every 30 seconds,

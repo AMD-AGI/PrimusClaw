@@ -100,3 +100,19 @@ test("a cancel while the run still waits for a sandbox carries why it waits", as
   assert.equal(world.rec.last_exit?.cause, "cancelled");
   assert.equal(world.rec.last_exit?.sandbox_reason, "sandbox_create_failed");
 });
+
+test("a wait the run's own stop cut short is not counted: the row stays provisioning for the stop to finish", async () => {
+  // reconcile() without run(): nothing has marked the runner halted, so the only thing
+  // keeping this from `countedRestart` (max_restarts 0: finishing, restarts_exhausted) is the runner itself.
+  const { world, runner } = harness({ ...MANIFEST, restart: { max_restarts: 0, backoff_sec: [1] } });
+  world.sandbox.ensure = async () => {
+    throw new SandboxProvisionTerminalError("sandbox_wait_interrupted", "workload w-1 startup was interrupted before it became ready");
+  };
+  await tick(runner);
+  assert.equal(world.patches.length, 0, "nothing written");
+  assert.equal(world.rec.state, "provisioning");
+  const outcome = await runner.finishNow("deadline");
+  assert.equal(outcome.success, false);
+  assert.equal(world.rec.state, "ended");
+  assert.equal(world.rec.last_exit?.cause, "deadline");
+});
