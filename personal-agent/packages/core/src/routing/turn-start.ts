@@ -103,7 +103,6 @@ type Started = StartTurn & { readonly replyLang?: Lang };
  */
 export class TurnStarter {
   private readonly running = new Set<Promise<void>>();
-  private readonly askers = new AskerLanguages();
 
   constructor(private readonly ctx: RouterContext) {}
 
@@ -293,7 +292,7 @@ export class TurnStarter {
       quote: request.quote ?? "",
       sent: request.sent ?? "",
       files: request.files ?? [],
-      lang: review?.lang ?? chat.lang(),
+      lang: review?.lang ?? request.replyLang ?? chat.lang(),
       ...(request.replyLang === undefined ? {} : { replyLang: request.replyLang }),
       ownThumbs: this.ownThumbs(request),
       notifies: this.ctx.deps.subscriptions !== undefined && store.notifySubs.getNotifySub(chat.sender.id) !== null,
@@ -304,18 +303,16 @@ export class TurnStarter {
   /**
    * The language a chat turn is to be answered in (a review's answer follows its request's language). In a 1:1 chat the one the
    * person chose, if any. In a group the group's (`groupChosenLang`; the sender's own choice is not read there); with none set, or
-   * "follow the asker", the language of the @-message's own words (`writtenLang`), else of the sender's last message in this
-   * group that had some (`AskerLanguages`), else none. A group's shared session holds every member's turns, and without the line
-   * the model answers in the language of that history, not the asker's.
+   * "follow the asker", the language of the @-message's own words (`writtenLang`), else English, as the group's fixed texts are
+   * (`groupLangOf`): a message with no words of its own (`help`, `ok #3`, a link) is answered in English. A group's shared
+   * session holds every member's turns, and without the line the model answers in the language of that history, not the asker's.
    */
   private replyLang(request: StartTurn): { replyLang?: Lang } {
     if (request.review !== undefined) return {};
     const { store } = this.ctx.deps;
     const { chat } = request;
-    // (the asker's language is remembered under a group's own setting too, for when the group goes back to following the asker)
-    const asker = chat.scope ? this.askers.answer(chat.scope, chat.sender.id, request.text) : undefined;
     const lang = chat.scope
-      ? (groupChosenLang(store, chat.scope) ?? asker)
+      ? (groupChosenLang(store, chat.scope) ?? writtenLang(request.text) ?? "en")
       : chosenLang(store.prefs.getPrefs(chat.sender.id));
     return lang === undefined ? {} : { replyLang: lang };
   }
@@ -390,29 +387,5 @@ export class TurnStarter {
       branch: bound && run.repo ? run.repo.branch : "",
     });
     if (created && run.repo) store.repoHistory.clearPendingRepo(userId);
-  }
-}
-
-const ASKERS_MAX = 10_000;
-
-/**
- * The language each member of a group last asked in there, for a message with no words of its own (`ok`, `#3`, a link): kept in
- * memory, per group and member, the newest `ASKERS_MAX`. After a restart such a message gets no language until its sender writes one.
- */
-export class AskerLanguages {
-  private readonly last = new Map<string, Lang>();
-
-  /** The language of `text` when it has words (and it is remembered), else the one remembered for `userId` in `scope`. */
-  answer(scope: string, userId: string, text: string): Lang | undefined {
-    const key = `${scope}\n${userId}`;
-    const own = writtenLang(text);
-    if (own === undefined) return this.last.get(key);
-    this.last.delete(key); // (the newest goes last, so the oldest is the first to drop)
-    this.last.set(key, own);
-    if (this.last.size > ASKERS_MAX) {
-      const [oldest] = this.last.keys();
-      if (oldest !== undefined) this.last.delete(oldest);
-    }
-    return own;
   }
 }

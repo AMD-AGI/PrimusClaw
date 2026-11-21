@@ -54,20 +54,16 @@ export function helpLang(
 /**
  * The language a group chat is answered in, its fixed texts and its answers alike: the one its members set (`/lang zh|en` there,
  * or a pick on its language card); else (none set, or "follow the asker") the language of the message being answered (`written`).
- * A person's own choice (`/lang` in their 1:1 chat) is not read here: in a group the group decides. A message that says no
- * language of its own ("/new", a link) is answered in the one the sender's messages were last written in, else their client's.
+ * A message that says no language of its own ("help", "/new", a link) is answered in English: a group's members share no other
+ * language, so neither the sender's own (`/lang` in their 1:1 chat, or the one their messages were last written in) nor their
+ * client's locale is read here.
  */
 export function groupLangOf(
-  store: Pick<RouterStore, "prefs"> & Partial<Pick<RouterStore, "groupLanguage">>,
+  store: Partial<Pick<RouterStore, "groupLanguage">>,
   conversationId: string,
-  userId: string,
-  locale: string,
   written: string,
 ): Lang {
-  const chosen = groupChosenLang(store, conversationId);
-  if (chosen !== undefined) return chosen;
-  const prefs = userId ? store.prefs.getPrefs(userId) : undefined;
-  return writtenLang(written) ?? answerLang(prefs !== undefined && !prefs.langSet ? prefs.lang : "", locale);
+  return groupChosenLang(store, conversationId) ?? writtenLang(written) ?? "en";
 }
 
 /** The language a group chat's members set, when it is one (`/lang zh|en`); undefined for none, and for "follow the asker". */
@@ -96,7 +92,7 @@ export class Chat {
   /** In a 1:1 chat the person's language (`langOf`); in a group, the group's (`groupLangOf`). */
   lang(): Lang {
     return this.scope
-      ? groupLangOf(this.store, this.scope, this.sender.id, this.locale, this.written)
+      ? groupLangOf(this.store, this.scope, this.written)
       : langOf(this.store, this.sender.id, this.locale);
   }
 

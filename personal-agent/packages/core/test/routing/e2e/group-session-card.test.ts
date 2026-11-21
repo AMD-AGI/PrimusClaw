@@ -10,7 +10,7 @@ import { test } from "node:test";
 import { INPUT_ID } from "../../../src/remote/window/view.js";
 import { ALICE as CLAW_ALICE, Script, USER_B } from "../../../../../test-support/remote-world.js";
 import { cardWords, windowCards } from "../../remote/e2e/window-helpers.js";
-import { clickOf } from "../world.js";
+import { clickOf, message } from "../world.js";
 import { type Routed, TWO_AGENTS, routed } from "./remote-routed.js";
 
 const GROUP_KEY = "aad-a#g-1";
@@ -173,4 +173,81 @@ test("test_a_groups_session_card_never_shows_the_lists", () =>
       later.every((o) => !JSON.stringify(o.card ?? null).includes('"primusclaw":"remote"')),
       JSON.stringify(later),
     );
+  }, CARD));
+
+test("test_a_groups_session_card_speaks_the_groups_language_never_the_binders_own", () =>
+  routed(async (w) => {
+    w.rw.setLang("aad-a", "zh"); // (the binder writes Chinese in her 1:1 chat)
+    await boundGroup(w);
+    await w.say("run the tests", { group: true });
+    await w.rw.until(() => cardWords(windowCards(w.rw).at(-1)?.card).includes("GROUP-ANSWER-7"));
+    let words = cardWords(windowCards(w.rw).at(-1)?.card);
+    assert.ok(words.includes("In this group, what you say to @PrimusClaw Assistant goes to this session"), words);
+    assert.ok(!words.includes("在这个群里"), words);
+    // (the group sets Chinese: the card follows the group)
+    w.rw.test.store.groupLanguage.setGroupLanguage("g-1", "zh");
+    await w.say("run them again", { group: true });
+    await w.rw.until(() => cardWords(windowCards(w.rw).at(-1)?.card).includes("在这个群里"));
+    words = cardWords(windowCards(w.rw).at(-1)?.card);
+    assert.ok(words.includes("在这个群里你 @PrimusClaw Assistant 说的话都发给这个会话"), words);
+    // (and her 1:1 English does not pull a Chinese group back)
+    w.rw.setLang("aad-a", "en");
+    await w.say("and once more", { group: true });
+    await w.rw.until(() => prompts(w).length === 3);
+    await w.rw.idle();
+    assert.ok(cardWords(windowCards(w.rw).at(-1)?.card).includes("在这个群里"));
+  }, CARD));
+
+/** The approval card a group binding sends to the binder's 1:1 chat, the row it keeps, and the group's notice that it waits. */
+async function askedFromTheGroup(w: Routed): Promise<{ sid: string; words: string; notice: string }> {
+  const sid = await boundGroup(w);
+  const script = new Script();
+  script.onPrompt = async (srv, s) => {
+    await srv.ask(s, "act-1", "Edit", [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }]);
+  };
+  w.rw.server.onCommand = script.hook;
+  await w.r.router.handle(message("add a line to the README", { kind: "group" })); // (the turn now waits for the answer)
+  const noticeOf = (): string => w.rw.said().find((t) => t.includes("your approval") || t.includes("在等你批准")) ?? "";
+  await w.rw.until(() => w.rw.permissionCards().length > 0 && noticeOf() !== "");
+  const words = cardWords(w.rw.permissionCards().at(-1));
+  const notice = noticeOf();
+  return { sid, words, notice };
+}
+
+test("test_a_groups_approval_card_in_the_binders_1on1_chat_speaks_her_language_not_the_groups", () =>
+  routed(async (w) => {
+    w.rw.setLang("aad-a", "zh"); // (her 1:1 chat is Chinese; the group never set a language, so it is English)
+    const { sid, words, notice } = await askedFromTheGroup(w);
+    assert.ok(words.includes("需要你批准"), words);
+    assert.ok(!words.includes("Approval needed"), words);
+    assert.equal(w.rw.test.store.remotePermissions.getRemotePermission(sid, "act-1")?.lang, "zh");
+    // (the group is told in its own language that the card went to her 1:1 chat)
+    assert.ok(notice.includes("is waiting for your approval"), notice);
+    // (her click in the 1:1 chat is answered, and the card settled, in her language too)
+    const actions = (w.rw.permissionCards().at(-1)?.["actions"] ?? []) as Record<string, unknown>[];
+    const allow = actions.find((a) => (a["data"] as Record<string, unknown>)["option_id"] === "allow_once") ?? {};
+    const data = allow["data"] as Record<string, unknown>;
+    await w.r.router.handle(clickOf(String(data["primusclaw"]), data, { card: "card-9" }));
+    await w.rw.until(() => w.rw.server.commandsOf("decision").length === 1);
+    const settledOf = (): string => [...w.rw.cards().map((c) => cardWords(c)), ...w.rw.said()].join("\n");
+    await w.rw.until(() => settledOf().includes("已允许一次") || settledOf().includes("Allowed once"));
+    const settled = settledOf();
+    assert.ok(settled.includes("已允许一次"), settled);
+    assert.ok(!settled.includes("Allowed once"), settled);
+  }, CARD));
+
+test("test_a_chinese_groups_approval_card_stays_in_an_english_binders_own_language", () =>
+  routed(async (w) => {
+    w.rw.setLang("aad-a", "en");
+    w.rw.test.store.groupLanguage.setGroupLanguage("g-1", "zh");
+    const { sid, words, notice } = await askedFromTheGroup(w);
+    assert.ok(words.includes("Approval needed"), words);
+    assert.ok(!words.includes("需要你批准"), words);
+    assert.equal(w.rw.test.store.remotePermissions.getRemotePermission(sid, "act-1")?.lang, "en");
+    assert.ok(notice.includes("在等你批准"), notice);
+    // (the turn waiting on the card is answered, so the world goes quiet)
+    const actions = (w.rw.permissionCards().at(-1)?.["actions"] ?? []) as Record<string, unknown>[];
+    const data = (actions[0]?.["data"] ?? {}) as Record<string, unknown>;
+    await w.r.router.handle(clickOf(String(data["primusclaw"]), data, { card: "card-9" }));
+    await w.rw.until(() => w.rw.server.commandsOf("decision").length === 1);
   }, CARD));

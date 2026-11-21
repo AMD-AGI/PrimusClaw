@@ -183,6 +183,7 @@ export class RemoteWorld {
       sessionNames: store.remoteSessionNames,
       permissions: store.remotePermissions,
       prefs: store.prefs,
+      groupLanguage: store.groupLanguage,
       references: store.references,
       conversationFor: (reference) => this.wrap(this.surface.conversation(refOf(reference))),
       credentialFor: (person) => this.credential(person),
