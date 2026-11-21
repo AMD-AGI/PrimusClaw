@@ -237,6 +237,9 @@ func (s *Service) prepareOwnerPolicy(ctx context.Context, p OwnerPolicy) (*owner
 	if err != nil {
 		return nil, err
 	}
+	if err := validateTemplateResources(stored, "invalid_owner_policy"); err != nil {
+		return nil, err
+	}
 	if err := s.resolveTemplateGPUCounts(ctx, ownerAppRunID, stored); err != nil {
 		return nil, err
 	}
@@ -475,14 +478,17 @@ func (s *Service) upsertOwnerTemplates(ctx context.Context, templates []runtimev
 	for _, tpl := range templates {
 		base, ok, err := templateFromSpec(tpl.Spec)
 		if err != nil {
-			return opWrap(http.StatusBadRequest, "invalid_owner_policy", "template spec is not JSON", err)
+			return specError("invalid_owner_policy", tpl.Name, err)
 		}
 		if !ok {
 			continue
 		}
 		for i, name := range expandOne(ownerAppRunID, TemplateRequest{Name: tpl.Name, PerGPUCount: tpl.PerGPUCount}) {
 			wanted[name] = true
-			want := codeInterpreter(ownerTemplatesID, name, base, templateGPUCount(tpl, i), s.namespace)
+			want, err := codeInterpreter(ownerTemplatesID, name, base, templateGPUCount(tpl, i), s.namespace)
+			if err != nil {
+				return opWrap(http.StatusBadRequest, "invalid_owner_policy", "template "+tpl.Name+": "+err.Error(), err)
+			}
 			existing, err := s.ownerTemplateCI(ctx, name)
 			if err != nil {
 				return err
