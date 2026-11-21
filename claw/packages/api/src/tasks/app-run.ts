@@ -588,8 +588,9 @@ export async function admitAppRun(
       await client.query(
         `INSERT INTO claw_app_runs (
            task_id, session_id, plugin_id, manifest, idempotency_key, state, mcp_token_enc,
-           grant_id, grant_keys_enc, grant_limits, grant_expires_at, created_by, request_hash, grant_templates
-         ) VALUES ($1, $2, $3, $4::jsonb, $5, 'provisioning', $6, $7, $8, $9::jsonb, $10, $11, $12, $13::jsonb)`,
+           grant_id, grant_keys_enc, grant_limits, grant_expires_at, created_by, request_hash, grant_templates,
+           sandbox_state, sandbox_since
+         ) VALUES ($1, $2, $3, $4::jsonb, $5, 'provisioning', $6, $7, $8, $9::jsonb, $10, $11, $12, $13::jsonb, 'pending', NOW())`,
         [
           taskId, req.sessionId, pluginId, JSON.stringify(manifest), req.idemKey,
           sealAppRunSecret(newMcpToken(), taskId, "mcp_token"),

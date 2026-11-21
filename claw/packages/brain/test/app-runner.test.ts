@@ -300,6 +300,7 @@ test("T14b a final exit hidden by a lost sandbox is found even with the budget s
   await h.runner.reconcile();
   assert.equal(h.world.rec.state, "finishing");
   assert.equal(h.world.rec.last_exit?.final, true);
+  assert.equal(h.world.rec.last_exit?.sandbox_gone, true, "the move says the sandbox is gone");
   const r = await h.runner.reconcile();
   assert.deepEqual(r, { done: true, outcome: { success: true, reason: "app finished", captures: { session_dir: STATE_DIR } } });
   assert.equal(h.world.starts.length, 1, "FINAL is not run again");
@@ -318,6 +319,7 @@ test("T14c a reader that cannot be made is retried; after three failed looks the
   await h.runner.reconcile();
   assert.equal(h.world.rec.state, "finishing");
   assert.equal(h.world.rec.last_exit?.cause, "restarts_exhausted");
+  assert.equal(h.world.rec.last_exit?.sandbox_gone, true, "the move says the sandbox is gone");
   assert.deepEqual(h.world.created, ["wl-1"]);
 });
 

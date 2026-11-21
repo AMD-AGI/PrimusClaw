@@ -113,6 +113,20 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: an app run (`mode: "app"`) carries an `app` block on `GET /v1/tasks/{id}` (`item.app`) and on every form of
+  `GET /v1/runs` (`app`, `null` for other runs). `app.sandbox` says where the run's sandbox is -- `state` (`pending`
+  while it is being created, queued or starting, `running` once the platform reports it Running, `ended`),
+  `workload_id` and `since` -- where until now the task read `running` from the moment a worker accepted it, however
+  long its sandbox stayed queued or pulled its image. `app.outcome`, once the run has ended, says how as stable fields:
+  `cause` (a closed list: `exited`, `restarts_exhausted`, `start_failed`, `deadline`, `cancelled`, `task_closed`,
+  `no_exit_record`, `sandbox_rejected`, `sandbox_create_failed`, `sandbox_unschedulable`, `sandbox_start_timeout`,
+  `sandbox_failed`), `returncode`, `final` and `error` (the application's `exit.json` `error`, or the platform's reason
+  for a `sandbox_*` cause; masked, one line, at most 300 characters), so a caller no longer matches on the prose of
+  `failure_reason`, which is unchanged. `placement.workload_id` on `GET /v1/runs` now names an app run's sandbox; it was
+  always empty. To tell a run that never got a sandbox from one whose application failed, the run's row now records why
+  it has no sandbox (the provisioning code and the platform's words, scrubbed) while it waits, until one is Running.
+  A wait for a sandbox cut short by the run's own cancel or deadline is never counted as a sandbox the platform failed
+  to give, so such a run ends as `cancelled` or `deadline`. See `claw/docs/run-api.md`, "App runs".
 - Claw: metrics for the API's event consumer: `claw_api_event_consumer_consecutive_failures` (deliveries this replica
   retried since it last stored or set aside an event), `claw_api_event_quarantined_total{reason}` (`unparseable`,
   `unstorable`, `bounded`), `claw_api_event_sanitised_total` (events stored with a character replaced), and, read from the server every 30 seconds,

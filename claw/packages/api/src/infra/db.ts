@@ -2594,6 +2594,14 @@ export async function initDb(): Promise<void> {
         logger.warn({ column: col, err: err instanceof Error ? err.message : String(err) }, "db.app_runs_alter_failed");
       });
     }
+    // The run's sandbox as callers read it (`pending` / `running` / `ended`) and when it
+    // entered that state; maintained by every write that moves the run's state
+    // (tasks/app-run-status.ts). A row written before these is read from its state.
+    for (const [col, type] of [["sandbox_state", "TEXT"], ["sandbox_since", "TIMESTAMPTZ"]] as const) {
+      await client.query(`ALTER TABLE claw_app_runs ADD COLUMN IF NOT EXISTS ${col} ${type}`).catch((err: unknown) => {
+        logger.warn({ column: col, err: err instanceof Error ? err.message : String(err) }, "db.app_runs_alter_failed");
+      });
+    }
     // Where a running application's session-level MCP answers (hosting design 5.8).
     // The address and the sandbox's session id only: the MCP token stays sealed in
     // claw_app_runs and is opened when a turn is dispatched.
