@@ -374,6 +374,13 @@ export class GithubReview {
             await this.click(click);
             return true;
           },
+          // (the ready card goes where the asker asked, a group too: only its retry is answered there, and only to the
+          // asker; it runs on the reviewer's own credential, never the group's or the presser's)
+          inGroup: async (click: ClickRoute) => {
+            if (click.action.data.primusclaw !== ONBOARDING_CLICK) return false;
+            await this.onboarding.click(click);
+            return true;
+          },
         },
       ],
     };

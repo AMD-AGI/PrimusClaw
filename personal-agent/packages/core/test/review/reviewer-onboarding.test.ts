@@ -30,6 +30,8 @@ import {
   type HandoffWorld,
   type ReviewWorld,
 } from "../../../../test-support/review-world.js";
+import { inboundAction } from "../../../../test-support/inbound.js";
+import { world as routingWorld } from "../../../../test-support/routing/world.js";
 
 const PR2 = "AMD-AGI/Hyperloom#13";
 const BOB_DM = "personal:aad-b";
@@ -620,4 +622,44 @@ test("the retry runs on the model the asker named, checked again as a new reques
   await settleFollows(other);
   assert.equal(otherHttp.requests.length, 0);
   assert.ok(saidIn(other.surface, CONV).includes("key 用不了模型 no-such-model"), saidIn(other.surface, CONV));
+});
+
+test("the ready card's retry in a group answers there, through the router, to the asker only", async () => {
+  const world = reviewWorld();
+  const http = clawReviewsOverHttp(world);
+  world.identity.know("aad-b", "u-bob", "bob-gh", false);
+  await asked(world, `请 {Bob} 帮我 review 合入 ${PR}`);
+  await says(world, BOB, "/github auto-merge on");
+  const retry = button(world, CONV, "retry");
+  // The worker's own router over the same store and surface, with the review service's handlers
+  const { router } = routingWorld({
+    testStore: { store: world.store, clock: world.clock, encryptionKeys: [] },
+    surface: world.surface,
+    handlers: world.service.routeHandlers(),
+  });
+  const click = (who: UserRef, id: string) =>
+    router.handle(
+      inboundAction({
+        id,
+        sender: who,
+        conversation: GROUP,
+        verb: String(retry.primusclaw),
+        clickVerb: "primusclaw.review_onboarding",
+        data: retry,
+        cardMessageId: `card-${id}`,
+      }),
+    );
+  // Another member of the group: told only the asker may, and nothing starts
+  await click(CAROL, "c-carol");
+  await settleFollows(world);
+  assert.equal(http.requests.length, 0);
+  assert.ok(saidIn(world.surface, CONV).includes("只有发起这次代审的人可以重新发起"), saidIn(world.surface, CONV));
+  // The asker: the same request starts, once, on the reviewer's own credential
+  await click(ALICE, "c-alice");
+  await settleFollows(world);
+  const [only, ...more] = http.requests;
+  assert.equal(more.length, 0);
+  assert.ok(only);
+  assert.equal(only.headers["x-acting-as-api-key"], "ak-bob-linked");
+  assert.equal(only.body.acting_as, "u-bob");
 });
