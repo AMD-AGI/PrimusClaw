@@ -13,7 +13,7 @@ import {
   SandboxGrantClient, buildSandboxGrant, grantWorkspaces, loadGrantSigner, type SandboxGrantMaterial,
 } from "../src/sandbox-grant.js";
 import { appGrantTemplates } from "../src/app-resources.js";
-import { APP_MANIFEST_SCHEMA, type AppManifestV1 } from "../src/app-manifest.js";
+import { APP_MANIFEST_SCHEMA, validateAppManifest, type AppManifestV1 } from "../src/app-manifest.js";
 
 const { privateKey, publicKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
 const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
@@ -80,6 +80,35 @@ test("the attestation is ES256 and matches the issue body", () => {
   assert.equal(built.body.maxGpus, 8);
   const tpl = (built.body.templates as Array<{ spec: { data_plane: { mode: string } } }>)[0]!;
   assert.equal(tpl.spec.data_plane.mode, "sealed");
+});
+
+test("a template's resources and gpu.sharedMemory reach Agent Sandbox unchanged", () => {
+  // The fields are Agent Sandbox's: the manifest accepts them, appGrantTemplates
+  // and the grant body carry them through as the template spec, and nothing in
+  // Claw reads, drops or rewrites them.
+  const manifest: AppManifestV1 = {
+    schema: APP_MANIFEST_SCHEMA, name: "measure", version: "1.0.0", container: { image: "img:1" },
+    state_dir: "/state/${run_id}", command: ["run"],
+    sandbox_templates: [
+      { name: "ds-tp2", per_gpu_count: [2], fromImage: "img:1", resources: { requests: { cpu: "16", memory: "448Gi" } } },
+      { name: "kimi-tp8", per_gpu_count: [8], fromImage: "img:1",
+        resources: { requests: { cpu: "32", memory: "1792Gi" }, limits: { cpu: "32", memory: "1792Gi", "ephemeral-storage": "1Ti" } },
+        gpu: { sharedMemory: "512Gi" } },
+    ],
+    sandbox_roles: { measurement: ["ds-tp2", "kimi-tp8"] },
+  };
+  assert.deepEqual(validateAppManifest(manifest), []);
+  const templates = appGrantTemplates(manifest, { image: "img:1", sandboxWorkspace: "ws-a" });
+  const built = buildSandboxGrant({ ...material(), templates, roles: manifest.sandbox_roles }, NOW);
+  const wire = JSON.parse(JSON.stringify(built.body.templates)) as Array<{ name: string; perGpuCount: number[]; spec: Record<string, unknown> }>;
+  assert.deepEqual(wire, [
+    { name: "ds-tp2", perGpuCount: [2],
+      spec: { fromImage: "img:1", resources: { requests: { cpu: "16", memory: "448Gi" } }, image: "img:1", workspace: "ws-a" } },
+    { name: "kimi-tp8", perGpuCount: [8],
+      spec: { fromImage: "img:1",
+        resources: { requests: { cpu: "32", memory: "1792Gi" }, limits: { cpu: "32", memory: "1792Gi", "ephemeral-storage": "1Ti" } },
+        gpu: { sharedMemory: "512Gi" }, image: "img:1", workspace: "ws-a" } },
+  ]);
 });
 
 test("a role that is not declared is not issued", () => {

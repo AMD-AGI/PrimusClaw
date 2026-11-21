@@ -128,7 +128,20 @@ release version, and its `appVersion` stays `latest`.
   to the `Idempotency-Key`. One generic plugin can so serve several model sizes instead of one plugin per size. A plugin
   that declares nothing launches exactly as before. Agent Sandbox applies a template's `resources` and
   `gpu.sharedMemory` from the release that reads them. See `claw/docs/plugins.md` section 4.
-
+- Claw: an app run (`mode: "app"`) carries an `app` block on `GET /v1/tasks/{id}` (`item.app`) and on every form of
+  `GET /v1/runs` (`app`, `null` for other runs). `app.sandbox` says where the run's sandbox is -- `state` (`pending`
+  while it is being created, queued or starting, `running` once the platform reports it Running, `ended`),
+  `workload_id` and `since` -- where until now the task read `running` from the moment a worker accepted it, however
+  long its sandbox stayed queued or pulled its image. `app.outcome`, once the run has ended, says how as stable fields:
+  `cause` (a closed list: `exited`, `restarts_exhausted`, `start_failed`, `deadline`, `cancelled`, `task_closed`,
+  `no_exit_record`, `sandbox_rejected`, `sandbox_create_failed`, `sandbox_unschedulable`, `sandbox_start_timeout`,
+  `sandbox_failed`), `returncode`, `final` and `error` (the application's `exit.json` `error`, or the platform's reason
+  for a `sandbox_*` cause; masked, one line, at most 300 characters), so a caller no longer matches on the prose of
+  `failure_reason`, which is unchanged. `placement.workload_id` on `GET /v1/runs` now names an app run's sandbox; it was
+  always empty. To tell a run that never got a sandbox from one whose application failed, the run's row now records why
+  it has no sandbox (the provisioning code and the platform's words, scrubbed) while it waits, until one is Running.
+  A wait for a sandbox cut short by the run's own cancel or deadline is never counted as a sandbox the platform failed
+  to give, so such a run ends as `cancelled` or `deadline`. See `claw/docs/run-api.md`, "App runs".
 - Claw: metrics for the API's event consumer: `claw_api_event_consumer_consecutive_failures` (deliveries this replica
   retried since it last stored or set aside an event), `claw_api_event_quarantined_total{reason}` (`unparseable`,
   `unstorable`, `bounded`), `claw_api_event_sanitised_total` (events stored with a character replaced), and, read from the server every 30 seconds,
@@ -193,6 +206,24 @@ release version, and its `appVersion` stays `latest`.
   minutes, for 5 minutes) and `ClawNotificationQuarantined`, tested with `promtool` in CI.
 
 ### Changed
+
+- Agent Sandbox: a GPU template's CPU, memory, pod storage and `/dev/shm` now come from the template when it sets them,
+  instead of always 24 CPU, 224Gi memory, 187.5Gi storage and 125Gi shared memory per card. A sandbox can ask for what
+  it needs (for example 16 CPU and 448Gi for two cards, or 32 CPU and 1792Gi for eight) and leave the rest of the node
+  to CPU sandboxes. Before, `resources` on a grant or owner policy template with GPU counts was silently overwritten.
+  Each of `cpu`, `memory` and `ephemeral-storage` in `resources.requests`/`resources.limits` is resolved on its own: a
+  value given only as a request is also the limit, one given only as a limit is also the request, and one given in
+  neither keeps the per-card size times the card count. `/dev/shm` is the spec's `gpu.sharedMemory`, else 125Gi per card
+  lowered to the memory limit when that is smaller. The card count still comes only from `perGpuCount`. A template with
+  no `resources` or `gpu` is sized exactly as before. A value that is zero, negative or not a quantity, a request above
+  its limit, a shared memory above the memory limit, any other resource name on a GPU template, or a `gpu` key other than
+  `sharedMemory` (`count`, `product` and `resourceName` are still accepted and ignored, so a stored policy with them keeps
+  applying), is refused with `400` (`invalid_grant` or `invalid_owner_policy`) naming the field, and nothing is
+  registered. A template without GPU counts keeps its `resources` as written, and its `cpu`, `memory` and
+  `ephemeral-storage` are now checked the same way. Claw already passes a manifest template's fields through unchanged, so an app manifest's
+  `sandbox_templates` entries can set these now. See `sandbox/docs/E2B.md` (GPU template size). Deploy the sandbox control
+  plane (`agent-sandbox-controlplane`); Claw is unchanged. Templates registered before the release keep their size until
+  their grant is issued again.
 
 - Claw API: a review asked of someone else ("review and merge", R asking X) is now merged with the reviewer's account
   whenever the reviewer can merge it, and the requester's own account is used only when the reviewer cannot, and only on
