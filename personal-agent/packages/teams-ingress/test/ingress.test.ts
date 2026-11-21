@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 
 import { ACK_TYPE } from "../src/outbound.js";
-import { PLACEHOLDER_CARD, UNAVAILABLE_CARD } from "../src/replies.js";
+import { PLACEHOLDER_CARD } from "../src/replies.js";
 import { readSettings } from "../src/settings.js";
 import {
   bodyOf,
@@ -291,12 +291,12 @@ test("test_the_placeholder_card_is_static_and_promises_no_change_to_itself", asy
   assert.deepEqual(served, card);
 });
 
-test("test_card_action_invoke_that_cannot_be_queued_gets_the_unavailable_card", async () => {
+test("test_card_action_invoke_that_cannot_be_queued_is_a_500_so_it_is_retried", async () => {
   const w = wired();
   brokenEnqueue(w.ingress);
   const reply = await post(w.ingress, CARD_ACTION);
-  assert.equal(reply.status, 200);
-  assert.deepEqual((json(reply) as { value: unknown }).value, UNAVAILABLE_CARD);
+  assert.equal(reply.status, 500);
+  assert.equal(reply.body.length, 0);
 });
 
 test("test_other_invokes_get_the_empty_compose_result_and_are_not_queued", async (t) => {

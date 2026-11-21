@@ -75,6 +75,9 @@ function isQueueWaitOutcome(outcome: QueueExitOutcome): outcome is QueueWaitOutc
 
 export type EverHeld = "true" | "false";
 
+/** Why the event consumer set an event aside (events/poison.ts). */
+export type EventQuarantineReason = "unparseable" | "unstorable" | "bounded";
+
 export const registry = new Registry();
 registry.setDefaultLabels({ service: "claw-api" });
 collectDefaultMetrics({ register: registry });
@@ -116,6 +119,46 @@ const agentDoneRefusedTotal = new Counter({
   name: "claw_api_agent_done_refused_total",
   help: "agent_done callbacks refused with 422 because the database rejected their values, by SQLSTATE.",
   labelNames: ["sqlstate"] as const,
+  registers: [registry],
+});
+
+// The event consumer's own health (events/poison.ts). Consecutive failures is this replica's run of deliveries answered
+// with a retry since it last stored an event or set one aside; an outage or a poison event shows here first. Quarantined is an event set aside with a
+// durable copy in claw_event_quarantine, by why: `unparseable` (not a JSON object) or `unstorable` (the database refused
+// its value after sanitising), or `bounded` (a completion the database refused for its depth, run with a depth-bounded
+// copy; the record keeps the original). Sanitised counts the events newly stored with characters Postgres cannot hold (NUL, a
+// lone surrogate) replaced by U+FFFD; a delivery that fails, is dropped, or finds its row already stored is not counted.
+const eventConsumerConsecutiveFailures = new Gauge({
+  name: "claw_api_event_consumer_consecutive_failures",
+  help: "Event deliveries this replica answered with a retry since it last stored or set aside an event.",
+  registers: [registry],
+});
+const eventQuarantinedTotal = new Counter({
+  name: "claw_api_event_quarantined_total",
+  help: "Events the event consumer set aside in claw_event_quarantine, by reason.",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+const eventSanitisedTotal = new Counter({
+  name: "claw_api_event_sanitised_total",
+  help: "Events stored with NUL or lone-surrogate characters replaced by U+FFFD.",
+  registers: [registry],
+});
+// The durable consumer's backlog as the server reports it, read every 30 s by each replica (the same numbers on
+// every replica). Oldest pending age is how long the oldest event not yet acknowledged has waited: the stall signal.
+const eventConsumerAckPending = new Gauge({
+  name: "claw_api_event_consumer_ack_pending",
+  help: "Events delivered to the api-consumer durable and not yet acknowledged.",
+  registers: [registry],
+});
+const eventConsumerPending = new Gauge({
+  name: "claw_api_event_consumer_pending",
+  help: "Events on the event stream not yet delivered to the api-consumer durable.",
+  registers: [registry],
+});
+const eventConsumerOldestPendingAge = new Gauge({
+  name: "claw_api_event_consumer_oldest_pending_age_seconds",
+  help: "Age of the oldest event the api-consumer durable has not acknowledged; 0 when none is pending.",
   registers: [registry],
 });
 
@@ -438,6 +481,30 @@ const notificationPending = new Gauge({
 // `claw_notification_subscriptions_failing` and `claw_notification_subscription_failures_max`, below.)
 void [notificationOldestPendingAge, notificationPending];
 
+// The per-session message queue (`claw_pending_messages`). The two gauges are
+// read from the table on every sweeper tick, by every replica, so they describe
+// the queue rather than this process: alert on max() across replicas.
+const pendingDrainFailuresTotal = new Counter({
+  name: "claw_api_pending_drain_failures_total",
+  help: "Attempts to send on a queued message that failed and left it queued.",
+  registers: [registry],
+});
+const pendingQuarantinedTotal = new Counter({
+  name: "claw_api_pending_quarantined_total",
+  help: "Queued messages moved out of their session's queue after repeated failures to send them.",
+  registers: [registry],
+});
+const pendingConsecutiveFailures = new Gauge({
+  name: "claw_api_pending_messages_consecutive_failures",
+  help: "Most consecutive failed attempts to send any one message still queued; 0 when every queued message is flowing.",
+  registers: [registry],
+});
+const pendingOldestAgeSeconds = new Gauge({
+  name: "claw_api_pending_messages_oldest_age_seconds",
+  help: "Age of the oldest message still queued behind a session; 0 when nothing is queued.",
+  registers: [registry],
+});
+
 // A marker ahead of the clock is pod skew, not a negative wait, so it clamps
 // to zero rather than entering the first bucket as a measurement nobody took.
 function sojournSeconds(markerIso: string | null | undefined): number | null {
@@ -642,6 +709,20 @@ export const metrics = {
   onEventPersisted(outcome: "ok" | "error"): void {
     eventPersistedTotal.inc({ outcome });
   },
+  setEventConsumerConsecutiveFailures(n: number): void {
+    eventConsumerConsecutiveFailures.set(n);
+  },
+  onEventQuarantined(reason: EventQuarantineReason): void {
+    eventQuarantinedTotal.inc({ reason });
+  },
+  onEventSanitised(): void {
+    eventSanitisedTotal.inc();
+  },
+  setEventConsumerBacklog(b: { ackPending: number; pending: number; oldestPendingAgeSeconds: number }): void {
+    eventConsumerAckPending.set(b.ackPending);
+    eventConsumerPending.set(b.pending);
+    eventConsumerOldestPendingAge.set(b.oldestPendingAgeSeconds);
+  },
 
   onAdmissionDecision(origin: AdmissionOrigin, decision: AdmissionDecisionLabel): void {
     admissionDecisionTotal.inc({ origin, decision });
@@ -763,5 +844,15 @@ export const metrics = {
   },
   onUserSkillSave(op: "create" | "update" | "draft" | "delete" | "disable" | "enable" | "undo", outcome: string): void {
     userSkillSaveTotal.inc({ op, outcome });
+  },
+  onPendingDrainFailure(): void {
+    pendingDrainFailuresTotal.inc();
+  },
+  onPendingQuarantined(): void {
+    pendingQuarantinedTotal.inc();
+  },
+  setPendingQueueState(consecutiveFailures: number, oldestAgeSeconds: number): void {
+    pendingConsecutiveFailures.set(Math.max(0, consecutiveFailures));
+    pendingOldestAgeSeconds.set(Math.max(0, oldestAgeSeconds));
   },
 };

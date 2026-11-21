@@ -21,6 +21,8 @@ export interface LogRecord {
 export type LogSink = (record: LogRecord) => void;
 
 export interface Logger {
+  /** Where this logger's records go, for a record under another logger name in the same place. */
+  readonly sink: LogSink;
   debug(message: string, error?: unknown): void;
   info(message: string, error?: unknown): void;
   warning(message: string, error?: unknown): void;
@@ -33,7 +35,7 @@ export function logger(sink: LogSink, name: string): Logger {
     (message: string, error?: unknown): void => {
       sink(error === undefined ? { logger: name, level, message } : { logger: name, level, message, error });
     };
-  return { debug: at("debug"), info: at("info"), warning: at("warning"), error: at("error") };
+  return { sink, debug: at("debug"), info: at("info"), warning: at("warning"), error: at("error") };
 }
 
 /** Core's Logger (message and fields) over a sink: the fields follow the message as JSON. */

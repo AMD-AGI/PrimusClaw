@@ -60,6 +60,9 @@ import { ensureSessionWorkspace, requireWorkspaceBinding } from "../workspace/st
 
 const logger = pino({ name: "pending-dispatch" });
 
+/** The failure reason on the turn a quarantined queued message ends with (tasks/pending-quarantine.ts). */
+export const PENDING_DRAIN_QUARANTINED = "pending_drain_quarantined";
+
 /**
  * How many times a queued message may be refused a workspace before it is
  * abandoned.
@@ -260,33 +263,75 @@ export async function publishRefusedTurn(
    * belonging to a sibling row that carries holder evidence.
    */
   taskId?: string,
+  /**
+   * Where an earlier, partly published attempt at this same refusal got to.
+   * Without it the refusal is published whole, which is right for a caller
+   * that tries once; a caller that retries passes it so a retry after a
+   * partial publish sends only what is still missing.
+   */
+  progress?: RefusedTurnProgress,
 ): Promise<void> {
   const finalText = failureReason === "workspace_bind_failed"
     ? "This message was not started: its workspace could not be prepared. "
       + "Nothing ran, and it can be sent again."
-    : "This message was not started: the cluster refused it. "
-      + "Nothing ran, and it can be sent again.";
+    : failureReason === PENDING_DRAIN_QUARANTINED
+      ? "This message was not started: it could not be sent after repeated attempts. "
+        + "Nothing ran, and it can be sent again."
+      : "This message was not started: the cluster refused it. "
+        + "Nothing ran, and it can be sent again.";
   const of = (event: Record<string, unknown>): Record<string, unknown> => ({
     session_id: input.sessionId,
     message_id: input.messageId,
     ...(taskId ? { task_id: taskId } : {}),
     ...event,
   });
-  await pendingDispatchPorts.publishSessionEvent(input.sessionId, of({
-    type: "AssistantMessage",
-    data: { content: [{ type: "text", text: finalText }] },
-  }));
-  await pendingDispatchPorts.publishSessionEvent(input.sessionId, of({ type: "ResultMessage" }));
-  await pendingDispatchPorts.publishSessionEvent(input.sessionId, of({
-    type: "exec_complete",
-    user_id: input.userId,
-    prompt: input.prompt,
-    final_text: finalText,
-    failed: true,
-    failure_reason: failureReason,
-    error_count: 0,
-    skills_used: {},
-  }));
+  const sequence = [
+    of({
+      type: "AssistantMessage",
+      data: { content: [{ type: "text", text: finalText }] },
+    }),
+    of({ type: "ResultMessage" }),
+    of({
+      type: "exec_complete",
+      user_id: input.userId,
+      prompt: input.prompt,
+      final_text: finalText,
+      failed: true,
+      failure_reason: failureReason,
+      error_count: 0,
+      skills_used: {},
+    }),
+  ];
+  for (let i = Math.max(0, progress?.published ?? 0); i < sequence.length; i++) {
+    await pendingDispatchPorts.publishSessionEvent(
+      input.sessionId,
+      sequence[i],
+      progress ? `${progress.dedupeKey}:${i}` : undefined,
+    );
+    if (progress) await progress.record(i + 1);
+  }
+}
+
+/**
+ * How far a retried refusal has got, for `publishRefusedTurn`.
+ *
+ * Two guards, because each covers what the other cannot. `published` is the
+ * durable count of events already out, recorded after each one, so a retry
+ * minutes later resumes after them. A publish that reached the stream and then
+ * failed to acknowledge, or whose count could not be recorded, is not in that
+ * count; `dedupeKey` names every event, so the stream drops that one event's
+ * second copy when the retry comes inside its duplicate window. A caller that
+ * retries keeps its retries inside that window (the event stream's is set by
+ * `EVENT_STREAM_DUPLICATE_WINDOW_MS`); after it the id is no longer known and a
+ * second copy would be stored.
+ */
+export interface RefusedTurnProgress {
+  /** Events of this refusal already published, in order: 0 to 3. */
+  published: number;
+  /** Record that the first `count` events are out. */
+  record(count: number): Promise<void>;
+  /** Stable per refusal; each event is published under `<dedupeKey>:<index>`. */
+  dedupeKey: string;
 }
 
 /**
@@ -1126,6 +1171,19 @@ async function preparePendingHandoff(
   while (true) {
     const recorded = await recordedHandoffState(handoffId);
     if (recorded === "retryable") {
+      // A message that has had its attempts is not sent again. A publish that
+      // timed out leaves its run open until the sweeper finds nothing was
+      // delivered, so the failure counted on it could never quarantine the
+      // row (the move waits for that run); this is the first drain after the
+      // run has closed, and it fails, is counted and moves the row instead of
+      // opening yet another run that may time out the same way.
+      const { pendingDrainSpent } = await import("./pending-quarantine.js");
+      if (await pendingDrainSpent(input.pendingId)) {
+        throw Object.assign(
+          new Error(`queued message ${String(input.pendingId)} has had its attempts and was not delivered`),
+          { code: "PENDING_DRAIN_SPENT" },
+        );
+      }
       // The only place the reservation is ever rotated, and it is reached only
       // from a terminal row -- that is what "retryable" now means. Rotating off
       // a row that is still open loses the turn's durable identity to a run

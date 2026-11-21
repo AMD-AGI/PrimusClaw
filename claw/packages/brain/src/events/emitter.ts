@@ -11,12 +11,6 @@ import pino from "pino";
 const sc = StringCodec();
 const logger = pino({ name: "nats-emitter" });
 
-/** Strip unpaired Unicode surrogates that break PG jsonb. */
-function sanitizeJson(str: string): string {
-  return str.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, "\uFFFD")
-            .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD");
-}
-
 /**
  * How long to wait before each retry of a publish JetStream did not acknowledge.
  *
@@ -81,7 +75,10 @@ export class NatsEmitter {
     sessionId: string, event: Record<string, unknown>, opts: { msgID?: string; stillMine?: () => boolean } = {},
   ): Promise<void> {
     const subject = eventSubject(sessionId);
-    const payload = sc.encode(sanitizeJson(JSON.stringify(event)));
+    // Published as `JSON.stringify` writes it. A NUL or a lone surrogate in a string goes out as an escape
+    // (`\u0000`, `\ud800`), which a replace over this text cannot see; the API's event consumer makes them storable
+    // on the parsed event, where it writes them (packages/api/src/events/poison.ts).
+    const payload = sc.encode(JSON.stringify(event));
     const msgID = opts.msgID ?? randomUUID();
     for (let attempt = 0; ; attempt++) {
       if (opts.stillMine && !opts.stillMine()) throw new EmitStoodDownError(String(event.type ?? ""));

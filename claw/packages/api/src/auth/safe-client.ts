@@ -3,7 +3,6 @@
 
 import { createHash } from "node:crypto";
 import type { UserInfo } from "./models.js";
-import { LLM_KEY_SOURCE } from "../config.js";
 import { safePreview } from "@claw/utils";
 import pino from "pino";
 
@@ -192,9 +191,11 @@ export class SafeClient {
     return h;
   }
 
-  // The virtual key is asked for only when LLM calls use it (LLM_KEY_SOURCE=virtualKey).
+  // Both keys are asked for whatever LLM_KEY_SOURCE says. `includeVirtualKey` is also what makes SaFE fill in the
+  // account's email from the user record: an `ak-` key and a default session cookie carry none of their own, so
+  // without it the caller has no email (GET /v1/me, everything keyed by it), and no virtual key to carry along.
   private body(): Record<string, unknown> {
-    return LLM_KEY_SOURCE === "virtualKey" ? { includePlatformKey: true, includeVirtualKey: true } : { includePlatformKey: true };
+    return { includePlatformKey: true, includeVirtualKey: true };
   }
 
   // Cache-lookup + singleflight wrapper shared by the API-key, cookie and access-token paths.

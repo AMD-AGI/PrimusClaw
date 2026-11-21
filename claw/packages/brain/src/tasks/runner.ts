@@ -49,7 +49,7 @@ import {
   S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, S3_API_ENDPOINT,
   BRAIN_WORKSPACE_SNAPSHOT_ENABLED,
   RETRY_PENDING_KEEPALIVE_GRACE_SEC,
-  TASK_MAX_DELIVER, BRAIN_LAZY_SANDBOX, BRAIN_SANDBOX_PRESTART,
+  TASK_MAX_DELIVER, TASK_POISON_DELIVERY_COUNT, BRAIN_LAZY_SANDBOX, BRAIN_SANDBOX_PRESTART,
   RUN_LEASE_HEARTBEAT_MS, RUN_LEASE_TTL_MS,
   LOCK_REFRESH_INTERVAL_MS,
   SANDBOX_HANDS_RESTART_ENABLED,
@@ -72,8 +72,8 @@ import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
 import {
-  SANDBOX_CAPACITY_FAILURE_REASONS, SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf,
-  sandboxUnavailableOf,
+  SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf, sandboxOpenFailureOf,
+  sandboxUnavailableOf, oneLineText,
 } from "../sandbox/errors.js";
 import { placementNodeLabels } from "../sandbox/create-sandbox.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
@@ -1654,6 +1654,14 @@ class TaskRunner {
    * the next message of the session tries afresh.
    */
   private sandboxUnavailable: unknown = null;
+  /**
+   * What the last failed open of this run's sandbox ended with, until an open
+   * succeeds. A failure the next tool may retry past (a create the platform
+   * answered 5xx, a workload that failed before it was ready) is not latched in
+   * `sandboxUnavailable`, but a run that asked and never got a sandbox did not do
+   * the work it needed one for either; see `provisionFailure`.
+   */
+  private lastOpenFailure: unknown = null;
   private resumeMetricsRecorded = false;
   // Set by the first successful reap, which a terminal path may do early to
   // keep a still-writing process out of its snapshot; the release on the way
@@ -2998,7 +3006,11 @@ class TaskRunner {
     // cached and how a rebuild is not undone: `recreateHands` replaces
     // `this.hands` without coming through here, so a retained promise would keep
     // handing out the sandbox the rebuild has already destroyed.
-    this.handsAttach = this.openSandbox(prestart).catch(async (err: unknown) => {
+    this.handsAttach = this.openSandbox(prestart).then((hands) => {
+      this.lastOpenFailure = null;
+      return hands;
+    }, async (err: unknown) => {
+      this.lastOpenFailure = err;
       await this.settleUnavailableOpen(err);
       throw err;
     }).finally(() => {
@@ -3021,23 +3033,31 @@ class TaskRunner {
 
   /**
    * Why this run ended without the sandbox it asked for, when it did: a tool asked
-   * for one, the platform had no capacity for it (SANDBOX_CAPACITY_FAILURE_REASONS:
-   * no node took the pod, the wait for capacity ran out, it never became ready)
-   * and none was opened after. The model was told and wrote its answer
-   * without one, so the turn ends as usual; but none of the work that needed the
-   * sandbox ran, and the run is recorded as failed for that reason, with the
-   * platform's account of it, so a caller reading the run sees why rather than a
-   * clean ending with no exit code.
+   * for one and the platform did not provide it -- it refused the create
+   * (`sandbox_rejected`, e.g. an admission webhook's QoS ceiling), the create
+   * failed (`sandbox_create_failed`), the workload failed before it was ready
+   * (AdminFailed), no node took the pod, or the wait for capacity ran out -- and
+   * none was opened after. The model was told and wrote its answer without one,
+   * so the turn ends as usual; but none of the work that needed the sandbox ran,
+   * and the run is recorded as failed for that reason, with the platform's
+   * account of it, so a caller reading the run sees why
+   * rather than a clean ending with no exit code.
    *
    * A prestarted open that failed with nothing asking for it is not this: the run
    * never needed the sandbox. Nor is an account the platform refuses a sandbox to:
-   * such a run carries on without one by design.
+   * such a run carries on without one by design (see `sandboxOpenFailureOf`).
    */
   private provisionFailure(): { reason: string; message: string } | null {
-    if (!this.sandboxClaimed || this.hands || !this.sandboxUnavailable) return null;
-    const terminal = sandboxUnavailableOf(this.sandboxUnavailable);
-    if (!terminal || !SANDBOX_CAPACITY_FAILURE_REASONS.has(terminal.reason)) return null;
-    return { reason: terminal.reason, message: String(terminal.message ?? "").slice(0, 2000) };
+    if (!this.sandboxClaimed || this.hands) return null;
+    const err = this.sandboxUnavailable ?? this.lastOpenFailure;
+    if (!err) return null;
+    const failure = sandboxOpenFailureOf(err, classifySandboxFailure);
+    if (!failure) return null;
+    // One line and bounded here, whichever path built it: a failed create's message
+    // carries the platform's body as it came, newlines and all. The run's secrets
+    // are masked on the way out, as for every event (`onEvent`) and callback
+    // (`redactEgressPayload`) this run sends.
+    return { reason: failure.reason, message: oneLineText(failure.message, 2000) };
   }
 
   /**
@@ -3847,6 +3867,13 @@ class TaskRunner {
         "task.ended_without_sandbox",
       );
       result = { ...result, abortReason: "error", failureReason: provisionFailure.reason, failureMessage: provisionFailure.message };
+      // In the session's events too, where a client following the session reads
+      // why the sandbox it was shown starting never came (the completion itself
+      // is not forwarded to clients).
+      await this.onEvent({
+        type: "sandboxStatus", status: "failed", reason: provisionFailure.reason, message: provisionFailure.message,
+        message_id: this.messageId,
+      }).catch(() => { /* a status event must not fail the run */ });
     }
     const completion: Record<string, unknown> = {
       type: "exec_complete",
@@ -4694,6 +4721,10 @@ class TaskRunner {
     // A SandboxProvisionTerminalError carries an authoritative machine reason
     // (e.g. sandbox_workload_terminal); else fall back to the message-regex classifier.
     const sandboxReason = provisionTerminalOf(err)?.reason ?? classifySandboxFailure(rawMsg);
+    // The platform's account of a sandbox that could not be provided, carried
+    // beside the code to the run row, the A2A task and the notification, so a
+    // caller can tell a refusal from a crash. Masked on the way out, as below.
+    const sandboxFailureMessage = sandboxReason ? rawMsg.slice(0, 2000) : undefined;
     if (sandboxReason) {
       await this.onEvent({
         type: "sandboxStatus",
@@ -4768,6 +4799,7 @@ class TaskRunner {
       final_text: finalText,
       failed: true,
       failure_reason: taskFailure.reason,
+      ...(sandboxFailureMessage ? { failure_message: sandboxFailureMessage } : {}),
       turns: partialTurns,
       elapsed_ms: elapsedMsAtFailure,
       token_usage: partialTokenUsage,
@@ -4802,6 +4834,7 @@ class TaskRunner {
           elapsedMs: elapsedMsAtFailure,
           abortReason: "error",
           failureReason: sandboxReason || rawMsg.slice(0, 500),
+          ...(sandboxFailureMessage ? { failureMessage: sandboxFailureMessage } : {}),
           ...(err instanceof AppRunFailedError && err.captures ? { captures: err.captures } : {}),
         }),
         runtimeSecrets(this.request, this.platformKey),
@@ -5514,12 +5547,18 @@ class TaskRunner {
     }
 
     if (this.abortCtrl.signal.reason === DEADLINE_EXCEEDED_ABORT_REASON) {
+      // A deadline that fell while the sandbox's create was failing ends the run
+      // for that: the run reached it because the platform never gave it a
+      // sandbox, and that is what a caller needs to read, not a spent budget.
+      const sandboxCause = this.sandboxCreateFailureOf(err);
       await this.settleTerminal(
         () => this.handleFatalError(
-          new Error(
-            `run_budget_exhausted: the run reached its deadline of ${this.request.deadline_at} `
-            + `after ${this.reportedCkpt?.turns_completed ?? 0} turns`,
-          ),
+          sandboxCause
+            ? new Error(`${sandboxCause} (retried until the run reached its deadline of ${this.request.deadline_at})`)
+            : new Error(
+              `run_budget_exhausted: the run reached its deadline of ${this.request.deadline_at} `
+              + `after ${this.reportedCkpt?.turns_completed ?? 0} turns`,
+            ),
         ),
         "task.deadline_agent_done_delivery_exhausted",
       );
@@ -5559,6 +5598,20 @@ class TaskRunner {
       return;
     }
     if (isRetryable(err)) {
+      // A create the platform keeps failing (a 5xx, a 429) is retried by
+      // redelivery. When no retry is left -- the next would come after the
+      // run's deadline, or be the delivery the poison guard resolves -- the run
+      // is failed here, as `sandbox_create_failed` with the platform's words;
+      // left to either of those, it ends with a reason that says nothing about
+      // the sandbox.
+      const lastRetry = this.sandboxCreateRetriesSpent(err);
+      if (lastRetry) {
+        await this.settleTerminal(
+          () => this.handleFatalError(new Error(lastRetry)),
+          "task.sandbox_create_retries_spent_agent_done_delivery_exhausted",
+        );
+        return;
+      }
       await this.handleRetryableError(err);
       return;
     }
@@ -5566,6 +5619,35 @@ class TaskRunner {
       () => this.handleFatalError(err),
       "task.failed_agent_done_delivery_exhausted",
     );
+  }
+
+  /** The failed create's message (`sandbox_create_failed`) behind `err`, or null when `err` is not one. */
+  private sandboxCreateFailureOf(err: unknown): string | null {
+    const failure = sandboxOpenFailureOf(err, classifySandboxFailure);
+    return failure?.reason === "sandbox_create_failed" ? failure.message : null;
+  }
+
+  /**
+   * The message to fail the run with when `err` is a failed sandbox create and
+   * this attempt was its last chance: the redelivery it would nak into lands
+   * after the run's deadline, or is the one the poison guard resolves
+   * (`TASK_POISON_DELIVERY_COUNT`). The guard counts both kinds of attempt: a
+   * JetStream delivery by `deliveryCount`, and a claimed run by its
+   * `claim_count`, which the API's claim fails as `max_retries_exceeded` once it
+   * reaches the same threshold. Null while a retry is still worth making.
+   */
+  private sandboxCreateRetriesSpent(err: unknown): string | null {
+    const message = this.sandboxCreateFailureOf(err);
+    if (!message) return null;
+    const attempt = this.claimed ? this.attempt.claimCount : this.msg.info.deliveryCount;
+    const deadlineMs = this.request.deadline_at ? Date.parse(this.request.deadline_at) : NaN;
+    if (Number.isFinite(deadlineMs) && Date.now() + retryableNakMs(attempt) >= deadlineMs) {
+      return `${message} (no retry left before the run's deadline of ${this.request.deadline_at})`;
+    }
+    if (attempt >= TASK_POISON_DELIVERY_COUNT - 1) {
+      return `${message} (failed on ${attempt} attempts)`;
+    }
+    return null;
   }
 
   private async finishRun(

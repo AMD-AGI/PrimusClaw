@@ -18,6 +18,7 @@
  *      and the conversation keeps the answer and goes idle as for any turn
  *   F2 the same turn without the fields is a run that exited, as before
  *   F3 a task's callback with a failure message: the run says it beside the code
+ *   F4 a turn that failed because its sandbox could not be provided says the platform's account beside the code
  */
 
 import assert from "node:assert/strict";
@@ -191,4 +192,19 @@ test("F3 a task's callback with a failure message: the run says it beside the co
   assert.equal(run.terminal.class, "killed", "a provisioning timeout is the platform's, as before");
   assert.equal(run.terminal.failure_reason, "sandbox_pending_timeout");
   assert.equal(run.terminal.failure_message, "workload wl-2 still waiting for capacity after 10800.0s (phase=notready)");
+});
+
+test("F4 a turn that failed for its sandbox says the platform's account beside the code", { skip }, async () => {
+  const refused = "The platform refused to create the sandbox (HTTP 400): admission webhook \"vworkload.kb.io\" denied the "
+    + "request: Bad request. timeout 64800 exceeds the qos limit of 10800 seconds for scope Sandbox";
+  const { sessionId, runId } = await runTurn({
+    failed: true, failure_reason: "sandbox_rejected", failure_message: refused,
+    final_text: `Sandbox failure (sandbox_rejected): ${refused}`,
+  });
+  const run = await runView(sessionId);
+  assert.equal(run.terminal.class, "failed");
+  assert.equal(run.terminal.failure_reason, "sandbox_rejected");
+  assert.equal(run.terminal.failure_message, refused);
+  const { rows: [row] } = await client.query("SELECT error_message FROM claw_tasks WHERE task_id = $1", [runId]);
+  assert.equal(row.error_message, refused);
 });

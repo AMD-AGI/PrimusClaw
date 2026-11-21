@@ -120,6 +120,16 @@ export interface RunFinished {
   taskIds: string[];
   outcome: "completed" | "failed";
   failureReason?: string;
+  /** What the run failed with, for a person (the platform's account of a sandbox it did not provide). */
+  failureMessage?: string;
+}
+
+/** A failed run's summary: its code, and what it failed with when that is known. */
+export function failureSummary(reason: string | undefined, message: string | undefined): string {
+  const code = String(reason ?? "").trim();
+  const text = String(message ?? "").trim();
+  if (!text || text === code) return clipSummary(code);
+  return clipSummary(code ? `${code}: ${text}` : text);
 }
 
 /**
@@ -172,7 +182,7 @@ export async function recordRunFinished(input: RunFinished): Promise<number> {
       message_id: row.message_id || null,
       trigger_id: row.trigger_id ?? null,
       title: `${type === "run.failed" ? "Run failed" : "Run completed"}${name ? `: ${name}` : ""}`.slice(0, 200),
-      summary: type === "run.failed" ? clipSummary(input.failureReason ?? "") : "",
+      summary: type === "run.failed" ? failureSummary(input.failureReason, input.failureMessage) : "",
       link: `${NOTIFY_LINK_BASE}/sessions/${input.sessionId}`,
     };
     written += await enqueue(eventId, subs, payload);
