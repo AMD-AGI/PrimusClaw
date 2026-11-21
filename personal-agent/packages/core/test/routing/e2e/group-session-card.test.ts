@@ -174,3 +174,26 @@ test("test_a_groups_session_card_never_shows_the_lists", () =>
       JSON.stringify(later),
     );
   }, CARD));
+
+test("test_a_groups_session_card_speaks_the_groups_language_never_the_binders_own", () =>
+  routed(async (w) => {
+    w.rw.setLang("aad-a", "zh"); // (the binder writes Chinese in her 1:1 chat)
+    await boundGroup(w);
+    await w.say("run the tests", { group: true });
+    await w.rw.until(() => cardWords(windowCards(w.rw).at(-1)?.card).includes("GROUP-ANSWER-7"));
+    let words = cardWords(windowCards(w.rw).at(-1)?.card);
+    assert.ok(words.includes("In this group, what you say to @PrimusClaw Assistant goes to this session"), words);
+    assert.ok(!words.includes("在这个群里"), words);
+    // (the group sets Chinese: the card follows the group)
+    w.rw.test.store.groupLanguage.setGroupLanguage("g-1", "zh");
+    await w.say("run them again", { group: true });
+    await w.rw.until(() => cardWords(windowCards(w.rw).at(-1)?.card).includes("在这个群里"));
+    words = cardWords(windowCards(w.rw).at(-1)?.card);
+    assert.ok(words.includes("在这个群里你 @PrimusClaw Assistant 说的话都发给这个会话"), words);
+    // (and her 1:1 English does not pull a Chinese group back)
+    w.rw.setLang("aad-a", "en");
+    await w.say("and once more", { group: true });
+    await w.rw.until(() => prompts(w).length === 3);
+    await w.rw.idle();
+    assert.ok(cardWords(windowCards(w.rw).at(-1)?.card).includes("在这个群里"));
+  }, CARD));

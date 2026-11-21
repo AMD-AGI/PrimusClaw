@@ -216,7 +216,7 @@ test("rule 3: after /lang auto in a group that talked English, the first Chinese
   );
 });
 
-test("rule 3: a message with no words of its own follows the asker's last one in this group, else is answered in English", async () => {
+test("rule 3: a message with no words of its own is answered in English, whatever its sender last wrote in this group", async () => {
   for (const setting of [undefined, "auto"] as const) {
     const w = asked();
     link(w, ALICE.id, "ak-alice");
@@ -228,40 +228,40 @@ test("rule 3: a message with no words of its own follows the asker's last one in
     await w.router.settled();
     await w.router.handle(gmsg("please check the build again", { user: BOB }));
     await w.router.settled();
-    await w.router.handle(gmsg("ok #3")); // (Alice's last here was Chinese; Bob's English is not hers)
+    await w.router.handle(gmsg("ok #3")); // (Alice's last here was Chinese: this one names no language, so English)
     await w.router.settled();
     await w.router.handle(gmsg("ok", { user: BOB }));
     await w.router.settled();
-    await w.router.handle(gmsg("ok", { conversation: "g-2" })); // (another group: nothing of hers there)
+    await w.router.handle(gmsg("ok", { conversation: "g-2" })); // (another group)
     await w.router.settled();
     assert.deepEqual(
       w.turns.runs.map((r) => r.replyLang),
-      ["en", "zh", "en", "zh", "en", "en"],
+      ["en", "zh", "en", "en", "en", "en"],
       String(setting),
     );
     // (the turn's own texts say the same language as the line it carries)
     assert.deepEqual(
       w.turns.runs.map((r) => r.lang),
-      ["en", "zh", "en", "zh", "en", "en"],
+      ["en", "zh", "en", "en", "en", "en"],
       String(setting),
     );
   }
 });
 
-test("rule 3: what the asker wrote under a group's own language is what a wordless message follows after /lang auto", async () => {
+test("rule 3: after /lang auto a wordless message is English, whatever the asker wrote under the group's own language", async () => {
   const w = asked();
   link(w, ALICE.id, "ak-alice");
-  await w.router.handle(gmsg("帮我看看这个 PR"));
-  await w.router.settled();
   w.store.groupLanguage.setGroupLanguage(CONV, "en");
-  await w.router.handle(gmsg("please check the build again"));
+  await w.router.handle(gmsg("帮我看看这个 PR"));
   await w.router.settled();
   w.store.groupLanguage.setGroupLanguage(CONV, "auto");
   await w.router.handle(gmsg("ok"));
   await w.router.settled();
+  await w.router.handle(gmsg("帮我看看这个 PR"));
+  await w.router.settled();
   assert.deepEqual(
     w.turns.runs.map((r) => r.replyLang),
-    ["zh", "en", "en"],
+    ["en", "en", "zh"],
   );
 });
 

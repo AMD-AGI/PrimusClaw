@@ -27,8 +27,8 @@ function isHelp(m: SeenMessage): boolean {
 }
 
 let run: KitRun | undefined;
-const hou = person("grouplang");
-const dm = dmOf(hou);
+const member = person("grouplang");
+const dm = dmOf(member);
 
 function r(): KitRun {
   if (run === undefined) throw new Error("the worker did not start");
@@ -65,10 +65,10 @@ async function helpAfter(group: KitChat, who: { id: string; name: string }, text
 describe("group language on Teams", () => {
   before(async () => {
     run = await KitRun.start(teamsUnderTest());
-    await run.link(hou, dm);
+    await run.link(member, dm);
     // he writes Chinese in his 1:1 chat: that is the language he is answered in there
     const asked = run.driver.seen(dm).length;
-    await run.driver.say(dm, hou, "帮我看看这个测试为什么失败", { locale: "zh-CN" });
+    await run.driver.say(dm, member, "帮我看看这个测试为什么失败", { locale: "zh-CN" });
     await run.shown(dm, (m) => m.final && m.text.startsWith("Echo: "), "his 1:1 answer", asked);
   });
   after(async () => {
@@ -77,7 +77,7 @@ describe("group language on Teams", () => {
 
   it("his 1:1 chat answers help in his language", async () => {
     const before = r().driver.seen(dm).length;
-    await r().driver.say(dm, hou, "help", { locale: "zh-CN" });
+    await r().driver.say(dm, member, "help", { locale: "zh-CN" });
     const own = await r().shown(dm, (m) => m.final && m.text.length > 200, "1:1 help", before);
     assert.ok(HAN.test(own.text), own.text);
   });
@@ -85,11 +85,11 @@ describe("group language on Teams", () => {
   it("a person whose 1:1 chat is Chinese gets help in English in a new group, Chinese for a Chinese question", async () => {
     // he adds the bot to a new group: nothing is said for the add itself
     const group: KitChat = { id: "19:grouplang-new@thread.v2", kind: "group" };
-    await botAdded(group, hou);
+    await botAdded(group, member);
     assert.deepEqual(r().driver.seen(group), [], "adding the bot says nothing");
 
     // "help", the first @mention: the language card (both languages) and help in English
-    const help = await helpAfter(group, hou, "help");
+    const help = await helpAfter(group, member, "help");
     assert.ok(help.text.includes(HELP_EN), help.text);
     assert.ok(!HAN.test(help.text), `help in English: ${help.text}`);
     const card = r()
@@ -103,17 +103,27 @@ describe("group language on Teams", () => {
 
     // the bare mention (the group's introduction) and /help: English too
     for (const text of ["", "/help"]) {
-      const said = await helpAfter(group, hou, text);
+      const said = await helpAfter(group, member, text);
       assert.ok(said.text.includes(HELP_EN) && !HAN.test(said.text), `${JSON.stringify(text)}: ${said.text}`);
     }
 
     // a question with words of its own is answered in them
-    const zh = await helpAfter(group, hou, "你能做什么");
+    const zh = await helpAfter(group, member, "你能做什么");
     assert.ok(zh.text.includes(HELP_ZH), zh.text);
 
-    // a message with no words of its own starts a turn told to answer in English
+    // a Chinese question starts a turn told to answer in Chinese; his next message, with no words of its own, one told to
+    // answer in English (what he wrote before in the group does not carry over)
+    const asked = r().driver.seen(group).length;
+    await r().driver.say(group, member, "帮我看看这个 PR", { mentionsBot: true, locale: "zh-CN" });
+    const first = await r().shown(
+      group,
+      (m) => m.final && m.text.startsWith("Echo: "),
+      "the Chinese turn's answer",
+      asked,
+    );
+    assert.ok(first.text.includes("[Reply language: Chinese]"), first.text);
     const turned = r().driver.seen(group).length;
-    await r().driver.say(group, hou, "ok #3", { mentionsBot: true, locale: "zh-CN" });
+    await r().driver.say(group, member, "ok #3", { mentionsBot: true, locale: "zh-CN" });
     const answer = await r().shown(group, (m) => m.final && m.text.startsWith("Echo: "), "the turn's answer", turned);
     assert.ok(answer.text.includes("[Reply language: English]"), answer.text);
   });
@@ -121,14 +131,14 @@ describe("group language on Teams", () => {
   it("a group set to Chinese answers help in Chinese, and his 1:1 chat keeps his language", async () => {
     const chinese: KitChat = { id: "19:grouplang-zh@thread.v2", kind: "group" };
     const set = r().driver.seen(chinese).length;
-    await r().driver.say(chinese, hou, "/lang zh", { mentionsBot: true, locale: "zh-CN" });
+    await r().driver.say(chinese, member, "/lang zh", { mentionsBot: true, locale: "zh-CN" });
     await r().shown(chinese, (m) => m.text.includes("已改为中文回复"), "the group set to Chinese", set);
-    const inChinese = await helpAfter(chinese, hou, "help");
+    const inChinese = await helpAfter(chinese, member, "help");
     assert.ok(inChinese.text.includes(HELP_ZH), inChinese.text);
 
     // and his 1:1 chat still answers "help" in his language
     const again = r().driver.seen(dm).length;
-    await r().driver.say(dm, hou, "help", { locale: "zh-CN" });
+    await r().driver.say(dm, member, "help", { locale: "zh-CN" });
     const still = await r().shown(dm, (m) => m.final && m.text.length > 200, "1:1 help again", again);
     assert.ok(HAN.test(still.text), still.text);
   });

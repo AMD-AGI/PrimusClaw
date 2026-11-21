@@ -69,6 +69,7 @@ export function remoteAgents(base: AssemblyBase, inputs: RemoteInputs): RemoteAg
     sessionNames: store.remoteSessionNames,
     permissions: store.remotePermissions,
     prefs: store.prefs,
+    groupLanguage: store.groupLanguage,
     references: store.references,
     conversationFor: conversationFor(base),
     credentialFor: async (person) => {

@@ -35,8 +35,8 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   sender's own language, the one their 1:1 messages were written in or their Teams client's, so "help" from a member who
   writes Chinese to the bot got Chinese help in a group of English speakers. Words of their own still pick the language
   ("你能做什么" gets Chinese help), and a group set with `/lang zh|en` keeps its language; such a turn is asked for an English
-  answer too (`[Reply language: English]`), unless the sender's last question in the group was in another, and its own texts
-  say the same language as the line. An answered question card in a group follows the group, the reply's words or the
+  answer too (`[Reply language: English]`), even when the sender's last question in the group was in another (a group no
+  longer remembers each member's last language), and its own texts say the same language as the line. An answered question card in a group follows the group, the reply's words or the
   question, never the sender's own language. A 1:1 chat is unchanged.
 
 - The Teams ingress gets messages through again after the Service Bus connection under its kept client dies. Until now a
