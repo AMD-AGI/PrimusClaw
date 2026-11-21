@@ -137,6 +137,11 @@ export const OVERRIDE_LIMITS = {
    * event loop for is this, and a value whose test did not finish is refused.
    */
   patternBudgetMs: 50,
+  /**
+   * Budget for checking that one declared `pattern` compiles. Compiling runs
+   * nothing against a value, so this only has to outlast a busy moment.
+   */
+  patternCompileBudgetMs: 1000,
 } as const;
 
 /** The variable names an app manifest accepts; the manifest validator has the last word on reserved names. */
@@ -424,21 +429,25 @@ function inPatternContext(script: string, data: string, budgetMs: number): unkno
 }
 
 /**
- * Whether `pattern` compiles as a `u`-flag regular expression. Compiling only
- * parses the pattern, in time linear in its (bounded) length, and runs nothing
- * against a value, so it needs no budget; it is checked directly, and the
- * answer never depends on how busy the process is. A budget here would turn a
- * slow moment into "not a valid regular expression", and a stored declaration
- * is re-checked on every launch, so a valid declaration would intermittently
- * read as none at all.
+ * Whether `pattern` compiles as a `u`-flag regular expression. It is compiled
+ * where it is tested, in the pattern context, but under its own budget rather
+ * than the match budget: compiling only parses the (bounded) pattern and runs
+ * nothing against a value, so it finishes in microseconds, and a stored
+ * declaration is re-checked on every launch. Under the 50 ms match budget a
+ * slow moment read as "not a valid regular expression", so a valid declaration
+ * intermittently read as none at all; a check that still does not finish is
+ * tried once more before it counts as one that failed.
  */
 export function patternCompiles(pattern: string): boolean {
-  try {
-    new RegExp(pattern, "u");
-    return true;
-  } catch {
-    return false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const out = inPatternContext(
+      "JSON.stringify((() => { try { new RegExp(JSON.parse(__jobs), 'u'); return true; } catch { return false; } })())",
+      JSON.stringify(pattern),
+      OVERRIDE_LIMITS.patternCompileBudgetMs,
+    );
+    if (typeof out === "boolean") return out;
   }
+  return false;
 }
 
 /**
