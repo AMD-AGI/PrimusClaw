@@ -404,6 +404,35 @@ const identityClientEnabled = new Gauge({
   registers: [registry],
 });
 
+// A2A push notifications (`routes/a2a-push.ts`). Each webhook gets its notifications in order, the oldest undelivered
+// one first and alone, so one that keeps failing holds the rest back until it is set aside (quarantined) after a bounded
+// number of attempts. The two gauges are read from the outbox on the worker's reconcile pass and are the same on every
+// replica: the most attempts any webhook's current head has used, and how long the oldest undelivered notification has
+// waited. A rising age with flat deliveries is a stalled webhook.
+const a2aPushDeliveryTotal = new Counter({
+  name: "claw_a2a_push_delivery_total",
+  help: "A2A push notification delivery attempts, by outcome.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+const a2aPushQuarantinedTotal = new Counter({
+  name: "claw_a2a_push_quarantined_total",
+  help: "A2A push notifications set aside after failing every allowed attempt, so the ones behind them could be sent.",
+  registers: [registry],
+});
+const a2aPushHeadConsecutiveFailures = new Gauge({
+  name: "claw_a2a_push_head_consecutive_failures",
+  help: "The most delivery attempts any webhook's oldest undelivered notification has used.",
+  registers: [registry],
+});
+const a2aPushOldestPendingAgeSeconds = new Gauge({
+  name: "claw_a2a_push_oldest_pending_age_seconds",
+  help: "Age of the oldest A2A push notification that is neither delivered nor set aside; 0 when none waits.",
+  registers: [registry],
+});
+
+export type A2aPushDeliveryOutcome = "delivered" | "retried" | "dropped" | "quarantined";
+
 // The per-session message queue (`claw_pending_messages`). The two gauges are
 // read from the table on every sweeper tick, by every replica, so they describe
 // the queue rather than this process: alert on max() across replicas.
@@ -745,6 +774,14 @@ export const metrics = {
   },
   onAssistantRouterUnsaid(outcome: RouterUnsaidOutcome): void {
     assistantRouterUnsaidTotal.inc({ outcome });
+  },
+  onA2aPushDelivery(outcome: A2aPushDeliveryOutcome): void {
+    a2aPushDeliveryTotal.inc({ outcome });
+    if (outcome === "quarantined") a2aPushQuarantinedTotal.inc();
+  },
+  setA2aPushBacklog(headConsecutiveFailures: number, oldestPendingAgeSeconds: number): void {
+    a2aPushHeadConsecutiveFailures.set(headConsecutiveFailures);
+    a2aPushOldestPendingAgeSeconds.set(oldestPendingAgeSeconds);
   },
   onUserSkillListed(role: "router", chars: number, truncated: boolean): void {
     userSkillListedChars.observe({ role }, chars);

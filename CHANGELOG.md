@@ -184,6 +184,25 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: an A2A push notification that its webhook keeps refusing no longer holds back every later notification for that
+  webhook for up to an hour. After eight failed attempts (about twenty minutes) it is set aside: its outbox row is
+  closed, a copy is kept in the new `claw_a2a_push_dead_letters` table for 14 days, the log line
+  `a2a_push.quarantined` names it without its content, and the next notification is sent, still in order. A
+  notification is no longer dropped just because it is an hour old, so a receiver that comes back after a longer outage
+  gets what it was owed. A notification whose text holds a NUL character or a lone UTF-16 surrogate, which PostgreSQL's
+  `jsonb` refuses, is stored with U+FFFD in their place instead of failing the write and losing the notification. New
+  metrics: `claw_a2a_push_delivery_total{outcome}`, `claw_a2a_push_quarantined_total`,
+  `claw_a2a_push_head_consecutive_failures` and `claw_a2a_push_oldest_pending_age_seconds`. A notification is set
+  aside even when its dead-letter copy cannot be written (it is then closed as `quarantined_unrecorded:<status>`,
+  and its config is kept so the row, the only copy left, is not deleted with it). Each
+  delivery attempt, config read and name lookup included, now ends within 45 seconds, inside the 120-second claim lease,
+  so a lookup that hangs can no longer let another replica send the next notification before a late copy of this one.
+  Only an attempt that reached the receiver (a request started, or its name looked up and not found) counts toward
+  the eight, so a slow or failing database cannot set aside a notification whose receiver is healthy; one that goes an
+  hour and at least three passes without any attempt reaching its receiver (a name lookup that hangs every time) is
+  set aside as `unsent:<status>` (a gap of more than 50 seconds between such passes, as when no worker ran, starts the
+  hour again), and one written before the upgrade is sent at least once more before it can be set aside. See "Push
+  notifications" in `claw/docs/a2a.md`.
 - Claw: a run whose sandbox the platform did not create or schedule now ends failed, with a stable `failure_reason` and
   the platform's own words as its message, on `GET /v1/runs`, the run row, the session's events (a `sandboxStatus`
   event with `status: failed`), the A2A task status (the message carries `metadata.failure_reason`) and the `run.failed`
