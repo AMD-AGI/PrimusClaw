@@ -254,6 +254,8 @@ export async function patchAppRun(
   expectState?: AppRunState,
 ): Promise<PatchOutcome> {
   const sets: string[] = [];
+  /** The sandbox columns, kept apart: see the retry below. */
+  const sandboxSets: string[] = [];
   const params: unknown[] = [taskId, fence.brainId, expectState ?? null, fence.claimCount, patch.restarts ?? null];
   const add = (column: string, value: unknown, cast = "") => {
     params.push(value);
@@ -266,8 +268,8 @@ export async function patchAppRun(
     // new sandbox, whose wait starts now.
     const next = sandboxStateSql(`$${params.length}::text`, patch.last_exit?.sandbox_gone === true ? "TRUE" : "FALSE");
     const fresh = patch.state === "provisioning" && patch.sandbox_workload_id === null ? "TRUE" : "FALSE";
-    sets.push(`sandbox_state = ${next}`);
-    sets.push(`sandbox_since = CASE WHEN ${fresh} OR ${next} IS DISTINCT FROM r.sandbox_state THEN NOW() ELSE r.sandbox_since END`);
+    sandboxSets.push(`sandbox_state = ${next}`);
+    sandboxSets.push(`sandbox_since = CASE WHEN ${fresh} OR ${next} IS DISTINCT FROM r.sandbox_state THEN NOW() ELSE r.sandbox_since END`);
   }
   if (patch.restarts !== undefined) add("restarts", patch.restarts);
   if (patch.events_cursor !== undefined) add("events_cursor", JSON.stringify(patch.events_cursor), "::jsonb");
@@ -294,7 +296,7 @@ export async function patchAppRun(
   // waits is seen, because Postgres re-evaluates the locked row's condition once the
   // lock is granted. Checking the lease through a plain join would test a snapshot
   // from before the wait, and a stale holder could still write.
-  const updated = await db.query(
+  const update = (assignments: string[]) => db.query(
     `WITH t AS (
        SELECT task_id, input, sandbox_spec, workspace_id, status, metadata
          FROM claw_tasks
@@ -304,7 +306,7 @@ export async function patchAppRun(
           AND claim_count = $4::int
           FOR UPDATE
      )
-     UPDATE claw_app_runs r SET ${sets.join(", ")}
+     UPDATE claw_app_runs r SET ${assignments.join(", ")}
        FROM t
       WHERE r.task_id = t.task_id
         AND r.state <> 'ended'
@@ -323,6 +325,14 @@ export async function patchAppRun(
                 ${TASK_STATUS_SQL} AS task_status, ${SESSION_DELETED_SQL} AS session_deleted`,
     params,
   );
+  // With APP_RUNS_ENABLED off the schema guard only warns about missing app-run
+  // columns, and a run already going must still move: on a database without the
+  // sandbox columns the same write is made without them (it is one statement, so
+  // the failed one wrote nothing), and the reads derive the state from the run's.
+  const updated = await update([...sandboxSets, ...sets]).catch((err: unknown) => {
+    if ((err as { code?: unknown })?.code !== "42703" || sandboxSets.length === 0) throw err;
+    return update(sets);
+  });
   if (updated.rowCount === 1) {
     // The session's MCP of an ended run is gone with it, whoever ended it.
     // Best effort: the state change has committed, so a failed delete must not turn

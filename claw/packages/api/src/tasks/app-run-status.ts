@@ -103,6 +103,9 @@ export function sandboxStateSql(next: string, gone = "FALSE"): string {
 const LEGACY_SANDBOX_STATE_SQL = "(CASE r.state WHEN 'provisioning' THEN 'pending' WHEN 'ended' THEN 'ended' ELSE 'running' END)";
 
 function sandboxStateOf(stored: string | null, runState: string): AppSandboxState {
+  // An ended run's sandbox is ended whatever is stored: a row moved while the database
+  // lacked the sandbox columns (see patchAppRun) keeps the value it was created with.
+  if (runState === "ended") return "ended";
   if (stored === "pending" || stored === "running" || stored === "ended") return stored;
   return runState === "provisioning" ? "pending" : runState === "ended" ? "ended" : "running";
 }

@@ -35,7 +35,8 @@
  *   R  a run whose first create was refused and whose second sandbox ran: the
  *      refusal is cleared from the row once the sandbox is Running
  *   D  a database without the sandbox columns, or the table, which the schema
- *      guard only warns about with app runs off: the reads still answer
+ *      guard only warns about with app runs off: a run still moves and both
+ *      routes still answer
  *   O  a non-app run on the same routes: `app: null`, nothing else changed
  */
 import assert from "node:assert/strict";
@@ -335,7 +336,9 @@ describe("an app run's sandbox state and outcome on the task and run routes", { 
 
   /** A run driven to its end, the application told to go as soon as it started. */
   async function runToEnd(m: Record<string, unknown>, env: Record<string, string> | null = null) {
-    const taskId = await createRun(m);
+    return driveToEnd(await createRun(m), env);
+  }
+  async function driveToEnd(taskId: string, env: Record<string, string> | null = null) {
     const udp = fresh();
     const { runner } = runnerFor(taskId, env ?? { USER_DATA_PATH: udp });
     writeFileSync(join(udp, "placeholder"), "");
@@ -657,23 +660,33 @@ describe("an app run's sandbox state and outcome on the task and run routes", { 
     assert.deepEqual(r.app.outcome, { cause: "restarts_exhausted", returncode: 2, final: false, error: null });
   });
 
-  test("D: a database the guard only warns about (APP_RUNS_ENABLED off): no sandbox columns, or no table, is not a failed read", async () => {
-    const r = await runToEnd(manifest());
-    const done = r.app;
+  test("D: a database the guard only warns about (APP_RUNS_ENABLED off): without the sandbox columns a run still moves and reads; without the table, no status", async () => {
+    const taskId = await createRun(manifest());
+    let done: Json = {};
     try {
       await q("ALTER TABLE claw_app_runs RENAME COLUMN sandbox_state TO sandbox_state_gone");
       await q("ALTER TABLE claw_app_runs RENAME COLUMN sandbox_since TO sandbox_since_gone");
-      const { app: a } = await readBoth(r.taskId);
-      assert.deepEqual(a, { sandbox: { ...done.sandbox, since: null }, outcome: done.outcome }, "read from the run's state");
+      // Every move of the run (provisioning -> starting -> running -> finishing -> ended) is a write.
+      const r = await driveToEnd(taskId);
+      assert.equal(r.result.kind, "ended");
+      done = r.app;
+      assert.deepEqual(done, {
+        sandbox: { state: "ended", workload_id: done.sandbox.workload_id, since: null },
+        outcome: { cause: "exited", returncode: 0, final: true, error: null },
+      }, "read from the run's state");
+      assert.match(done.sandbox.workload_id, /^claw-\d+-sandbox-/);
       await q("ALTER TABLE claw_app_runs RENAME TO claw_app_runs_gone");
-      assert.equal((await readRun(r.taskId)).app, null);
-      assert.equal((await readTask(r.taskId)).app, null);
+      assert.equal((await readRun(taskId)).app, null);
+      assert.equal((await readTask(taskId)).app, null);
     } finally {
       await q("ALTER TABLE IF EXISTS claw_app_runs_gone RENAME TO claw_app_runs");
       await q("ALTER TABLE claw_app_runs RENAME COLUMN sandbox_state_gone TO sandbox_state").catch(() => undefined);
       await q("ALTER TABLE claw_app_runs RENAME COLUMN sandbox_since_gone TO sandbox_since").catch(() => undefined);
     }
-    assert.deepEqual((await readBoth(r.taskId)).app, done);
+    // The columns back: the row moved without them still reads as the ended run it is.
+    const back = (await readBoth(taskId)).app;
+    assert.deepEqual({ state: back.sandbox.state, workload_id: back.sandbox.workload_id, outcome: back.outcome },
+      { state: "ended", workload_id: done.sandbox.workload_id, outcome: done.outcome });
   });
 
   test("O: a run that is not an app run has app null and its own placement", async () => {
