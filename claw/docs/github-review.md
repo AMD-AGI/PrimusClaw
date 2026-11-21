@@ -164,35 +164,45 @@ credentials with the request: `x-acting-as-token` (X's delegated identity-provid
 - A review again (below) continues only the last closed review of the same pull request with the same owner and the same
   requester: a new request from R continues R's last request of X, never X's own review or another requester's.
 
-### After the review: the pull request is followed, and the requester merges
+### After the review: the pull request is followed, and the requester is asked only when the reviewer cannot merge
 
 Once a review item's turn has ended having posted or held something, the review items' sweep looks at its pull request on GitHub,
 at most once every 90 seconds per item and by one replica at a time (`followReviewItems`, `GithubReview.followPullRequest`; an
 audit row with tool `gh_pr_follow` each time):
 
 - **Merged or closed on GitHub, by anyone.** The item ends (`merged on GitHub` as done, `closed on GitHub without a merge` as stopped),
-  and every write its session still holds for the acting user's answer is closed as `stale` (`result.reason` `pr_merged` /
+  and every write its session still holds for an answer is closed as `stale` (`result.reason` `pr_merged` /
   `pr_closed`): nobody is asked to confirm a merge of a pull request that is no longer open, and it no longer counts against
   `too_many_pending_confirmations`. The requester's view says `merged` for a pull request merged on GitHub.
-- **The requester's merge.** For a review asked of someone else (R asked X) that may merge (not `review_only`: R's message asked for
-  a merge), the merge is R's once X's approval is on GitHub. R wrote the pull request and asked for it to be merged; X's review mode and
-  X's held merge govern what is done with X's account, not what R does with R's own. So the sweep merges it **with R's own GitHub
-  account** (R's own credential: nobody's switch is asked), instead of waiting for X to confirm a held merge, when every one of these
-  holds, read at that moment: the pull request is open and not a draft; R's account is its author and may push; this review session
-  posted an approval of the current head with X's account (the review id on its own audit row), and GitHub still has that review as
-  `APPROVED` on that commit (a push or a dismissal takes it back); CI is green on the head, no review thread is open, and GitHub's merge
-  state is `CLEAN` (a merge queue: it is queued as R, never merged directly; a pull request someone already queued is not written to, and X's held merge of that head is closed as `stale`, `pr_queued`); and nobody is answering X's held merge right now (X's
-  answer, or X's write lock on the pull request, goes first). The merge is pinned to the head (`sha`), counts against the hourly write
-  limits, and is made only with `CLAW_GITHUB_WRITES_ENABLED`. X's held merge for that head is then closed as `merged` (or `queued`),
-  decided by R (`decided_via: {"kind": "requester"}`, `result.by: "requester"`), so X's card or `批准 #<ref>` for it answers that it no
-  longer waits, and the item ends as merged by the requester's account. A merge GitHub refuses gives X's held merge back to X, still
-  pending. When a gate is not open yet (CI still running, a thread open, `BEHIND`) nothing is written and the sweep looks again later.
-  R without a bound GitHub account (or a lapsed one) is not merged for: the pull request is read with X's account, as the review read it,
-  for the merged-or-closed check only.
+- **The merge is the reviewer's.** For a review asked of someone else (R asked X) that may merge (not `review_only`: R's message asked
+  for a merge), the merge is made with **X's account** once X approves: at once under X's `fully_auto`, and under `high_risk_confirm`
+  a merge judged high is held for X, who gets the merge's card and answers it. R's account is never used because X's merge is held
+  (2026-11-20). Until X's account is found unable to merge, the pull request is read with X's account, as the review read it.
+- **The requester is asked when the reviewer cannot merge.** X's account cannot merge when X's last merge of the current head
+  (`gh_pr_merge`, the review's own or a held merge X confirmed) was refused `no_merge_permission` (no write permission on the
+  repository) or `merge_not_permitted` (GitHub refused the merge for a permission reason: a 403, or GitHub's words for one, such as a
+  protected branch that restricts who may push). Then, and only while every one of these holds, read at that moment, R is asked: the
+  pull request is open and not a draft; R's account is its author and may push; this review session posted an approval of the current
+  head with X's account (the review id on its own audit row), and GitHub still has that review as `APPROVED` on that commit (a push or
+  a dismissal takes it back); CI is green on the head, no review thread is open, and GitHub's merge state is `CLEAN`. The question is
+  a `claw_github_confirmations` row of kind `requester_merge` whose acting user is R, opened once per head, and the sweep sends it to
+  R's own assistant conversation as an `assistant.say` carrying `confirm_write` (kind `github_merge`, buttons 合入 / 不合): "X 已批准，
+  但 X 没有合入权限；要用你自己的账号合入吗？". Nothing is merged with R's account without R's yes. R answers with the button
+  (`POST /v1/assistant/confirmations/:id/decision`), `批准 #<ref>` / `拒绝 #<ref>`, or `POST /v1/github-review/confirmations/:id/decision`
+  as R; nobody else can. On R's yes every gate above is read again, and the head must still be the one R was asked about; then the
+  merge is made with **R's own GitHub account** (R's own credential: nobody's switch is asked), pinned to the head (`sha`), within the
+  hourly write limits, only with `CLAW_GITHUB_WRITES_ENABLED`, and audited as `gh_pr_merge_as_requester` (a merge queue: it is queued as R,
+  never merged directly; a pull request someone already queued is not written to). A held merge of X's for that head is then closed
+  as `merged` (or `queued`) by R; X answering their held merge right now goes first. A gate shut at R's yes refuses it, nothing merged.
+  R's no (`denied`) leaves it unmerged and ends the item; R is not asked again for that head. The item stays in progress while R's
+  answer is awaited, and X is not asked about R's question. R without a bound GitHub account (or a lapsed one) is not asked: the pull
+  request is read with X's account, for the merged-or-closed check only. An item opened before this rule (2026-11-20) follows it too:
+  a merge held for X waits for X, and R is asked only as above.
 - A review only, and the acting user's own review, are only read, with the acting user's account (their switch still counts).
 
 `POST /v1/assistant/reviews` answers `merge_by_requester: true` on each item of a review asked of someone else that may merge, so the
-channel that started it can tell the requester how the merge will be made.
+channel that started it can tell the requester how the merge will be made: with the reviewer's account once they approve, and, when the
+reviewer cannot merge, their own account only if they say yes when asked.
 
 ### A review again: it continues the last one
 

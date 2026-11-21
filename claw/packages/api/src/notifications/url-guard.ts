@@ -55,7 +55,7 @@ export type GuardResult =
 
 export type Resolver = (host: string) => Promise<Array<{ address: string; family: number }>>;
 
-const defaultResolver: Resolver = (host) => lookup(host, { all: true });
+export const defaultResolver: Resolver = (host) => lookup(host, { all: true });
 
 export async function guardWebhookUrl(
   raw: string,

@@ -123,8 +123,51 @@ when the config is created and again at every delivery, which connects to the
 address that was checked. With `CLAW_A2A_PUSH_ALLOWED_HOSTS_ONLY=true` the list
 is the whole of it: a host it does not name is refused even when it is public, at
 creation and again at every delivery, for a deployment whose receivers are all its
-own. Delivery is at least once and in order per config,
-retried with backoff and abandoned after an hour.
+own. Delivery is at least once and in order per config, retried with backoff
+(1, 5, 30, then every 300 seconds).
+
+A notification that fails eight times in a row (about twenty minutes) is set
+aside so the ones behind it are sent. An attempt counts when its receiver was
+asked: a request was started, or the receiver's name was looked up and not
+found. A pass that never got that far (the database too slow or failing to read
+the config, a name lookup cut off by the deadline) is tried again five seconds
+later without using one, so a database that is slow for a while cannot set aside
+a notification whose receiver is healthy. A notification that has gone an hour
+and at least three passes without any pass reaching its receiver (a name lookup
+that hangs every time) is set aside all the same, as `unsent:<status>`, so it
+cannot hold its webhook for good. A pass that comes more than 50 seconds after
+the previous one that did not reach the receiver starts that hour again, so time
+in which no worker ran (an outage of the API) does not count toward it. A notification written before this release, whose count also included
+passes that never reached the receiver, is sent at least once more before it
+can be set aside. When it is set aside, its outbox row
+is closed, a copy is kept in
+`claw_a2a_push_dead_letters` for 14 days, and the API logs
+`a2a_push.quarantined` with the task, config and status but not the content. A
+receiver that is down for longer therefore loses at most one notification per
+twenty minutes and gets the rest, still in order, once it is back; a final
+notification set aside still retires its config. If the copy cannot be written
+(the dead-letter table refuses it, say on a full disk), the row is closed anyway
+with `last_status = quarantined_unrecorded:<status>` and the payload kept on it,
+and `a2a_push.dead_letter_failed` is logged: a head that could not be set aside
+would hold its webhook for good. Such a row is then the only copy of the
+notification, so its config is not retired by the task's final notification
+(deleting the config would delete the row with it); it stays until an operator
+has dealt with the row.
+
+Each attempt, from its claim to the end of the request, including the config
+read and the name lookup, ends within 45 seconds or is abandoned and retried; a claim's lease is
+120 seconds, so no attempt is still being sent when another replica can claim the
+same notification and go on to the next. A late answer from an attempt whose
+lease ran out is not recorded over the newer claim. Text that PostgreSQL cannot
+store (a NUL character, a lone UTF-16 surrogate) is replaced with U+FFFD when the
+notification is written, rather than failing the write.
+
+| Metric | What it says |
+|---|---|
+| `claw_a2a_push_delivery_total{outcome}` | Attempts by outcome: `delivered`, `retried`, `dropped` (config gone, URL refused), `quarantined` |
+| `claw_a2a_push_quarantined_total` | Notifications set aside after every attempt failed |
+| `claw_a2a_push_head_consecutive_failures` | The most attempts any webhook's oldest undelivered notification has used |
+| `claw_a2a_push_oldest_pending_age_seconds` | Age of the oldest notification still owed; 0 when none is |
 
 ## Not supported
 

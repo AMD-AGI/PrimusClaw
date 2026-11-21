@@ -101,7 +101,7 @@ export interface ReviewStart {
   readonly mergeNeedsConfirmation: boolean | null;
   /** The item limit that was full when Claw queued it ("" it started). */
   readonly queued: string;
-  /** Claw merges it with the asker's own account once approved and green. */
+  /** The reviewer's account merges it; when the reviewer cannot merge, Claw asks the asker whether their own account merges it. */
   readonly mergeByRequester: boolean;
 }
 

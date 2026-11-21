@@ -12,8 +12,23 @@
  * outbox holds one row per (configuration, notification), unique on a key
  * derived from the event that caused it so a redelivered event records nothing
  * twice.
+ *
+ * A notification that keeps failing is set aside after a bounded number of
+ * attempts so the ones behind it are sent: its outbox row is closed and a copy
+ * goes to `claw_a2a_push_dead_letters`. That table has no key into the
+ * configurations, so the record outlives the config (which goes with its
+ * task's last notification, and its outbox rows with it).
  */
 import type pg from "pg";
+
+/**
+ * Attempts a notification gets before it is set aside so the ones behind it can
+ * go. With the backoff (routes/a2a-push.ts) that is about twenty minutes of
+ * trying; a receiver that is down for longer loses at most one notification per
+ * twenty minutes to the dead letters, and gets the rest, in order, when it is
+ * back.
+ */
+export const MAX_DELIVERY_ATTEMPTS = 8;
 
 /**
  * The first shape of these tables keyed a configuration by `config_id` alone.
@@ -68,6 +83,10 @@ export async function ensureA2aPushSchema(client: pg.PoolClient): Promise<void> 
       payload         JSONB NOT NULL,
       final           BOOLEAN NOT NULL DEFAULT FALSE,
       attempts        INT NOT NULL DEFAULT 0,
+      claims          INT NOT NULL DEFAULT 0,
+      unsent_since    TIMESTAMPTZ,
+      unsent_passes   INT NOT NULL DEFAULT 0,
+      unsent_last_at  TIMESTAMPTZ,
       next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       delivered_at    TIMESTAMPTZ,
       dropped_at      TIMESTAMPTZ,
@@ -78,9 +97,55 @@ export async function ensureA2aPushSchema(client: pg.PoolClient): Promise<void> 
       UNIQUE (task_id, config_id, dedupe_key)
     )
   `);
+  // A claim is counted apart from an attempt (a claim that never reached the
+  // receiver uses no attempt). A row written before counted every claim as an
+  // attempt, whether or not anything was sent, so its count says how often it
+  // was claimed, not how often its receiver was asked: it becomes the row's
+  // claims (the claim fence), and an open row keeps at most one attempt short
+  // of the limit, so it is sent at least once more before it can be set aside
+  // (a row at the limit would otherwise be taken for a send the process died
+  // in, and set aside on its first claim without one).
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'claw_a2a_push_outbox' AND column_name = 'claims') THEN
+        ALTER TABLE claw_a2a_push_outbox ADD COLUMN claims INT NOT NULL DEFAULT 0;
+        UPDATE claw_a2a_push_outbox
+           SET claims = attempts,
+               attempts = CASE WHEN delivered_at IS NULL AND dropped_at IS NULL
+                               THEN LEAST(attempts, ${MAX_DELIVERY_ATTEMPTS - 1}) ELSE attempts END;
+      END IF;
+    END $$`);
+  // Since when every claim of the row has ended before its receiver was asked.
+  // How many such passes there have been, and when the last one ended.
+  await client.query(`
+    ALTER TABLE claw_a2a_push_outbox
+      ADD COLUMN IF NOT EXISTS unsent_since TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS unsent_passes INT NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS unsent_last_at TIMESTAMPTZ`);
   await client.query(
     `CREATE INDEX IF NOT EXISTS idx_a2a_push_outbox_due
        ON claw_a2a_push_outbox(next_attempt_at)
        WHERE delivered_at IS NULL AND dropped_at IS NULL`,
+  );
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_a2a_push_dead_letters (
+      outbox_id      BIGINT PRIMARY KEY,
+      task_id        TEXT NOT NULL,
+      config_id      TEXT NOT NULL,
+      dedupe_key     TEXT NOT NULL,
+      payload        JSONB NOT NULL,
+      final          BOOLEAN NOT NULL,
+      attempts       INT NOT NULL,
+      last_status    TEXT,
+      created_at     TIMESTAMPTZ NOT NULL,
+      quarantined_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await client.query(
+    "CREATE INDEX IF NOT EXISTS idx_a2a_push_dead_letters_quarantined ON claw_a2a_push_dead_letters(quarantined_at)",
   );
 }

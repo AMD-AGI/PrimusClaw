@@ -1,0 +1,14 @@
+{
+  "event_id": "<event_id>",
+  "occurred_at": "<occurred_at>",
+  "user_id": "u-alice",
+  "text": "Bob 已批准 AMD-AGI/demo#7，但 Bob 没有合入权限；要用你自己的账号合入吗？点「合入」（或回复 批准 #<ref>）；不合就点「不合」（或回复 拒绝 #<ref>）。合入前会再确认一遍：批准还在最新提交上、CI 全绿、没有未解决的评论、GitHub 显示可以合入。",
+  "type": "assistant.say",
+  "confirm_write": {
+    "confirmation_id": "<confirmation_id>",
+    "ref": "<ref>",
+    "kind": "github_merge",
+    "allow_label": "合入",
+    "expires_at": "<expires_at>"
+  }
+}

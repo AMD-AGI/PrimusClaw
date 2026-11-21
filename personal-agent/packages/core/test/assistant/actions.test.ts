@@ -353,6 +353,7 @@ it("claw not answering gives the card back", async () => {
     text: "PrimusClaw did not answer; nothing was done. Press it again.",
     cardId: card,
     allowLabel: "Create",
+    kind: "trigger_create",
     lang: "en",
   });
   w.held = undefined;

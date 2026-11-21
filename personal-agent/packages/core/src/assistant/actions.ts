@@ -234,7 +234,7 @@ export class AssistantActions {
 
   /** Nothing was answered: the card comes back with `note`, and pressing it again can help. */
   private async again(click: CardClick, card: ConfirmCard, note: string): Promise<void> {
-    const model = { text: note, cardId: card.cardId, allowLabel: card.label, lang: click.lang() };
+    const model = { text: note, cardId: card.cardId, allowLabel: card.label, kind: card.kind, lang: click.lang() };
     await click.settle(viewMessage({ name: "confirmWrite", model }), { fallback: note });
   }
 }
