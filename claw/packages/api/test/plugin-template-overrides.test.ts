@@ -38,7 +38,10 @@ import {
   applyAppOverrides,
   applyTemplateOverride,
   checkOverrides,
+  compiledPatternCount,
+  MAX_COMPILED_PATTERNS,
   overridableDeclarationProblems,
+  patternsCompile,
   overrideKeys,
 } from "../src/marketplace/plugin-overrides.js";
 import { postgresSkipReason } from "./support/pg-cluster.js";
@@ -220,6 +223,21 @@ test("every pattern of a declaration is compiled in one check, and only one that
     env: { A: rule("^a$"), B: rule("^b$") },
     sandbox_templates: { runner: image("^r:[0-9]+$"), wrapped: image("^w:[0-9]+$") },
   }), []);
+});
+
+// D1
+test("a kept compile answer survives the bound being reached within the check that uses it", () => {
+  assert.deepEqual(patternsCompile(["^keep$"]), [true]);
+  // Fill to one below the bound, so the next check with two new patterns clears it.
+  let i = 0;
+  while (compiledPatternCount() < MAX_COMPILED_PATTERNS - 1) {
+    const batch: string[] = [];
+    while (batch.length < 32 && compiledPatternCount() + batch.length < MAX_COMPILED_PATTERNS - 1) batch.push(`^fill${i++}$`);
+    assert.ok(patternsCompile(batch)?.every((x) => x === true));
+  }
+  assert.deepEqual(patternsCompile(["^keep$", "^new1$", "^new2$", "("]), [true, true, true, false]);
+  assert.ok(compiledPatternCount() <= MAX_COMPILED_PATTERNS);
+  assert.deepEqual(patternsCompile(["^keep$", "("]), [true, false]);
 });
 
 // D2

@@ -456,7 +456,9 @@ function inPatternContext(script: string, data: string, budgetMs: number): unkno
  * when full.
  */
 const compiledPatterns = new Map<string, boolean>();
-const MAX_COMPILED_PATTERNS = 4096;
+/** Exported, with the count, for tests only. */
+export const MAX_COMPILED_PATTERNS = 4096;
+export const compiledPatternCount = (): number => compiledPatterns.size;
 
 /**
  * Whether each of `patterns` compiles as a `u`-flag regular expression; null
@@ -465,7 +467,13 @@ const MAX_COMPILED_PATTERNS = 4096;
  * so one check holds the event loop no longer than one launch's pattern tests.
  */
 export function patternsCompile(patterns: string[]): boolean[] | null {
-  const unknown = [...new Set(patterns.filter((p) => !compiledPatterns.has(p)))];
+  // Answers read before the cache may be cleared below, so a clear never loses one this check uses.
+  const answers = new Map<string, boolean>();
+  for (const p of patterns) {
+    const known = compiledPatterns.get(p);
+    if (known !== undefined) answers.set(p, known);
+  }
+  const unknown = [...new Set(patterns.filter((p) => !answers.has(p)))];
   if (unknown.length > 0) {
     const out = inPatternContext(
       "JSON.stringify(JSON.parse(__jobs).map((p) => { try { new RegExp(p, 'u'); return true; } catch { return false; } }))",
@@ -474,9 +482,12 @@ export function patternsCompile(patterns: string[]): boolean[] | null {
     );
     if (!Array.isArray(out) || out.length !== unknown.length) return null;
     if (compiledPatterns.size + unknown.length > MAX_COMPILED_PATTERNS) compiledPatterns.clear();
-    unknown.forEach((p, i) => compiledPatterns.set(p, out[i] === true));
+    unknown.forEach((p, i) => {
+      answers.set(p, out[i] === true);
+      compiledPatterns.set(p, out[i] === true);
+    });
   }
-  return patterns.map((p) => compiledPatterns.get(p) === true);
+  return patterns.map((p) => answers.get(p) === true);
 }
 
 /** Whether `pattern` compiles as a `u`-flag regular expression; false when the check did not finish. */
