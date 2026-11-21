@@ -206,7 +206,7 @@ func TestTemplateResourcesRejected(t *testing.T) {
 		{"not a quantity", `"resources":{"requests":{"cpu":"lots"}}`, "spec is invalid", nil},
 		{"shm above memory", `"resources":{"limits":{"memory":"64Gi"}},"gpu":{"sharedMemory":"128Gi"}`, "gpu.sharedMemory 128Gi exceeds the memory limit 64Gi", nil},
 		{"zero shm", `"gpu":{"sharedMemory":"0"}`, "gpu.sharedMemory must be positive", nil},
-		{"gpu count in spec", `"gpu":{"count":2}`, "gpu may set only sharedMemory", nil},
+		{"misspelt shm", `"gpu":{"sharedMemroy":"8Gi"}`, "gpu may set only sharedMemory", nil},
 		{"shm without cards", `"gpu":{"sharedMemory":"8Gi"}`, "without GPUs", []int32{}},
 		{"cpu template request above limit", `"resources":{"requests":{"memory":"16Gi"},"limits":{"memory":"8Gi"}}`, "resources.requests.memory 16Gi exceeds", []int32{}},
 	} {
@@ -262,4 +262,39 @@ func TestOwnerPolicyTemplateResources(t *testing.T) {
 	if r.stored(t) != before || r.ciExists(t, "e2b-bad-g2") {
 		t.Fatal("a refused template was stored or registered")
 	}
+}
+
+// The CodeInterpreter gpu fields count, product and resourceName were always
+// ignored in a template spec. A policy stored with them keeps applying after
+// an upgrade, and the card count still comes from perGpuCount alone.
+func TestOwnerPolicyIgnoresCodeInterpreterGPUFields(t *testing.T) {
+	ctx := context.Background()
+	gpu := `"gpu":{"count":2,"product":"MI300X","resourceName":"amd.com/gpu"}`
+	spec := `{"fromImage":"harbor.example/runner@sha256:0123456789abcdef",` + gpu + `}`
+	policy := `{"templates":[{"name":"runner","perGpuCount":[4],"spec":` + spec + `}],"default":{"maxSandboxes":2}}`
+	r := newStoreRig(t, policy, nil)
+	if err := r.store.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(r.appliedTemplates(), "e2b-runner-g4") {
+		t.Fatalf("applied templates = %q", r.appliedTemplates())
+	}
+	ci := &runtimev1alpha1.CodeInterpreter{}
+	if err := r.cl.Get(ctx, types.NamespacedName{Namespace: storeNS, Name: "e2b-runner-g4"}, ci); err != nil {
+		t.Fatal(err)
+	}
+	assertShape(t, ci, wantShape{4, "96", "96", "896Gi", "896Gi", "750Gi", "750Gi", "500Gi"})
+	if ci.Spec.GPU.Product != "" {
+		t.Errorf("product carried: %q", ci.Spec.GPU.Product)
+	}
+
+	// The same fields in a new write are accepted too, next to sharedMemory.
+	withShm := `{"fromImage":"harbor.example/runner@sha256:0123456789abcdef","gpu":{"count":8,"product":"MI300X","resourceName":"amd.com/gpu","sharedMemory":"64Gi"}}`
+	if _, err := r.store.PutTemplate(ctx, TemplateRequest{Name: "ds", PerGPUCount: []int32{2}, Spec: json.RawMessage(withShm)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.cl.Get(ctx, types.NamespacedName{Namespace: storeNS, Name: "e2b-ds-g2"}, ci); err != nil {
+		t.Fatal(err)
+	}
+	assertShape(t, ci, wantShape{2, "48", "48", "448Gi", "448Gi", "375Gi", "375Gi", "64Gi"})
 }

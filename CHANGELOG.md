@@ -187,8 +187,9 @@ release version, and its `appVersion` stays `latest`.
   neither keeps the per-card size times the card count. `/dev/shm` is the spec's `gpu.sharedMemory`, else 125Gi per card
   lowered to the memory limit when that is smaller. The card count still comes only from `perGpuCount`. A template with
   no `resources` or `gpu` is sized exactly as before. A value that is zero, negative or not a quantity, a request above
-  its limit, a shared memory above the memory limit, any other resource name on a GPU template, or any `gpu` field but
-  `sharedMemory`, is refused with `400` (`invalid_grant` or `invalid_owner_policy`) naming the field, and nothing is
+  its limit, a shared memory above the memory limit, any other resource name on a GPU template, or a `gpu` key other than
+  `sharedMemory` (`count`, `product` and `resourceName` are still accepted and ignored, so a stored policy with them keeps
+  applying), is refused with `400` (`invalid_grant` or `invalid_owner_policy`) naming the field, and nothing is
   registered. A template without GPU counts keeps its `resources` as written, and its `cpu`, `memory` and
   `ephemeral-storage` are now checked the same way. Claw already passes a manifest template's fields through unchanged, so an app manifest's
   `sandbox_templates` entries can set these now. See `sandbox/docs/E2B.md` (GPU template size). Deploy the sandbox control

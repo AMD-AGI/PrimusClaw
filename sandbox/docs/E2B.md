@@ -98,7 +98,9 @@ Per card is 24 CPU, 224Gi memory and 187.5Gi pod storage. `/dev/shm` is `gpu.sha
 
 A SaFE Workload takes one CPU and one memory value per sandbox: it is sent the limit.
 
-The grant (or the owner policy write) is refused with `400` (`invalid_grant`, or `invalid_owner_policy`) and nothing is registered when a value is zero, negative or not a quantity, a request exceeds its limit, `gpu.sharedMemory` exceeds the memory limit, `resources` on a GPU template names anything other than `cpu`, `memory` and `ephemeral-storage` (the GPU count is not set there), `gpu` sets anything other than `sharedMemory`, or a template without GPU counts sets `gpu.sharedMemory`. A template without GPU counts keeps its `resources` as written; its `cpu`, `memory` and `ephemeral-storage` are checked the same way.
+The grant (or the owner policy write) is refused with `400` (`invalid_grant`, or `invalid_owner_policy`) and nothing is registered when a value is zero, negative or not a quantity, a request exceeds its limit, `gpu.sharedMemory` exceeds the memory limit, `resources` on a GPU template names anything other than `cpu`, `memory` and `ephemeral-storage` (the GPU count is not set there), `gpu` sets a key other than `sharedMemory`, `count`, `product` and `resourceName`, or a template without GPU counts sets `gpu.sharedMemory`. A template without GPU counts keeps its `resources` as written; its `cpu`, `memory` and `ephemeral-storage` are checked the same way.
+
+`gpu.count`, `gpu.product` and `gpu.resourceName` (the CodeInterpreter `gpu` fields) are accepted and ignored, as before: the card count is `perGpuCount` and the resource is `amd.com/gpu`. A policy stored with them keeps applying.
 
 ### User templates
 

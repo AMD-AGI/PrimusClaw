@@ -446,20 +446,26 @@ func templateFromSpec(spec string) (*templateSpec, bool, error) {
 	return &templateSpec{template: tmpl, sharedMemory: shm}, true, nil
 }
 
-// sharedMemoryOf reads the spec's gpu object. Only sharedMemory may be set:
-// the card count and resource name are the grant's, and a field this reader
-// would drop is refused rather than ignored.
+// sharedMemoryOf reads the spec's gpu object. Only sharedMemory is used.
+// count, product and resourceName are the CodeInterpreter gpu fields; they are
+// accepted and ignored, as they always were, because the card count and
+// resource name are the grant's (perGpuCount) and an owner policy stored with
+// them must keep applying. Any other key is refused rather than ignored, so a
+// misspelt sharedMemory is not silently dropped.
 func sharedMemoryOf(raw json.RawMessage) (*resource.Quantity, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
 	var gpu struct {
 		SharedMemory *resource.Quantity `json:"sharedMemory"`
+		Count        json.RawMessage    `json:"count"`
+		Product      json.RawMessage    `json:"product"`
+		ResourceName json.RawMessage    `json:"resourceName"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&gpu); err != nil {
-		return nil, fmt.Errorf("gpu may set only sharedMemory: %w", err)
+		return nil, fmt.Errorf("gpu may set only sharedMemory (count, product and resourceName are ignored): %w", err)
 	}
 	return gpu.SharedMemory, nil
 }
