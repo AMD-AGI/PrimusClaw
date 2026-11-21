@@ -50,6 +50,8 @@ interface Kept {
   readonly requester: Actor;
   readonly pulls: readonly PullRef[];
   readonly merge: boolean;
+  /** The models the request named ("用 X 帮我 review"); none: the default. Checked again when it starts again. */
+  readonly models: readonly string[];
   readonly note: string;
   readonly handoffId: string;
   readonly askedAt: number;
@@ -83,6 +85,7 @@ function keptOf(row: ReviewOnboarding): Kept | undefined {
     requester: actorOf(r.requester),
     pulls,
     merge: r.merge === true,
+    models: Array.isArray(r.models) ? r.models.filter((m): m is string => typeof m === "string" && m !== "") : [],
     note: str(r.note),
     handoffId: str(r.handoffId),
     askedAt: typeof r.askedAt === "number" ? r.askedAt : 0,
@@ -171,6 +174,8 @@ export class ReviewerOnboarding {
       requester: { userId: ctx.sender.id, name: ctx.sender.name, channelUserId: ctx.sender.channelUserId },
       pulls: pulls.map((p) => ({ owner: p.owner, repo: p.repo, number: p.number })),
       merge: ask.merge,
+      // (the model the asker named runs the retry too, through the same model checks a new request gets)
+      models: [...ask.models],
       note: ctx.text,
       handoffId: ask.handoffId,
       askedAt: epochSeconds(this.deps.clock),
@@ -451,6 +456,7 @@ export class ReviewerOnboarding {
       who: kept.actor.name,
       pulls: kept.pulls,
       merge: kept.merge,
+      models: kept.models,
       named: [kept.actor.channelUserId],
       handoffId: fresh ? kept.handoffId : "",
     });

@@ -594,3 +594,30 @@ test("an asker who could not be told the reviewer said no is told on the next sw
   assert.equal(notes(world, CONV).filter((n) => n.text.includes(READY)).length, 0);
   assert.deepEqual(reviews(http), []);
 });
+
+test("the retry runs on the model the asker named, checked again as a new request is", async () => {
+  const world = reviewWorld();
+  const http = clawReviewsOverHttp(world);
+  world.identity.know("aad-b", "u-bob", "bob-gh", false);
+  await asked(world, `请 {Bob} 用 gpt-6-luna 帮我 review 合入 ${PR}`);
+  await says(world, BOB, "/github auto-merge on");
+  await press(world, ALICE, GROUP, button(world, CONV, "retry"));
+  await settleFollows(world);
+  assert.equal(http.requests.length, 1);
+  assert.equal(http.requests[0]?.body.model, "gpt-6-luna");
+  assert.deepEqual(
+    world.claw.calls.filter(([call]) => call === "models"),
+    [["models", "ak-bob-linked"]],
+  );
+
+  // A model the reviewer's key cannot use is refused at the retry, and nothing starts on the default instead
+  const other = reviewWorld();
+  const otherHttp = clawReviewsOverHttp(other);
+  other.identity.know("aad-b", "u-bob", "bob-gh", false);
+  await asked(other, `请 {Bob} 用 no-such-model 帮我 review 合入 ${PR}`);
+  await says(other, BOB, "/github auto-merge on");
+  await press(other, ALICE, GROUP, button(other, CONV, "retry"));
+  await settleFollows(other);
+  assert.equal(otherHttp.requests.length, 0);
+  assert.ok(saidIn(other.surface, CONV).includes("key 用不了模型 no-such-model"), saidIn(other.surface, CONV));
+});

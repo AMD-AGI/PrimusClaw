@@ -226,9 +226,10 @@ release version, and its `appVersion` stays `latest`.
   identity service tells the worker nothing when someone confirms there, so the reviewer's state is read again on any
   message of theirs and every minute. The asker is told which step is missing ("还差第 N 步「…」"), and once every step is
   done hears "<name> 已完成授权，可以开始代审了" where they asked, with a button that starts the same request again (same
-  pull requests, same merge flag, the same handoff within a day) through every check, so nothing starts without the
-  reviewer's authorization on. A reviewer who declines, or turns the authorization off while asked, is not asked again,
-  and the asker is told once. The reviewer's first message stays at most once a day. A step that could not be said (the
+  pull requests, same merge flag, the same handoff within a day, the same model) through every check, the model's
+  included, so nothing starts without the reviewer's authorization on and nothing runs on a model nobody chose. A
+  reviewer who declines, or turns the authorization off while asked, is not asked again for those requests, and each
+  asker is told once; a later new request of them sends the steps once more. The reviewer's first message stays at most once a day. A step that could not be said (the
   reviewer's chat not reachable yet, or a send whose text failed) is said on the next read rather than counted as said;
   once its text went, a button that failed after it does not send the step again. The asker's "ready" and "declined"
   messages are marked sent only once they went out, and one that failed is sent by the next minute's read. A GitHub notice
