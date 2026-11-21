@@ -444,7 +444,9 @@ Per template, under `sandbox_templates.<name>`:
 | `resources` | `{ "requests": {...}, "limits": {...}, "sharedMemory": "..." }` | One `{ "max": "<quantity>" }` per resource the launch may size: `cpu`, `memory`, `ephemeralStorage` (`ephemeral-storage` in `requests`/`limits`) and `sharedMemory` (the template's `/dev/shm`). |
 
 The resource values are Kubernetes quantity strings (`"24"`, `"500m"`, `"1400Gi"`),
-each positive and at most its declared `max`. A resource with no `max` cannot be
+each positive and at most its declared `max`, compared exactly as Kubernetes
+compares them (a value finer than a nano-unit rounds up, so `"64.0000000001"` is
+above a `max` of `"64"`; a decimal exponent above 64 is not accepted). A resource with no `max` cannot be
 set, and `requests`/`limits` take only `cpu`, `memory` and `ephemeral-storage`
 (the GPU count comes from `per_gpu_count` alone).
 
@@ -514,9 +516,13 @@ every other template is left as written:
 - each given request or limit replaces that one entry of the template's
   `resources` and keeps the others; `sharedMemory` becomes `gpu.sharedMemory`;
 - the result must hold: a request may not exceed its limit (the launch's or the
-  template's own), `sharedMemory` may not exceed the memory limit (or the memory
-  request when no limit is set), and only a template with `per_gpu_count` may set
-  `sharedMemory`.
+  template's own), and only a template with `per_gpu_count` may set
+  `sharedMemory`;
+- the template's shared memory (the launch's `sharedMemory`, or the template's own
+  `gpu.sharedMemory` when the launch changes its card count or memory) may not
+  exceed the memory it will get: its memory limit, else its memory request, else
+  Agent Sandbox's per-card default of `224Gi` times its fewest cards. A launch that
+  wants more shared memory than that gives a memory limit as well.
 
 The effective templates are what the run's grant hands Agent Sandbox (and what a
 later reissue or extension of the grant uses). Agent Sandbox registers a template's

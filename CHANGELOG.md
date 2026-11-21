@@ -121,8 +121,9 @@ release version, and its `appVersion` stays `latest`.
   "24", "memory": "1400Gi" } } } }`. The values are checked against the declaration and applied to a copy of the
   manifest (the card count becomes `[n]`; `fromImage` and `resources` land where Agent Sandbox reads them; each given
   request or limit replaces that entry; `sharedMemory` becomes `gpu.sharedMemory`), which must still validate: a request
-  above its limit, a shared memory above the memory limit, or two templates of one role with the same card count is
-  refused. A refusal is `400 plugin_overrides_invalid` naming each field, and nothing is created. The run stores and
+  above its limit, a shared memory above the memory the template will get (its memory limit, else its request, else
+  the per-card default of 224Gi times its fewest cards), or two templates of one role with the same card count is
+  refused. Quantities are compared exactly, as Kubernetes rounds them, not as floating-point numbers. A refusal is `400 plugin_overrides_invalid` naming each field, and nothing is created. The run stores and
   grants the effective templates, records the values in `metadata.plugin_overrides`, logs only the keys, and binds them
   to the `Idempotency-Key`. One generic plugin can so serve several model sizes instead of one plugin per size. A plugin
   that declares nothing launches exactly as before. Agent Sandbox applies a template's `resources` and

@@ -28,7 +28,6 @@
  * launch path read the same rules.
  */
 import { createContext, runInContext } from "node:vm";
-import { parseQuantity } from "@claw/protocol";
 import { BadRequestError } from "../shared/errors.js";
 
 /** The surfaces a plugin is launched from. */
@@ -276,11 +275,41 @@ export function overridableDeclarationProblems(v: unknown): OverrideProblem[] {
   return out;
 }
 
-/** A positive Kubernetes quantity, as a number; undefined for anything else. */
-function quantityOf(v: unknown): number | undefined {
+const DECIMAL_SUFFIX_EXPONENT: Readonly<Record<string, number>> = Object.freeze(
+  Object.assign(Object.create(null), { n: -9, u: -6, m: -3, "": 0, k: 3, M: 6, G: 9, T: 12, P: 15, E: 18 }),
+);
+const BINARY_SUFFIX_POWER: Readonly<Record<string, number>> = Object.freeze(
+  Object.assign(Object.create(null), { Ki: 1, Mi: 2, Gi: 3, Ti: 4, Pi: 5, Ei: 6 }),
+);
+/** Largest decimal exponent (`1e<n>`) a quantity may carry here; far above any real size. */
+const MAX_QUANTITY_EXPONENT = 64;
+
+/**
+ * A positive Kubernetes quantity, exactly, in nano-units (1e-9), rounded up as
+ * Kubernetes rounds a value finer than its nano scale; undefined for anything
+ * else. Exact so that a comparison with a declared maximum is the comparison
+ * Kubernetes makes: no value a float rounds down to the maximum gets past it.
+ */
+function quantityOf(v: unknown): bigint | undefined {
   if (typeof v !== "string" || v === "" || v.trim() !== v || v.length > OVERRIDE_LIMITS.maxQuantityLength) return undefined;
-  const n = parseQuantity(v);
-  return n !== undefined && n > 0 ? n : undefined;
+  const m = /^([0-9]+)?(?:\.([0-9]*))?(?:([eE])([+-]?[0-9]+)|(Ki|Mi|Gi|Ti|Pi|Ei)|([numkMGTPE]))?$/.exec(v);
+  if (!m || (m[1] === undefined && !m[2])) return undefined;
+  const whole = m[1] ?? "";
+  const fraction = m[2] ?? "";
+  let exponent = 9 - fraction.length; // in nano-units
+  if (m[3] !== undefined) {
+    const e = Number(m[4]);
+    if (!Number.isSafeInteger(e) || Math.abs(e) > MAX_QUANTITY_EXPONENT) return undefined;
+    exponent += e;
+  } else if (m[6] !== undefined) exponent += DECIMAL_SUFFIX_EXPONENT[m[6]]!;
+  let n = BigInt(`${whole}${fraction}` || "0");
+  if (m[5] !== undefined) n *= 1024n ** BigInt(BINARY_SUFFIX_POWER[m[5]]!);
+  if (exponent >= 0) n *= 10n ** BigInt(exponent);
+  else {
+    const d = 10n ** BigInt(-exponent);
+    n = (n + d - 1n) / d;
+  }
+  return n > 0n ? n : undefined;
 }
 
 const QUANTITY_TEXT = "must be a positive Kubernetes quantity string, such as \"64\" or \"2048Gi\"";
@@ -770,10 +799,22 @@ export function applyTemplateOverride(template: Record<string, unknown>, v: Temp
   return out;
 }
 
-/** What the effective template could not run with, for the values a launch gave. */
+/**
+ * Agent Sandbox's memory, per card, for a GPU template that sets no memory
+ * request or limit (it scales with the card count). Shared memory is charged to
+ * the container's memory, so it is what a `sharedMemory` is held to there.
+ */
+export const SANDBOX_DEFAULT_MEMORY_PER_CARD = "224Gi";
+
+/**
+ * What the effective template could not run with, for the values a launch gave.
+ * Resolved as Agent Sandbox resolves it: a resource set on one side only has
+ * that value on both; memory set on neither is the per-card default times the
+ * card count.
+ */
 function effectiveTemplateProblems(t: Record<string, unknown>, v: TemplateOverrideValues, at: string, out: OverrideProblem[]): void {
   const r = v.resources;
-  if (!r) return;
+  if (!r && v.per_gpu_count === undefined) return;
   const resources = containerOf(t).resources;
   const list = (side: string): Record<string, unknown> => {
     const l = isPlainObject(resources) ? resources[side] : undefined;
@@ -782,26 +823,46 @@ function effectiveTemplateProblems(t: Record<string, unknown>, v: TemplateOverri
   const requests = list("requests");
   const limits = list("limits");
   for (const name of RESOURCE_NAMES) {
-    if (r.requests?.[name] === undefined && r.limits?.[name] === undefined) continue;
+    if (r?.requests?.[name] === undefined && r?.limits?.[name] === undefined) continue;
     const req = quantityOf(requests[name]);
     const lim = quantityOf(limits[name]);
     if (req !== undefined && lim !== undefined && req > lim) {
-      const side = r.requests?.[name] !== undefined ? "requests" : "limits";
+      const side = r?.requests?.[name] !== undefined ? "requests" : "limits";
       out.push({ field: `${at}.resources.${side}.${name}`, reason: `the request ${String(requests[name])} exceeds the limit ${String(limits[name])}` });
     }
   }
-  if (r.sharedMemory !== undefined) {
-    const cards = t.per_gpu_count;
-    if (!Array.isArray(cards) || cards.length === 0) {
-      out.push({ field: `${at}.resources.sharedMemory`, reason: "applies only to a template with per_gpu_count" });
-    }
-    // Shared memory is charged to the container's memory: it cannot exceed the memory limit.
-    const memory = limits.memory ?? requests.memory;
-    const shm = quantityOf(r.sharedMemory)!;
+  const cards = Array.isArray(t.per_gpu_count) ? t.per_gpu_count.filter((c): c is number => isCardCount(c)) : [];
+  // The field a shared-memory problem is named by: the launch value that made it one.
+  const shmAt = r?.sharedMemory !== undefined ? `${at}.resources.sharedMemory`
+    : r?.limits?.memory !== undefined ? `${at}.resources.limits.memory`
+    : r?.requests?.memory !== undefined ? `${at}.resources.requests.memory`
+    : `${at}.per_gpu_count`;
+  if (r?.sharedMemory !== undefined && cards.length === 0) {
+    out.push({ field: shmAt, reason: "applies only to a template with per_gpu_count" });
+    return;
+  }
+  // The memory of the launch's own values or of the card count it sets now bounds the template's shared memory.
+  const touchesMemory = r?.sharedMemory !== undefined || v.per_gpu_count !== undefined
+    || r?.requests?.memory !== undefined || r?.limits?.memory !== undefined;
+  const gpu = isPlainObject(t.gpu) ? t.gpu : undefined;
+  if (!touchesMemory || gpu?.sharedMemory === undefined || cards.length === 0) return;
+  const shm = quantityOf(gpu.sharedMemory);
+  if (shm === undefined) return; // the manifest validator names a malformed value
+  const memory = limits.memory ?? requests.memory;
+  if (memory !== undefined) {
     const mem = quantityOf(memory);
     if (mem !== undefined && shm > mem) {
-      out.push({ field: `${at}.resources.sharedMemory`, reason: `exceeds the memory limit ${String(memory)}` });
+      out.push({ field: shmAt, reason: `shared memory ${String(gpu.sharedMemory)} exceeds the memory limit ${String(memory)}` });
     }
+    return;
+  }
+  const fewest = Math.min(...cards);
+  const mem = quantityOf(SANDBOX_DEFAULT_MEMORY_PER_CARD)! * BigInt(fewest);
+  if (shm > mem) {
+    out.push({
+      field: shmAt,
+      reason: `shared memory ${String(gpu.sharedMemory)} exceeds the memory limit of ${fewest} card(s) (${SANDBOX_DEFAULT_MEMORY_PER_CARD} per card when the template sets no memory); give a memory limit`,
+    });
   }
 }
 

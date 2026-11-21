@@ -20,6 +20,7 @@
  * Coverage:
  *   D1 a declaration is checked when written, and every problem is named
  *   D2 the values land where Agent Sandbox reads them, in both template forms; the input is untouched
+ *   D3 quantities are compared exactly; shared memory is held to the memory the template will get (Agent Sandbox's per-card default when it sets none)
  *   P1 plugin writes: an invalid declaration is 400 and stores nothing; a valid one round-trips
  *   P2 an app run stores the effective manifest and the audit, and the grant carries the effective templates
  *   P3 every refusal is 400 plugin_overrides_invalid, names the field, and creates nothing
@@ -139,6 +140,56 @@ test("a template declaration is checked, and every problem is named", () => {
   assert.deepEqual(overridableDeclarationProblems({ sandbox_templates: [] }).map((p) => p.field), ["overridable.sandbox_templates"]);
 });
 
+// D3
+test("a quantity is compared exactly, and shared memory against the memory the template will get", () => {
+  const check = (overrides: unknown, plugin: unknown = PLUGIN) => checkOverrides({ sandbox_templates: overrides }, plugin as typeof PLUGIN, "app");
+  const fields = (r: ReturnType<typeof checkOverrides>) => (r.ok ? [] : r.problems.map((p) => p.field));
+  // At the maximum, however it is spelt, is admitted; a nano-unit above it is not.
+  for (const cpu of ["64", "64.000000000", "64000m", "64e0", "0.064k"]) {
+    assert.ok(check({ runner: { resources: { limits: { cpu } } } }).ok, cpu);
+  }
+  for (const cpu of ["64.000000001", "64000000001n", "64.0000000000000001", "1e64"]) {
+    assert.deepEqual(fields(check({ runner: { resources: { limits: { cpu } } } })), ["overrides.sandbox_templates.runner.resources.limits.cpu"], cpu);
+  }
+  for (const memory of ["2048Gi", "2Ti", "2199023255552", "2199023255552000m"]) {
+    assert.ok(check({ runner: { resources: { requests: { memory } } } }).ok, memory);
+  }
+  for (const memory of ["2199023255553", "2199023255552.000000001", "+1Gi", "1e65", "1Gi ", "-1Gi"]) {
+    assert.equal(check({ runner: { resources: { requests: { memory } } } }).ok, false, memory);
+  }
+  // An exponent is bounded, so a short value cannot ask for an enormous number: it is not a quantity here.
+  for (const memory of ["1e65", "1e999999999"]) {
+    const r = check({ runner: { resources: { requests: { memory } } } });
+    assert.match(JSON.stringify(r), /must be a positive Kubernetes quantity/, memory);
+  }
+
+  // No memory on the template: shared memory is held to 224Gi times the fewest cards.
+  assert.ok(check({ runner: { resources: { sharedMemory: "224Gi" } } }).ok);
+  assert.ok(check({ runner: { per_gpu_count: 4, resources: { sharedMemory: "896Gi" } } }).ok);
+  assert.deepEqual(fields(check({ runner: { per_gpu_count: 4, resources: { sharedMemory: "897Gi" } } })), ["overrides.sandbox_templates.runner.resources.sharedMemory"]);
+  assert.deepEqual(fields(check({ runner: { resources: { sharedMemory: "225Gi" } } })), ["overrides.sandbox_templates.runner.resources.sharedMemory"]);
+  // A memory limit or request, the launch's or the template's, is what it is held to instead.
+  assert.ok(check({ runner: { resources: { limits: { memory: "1000Gi" }, sharedMemory: "1000Gi" } } }).ok);
+  assert.ok(check({ runner: { resources: { requests: { memory: "600Gi" }, sharedMemory: "600Gi" } } }).ok);
+  assert.deepEqual(fields(check({ runner: { resources: { requests: { memory: "600Gi" }, sharedMemory: "601Gi" } } })), ["overrides.sandbox_templates.runner.resources.sharedMemory"]);
+
+  // The manifest's own shared memory is held to the memory a launch's card count or memory leaves.
+  const withShm = structuredClone(MANIFEST) as typeof MANIFEST;
+  Object.assign(withShm.sandbox_templates[0]!, { per_gpu_count: [8], gpu: { sharedMemory: "1000Gi" } });
+  const shmPlugin = { ...PLUGIN, resource: { app: { manifest: withShm } } };
+  assert.ok(check({ runner: { per_gpu_count: 8 } }, shmPlugin).ok);
+  assert.ok(check({ runner: { per_gpu_count: 4, resources: { limits: { memory: "1000Gi" } } } }, shmPlugin).ok);
+  assert.deepEqual(fields(check({ runner: { per_gpu_count: 4 } }, shmPlugin)), ["overrides.sandbox_templates.runner.per_gpu_count"]);
+  assert.deepEqual(fields(check({ runner: { resources: { limits: { memory: "999Gi" } } } }, shmPlugin)), ["overrides.sandbox_templates.runner.resources.limits.memory"]);
+  assert.deepEqual(fields(check({ runner: { resources: { requests: { memory: "999Gi" } } } }, shmPlugin)), ["overrides.sandbox_templates.runner.resources.requests.memory"]);
+  // A launch that leaves the template's memory alone is not held to it.
+  assert.ok(check({ runner: { fromImage: IMG2 } }, { ...PLUGIN, resource: { app: { manifest: (() => {
+    const m = structuredClone(withShm);
+    Object.assign(m.sandbox_templates[0]!, { per_gpu_count: [1] });
+    return m;
+  })() } } }).ok);
+});
+
 // D2
 test("the values land where Agent Sandbox reads them, in both template forms", () => {
   const before = JSON.stringify(MANIFEST);
@@ -198,6 +249,12 @@ const REFUSALS: Array<[string, unknown, string]> = [
   ["request above the template's own limit", { runner: { resources: { requests: { cpu: "24" } } } }, "overrides.sandbox_templates.runner.resources.requests.cpu"],
   ["limit below the template's own request", { runner: { resources: { limits: { cpu: "4" } } } }, "overrides.sandbox_templates.runner.resources.limits.cpu"],
   ["shared memory above the memory limit", { runner: { resources: { limits: { memory: "256Gi" }, sharedMemory: "512Gi" } } }, "overrides.sandbox_templates.runner.resources.sharedMemory"],
+  // A template that sets no memory gets Agent Sandbox's 224Gi per card: the runner's fewest cards are 1.
+  ["shared memory above the default memory of the fewest cards", { runner: { resources: { sharedMemory: "300Gi" } } }, "overrides.sandbox_templates.runner.resources.sharedMemory"],
+  ["shared memory above the default memory of the card count set", { runner: { per_gpu_count: 4, resources: { sharedMemory: "897Gi" } } }, "overrides.sandbox_templates.runner.resources.sharedMemory"],
+  // Compared exactly: a float reads each as the maximum itself.
+  ["cpu a float rounds down to the maximum", { runner: { resources: { limits: { cpu: "64.0000000000000001" } } } }, "overrides.sandbox_templates.runner.resources.limits.cpu"],
+  ["memory a float rounds down to the maximum", { runner: { resources: { requests: { memory: "2199023255552.0000000001" } } } }, "overrides.sandbox_templates.runner.resources.requests.memory"],
   ["no template named", {}, "overrides.sandbox_templates"],
   ["nothing named for a template", { runner: {} }, "overrides.sandbox_templates.runner"],
 ];
