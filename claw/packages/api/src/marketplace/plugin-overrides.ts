@@ -137,12 +137,6 @@ export const OVERRIDE_LIMITS = {
    * event loop for is this, and a value whose test did not finish is refused.
    */
   patternBudgetMs: 50,
-  /**
-   * Budget for checking that every `pattern` of one declaration compiles, as
-   * one run (tried once more if it does not finish). Compiling runs nothing
-   * against a value, so this only has to outlast a busy moment.
-   */
-  patternCompileBudgetMs: 500,
 } as const;
 
 /** The variable names an app manifest accepts; the manifest validator has the last word on reserved names. */
@@ -236,7 +230,7 @@ export function overridableDeclarationProblems(v: unknown): OverrideProblem[] {
   if (!isPlainObject(v)) return [{ field: "overridable", reason: "must be an object" }];
   const compile: CompileJob[] = [];
   declarationProblems(v, out, compile);
-  // Every pattern of the declaration in one check, under one budget.
+  // Every pattern of the declaration in one check, under one budget; one already answered is not compiled again.
   const compiled = patternsCompile(compile.map((j) => j.pattern));
   const valid = new Set(compile.filter((_, i) => compiled?.[i] === true).map((j) => j.problem));
   return valid.size === 0 ? out : out.filter((p) => !valid.has(p));
@@ -454,26 +448,35 @@ function inPatternContext(script: string, data: string, budgetMs: number): unkno
 }
 
 /**
- * Whether each of `patterns` compiles as a `u`-flag regular expression, as one
- * run in the pattern context (where they are tested); null when the check did
- * not finish. It has its own budget rather than the match budget: compiling
- * only parses the (bounded) patterns and runs nothing against a value, and a
- * stored declaration is re-checked on every launch, so under the 50 ms match
- * budget a busy moment read as "not a valid regular expression" and a valid
- * declaration as none at all. A run that does not finish is tried once more,
- * so one declaration holds the event loop for at most twice the budget.
+ * Whether a pattern compiles, for every pattern a check has answered. The
+ * answer never changes, and a stored declaration is re-checked on every
+ * launch (more than once in one request), so each pattern is compiled once
+ * per process, not once per check: a busy moment can make only a pattern's
+ * first check not finish, never one it has already passed. Bounded: cleared
+ * when full.
+ */
+const compiledPatterns = new Map<string, boolean>();
+const MAX_COMPILED_PATTERNS = 4096;
+
+/**
+ * Whether each of `patterns` compiles as a `u`-flag regular expression; null
+ * when the check did not finish. The ones not yet answered are compiled in one
+ * run in the pattern context (where they are tested), under the match budget,
+ * so one check holds the event loop no longer than one launch's pattern tests.
  */
 export function patternsCompile(patterns: string[]): boolean[] | null {
-  if (patterns.length === 0) return [];
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const unknown = [...new Set(patterns.filter((p) => !compiledPatterns.has(p)))];
+  if (unknown.length > 0) {
     const out = inPatternContext(
       "JSON.stringify(JSON.parse(__jobs).map((p) => { try { new RegExp(p, 'u'); return true; } catch { return false; } }))",
-      JSON.stringify(patterns),
-      OVERRIDE_LIMITS.patternCompileBudgetMs,
+      JSON.stringify(unknown),
+      OVERRIDE_LIMITS.patternBudgetMs,
     );
-    if (Array.isArray(out) && out.length === patterns.length) return out.map((x) => x === true);
+    if (!Array.isArray(out) || out.length !== unknown.length) return null;
+    if (compiledPatterns.size + unknown.length > MAX_COMPILED_PATTERNS) compiledPatterns.clear();
+    unknown.forEach((p, i) => compiledPatterns.set(p, out[i] === true));
   }
-  return null;
+  return patterns.map((p) => compiledPatterns.get(p) === true);
 }
 
 /** Whether `pattern` compiles as a `u`-flag regular expression; false when the check did not finish. */
