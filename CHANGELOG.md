@@ -164,7 +164,8 @@ release version, and its `appVersion` stays `latest`.
 - Claw: metrics and alerts for outbound notifications. `claw_notification_outbox_oldest_pending_age_seconds`
   and `claw_notification_outbox_pending` are read from the outbox table at each scrape, so they show a
   stall even when the delivery loop itself has stopped; `claw_notification_delivery_total{outcome}` and
-  `claw_notification_quarantined_total{reason}` count what became of each attempt. `claw/deploy/promql/notification-outbox.rules.yaml`
+  `claw_notification_quarantined_total{reason}` count what became of each attempt, every series exported at 0 from
+  start-up so a pod's first quarantine is an increase Prometheus sees. `claw/deploy/promql/notification-outbox.rules.yaml`
   is a Prometheus rule group with two alerts, `ClawNotificationOutboxStalled` (a notification has waited more than 15
   minutes, for 5 minutes) and `ClawNotificationQuarantined`, tested with `promtool` in CI.
 

@@ -86,3 +86,60 @@ tests:
       - eval_time: 80m
         alertname: ClawNotificationQuarantined
         exp_alerts: []
+
+  # The shape claw-api's start-up initialisation exists for, checked here in case a series still arrives this way: a
+  # replica Prometheus first sees with the counter already at 1. increase() over it is 0; the alert must fire anyway, once,
+  # and clear an hour after the series appeared.
+  - name: "a counter first seen at 1 still fires the warning, and clears an hour later"
+    interval: 1m
+    input_series:
+      - series: 'claw_notification_quarantined_total{namespace="primus-claw", pod="claw-api-1", reason="isolated_failures"}'
+        values: '0x110'
+      - series: 'claw_notification_quarantined_total{namespace="primus-claw", pod="claw-api-3", reason="isolated_failures"}'
+        values: '_x10 1x100'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ClawNotificationQuarantined
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ClawNotificationQuarantined
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "A Claw notification was quarantined"
+              description: >-
+                At least one notification was quarantined in the last hour. Look for "notification.quarantined" in claw-api's
+                log for the event and the receiver's answer, and at the receiver's log for why it cannot take it.
+      - eval_time: 65m
+        alertname: ClawNotificationQuarantined
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "A Claw notification was quarantined"
+              description: >-
+                At least one notification was quarantined in the last hour. Look for "notification.quarantined" in claw-api's
+                log for the event and the receiver's answer, and at the receiver's log for why it cannot take it.
+      - eval_time: 75m
+        alertname: ClawNotificationQuarantined
+        exp_alerts: []
+
+  # A replica that restarts exports its counter at 0 again: a new series at 0 is not a quarantine.
+  - name: "a replica that starts with the counter at 0 fires nothing"
+    interval: 1m
+    input_series:
+      - series: 'claw_notification_quarantined_total{namespace="primus-claw", pod="claw-api-1", reason="isolated_failures"}'
+        values: '0x30'
+      - series: 'claw_notification_quarantined_total{namespace="primus-claw", pod="claw-api-4", reason="isolated_failures"}'
+        values: '_x10 0x100'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ClawNotificationQuarantined
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ClawNotificationQuarantined
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: ClawNotificationQuarantined
+        exp_alerts: []

@@ -364,8 +364,12 @@ const identityClientEnabled = new Gauge({
 // ─── Outbound notifications (notifications/outbox.ts) ─────────────────
 // What became of each delivery attempt. `failed` is a row that will be tried again; the `dropped_*` and `quarantined`
 // outcomes are the ones it will not.
-export type NotificationDeliveryOutcome =
-  | "delivered" | "failed" | "quarantined" | "dropped_gone" | "dropped_expired" | "dropped_subscription_gone";
+export const NOTIFICATION_DELIVERY_OUTCOMES = [
+  "delivered", "failed", "quarantined", "dropped_gone", "dropped_expired", "dropped_subscription_gone",
+] as const;
+export type NotificationDeliveryOutcome = (typeof NOTIFICATION_DELIVERY_OUTCOMES)[number];
+export const NOTIFICATION_QUARANTINE_REASONS = ["isolated_failures"] as const;
+export type NotificationQuarantineReason = (typeof NOTIFICATION_QUARANTINE_REASONS)[number];
 const notificationDeliveryTotal = new Counter({
   name: "claw_notification_delivery_total",
   help: "Outbound notification delivery attempts, by outcome.",
@@ -380,6 +384,11 @@ const notificationQuarantinedTotal = new Counter({
   labelNames: ["reason"] as const,
   registers: [registry],
 });
+// Every series is exported at 0 from the start. prom-client exports a labelled series only once it has a value, so without
+// this a pod's first quarantine would appear to Prometheus already at 1, increase() over it would read 0, and the alert on
+// it (ClawNotificationQuarantined) would stay silent for exactly the case it exists for.
+for (const reason of NOTIFICATION_QUARANTINE_REASONS) notificationQuarantinedTotal.inc({ reason }, 0);
+for (const outcome of NOTIFICATION_DELIVERY_OUTCOMES) notificationDeliveryTotal.inc({ outcome }, 0);
 const notificationReadFailedTotal = new Counter({
   name: "claw_notification_outbox_read_failed_total",
   help: "Scrapes whose read of the notification outbox failed; the outbox gauges then keep their last value.",
@@ -743,7 +752,7 @@ export const metrics = {
   onNotificationDelivery(outcome: NotificationDeliveryOutcome): void {
     notificationDeliveryTotal.inc({ outcome });
   },
-  onNotificationQuarantined(reason: "isolated_failures"): void {
+  onNotificationQuarantined(reason: NotificationQuarantineReason): void {
     notificationQuarantinedTotal.inc({ reason });
     notificationDeliveryTotal.inc({ outcome: "quarantined" });
   },

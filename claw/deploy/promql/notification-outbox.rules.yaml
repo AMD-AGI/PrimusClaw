@@ -30,8 +30,15 @@ groups:
 
       # A notification was set aside instead of delivered: the receiver kept refusing its body (400, 413, 415, 422) for an
       # hour while it took the subscription's other rows. The row is kept (quarantined_at in claw_notification_outbox).
+      # claw-api exports the counter at 0 from start-up, so a quarantine is a step increase() sees. The second arm is for a
+      # series Prometheus meets already above 0 (a scrape missed between start-up and the first quarantine, or an exporter
+      # that did not initialise it): increase() over samples that are all 1 is 0, so a series new within the hour that is
+      # above 0 counts on its own.
       - alert: ClawNotificationQuarantined
-        expr: sum(increase(claw_notification_quarantined_total[1h])) > 0
+        expr: >-
+          sum(increase(claw_notification_quarantined_total[1h])) > 0
+          or
+          sum((claw_notification_quarantined_total unless claw_notification_quarantined_total offset 1h) > 0) > 0
         labels:
           severity: warning
         annotations:
