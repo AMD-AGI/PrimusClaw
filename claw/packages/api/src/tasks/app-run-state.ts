@@ -32,6 +32,7 @@ import pino from "pino";
 import { db } from "../infra/db.js";
 import { openAppRunSecret, sealAppRunSecret } from "../crypto/app-run-secrets.js";
 import { dropSessionAppMcpOfRun } from "./session-app-mcp.js";
+import { sandboxStateSql } from "./app-run-status.js";
 
 const logger = pino({ name: "app-run-state" });
 
@@ -216,7 +217,7 @@ export async function appRunHeldBy(taskId: string, fence: AppRunFence): Promise<
 }
 
 /** The `last_exit` fields that carry free text, the only ones a secret can ride in. */
-const LAST_EXIT_TEXT_FIELDS = ["stop_reason", "error"] as const;
+const LAST_EXIT_TEXT_FIELDS = ["stop_reason", "error", "sandbox_message"] as const;
 
 /**
  * `last_exit` with secrets removed. The secrets are opened only when there is text
@@ -258,7 +259,16 @@ export async function patchAppRun(
     params.push(value);
     sets.push(`${column} = $${params.length}${cast}`);
   };
-  if (patch.state !== undefined) add("state", patch.state);
+  if (patch.state !== undefined) {
+    add("state", patch.state);
+    // The sandbox's state follows the run's (see sandboxStateSql), and its `since`
+    // moves when it changes -- or when the run goes back to provisioning to make a
+    // new sandbox, whose wait starts now.
+    const next = sandboxStateSql(`$${params.length}::text`);
+    const fresh = patch.state === "provisioning" && patch.sandbox_workload_id === null ? "TRUE" : "FALSE";
+    sets.push(`sandbox_state = ${next}`);
+    sets.push(`sandbox_since = CASE WHEN ${fresh} OR ${next} IS DISTINCT FROM r.sandbox_state THEN NOW() ELSE r.sandbox_since END`);
+  }
   if (patch.restarts !== undefined) add("restarts", patch.restarts);
   if (patch.events_cursor !== undefined) add("events_cursor", JSON.stringify(patch.events_cursor), "::jsonb");
   if (patch.state_dir !== undefined) add("state_dir", patch.state_dir);

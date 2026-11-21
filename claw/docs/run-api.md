@@ -145,6 +145,85 @@ a failure, and callers must not read it as `0`. `signal` is `""` unless the exit
 genuinely encodes one (`128 + N` for a signal number `N`); an exit status that names
 no signal is reported without one rather than given an invented name.
 
+## App runs
+
+A run of a hosted application (`mode: "app"`) carries an `app` block, on every form of
+`GET /v1/runs` and on `GET /v1/tasks/{id}` (as `item.app`). Every other run has
+`app: null` on `GET /v1/runs`, and no `app` field on `GET /v1/tasks/{id}`. Both routes
+read it from the same place and answer the same block.
+
+```json
+{
+  "app": {
+    "sandbox": {
+      "state": "ended",
+      "workload_id": "claw-1795239361812-sandbox-q8v4n",
+      "since": "2026-11-21T05:41:12.384Z"
+    },
+    "outcome": {
+      "cause": "exited",
+      "returncode": 3,
+      "final": true,
+      "error": "Traceback (most recent call last): ... RuntimeError: dataset not found"
+    }
+  }
+}
+```
+
+`sandbox.state` is where the run's own sandbox is, which the task's `status` does not
+say: an app task reads `running` from the moment a worker accepts it, while its sandbox
+may still be queued for capacity or pulling a large image.
+
+| `sandbox.state` | Meaning |
+| --- | --- |
+| `pending` | No sandbox is running yet: it is being created, is queued, or is starting (image pull included). Also after a sandbox was lost and a new one is on its way. |
+| `running` | The platform reported the sandbox Running. The application may be starting, running, or waiting to be restarted in it. |
+| `ended` | The run is over and its sandbox was stopped. |
+
+A run cancelled while its sandbox was still `pending` stays `pending` until it is
+`ended`; it never reads `running`. `sandbox.workload_id` is the platform's workload of
+the run's current sandbox, and once the run has ended the last one it had; `""` before
+one was created (and while a replacement for a lost one is being created).
+`sandbox.since` is when the sandbox entered its state, and also moves when a new
+sandbox is started for the run; `null` for a run created before this field existed.
+`placement.workload_id` on `GET /v1/runs` names the same workload for an app run.
+
+`outcome` is `null` until the run has ended. Then:
+
+- `cause` is one of the closed list below; no other value is sent.
+- `returncode` is the return code the application wrote in its `exit.json`, `null` when
+  it wrote none or the run ended another way.
+- `final` is `exit.json`'s `final`: the application said its run was over. `false` for
+  every other ending.
+- `error` is the application's own `exit.json` `error`, or, for a `sandbox_*` cause,
+  what the platform said about the sandbox it did not provide. Secrets are masked
+  (before it is cut), it is folded onto one line and is at most 300 characters; `null`
+  when there is nothing.
+
+| `cause` | The run ended because |
+| --- | --- |
+| `exited` | The application wrote `exit.json` with `final: true`. It succeeded when `returncode` is `0`. |
+| `restarts_exhausted` | The application exited (or could not be started) without `final`, and no restart was left (`restart.max_restarts`), or the platform took its sandbox away more times than a run is given. |
+| `start_failed` | The application could not be started at all: the sandbox has no user data directory for its state, or the run could not be driven (no platform key). |
+| `deadline` | The run reached `limits.max_runtime_sec` or its deadline. |
+| `cancelled` | The run was cancelled, or its session was deleted. |
+| `task_closed` | The run's task was closed by something other than the run (for example the lost-worker reaper) before the application ended. |
+| `no_exit_record` | The run ended with no exit record. |
+| `sandbox_rejected` | The platform refused to create the sandbox (`sandbox_rejected`, such as an admission webhook's quota denial, or the account or workspace refused: `sandbox_workspace_forbidden`, `sandbox_workspace_not_allowed`, `sandbox_placement_invalid`). |
+| `sandbox_create_failed` | Every request to create the sandbox failed (a 5xx, or no answer) until the run reached its deadline. |
+| `sandbox_unschedulable` | No node would take the sandbox (`sandbox_unschedulable`), or it waited for capacity past the ceiling (`sandbox_pending_timeout`). |
+| `sandbox_start_timeout` | The sandbox was scheduled but did not become ready in time. |
+| `sandbox_failed` | The sandbox failed or disappeared before it was ready for another reason (for example `sandbox_workload_terminal`). |
+
+A `sandbox_*` cause is reported when the run ended because it never got a sandbox: on
+its restart budget, or (for `sandbox_create_failed`) at its deadline. A run cancelled
+or past its deadline while merely queued reads `cancelled` or `deadline`, with
+`sandbox.state` saying where the sandbox was.
+
+The task's `failure_reason` is unchanged and still carries the same text for a person
+("app exited final with return code 3", "app run ended: restarts exhausted"); read
+`app.outcome` instead of matching on it.
+
 ## Walk terminal runs
 
 ```text

@@ -50,6 +50,17 @@ export interface AppLastExit {
    * do not spend `max_restarts`. Absent means none.
    */
   platform_losses?: number;
+  /**
+   * Why the run has no sandbox right now, when the platform did not provide one:
+   * the provisioning code (`sandbox_rejected`, `sandbox_unschedulable`,
+   * `sandbox_create_failed`, ...; see sandbox/errors.ts). Set when an attempt to
+   * get a sandbox fails, carried while the run is still provisioning (into a
+   * deadline or a cancel that ends it there), and cleared once a sandbox is Running.
+   * It is what tells a caller that a run ended because it never got a sandbox.
+   */
+  sandbox_reason?: string;
+  /** What the platform said with {@link AppLastExit.sandbox_reason}: one line, bounded, scrubbed. */
+  sandbox_message?: string;
 }
 
 /**

@@ -52,7 +52,8 @@ import { APP_MANIFEST_DEFAULTS, type AppManifestV1, type AppSandboxRole, type Sa
 import type {
   SandboxExecOptions, SandboxExecResult, SandboxInstance, SandboxStatus,
 } from "../sandbox/provider.js";
-import { provisionTerminalOf } from "../sandbox/errors.js";
+import { oneLineText, provisionTerminalOf } from "../sandbox/errors.js";
+import { classifySandboxFailure } from "../sandbox/reaper.js";
 import type { AppSandbox, AppSandboxEnsureOptions, AppSandboxRun } from "./app-sandbox.js";
 import { appStartEnv } from "./app-sandbox.js";
 import {
@@ -566,7 +567,7 @@ export class AppRunner {
     this.ensureStop = {};
     this.rec = await this.deps.store.load(this.runId);
     if (this.rec.state !== "finishing" && this.rec.state !== "ended") {
-      await this.commit({ state: "finishing", last_exit: { at: this.iso(), cause, final: false } });
+      await this.commit({ state: "finishing", last_exit: { at: this.iso(), cause, final: false, ...this.sandboxFailure() } });
     }
     for (let failures = 0; ; ) {
       try {
@@ -609,7 +610,7 @@ export class AppRunner {
     if (this.pastDeadline()) {
       // Any state but the last two: the same road a cancel takes, so the
       // application gets its SIGTERM and its grace, and the grant is revoked.
-      await this.move({ state: "finishing", last_exit: { at: this.iso(), cause: "deadline", final: false } }, this.rec.state);
+      await this.move({ state: "finishing", last_exit: { at: this.iso(), cause: "deadline", final: false, ...this.sandboxFailure() } }, this.rec.state);
       return { done: false };
     }
     const held = await this.ensureGrantCopy();
@@ -779,12 +780,39 @@ export class AppRunner {
       const terminal = provisionTerminalOf(err);
       if (terminal) {
         logger.warn({ runId: this.runId, reason: terminal.reason }, "app_run.sandbox_not_provisioned");
-        return this.countedRestart("sandbox_lost", undefined, platformLoss(terminal.reason));
+        return this.countedRestart(
+          "sandbox_lost", undefined, platformLoss(terminal.reason), this.sandboxFailureOf(terminal.reason, terminal.message),
+        );
+      }
+      // A create the platform failed (a 5xx, no answer) is retried on the next tick
+      // and never counted; it is recorded, so a run that reaches its deadline still
+      // waiting says that is why. Recorded once, not on every failing tick.
+      const message = err instanceof Error ? err.message : String(err);
+      if (classifySandboxFailure(message) === "sandbox_create_failed" && this.rec.last_exit?.sandbox_reason !== "sandbox_create_failed") {
+        const last = this.rec.last_exit ?? { at: this.iso(), cause: "sandbox_lost" as const, final: false };
+        await this.move({ last_exit: { ...last, ...this.sandboxFailureOf("sandbox_create_failed", message) } }, "provisioning");
       }
       throw err;
     }
-    await this.move({ state: "starting", sandbox_workload_id: sandbox.workloadId }, "provisioning");
+    // The sandbox is Running: whatever kept the run from one before is over.
+    const last = this.rec.last_exit;
+    const cleared = last && (last.sandbox_reason !== undefined || last.sandbox_message !== undefined)
+      ? { last_exit: withoutSandboxFailure(last) } : {};
+    await this.move({ state: "starting", sandbox_workload_id: sandbox.workloadId, ...cleared }, "provisioning");
     return { done: false };
+  }
+
+  /** The provisioning failure to record on `last_exit`: the code and what the platform said, scrubbed and bounded. */
+  private sandboxFailureOf(reason: string, message: unknown): Pick<AppLastExit, "sandbox_reason" | "sandbox_message"> {
+    const said = oneLineText(this.scrubbed(String(message ?? "")), TEXT_MAX);
+    return { sandbox_reason: reason, ...(said ? { sandbox_message: said } : {}) };
+  }
+
+  /** The provisioning failure on the row, carried into an ending made while the run is still waiting for a sandbox. */
+  private sandboxFailure(): Pick<AppLastExit, "sandbox_reason" | "sandbox_message"> {
+    const last = this.rec?.last_exit;
+    if (this.rec?.state !== "provisioning" || !last?.sandbox_reason) return {};
+    return { sandbox_reason: last.sandbox_reason, ...(last.sandbox_message ? { sandbox_message: last.sandbox_message } : {}) };
   }
 
   private async inStarting(): Promise<TickResult> {
@@ -1087,12 +1115,14 @@ export class AppRunner {
     cause: "exit" | "sandbox_lost" | "start_failed",
     last?: AppLastExit,
     platform = false,
+    sandboxFailure: Pick<AppLastExit, "sandbox_reason" | "sandbox_message"> = {},
   ): Promise<TickResult> {
     const rec = this.rec;
     const losses = rec.last_exit?.platform_losses ?? 0;
     const lastExit: AppLastExit = {
       ...(last ?? { at: this.iso(), cause, final: false }),
       ...(losses > 0 ? { platform_losses: losses } : {}),
+      ...sandboxFailure,
     };
     // A manifest that allows no restart (max_restarts 0, or no restart block) is never started a second time, whoever lost its
     // sandbox: it ends here as it always did. Only a run that may restart at all is spared spending one on the platform.
@@ -1537,6 +1567,14 @@ export class AppRunner {
   private warnTickFailure(err: unknown): void {
     logger.warn({ runId: this.runId, err: this.safeText(err) }, "app_run.reconcile_failed");
   }
+}
+
+/** `last` without the provisioning failure it carried. */
+function withoutSandboxFailure(last: AppLastExit): AppLastExit {
+  const kept = { ...last };
+  delete kept.sandbox_reason;
+  delete kept.sandbox_message;
+  return kept;
 }
 
 /** `exit.json`, reduced to the fields the runner uses; null when it is not an object. */
