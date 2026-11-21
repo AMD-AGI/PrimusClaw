@@ -443,8 +443,8 @@ Per template, under `sandbox_templates.<name>`:
 | `per_gpu_count` | an integer | Integer rule: `{ "enum": [2, 4, 8] }` or `{ "minimum": 1, "maximum": 8 }` (an `enum` or a `maximum` is required; values 1-1024). Becomes the template's only card count, `[n]`. |
 | `resources` | `{ "requests": {...}, "limits": {...}, "sharedMemory": "..." }` | One `{ "max": "<quantity>" }` per resource the launch may size: `cpu`, `memory`, `ephemeralStorage` (`ephemeral-storage` in `requests`/`limits`) and `sharedMemory` (the template's `/dev/shm`). |
 
-The resource values are Kubernetes quantity strings (`"24"`, `"500m"`, `"1400Gi"`),
-each positive and at most its declared `max`, compared exactly as Kubernetes
+The resource values are Kubernetes quantity strings (`"24"`, `"500m"`, `"1400Gi"`;
+a leading `+` is accepted, as Kubernetes accepts it), each positive and at most its declared `max`, compared exactly as Kubernetes
 compares them (a value finer than a nano-unit rounds up, so `"64.0000000001"` is
 above a `max` of `"64"`; a decimal exponent above 64 is not accepted). A resource with no `max` cannot be
 set, and `requests`/`limits` take only `cpu`, `memory` and `ephemeral-storage`
@@ -456,7 +456,9 @@ characters; anchor it with `^...$`), `maxLength` (1-4096, default 4096) and
 `description`. Unknown keys are refused. Values and `enum` entries may not
 have leading or trailing whitespace. All pattern tests of one launch share a
 50 ms budget and run interruptibly, so a pattern that backtracks badly cannot
-stall the API: a value whose test does not finish in time is refused.
+stall the API: a value whose test does not finish in time is refused. Whether a
+pattern compiles is checked without a budget (compiling runs nothing against a
+value), so a stored declaration never reads as invalid because the API was busy.
 
 ### Launching with `overrides`
 

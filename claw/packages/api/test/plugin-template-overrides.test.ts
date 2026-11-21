@@ -154,9 +154,20 @@ test("a quantity is compared exactly, and shared memory against the memory the t
   for (const memory of ["2048Gi", "2Ti", "2199023255552", "2199023255552000m"]) {
     assert.ok(check({ runner: { resources: { requests: { memory } } } }).ok, memory);
   }
-  for (const memory of ["2199023255553", "2199023255552.000000001", "+1Gi", "1e65", "1Gi ", "-1Gi"]) {
+  for (const memory of ["2199023255553", "2199023255552.000000001", "1e65", "1Gi ", "-1Gi", "+-1Gi", "++1Gi", "+", "+Gi"]) {
     assert.equal(check({ runner: { resources: { requests: { memory } } } }).ok, false, memory);
   }
+  // A leading "+" is a sign Kubernetes accepts, and it is held to the same maximum.
+  for (const memory of ["+1Gi", "+2048Gi", "+2Ti", "+.5Gi"]) {
+    assert.ok(check({ runner: { resources: { requests: { memory } } } }).ok, memory);
+  }
+  for (const cpu of ["+64", "+64000m"]) {
+    assert.ok(check({ runner: { resources: { limits: { cpu } } } }).ok, cpu);
+  }
+  for (const cpu of ["+64.000000001", "+65", "+0"]) {
+    assert.deepEqual(fields(check({ runner: { resources: { limits: { cpu } } } })), ["overrides.sandbox_templates.runner.resources.limits.cpu"], cpu);
+  }
+  assert.deepEqual(fields(check({ runner: { resources: { requests: { memory: "+2049Gi" } } } })), ["overrides.sandbox_templates.runner.resources.requests.memory"]);
   // An exponent is bounded, so a short value cannot ask for an enormous number: it is not a quantity here.
   for (const memory of ["1e65", "1e999999999"]) {
     const r = check({ runner: { resources: { requests: { memory } } } });

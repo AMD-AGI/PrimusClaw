@@ -192,8 +192,7 @@ function checkStringRule(v: unknown, at: string, out: OverrideProblem[], extraKe
     if (typeof v.pattern !== "string" || v.pattern === "" || v.pattern.length > OVERRIDE_LIMITS.maxPatternLength) {
       out.push({ field: `${at}.pattern`, reason: `must be a non-empty string of at most ${OVERRIDE_LIMITS.maxPatternLength} characters` });
     } else {
-      // Compiled where it is tested: in the pattern context, under its timeout.
-      if (patternCompiles(v.pattern) !== true) {
+      if (!patternCompiles(v.pattern)) {
         out.push({ field: `${at}.pattern`, reason: "is not a valid regular expression" });
       }
     }
@@ -292,7 +291,7 @@ const MAX_QUANTITY_EXPONENT = 64;
  */
 function quantityOf(v: unknown): bigint | undefined {
   if (typeof v !== "string" || v === "" || v.trim() !== v || v.length > OVERRIDE_LIMITS.maxQuantityLength) return undefined;
-  const m = /^([0-9]+)?(?:\.([0-9]*))?(?:([eE])([+-]?[0-9]+)|(Ki|Mi|Gi|Ti|Pi|Ei)|([numkMGTPE]))?$/.exec(v);
+  const m = /^[+]?([0-9]+)?(?:\.([0-9]*))?(?:([eE])([+-]?[0-9]+)|(Ki|Mi|Gi|Ti|Pi|Ei)|([numkMGTPE]))?$/.exec(v);
   if (!m || (m[1] === undefined && !m[2])) return undefined;
   const whole = m[1] ?? "";
   const fraction = m[2] ?? "";
@@ -424,14 +423,22 @@ function inPatternContext(script: string, data: string, budgetMs: number): unkno
   }
 }
 
-/** Whether `pattern` compiles as a `u`-flag regular expression; null when the check did not finish. */
-export function patternCompiles(pattern: string): boolean | null {
-  const out = inPatternContext(
-    "JSON.stringify((() => { try { new RegExp(JSON.parse(__jobs), 'u'); return true; } catch { return false; } })())",
-    JSON.stringify(pattern),
-    OVERRIDE_LIMITS.patternBudgetMs,
-  );
-  return typeof out === "boolean" ? out : null;
+/**
+ * Whether `pattern` compiles as a `u`-flag regular expression. Compiling only
+ * parses the pattern, in time linear in its (bounded) length, and runs nothing
+ * against a value, so it needs no budget; it is checked directly, and the
+ * answer never depends on how busy the process is. A budget here would turn a
+ * slow moment into "not a valid regular expression", and a stored declaration
+ * is re-checked on every launch, so a valid declaration would intermittently
+ * read as none at all.
+ */
+export function patternCompiles(pattern: string): boolean {
+  try {
+    new RegExp(pattern, "u");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
