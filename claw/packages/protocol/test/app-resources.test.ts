@@ -69,7 +69,11 @@ test("types are checked and nothing negative passes", () => {
   refused({ ...GOOD, cpu: 0 }, "resources.cpu", "plain decimal");
   refused({ ...GOOD, memory_gi: -4 }, "resources.memory_gi", "plain decimal");
   refused({ ...GOOD, grant: { gpu_hours: -1 } }, "resources.grant.gpu_hours", ">= 0");
-  refused({ ...GOOD, grant: { max_runtime_sec: "x" } }, "resources.grant.max_runtime_sec", ">= 0");
+  refused({ ...GOOD, grant: { max_runtime_sec: "x" } }, "resources.grant.max_runtime_sec", "whole number");
+  for (const bad of [1.5, 0.5, 0, -1, 2_147_483_648]) {
+    refused({ ...GOOD, grant: { max_runtime_sec: bad } }, "resources.grant.max_runtime_sec", "whole number");
+  }
+  assert.equal(ok({ ...GOOD, grant: { max_runtime_sec: 1 } }).grant.max_runtime_sec, 1);
   refused({ ...GOOD, grant: { max_sandboxes: -1 } }, "resources.grant.max_sandboxes", "whole number");
   refused({ ...GOOD, grant: { max_gpus: 0.5 } }, "resources.grant.max_gpus", "whole number");
   refused("x", "resources", "must be an object");

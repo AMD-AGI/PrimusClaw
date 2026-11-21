@@ -223,6 +223,9 @@ release version, and its `appVersion` stays `latest`.
   used to stop it at the manifest's only). The deadline backstop now gives an app run its application's
   `stop_grace_sec` (at most an hour) past the deadline before it closes the task, so it no longer closes a run the
   Brain is still stopping as `run_budget_exhausted`.
+  The request's `resources.grant.max_runtime_sec` (and `APP_SANDBOX_CAPS.max_runtime_sec`) must now be a whole number
+  of seconds from 1 to 2147483647: a fraction or 0, which the grant issuer already refused, is refused at admission
+  with `400 app_resources_invalid`.
 - Claw API: a review asked of someone else ("review and merge", R asking X) is now merged with the reviewer's account
   whenever the reviewer can merge it, and the requester's own account is used only when the reviewer cannot, and only on
   the requester's yes. Under X's `fully_auto` the merge is made at once; under `high_risk_confirm` a held merge waits for

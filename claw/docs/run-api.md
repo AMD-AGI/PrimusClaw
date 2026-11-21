@@ -253,7 +253,8 @@ or past its deadline while merely queued reads `cancelled` or `deadline`, with
 
 An app run's time limit is the smaller of the manifest's `limits.max_runtime_sec` and
 the request's `resources.grant.max_runtime_sec`, counted from the run's creation (queue
-time included). The task's `deadline_at` is that moment, the one the run is stopped
+time included); the request's value must be a whole number of seconds from 1 to
+2147483647, or the run is refused with `400 app_resources_invalid`. The task's `deadline_at` is that moment, the one the run is stopped
 at with cause `deadline`, rather than the generic budget a task gets from its start;
 an app run with no limit keeps that budget. Past `deadline_at`, the application is given its
 `stop_grace_sec` (at most an hour) to stop before the deadline backstop closes the
