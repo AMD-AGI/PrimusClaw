@@ -216,14 +216,15 @@ function fakeAgentSandbox(): { server: Server; issued: any[]; url: () => string 
       if (req.method === "DELETE") { res.writeHead(200).end("{}"); return; }
       const body = JSON.parse(raw);
       issued.push(body);
-      const names: Record<string, string[]> = {};
-      for (const [role, r] of Object.entries(body.roles as Record<string, { templates: string[] }>)) {
-        names[role] = r.templates.flatMap((name) => {
+      // Built from entries, never by assigning to a key the request names.
+      const names = Object.fromEntries(Object.entries(body.roles as Record<string, { templates: string[] }>).map(([role, r]) => [
+        role,
+        r.templates.flatMap((name) => {
           const t = (body.templates as Array<{ name: string; perGpuCount?: number[] }>).find((x) => x.name === name)!;
           const base = `ar-${body.issuer.appRunId.toLowerCase()}-${name}`;
           return t.perGpuCount ? t.perGpuCount.map((n) => `${base}-g${n}`) : [base];
-        });
-      }
+        }),
+      ]));
       const keys = Object.fromEntries(Object.keys(body.roles).map((r) => [r, `key-${r}`]));
       res.writeHead(200, { "content-type": "application/json" })
         .end(JSON.stringify({ keys, maxSandboxes: body.maxSandboxes, maxGpus: body.maxGpus, templates: names }));
