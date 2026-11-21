@@ -13,8 +13,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  APP_RUN_CAUSES, appRunCauseOf, appRunErrorText, appRunOutcomeOf, appRunStatusOf,
+  APP_RUN_CAUSES, APP_RUN_EXIT_CAUSES, appRunCauseOf, appRunErrorText, appRunLastExitOf, appRunOutcomeOf, appRunStatusOf,
 } from "../src/tasks/app-run-status.js";
+import { appRunMaxRuntimeSec } from "../src/tasks/app-run.js";
+import { APP_MAX_STOP_GRACE_SEC, appStopGraceSec, type AppManifestV1 } from "@claw/protocol";
 
 const AT = "2026-11-21T00:00:00.000Z";
 const exit = (over: Record<string, unknown>) => ({ at: AT, final: false, ...over });
@@ -88,4 +90,58 @@ test("sandbox: the stored state; a row from before the column reads its run stat
     assert.deepEqual(appRunStatusOf({ ...row, state: state!, sandbox_state: null, sandbox_since: null, sandbox_workload_id: null }).sandbox,
       { state: want, workload_id: "", since: null }, state);
   }
+});
+
+test("last_exit: every cause the Brain writes, its return code and time; nothing else", () => {
+  const cases: Array<[Record<string, unknown>, number, unknown]> = [
+    [exit({ cause: "exit", returncode: 11, error: "crash", stop_reason: "x" }), 1, { returncode: 11, at: AT, cause: "exited" }],
+    [exit({ cause: "exit", final: true, returncode: 0 }), 0, { returncode: 0, at: AT, cause: "exited" }],
+    [exit({ cause: "exit" }), 2, { returncode: null, at: AT, cause: "exited" }],
+    [exit({ cause: "exit", returncode: 1.5 }), 2, { returncode: null, at: AT, cause: "exited" }],
+    [exit({ cause: "start_failed", stop_reason: "no user data directory" }), 0, { returncode: null, at: AT, cause: "start_failed" }],
+    [exit({ cause: "sandbox_lost" }), 1, { returncode: null, at: AT, cause: "sandbox_lost" }],
+    [exit({ cause: "sandbox_lost", platform_losses: 2 }), 0, { returncode: null, at: AT, cause: "sandbox_lost" }],
+    [exit({ cause: "restarts_exhausted", returncode: 15 }), 4, { returncode: 15, at: AT, cause: "restarts_exhausted" }],
+    [exit({ cause: "deadline" }), 0, { returncode: null, at: AT, cause: "deadline" }],
+    [exit({ cause: "cancelled" }), 0, { returncode: null, at: AT, cause: "cancelled" }],
+    [exit({ cause: "row_terminal" }), 0, { returncode: null, at: AT, cause: "task_closed" }],
+  ];
+  for (const [lastExit, restarts, want] of cases) assert.deepEqual(appRunLastExitOf(lastExit, restarts), want, JSON.stringify(lastExit));
+  const reached = new Set(cases.map(([, , want]) => (want as { cause: string }).cause));
+  assert.deepEqual([...APP_RUN_EXIT_CAUSES].filter((c) => !reached.has(c)), [], "every cause in the list is reached");
+  // Not shown: no record, a cause outside the list, an unreadable time, and the carrier of a create
+  // that keeps failing before anything ran (no restart, no platform loss counted).
+  assert.equal(appRunLastExitOf(null, 0), null);
+  assert.equal(appRunLastExitOf(exit({ cause: "something_new" }), 0), null);
+  assert.equal(appRunLastExitOf({ cause: "exit", at: "yesterday" }, 1), null);
+  assert.equal(appRunLastExitOf(exit({ cause: "sandbox_lost", sandbox_reason: "sandbox_create_failed" }), 0), null);
+  assert.equal(appRunLastExitOf(exit({ cause: "sandbox_lost", platform_losses: 0 }), 0), null);
+  // The time is normalised.
+  assert.equal(appRunLastExitOf({ cause: "exit", at: "2026-11-21T08:00:00+08:00", final: false }, 1)?.at, "2026-11-21T00:00:00.000Z");
+});
+
+test("status: restarts and last_exit beside the sandbox, from the row; restarts never below zero", () => {
+  const row = { task_id: "t", state: "restarting", sandbox_workload_id: "w", sandbox_state: "running", sandbox_since: AT };
+  const s = appRunStatusOf({ ...row, restarts: "3", last_exit: exit({ cause: "exit", returncode: 13 }) });
+  assert.deepEqual({ restarts: s.restarts, last_exit: s.last_exit, outcome: s.outcome },
+    { restarts: 3, last_exit: { returncode: 13, at: AT, cause: "exited" }, outcome: null });
+  assert.deepEqual(Object.keys(s), ["sandbox", "restarts", "last_exit", "outcome"]);
+  assert.equal(appRunStatusOf({ ...row, restarts: null, last_exit: null }).restarts, 0);
+  assert.equal(appRunStatusOf({ ...row, restarts: -1, last_exit: null }).restarts, 0);
+});
+
+test("the run's time limit: the smaller of the manifest's and the request's grant; the stop grace bounded", () => {
+  const m = (sec?: number) => ({ limits: sec === undefined ? undefined : { max_runtime_sec: sec } }) as unknown as AppManifestV1;
+  assert.equal(appRunMaxRuntimeSec(m(3600), { grant: { max_runtime_sec: 7200 } }), 3600);
+  assert.equal(appRunMaxRuntimeSec(m(7200), { grant: { max_runtime_sec: 1800 } }), 1800);
+  assert.equal(appRunMaxRuntimeSec(m(), { grant: { max_runtime_sec: 900 } }), 900);
+  assert.equal(appRunMaxRuntimeSec(m(600), {}), 600);
+  assert.equal(appRunMaxRuntimeSec(m(600), undefined), 600);
+  assert.equal(appRunMaxRuntimeSec(m(), {}), undefined);
+  // A request the grant would not take (zero, a fraction) does not set it.
+  assert.equal(appRunMaxRuntimeSec(m(600), { grant: { max_runtime_sec: 0 } }), 600);
+  assert.equal(appRunMaxRuntimeSec(m(), { grant: { max_runtime_sec: 1.5 } }), undefined);
+  assert.equal(appStopGraceSec({}), 900);
+  assert.equal(appStopGraceSec({ stop_grace_sec: 5 }), 5);
+  assert.equal(appStopGraceSec({ stop_grace_sec: 99_999 }), APP_MAX_STOP_GRACE_SEC);
 });

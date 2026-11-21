@@ -145,6 +145,8 @@ export function parseAppContainerCaps(raw: string | undefined): AppContainerCaps
   return out;
 }
 const isNonNeg = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
+const isRuntimeSec = (v: unknown): v is number =>
+  typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 2_147_483_647;
 const isName = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
 
 const RESOURCE_KEYS = ["image", "gpus", "workspace", "sandbox_workspace", "cpu", "memory_gi", "grant"];
@@ -167,8 +169,10 @@ export function validateAppGrantLimits(at: string, v: unknown, out: AppResources
     if (v[k] !== undefined && !isCount(v[k])) out.push({ field: `${at}.${k}`, reason: "must be a whole number >= 0" });
   }
   if (v.gpu_hours !== undefined && !isNonNeg(v.gpu_hours)) out.push({ field: `${at}.gpu_hours`, reason: "must be a number >= 0" });
-  if (v.max_runtime_sec !== undefined && !isNonNeg(v.max_runtime_sec)) {
-    out.push({ field: `${at}.max_runtime_sec`, reason: "must be a number >= 0" });
+  // Whole seconds in the range the grant issuer takes: a fraction or 0 would be
+  // accepted here, then ignored by the run's deadline and refused by the issuer.
+  if (v.max_runtime_sec !== undefined && !isRuntimeSec(v.max_runtime_sec)) {
+    out.push({ field: `${at}.max_runtime_sec`, reason: "must be a whole number of seconds >= 1 and <= 2147483647" });
   }
 }
 

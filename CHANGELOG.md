@@ -113,6 +113,12 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, the restarts it has
+  spent of `restart.max_restarts`, and `app.last_exit`, `{ returncode, at, cause }` of the last time the application
+  stopped (`null` until then), moved on every exit. A crash-looping application used to read only `status: running`
+  with nothing else until its run ended. `cause` is a closed list (`exited`, `start_failed`, `sandbox_lost`,
+  `restarts_exhausted`, `deadline`, `cancelled`, `task_closed`); no free text is carried. See `claw/docs/run-api.md`,
+  "App runs".
 - Claw: a plugin can let an app run change its manifest's sandbox templates. `overridable.sandbox_templates` declares,
   per template name, which of `fromImage` (a string rule with an `enum` or a `pattern`), `per_gpu_count` (an integer
   `enum` or range) and `resources` (a `max` Kubernetes quantity for each of `cpu`, `memory`, `ephemeralStorage` and
@@ -224,7 +230,17 @@ release version, and its `appVersion` stays `latest`.
   `sandbox_templates` entries can set these now. See `sandbox/docs/E2B.md` (GPU template size). Deploy the sandbox control
   plane (`agent-sandbox-controlplane`); Claw is unchanged. Templates registered before the release keep their size until
   their grant is issued again.
-
+- Claw: an app task's `deadline_at` is the run's own time limit, the smaller of the manifest's
+  `limits.max_runtime_sec` and the request's `resources.grant.max_runtime_sec`, counted from the run's creation: the
+  moment the Brain stops it. It used to be the generic task budget (72 hours) from the task's start, which said
+  nothing about when the run would end. An app run with neither limit keeps that budget, and other tasks are
+  unchanged. A run whose request asked for less than its manifest's limit is now stopped at the request's (the Brain
+  used to stop it at the manifest's only). The deadline backstop now gives an app run its application's
+  `stop_grace_sec` (at most an hour) past the deadline before it closes the task, so it no longer closes a run the
+  Brain is still stopping as `run_budget_exhausted`.
+  The request's `resources.grant.max_runtime_sec` (and `APP_SANDBOX_CAPS.max_runtime_sec`) must now be a whole number
+  of seconds from 1 to 2147483647: a fraction or 0, which the grant issuer already refused, is refused at admission
+  with `400 app_resources_invalid`.
 - Claw API: a review asked of someone else ("review and merge", R asking X) is now merged with the reviewer's account
   whenever the reviewer can merge it, and the requester's own account is used only when the reviewer cannot, and only on
   the requester's yes. Under X's `fully_auto` the merge is made at once; under `high_risk_confirm` a held merge waits for
