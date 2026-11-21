@@ -1289,7 +1289,9 @@ const APP_RUN_DRIVEN_STATES = "('provisioning','starting','running','restarting'
  * stops every live sandbox carrying the run's `CLAW_APP_RUN_ID`, a queued one included.
  *
  * `last_exit` says why (`row_terminal`); the restart history it held is not a finish's, and only
- * `recovery` (shared storage was already read once) is kept. Not a task with `app_finish_prior`:
+ * `recovery` (shared storage was already read once) and `platform_losses` (the run's count of
+ * sandboxes the platform took away, shown as `app.platform_losses` and inside `app.restarts` for
+ * as long as the run is shown) are kept. Not a task with `app_finish_prior`:
  * that is a finish-only dispatch, whose rows the passes above own.
  */
 export async function finishAbandonedAppRuns(): Promise<number> {
@@ -1311,7 +1313,9 @@ export async function finishAbandonedAppRuns(): Promise<number> {
         SET state = 'finishing',
             last_exit = jsonb_build_object('at', to_jsonb(NOW()), 'cause', 'row_terminal', 'final', false)
                         || CASE WHEN r.last_exit->'recovery' = 'true'::jsonb
-                                THEN '{"recovery": true}'::jsonb ELSE '{}'::jsonb END,
+                                THEN '{"recovery": true}'::jsonb ELSE '{}'::jsonb END
+                        || CASE WHEN jsonb_typeof(r.last_exit->'platform_losses') = 'number'
+                                THEN jsonb_build_object('platform_losses', r.last_exit->'platform_losses') ELSE '{}'::jsonb END,
             updated_at = NOW()
        FROM prior p
       WHERE r.task_id = p.task_id

@@ -211,9 +211,8 @@ one whose sandboxes the platform keeps taking away:
   loss instead, and that is not counted. `0` until then.
 - `restarts` is their total: every time the application was started again. Until
   `crash_restarts` and `platform_losses` existed it carried only the first; read
-  `crash_restarts` for what it used to say.
-
-All three keep their last value once the run has ended.
+  `crash_restarts` for what it used to say. All three keep their last value once
+  the run has ended.
 - `last_exit` is the last time the application stopped, or the run was stopped;
   `null` until then (a run still waiting for its first sandbox has had nothing stop).
   It moves on every exit. `returncode` is what the application wrote in its
