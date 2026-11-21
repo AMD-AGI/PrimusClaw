@@ -29,6 +29,7 @@ import {
   Router,
   reviewStop,
   REVIEW_HANDOFF,
+  ONBOARDING_SWEEP_MS,
   pendingOf,
   UPGRADE_RETRY_SECONDS,
   noModelRefusalPolicy,
@@ -307,6 +308,12 @@ function featureTimers(base: AssemblyBase, built: Built): FeatureTimer[] {
       everyMs: REVIEW_CARD_SWEEP_MS,
       runAtStart: true,
       run: () => sweepOnce(review),
+    });
+    timers.push({
+      name: "review_onboarding", // (a reviewer who confirmed at the identity service is sent the next step)
+      everyMs: ONBOARDING_SWEEP_MS,
+      runAtStart: false,
+      run: () => review.sweepOnboarding(),
     });
   }
   return timers;

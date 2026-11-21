@@ -35,6 +35,9 @@ interface Binding {
   finished: boolean;
 }
 
+/** What a person changed on their binding, for what waits on it (`GithubAccount.changed`). */
+export type AccountChange = "bound" | "delegation_on" | "delegation_off";
+
 /** `(connected, login)` once a device flow has ended, for a question that waited for it. */
 export type OnBound = (connected: boolean, login: string) => Promise<void>;
 
@@ -46,7 +49,19 @@ export class GithubAccount {
   /** Teams user -> the confirmation setting chosen while their binding is made. */
   private readonly modeChosen = new Map<string, ReviewMode>();
 
+  /** Told after a person connected GitHub or switched their standing authorization (errors are logged, never thrown). */
+  changed: ((userId: string, change: AccountChange) => Promise<void>) | undefined;
+
   constructor(private readonly deps: ReviewDeps) {}
+
+  private async tellChanged(userId: string, change: AccountChange): Promise<void> {
+    if (this.changed === undefined) return;
+    try {
+      await this.changed(userId, change);
+    } catch (err) {
+      this.deps.logger.warn("what waits on a person's GitHub binding could not be told", { error: errorName(err) });
+    }
+  }
 
   /** Settles when every device flow started so far has ended (for tests and an orderly stop). */
   async idle(): Promise<void> {
@@ -236,11 +251,12 @@ export class GithubAccount {
     const written = await writeMode(this.deps, sender.id, chosen);
     if (short) {
       await sayQuietly(this.deps, conversation, t.connectedShort(state.login), "github bind");
-      return [true, state.login];
+    } else {
+      const [zh, en] = REVIEW_MODES[chosen];
+      const confirmation = written === true ? `${en} / ${zh}` : written === NOT_YET ? NOT_YET_TEXT : t.choiceNotSaved;
+      await sayQuietly(this.deps, conversation, t.connected(state.login, confirmation), "github bind");
     }
-    const [zh, en] = REVIEW_MODES[chosen];
-    const confirmation = written === true ? `${en} / ${zh}` : written === NOT_YET ? NOT_YET_TEXT : t.choiceNotSaved;
-    await sayQuietly(this.deps, conversation, t.connected(state.login, confirmation), "github bind");
+    await this.tellChanged(sender.id, "bound");
     return [true, state.login];
   }
 
@@ -407,6 +423,7 @@ export class GithubAccount {
       return set.error;
     }
     await say(this.deps, conversation, set.value.delegation ? t.autoMergeOn : t.autoMergeOff);
+    await this.tellChanged(sender.id, set.value.delegation ? "delegation_on" : "delegation_off");
     return undefined;
   }
 }

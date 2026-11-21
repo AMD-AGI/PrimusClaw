@@ -296,6 +296,24 @@ release version, and its `appVersion` stays `latest`.
 - Claw API: a message whose text or request carries a NUL character or a lone UTF-16 surrogate is now queued with
   U+FFFD in its place. PostgreSQL stores neither (TEXT refuses the NUL byte; `jsonb` refuses the `\u0000` escape and a
   lone surrogate escape), so such a message used to be refused with a server error when the session was busy.
+- Personal agent: a review asked of a colleague who cannot be acted as yet no longer stops at the first step they finish.
+  Reviewing for someone else takes three steps of theirs (connecting their Primus account at the identity service,
+  `/github bind`, `/github auto-merge on`, and `/link` when their own key is missing too), and confirming the identity
+  card looked like being done. Now the request is kept (new store table `review_onboarding`, kept a week): the reviewer's
+  first message lists every step with the current one marked, in English and Chinese, and each step they finish is
+  answered once with the next one (a button runs `/github bind`, another turns the authorization on or declines it). The
+  identity service tells the worker nothing when someone confirms there, so the reviewer's state is read again on any
+  message of theirs and every minute. The asker is told which step is missing ("还差第 N 步「…」"), and once every step is
+  done hears "<name> 已完成授权，可以开始代审了" where they asked, with a button that starts the same request again (same
+  pull requests, same merge flag, the same handoff within a day, the same model) through every check, the model's
+  included, so nothing starts without the reviewer's authorization on and nothing runs on a model nobody chose. A
+  reviewer who declines, or turns the authorization off while asked, is not asked again for those requests, and each
+  asker is told once; a later new request of them sends the steps once more. The reviewer's first message stays at most once a day. A step that could not be said (the
+  reviewer's chat not reachable yet, or a send whose text failed) is said on the next read rather than counted as said;
+  once its text went, a button that failed after it does not send the step again. The asker's "ready" and "declined"
+  messages are marked sent only once they went out, and one that failed is sent by the next minute's read. A GitHub notice
+  that already went to the reviewer earlier the same day for something else no longer keeps the step they are at from
+  being sent. Asked again for the same pull requests, a button sent for the earlier request no longer starts the new one.
 - Claw: in the SaFE deployment mode with `LLM_KEY_SOURCE=platformKey`, a caller signed in with an `ak-` key (in
   `Authorization: Bearer`, `x-api-key` or a download URL) or a default session cookie has their email again:
   `GET /v1/me` answers it and the request's user carries it, as in 0.5.8. Since 0.5.9 the API no longer asked SaFE's

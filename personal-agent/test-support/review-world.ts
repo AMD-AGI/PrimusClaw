@@ -28,6 +28,7 @@ import {
   silentLogger,
   type ReviewDeps,
 } from "../packages/core/src/index.js";
+import { createClawClient } from "../packages/runtime/src/claw/client.js";
 import { GithubApi } from "../packages/runtime/src/github/api.js";
 import { IdentityCredentialClient } from "../packages/runtime/src/github/credential-client.js";
 import { GithubDeviceFlow } from "../packages/runtime/src/github/device-flow.js";
@@ -578,4 +579,67 @@ export async function handBack(world: HandoffWorld, ...events: Record<string, un
   await world.action.idle();
   await settleFollows(world);
   return outcomes;
+}
+
+/**
+ * Claw's `POST /v1/assistant/reviews` over HTTP, answered as the API answers it (`routes/assistant.ts`, `review-items.ts`):
+ * a review asked of someone else is answered without its session, and a handoff the assistant recorded is started from once,
+ * within a day, never merging when it was recorded without a merge (`handoffGate`).
+ */
+export class ClawReviewsHttp {
+  readonly requests: { readonly headers: Record<string, string>; readonly body: Record<string, unknown> }[] = [];
+  /** The handoffs the assistant recorded (`claw_assistant_review_handoffs`), by id. */
+  readonly handoffs = new Map<string, { merge: boolean; used: boolean; at: number }>();
+  private seq = 0;
+
+  constructor(private readonly clock: FakeClock) {}
+
+  /** The assistant recorded handoff `id` now (`recordReviewHandoff`). */
+  recordHandoff(id: string, merge = true): void {
+    this.handoffs.set(id, { merge, used: false, at: this.clock.epochMs() });
+  }
+
+  handle(url: string, init: RequestInit): Response {
+    const path = new URL(url).pathname;
+    if (init.method !== "POST" || path !== "/claw-api/v1/assistant/reviews")
+      return Response.json({ message: `Route ${init.method ?? "GET"}:${path} not found` }, { status: 404 });
+    const body = JSON.parse(typeof init.body === "string" ? init.body : "{}") as Record<string, unknown>;
+    this.requests.push({ headers: Object.fromEntries(new Headers(init.headers).entries()), body });
+    const refuse = (status: number, error: string) =>
+      Response.json({ ok: false, error, message: "nothing was started", data: { field: "handoff_id" } }, { status });
+    let reviewOnly = body.review_only === true;
+    const id = typeof body.handoff_id === "string" ? body.handoff_id : "";
+    if (id) {
+      const handoff = this.handoffs.get(id);
+      if (handoff === undefined || this.clock.epochMs() - handoff.at > 24 * 3600_000)
+        return refuse(404, "handoff_not_found");
+      if (handoff.used) return refuse(409, "handoff_used");
+      handoff.used = true;
+      reviewOnly = reviewOnly || !handoff.merge;
+    }
+    const items = (body.prs as { owner: string; repo: string; number: number }[]).map((pr) => {
+      this.seq += 1;
+      return {
+        item_id: `item-${String(this.seq)}`,
+        seq: this.seq,
+        title: `${pr.owner}/${pr.repo}#${String(pr.number)}`,
+        pr: { owner: pr.owner, repo: pr.repo, number: pr.number },
+        ignored: [],
+        review_only: reviewOnly,
+      };
+    });
+    return Response.json({ ok: true, data: { items } });
+  }
+}
+
+/** The world's Claw reviews, started over HTTP through the runtime's own client (the rest of Claw stays the fake port). */
+export function clawReviewsOverHttp(world: ReviewWorld): ClawReviewsHttp {
+  const http = new ClawReviewsHttp(world.clock);
+  const client = createClawClient({
+    baseUrl: "https://claw.test/claw-api",
+    clock: world.clock,
+    fetch: (url, init) => Promise.resolve(http.handle(url, init)),
+  });
+  (world.deps as { claw: ClawPort }).claw = { ...world.claw.port(), assistant: client.assistant };
+  return http;
 }
