@@ -188,7 +188,9 @@ release version, and its `appVersion` stays `latest`.
   same decision routes as any held write, reads every gate again and the head must be the one R was asked about; then R's
   account merges (or queues) it, audited as `gh_pr_merge_as_requester`, and a held merge of X's for that head closes as
   merged by R. R's no leaves it unmerged and ends the item; R is not asked again for that head. The item stays in
-  progress while R's answer is awaited, and X is not asked about R's question. Review items opened before this change
+  progress while R's answer is awaited, and X is not asked about R's question. The sweep always reads the pull request
+  with X's account first, and uses R's account only once that read shows X's merge of the current head was refused, so a
+  push after X's refusal is read with X's account only and R's credential is not fetched. Review items opened before this change
   follow the new rule after the deploy: a merge held for X waits for X, and R is asked only as above.
 - Personal agent: the receipt for "请 X 帮我 review 并合入" says plainly who merges: "X 批准后，用 X 的账号合入", with
   "（X 需要确认，TA 确认之前不会合入）" when X's merge waits for X, and "X 没有合入权限时，会先问你要不要用你自己的账号合入。"

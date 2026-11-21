@@ -190,10 +190,15 @@ describe("F whose account merges after the reviewer's approval", () => {
     o = await follow();
     assert.equal(o.body.reason, "no_merge_permission", o.text);
     e.gh.repo.permissions = { push: true, pull: true, admin: false };
-    // bob's refusal was of another head: this one is still his to merge, and she is not asked.
+    // bob's refusal was of another head: this one is still his to merge, and she is not asked. The current head is read with bob's
+    // account, and alice's is neither fetched nor used, since bob was never refused on this head.
     await e.sql("UPDATE claw_github_audit SET head_sha = $1 WHERE tool = 'gh_pr_merge'", ["2".repeat(40)]);
+    e.gh.calls.length = 0;
+    e.resolved.length = 0;
     o = await follow();
-    assert.deepEqual([o.body.status, o.body.reason], ["waiting", "reviewer_may_merge"], o.text);
+    assert.deepEqual([o.body.status, o.body.reason, o.body.head_sha], ["open", undefined, HEAD], o.text);
+    assert.ok(e.gh.calls.length > 0 && e.gh.calls.every((c) => c.authorization === `Bearer ${TOKEN}`), "read with bob's account only");
+    assert.ok(e.resolved.every((r) => r.userId === "u-bob"), JSON.stringify(e.resolved));
     await e.sql("UPDATE claw_github_audit SET head_sha = $1 WHERE tool = 'gh_pr_merge'", [HEAD]);
     // A later merge of bob's of this head, refused for another reason, is the one that counts.
     await bobMergeRefused("ci_not_green");

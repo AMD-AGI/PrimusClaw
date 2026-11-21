@@ -26,6 +26,8 @@
  *       would, but alice's account needs CLEAN: she is not asked while it is UNSTABLE, and 合入 pressed while it is merges nothing
  *   MA9 the base branch has a merge queue: alice's account needs CLEAN there too. While the state is UNSTABLE or BLOCKED she is not
  *       asked, and 合入 pressed while it is puts nothing in the queue
+ *   MA10 bob's merge was refused for a permission on one head, then the author pushed: the new head is read with bob's account, and
+ *       alice's account is never fetched or used, since bob was never refused on it
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -455,5 +457,28 @@ describe("whose account merges a review asked of someone else", { skip }, () => 
       assert.ok(!resolved.includes(ALICE), `alice's credential was never fetched after "${answer.message}": ${resolved.join(",")}`);
       assert.ok(puts().every((c) => c.authorization === `Bearer ${env.TOKEN}`), "any merge the sweep makes is bob's");
     }
+  });
+
+  test("MA10 bob was refused on an earlier head and the author pushed: the new head is read with bob's account, and alice's is never fetched", async () => {
+    const r = await askBob("fully_auto");
+    gh.mergeAnswers = [NOT_AUTHORIZED];
+    const merged = await bobReviews(r, "low");
+    assert.deepEqual([merged.status, merged.reason], ["refused", "merge_not_permitted"], JSON.stringify(merged));
+    // A push before the sweep looks: bob's refusal was of the old head, which says nothing of the new one.
+    const pushed = "2".repeat(40);
+    gh.pr.head = { ...gh.pr.head, sha: pushed };
+    gh.graphql.headRefOid = pushed;
+    gh.calls.length = 0;
+    resolved = [];
+    for (let i = 0; i < 3; i++) await sweep();
+    assert.ok(gh.calls.some((c) => /\/pulls\/7$/.test(c.path) && c.authorization === `Bearer ${env.TOKEN}`), "the new head was read with bob's account");
+    assert.equal(asAlice().length, 0, "nothing read with alice's account");
+    assert.ok(!resolved.includes(ALICE), `alice's credential was never fetched: ${resolved.join(",")}`);
+    const follows = await w.q("SELECT arguments->>'as' AS who, actor_user_id FROM claw_github_audit WHERE session_id = $1 AND tool = 'gh_pr_follow'", [r.sessionId]);
+    assert.ok(follows.length > 0, "the sweep followed the pull request");
+    assert.ok(follows.every((a: Record<string, unknown>) => a.who === "acting_user" && a.actor_user_id === BOB), JSON.stringify(follows));
+    assert.deepEqual(await asks(r.sessionId), [], "alice is not asked about a head bob was never refused on");
+    assert.deepEqual(await cardsTo(ALICE), []);
+    assert.equal(puts().length, 0);
   });
 });

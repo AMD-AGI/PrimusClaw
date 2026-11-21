@@ -944,17 +944,19 @@ export class GithubReview {
    *
    * Whether or not R is asked, a pull request that is merged or closed on GitHub is said so (`already_merged`, `closed`), and every write
    * the session still holds for an answer is closed with it (`stale`, with the reason): there is nothing left to confirm.
-   * Until X cannot merge, and when R has no GitHub account bound, the pull request is read with X's account, as the review read it.
+   * The pull request is read with X's account first, as the review read it; R's account is used only once that read shows X's merge of
+   * the current head was refused (`requesterGates` checks it again on R's read), and never when R has no GitHub account bound.
    */
   async followPullRequest(f: FollowRequest): Promise<ToolOutcome> {
-    const asRequester = f.mergeByRequester && f.requesterUserId !== f.actingUserId
+    // R may be asked only once X's merge of some head was refused for a permission; whether that head is the current one is read
+    // with X's account first, so that R's account is not used on a head X was never refused on (a push after X's refusal).
+    const mayAskRequester = f.mergeByRequester && f.requesterUserId !== f.actingUserId
       && await reviewerMergeRefusal(this.deps.db, f.sessionId, f.actingUserId, null) !== null;
     const tool = "gh_pr_follow";
-    const args = { pr: `${f.ref.owner}/${f.ref.repo}#${f.ref.number}`, as: asRequester ? "requester" : "acting_user" };
-    const actor: ReviewActor = asRequester
-      ? { sessionId: f.sessionId, requesterUserId: f.requesterUserId, actorUserId: f.requesterUserId, requesterLabel: f.requesterLabel }
-      : { sessionId: f.sessionId, requesterUserId: f.requesterUserId, actorUserId: f.actingUserId, requesterLabel: f.requesterLabel };
-    const outcome = await this.run(actor, tool, args, async (ctx, ref) => {
+    const prName = `${f.ref.owner}/${f.ref.repo}#${f.ref.number}`;
+    let refusedHead: string | null = null;
+    const asReviewer: ReviewActor = { sessionId: f.sessionId, requesterUserId: f.requesterUserId, actorUserId: f.actingUserId, requesterLabel: f.requesterLabel };
+    const read = await this.run(asReviewer, tool, { pr: prName, as: "acting_user" }, async (ctx, ref) => {
       const redact = (t: string): string => ctx.client.redact(t);
       const { repo, pr } = await this.load(ctx, ref);
       if (pr.merged || pr.state !== "open") {
@@ -962,21 +964,35 @@ export class GithubReview {
         await this.closeHeldForEnded(f.sessionId, f.requesterUserId, status);
         return ok({ status, url: pr.url, head_sha: pr.headSha }, redact);
       }
-      if (!asRequester) {
-        const st = f.withChecks ? await this.readState(ctx, ref, pr, repo) : null;
-        return ok({
-          status: "open", url: pr.url, head_sha: pr.headSha,
-          ...(st ? { ci: {
-            green: st.checks.green, failed: st.checks.summary.failedNames, advisory: st.checks.summary.advisoryFailed, pending: st.checks.summary.pendingNames,
-            // (what else would stop an approval once CI is green: a review run again for CI alone would be refused for it)
-            unresolved_threads: st.threadsComplete ? st.unresolvedThreads : null,
-          } } : {}),
-        }, redact);
+      if (mayAskRequester && await reviewerMergeRefusal(this.deps.db, f.sessionId, f.actingUserId, pr.headSha) !== null) {
+        // X's merge of this very head was refused: the rest is read with R's account, which reads the head again (`requesterGates`).
+        refusedHead = pr.headSha;
+        return ok({ status: "open", url: pr.url, head_sha: pr.headSha }, redact);
+      }
+      const st = f.withChecks ? await this.readState(ctx, ref, pr, repo) : null;
+      return ok({
+        status: "open", url: pr.url, head_sha: pr.headSha,
+        ...(st ? { ci: {
+          green: st.checks.green, failed: st.checks.summary.failedNames, advisory: st.checks.summary.advisoryFailed, pending: st.checks.summary.pendingNames,
+          // (what else would stop an approval once CI is green: a review run again for CI alone would be refused for it)
+          unresolved_threads: st.threadsComplete ? st.unresolvedThreads : null,
+        } } : {}),
+      }, redact);
+    }, { skipBudget: true, ref: f.ref });
+    if (refusedHead === null) return read;
+    const asRequester: ReviewActor = { sessionId: f.sessionId, requesterUserId: f.requesterUserId, actorUserId: f.requesterUserId, requesterLabel: f.requesterLabel };
+    const outcome = await this.run(asRequester, tool, { pr: prName, as: "requester" }, async (ctx, ref) => {
+      const redact = (t: string): string => ctx.client.redact(t);
+      const { repo, pr } = await this.load(ctx, ref);
+      if (pr.merged || pr.state !== "open") {
+        const status = pr.merged ? "already_merged" : "closed";
+        await this.closeHeldForEnded(f.sessionId, f.requesterUserId, status);
+        return ok({ status, url: pr.url, head_sha: pr.headSha }, redact);
       }
       return ok(await this.askRequester(ctx, ref, repo, pr, f), redact);
     }, { skipBudget: true, ref: f.ref });
     // R has no GitHub account bound (or it lapsed): what became of the pull request is still read, with X's account as the review read it.
-    if (asRequester && outcome.isError && ["actor_not_bound", "credential_expired", "acting_login_unknown"].includes(String(outcome.body.reason))) {
+    if (outcome.isError && ["actor_not_bound", "credential_expired", "acting_login_unknown"].includes(String(outcome.body.reason))) {
       return this.followPullRequest({ ...f, mergeByRequester: false });
     }
     return outcome;
