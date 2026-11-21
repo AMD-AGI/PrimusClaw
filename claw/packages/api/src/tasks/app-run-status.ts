@@ -18,6 +18,8 @@
  *   {
  *     "sandbox": { "state": "pending" | "running" | "ended", "workload_id": string, "since": ISO time | null },
  *     "restarts": int,
+ *     "crash_restarts": int,
+ *     "platform_losses": int,
  *     "last_exit": null | { "returncode": int | null, "at": ISO time, "cause": AppRunExitCause },
  *     "outcome": null | { "cause": AppRunCause, "returncode": int | null, "final": bool, "error": string | null }
  *   }
@@ -112,11 +114,21 @@ export interface AppRunStatus {
     since: string | null;
   };
   /**
-   * Restarts the Brain has counted against the manifest's `restart.max_restarts`: an
-   * exit without `final`, a launch that kept failing, or a sandbox lost for a reason
-   * that is the application's. A sandbox the platform took away is not counted.
+   * Every time the run's application was started again: {@link crash_restarts} plus
+   * {@link platform_losses}.
    */
   restarts: number;
+  /**
+   * Restarts for the application's own failure, the ones counted against the
+   * manifest's `restart.max_restarts`: an exit without `final`, a launch that kept
+   * failing, or a sandbox lost for a reason that is the application's.
+   */
+  crash_restarts: number;
+  /**
+   * Sandboxes the platform took away (its node lost, no node to run on) that were
+   * replaced with a new one. Not counted against `restart.max_restarts`.
+   */
+  platform_losses: number;
   /** The last time the application stopped (or the run was stopped); null until then. */
   last_exit: AppRunLastExitView | null;
   /** How the run ended; null until it has. */
@@ -259,17 +271,27 @@ interface StatusRow {
   sandbox_since: Date | string | null;
 }
 
+/** A count as stored (an int column, or a number in `last_exit`); 0 for anything that is not a positive whole number. */
+function count(v: unknown): number {
+  const n = typeof v === "string" ? Number(v) : v;
+  return typeof n === "number" && Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
+
 export function appRunStatusOf(row: StatusRow): AppRunStatus {
   const since = row.sandbox_since instanceof Date ? row.sandbox_since.toISOString() : row.sandbox_since ?? null;
-  const restarts = Number(row.restarts ?? 0);
-  const counted = Number.isInteger(restarts) && restarts > 0 ? restarts : 0;
+  const counted = count(row.restarts);
+  // The Brain writes the count as a number; nothing else in `last_exit` is read as one.
+  const lossesRaw = row.last_exit?.platform_losses;
+  const losses = typeof lossesRaw === "number" ? count(lossesRaw) : 0;
   return {
     sandbox: {
       state: sandboxStateOf(row.sandbox_state, row.state),
       workload_id: row.sandbox_workload_id ?? "",
       since,
     },
-    restarts: counted,
+    restarts: counted + losses,
+    crash_restarts: counted,
+    platform_losses: losses,
     last_exit: appRunLastExitOf(row.last_exit, counted),
     outcome: appRunOutcomeOf(row.state, row.last_exit),
   };

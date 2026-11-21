@@ -569,7 +569,7 @@ describe("an app run's sandbox state and outcome on the task and run routes", { 
     const row = (await q("SELECT state, restarts, last_exit FROM claw_app_runs WHERE task_id = $1", [taskId])).rows[0] as Json;
     assert.deepEqual({ state: row.state, restarts: row.restarts, last_exit: row.last_exit }, { state: "provisioning", restarts: 0, last_exit: null });
     const after = (await readBoth(taskId)).app;
-    assert.deepEqual(after, { sandbox: queued, restarts: 0, last_exit: null, outcome: null }, "the stop alone changes nothing a caller sees");
+    assert.deepEqual(after, { sandbox: queued, restarts: 0, crash_restarts: 0, platform_losses: 0, last_exit: null, outcome: null }, "the stop alone changes nothing a caller sees");
     const outcome = await runner.finishNow(cause);
     assert.equal(outcome.success, false);
     assert.ok(seen.includes("finishing:pending"), `the finish passed through finishing with the sandbox still pending: ${seen}`);
@@ -673,6 +673,8 @@ describe("an app run's sandbox state and outcome on the task and run routes", { 
       assert.deepEqual(done, {
         sandbox: { state: "ended", workload_id: done.sandbox.workload_id, since: null },
         restarts: 0,
+        crash_restarts: 0,
+        platform_losses: 0,
         last_exit: { returncode: 0, at: done.last_exit?.at, cause: "exited" },
         outcome: { cause: "exited", returncode: 0, final: true, error: null },
       }, "read from the run's state");

@@ -123,11 +123,31 @@ test("last_exit: every cause the Brain writes, its return code and time; nothing
 test("status: restarts and last_exit beside the sandbox, from the row; restarts never below zero", () => {
   const row = { task_id: "t", state: "restarting", sandbox_workload_id: "w", sandbox_state: "running", sandbox_since: AT };
   const s = appRunStatusOf({ ...row, restarts: "3", last_exit: exit({ cause: "exit", returncode: 13 }) });
-  assert.deepEqual({ restarts: s.restarts, last_exit: s.last_exit, outcome: s.outcome },
-    { restarts: 3, last_exit: { returncode: 13, at: AT, cause: "exited" }, outcome: null });
-  assert.deepEqual(Object.keys(s), ["sandbox", "restarts", "last_exit", "outcome"]);
-  assert.equal(appRunStatusOf({ ...row, restarts: null, last_exit: null }).restarts, 0);
-  assert.equal(appRunStatusOf({ ...row, restarts: -1, last_exit: null }).restarts, 0);
+  assert.deepEqual({ restarts: s.restarts, crash_restarts: s.crash_restarts, platform_losses: s.platform_losses, last_exit: s.last_exit, outcome: s.outcome },
+    { restarts: 3, crash_restarts: 3, platform_losses: 0, last_exit: { returncode: 13, at: AT, cause: "exited" }, outcome: null });
+  assert.deepEqual(Object.keys(s), ["sandbox", "restarts", "crash_restarts", "platform_losses", "last_exit", "outcome"]);
+  const counts = (r: Record<string, unknown>) => {
+    const v = appRunStatusOf({ ...row, ...r } as never);
+    return [v.restarts, v.crash_restarts, v.platform_losses];
+  };
+  assert.deepEqual(counts({ restarts: null, last_exit: null }), [0, 0, 0]);
+  assert.deepEqual(counts({ restarts: -1, last_exit: null }), [0, 0, 0]);
+});
+
+test("status: crash_restarts from the row's restarts, platform_losses from last_exit, restarts their total", () => {
+  const row = { task_id: "t", state: "provisioning", sandbox_workload_id: null, sandbox_state: "pending", sandbox_since: AT };
+  const counts = (restarts: unknown, lastExit: Record<string, unknown> | null) => {
+    const v = appRunStatusOf({ ...row, restarts, last_exit: lastExit } as never);
+    return { restarts: v.restarts, crash_restarts: v.crash_restarts, platform_losses: v.platform_losses };
+  };
+  assert.deepEqual(counts(2, exit({ cause: "sandbox_lost", platform_losses: 3 })), { restarts: 5, crash_restarts: 2, platform_losses: 3 });
+  assert.deepEqual(counts(0, exit({ cause: "sandbox_lost", platform_losses: 1 })), { restarts: 1, crash_restarts: 0, platform_losses: 1 });
+  // Carried onto an ending the run reached afterwards, which still says so.
+  assert.deepEqual(counts(1, exit({ cause: "exit", final: true, returncode: 0, platform_losses: 2 })), { restarts: 3, crash_restarts: 1, platform_losses: 2 });
+  // Anything that is not a positive whole number is no loss.
+  for (const bad of [-1, 1.5, "2", null, true, Number.NaN]) {
+    assert.deepEqual(counts(1, exit({ cause: "sandbox_lost", platform_losses: bad })), { restarts: 1, crash_restarts: 1, platform_losses: 0 }, String(bad));
+  }
 });
 
 test("the run's time limit: the smaller of the manifest's and the request's grant; the stop grace bounded", () => {
