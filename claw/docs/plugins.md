@@ -457,9 +457,9 @@ characters; anchor it with `^...$`), `maxLength` (1-4096, default 4096) and
 have leading or trailing whitespace. All pattern tests of one launch share a
 50 ms budget and run interruptibly, so a pattern that backtracks badly cannot
 stall the API: a value whose test does not finish in time is refused. Whether a
-pattern compiles is checked under its own 1 s budget (compiling runs nothing
-against a value), so a stored declaration does not read as invalid because the
-API was briefly busy.
+declaration's patterns compile is checked once for all of them, under its own
+500 ms budget (compiling runs nothing against a value), so a stored declaration
+does not read as invalid because the API was briefly busy.
 
 ### Launching with `overrides`
 

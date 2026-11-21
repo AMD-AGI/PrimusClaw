@@ -201,6 +201,27 @@ test("a quantity is compared exactly, and shared memory against the memory the t
   })() } } }).ok);
 });
 
+// D1
+test("every pattern of a declaration is compiled in one check, and only one that does not compile is named", () => {
+  const rule = (pattern: string) => ({ pattern });
+  const image = (pattern: string) => ({ fromImage: { pattern } });
+  // Invalid patterns before, between and after valid ones: each is named in its place, and no valid one is.
+  assert.deepEqual(overridableDeclarationProblems({
+    env: { A: rule("("), B: rule("^[a-z]+$"), C: rule("["), D: rule("^x$") },
+    sandbox_templates: { runner: image("^r:[0-9]+$"), wrapped: image(")") },
+  }).map((p) => p.field), [
+    "overridable.env.A.pattern", "overridable.env.C.pattern", "overridable.sandbox_templates.wrapped.fromImage.pattern",
+  ]);
+  assert.deepEqual(overridableDeclarationProblems({
+    env: { A: rule("^a$"), B: rule("(") },
+    sandbox_templates: { runner: image("^r:[0-9]+$") },
+  }).map((p) => p.field), ["overridable.env.B.pattern"]);
+  assert.deepEqual(overridableDeclarationProblems({
+    env: { A: rule("^a$"), B: rule("^b$") },
+    sandbox_templates: { runner: image("^r:[0-9]+$"), wrapped: image("^w:[0-9]+$") },
+  }), []);
+});
+
 // D2
 test("the values land where Agent Sandbox reads them, in both template forms", () => {
   const before = JSON.stringify(MANIFEST);

@@ -138,10 +138,11 @@ export const OVERRIDE_LIMITS = {
    */
   patternBudgetMs: 50,
   /**
-   * Budget for checking that one declared `pattern` compiles. Compiling runs
-   * nothing against a value, so this only has to outlast a busy moment.
+   * Budget for checking that every `pattern` of one declaration compiles, as
+   * one run (tried once more if it does not finish). Compiling runs nothing
+   * against a value, so this only has to outlast a busy moment.
    */
-  patternCompileBudgetMs: 1000,
+  patternCompileBudgetMs: 500,
 } as const;
 
 /** The variable names an app manifest accepts; the manifest validator has the last word on reserved names. */
@@ -185,7 +186,23 @@ function checkEnum(v: unknown, at: string, out: OverrideProblem[]): void {
   }
 }
 
-function checkStringRule(v: unknown, at: string, out: OverrideProblem[], extraKeys: string[] = []): void {
+/**
+ * A declared pattern awaiting the one compile check of its declaration: the
+ * problem it becomes if it does not compile, already in its place in `out`
+ * and dropped from it when it does.
+ */
+interface CompileJob {
+  pattern: string;
+  problem: OverrideProblem;
+}
+
+function checkStringRule(
+  v: unknown,
+  at: string,
+  out: OverrideProblem[],
+  compile: CompileJob[],
+  extraKeys: string[] = [],
+): void {
   if (!isPlainObject(v)) {
     out.push({ field: at, reason: "must be an object" });
     return;
@@ -197,9 +214,9 @@ function checkStringRule(v: unknown, at: string, out: OverrideProblem[], extraKe
     if (typeof v.pattern !== "string" || v.pattern === "" || v.pattern.length > OVERRIDE_LIMITS.maxPatternLength) {
       out.push({ field: `${at}.pattern`, reason: `must be a non-empty string of at most ${OVERRIDE_LIMITS.maxPatternLength} characters` });
     } else {
-      if (!patternCompiles(v.pattern)) {
-        out.push({ field: `${at}.pattern`, reason: "is not a valid regular expression" });
-      }
+      const problem = { field: `${at}.pattern`, reason: "is not a valid regular expression" };
+      out.push(problem);
+      compile.push({ pattern: v.pattern, problem });
     }
   }
   if (v.maxLength !== undefined && !(Number.isSafeInteger(v.maxLength)
@@ -217,6 +234,15 @@ export function overridableDeclarationProblems(v: unknown): OverrideProblem[] {
   const out: OverrideProblem[] = [];
   if (v === undefined || v === null) return out;
   if (!isPlainObject(v)) return [{ field: "overridable", reason: "must be an object" }];
+  const compile: CompileJob[] = [];
+  declarationProblems(v, out, compile);
+  // Every pattern of the declaration in one check, under one budget.
+  const compiled = patternsCompile(compile.map((j) => j.pattern));
+  const valid = new Set(compile.filter((_, i) => compiled?.[i] === true).map((j) => j.problem));
+  return valid.size === 0 ? out : out.filter((p) => !valid.has(p));
+}
+
+function declarationProblems(v: Record<string, unknown>, out: OverrideProblem[], compile: CompileJob[]): void {
   for (const k of Object.keys(v)) {
     if (!TOP_KEYS.has(k)) out.push({ field: `overridable.${k}`, reason: `unknown key (expected ${TOP_KEYS_TEXT})` });
   }
@@ -229,7 +255,7 @@ export function overridableDeclarationProblems(v: unknown): OverrideProblem[] {
     }
   }
   if (v.model !== undefined) {
-    checkStringRule(v.model, "overridable.model", out, ["env"]);
+    checkStringRule(v.model, "overridable.model", out, compile, ["env"]);
     const env = isPlainObject(v.model) ? v.model.env : undefined;
     if (env !== undefined && (!Array.isArray(env) || env.length > OVERRIDE_LIMITS.maxEnvEntries
       || !env.every(isEnvName))) {
@@ -241,7 +267,7 @@ export function overridableDeclarationProblems(v: unknown): OverrideProblem[] {
     else {
       checkKeys(v.args, ["type", "items", "maxItems", "description"], "overridable.args", out);
       if (v.args.type !== undefined && v.args.type !== "array") out.push({ field: "overridable.args.type", reason: "must be \"array\"" });
-      if (v.args.items !== undefined) checkStringRule(v.args.items, "overridable.args.items", out);
+      if (v.args.items !== undefined) checkStringRule(v.args.items, "overridable.args.items", out, compile);
       if (v.args.maxItems !== undefined && !(Number.isSafeInteger(v.args.maxItems)
         && (v.args.maxItems as number) >= 1 && (v.args.maxItems as number) <= OVERRIDE_LIMITS.maxArgs)) {
         out.push({ field: "overridable.args.maxItems", reason: `must be an integer from 1 to ${OVERRIDE_LIMITS.maxArgs}` });
@@ -258,7 +284,7 @@ export function overridableDeclarationProblems(v: unknown): OverrideProblem[] {
       }
       for (const name of names) {
         if (!isEnvName(name)) out.push({ field: `overridable.env.${name}`, reason: "is not an environment variable name" });
-        else checkStringRule(v.env[name], `overridable.env.${name}`, out);
+        else checkStringRule(v.env[name], `overridable.env.${name}`, out, compile);
       }
     }
   }
@@ -272,11 +298,10 @@ export function overridableDeclarationProblems(v: unknown): OverrideProblem[] {
       }
       for (const name of names) {
         if (!TEMPLATE_NAME_RE.test(name)) out.push({ field: `${at}.${name}`, reason: "is not a template name" });
-        else checkTemplateDeclaration(v.sandbox_templates[name], `${at}.${name}`, out);
+        else checkTemplateDeclaration(v.sandbox_templates[name], `${at}.${name}`, out, compile);
       }
     }
   }
-  return out;
 }
 
 const DECIMAL_SUFFIX_EXPONENT: Readonly<Record<string, number>> = Object.freeze(
@@ -343,7 +368,7 @@ function checkIntegerRule(v: unknown, at: string, out: OverrideProblem[]): void 
   checkDescription(v, at, out);
 }
 
-function checkTemplateDeclaration(v: unknown, at: string, out: OverrideProblem[]): void {
+function checkTemplateDeclaration(v: unknown, at: string, out: OverrideProblem[], compile: CompileJob[]): void {
   if (!isPlainObject(v)) {
     out.push({ field: at, reason: "must be an object" });
     return;
@@ -353,7 +378,7 @@ function checkTemplateDeclaration(v: unknown, at: string, out: OverrideProblem[]
     out.push({ field: at, reason: "declares nothing overridable (expected fromImage, per_gpu_count or resources)" });
   }
   if (v.fromImage !== undefined) {
-    checkStringRule(v.fromImage, `${at}.fromImage`, out);
+    checkStringRule(v.fromImage, `${at}.fromImage`, out, compile);
     // An image is what a sandbox runs: the declaration says which, never "any".
     if (isPlainObject(v.fromImage) && v.fromImage.enum === undefined && v.fromImage.pattern === undefined) {
       out.push({ field: `${at}.fromImage`, reason: "needs an enum or a pattern" });
@@ -429,25 +454,31 @@ function inPatternContext(script: string, data: string, budgetMs: number): unkno
 }
 
 /**
- * Whether `pattern` compiles as a `u`-flag regular expression. It is compiled
- * where it is tested, in the pattern context, but under its own budget rather
- * than the match budget: compiling only parses the (bounded) pattern and runs
- * nothing against a value, so it finishes in microseconds, and a stored
- * declaration is re-checked on every launch. Under the 50 ms match budget a
- * slow moment read as "not a valid regular expression", so a valid declaration
- * intermittently read as none at all; a check that still does not finish is
- * tried once more before it counts as one that failed.
+ * Whether each of `patterns` compiles as a `u`-flag regular expression, as one
+ * run in the pattern context (where they are tested); null when the check did
+ * not finish. It has its own budget rather than the match budget: compiling
+ * only parses the (bounded) patterns and runs nothing against a value, and a
+ * stored declaration is re-checked on every launch, so under the 50 ms match
+ * budget a busy moment read as "not a valid regular expression" and a valid
+ * declaration as none at all. A run that does not finish is tried once more,
+ * so one declaration holds the event loop for at most twice the budget.
  */
-export function patternCompiles(pattern: string): boolean {
+export function patternsCompile(patterns: string[]): boolean[] | null {
+  if (patterns.length === 0) return [];
   for (let attempt = 0; attempt < 2; attempt++) {
     const out = inPatternContext(
-      "JSON.stringify((() => { try { new RegExp(JSON.parse(__jobs), 'u'); return true; } catch { return false; } })())",
-      JSON.stringify(pattern),
+      "JSON.stringify(JSON.parse(__jobs).map((p) => { try { new RegExp(p, 'u'); return true; } catch { return false; } }))",
+      JSON.stringify(patterns),
       OVERRIDE_LIMITS.patternCompileBudgetMs,
     );
-    if (typeof out === "boolean") return out;
+    if (Array.isArray(out) && out.length === patterns.length) return out.map((x) => x === true);
   }
-  return false;
+  return null;
+}
+
+/** Whether `pattern` compiles as a `u`-flag regular expression; false when the check did not finish. */
+export function patternCompiles(pattern: string): boolean {
+  return patternsCompile([pattern])?.[0] === true;
 }
 
 /**
