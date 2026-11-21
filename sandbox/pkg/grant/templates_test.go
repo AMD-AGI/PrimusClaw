@@ -31,8 +31,12 @@ var (
 
 func measurementTemplateForCards(t *testing.T, gpus int32) *runtimev1alpha1.CodeInterpreter {
 	t.Helper()
-	base := &runtimev1alpha1.CodeInterpreterSandboxTemplate{FromImage: "example@sha256:" + fmt.Sprintf("%064d", 0)}
-	return codeInterpreter("grant", fmt.Sprintf("ar-01ja-measurement-g%d", gpus), base, gpus, "ns")
+	base := &templateSpec{template: &runtimev1alpha1.CodeInterpreterSandboxTemplate{FromImage: "example@sha256:" + fmt.Sprintf("%064d", 0)}}
+	ci, err := codeInterpreter("grant", fmt.Sprintf("ar-01ja-measurement-g%d", gpus), base, gpus, "ns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ci
 }
 
 // Every card count up to a whole node is admitted on one MI355X node, and as

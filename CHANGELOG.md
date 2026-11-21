@@ -178,6 +178,23 @@ release version, and its `appVersion` stays `latest`.
 
 ### Changed
 
+- Agent Sandbox: a GPU template's CPU, memory, pod storage and `/dev/shm` now come from the template when it sets them,
+  instead of always 24 CPU, 224Gi memory, 187.5Gi storage and 125Gi shared memory per card. A sandbox can ask for what
+  it needs (for example 16 CPU and 448Gi for two cards, or 32 CPU and 1792Gi for eight) and leave the rest of the node
+  to CPU sandboxes. Before, `resources` on a grant or owner policy template with GPU counts was silently overwritten.
+  Each of `cpu`, `memory` and `ephemeral-storage` in `resources.requests`/`resources.limits` is resolved on its own: a
+  value given only as a request is also the limit, one given only as a limit is also the request, and one given in
+  neither keeps the per-card size times the card count. `/dev/shm` is the spec's `gpu.sharedMemory`, else 125Gi per card
+  lowered to the memory limit when that is smaller. The card count still comes only from `perGpuCount`. A template with
+  no `resources` or `gpu` is sized exactly as before. A value that is zero, negative or not a quantity, a request above
+  its limit, a shared memory above the memory limit, any other resource name on a GPU template, or any `gpu` field but
+  `sharedMemory`, is refused with `400` (`invalid_grant` or `invalid_owner_policy`) naming the field, and nothing is
+  registered. A template without GPU counts keeps its `resources` as written, and its `cpu`, `memory` and
+  `ephemeral-storage` are now checked the same way. Claw already passes a manifest template's fields through unchanged, so an app manifest's
+  `sandbox_templates` entries can set these now. See `sandbox/docs/E2B.md` (GPU template size). Deploy the sandbox control
+  plane (`agent-sandbox-controlplane`); Claw is unchanged. Templates registered before the release keep their size until
+  their grant is issued again.
+
 - Claw API: a review asked of someone else ("review and merge", R asking X) is now merged with the reviewer's account
   whenever the reviewer can merge it, and the requester's own account is used only when the reviewer cannot, and only on
   the requester's yes. Under X's `fully_auto` the merge is made at once; under `high_risk_confirm` a held merge waits for

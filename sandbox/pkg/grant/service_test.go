@@ -1181,12 +1181,18 @@ func TestReaperPromotesPendingSandbox(t *testing.T) {
 }
 
 func TestMeasurementTemplateDeniesEgress(t *testing.T) {
-	base := &runtimev1alpha1.CodeInterpreterSandboxTemplate{FromImage: "image:v1"}
-	measurement := codeInterpreter("gr", "ar-01ja-measurement-g8", base, 8, "ns")
+	base := &templateSpec{template: &runtimev1alpha1.CodeInterpreterSandboxTemplate{FromImage: "image:v1"}}
+	measurement, err := codeInterpreter("gr", "ar-01ja-measurement-g8", base, 8, "ns")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if measurement.Spec.RuntimePolicy != "agent-restricted" {
 		t.Fatalf("policy=%s", measurement.Spec.RuntimePolicy)
 	}
-	dev := codeInterpreter("gr", "ar-01ja-dev-g1", base, 1, "ns")
+	dev, err := codeInterpreter("gr", "ar-01ja-dev-g1", base, 1, "ns")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if dev.Spec.RuntimePolicy != "" {
 		t.Fatalf("dev policy=%s", dev.Spec.RuntimePolicy)
 	}
