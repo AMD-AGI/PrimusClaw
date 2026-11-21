@@ -15,21 +15,62 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
-## Unreleased
+## 0.11.0
+
+A minor release, because core's exported API changes incompatibly: `StorePort` gains required members for a review that
+waits for its reviewer's steps (see the note below), so a store of one's own must add them (#893). No plugin port (core's
+`src/plugins/`) changed. The runtime's SQLite store gains one table (`review_onboarding`), created at start; nothing to do
+for a deployment of the published packages. It walks a reviewer with steps left through each and lets the asker start
+the same request again (#893), says who merges a review asked of someone else (#894), and gets the Teams ingress's
+messages through again after its Service Bus connection dies (#896).
+
+**Claw:** the question to the asker whether to merge with their own account when the reviewer cannot merge is asked by
+Claw, claw-v0.5.11 and later (#894); with an older Claw it is not asked.
+
+**Breaking for custom StorePort implementations:** In `@primusclaw/personal-agent`, the core's exported `StorePort`
+gains required members on its GitHub repository for a review that waits for its reviewer's steps (`ReviewOnboarding`:
+`saveReviewOnboarding`, `getReviewOnboarding`, `openReviewOnboardings`, `onboardingReviewers`, `claimOnboardingStep`,
+`releaseOnboardingStep`, `finishReviewOnboarding`, `dropReviewOnboarding`, `declineReviewOnboarding`,
+`declinedReviewOnboardings`, `claimDeclinedOnboarding`, `releaseDeclinedOnboarding`), and
+`REVIEW_ONBOARDING_KEEP_SECONDS` (a week). The runtime's SQLite store implements them, so a deployment of the published
+packages has nothing to do; a store of one's own must add them (#893).
 
 ### Added
 
 - `deploy/teams-ingress-alerts.yaml`: Grafana alert rules over the ingress's Application Insights, more than 2 requests to
   `messages` answered `499` or above in 5 minutes, and any failed enqueue, with the data source they need
-  ([quick start](docs/quickstart.md#4-the-ingress), "Alerts").
+  ([quick start](docs/quickstart.md#4-the-ingress), "Alerts") (#896).
 
 ### Changed
 
+- `@primusclaw/personal-agent`: the receipt for "请 X 帮我 review 并合入" says plainly who merges: "X 批准后，用 X 的账号合入", with
+  "（X 需要确认，TA 确认之前不会合入）" when X's merge waits for X, and "X 没有合入权限时，会先问你要不要用你自己的账号合入。"
+  when Claw may ask the asker; the old "（X 那边被拦下的合入，会用你自己的 GitHub 账号合，前提是 PR 是你提的）" is gone. A
+  card for a held merge (the reviewer's, or the asker's question) now has 合入 and 不合 ("Merge" and "Don't merge")
+  instead of "不要" (#894).
 - `@primusclaw/personal-agent-teams-ingress`: `QueueClient` (what a `ServiceBusFactory` returns) has a `close()`, which
-  the ingress calls on a client it throws away. A factory of one's own must add it.
+  the ingress calls on a client it throws away. A factory of one's own must add it (#896).
 
 ### Fixed
 
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`: a review asked of a colleague who cannot be acted as yet no longer stops at the first step they finish.
+  Reviewing for someone else takes three steps of theirs (connecting their Primus account at the identity service,
+  `/github bind`, `/github auto-merge on`, and `/link` when their own key is missing too), and confirming the identity
+  card looked like being done. Now the request is kept (new store table `review_onboarding`, kept a week): the reviewer's
+  first message lists every step with the current one marked, in English and Chinese, and each step they finish is
+  answered once with the next one (a button runs `/github bind`, another turns the authorization on or declines it). The
+  identity service tells the worker nothing when someone confirms there, so the reviewer's state is read again on any
+  message of theirs and every minute. The asker is told which step is missing ("还差第 N 步「…」"), and once every step is
+  done hears "<name> 已完成授权，可以开始代审了" where they asked, with a button that starts the same request again (same
+  pull requests, same merge flag, the same handoff within a day, the same model) through every check, the model's
+  included, so nothing starts without the reviewer's authorization on and nothing runs on a model nobody chose. A
+  reviewer who declines, or turns the authorization off while asked, is not asked again for those requests, and each
+  asker is told once; a later new request of them sends the steps once more. The reviewer's first message stays at most once a day. A step that could not be said (the
+  reviewer's chat not reachable yet, or a send whose text failed) is said on the next read rather than counted as said;
+  once its text went, a button that failed after it does not send the step again. The asker's "ready" and "declined"
+  messages are marked sent only once they went out, and one that failed is sent by the next minute's read. A GitHub notice
+  that already went to the reviewer earlier the same day for something else no longer keeps the step they are at from
+  being sent. Asked again for the same pull requests, a button sent for the earlier request no longer starts the new one (#893).
 - The Teams ingress gets messages through again after the Service Bus connection under its kept client dies. Until now a
   failed send was retried on a new sender of the same client; when the client's connection was stuck closing, every
   sender opened on it waited the whole 20 s deadline, so every message on that instance was lost (answered `500`, or
@@ -41,14 +82,14 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   `500` that Teams retries. The token check itself races the same deadline: on a cold instance its OpenID metadata and
   signing-key fetches may take up to 15 s and 30 s, and a request held past the Bot Framework's wait lost its message as
   a `499`; it is now a `500` at the deadline (Teams retries it, and the keys fetched meanwhile are cached). The queue
-  message id stays the activity id, which the worker dedupes on.
+  message id stays the activity id, which the worker dedupes on (#896).
 - A card action (`adaptiveCard/action`) the ingress cannot queue is answered `500`, which the Bot Framework retries, like
   any other activity. Until now it was answered `200` with a "temporarily unavailable" card, which ended the invoke: the
-  click never reached the worker and was not retried. `UNAVAILABLE_CARD` stays exported but the ingress no longer sends it.
+  click never reached the worker and was not retried. `UNAVAILABLE_CARD` stays exported but the ingress no longer sends it (#896).
 - The ingress reports its send path: one `inbound_enqueue_failed` record (logger `ingress_health`) per send that fails
   after its retries, one `inbound_client_reset` per client thrown away and one `inbound_enqueue_recovered` on the first
   success after failures, each with the instance's running counts (`Ingress.health.counters`). Never the message, the
-  error text or a setting.
+  error text or a setting (#896).
 
 ## 0.10.4
 
