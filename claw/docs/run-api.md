@@ -178,7 +178,7 @@ may still be queued for capacity or pulling a large image.
 | --- | --- |
 | `pending` | No sandbox is running yet: it is being created, is queued, or is starting (image pull included). Also after a sandbox was lost and a new one is on its way. |
 | `running` | The platform reported the sandbox Running. The application may be starting, running, or waiting to be restarted in it. |
-| `ended` | The run is over and its sandbox was stopped. |
+| `ended` | The run is over and its sandbox was stopped; or the platform lost the sandbox and the run, with no restart left, is finishing without it. |
 
 A run cancelled while its sandbox was still `pending` stays `pending` until it is
 `ended`; it never reads `running`. `sandbox.workload_id` is the platform's workload of

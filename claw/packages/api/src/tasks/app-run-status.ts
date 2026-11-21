@@ -82,18 +82,20 @@ export interface AppRunStatus {
  *
  *   provisioning                    -> pending (no sandbox yet, or one not yet Running)
  *   starting, running, restarting   -> running (the Brain saw the sandbox Running)
- *   finishing                       -> what it was: a run cancelled while its sandbox
+ *   finishing                       -> ended when the move says the sandbox was lost
+ *                                      (`gone`, `last_exit.sandbox_gone`); otherwise
+ *                                      what it was: a run cancelled while its sandbox
  *                                      was queued never had one running
  *   ended                           -> ended (the finish stopped the sandbox)
  *
  * The move out of provisioning is made exactly when the Brain's sandbox `ensure`
  * returns, which is when SaFE reports the workload Running.
  */
-export function sandboxStateSql(next: string): string {
+export function sandboxStateSql(next: string, gone = "FALSE"): string {
   return `(CASE ${next}
              WHEN 'provisioning' THEN 'pending'
              WHEN 'ended' THEN 'ended'
-             WHEN 'finishing' THEN COALESCE(r.sandbox_state, ${LEGACY_SANDBOX_STATE_SQL})
+             WHEN 'finishing' THEN CASE WHEN ${gone} THEN 'ended' ELSE COALESCE(r.sandbox_state, ${LEGACY_SANDBOX_STATE_SQL}) END
              ELSE 'running' END)`;
 }
 

@@ -1099,8 +1099,8 @@ export class AppRunner {
     return this.countedRestart("exit", last);
   }
 
-  private async finishFromExit(exit: Extract<ExitRead, { kind: "exit" }>): Promise<TickResult> {
-    await this.move({ state: "finishing", last_exit: this.exitRecord(exit, "exit") });
+  private async finishFromExit(exit: Extract<ExitRead, { kind: "exit" }>, sandboxGone = false): Promise<TickResult> {
+    await this.move({ state: "finishing", last_exit: { ...this.exitRecord(exit, "exit"), ...(sandboxGone ? { sandbox_gone: true as const } : {}) } });
     return { done: false };
   }
 
@@ -1129,13 +1129,16 @@ export class AppRunner {
       ...(losses > 0 ? { platform_losses: losses } : {}),
       ...sandboxFailure,
     };
+    // A sandbox lost after it was Running (not a provisioning that failed): a run that
+    // ends on it has no sandbox left, and says so on the move to finishing.
+    const gone = cause === "sandbox_lost" && rec.state !== "provisioning" ? { sandbox_gone: true as const } : {};
     // A manifest that allows no restart (max_restarts 0, or no restart block) is never started a second time, whoever lost its
     // sandbox: it ends here as it always did. Only a run that may restart at all is spared spending one on the platform.
     if (platform && maxRestarts(rec.manifest) > 0) {
       if (losses >= PLATFORM_LOSSES_MAX) {
         await this.move({
           state: "finishing",
-          last_exit: { ...lastExit, cause: "restarts_exhausted", stop_reason: `the platform lost the app's sandbox ${losses} times` },
+          last_exit: { ...lastExit, ...gone, cause: "restarts_exhausted", stop_reason: `the platform lost the app's sandbox ${losses} times` },
         });
         return { done: false };
       }
@@ -1148,7 +1151,7 @@ export class AppRunner {
     if (rec.restarts >= maxRestarts(rec.manifest)) {
       // A lost sandbox has already been looked behind (`finalAfterLoss`, through a small
       // reader sandbox): no application-sized sandbox is made only to read `exit.json`.
-      await this.move({ state: "finishing", last_exit: { ...lastExit, cause: "restarts_exhausted" } });
+      await this.move({ state: "finishing", last_exit: { ...lastExit, ...gone, cause: "restarts_exhausted" } });
       return { done: false };
     }
     const restarts = rec.restarts + 1;
@@ -1184,7 +1187,7 @@ export class AppRunner {
     // A sandbox can be lost after the application finished (its node preempted, its pod gone
     // with no exit status): `final` is on shared storage and decides, as it does for an exit.
     const exit = await this.finalAfterLoss();
-    if (exit) return this.finishFromExit(exit);
+    if (exit) return this.finishFromExit(exit, true);
     const reason = status.state === "absent" ? "sandbox_gone" : status.reason;
     return this.countedRestart("sandbox_lost", undefined, platformLoss(reason, status.disrupted === true));
   }

@@ -264,7 +264,7 @@ export async function patchAppRun(
     // The sandbox's state follows the run's (see sandboxStateSql), and its `since`
     // moves when it changes -- or when the run goes back to provisioning to make a
     // new sandbox, whose wait starts now.
-    const next = sandboxStateSql(`$${params.length}::text`);
+    const next = sandboxStateSql(`$${params.length}::text`, patch.last_exit?.sandbox_gone === true ? "TRUE" : "FALSE");
     const fresh = patch.state === "provisioning" && patch.sandbox_workload_id === null ? "TRUE" : "FALSE";
     sets.push(`sandbox_state = ${next}`);
     sets.push(`sandbox_since = CASE WHEN ${fresh} OR ${next} IS DISTINCT FROM r.sandbox_state THEN NOW() ELSE r.sandbox_since END`);

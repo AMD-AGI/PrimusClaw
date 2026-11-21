@@ -38,6 +38,7 @@ test("a refused create: the code and the platform's words (the key masked) go on
   assert.equal(world.rec.state, "finishing");
   assert.equal(world.rec.last_exit?.cause, "restarts_exhausted");
   assert.equal(world.rec.last_exit?.sandbox_reason, "sandbox_rejected");
+  assert.equal(world.rec.last_exit?.sandbox_gone, undefined, "a sandbox never given was not lost");
   const said = world.rec.last_exit?.sandbox_message ?? "";
   assert.match(said, /^The platform refused to create the sandbox \(HTTP 400\): denied, key /);
   assert.ok(!said.includes(PLATFORM_KEY), said);

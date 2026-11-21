@@ -61,6 +61,12 @@ export interface AppLastExit {
   sandbox_reason?: string;
   /** What the platform said with {@link AppLastExit.sandbox_reason}: one line, bounded, scrubbed. */
   sandbox_message?: string;
+  /**
+   * Set on the move to `finishing` made because the run's sandbox was lost (the
+   * platform reported it gone): there is no sandbox left for the finish to stop, and
+   * callers read the run's sandbox as ended from here.
+   */
+  sandbox_gone?: true;
 }
 
 /**

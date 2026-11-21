@@ -30,7 +30,8 @@
  *      the stop writes nothing (no restart counted), its sandbox never reads
  *      running, and the cause is the stop's
  *   P  a sandbox lost while the application ran: back to pending (and a new
- *      `since`) while the next one queues, then running, then ended
+ *      `since`) while the next one queues, then running, then ended; with no
+ *      restart left, ended from the move to finishing
  *   R  a run whose first create was refused and whose second sandbox ran: the
  *      refusal is cleared from the row once the sandbox is Running
  *   D  a database without the sandbox columns, or the table, which the schema
@@ -164,10 +165,14 @@ function sh(command: string, cwd: string, env: Record<string, string>) {
   });
 }
 
-/** An application that waits for `go` in its state directory, then writes `exit` (when given) and exits. */
+/**
+ * An application that waits for `go` in its state directory, then writes `exit` (when
+ * given) and exits. It ignores SIGTERM, as a slow application does; it also goes once
+ * its state directory is removed, so a run the test stopped leaves nothing behind.
+ */
 function appScript(exit: Record<string, unknown> | null): string {
   const write = exit ? `printf '%s' '${JSON.stringify(exit).replace(/'/g, "'\\''")}' > "$APP_STATE_DIR/exit.json"; ` : "";
-  return `trap '' TERM; while [ ! -f "$APP_STATE_DIR/go" ]; do sleep 0.1; done; ${write}exit 0`;
+  return `trap '' TERM; while [ ! -f "$APP_STATE_DIR/go" ]; do [ -d "$APP_STATE_DIR" ] || exit 0; sleep 0.1; done; ${write}exit 0`;
 }
 
 function manifest(over: Record<string, unknown> = {}, exit: Record<string, unknown> | null = { final: true, returncode: 0 }) {
@@ -621,6 +626,26 @@ describe("an app run's sandbox state and outcome on the task and run routes", { 
     assert.equal(end.sandbox.state, "ended");
     assert.equal(end.sandbox.workload_id, up.workload_id);
     assert.deepEqual(end.outcome, { cause: "exited", returncode: 0, final: true, error: null });
+  });
+
+  test("P: a sandbox lost with no restart left: ended from the move to finishing, not running until the finish is done", async () => {
+    const taskId = await createRun(manifest());
+    const seen: string[] = [];
+    const { runner } = runnerFor(taskId, { USER_DATA_PATH: fresh() }, seen);
+    const done = runner.run(AbortSignal.timeout(60_000));
+    await until("the application up", async () => (await rowState(taskId)) === "running");
+    const up = (await readBoth(taskId)).app.sandbox;
+    assert.equal(up.state, "running");
+    workloads.delete(up.workload_id);
+    assert.equal((await done).kind, "ended");
+    // The application in the lost sandbox is not told anything; let it go.
+    const dir = ((await q("SELECT state_dir FROM claw_app_runs WHERE task_id = $1", [taskId])).rows[0] as { state_dir: string }).state_dir;
+    writeFileSync(join(dir, "go"), "");
+    assert.ok(seen.includes("finishing:ended"), `the sandbox reads ended once the run is finishing on its loss: ${seen}`);
+    assert.ok(!seen.includes("finishing:running"), `${seen}`);
+    const end = (await readBoth(taskId)).app;
+    assert.deepEqual({ state: end.sandbox.state, workload_id: end.sandbox.workload_id }, { state: "ended", workload_id: up.workload_id });
+    assert.deepEqual(end.outcome, { cause: "restarts_exhausted", returncode: null, final: false, error: null });
   });
 
   test("R: a refused create, then a sandbox that ran: the refusal leaves the row and the cause is the application's", async () => {
