@@ -160,7 +160,9 @@ read it from the same place and answer the same block.
       "workload_id": "claw-1795239361812-sandbox-q8v4n",
       "since": "2026-11-21T05:41:12.384Z"
     },
-    "restarts": 4,
+    "restarts": 5,
+    "crash_restarts": 4,
+    "platform_losses": 1,
     "last_exit": {
       "returncode": 3,
       "at": "2026-11-21T06:10:02.918Z",
@@ -194,14 +196,24 @@ one was created (and while a replacement for a lost one is being created).
 sandbox is started for the run; `null` for a run created before this field existed.
 `placement.workload_id` on `GET /v1/runs` names the same workload for an app run.
 
-`restarts` and `last_exit` are there while the run is alive, so an application that
-keeps crashing (and keeps being restarted, its task reading `running` all along) can
-be told from one that is running:
+`restarts`, `crash_restarts`, `platform_losses` and `last_exit` are there while the
+run is alive, so an application that keeps crashing (and keeps being restarted, its
+task reading `running` all along) can be told from one that is running, and both from
+one whose sandboxes the platform keeps taking away:
 
-- `restarts` is how many restarts the run has spent of the manifest's
-  `restart.max_restarts`: an exit without `final`, a launch that kept failing, or a
-  sandbox lost for a reason that is the application's. A sandbox the platform took
-  away (its node lost, no node to run on) is not counted. `0` until then.
+- `crash_restarts` is how many restarts the run has spent of the manifest's
+  `restart.max_restarts`, for the application's own failure: an exit without `final`,
+  a launch that kept failing, or a sandbox lost for a reason that is the
+  application's (its container failed). `0` until then.
+- `platform_losses` is how many times the platform took the run's sandbox away (its
+  node lost, no node to run on) and a new one was made. These do not spend
+  `restart.max_restarts`; a manifest that allows no restart ends the run on such a
+  loss instead, and that is not counted. `0` until then.
+- `restarts` is their total: every time the application was started again. Until
+  `crash_restarts` and `platform_losses` existed it carried only the first; read
+  `crash_restarts` for what it used to say.
+
+All three keep their last value once the run has ended.
 - `last_exit` is the last time the application stopped, or the run was stopped;
   `null` until then (a run still waiting for its first sandbox has had nothing stop).
   It moves on every exit. `returncode` is what the application wrote in its
@@ -253,8 +265,10 @@ or past its deadline while merely queued reads `cancelled` or `deadline`, with
 
 An app run's time limit is the smaller of the manifest's `limits.max_runtime_sec` and
 the request's `resources.grant.max_runtime_sec`, counted from the run's creation (queue
-time included); the request's value must be a whole number of seconds from 1 to
-2147483647, or the run is refused with `400 app_resources_invalid`. The task's `deadline_at` is that moment, the one the run is stopped
+time included). Each, where it is set, must be a whole number of seconds from 1 to
+2147483 (about 24.8 days, the longest a timer of the run's worker can wait), or the
+run is refused with `400 app_resources_invalid`, naming `resources.grant.max_runtime_sec`
+or `manifest.limits.max_runtime_sec`. The task's `deadline_at` is that moment, the one the run is stopped
 at with cause `deadline`, rather than the generic budget a task gets from its start;
 an app run with no limit keeps that budget. Past `deadline_at`, the application is given its
 `stop_grace_sec` (at most an hour) to stop before the deadline backstop closes the

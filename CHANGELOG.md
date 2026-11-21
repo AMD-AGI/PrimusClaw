@@ -113,12 +113,19 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
-- Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, the restarts it has
-  spent of `restart.max_restarts`, and `app.last_exit`, `{ returncode, at, cause }` of the last time the application
+- Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, how many times the
+  application was started again, and `app.last_exit`, `{ returncode, at, cause }` of the last time the application
   stopped (`null` until then), moved on every exit. A crash-looping application used to read only `status: running`
   with nothing else until its run ended. `cause` is a closed list (`exited`, `start_failed`, `sandbox_lost`,
   `restarts_exhausted`, `deadline`, `cancelled`, `task_closed`); no free text is carried. See `claw/docs/run-api.md`,
   "App runs".
+- Claw: `app.restarts` is split by kind. `app.crash_restarts` counts the restarts for the application's own failure (an
+  exit without `final`, a launch that kept failing, its container failing), the ones `restart.max_restarts` bounds;
+  `app.platform_losses` counts the sandboxes the platform took away (node lost, no node to run on) that were replaced.
+  `app.restarts` is now their total, so a reader of it keeps working; before, it carried only the first and a platform
+  loss was in no count. Both are on `GET /v1/tasks/:id` (`item.app`) and `GET /v1/runs` (`app`), and keep their value
+  once the run has ended (the Brain now carries the platform-loss count onto the run's final `last_exit`). See
+  `claw/docs/run-api.md`, "App runs".
 - Claw: a plugin can let an app run change its manifest's sandbox templates. `overridable.sandbox_templates` declares,
   per template name, which of `fromImage` (a string rule with an `enum` or a `pattern`), `per_gpu_count` (an integer
   `enum` or range) and `resources` (a `max` Kubernetes quantity for each of `cpu`, `memory`, `ephemeralStorage` and
@@ -238,9 +245,11 @@ release version, and its `appVersion` stays `latest`.
   used to stop it at the manifest's only). The deadline backstop now gives an app run its application's
   `stop_grace_sec` (at most an hour) past the deadline before it closes the task, so it no longer closes a run the
   Brain is still stopping as `run_budget_exhausted`.
-  The request's `resources.grant.max_runtime_sec` (and `APP_SANDBOX_CAPS.max_runtime_sec`) must now be a whole number
-  of seconds from 1 to 2147483647: a fraction or 0, which the grant issuer already refused, is refused at admission
-  with `400 app_resources_invalid`.
+  The request's `resources.grant.max_runtime_sec`, the manifest's `limits.max_runtime_sec` and
+  `APP_SANDBOX_CAPS.max_runtime_sec` must now be a whole number of seconds from 1 to 2147483 (about 24.8 days): a
+  fraction or 0, which the grant issuer already refused, or a longer limit, is refused at admission with
+  `400 app_resources_invalid` (an `APP_SANDBOX_CAPS` outside it stops the API at start-up). Limits in use today are at
+  most 259200 seconds.
 - Claw API: a review asked of someone else ("review and merge", R asking X) is now merged with the reviewer's account
   whenever the reviewer can merge it, and the requester's own account is used only when the reviewer cannot, and only on
   the requester's yes. Under X's `fully_auto` the merge is made at once; under `high_risk_confirm` a held merge waits for
@@ -282,6 +291,10 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: a run whose deadline was more than about 24.8 days away was stopped at once. The Brain stops a run at its
+  `deadline_at` with a timer, and Node fires a timer longer than 2^31 - 1 ms after 1 ms; an app run's deadline can be
+  its own time limit, which a request or manifest could set that far out. The timer now waits in steps no longer than
+  that, so any deadline fires when it comes, and admission refuses a time limit above 2147483 seconds (see Changed).
 - Claw: an A2A push notification that its webhook keeps refusing no longer holds back every later notification for that
   webhook for up to an hour. After eight failed attempts (about twenty minutes) it is set aside: its outbox row is
   closed, a copy is kept in the new `claw_a2a_push_dead_letters` table for 14 days, the log line

@@ -1525,7 +1525,7 @@ export class AppRunner {
    */
   private async commit(patch: AppRunPatch, from?: AppRunState): Promise<void> {
     const before = this.rec?.state;
-    this.rec = await this.deps.store.patch(this.runId, patch, from);
+    this.rec = await this.deps.store.patch(this.runId, withPlatformLosses(patch, this.rec?.last_exit), from);
     const seam = this.seams.stateChanged;
     if (!seam || this.rec.state === before) return;
     const record = this.rec;
@@ -1601,6 +1601,23 @@ export function parseExit(text: string): Extract<ExitRead, { kind: "exit" }> | n
     ...(typeof d.stop_reason === "string" ? { stop_reason: d.stop_reason } : {}),
     ...(typeof d.error === "string" ? { error: d.error } : {}),
   };
+}
+
+/**
+ * `patch` with the run's `platform_losses` carried onto the `last_exit` it writes.
+ *
+ * The count is the run's, like `restarts`, and is read back by callers
+ * (`app.platform_losses`) for as long as the run is shown, its end included. The
+ * restart road carries it itself; every other `last_exit` (a final exit, the
+ * deadline, a cancel, a launch that cannot be made) is written fresh, and would
+ * otherwise drop it. A patch that sets its own count, or clears `last_exit`, is
+ * left as it is.
+ */
+export function withPlatformLosses(patch: AppRunPatch, prior: AppLastExit | null | undefined): AppRunPatch {
+  const losses = prior?.platform_losses;
+  if (!patch.last_exit || patch.last_exit.platform_losses !== undefined) return patch;
+  if (typeof losses !== "number" || !(losses > 0)) return patch;
+  return { ...patch, last_exit: { ...patch.last_exit, platform_losses: losses } };
 }
 
 const ABORTED = Symbol("aborted");

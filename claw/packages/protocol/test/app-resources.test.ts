@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { APP_MANIFEST_SCHEMA, type AppManifestV1 } from "../src/app-manifest.js";
 import {
-  appGrantTemplates, DEFAULT_APP_CONTAINER_CAPS, DEFAULT_APP_SANDBOX_CAPS, parseAppContainerCaps, parseAppSandboxCaps, resolveAppResources, type ResolvedAppResources,
+  APP_MAX_RUNTIME_SEC, appGrantTemplates, DEFAULT_APP_CONTAINER_CAPS, DEFAULT_APP_SANDBOX_CAPS, parseAppContainerCaps, parseAppSandboxCaps, resolveAppResources, type ResolvedAppResources,
 } from "../src/app-resources.js";
 
 /** A generic app: two roles, a default image, defaults and a maximum in `limits`. */
@@ -70,7 +70,7 @@ test("types are checked and nothing negative passes", () => {
   refused({ ...GOOD, memory_gi: -4 }, "resources.memory_gi", "plain decimal");
   refused({ ...GOOD, grant: { gpu_hours: -1 } }, "resources.grant.gpu_hours", ">= 0");
   refused({ ...GOOD, grant: { max_runtime_sec: "x" } }, "resources.grant.max_runtime_sec", "whole number");
-  for (const bad of [1.5, 0.5, 0, -1, 2_147_483_648]) {
+  for (const bad of [1.5, 0.5, 0, -1, 2_147_484, 2_147_483_647, 2_147_483_648]) {
     refused({ ...GOOD, grant: { max_runtime_sec: bad } }, "resources.grant.max_runtime_sec", "whole number");
   }
   assert.equal(ok({ ...GOOD, grant: { max_runtime_sec: 1 } }).grant.max_runtime_sec, 1);
@@ -226,7 +226,7 @@ test("a manifest default above the platform caps is refused when the request doe
 
 test("an unconfigured grant is bounded: max_gpus and gpu_hours have defaults, asked or not", () => {
   // No caps argument at all: the platform defaults apply.
-  const big = resolveAppResources(MANIFEST, { ...GOOD, grant: { max_gpus: 100000, gpu_hours: 1e9, max_sandboxes: 500, max_runtime_sec: 1e9 } });
+  const big = resolveAppResources(MANIFEST, { ...GOOD, grant: { max_gpus: 100000, gpu_hours: 1e9, max_sandboxes: 500, max_runtime_sec: 2_147_483 } });
   assert.ok("resources" in big);
   const g = (big as { resources: ResolvedAppResources }).resources.grant;
   assert.equal(g.max_gpus, DEFAULT_APP_SANDBOX_CAPS.max_gpus);
@@ -239,4 +239,23 @@ test("an unconfigured grant is bounded: max_gpus and gpu_hours have defaults, as
   assert.equal(n.gpu_hours, DEFAULT_APP_SANDBOX_CAPS.gpu_hours);
   // Explicit caps replace the defaults per item; an explicit empty set is the caller saying "no cap" (tests only).
   assert.equal(ok({ ...GOOD, grant: { max_gpus: 5 } }, { max_gpus: 3 }).grant.max_gpus, 3);
+});
+
+test("a run's time limit is at most what the Brain's deadline timer can wait: 2147483 s, from the request, the manifest or the caps", () => {
+  // 2^31 - 1 ms is the longest a Node timer waits; a longer one fires after 1 ms.
+  assert.equal(APP_MAX_RUNTIME_SEC, 2_147_483);
+  assert.equal(APP_MAX_RUNTIME_SEC, Math.floor((2 ** 31 - 1) / 1000));
+  const noCap = { max_runtime_sec: 2_147_483 };
+  // The request's grant.
+  assert.equal(ok({ ...GOOD, grant: { max_runtime_sec: 2_147_483 } }, noCap, { ...MANIFEST, limits: {} }).grant.max_runtime_sec, 2_147_483);
+  refused({ ...GOOD, grant: { max_runtime_sec: 2_147_484 } }, "resources.grant.max_runtime_sec", "<= 2147483", noCap);
+  // The manifest's limits, which the run's limit is when it is the smaller one.
+  const at = (sec: number) => ({ ...MANIFEST, limits: { max_runtime_sec: sec } });
+  assert.equal(ok(GOOD, noCap, at(2_147_483)).grant.max_runtime_sec, 2_147_483);
+  refused(GOOD, "manifest.limits.max_runtime_sec", "<= 2147483", noCap, at(2_147_484));
+  // Refused even when the request asks for less: the manifest is what is wrong.
+  refused({ ...GOOD, grant: { max_runtime_sec: 60 } }, "manifest.limits.max_runtime_sec", "<= 2147483", noCap, at(2_147_484));
+  // APP_SANDBOX_CAPS.
+  assert.equal(parseAppSandboxCaps('{"max_runtime_sec":2147483}').max_runtime_sec, 2_147_483);
+  assert.throws(() => parseAppSandboxCaps('{"max_runtime_sec":2147484}'), /APP_SANDBOX_CAPS\.max_runtime_sec: must be a whole number of seconds >= 1 and <= 2147483/);
 });
