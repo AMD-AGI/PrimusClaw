@@ -31,7 +31,7 @@ import { isValidPrRef, type PrRef } from "../github-review/github.js";
 import type { StartedReview, StartedReviewForRequester } from "@claw/protocol";
 import { WORKFLOW_SCOPE_REFUSAL, type FollowRequest, type ReviewActor, type ReviewContinuation, type ToolOutcome } from "../github-review/service.js";
 import { readGithubReviewSettings } from "../github-review/settings.js";
-import { REVIEW_ROWS_ONLY, closeConfirmationsForStop, type PostedReview } from "../github-review/store.js";
+import { REQUESTER_MERGE, REVIEW_ROWS_ONLY, closeConfirmationsForStop, type PostedReview } from "../github-review/store.js";
 import { db, inTransaction, type Querier, type StatementRunner } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { queuedMessageId, SWEEPABLE_RUN_STATUSES, stopSessionRuns } from "../tasks/chat-run.js";
@@ -1355,8 +1355,8 @@ export function reviewState(f: ReviewFacts): ReviewState {
   if (f.queued && !f.halted) return { boardState: "in_progress", summary: `${pr} is queued: it starts by itself when a slot is free`, question: null };
   const own = f.actingAs === f.ownerUserId;
   const latest = <T extends { at: number }>(xs: T[]): T | null => xs.reduce<T | null>((a, x) => (!a || x.at >= a.at ? x : a), null);
-  // What the sweep found of the pull request on GitHub (`followReviewItems`): merged by the requester's own account after this review's
-  // approval, merged or closed by anyone, which ends the item whatever it still held for an answer.
+  // What the sweep found of the pull request on GitHub (`followReviewItems`): merged or closed by anyone (or, before 2026-11-20, merged
+  // by the requester's own account after this review's approval), which ends the item whatever it still held for an answer.
   const ended = latest(f.writes.filter((w) => w.tool === FOLLOW_TOOL && w.result === "ok" && FOLLOW_ENDS.has(w.detail)));
   if (ended) {
     switch (ended.detail) {
@@ -1366,6 +1366,22 @@ export function reviewState(f: ReviewFacts): ReviewState {
       default: return { boardState: "done", outcome: "stopped", summary: `${pr} was closed on GitHub without a merge` };
     }
   }
+  // The requester's own answer, asked because the reviewer approved and cannot merge (`requester_merge`, `GithubReview.followPullRequest`):
+  // never one of the reviewer's held writes, so the reviewer is not asked about it. Their yes merged it, their no ends the item, and while
+  // it waits for them (or their yes is being carried out) the item is in progress.
+  const asked = latest(f.confirmations.filter((c) => c.kind === REQUESTER_MERGE));
+  if (asked) {
+    switch (asked.status) {
+      case "merged": return { boardState: "done", outcome: "accepted", summary: `${pr} merged with the requester's account (reviewer cannot merge)` };
+      case "queued": return { boardState: "done", outcome: "accepted", summary: `${pr} queued with the requester's account (reviewer cannot merge)` };
+      case "pending":
+      case "merging":
+        return { boardState: "in_progress", summary: `${pr}: approved, the reviewer cannot merge; asking the requester`, question: null };
+      case "denied": return { boardState: "done", outcome: "stopped", summary: `the requester chose not to merge ${pr}` };
+      default: return { boardState: "done", outcome: "stopped", summary: `${pr} not merged: the requester's merge ended ${asked.status}` };
+    }
+  }
+  const held = f.confirmations.filter((c) => c.kind !== REQUESTER_MERGE);
   // The review tools found the pull request already merged when the review tried to approve or merge it: the item ends as the sweep's
   // `already_merged` does, whatever an earlier write was refused for (2026-11-13, N32: the author merged while the review ran again on
   // new commits, its submit was refused already_merged, and the first head's conflict refusal woke the reviewer for a merged pull request).
@@ -1377,7 +1393,7 @@ export function reviewState(f: ReviewFacts): ReviewState {
   // write call names the head the review is at; a held write still open (pending, merging) is judged above whatever its head.
   const lastWrite = latest(f.writes.filter((w) => WRITE_TOOLS.has(w.tool)));
   const current = (w: { headSha?: string }): boolean => !w.headSha || !lastWrite?.headSha || w.headSha === lastWrite.headSha;
-  const merged = f.confirmations.find((c) => c.status === "merged" || c.status === "queued")
+  const merged = held.find((c) => c.status === "merged" || c.status === "queued")
     ?? f.writes.find((w) => w.tool === "gh_pr_merge" && w.result === "ok" && (w.detail === "merged" || w.detail === "queued"));
   if (merged) {
     const queued = ("status" in merged ? merged.status : merged.detail) === "queued";
@@ -1386,10 +1402,10 @@ export function reviewState(f: ReviewFacts): ReviewState {
     const told = f.ownReview ? { result: queued ? "merge_queued" as const : "merged" as const } : {};
     return { boardState: "done", outcome: "accepted", summary: queued ? `${pr} is in the merge queue` : `${pr} was merged`, ...told };
   }
-  if (f.confirmations.some((c) => c.status === "merging")) {
+  if (held.some((c) => c.status === "merging")) {
     return { boardState: "in_progress", summary: `the confirmed write to ${pr} is being made`, question: null };
   }
-  const pending = f.confirmations.find((c) => c.status === "pending");
+  const pending = held.find((c) => c.status === "pending");
   if (pending) {
     const what = pending.kind === "review" ? "the approval" : "the merge";
     // Waiting for someone else is still work in progress for the owner; waiting for the owner is theirs to do.
@@ -1398,7 +1414,7 @@ export function reviewState(f: ReviewFacts): ReviewState {
   }
   if (f.turn === "running") return { boardState: "in_progress", summary: `reviewing ${pr}`, question: null };
   const submitted = latest([
-    ...f.confirmations.filter((c) => c.status === "submitted" && current(c)),
+    ...held.filter((c) => c.status === "submitted" && current(c)),
     ...f.writes.filter((w) => w.tool === "gh_review_submit" && w.result === "ok" && (w.detail === "submitted" || w.detail === "already_submitted") && current(w)),
   ]);
   // A review the server stopped before its turn ran: the owner's to look at, with the reason; never a review in progress for ever.
@@ -1415,7 +1431,7 @@ export function reviewState(f: ReviewFacts): ReviewState {
       question: RQ.lookAtSession.en(pr), result: "budget_partial",
     };
   }
-  const closed = latest(f.confirmations.filter((c) => ["denied", "stale", "expired", "refused"].includes(c.status) && current(c)));
+  const closed = latest(held.filter((c) => ["denied", "stale", "expired", "refused"].includes(c.status) && current(c)));
   if (closed && (!submitted || closed.at >= submitted.at)) {
     switch (closed.status) {
       case "denied": return { boardState: "done", outcome: "stopped", summary: `the held write to ${pr} was denied` };
@@ -1830,8 +1846,9 @@ export const REVIEW_FOLLOW_BATCH = 30;
  * Every tick, for the open review items whose review has had its turn (or was halted before it): what became of the pull request on GitHub
  * (`GithubReview.followPullRequest`). A pull request merged or closed there ends the item, and what its session still held for the
  * reviewer's answer is closed with it, so an item does not wait for ever on a confirmation nobody needs. For a review asked of someone
- * else whose requester asked for a merge, the requester's own account merges it once the reviewer's approval is on GitHub and every
- * gate is open, instead of asking the reviewer to confirm the merge. One item is looked at by one replica at a time, every
+ * else whose requester asked for a merge, the merge stays the reviewer's (at once under fully_auto, or on their own confirmation); only
+ * when the reviewer approved and their account cannot merge it is the requester asked, with a card, whether their own account merges it
+ * (`sendRequesterMergeCard`). One item is looked at by one replica at a time, every
  * `REVIEW_FOLLOW_MS` at most; a look that fails says so in the log and is tried at the next.
  */
 export async function followReviewItems(now = Date.now()): Promise<number> {
@@ -1889,6 +1906,12 @@ export async function followReviewItems(now = Date.now()): Promise<number> {
       });
       const status = String(out.body.status ?? "");
       logger.info({ itemId: item_id, status, reason: out.body.reason ?? null }, "assistant.review_followed");
+      // The reviewer approved and cannot merge: the requester is asked, with a card in their own conversation, once per question.
+      if (!out.isError && status === "waiting" && out.body.reason === "requester_asked" && requestedBy) {
+        await sendRequesterMergeCard(item_id, requestedBy, params, out.body).catch((err) => logger.warn({ err, itemId: item_id }, "assistant.review_requester_card_failed"));
+        await syncReviewItem(item_id);
+        continue;
+      }
       if (!out.isError && FOLLOW_ENDS.has(status)) {
         await syncReviewItem(item_id);
         ended += 1;
@@ -1902,6 +1925,48 @@ export async function followReviewItems(now = Date.now()): Promise<number> {
     }
   }
   return ended;
+}
+
+/**
+ * The question to the person who asked for a review of someone else, when the reviewer approved and their account cannot merge it
+ * (`GithubReview.followPullRequest`, `requester_asked`): "X approved it, but X has no permission to merge; merge it with your own account?",
+ * as an `assistant.say` carrying the confirmation for their chat to draw with a Merge and a Don't-merge button (`github_merge`: the same
+ * decision route as every held write's, which reads every gate again before anything is merged), in their language, to their own assistant's
+ * conversation. Stored once per confirmation; nothing is merged without their yes.
+ */
+async function sendRequesterMergeCard(itemId: string, requesterId: string, params: ReviewParams, body: Record<string, unknown>): Promise<void> {
+  const id = String(body.confirmation_id ?? "");
+  if (!id) return;
+  const stored = await inTransaction(async (query) => {
+    const c = (await query(
+      `SELECT confirmation_id::text AS id, repo, pr, expires_at FROM claw_github_confirmations
+        WHERE confirmation_id = $1::uuid AND kind = '${REQUESTER_MERGE}' AND actor_user_id = $2 AND status = 'pending' AND expires_at > NOW()`,
+      [id, requesterId],
+    )).rows[0] as { id: string; repo: string; pr: number; expires_at: Date | string } | undefined;
+    if (!c) return null;
+    const where = (await query(
+      `SELECT a.session_id FROM claw_assistants a JOIN claw_sessions s ON s.session_id = a.session_id AND s.deleted_at IS NULL WHERE a.user_id = $1`,
+      [requesterId],
+    )).rows[0] as { session_id: string } | undefined;
+    const zh = await personWritesChinese(query, requesterId, params.brief);
+    const lang = zh ? "zh" : "en";
+    const ref = confirmationRef(c.id);
+    const who = params.acting_as_name || params.acting_as;
+    const pr = `${c.repo}#${c.pr}`;
+    const [approve, deny] = [typedCommand("approve", ref, lang), typedCommand("deny", ref, lang)];
+    const text = zh
+      ? `${who} 已批准 ${pr}，但 ${who} 没有合入权限；要用你自己的账号合入吗？点「合入」（或回复 ${approve}）；不合就点「不合」（或回复 ${deny}）。合入前会再确认一遍：批准还在最新提交上、CI 全绿、没有未解决的评论、GitHub 显示可以合入。`
+      : `${who} approved ${pr}, but ${who} has no permission to merge it. Merge it with your own account? Press "Merge" (or reply ${approve}); `
+        + `press "Don't merge" (or reply ${deny}) to leave it unmerged. Before merging, everything is checked again: the approval is on the latest commit, CI is green, no review thread is open, and GitHub says it can be merged.`;
+    return storeGithubConfirmCard(query, {
+      userId: requesterId, sessionId: where?.session_id ?? null, text,
+      confirm: { confirmation_id: c.id, ref, kind: "github_merge", allow_label: zh ? "合入" : "Merge", expires_at: new Date(c.expires_at).toISOString() },
+    }, reportPorts.sayDeps);
+  });
+  if (stored) {
+    logger.info({ itemId, confirmationId: id }, "assistant.review_requester_asked");
+    await stored.announce();
+  }
 }
 
 /** The wait for the author the facts are in (`AuthorWait`): the head of the refused merge it waits on, and since when; null when none. */

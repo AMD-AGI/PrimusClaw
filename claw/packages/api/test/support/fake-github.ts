@@ -70,7 +70,7 @@ export class FakeGithub {
   dirs: Record<string, Array<{ name: string; type: string }>> = {};
   mergeStatus = 200;
   /** What the next merges answer, in order, before `mergeStatus` takes over: a test of a refusal GitHub gives only once or twice. */
-  mergeAnswers: Array<{ status: number; message: string }> = [];
+  mergeAnswers: Array<{ status: number; message: string; headers?: Record<string, string> }> = [];
   /** What the `enqueuePullRequest` mutation answers with when it goes through: the entry GitHub returns, or null for an answer without one. */
   enqueueEntry: Record<string, any> | null = { id: "MQE_kwDOdemo1", position: 3, state: "QUEUED" };
   /** A GraphQL error message for the mutation (the answer is 200 with `errors`), as GitHub gives when it refuses to queue; null to let it through. */
@@ -192,7 +192,7 @@ export class FakeGithub {
     }
     if (/\/pulls\/\d+\/merge$/.test(p) && method === "PUT") {
       const next = this.mergeAnswers.shift();
-      if (next) return next.status === 200 ? json(200, { sha: "m".repeat(40), merged: true, message: "Pull Request successfully merged" }) : json(next.status, { message: next.message });
+      if (next) return next.status === 200 ? json(200, { sha: "m".repeat(40), merged: true, message: "Pull Request successfully merged" }) : json(next.status, { message: next.message }, next.headers);
       if (this.mergeStatus !== 200) return json(this.mergeStatus, { message: this.mergeStatus === 409 ? "Head branch was modified" : "Not mergeable" });
       return json(200, { sha: "m".repeat(40), merged: true, message: "Pull Request successfully merged" });
     }

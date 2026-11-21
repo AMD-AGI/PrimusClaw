@@ -72,8 +72,9 @@ for (const clawSays of [false, true]) {
     world.claw.reviewModes.set("tok-aad-b", "fully_auto"); // Bob's own setting
     assert.deepEqual(await handBack(world, handoffEvent({ prs: [PR, PR2] })), ["delivered"]);
     const text = said(world);
-    assert.ok(text.includes("合入要等 Bob 本人确认"), text);
+    assert.ok(text.includes("Bob 批准后，用 Bob 的账号合入（Bob 需要确认，TA 确认之前不会合入）"), text);
     assert.ok(!text.includes("全自动") && !text.includes("无需人工确认") && !text.includes("不会自动合"));
+    assert.ok(!text.includes("你自己的 GitHub 账号合") && !text.includes("前提是 PR 是你提的"), text);
     assert.ok(toOthers(world).includes("合入前会先请你确认"), "Bob is told his confirmation is asked");
   });
 }
@@ -93,9 +94,10 @@ for (const mode of ["fully_auto", "high_risk_confirm"]) {
     assert.deepEqual(await handBack(world, handoffEvent({ prs: [PR, PR2] })), ["delivered"]);
     assert.equal(requests(world)[0]?.[1].handoffId, "h-1");
     const text = said(world);
-    assert.ok(!text.includes("本人确认") && !text.includes("不会合入"), text);
+    assert.ok(!text.includes("本人确认") && !text.includes("不会合入") && !text.includes("需要确认"), text);
+    assert.equal(text.includes("Bob 批准后，用 Bob 的账号合入。"), mode === "fully_auto", text);
     assert.equal(text.includes("Bob 已设为全自动合入"), mode === "fully_auto");
-    assert.ok(!text.includes("用你自己的 GitHub 账号")); // a Claw that does not say `merge_by_requester`
+    assert.ok(!text.includes("你自己的账号")); // a Claw that does not say `merge_by_requester`
     assert.ok(!toOthers(world).includes("合入前会先请你确认"));
   });
 
@@ -105,14 +107,11 @@ for (const mode of ["fully_auto", "high_risk_confirm"]) {
     assert.deepEqual(await handBack(world, handoffEvent({ prs: [PR, PR2] })), ["delivered"]);
     const text = said(world);
     assert.ok(!text.includes("本人确认") && !text.includes("不会合入"), text);
-    if (mode === "fully_auto") {
-      assert.ok(text.includes("Bob 已设为全自动合入") && !text.includes("用你自己的 GitHub 账号"), text);
-    } else {
-      assert.ok(
-        text.includes("合入不用等 Bob 确认") && text.includes("用你自己的 GitHub 账号") && !text.includes("全自动"),
-        text,
-      );
-    }
+    // The reviewer's account merges; the asker is only asked, first, when the reviewer has no permission (2026-11-20).
+    assert.ok(text.includes("Bob 批准后，用 Bob 的账号合入。"), text);
+    assert.ok(text.includes("Bob 没有合入权限时，会先问你要不要用你自己的账号合入。"), text);
+    assert.ok(!text.includes("合入不用等") && !text.includes("前提是 PR 是你提的"), text);
+    assert.equal(text.includes("Bob 已设为全自动合入"), mode === "fully_auto", text);
     assert.ok(!toOthers(world).includes("合入前会先请你确认"));
   });
 }

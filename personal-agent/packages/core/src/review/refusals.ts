@@ -178,20 +178,31 @@ export function modelChosenNote(review: ReviewTurn, who: string, asked: string):
 }
 
 /**
- * What the receipt says of how the merges will be made: only what the reviews started say. Every one waits for the
- * reviewer's confirmation: that, plainly. Otherwise the reviewer's fully automatic setting is said, a held one among the
- * others is named, and a merge Claw makes with the asker's own account is said. '' when there is nothing to say.
+ * What the receipt says of how the merges will be made: only what the reviews started say. A review asked of someone else is merged
+ * with that reviewer's account once they approve, said plainly, with "they confirm it first" when its merge waits for them; the
+ * reviewer's fully automatic setting is said; and when Claw may put the merge to the asker (`mergeByRequester`), that the asker is
+ * asked first, only when the reviewer has no permission to merge. Nothing is merged with the asker's account unasked
+ * (2026-11-20). One's own review says only whether its merge waits for one's own confirmation. '' when there is nothing to say.
  */
 export function mergeLine(reviews: readonly ReviewTurn[], who: string, merge: boolean, auto: boolean): string {
   if (!merge || !reviews.length) return "";
   const held = reviews.filter((r) => r.mergeHeld);
-  if (held.length === reviews.length) return `合入要等 ${who} 本人确认，TA 确认之前不会合入。`;
-  const some = held.length ? `其中 ${held.map((r) => shortName(r.pull)).join("、")} 的合入要等 ${who} 本人确认。` : "";
-  const free = reviews.filter((r) => !r.mergeHeld);
-  const byAsker = !auto && free.every((r) => r.item?.mergeByRequester === true);
-  const asker = byAsker
-    ? `合入不用等 ${who} 确认：${who} 批准后，只要 CI 全绿、没有未解决的评论，就会自动合入（${who} 那边被拦下的合入，会用你自己的 GitHub 账号合，前提是 PR 是你提的）。`
-    : "";
-  const automatic = auto ? `${who} 已设为全自动合入（无需人工确认，只有仓库自己要求确认的才会问 TA）。` : "";
-  return automatic + asker + some;
+  const all = held.length === reviews.length;
+  const names = held.map((r) => shortName(r.pull)).join("、");
+  const automatic = auto && !all ? `${who} 已设为全自动合入（无需人工确认，只有仓库自己要求确认的才会问 TA）。` : "";
+  const askable = reviews.some((r) => r.item?.mergeByRequester === true);
+  // (nothing held, no automatic setting, and a Claw that does not say how the merge goes: nothing to add, as before)
+  if (!held.length && !auto && !askable) return "";
+  if (reviews.every(selfReview)) {
+    if (all) return `合入要等 ${who} 本人确认，TA 确认之前不会合入。`;
+    return automatic + (held.length ? `其中 ${names} 的合入要等 ${who} 本人确认。` : "");
+  }
+  const confirm = all
+    ? `（${who} 需要确认，TA 确认之前不会合入）`
+    : held.length
+      ? `（其中 ${names} 的合入 ${who} 需要确认）`
+      : "";
+  const byReviewer = `${who} 批准后，用 ${who} 的账号合入${confirm}。`;
+  const asker = askable ? `${who} 没有合入权限时，会先问你要不要用你自己的账号合入。` : "";
+  return byReviewer + automatic + asker;
 }

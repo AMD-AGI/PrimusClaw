@@ -196,7 +196,7 @@ export class SayPlanner {
         held.kind,
         held.allowLabel,
       );
-      const model = { text: inCard || held.allowLabel, cardId, allowLabel: held.allowLabel, lang };
+      const model = { text: inCard || held.allowLabel, cardId, allowLabel: held.allowLabel, kind: held.kind, lang };
       return view({ name: "confirmWrite", model });
     }
     const confirm = confirmActionOf(event, this.deps.exactCommand);
