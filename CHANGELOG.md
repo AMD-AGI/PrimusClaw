@@ -168,6 +168,14 @@ release version, and its `appVersion` stays `latest`.
   Roll out Brain before the API. See "Placing a session's sandboxes on labelled nodes" in
   `claw/docs/sandbox-session-lifecycle.md`.
 
+- Claw: metrics and alerts for outbound notifications. `claw_notification_outbox_oldest_pending_age_seconds`
+  and `claw_notification_outbox_pending` are read from the outbox table at each scrape, so they show a
+  stall even when the delivery loop itself has stopped; `claw_notification_delivery_total{outcome}` and
+  `claw_notification_quarantined_total{reason}` count what became of each attempt, every series exported at 0 from
+  start-up so a pod's first quarantine is an increase Prometheus sees. `claw/deploy/promql/notification-outbox.rules.yaml`
+  is a Prometheus rule group with two alerts, `ClawNotificationOutboxStalled` (a notification has waited more than 15
+  minutes, for 5 minutes) and `ClawNotificationQuarantined`, tested with `promtool` in CI.
+
 ### Changed
 
 - Claw API: a review asked of someone else ("review and merge", R asking X) is now merged with the reviewer's account
@@ -337,6 +345,30 @@ release version, and its `appVersion` stays `latest`.
   `500` that names nothing about the event (a deadlock, a lost database connection): a Claw that fails now and then
   would otherwise narrow the search onto an event that was fine, a turn's end as likely as any, and drop it. Events are also made storable where
   they are made, so a NUL an agent prints never reaches Claw.
+- Claw notifications: a notification whose text holds a character PostgreSQL cannot store (U+0000, or half of a
+  surrogate pair, as a run's raw output or a cut-off emoji can) is now recorded with U+FFFD in its place, however deeply
+  it is nested (a terminal's request carries its input whole). Until now the write failed, and with it whatever recorded
+  the event: a run's end, an approval request or the assistant's message was never announced, and a caller that retried
+  failed the same way every time. The outbox uses the replacement the rest of the server stores events with
+  (`storableJson` and `storableText` in `@claw/utils`).
+- Claw notifications: one notification the receiver refuses for good no longer retries for a day. A row the receiver
+  refuses at least five times for its body (`400`, `413`, `415` or `422`), each time after it has taken another of the
+  subscription's notifications, and for at least an hour since its first refusal, with no other failure in between (a
+  5xx, a `401` or a timeout starts the count and the hour again, as does a previous status that is not a refusal
+  however it was written, so a failure recorded by a replica still on the previous version also counts), is
+  quarantined: it is no longer sent,
+  it is kept in `claw_notification_outbox` with `quarantined_at` set as the record of what was not delivered, and the
+  `notification.quarantined` log line names the event, the receiver's answer and the reason, never what the
+  notification says. No single answer quarantines a row, a `422` included, and no other 4xx counts: a `401`
+  (the personal agent's `bad_signature` from a backend still on the old secret, or `stale_timestamp` to a Claw replica
+  whose clock is off), a `403` or a `404` depends on who sent the request or where it landed, not on the event. The
+  quarantining answer does not count against the subscription. A 5xx, a timeout or a connection error never
+  quarantines a row: the personal agent answers 503 for a notification it will take on a later
+  try (a run's end while that chat's turn is still answering), so such a row keeps the 24-hour retry window, as does
+  every row of a receiver that is down or refuses everything (a wrong secret). The rows one delivery round claims for a
+  subscription are now sent in the order they were recorded; before, the order the database handed them back in could
+  send a later one first. This is not an order across rounds or replicas: a receiver that needs one reads
+  `occurred_at`.
 - Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its
   own run, the person is now told how it ended, once, in their language. Until now a review under the `fully_auto` mode
   that approved and merged closed its item silently: the person got only the generic "Run completed" notice and had to

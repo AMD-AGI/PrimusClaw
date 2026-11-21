@@ -1,0 +1,48 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Alerts on Claw's outbound notifications (claw/packages/api/src/notifications/outbox.ts), the webhooks that carry a run's
+# end, an approval request and the assistant's messages to the chat. A Prometheus rule group: load it into the server that
+# scrapes claw-api (the chart's ServiceMonitor), or translate the expressions into the alerting system in use.
+#
+# Every claw-api replica with notifications on reports the outbox gauges, read from the same table, so the expressions
+# take max() over replicas: one alert, not one per pod.
+#
+#   tested with: promtool test rules claw/deploy/promql/notification-outbox.test.yaml
+
+groups:
+  - name: claw-notification-outbox
+    rules:
+      # Something owed to a person has waited more than 15 minutes. A healthy outbox delivers within seconds, and a
+      # receiver that is briefly down is probed every 15 s, so this is a receiver down for a quarter of an hour, a delivery
+      # loop that stopped, or a row retried without end -- each of which means people are not told what they wait for.
+      - alert: ClawNotificationOutboxStalled
+        expr: max(claw_notification_outbox_oldest_pending_age_seconds) > 900
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Claw notifications are not being delivered"
+          description: >-
+            The oldest notification still to be delivered has waited {{ $value | humanizeDuration }}. Check the
+            receiver of the failing subscription (claw_notification_subscriptions_failing,
+            claw_notification_subscription_failures_max) and claw-api's "notification." log lines.
+
+      # A notification was set aside instead of delivered: the receiver kept refusing its body (400, 413, 415, 422) for an
+      # hour while it took the subscription's other rows. The row is kept (quarantined_at in claw_notification_outbox).
+      # claw-api exports the counter at 0 from start-up, so a quarantine is a step increase() sees. The second arm is for a
+      # series Prometheus meets already above 0 (a scrape missed between start-up and the first quarantine, or an exporter
+      # that did not initialise it): increase() over samples that are all 1 is 0, so a series new within the hour that is
+      # above 0 counts on its own.
+      - alert: ClawNotificationQuarantined
+        expr: >-
+          sum(increase(claw_notification_quarantined_total[1h])) > 0
+          or
+          sum((claw_notification_quarantined_total unless claw_notification_quarantined_total offset 1h) > 0) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A Claw notification was quarantined"
+          description: >-
+            At least one notification was quarantined in the last hour. Look for "notification.quarantined" in claw-api's
+            log for the event and the receiver's answer, and at the receiver's log for why it cannot take it.

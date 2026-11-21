@@ -44,3 +44,29 @@ test("what redactStoredText and redactStoredValue hand to an INSERT is storable"
   assert.deepEqual(redactStoredValue({ message_id: "m\u0000", ["k\u0000"]: "v\uD800", password: "hunter2" }),
     { message_id: `m${R}`, [`k${R}`]: `v${R}`, password: "<redacted>" });
 });
+
+/** `depth` objects and arrays around `inner`, as a JSON value a terminal ask's input can be. */
+function nested(depth: number, inner: unknown): unknown {
+  let v = inner;
+  for (let i = 0; i < depth; i++) v = i % 2 ? [v] : { k: v };
+  return v;
+}
+
+test("storableJson cleans a key or value however deep it is nested", () => {
+  for (const depth of [63, 64, 65, 200, 2000]) {
+    const text = storableJsonText(nested(depth, { "deep\u0000key": "nul \u0000 and half \uD83D" }));
+    assert.doesNotMatch(text, /\\u0000|\\ud[89a-f][0-9a-f]{2}/i, `depth ${depth}`);
+    assert.ok(text.includes(`"deep${R}key":"nul ${R} and half ${R}"`), `depth ${depth}`);
+  }
+});
+
+test("storableJson reads each value once, however deep the bad string is", () => {
+  // Counted where the walk reads the leaf: a walk that read an object's values again to build its copy would read it 2^depth
+  // times, and a payload a few dozen objects deep would never finish.
+  let reads = 0;
+  const leaf = { get text() { reads += 1; return "bad \u0000"; } };
+  let value: unknown = leaf;
+  for (let i = 0; i < 20; i++) value = { k: value };
+  assert.ok(storableJsonText(value).includes(`"text":"bad ${R}"`));
+  assert.equal(reads, 1);
+});
