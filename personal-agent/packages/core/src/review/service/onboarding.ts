@@ -155,7 +155,9 @@ export class ReviewerOnboarding {
     };
     const person: UserRef = { id: actor.userId, channelUserId: actor.channelUserId, name: actor.name, email: "" };
     const store = this.deps.store.reviewDelegation;
-    // (the furthest step an earlier ask of theirs, still open, has already told them)
+    // (the furthest step an earlier ask of theirs, still open, has already told them; one they have since undone is
+    // not told, so it is said again)
+    const regressed = this.behind(actor.userId, RANK[step]);
     const prior = Math.max(0, ...store.openReviewOnboardings(actor.userId).map((o) => o.toldRank));
     const send = async (chat: Conversation) => {
       await say(this.deps, chat, t.first(asked, steps, step));
@@ -192,6 +194,8 @@ export class ReviewerOnboarding {
       // (not reached: their next message, or the sweep, sends the steps)
       toldRank: sent ? RANK[step] : prior,
     });
+    // (said again for a step they undid: the earlier asks were told it too)
+    if (regressed && sent) store.claimOnboardingStep(actor.userId, RANK[step]);
     await say(this.deps, ctx.conversation, t.missing(actor.name || "对方", steps, step, sent, ctx.group));
   }
 
@@ -230,6 +234,22 @@ export class ReviewerOnboarding {
       );
   }
 
+  /**
+   * A reviewer who undid a step they had done (`/github unbind`, or an identity service that no longer knows them) is
+   * behind what they were told: each open ask told further than `rank` is put just below it, so the step they are at
+   * now is said again (once, by whoever raises it first). True when any was.
+   */
+  private behind(userId: string, rank: number): boolean {
+    const store = this.deps.store.reviewDelegation;
+    let any = false;
+    for (const row of store.openReviewOnboardings(userId))
+      if (row.toldRank > rank) {
+        store.releaseOnboardingStep(row.onboardingId, row.toldRank, rank - 1);
+        any = true;
+      }
+    return any;
+  }
+
   /** A message of this person's: when something waits for them, their state is read again (in the background). */
   activity(userId: string): void {
     if (!this.deps.store.reviewDelegation.openReviewOnboardings(userId).length) return;
@@ -258,16 +278,18 @@ export class ReviewerOnboarding {
 
   /**
    * This person's state, read again: a step further than they were told is answered with the next one (once, whoever
-   * reads it first); all done, each asker is told where they asked. A step that could not be said is claimed back, so
-   * the next read (their next message, or the sweep) says it.
+   * reads it first), and so is a step they undid; all done, each asker is told where they asked. A step that could not
+   * be said is claimed back, so the next read (their next message, or the sweep) says it.
    */
   async advance(userId: string): Promise<void> {
     const store = this.deps.store.reviewDelegation;
-    const open = store.openReviewOnboardings(userId);
-    if (!open.length) return;
+    if (!store.openReviewOnboardings(userId).length) return;
     const now = await this.progress(userId);
     if (now === undefined) return;
     const rank = RANK[now];
+    this.behind(userId, rank);
+    const open = store.openReviewOnboardings(userId);
+    if (!open.length) return;
     // (whoever raises the told step first says it: a sweep and a message that read the same news say it once)
     if (!store.claimOnboardingStep(userId, rank)) return;
     const unclaim = (rows: readonly ReviewOnboarding[]) => {

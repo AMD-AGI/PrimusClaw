@@ -341,6 +341,38 @@ test("several asks of the same reviewer send each step once, naming every asker,
   assert.equal(notes(world, CONV).filter((n) => n.text.includes(READY)).length, 3);
 });
 
+test("a reviewer who undoes a step is told it again, once, and the asker who asks again hears it was sent", async () => {
+  const bindNow = "kept only in the Primus identity service) <- this step now"; // (step 2, as the current one)
+  // Bob had done step 2 and was told step 3, then undid step 2 (`/github bind` again: a fresh device flow)
+  const undone = async () => {
+    const world = reviewWorld();
+    clawReviewsOverHttp(world);
+    world.identity.know("aad-b", "u-bob", null);
+    await asked(world, `请 {Bob} 帮我 review 合入 ${PR}`);
+    await says(world, BOB, "/github bind");
+    const before = times(world, BOB_DM, bindNow);
+    await says(world, BOB, "/github unbind");
+    world.github.script = ["ok"];
+    return { world, again: () => times(world, BOB_DM, bindNow) - before };
+  };
+  // Alice asks the same again: she hears he was sent it, and he is, once, however often he is read
+  const { world, again } = await undone();
+  await asked(world, `请 {Bob} 帮我 review 合入 ${PR}`, ALICE, "g2");
+  assert.equal(times(world, CONV, "我已私信 TA 这几步"), 2, saidIn(world.surface, CONV));
+  await world.service.sweepOnboarding();
+  assert.equal(again(), 1, saidIn(world.surface, BOB_DM));
+  // ...and each step after it follows as before: she gets her button
+  await says(world, BOB, "/github bind");
+  assert.equal(times(world, BOB_DM, "Next is step 3 of 3"), 2);
+  await says(world, BOB, "/github auto-merge on");
+  assert.equal(notes(world, CONV).filter((n) => n.text.includes(READY)).length, 1);
+  // No one asks again: the sweep says it, once
+  const quiet = await undone();
+  await quiet.world.service.sweepOnboarding();
+  await says(quiet.world, BOB, "hi");
+  assert.equal(quiet.again(), 1, saidIn(quiet.world.surface, BOB_DM));
+});
+
 test("a reviewer who says no stays at no: the asker is told once and nothing starts, even from an old button", async () => {
   const world = reviewWorld();
   const http = clawReviewsOverHttp(world);
