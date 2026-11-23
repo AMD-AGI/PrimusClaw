@@ -248,7 +248,6 @@ export class SessionManager {
     }
   }
 
-  /** The ids of the existing sessions this connector holds open, by agent. */
   /**
    * Whether a session of this connector follows that conversation now (taken over, typed into or watched read-only from the
    * phone), for any agent: the chat it is attached to shows what the conversation does.
@@ -259,6 +258,7 @@ export class SessionManager {
     return false;
   }
 
+  /** The ids of the existing sessions this connector holds open, by agent. */
   attachedRefs(agentId: string): Set<string> {
     const out = new Set<string>();
     // (A read-only one is not: the conversation is the terminal's, and the list says so.)
