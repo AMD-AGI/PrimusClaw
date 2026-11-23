@@ -419,6 +419,11 @@ export class ApprovalBroker {
   private readonly owned = new Set<string>();
   /** Turns that ended in a terminal, one per conversation: told once the terminal has had no input for `awayMs`. */
   private readonly endings = new Map<string, Ending>();
+  /**
+   * Ends whose session Claw is opening, taken back meanwhile or not: the end of the conversation or a stop in that time still
+   * marks them gone, so a session that opens after the conversation ended is closed rather than kept.
+   */
+  private readonly opening = new Set<Ending>();
 
   constructor(private readonly d: BrokerDeps) {}
 
@@ -565,8 +570,10 @@ export class ApprovalBroker {
     }
     // A new prompt or the end of the conversation: someone is at the terminal, and an end not yet told is not news to them.
     if (event === "SessionEnd") {
+      const gone = { ended: true as const, closed: this.sessions.get(ref) };
       const e = this.endings.get(ref);
-      if (e) e.gone = { ended: true, closed: this.sessions.get(ref) };
+      if (e && !e.gone) e.gone = gone;
+      for (const o of this.opening) if (o.ref === ref && !o.gone) o.gone = gone;
     }
     if (event === "UserPromptSubmit" || event === "SessionEnd") this.dropEnding(ref, "terminal_active");
     if (event === "Stop" || event === "StopFailure") this.turnEnded(raw, ref, from);
@@ -634,8 +641,10 @@ export class ApprovalBroker {
     const before = away();
     if ("not" in before) { skip(before.not); return; }
     const title = oneLine(path.basename(e.cwd), 80) || e.cwd;
+    this.opening.add(e);
     const opened = await this.d.openSession({ agent: e.agent, configDir: e.configDir, ref: e.ref, cwd: e.cwd, title })
-      .catch((err: unknown) => ({ refused: `open_failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) }));
+      .catch((err: unknown) => ({ refused: `open_failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) }))
+      .finally(() => { this.opening.delete(e); });
     // Taken back while the session was opening (dropEnding said why), or forgotten by a stop: nothing is told.
     if (this.endings.get(e.ref) !== e) { if (!("refused" in opened)) this.unused(e, opened.sessionId, title); return; }
     if ("refused" in opened) { skip(opened.refused); return; }
@@ -706,6 +715,7 @@ export class ApprovalBroker {
   stopAll(): void {
     for (const p of [...this.pending.values()]) this.settle(p, null, "connector_restart");
     for (const e of this.endings.values()) { clearTimeout(e.timer); e.gone = { stopped: true }; }
+    for (const e of this.opening) e.gone = { stopped: true };
     this.endings.clear();
   }
 

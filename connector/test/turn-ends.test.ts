@@ -13,7 +13,8 @@
  *   E6 a Codex `Stop` (the payload 0.153.4 hands the hook, measured) is told as Codex's
  *   E7 the hook program itself, run in a real pseudo-terminal: it names that terminal, and the connector tells the end
  *   E8 while Claw opens the session: a new prompt, typing at the terminal, a chat attaching, a newer end or a stop takes the end back
- *   E9 a session Claw opened for an end that is then not told is not left open: the end of the conversation closes it (once)
+ *   E9 a session Claw opened for an end that is then not told is not left open: the end of the conversation closes it (once),
+ *      also when a new prompt took the end back before the conversation ended while the session was still opening
  *   E10 a chat still attaching to the conversation counts as following it (manager.ts `followsRef`), so its end is not told twice
  */
 import assert from "node:assert/strict";
@@ -286,6 +287,19 @@ describe("a turn's end in a terminal nobody is at", () => {
     end(prompt.r);
     assert.deepEqual(lifecycle(prompt.r), [`session_started:${SID}`, `session_closed:${SID}`]);
     assert.equal(prompt.r.ends().length, 0);
+
+    // A new prompt takes it back and then the conversation ends, both while it opens: closed at once, never said started.
+    const promptEnded = held();
+    promptEnded.hold();
+    promptEnded.r.broker.settled(CLAUDE_STOP, claude);
+    await until(() => promptEnded.r.opened.length === 1);
+    promptEnded.r.broker.settled({ session_id: CLAUDE_STOP.session_id, hook_event_name: "UserPromptSubmit", cwd: "/home/u/work/claw", prompt: "go on" }, claude);
+    end(promptEnded.r);
+    promptEnded.go();
+    await until(() => lifecycle(promptEnded.r).length === 1);
+    await wait(100);
+    assert.deepEqual(lifecycle(promptEnded.r), [`session_closed:${SID}`]);
+    assert.equal(promptEnded.r.ends().length, 0);
 
     // Typing at the terminal once it is open: the same.
     let typedAt = Date.now() - 600_000;
