@@ -467,7 +467,7 @@ export function channelsOf(current?: string): string[] {
  * deployment has what needs it.
  */
 async function githubAccountOf(userId: string, features: DeploymentFeatures): Promise<GithubAccount> {
-  let token: GithubAccountState = "none";
+  let token: GithubAccountState;
   try {
     token = (await githubEventPorts.loadToken(userId, "assistant:capabilities")) ? "yes" : "none";
   } catch {
