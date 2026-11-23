@@ -113,10 +113,10 @@ export class PersonalText {
   }
 
   /**
-   * The files of a message to the attached session, as text after the person's words (a session takes text only): the
-   * text files inline, and the person told about the rest.
+   * The files of a message to an attached session (the 1:1 chat's, or a bound group's), as text after the person's words
+   * (a session takes text only): the text files inline, and the person told about the rest.
    */
-  private async toSession(message: InboundMessage, chat: Chat, room: number): Promise<string> {
+  async toSession(message: InboundMessage, chat: Chat, room: number): Promise<string> {
     if (message.files.length === 0) return "";
     const { surface, metrics } = this.ctx.deps;
     const inline = await inlineFiles(

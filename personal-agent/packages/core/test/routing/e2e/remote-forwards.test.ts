@@ -9,8 +9,8 @@ import { test } from "node:test";
 import type { InboundFile, InboundForward } from "@primusclaw/personal-agent";
 
 import type { FakeRemote } from "../../../../../test-support/remote-fake.js";
-import { Script } from "../../../../../test-support/remote-world.js";
-import { attachedThroughRouter, routed } from "./remote-routed.js";
+import { ALICE as CLAW_ALICE, Script } from "../../../../../test-support/remote-world.js";
+import { attachedThroughRouter, routed, TWO_AGENTS, type Routed } from "./remote-routed.js";
 
 async function oneTurn(srv: FakeRemote, sid: string): Promise<void> {
   await srv.say(sid, "Done.");
@@ -141,6 +141,43 @@ test("a forward longer than one prompt to a session takes is cut to fit, the per
       assert.match(text, /\[cut: the rest of the forwarded and quoted messages did not fit/u);
       // (no room is left for the file: the person is told so)
       assert.match(w.rw.said().slice(before).join("\n"), /`build\.log` \(the files before it filled/u);
+    },
+    { remote: { files: { "build.log": { mediaType: "text/plain", bytes: bytes(LOG) } } } },
+  ));
+
+/** Alice's group bound to a session of hers on dev-pod. */
+async function boundGroup(w: Routed): Promise<void> {
+  w.rw.server.addConnector(CLAW_ALICE, "dev-pod", TWO_AGENTS);
+  const script = new Script();
+  script.onPrompt = oneTurn;
+  w.rw.server.onCommand = script.hook;
+  await w.say("/agent new claude /home/me/repo");
+  await w.say("/agent detach");
+  await w.say("切到 dev-pod 上的 claude 会话", { group: true });
+  assert.ok(w.rw.test.store.remoteState.attachedRemote("aad-a#g-1")?.sessionId, w.rw.said().join("\n"));
+}
+
+test("a bound group's forward with an image and a text file: the text inline, the image named back to the person", () =>
+  routed(
+    async (w) => {
+      await boundGroup(w);
+      const before = w.rw.said().length;
+      await w.say("what is wrong here?", {
+        group: true,
+        forwards: [{ messageId: "2", author: "Carol", text: "see [image-1]", sentAt: "", source: "reference" }],
+        files: [
+          { name: "", type: "", handle: { kind: "pasted", index: 1 } },
+          { name: "build.log", type: "log", handle: {} },
+        ],
+      });
+      const [prompt, ...more] = texts(w.rw.server);
+      assert.ok(typeof prompt === "string" && more.length === 0, w.rw.said().join("\n"));
+      assert.match(prompt, /Forwarded message from Carol:\n> see \[image-1\]/u, prompt);
+      assert.match(prompt, /what is wrong here\?\n\nThe file sent with this message:\n\nFile build\.log/u, prompt);
+      assert.match(
+        w.rw.said().slice(before).join("\n"),
+        /`image-1` \(a session takes text, and this is not a text file\)/u,
+      );
     },
     { remote: { files: { "build.log": { mediaType: "text/plain", bytes: bytes(LOG) } } } },
   ));
