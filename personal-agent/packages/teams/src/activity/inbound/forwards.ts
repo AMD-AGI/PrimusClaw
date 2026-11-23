@@ -271,13 +271,25 @@ export function forwardsOf(activity: Activity, files: readonly InboundFile[], lo
 }
 
 /**
+ * Whether the message's own `text` holds its forwards as Forward blockquotes: `written` cuts them out, so what is left
+ * is all the person's own words and nothing of it is a copy of a forward (their "LGTM" before a forwarded "LGTM" stays
+ * theirs).
+ */
+export function forwardsInText(activity: Activity): boolean {
+  return FORWARD_ITEMTYPE.test(pyStr(activity.text));
+}
+
+/** The ` <address>` a forwarded text says after a link's words (quotes-html). */
+const LINK_ADDRESS = / <https?:\/\/[^\s<>]+>/gu;
+
+/**
  * `text` (the person's words) without the forwarded messages' text that Teams also put there: a client that sends the
  * forward as plain text writes the forwarded messages into `text` as well, after the person's words and in their order,
  * and they must not read as the person's own words. Only that shape is cut: every forwarded message's text, in order, at
  * the end of `text` (after a space, or as all of it). A forwarded text the person happens to repeat in their own words
  * ("who said LGTM on this?" with "LGTM" forwarded), or one written anywhere else, stays theirs; `text` is untouched then.
  */
-export function ownWords(text: string, forwards: readonly InboundForward[]): string {
+export function ownWords(text: string, forwards: readonly InboundForward[], keepSome = false): string {
   // (a forwarded message with no text, an image alone, leaves nothing in `text`)
   const said = forwards
     .map((f) => squashSpaces(f.text.replace(/\[image(?:-[0-9]+| not passed on)\]/gu, "")))
@@ -285,14 +297,15 @@ export function ownWords(text: string, forwards: readonly InboundForward[]): str
   if (said.length === 0) return text;
   let own = squashSpaces(text);
   for (const one of [...said].reverse()) {
-    if (own === one) {
-      own = "";
-    } else if (own.endsWith(` ${one}`)) {
-      own = own.slice(0, own.length - one.length - 1);
-    } else {
-      return text;
-    }
+    // (a link's address, ` <https://...>` after its words in the forwarded text, is not in a plain-text copy)
+    const shown = squashSpaces(one.replace(LINK_ADDRESS, ""));
+    const copy = [one, shown].find((words) => words !== "" && (own === words || own.endsWith(` ${words}`)));
+    if (copy === undefined) return text;
+    own = own === copy ? "" : own.slice(0, own.length - copy.length - 1);
   }
+  // (a text that only refers to its forwards, `<attachment id="..."/>`, names them apart from the person's words: a text
+  // that is all a forwarded message's words is then the person saying them, kept rather than lost)
+  if (own === "" && keepSome) return text;
   // (the cut is whole words at the end; what is left is cut from `text` as written, its line breaks and indents kept)
   return firstWords(text, pySplit(own).length);
 }

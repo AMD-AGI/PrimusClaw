@@ -385,6 +385,41 @@ test("a forwarded text the person repeats in their own words stays theirs", () =
   );
 });
 
+test("the person's words that equal a forwarded text stay theirs when the text itself holds the forward", () => {
+  const html = `<p>LGTM</p>${forwardHtml("<p>LGTM</p>", BOB)}`;
+  const event = eventOf(teamsDm(html, html));
+  assert.equal(event.text, "LGTM");
+  assert.equal(event.forwards?.[0]?.text, "LGTM");
+  const both = `<p>LGTM</p>${forwardHtml("<p>first one</p>", BOB)}${forwardHtml("<p>LGTM</p>", CAROL)}`;
+  assert.equal(eventOf(teamsDm(both, both)).text, "LGTM");
+  const ref = teamsDm('LGTM <attachment id="1727881360458"></attachment>', null, {
+    attachments: [reference({ html: "<p>LGTM</p>" })],
+  });
+  assert.equal(eventOf(ref).text, "LGTM");
+  const copied = teamsDm('please look The deploy failed on node 3 <attachment id="1727881360458"></attachment>', null, {
+    attachments: [reference({ html: "<p>The deploy failed on node 3</p>" })],
+  });
+  assert.equal(eventOf(copied).text, "please look");
+  const linked = teamsDm('please look Open the dashboard <attachment id="1727881360458"></attachment>', null, {
+    attachments: [reference({ html: '<p><a href="https://example.test/d">Open the dashboard</a></p>' })],
+  });
+  assert.equal(eventOf(linked).text, "please look");
+});
+
+test("a link in a forwarded message comes with the message, not as a link of the person's words", () => {
+  const link = '<a href="https://example.test/private">open the dashboard</a>';
+  const event = eventOf(teamsDm("see this", `<p>see this</p>${forwardHtml(`<p>${link}</p>`, BOB)}`));
+  assert.deepEqual(event.links, []);
+  assert.equal(event.forwards?.[0]?.text, "open the dashboard <https://example.test/private>");
+  const own = eventOf(
+    teamsDm("see this", `<p>see <a href="https://example.test/mine">this</a></p>${forwardHtml(`<p>${link}</p>`, BOB)}`),
+  );
+  assert.deepEqual(
+    own.links.map((l) => l.url),
+    ["https://example.test/mine"],
+  );
+});
+
 test("several forwards written into the plain text after the person's words: all of them are cut, in order", () => {
   const html = `<p>see these</p>${forwardHtml("<p>first one</p>", BOB)}${forwardHtml("<p>second one</p>", CAROL)}`;
   assert.equal(eventOf(teamsDm("see these first one second one", html)).text, "see these");

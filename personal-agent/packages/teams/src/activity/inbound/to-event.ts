@@ -23,7 +23,7 @@ import {
   type UserRef,
 } from "@primusclaw/personal-agent";
 import { cardDataOf, cardKindOf, cardVerb, isCardClick } from "./actions.js";
-import { forwardsOf, logUnreadKinds, ownWords } from "./forwards.js";
+import { forwardsInText, forwardsOf, logUnreadKinds, ownWords } from "./forwards.js";
 import { clientPlatform, conversationId, conversationKind, isPersonal, senderOf, tenantOf } from "./identity.js";
 import { inboundLinksOf } from "./links.js";
 import { addressedToBot, DEFAULT_BOT_NAME, isMentioned, isTargeted, mentionsOf, messageText } from "./mentions.js";
@@ -95,7 +95,10 @@ function messageOf(activity: Activity, sender: UserRef, options: ToEventOptions)
   return {
     type: "message",
     ...base(activity, sender),
-    text: forwarded.forwards.length ? ownWords(messageText(activity), forwarded.forwards) : messageText(activity),
+    text:
+      forwarded.forwards.length && !forwardsInText(activity)
+        ? ownWords(messageText(activity), forwarded.forwards, /<attachment\b/iu.test(pyStr(activity.text)))
+        : messageText(activity),
     mentioned: isMentioned(activity),
     targeted: isTargeted(activity),
     namesBotFirst: addressedToBot(activity, options.botName ?? DEFAULT_BOT_NAME),
