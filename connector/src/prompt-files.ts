@@ -29,20 +29,40 @@ function sessionDir(root: string, sid: string): string {
   return path.join(root, sid.replace(/[^A-Za-z0-9-]/g, "_").slice(0, 64));
 }
 
+/** Opening a file this way never follows a symbolic link at its last component (0 where the platform has no such flag). */
+const NO_FOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+
+/** Refuses `dir` when it is a symbolic link, or anything but a folder: a file saved through it could land anywhere. */
+function ownFolder(dir: string): void {
+  const st = fs.lstatSync(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`refused a folder that is not a plain folder: ${dir}`);
+}
+
 /**
  * Saves `files` for the prompt `cmdId` of session `sid` under `root`. A name was checked by the wire contract (one path
- * component, no leading dot); it is checked again here, as the path it makes must stay inside the folder.
+ * component, no leading dot); it is checked again here, as the path it makes must stay inside the folder. Nothing is
+ * written through a symbolic link: the session's and the prompt's folders must be plain folders, and a file is opened
+ * without following one, so a link put there (by an agent of the session, say) cannot send the bytes elsewhere.
  */
 export function savePromptFiles(root: string, sid: string, cmdId: string, files: readonly RemotePromptFile[]): SavedFile[] {
-  const dir = path.join(sessionDir(root, sid), createHash("sha256").update(cmdId).digest("hex").slice(0, 16));
+  const session = sessionDir(root, sid);
+  const dir = path.join(session, createHash("sha256").update(cmdId).digest("hex").slice(0, 16));
+  fs.mkdirSync(session, { recursive: true, mode: 0o700 });
+  ownFolder(session); // (before anything is made in it)
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  ownFolder(dir);
   const saved: SavedFile[] = [];
   for (const f of files) {
     const file = path.join(dir, f.name);
     if (path.dirname(file) !== dir || f.name.startsWith(".")) throw new Error(`refused a file name: ${JSON.stringify(f.name)}`);
     const bytes = Buffer.from(f.data, "base64");
     // (a redelivered prompt finds its files already there: they are the same bytes, written again)
-    fs.writeFileSync(file, bytes, { mode: 0o600 });
+    const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | NO_FOLLOW, 0o600);
+    try {
+      fs.writeFileSync(fd, bytes);
+    } finally {
+      fs.closeSync(fd);
+    }
     saved.push({ path: file, media_type: f.media_type, size: bytes.length });
   }
   return saved;
