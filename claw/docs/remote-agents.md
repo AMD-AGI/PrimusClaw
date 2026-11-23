@@ -677,13 +677,20 @@ of two sources:
   three sentences what you are responsible for in this directory and what you have been working on recently. Only answer; do not
   run any tool or change anything."* It is asked only in a session open through Claw that is idle with nothing in it for ten minutes,
   and no conversation of that folder open in a terminal busy or typed into within ten minutes. It is sent as Claw's (`client:
-  seat_probe` on its `user_prompt` event, command id `seat-probe:<seat>:<n>`), filed as no item, with `answer_only: true`: a connector
-  with the agent capability `answer_only` refuses every permission the agent asks for in that turn on the machine
-  (`permission_auto_denied`), and for an older one Claw cancels the turn as soon as it asks for one.
+  seat_probe` on its `user_prompt` event, command id `seat-probe:<seat>:<n>`), filed as no item, with `answer_only: true`, and only
+  where that turn is held to answering on the machine: the agent's capabilities say `answer_only` (an older connector's do not, and
+  its sessions are never asked) and name a read-only mode (`read_only_modes`), the agent is not unattended, and the session's mode,
+  as its latest `session_started`, `session_resumed` or `mode_update` names it, asks (`unattended: false`) and is the agent's ask
+  mode or a read-only one. The connector runs the turn in the read-only mode (switching to it for that turn and back), refuses every
+  permission, plan and question the agent asks for in it (`permission_auto_denied`), stops it if the agent leaves that mode, and
+  refuses the prompt (`answer_only_unsupported`) where it cannot do that. Claw never cancels anything in that session: a permission
+  request there is a turn of the user's.
 
 `seat_roster` (a router read) lists the seats with only what Claw computed or the user confirmed: `seat_id`, `alias`, the confirmed
-`role`, `role_state` (`new`, `suggested`, `confirmed`, `retired`), `tags`, `machine_online`, `state` (from the types of the session's
-events and the machine's presence), `dispatch_mode` and the latest item. Nothing in it was written by a machine or an agent, so
+`role`, `role_state` (`new`, `suggested`, `confirmed`, `retired`), `machine_online`, `state` (from the types of the session's
+events and the machine's presence), `dispatch_mode` and the latest item. It has no tags: they are slugs of the git remote and branch
+the machine reports, whose words a branch name can make anything, so they are only what a guess may pick from (and the API lists
+them, for a card). Nothing in it was written by a machine or an agent, so
 reading it does not mark the turn as having read untrusted text (`devenv_list` still does). `devenv_list` shows each session's seat
 (alias, confirmed role), and `GET /v1/remote-agents/seats` lists the caller's seats with their machine and folder, for a card.
 

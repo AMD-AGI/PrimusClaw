@@ -135,6 +135,13 @@ async function prompt(id, params) {
     update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "waited" } });
     return done(s.cancelled ? "cancelled" : "end_turn");
   }
+  // `leave-mode <mode>`: the agent switches its own mode mid-turn (as Claude Code leaving plan), then works on until cancelled.
+  if ((n = /^leave-mode (\S+)$/.exec(text))) {
+    s.mode = n[1];
+    update(params.sessionId, { sessionUpdate: "current_mode_update", currentModeId: s.mode });
+    for (let i = 0; i < 200 && !s.cancelled; i++) await new Promise((r) => setTimeout(r, 25));
+    return done(s.cancelled ? "cancelled" : "end_turn");
+  }
   if (text === "hang") {
     for (let i = 0; i < 600 && !s.cancelled; i++) await new Promise((r) => setTimeout(r, 25));
     return done(s.cancelled ? "cancelled" : "end_turn");

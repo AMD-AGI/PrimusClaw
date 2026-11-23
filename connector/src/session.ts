@@ -1099,6 +1099,11 @@ export class Session {
     if (mode === this.currentMode) return;
     const from = this.currentMode;
     this.currentMode = mode;
+    if (this.answerOnlyTurn && !this.agent.readOnlyModes.includes(mode) && this.adapter && this.acpId) {
+      // The agent left the read-only mode a turn that may only answer runs in: the turn is stopped (then the mode is put back after it).
+      this.audit("answer_only_stopped", { from, to: mode });
+      void this.adapter.notify("session/cancel", { sessionId: this.acpId }).catch(() => undefined);
+    }
     if (!this.modeAllowed(mode)) {
       this.audit("mode_reverted", { from, to: mode, back_to: this.agent.askMode });
       this.emit("mode_update", { currentMode: mode, reverted: true, unattended: this.unattended });
@@ -1271,6 +1276,14 @@ export class Session {
   /** The Cursor extension requests the adapter blocks on. Never left unanswered. */
   private onExtension(method: string, params: AcpParams): Promise<AcpParams> {
     this.touch();
+    if (this.answerOnlyTurn && (method === "cursor/create_plan" || method === "cursor/ask_question")) {
+      // A turn that may only answer asks nobody anything: a plan is rejected, a question skipped, here.
+      this.audit("answer_only_denied", { tool: method, tool_kind: "extension" });
+      this.emit("permission_auto_denied", { tool: method, kind: "extension", reason: "answer_only" });
+      return Promise.resolve(method === "cursor/create_plan"
+        ? { outcome: { outcome: "rejected", reason: "this turn may only answer" } }
+        : { outcome: { outcome: "skipped", reason: "this turn may only answer" } });
+    }
     if (method === "cursor/create_plan") {
       const options: OfferedOption[] = [
         { optionId: "plan-accept", name: "Accept the plan", kind: "allow_once" },
@@ -1375,12 +1388,7 @@ export class Session {
         if (verdict === "keep") { this.queue.unshift(next); break; }
         if (verdict === "drop") { next.started(); continue; }
         if (this.closed) { this.rejectCommand("prompt", next.cmdId, "session_closed", next.cmdSeq); next.started(); break; }
-        this.answerOnlyTurn = next.answerOnly === true;
-        try {
-          await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq);
-        } finally {
-          this.answerOnlyTurn = false;
-        }
+        await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq, next.answerOnly === true);
       }
     } finally {
       this.turnRunning = false;
@@ -1388,8 +1396,55 @@ export class Session {
     }
   }
 
+  /**
+   * The turn of a prompt that may only answer (`prompt.answer_only`), readied once its agent runs: it runs in a mode of the agent's that
+   * changes nothing (`readOnlyModes`: Claude Code's `plan`, Cursor's `ask`), the session's own when it is one, else one switched to for
+   * this turn only (and back after it, {@link leaveAnswerOnly}). Refused, and never run, in a session that does not ask (`unattended`:
+   * the agent's own rules would let it run anything, and nothing of that reaches here), for an agent with no such mode, or when the mode
+   * cannot be set. In the turn every permission and every question the agent asks is refused here and put to nobody
+   * ({@link onPermission}, {@link onExtension}), and the agent leaving the read-only mode stops it ({@link noteMode}).
+   * Returns the mode to go back to (null: none), or `false` when refused (the turn's end already said so).
+   */
+  private async enterAnswerOnly(cmdId: string | null, cmdSeq: number | null, started: () => void): Promise<string | null | false> {
+    const refuse = (reason: string): false => {
+      started();
+      this.audit("prompt_refused", { reason: ANSWER_ONLY_UNSUPPORTED, detail: reason });
+      this.rejectCommand("prompt", cmdId, ANSWER_ONLY_UNSUPPORTED, cmdSeq);
+      this.emit("turn_end", { stopReason: "error", error: ANSWER_ONLY_UNSUPPORTED, cmd_id: cmdId, cmd_seq: cmdSeq });
+      this.env.store.endTurn(this.id);
+      return false;
+    };
+    if (this.unattended) return refuse("unattended");
+    const readOnly = this.agent.readOnlyModes;
+    const from = this.currentMode;
+    if (from !== null && readOnly.includes(from)) return null;
+    const to = readOnly.find((m) => this.modeAllowed(m) && (this.modes.length === 0 || this.modes.some((x) => x.id === m)));
+    if (!to || from === null) return refuse("no_read_only_mode");
+    try {
+      await this.enforceMode(to);
+    } catch (e) {
+      this.audit("mode_set_failed", { mode: to, error: errMessage(e), answer_only: true });
+      try { await this.enforceMode(from); } catch (again) { refuse("mode_not_set"); await this.refuse(again); return false; }
+      return refuse("mode_not_set");
+    }
+    this.emit("mode_update", { currentMode: this.currentMode, unattended: this.unattended, answer_only: true });
+    return from;
+  }
+
+  /** After a turn that may only answer: back to the mode it was switched from. Failing that it stays read-only, which runs nothing. */
+  private async leaveAnswerOnly(back: string | null): Promise<void> {
+    this.answerOnlyTurn = false;
+    if (back === null || this.closed || !this.adapter) return;
+    try {
+      await this.enforceMode(back);
+    } catch (e) {
+      this.audit("mode_set_failed", { mode: back, error: errMessage(e), answer_only: true });
+    }
+    this.emit("mode_update", { currentMode: this.currentMode, unattended: this.unattended });
+  }
+
   /** Every `turn_end` of the turn names its prompt: `cmd_id`, and `cmd_seq` (a number, which no credential scrub ever masks). */
-  private async runTurn(text: string, started: () => void, cmdId: string | null, cmdSeq: number | null): Promise<void> {
+  private async runTurn(text: string, started: () => void, cmdId: string | null, cmdSeq: number | null, answerOnly = false): Promise<void> {
     if (this.agent.attach) {
       const refused = await this.preflight();
       if (refused) {
@@ -1413,6 +1468,19 @@ export class Session {
       if (reason === "agent_auth_required") return;
       return this.refuse(e);
     }
+    if (!answerOnly) return this.runAdapterTurn(text, started, cmdId, cmdSeq);
+    const back = await this.enterAnswerOnly(cmdId, cmdSeq, started);
+    if (back === false) return;
+    this.answerOnlyTurn = true;
+    try {
+      await this.runAdapterTurn(text, started, cmdId, cmdSeq);
+    } finally {
+      await this.leaveAnswerOnly(back);
+    }
+  }
+
+  /** The turn itself, its agent running (and, for a turn that may only answer, in a read-only mode). */
+  private async runAdapterTurn(text: string, started: () => void, cmdId: string | null, cmdSeq: number | null): Promise<void> {
     const a = this.adapter!;
     this.audit("turn_started", { length: text.length });
     const support = this.agent.attach && this.acpId ? this.env.attach.get(this.agent.id) : undefined;

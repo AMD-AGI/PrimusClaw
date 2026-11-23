@@ -350,9 +350,13 @@ All of these run on your machine and fail closed.
   are read from the files git keeps, never by running git, and leave the machine only as `host/owner/repo` and a branch name: the
   user and any password or token in the remote's URL are dropped first, and a remote that still looks like it carries one is
   not reported at all.
-- **A turn that may only answer.** A prompt Claw sends with `answer_only` (it asks a session, once, what it is for) refuses
-  every permission the agent asks for in that turn here, on your machine, even one an `auto_allow` rule would let through, and
-  asks nobody; the refusal is audited (`answer_only_denied`). A conversation open in a terminal never takes such a prompt.
+- **A turn that may only answer.** A prompt Claw sends with `answer_only` (it asks a session, once, what it is for) runs in a
+  mode of the agent's that changes nothing (Claude Code's `plan`, Cursor's `ask`): the session's own when it is one, else one
+  switched to for that turn only and back after it. In that turn every permission the agent asks for is refused here, on your
+  machine, even one an `auto_allow` rule would let through, and so is a plan it proposes or a question it asks; nobody is asked,
+  and the refusal is audited (`answer_only_denied`). It is refused, and never reaches the agent, in a session that does not ask
+  (`approval = "never"`, whose agent would run anything its own rules allow), for an agent with no such mode (Codex), and in a
+  conversation open in a terminal.
 
 ## Taking over an existing conversation
 

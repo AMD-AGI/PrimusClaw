@@ -118,12 +118,15 @@ release version, and its `appVersion` stays `latest`.
   counts only once the user confirmed it on a card: their own words (`seat_set`, in a turn answering their own signed-in message), or
   Claw's guess (one tool-less model call with a schema-bounded answer, from the folder, its git remote and branch, the conversations'
   titles, the start of the user's last 20 prompts there and, once per seat, the session's answer to one fixed question asked only while
-  it is idle and quiet for ten minutes, as an answer-only turn). `seat_roster` lists only what Claw computed or the user confirmed and
-  does not mark the turn; `devenv_list` and `GET /v1/remote-agents/seats` show each seat's alias and confirmed role. Shown only: nothing
+  it is idle and quiet for ten minutes, as an answer-only turn, and only of a connector that holds such a turn to a read-only mode and
+  a session that asks). `seat_roster` lists only what Claw computed or the user confirmed (no tags: a branch's name is the machine's)
+  and does not mark the turn; `devenv_list` and `GET /v1/remote-agents/seats` show each seat's alias and confirmed role. Shown only: nothing
   is sent to a seat because of its role. See `claw/docs/remote-agents.md`, "Seats".
 - Connector: the heartbeat reports each session folder's git remote and branch (`workspaces`, capability `git_info`), read from git's
   files and normalized on the machine (`host/owner/repo`, no user or credential); a prompt with `answer_only: true` (capability
-  `answer_only`) refuses every permission its agent asks for in that turn, on the machine.
+  `answer_only`) runs in the agent's read-only mode (switched to for that turn and back) and refuses, on the machine, every
+  permission, plan and question its agent asks for in it; it is refused in a session that does not ask and for an agent with no
+  read-only mode.
 
 - Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, how many times the
   application was started again, and `app.last_exit`, `{ returncode, at, cause }` of the last time the application

@@ -9,8 +9,12 @@
  *   G2 the heartbeat never waits for a read: a stalled disk is given up within the timeout, and holds back the rest (one thread)
  *   G3 end to end: the connector's heartbeat carries the session folder's remote and branch, with the capability, and the server's
  *      own parser takes it (and takes a heartbeat without it, as an older connector sends)
- *   A1 an answer-only prompt: the permission the agent asks for is refused on the machine, nobody is asked, nothing is written
+ *   A1 an answer-only prompt runs in the agent's read-only mode (switched to for the turn, and back): the permission the agent asks for
+ *      is refused on the machine, nobody is asked, nothing is written
+ *   A1c the agent leaving the read-only mode in that turn stops the turn
+ *   A1b a plan the agent proposes and a question it asks in that turn (Cursor's extension requests) are refused, put to nobody
  *   A2 the same prompt without answer_only still asks, so the refusal is the flag's doing
+ *   A3 refused, never reaching the agent, in a session that does not ask (unattended) and for an agent with no read-only mode
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -131,7 +135,7 @@ describe("G2 the heartbeat never waits", () => {
   });
 });
 
-describe("G3 and A1-A2 end to end", () => {
+describe("G3 and A1-A3 end to end", () => {
   test("the heartbeat carries the session folder's remote and branch; the server's parser takes it, and one without it", async () => {
     const work = tmpdir("cc-work-git-");
     repo(work, { url: "https://dev:supersecretpassword@github.com/Org/Repo.git", head: "ref: refs/heads/feat/seats\n" });
@@ -153,8 +157,8 @@ describe("G3 and A1-A2 end to end", () => {
     assert.equal(old.value.workspaces, null, "an older connector's heartbeat: no workspaces, still taken");
   });
 
-  test("A1 answer_only: the agent's permission is refused on the machine, nobody is asked, nothing is written", async () => {
-    const h = await make();
+  test("A1 answer_only: run in a read-only mode switched to for the turn and back; the permission is refused on the machine, nobody asked", async () => {
+    const h = await make({ preset: "claude" });
     const sid = await h.newSession();
     h.prompt(sid, "write probe.txt something", { answer_only: true });
     const end = await h.turnEnd(sid);
@@ -165,10 +169,61 @@ describe("G3 and A1-A2 end to end", () => {
     assert.equal(denied[0]!.data.reason, "answer_only");
     assert.equal(fs.existsSync(path.join(h.work, "probe.txt")), false);
     assert.deepEqual(h.adapterLog().find((l) => l.permissionAnswer)!.permissionAnswer, { outcome: { outcome: "selected", optionId: "reject" } });
-    // The next prompt of the same session is an ordinary one again: it asks.
+    assert.equal(h.adapterLog().find((l) => l.prompt === "write probe.txt something")!.mode, "plan", "the turn ran in the read-only mode");
+    await h.claw.until("the mode put back", () => h.claw.eventsOf(sid, "mode_update").some((e) => e.data.currentMode === "default"));
+    assert.deepEqual(h.adapterLog().filter((l) => l.method === "session/set_mode").map((l) => l.params.modeId).slice(-2), ["plan", "default"]);
+    // The next prompt of the same session is an ordinary one again, in its own mode: it asks.
     h.prompt(sid, "write after.txt again");
     const perm = await h.permission(sid);
     assert.ok(perm.data.actionId);
+    assert.equal(h.adapterLog().find((l) => l.prompt === "write after.txt again")!.mode, "default");
+  });
+
+  test("A1b answer_only: a plan the agent proposes and a question it asks are refused on the machine, put to nobody", async () => {
+    const h = await make({ preset: "claude" });
+    const sid = await h.newSession();
+    h.prompt(sid, "plan", { answer_only: true });
+    await h.turnEnd(sid);
+    h.prompt(sid, "question", { answer_only: true });
+    await h.turnEnd(sid, 2);
+    assert.equal(h.claw.eventsOf(sid, "permissionRequest").length, 0, "no card was put to anyone");
+    assert.deepEqual(h.adapterLog().find((l) => l.planAnswer)!.planAnswer.outcome.outcome, "rejected");
+    assert.deepEqual(h.adapterLog().find((l) => l.questionAnswer)!.questionAnswer.outcome.outcome, "skipped");
+    assert.deepEqual(h.claw.eventsOf(sid, "permission_auto_denied").map((e) => e.data.reason), ["answer_only", "answer_only"]);
+    // Without answer_only the same plan is put to the person.
+    h.prompt(sid, "plan");
+    const perm = await h.permission(sid);
+    assert.ok(perm.data.actionId);
+  });
+
+  test("A1c answer_only: the agent leaving the read-only mode in that turn stops it; the session is put back in its own mode", async () => {
+    const h = await make({ preset: "claude" });
+    const sid = await h.newSession();
+    h.prompt(sid, "leave-mode default", { answer_only: true });
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.stopReason, "cancelled", "stopped, not left to run in a mode that may act");
+    assert.ok(h.audit().some((a) => a.kind === "answer_only_stopped" && a.to === "default"));
+    await h.claw.until("the mode put back", () => h.claw.eventsOf(sid, "mode_update").at(-1)?.data.currentMode === "default");
+  });
+
+  test("A3 answer_only is refused, and never reaches the agent, where it cannot be held to answering", async () => {
+    // A session that does not ask (the agent's own rules would run anything), and an agent with no read-only mode.
+    const cases: Array<[string, Parameters<typeof Harness.create>[0]]> = [
+      ["unattended", { preset: "claude", approval: "never", askMode: "bypassPermissions" }],
+      ["no read-only mode", {}],
+    ];
+    for (const [why, opts] of cases) {
+      const h = await make(opts);
+      const sid = await h.newSession();
+      const seq = h.prompt(sid, "write probe.txt something", { answer_only: true });
+      const end = await h.turnEnd(sid);
+      assert.equal(end.data.error, "answer_only_unsupported", why);
+      assert.equal(end.data.cmd_seq, seq, `${why}: the turn's end names its prompt`);
+      assert.deepEqual(h.claw.eventsOf(sid, "command_rejected").map((e) => e.data.reason), ["answer_only_unsupported"], why);
+      assert.equal(h.adapterLog().filter((l) => l.prompt === "write probe.txt something").length, 0, `${why}: the agent never saw it`);
+      assert.equal(fs.existsSync(path.join(h.work, "probe.txt")), false, why);
+      assert.equal(h.claw.eventsOf(sid, "permissionRequest").length, 0, why);
+    }
   });
 
   test("A2 the same prompt without answer_only asks the person", async () => {
