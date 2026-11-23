@@ -35,15 +35,16 @@ const { contradictedClaims, DETECTOR_ENTRY_IDS } = await import("./e2e/self-know
 type Inputs = Parameters<typeof caps.capabilityList>[0];
 
 const ALL_ON: Inputs["features"] = {
-  review_tools: true, github_review: true, github_events: true, memory: true, remote_agents: true, triggers: true, job_watch: true,
+  review_tools: true, github_review: true, review_items: true, github_events: true, memory: true, remote_agents: true, triggers: true, job_watch: true,
   files_and_images: true, user_skills: true, github_poll_sec: 30, job_poll_sec: 30, images_per_message: 4,
 };
 const EVERY_TOOL = Object.keys(caps.TOOL_EFFECTS);
+const WEB_BOTH = { search: true, fetch: true };
 
 function inputs(over: Partial<Inputs> = {}): Inputs {
   return {
-    tools: EVERY_TOOL, features: ALL_ON, lookups: { web: true, github: true, systems: ["safe", "agent-board"] },
-    reviewMode: "high_risk_confirm", channels: ["teams"], ...over,
+    tools: EVERY_TOOL, features: ALL_ON, lookups: { web: WEB_BOTH, github: true, systems: ["safe", "agent-board"] },
+    reviewMode: "high_risk_confirm", userMemory: { enabled: true, here: true }, channels: ["teams"], ...over,
   };
 }
 const on = (list: ReturnType<typeof caps.capabilityList>, id: string): boolean | undefined =>
@@ -52,16 +53,17 @@ const onIds = (list: ReturnType<typeof caps.capabilityList>): string[] => list.a
 
 test("K1 every ability is on with its feature and its tools, and taking one away turns exactly that entry off", () => {
   const full = caps.capabilityList(inputs());
-  assert.equal(full.version, "capabilities-v1");
+  assert.equal(full.version, "capabilities-v2");
   assert.deepEqual(full.abilities.filter((a) => !a.on).map((a) => a.id), [], "everything on");
   assert.match(full.abilities.find((a) => a.id === "see_images")!.what, /Images sent with a message are shown to you \(up to 4 per message\)/);
   assert.match(full.abilities.find((a) => a.id === "watch_pull_requests")!.what, /in the background.*read every 30 s/);
-  assert.match(full.abilities.find((a) => a.id === "look_up")!.what, /the web .*the user's GitHub .*these systems: safe, agent-board\./);
+  assert.match(full.abilities.find((a) => a.id === "look_up")!.what, /search the web \(web_search\); read a web page at an address \(web_fetch\); the user's GitHub .*these systems: safe, agent-board\.$/);
+  assert.deepEqual(full.abilities.find((a) => a.id === "look_up")!.tools, ["web_search", "web_fetch", "github", "safe", "agent-board"]);
 
   // Each switch off: its entry, and nothing else, goes off (the tool may still be listed: the switch decides).
   const features: Array<[keyof Inputs["features"], string]> = [
     ["files_and_images", "see_images"], ["github_events", "watch_pull_requests"], ["job_watch", "watch_jobs"], ["triggers", "scheduled_tasks"],
-    ["memory", "memory"], ["review_tools", "reviews"], ["remote_agents", "dev_environments"], ["user_skills", "personal_skills"],
+    ["memory", "memory"], ["review_tools", "reviews"], ["github_review", "reviews"], ["review_items", "reviews"], ["remote_agents", "dev_environments"], ["user_skills", "personal_skills"],
   ];
   for (const [feature, id] of features) {
     const list = caps.capabilityList(inputs({ features: { ...ALL_ON, [feature]: false } }));
@@ -84,7 +86,7 @@ test("K1 every ability is on with its feature and its tools, and taking one away
   assert.deepEqual(half.abilities.find((a) => a.id === "check_work")!.tools, ["work_recall"]);
   assert.doesNotMatch(half.abilities.find((a) => a.id === "check_work")!.what, /pr_state/);
   // No lookups at all: nothing to look up with.
-  assert.equal(on(caps.capabilityList(inputs({ lookups: { web: false, github: false, systems: [] } })), "look_up"), false);
+  assert.equal(on(caps.capabilityList(inputs({ lookups: { web: { search: false, fetch: false }, github: false, systems: [] } })), "look_up"), false);
   // A router with only the base tools (every switch off): what is on is what those tools do.
   const bare = caps.capabilityList(inputs({
     tools: ["say", "deliver_text", "work_create", "work_send", "work_stop", "work_recall", CAPABILITIES_TOOL()],
@@ -108,12 +110,12 @@ test("K2 the review mode says how a merge goes, limits are data a system lifts, 
     ["email", false], ["calendar", false], ["documents", false], ["voice", false], ["other_chat_apps", false],
   ]);
   assert.match(careful.limits.find((l) => l.id === "other_chat_apps")!.what, /^Only in teams: not in other chat apps/);
-  const mail = caps.capabilityList(inputs({ lookups: { web: true, github: true, systems: ["outlook-mail"] } }));
+  const mail = caps.capabilityList(inputs({ lookups: { web: WEB_BOTH, github: true, systems: ["outlook-mail"] } }));
   assert.equal(on(mail, "email"), true);
   assert.equal(on(mail, "calendar"), true, "outlook holds the calendar too");
   assert.equal(on(mail, "documents"), false);
-  assert.equal(on(caps.capabilityList(inputs({ lookups: { web: true, github: true, systems: ["confluence"] } })), "documents"), true);
-  assert.equal(on(caps.capabilityList(inputs({ lookups: { web: true, github: true, systems: ["voice-gw"] } })), "voice"), false, "nothing lifts voice");
+  assert.equal(on(caps.capabilityList(inputs({ lookups: { web: WEB_BOTH, github: true, systems: ["confluence"] } })), "documents"), true);
+  assert.equal(on(caps.capabilityList(inputs({ lookups: { web: WEB_BOTH, github: true, systems: ["voice-gw"] } })), "voice"), false, "nothing lifts voice");
   const two = caps.capabilityList(inputs({ channels: ["slack", "teams"] }));
   assert.equal(on(two, "other_chat_apps"), true);
   assert.deepEqual(two.channels, ["slack", "teams"]);
@@ -243,7 +245,7 @@ test("K6 claiming an ability the list has off is a contradiction, a plain answer
   ] as const;
   for (const [line, detector] of claims) assert.deepEqual(contradictedClaims(line, list).map((c) => c.detector), [detector], line);
   // Lifted by the deployment, the same claim is true.
-  const mail = caps.capabilityList(inputs({ lookups: { web: true, github: true, systems: ["outlook-mail"] } }));
+  const mail = caps.capabilityList(inputs({ lookups: { web: WEB_BOTH, github: true, systems: ["outlook-mail"] } }));
   assert.deepEqual(contradictedClaims("我可以帮你查看邮件并回复。", mail), []);
   // Answers that are not about the assistant's abilities, or that deny what is really off, are none.
   for (const line of ["PR #12 的 CI 失败了，我已经让 worker 去看。", "节点 n1 现在无法访问。", "我不能读你的邮件。", "I can't take voice calls.", "There are 3 open pull requests."]) {
@@ -251,4 +253,80 @@ test("K6 claiming an ability the list has off is a contradiction, a plain answer
   }
   const ids = new Set([...list.abilities, ...list.limits].map((e) => e.id));
   for (const id of DETECTOR_ENTRY_IDS) assert.ok(ids.has(id), `${id} is an entry the server generates`);
+});
+
+test("K7 what is listed is what works: the web tools as the Brain has them, reviews only where review_start would start one, memory only where it is kept", () => {
+  const look = (web: Inputs["lookups"]["web"], github = false) => {
+    const list = caps.capabilityList(inputs({ lookups: { web, github, systems: [] } }));
+    const a = list.abilities.find((x) => x.id === "look_up")!;
+    return { on: a.on, what: a.what, tools: a.tools, web: list.lookups.web };
+  };
+  // Brain's defaults: neither tool. Nothing to look up, and the list says the web is not there.
+  const none = look({ search: false, fetch: false });
+  assert.equal(none.on, false);
+  assert.match(none.what, /No web search here\. No reading web pages here\.$/);
+  assert.deepEqual(none.web, { search: false, fetch: false });
+  // Each on its own: only that one is listed, and the other is said to be missing.
+  const search = look({ search: true, fetch: false });
+  assert.equal(search.on, true);
+  assert.deepEqual(search.tools, ["web_search"]);
+  assert.match(search.what, /search the web \(web_search\)\. No reading web pages here\.$/);
+  assert.doesNotMatch(search.what, /web_fetch/);
+  const fetch = look({ search: false, fetch: true });
+  assert.deepEqual(fetch.tools, ["web_fetch"]);
+  assert.match(fetch.what, /read a web page at an address \(web_fetch\)\. No web search here\.$/);
+  assert.doesNotMatch(fetch.what, /web_search/);
+  // Not known (the API's own list, a Brain that does not say): neither is claimed, and no absence is asserted either.
+  const unknown = look(null, true);
+  assert.equal(unknown.on, true, "GitHub is still there");
+  assert.deepEqual(unknown.tools, ["github"]);
+  assert.doesNotMatch(unknown.what, /web/i);
+  assert.equal(unknown.web, null);
+
+  // The header a Brain names its web tools in.
+  assert.deepEqual(caps.parseWebTools(undefined), null);
+  assert.deepEqual(caps.parseWebTools("none"), { search: false, fetch: false });
+  assert.deepEqual(caps.parseWebTools(""), { search: false, fetch: false });
+  assert.deepEqual(caps.parseWebTools("web_search"), { search: true, fetch: false });
+  assert.deepEqual(caps.parseWebTools(" web_fetch , web_search "), { search: true, fetch: true });
+  assert.deepEqual(caps.parseWebTools(["web_fetch"]), { search: false, fetch: true });
+  assert.deepEqual(caps.parseWebTools("web_searchx,bash"), { search: false, fetch: false }, "only the names themselves");
+
+  // Reviews: off when review_start would refuse (no reviews, or no review items), and then no review mode is claimed either.
+  for (const off of ["review_tools", "github_review", "review_items"] as const) {
+    const list = caps.capabilityList(inputs({ reviewMode: "fully_auto", features: { ...ALL_ON, [off]: false } }));
+    assert.equal(on(list, "reviews"), false, `${off} off`);
+    assert.equal(list.review_mode, null, `${off} off: no fully_auto merge claimed`);
+  }
+  assert.equal(caps.capabilityList(inputs({ reviewMode: "fully_auto" })).review_mode?.mode, "fully_auto");
+
+  // Memory: the deployment's switch, the user's own setting and this conversation all have to keep it.
+  const memory = (userMemory: Inputs["userMemory"], features = ALL_ON) => caps.capabilityList(inputs({ userMemory, features })).abilities.find((a) => a.id === "memory")!;
+  assert.equal(memory({ enabled: true, here: true }).on, true);
+  assert.match(memory({ enabled: true, here: true }).what, /^Remember things across conversations/);
+  const userOff = memory({ enabled: false, here: true });
+  assert.equal(userOff.on, false);
+  assert.match(userOff.what, /^Long-term memory is off for this user: nothing is saved or recalled; they can turn it on in their settings\.$/);
+  const groupChat = memory({ enabled: true, here: false });
+  assert.equal(groupChat.on, false);
+  assert.match(groupChat.what, /not kept in this conversation/);
+  assert.equal(memory({ enabled: true, here: true }, { ...ALL_ON, memory: false }).on, false);
+});
+
+test("K8 the inputs read the user's memory only where the deployment has it, and carry the Brain's web tools as given", async () => {
+  const q = (async () => ({ rows: [] })) as never;
+  const asked: Array<[string, string | null]> = [];
+  const deps = {
+    systems: async () => [], github: async () => false,
+    memory: async (u: string, s: string | null) => { asked.push([u, s]); return { enabled: false, here: true }; },
+  };
+  const on_ = await caps.capabilityInputs(q, "alice", "sid-1", EVERY_TOOL, undefined, { ...deps, features: ALL_ON, web: { search: true, fetch: false } });
+  assert.deepEqual(on_.userMemory, { enabled: false, here: true });
+  assert.deepEqual(asked, [["alice", "sid-1"]]);
+  assert.deepEqual(on_.lookups.web, { search: true, fetch: false });
+  assert.equal(on(caps.capabilityList(on_), "memory"), false, "the user's own setting is off");
+  const off = await caps.capabilityInputs(q, "alice", "sid-1", EVERY_TOOL, undefined, { ...deps, features: { ...ALL_ON, memory: false } });
+  assert.deepEqual(off.userMemory, { enabled: false, here: false });
+  assert.equal(asked.length, 1, "not asked where the deployment has no memory");
+  assert.equal(off.lookups.web, null, "no web tools named: not known");
 });

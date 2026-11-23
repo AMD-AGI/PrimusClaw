@@ -123,6 +123,10 @@ release version, and its `appVersion` stays `latest`.
   answer only from it (`router-self-v5`, `router-read-v18`); "every change goes through a work item that asks first"
   is no longer said, since its own tools act by themselves. `GET /v1/assistant/capabilities` serves the same list to
   the signed-in user. Asked what it could not do, it used to answer from guesswork and name limits it does not have.
+  An entry is on only where it works: web search and page reading as the Brain running the turn has each of them
+  (the Brain names them to the assistant's server in `x-claw-web-tools`; the API's own list, which no Brain serves,
+  claims neither), reviews and the review mode only where a review can be started from the assistant (reviews and
+  review items on), and memory only where the user's own setting has it and the conversation keeps it.
 - Claw: the super-agent evaluation grades an answer about the assistant against that list. A case with
   `self_knowledge` reads the identity's list before it is sent; an answer that states a limit the list contradicts,
   or claims an ability it lists as off, fails, and the judge is given the list as the truth. Nine such cases are in

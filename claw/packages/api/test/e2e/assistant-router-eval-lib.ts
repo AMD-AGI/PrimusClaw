@@ -370,8 +370,13 @@ export function capabilitiesFor(tools: readonly ToolSchema[], over: Partial<Omit
   const prefix = `mcp__${ASSISTANT_MCP_SERVER}__`;
   return capabilityList({
     tools: tools.map((t) => t.name).filter((n) => n.startsWith(prefix)).map((n) => n.slice(prefix.length)),
-    features: over.features ?? deploymentFeatures(), lookups: over.lookups ?? { web: true, github: false, systems: [] },
-    reviewMode: over.reviewMode ?? "high_risk_confirm", channels: over.channels ?? channelsOf(),
+    features: over.features ?? deploymentFeatures(),
+    // Brain's web tools as the stand-in offers them, as a Brain names the ones it has.
+    lookups: over.lookups ?? {
+      web: { search: tools.some((t) => t.name === "web_search"), fetch: tools.some((t) => t.name === "web_fetch") }, github: false, systems: [],
+    },
+    reviewMode: over.reviewMode ?? "high_risk_confirm", userMemory: over.userMemory ?? { enabled: true, here: true },
+    channels: over.channels ?? channelsOf(),
   });
 }
 

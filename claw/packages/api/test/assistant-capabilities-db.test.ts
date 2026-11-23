@@ -10,6 +10,8 @@
  *       (pull request watching on, jobs off), the user's review mode as stored, read again on every call, and the turn's chat app
  *   KD3 GET /v1/assistant/capabilities serves the same list to the user it is about, and nothing to a caller without a user
  *   KD4 a router turn that reads the list and answers from it says nothing the list contradicts; the 2026-11-23 answer does
+ *   KD5 the web tools are the ones the Brain names on its call (none named: not claimed), and memory is what the user's own setting and
+ *       the conversation keep, read from the store
  *
  * Skipped without DATABASE_URL, and a skip is not a pass. The source is imported only once the world has set the configuration.
  */
@@ -30,7 +32,7 @@ describe("claw_capabilities on a database", { skip: postgresSkipReason() }, () =
   let self: typeof import("./e2e/self-knowledge.js");
 
   before(async () => {
-    w = await startWorld({ CLAW_ASSISTANT_GITHUB_EVENTS: "true", CLAW_ASSISTANT_TOOLS: "on", CLAW_GITHUB_REVIEW_ENABLED: "true" });
+    w = await startWorld({ CLAW_ASSISTANT_GITHUB_EVENTS: "true", CLAW_ASSISTANT_TOOLS: "on", CLAW_GITHUB_REVIEW_ENABLED: "true", CLAW_ASSISTANT_REVIEW_ITEMS: "true" });
     app = Fastify();
     app.addHook("preHandler", async (req) => {
       const id = req.headers["x-test-user"];
@@ -45,10 +47,10 @@ describe("claw_capabilities on a database", { skip: postgresSkipReason() }, () =
   });
   after(async () => { await app?.close(); await w?.stop(); });
 
-  async function connect(claims: object): Promise<Client> {
+  async function connect(claims: object, extra: Record<string, string> = {}): Promise<Client> {
     const token = w.mod.token.mintAssistantToken(claims as never, TOKEN_KEY);
     const client = new Client({ name: "brain-mcp-assistant", version: "1.0.0" }, { capabilities: {} });
-    await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/v1/internal/assistant-mcp`), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/v1/internal/assistant-mcp`), { requestInit: { headers: { Authorization: `Bearer ${token}`, ...extra } } }));
     return client;
   }
   const parsed = (res: Awaited<ReturnType<Client["callTool"]>>): Record<string, any> => JSON.parse((res.content as Array<{ text: string }>)[0]!.text);
@@ -159,5 +161,43 @@ describe("claw_capabilities on a database", { skip: postgresSkipReason() }, () =
     } finally {
       await router.close();
     }
+  });
+
+  test("KD5 the web tools the Brain names, and the memory the user's setting and the conversation keep", async () => {
+    await w.q("TRUNCATE claw_assistant_messages, claw_pending_messages, claw_tasks, claw_work_items, claw_assistants, claw_sessions, claw_github_review_settings CASCADE");
+    const alice = await w.user("alice");
+    const lookUp = (list: Record<string, any>) => list.abilities.find((a: { id: string }) => a.id === "look_up");
+    for (const [header, web, tools] of [
+      [undefined, null, []], ["none", { search: false, fetch: false }, []], ["web_fetch", { search: false, fetch: true }, ["web_fetch"]],
+      ["web_search,web_fetch", { search: true, fetch: true }, ["web_search", "web_fetch"]],
+    ] as const) {
+      const router = await connect(await turnFrom(alice, "你能上网查吗"), header === undefined ? {} : { "x-claw-web-tools": header });
+      try {
+        const list = parsed(await router.callTool({ name: "claw_capabilities", arguments: {} }));
+        assert.deepEqual(list.lookups.web, web, `header ${header}`);
+        assert.deepEqual((lookUp(list)?.tools ?? []).filter((t: string) => t.startsWith("web_")), tools, `header ${header}`);
+        if (header !== "web_search,web_fetch") assert.doesNotMatch(lookUp(list).what, /search the web/, `header ${header}`);
+      } finally {
+        await router.close();
+      }
+    }
+
+    // Memory, from the store, as the memory tools decide it (the deployment's switch given on).
+    const { capabilityInputs, capabilityList, deploymentFeatures } = await import("../src/assistant/capabilities.js");
+    const { db } = await import("../src/infra/db.js");
+    const memoryOf = async (sid: string | null) => {
+      const inputs = await capabilityInputs((t, p) => db.query(t, p), "alice", sid, ["memory_save", "memory_recall"], undefined,
+        { features: { ...deploymentFeatures(), memory: true }, systems: async () => [], github: async () => false });
+      return { memory: inputs.userMemory, on: capabilityList(inputs).abilities.find((a) => a.id === "memory")!.on };
+    };
+    await w.q("INSERT INTO claw_user_memory_prefs (user_id, enabled) VALUES ('alice', true) ON CONFLICT (user_id) DO UPDATE SET enabled = true");
+    assert.deepEqual(await memoryOf(alice.routerSid), { memory: { enabled: true, here: true }, on: true });
+    await w.q("UPDATE claw_user_memory_prefs SET enabled = false WHERE user_id = 'alice'");
+    assert.deepEqual(await memoryOf(alice.routerSid), { memory: { enabled: false, here: true }, on: false }, "the user turned memory off");
+    await w.q("UPDATE claw_user_memory_prefs SET enabled = true WHERE user_id = 'alice'");
+    await w.q(`UPDATE claw_sessions SET config = config || '{"memory":"off"}'::jsonb WHERE session_id = $1`, [alice.routerSid]);
+    assert.deepEqual(await memoryOf(alice.routerSid), { memory: { enabled: true, here: false }, on: false }, "a conversation that keeps none");
+    assert.deepEqual(await memoryOf(null), { memory: { enabled: true, here: false }, on: false }, "no session yet");
+    await w.q("DELETE FROM claw_user_memory_prefs WHERE user_id = 'alice'");
   });
 });

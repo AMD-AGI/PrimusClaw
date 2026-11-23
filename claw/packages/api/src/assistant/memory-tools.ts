@@ -309,7 +309,7 @@ async function orNothing<T>(what: string, sessionId: string, read: () => Promise
 }
 
 /** Whether the session is one other people read (`memory: "off"`, a group's), where no one's personal memory is shown. */
-async function sessionWithoutMemory(sessionId: string): Promise<boolean> {
+export async function sessionWithoutMemory(sessionId: string): Promise<boolean> {
   const row = (await db.query("SELECT config->'memory' AS memory FROM claw_sessions WHERE session_id = $1", [sessionId])).rows[0] as
     { memory: unknown } | undefined;
   return !row || row.memory === "off" || row.memory === false;

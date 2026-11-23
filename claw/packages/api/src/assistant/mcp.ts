@@ -51,7 +51,7 @@ import { REVIEWS_STARTED_AT_ONCE } from "./review-items.js";
 import { observeEveryTool, recordObservation } from "./observe.js";
 import { assistantCitationsOn } from "./citations.js";
 import { readSelfStatus, selfStatusOn } from "./self-status.js";
-import { CAPABILITIES_RULE, CAPABILITIES_TOOL, capabilityInputs, capabilityList } from "./capabilities.js";
+import { CAPABILITIES_RULE, CAPABILITIES_TOOL, capabilityInputs, capabilityList, parseWebTools, WEB_TOOLS_HEADER, type WebTools } from "./capabilities.js";
 import { turnMessage } from "./inbound.js";
 import { assertLiveRun } from "./tools.js";
 import { CITE_MAX_PER_CALL, citeSourcesAsked } from "@claw/protocol";
@@ -474,7 +474,7 @@ export function createAssistantMcpServer(
   claims: AssistantTokenClaims, reviewTools: boolean = CLAW_ASSISTANT_TOOLS, memoryTools: boolean = assistantMemoryOn(),
   modelChoice: boolean = modelChoiceOn(), citations: boolean = assistantCitationsOn(), devenv: boolean = devenvToolsOn(),
   suggested: boolean = suggestedRepliesOn(), choices: boolean = sayChoicesOn(), userSkills: boolean = CLAW_USER_SKILLS_ENABLED,
-  registered?: string[],
+  registered?: string[], web: WebTools | null = null,
 ): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
   // Every tool registered below, in order: the router's claw_capabilities reads it when it is called, once all are registered.
@@ -593,7 +593,7 @@ export function createAssistantMcpServer(
             const run = await assertLiveRun(q, claims);
             return { userId: run.userId, channel: (await turnMessage(q, claims.sid, claims.mid))?.context.channel };
           });
-          const list = capabilityList(await capabilityInputs((t, p) => db.query(t, p), userId, claims.sid, tools, channel));
+          const list = capabilityList(await capabilityInputs((t, p) => db.query(t, p), userId, claims.sid, tools, channel, { web }));
           return { ok: true, rule: CAPABILITIES_RULE, ...list };
         }),
       );
@@ -769,7 +769,9 @@ export async function registerAssistantMcpRoutes(
   if (!enabled) return;
   app.all(ASSISTANT_MCP_PATH, { preHandler: assistantTokenAuth }, async (req, reply) => {
     const claims = claimsOf.get(req) as AssistantTokenClaims;
-    const mcp = createAssistantMcpServer(claims);
+    // The web tools the Brain running the turn has, as it names them (`capabilities.ts`, WebTools): only claw_capabilities reads them.
+    const mcp = createAssistantMcpServer(claims, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, parseWebTools(req.headers[WEB_TOOLS_HEADER]));
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as never });
     await mcp.connect(transport);
     await transport.handleRequest(req.raw, reply.raw, req.body);

@@ -24,14 +24,16 @@ import { devenvToolsOn } from "./devenv-tools.js";
 import { PROMPT_IMAGES_MAX } from "./files.js";
 import { githubEventsEnabled } from "./github-events.js";
 import { jobWatchesEnabled } from "./job-watch.js";
-import { assistantMemoryOn } from "./memory-tools.js";
+import { assistantMemoryOn, sessionWithoutMemory } from "./memory-tools.js";
+import { getMemoryPreference } from "../memory/service.js";
+import { reviewItemsEnabled } from "./review-items.js";
 import { ROUTER_WEB_TOOLS, routerReadTools } from "./read-tools.js";
 import { assistantSchedulesOn } from "./schedules.js";
 
 /** The tool's name on the assistant's server. */
 export const CAPABILITIES_TOOL = "claw_capabilities";
 /** The shape of the list; moves when an entry is added, removed or changes meaning. */
-export const CAPABILITIES_VERSION = "capabilities-v1";
+export const CAPABILITIES_VERSION = "capabilities-v2";
 
 /** The deployment's switches that decide what the assistant can do, beside the tools they register. */
 export interface DeploymentFeatures {
@@ -39,6 +41,8 @@ export interface DeploymentFeatures {
   review_tools: boolean;
   /** CLAW_GITHUB_REVIEW_ENABLED: Claw reviews pull requests. */
   github_review: boolean;
+  /** CLAW_ASSISTANT_REVIEW_ITEMS: a review is started from the assistant as an item (`review_start` refuses without it). */
+  review_items: boolean;
   /** CLAW_ASSISTANT_GITHUB_EVENTS: items watch pull requests in the background. */
   github_events: boolean;
   /** CLAW_ASSISTANT_MEMORY_TOOLS: long-term memory. */
@@ -63,7 +67,7 @@ export interface DeploymentFeatures {
 /** The deployment's features as this process has them. */
 export function deploymentFeatures(): DeploymentFeatures {
   return {
-    review_tools: CLAW_ASSISTANT_TOOLS, github_review: CLAW_GITHUB_REVIEW_ENABLED, github_events: githubEventsEnabled(),
+    review_tools: CLAW_ASSISTANT_TOOLS, github_review: CLAW_GITHUB_REVIEW_ENABLED, review_items: reviewItemsEnabled(), github_events: githubEventsEnabled(),
     memory: assistantMemoryOn(), remote_agents: devenvToolsOn(), triggers: assistantSchedulesOn(), job_watch: jobWatchesEnabled(),
     // Unconditional where the assistant runs: a channel's files are named with the message, and its images shown to the router.
     files_and_images: PROMPT_IMAGES_MAX > 0, user_skills: CLAW_USER_SKILLS_ENABLED,
@@ -71,10 +75,29 @@ export function deploymentFeatures(): DeploymentFeatures {
   };
 }
 
+/**
+ * Brain's own web tools, as the Brain that runs the turn has them: it has web_search only with a search provider
+ * (`WEB_SEARCH_PROVIDER`, off by default) and web_fetch only with `WEB_FETCH_ENABLED` (off by default), each on its own. The API has
+ * neither setting: the Brain names the ones it has when it calls the assistant's server (`WEB_TOOLS_HEADER`). Null where that is not
+ * known (the API's own list, a Brain that does not say): then neither is claimed.
+ */
+export interface WebTools { search: boolean; fetch: boolean }
+
+/** The header a Brain names its web tools in, on its calls to the assistant's server (`brain/src/clients/mcp.ts`). */
+export const WEB_TOOLS_HEADER = "x-claw-web-tools";
+
+/** The header's value as the Brain sent it: the web tools it names ("none": neither), or null when there is no header. */
+export function parseWebTools(value: string | string[] | undefined): WebTools | null {
+  const raw = Array.isArray(value) ? value.join(",") : value;
+  if (raw === undefined) return null;
+  const names = new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
+  return { search: names.has("web_search"), fetch: names.has("web_fetch") };
+}
+
 /** What the router turn may look up itself, besides its own tools. */
 export interface Lookups {
-  /** web_search and web_fetch: offered to every router turn (Brain serves them where its deployment has a search provider). */
-  web: boolean;
+  /** Brain's web_search and web_fetch, as the Brain running the turn has them; null: not known, so neither is claimed. */
+  web: WebTools | null;
   /** The user's GitHub, as them (their linked account). */
   github: boolean;
   /** The read servers of the deployment's assistant plugin (`routerReadTools`). */
@@ -88,6 +111,11 @@ export interface CapabilityInputs {
   lookups: Lookups;
   /** The user's review mode (`getReviewMode`). */
   reviewMode: ReviewMode;
+  /**
+   * The user's own memory: `enabled` is their setting (`getMemoryPreference`, off: the memory tools refuse with memory_off), `here`
+   * whether this conversation is one where it is kept (never a group's: `sessionWithoutMemory`).
+   */
+  userMemory: { enabled: boolean; here: boolean };
   /** The chat apps the assistant is talked to in: the channels with a surface of their own, and the one this message came through. */
   channels: readonly string[];
 }
@@ -141,7 +169,7 @@ export interface Capabilities {
   reads: string[];
   /** Registered tools that no entry of TOOL_EFFECTS classifies (none in a correct build). */
   unclassified?: string[];
-  lookups: { web: boolean; github: boolean; systems: string[] };
+  lookups: { web: WebTools | null; github: boolean; systems: string[] };
   channels: string[];
 }
 
@@ -160,18 +188,26 @@ interface AbilitySpec {
 }
 
 const has = (i: CapabilityInputs, t: string): boolean => i.tools.includes(t);
+const webSearch = (i: CapabilityInputs): boolean => i.lookups.web?.search === true;
+const webFetch = (i: CapabilityInputs): boolean => i.lookups.web?.fetch === true;
+/** The web tools the turn has, by name. */
+const webToolsOf = (i: CapabilityInputs): string[] => ROUTER_WEB_TOOLS.filter((t) => (t === "web_search" ? webSearch(i) : webFetch(i)));
 const listed = (xs: readonly string[]): string => xs.join(", ");
 
 /** Every ability the list can name, in the order it names them. */
 const ABILITIES: readonly AbilitySpec[] = [
   {
     id: "look_up",
-    needs: (i) => i.lookups.web || i.lookups.github || i.lookups.systems.length > 0,
+    needs: (i) => webSearch(i) || webFetch(i) || i.lookups.github || i.lookups.systems.length > 0,
     what: (i) => `Look things up at once, in the same turn: ${[
-      ...(i.lookups.web ? ["the web (search, and read a page)"] : []),
+      ...(webSearch(i) ? ["search the web (web_search)"] : []),
+      ...(webFetch(i) ? ["read a web page at an address (web_fetch)"] : []),
       ...(i.lookups.github ? ["the user's GitHub as them (pull requests, issues, checks, reviews, files)"] : []),
       ...(i.lookups.systems.length ? [`these systems: ${listed(i.lookups.systems)}`] : []),
-    ].join("; ")}.`,
+    ].join("; ")}.${i.lookups.web === null ? "" : [
+      ...(webSearch(i) ? [] : [" No web search here."]),
+      ...(webFetch(i) ? [] : [" No reading web pages here."]),
+    ].join("")}`,
   },
   {
     id: "see_images",
@@ -216,13 +252,18 @@ const ABILITIES: readonly AbilitySpec[] = [
   {
     id: "memory",
     tools: ["memory_save", "memory_recall"],
-    needs: (i) => i.features.memory,
-    what: () => "Remember things across conversations: saved at once when the user asks, with Undo; read back in later conversations.",
+    needs: (i) => i.features.memory && i.userMemory.enabled && i.userMemory.here,
+    what: (i) => (!i.features.memory || (i.userMemory.enabled && i.userMemory.here)
+      ? "Remember things across conversations: saved at once when the user asks, with Undo; read back in later conversations."
+      : !i.userMemory.enabled
+        ? "Long-term memory is off for this user: nothing is saved or recalled; they can turn it on in their settings."
+        : "Long-term memory is not kept in this conversation (one others read, such as a group's): nothing is saved or recalled here."),
   },
   {
     id: "reviews",
     tools: ["review_start"],
-    needs: (i) => i.features.review_tools,
+    // review_start refuses without both (`review-tools.ts`, requireReviews(true)).
+    needs: (i) => i.features.review_tools && i.features.github_review && i.features.review_items,
     what: (i) => `Review pull requests and merge them when asked (started at once, no worker needed to ask); ${
       i.reviewMode === "fully_auto"
         ? "the user's review mode is fully_auto: a merge asked for happens once the review approves, without asking them"
@@ -306,7 +347,7 @@ export function capabilityList(i: CapabilityInputs): Capabilities {
     const on = (a.needs ? a.needs(i) : true) && (a.tools === undefined || present.length > 0);
     return {
       id: a.id, on, what: a.what(i),
-      ...(a.id === "look_up" && on ? { tools: [...(i.lookups.web ? ROUTER_WEB_TOOLS : []), ...(i.lookups.github ? ["github"] : []), ...i.lookups.systems] } : {}),
+      ...(a.id === "look_up" && on ? { tools: [...webToolsOf(i), ...(i.lookups.github ? ["github"] : []), ...i.lookups.systems] } : {}),
       ...(present.length ? { tools: present } : {}),
     };
   });
@@ -336,7 +377,7 @@ export function capabilityList(i: CapabilityInputs): Capabilities {
     asks_first: of("card_first"),
     reads: of("reads"),
     ...(unclassified.length ? { unclassified } : {}),
-    lookups: { web: i.lookups.web, github: i.lookups.github, systems: [...i.lookups.systems] },
+    lookups: { web: i.lookups.web === null ? null : { ...i.lookups.web }, github: i.lookups.github, systems: [...i.lookups.systems] },
     channels: [...i.channels],
   };
 }
@@ -346,22 +387,35 @@ export function channelsOf(current?: string): string[] {
   return sorted([...Object.keys(CHAT_SURFACES), ...(current ? [chatSurface(current).channel] : [])]);
 }
 
-/** What the list of a user is built from, read now; `sessionId` is their router session (null: none yet). */
+/** The user's memory as the memory tools decide it (`requireMemoryHere`): their setting, and whether this session keeps it. */
+async function userMemoryOf(userId: string, sessionId: string | null): Promise<{ enabled: boolean; here: boolean }> {
+  const enabled = await getMemoryPreference(userId);
+  return { enabled, here: sessionId !== null && !(await sessionWithoutMemory(sessionId)) };
+}
+
+/**
+ * What the list of a user is built from, read now; `sessionId` is the session of the turn (the router's own for the API's list; null:
+ * none yet), `web` the web tools the Brain running the turn named (null: not known).
+ */
 export async function capabilityInputs(
   q: Querier, userId: string, sessionId: string | null, tools: readonly string[], channel?: string,
   deps: {
     features?: DeploymentFeatures;
     systems?: (userId: string) => Promise<readonly string[]>;
     github?: (sessionId: string) => Promise<boolean>;
+    memory?: (userId: string, sessionId: string | null) => Promise<{ enabled: boolean; here: boolean }>;
+    web?: WebTools | null;
   } = {},
 ): Promise<CapabilityInputs> {
+  const features = deps.features ?? deploymentFeatures();
   const systems = await (deps.systems ?? (async (u: string) => (await routerReadTools(u))?.servers ?? []))(userId);
   const github = sessionId
     ? await (deps.github ?? (async (s: string) => Object.keys(await githubMcpServers(s)).length > 0))(sessionId)
     : false;
   const { mode } = await getReviewMode({ query: (t: string, p?: unknown[]) => q(t, p) } as never, userId);
+  // Only asked where the deployment has memory at all: without it the entry is off whatever the user chose.
+  const userMemory = features.memory ? await (deps.memory ?? userMemoryOf)(userId, sessionId) : { enabled: false, here: false };
   return {
-    tools, features: deps.features ?? deploymentFeatures(), lookups: { web: true, github, systems }, reviewMode: mode,
-    channels: channelsOf(channel),
+    tools, features, lookups: { web: deps.web ?? null, github, systems }, reviewMode: mode, userMemory, channels: channelsOf(channel),
   };
 }
