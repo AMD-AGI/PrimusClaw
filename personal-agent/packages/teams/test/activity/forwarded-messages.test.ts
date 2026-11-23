@@ -385,6 +385,19 @@ test("a forwarded text the person repeats in their own words stays theirs", () =
   );
 });
 
+test("the person's words that equal a forwarded text stay theirs when the text itself holds the forward", () => {
+  const html = `<p>LGTM</p>${forwardHtml("<p>LGTM</p>", BOB)}`;
+  const event = eventOf(teamsDm(html, html));
+  assert.equal(event.text, "LGTM");
+  assert.equal(event.forwards?.[0]?.text, "LGTM");
+  const both = `<p>LGTM</p>${forwardHtml("<p>first one</p>", BOB)}${forwardHtml("<p>LGTM</p>", CAROL)}`;
+  assert.equal(eventOf(teamsDm(both, both)).text, "LGTM");
+  const ref = teamsDm('LGTM <attachment id="1727881360458"></attachment>', null, {
+    attachments: [reference({ html: "<p>LGTM</p>" })],
+  });
+  assert.equal(eventOf(ref).text, "LGTM");
+});
+
 test("several forwards written into the plain text after the person's words: all of them are cut, in order", () => {
   const html = `<p>see these</p>${forwardHtml("<p>first one</p>", BOB)}${forwardHtml("<p>second one</p>", CAROL)}`;
   assert.equal(eventOf(teamsDm("see these first one second one", html)).text, "see these");

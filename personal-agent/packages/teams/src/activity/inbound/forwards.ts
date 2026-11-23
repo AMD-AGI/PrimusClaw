@@ -270,6 +270,18 @@ export function forwardsOf(activity: Activity, files: readonly InboundFile[], lo
   return { forwards, files: all };
 }
 
+const ATTACHMENT_TAG = /<attachment\b/iu;
+
+/**
+ * Whether the message's own `text` already says where its forwards stand (a Forward blockquote, or the
+ * `<attachment id="..."/>` tag of a reference): `written` takes those out, so what is left is all the person's own words
+ * and nothing of it is a copy of a forward (their "LGTM" before a forwarded "LGTM" stays theirs).
+ */
+export function forwardsMarkedInText(activity: Activity): boolean {
+  const text = pyStr(activity.text);
+  return FORWARD_ITEMTYPE.test(text) || ATTACHMENT_TAG.test(text);
+}
+
 /**
  * `text` (the person's words) without the forwarded messages' text that Teams also put there: a client that sends the
  * forward as plain text writes the forwarded messages into `text` as well, after the person's words and in their order,
