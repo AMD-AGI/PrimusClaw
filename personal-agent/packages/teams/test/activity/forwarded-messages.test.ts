@@ -229,6 +229,26 @@ test("a reference and a blockquote of the same message are one; the blockquote f
   assert.equal(first.author, "Dave Zhou");
 });
 
+test("an image only the blockquote of a referenced message shows still comes, after the reference's text", () => {
+  const img = `<img itemtype="http://schema.skype.com/AMSImage" src="${ASM}" itemid="${IMG_ID}">`;
+  const a = teamsDm("", forwardHtml(`<p>hello ${img}</p>`, { ...BOB, messageId: "1727881360458" }), {
+    attachments: [reference({ html: "<p>hello</p>" })],
+  });
+  const event = eventOf(a);
+  const [first, ...rest] = event.forwards ?? [];
+  assert.ok(first !== undefined && rest.length === 0);
+  assert.equal(first.source, "reference");
+  assert.equal(first.text, "hello\n[image-1]");
+  assert.deepEqual(event.files, [{ name: "", type: "", handle: { kind: "pasted", url: CONNECTOR_IMG, index: 1 } }]);
+  // (an image both readings show is one image)
+  const both = teamsDm("", forwardHtml(`<p>hello ${img}</p>`, { ...BOB, messageId: "1727881360458" }), {
+    attachments: [reference({ html: `<p>hello ${img}</p>` })],
+  });
+  const again = eventOf(both);
+  assert.equal(again.forwards?.[0]?.text, "hello [image-1]");
+  assert.equal(again.files.length, 1);
+});
+
 test("a reference whose content cannot be read is still a forwarded message, said to be without text", () => {
   const a = teamsDm("", null, {
     attachments: [{ id: "177", contentType: "forwardedMessageReference", content: "{not json" }],
@@ -340,6 +360,14 @@ test("a client that also writes the forwarded text into the plain text: it is no
     `<p>please look</p>${forwardHtml("<p>The deploy failed on node 3</p>", BOB)}`,
   );
   assert.equal(eventOf(a).text, "please look");
+});
+
+test("the person's own words keep their line breaks and indents when a forward written after them is cut", () => {
+  const a = teamsDm(
+    "please look:\n  - the deploy\n  - the logs  The deploy failed\non node 3",
+    `<p>please look:</p>${forwardHtml("<p>The deploy failed on node 3</p>", BOB)}`,
+  );
+  assert.equal(eventOf(a).text, "please look:\n  - the deploy\n  - the logs");
 });
 
 test("a forwarded text the person repeats in their own words stays theirs", () => {

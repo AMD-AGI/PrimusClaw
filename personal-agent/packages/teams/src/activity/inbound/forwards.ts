@@ -16,7 +16,9 @@
  * attachment; an image with no such id is said to be not passed on.
  */
 import {
+  isPySpace,
   own,
+  pySplit,
   pyStr,
   squashSpaces,
   type InboundFile,
@@ -25,7 +27,7 @@ import {
 } from "@primusclaw/personal-agent";
 import type { TeamsFileHandle } from "../../inbound/attachments.js";
 import { cutForwards, FORWARD_ITEMTYPE } from "./markup.js";
-import { htmlForward, IMAGE_MARKER, type HtmlForward, type HtmlImage } from "./quotes-html.js";
+import { htmlForward, IMAGE_MARKER, imageMarker, type HtmlForward, type HtmlImage } from "./quotes-html.js";
 import { kindsOf } from "./quotes.js";
 import { attachmentsOf, isFields, type Activity, type Fields } from "./schema.js";
 
@@ -121,6 +123,29 @@ function sameForward(known: Read, other: Read): boolean {
   return plainText(known) !== "" && plainText(known) === plainText(other);
 }
 
+/** The same image as Teams names it: its stored id, else its address, else nothing to match it by. */
+function imageKey(image: HtmlImage): string {
+  return objectIdOf(image) || image.src;
+}
+
+/**
+ * The text and images of `known` with the images only `other` (another reading of the same message) shows added at the
+ * end of its text, so an image one reading carries and the other lacks still comes with the message.
+ */
+function withImagesOf(known: Read, other: Read): Pick<Read, "text" | "images"> {
+  const have = new Set(known.images.map(imageKey).filter(Boolean));
+  const more = other.images.filter((image) => {
+    const key = imageKey(image);
+    if (key && have.has(key)) return false;
+    if (key) have.add(key);
+    return true;
+  });
+  if (more.length === 0) return { text: known.text, images: known.images };
+  const images = [...known.images, ...more];
+  const markers = more.map((_, at) => imageMarker(known.images.length + at)).join(" ");
+  return { text: known.text ? `${known.text}\n${markers}` : markers, images };
+}
+
 /**
  * The messages the activity forwards, in the order Teams gave them: references first (they carry the most), then
  * Forward blockquotes no reference describes. A message is matched across markups (the text and its HTML copy, a
@@ -147,7 +172,9 @@ function forwardsRead(activity: Activity): Read[] {
         senderId: known.senderId || html.senderId,
         sender: known.sender || html.sender,
         time: known.time || html.time,
-        ...(plainText(known) || known.images.length ? {} : { text: html.text, images: html.images }),
+        ...(plainText(known) || known.images.length
+          ? withImagesOf(known, html)
+          : { text: html.text, images: html.images }),
       };
     }
   }
@@ -257,7 +284,7 @@ export function ownWords(text: string, forwards: readonly InboundForward[]): str
     .filter(Boolean);
   if (said.length === 0) return text;
   let own = squashSpaces(text);
-  for (const one of said.reverse()) {
+  for (const one of [...said].reverse()) {
     if (own === one) {
       own = "";
     } else if (own.endsWith(` ${one}`)) {
@@ -266,7 +293,18 @@ export function ownWords(text: string, forwards: readonly InboundForward[]): str
       return text;
     }
   }
-  return squashSpaces(own);
+  // (the cut is whole words at the end; what is left is cut from `text` as written, its line breaks and indents kept)
+  return firstWords(text, pySplit(own).length);
+}
+
+/** `text` up to the end of its first `count` words (`pySplit`'s), as written; "" for none. */
+function firstWords(text: string, count: number): string {
+  let at = 0;
+  for (let words = 0; words < count; words += 1) {
+    while (at < text.length && isPySpace(text.charAt(at))) at += 1;
+    while (at < text.length && !isPySpace(text.charAt(at))) at += 1;
+  }
+  return text.slice(0, at);
 }
 
 const READ_KINDS =

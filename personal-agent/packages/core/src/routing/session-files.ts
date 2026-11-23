@@ -20,19 +20,23 @@ export const SESSION_PROMPT_BYTES = 63 * 1024;
 export const QUOTE_CUT =
   "\n… [cut: the rest of the forwarded and quoted messages did not fit in one message to the session]";
 
+/** What is said in place of forwarded or quoted text when none of it fits beside the person's words. */
+export const QUOTE_DROPPED = "[cut: the forwarded and quoted messages did not fit in one message to the session]";
+
 function bytesOf(text: string): number {
   return new TextEncoder().encode(text).length;
 }
 
 /**
  * The forwarded and quoted messages (`quote`) cut so that they and the person's words (`sent`) fit one prompt to a
- * session: the words are the person's and go whole; what others wrote is cut at its end, and says so.
+ * session: the words are the person's and go whole; what others wrote is cut at its end, and says so. When the words
+ * leave no room for any of it, the notice alone stands for it (a few bytes past the budget, inside Claw's own limit).
  */
 export function fitQuote(quote: string, sent: string): string {
   const room = SESSION_PROMPT_BYTES - (sent ? bytesOf(sent) + 2 : 0);
   if (bytesOf(quote) <= room) return quote;
   const head = room - bytesOf(QUOTE_CUT);
-  return head > 0 ? headBytes(quote, head).trimEnd() + QUOTE_CUT : "";
+  return head > 0 ? headBytes(quote, head).trimEnd() + QUOTE_CUT : QUOTE_DROPPED;
 }
 
 /** The bytes of files that may follow `words` in one prompt to a session (at most `INLINE_FILE_BYTES`). */
