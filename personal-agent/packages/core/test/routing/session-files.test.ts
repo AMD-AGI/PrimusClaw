@@ -154,3 +154,26 @@ test("files a channel gave one name (its safe name of two Chinese names) go to t
     ["y".repeat(96) + ".pdf", `2-${"y".repeat(94)}.pdf`],
   );
 });
+
+test("a file to a machine goes with the media type the wire takes, and an empty one is named back, not sent", async () => {
+  const typed = (mediaType: string, bytes: Uint8Array) => (): Promise<Result<FetchedFile, FileRefused>> =>
+    Promise.resolve(ok({ name: "f.bin", mediaType, bytes }));
+  const fetches = [
+    typed("Image/PNG", new Uint8Array(1)),
+    typed("application/pdf; charset=binary", new Uint8Array(1)),
+    typed("not a type", new Uint8Array(1)),
+    typed("image/png", new Uint8Array(0)),
+  ];
+  let at = 0;
+  const got = await inlineFiles(
+    [file("a.png"), file("b.pdf"), file("c.bin"), file("empty.png")],
+    () => (fetches[at++] ?? typed("?", new Uint8Array(0)))(),
+    shown,
+    { asFiles: true },
+  );
+  assert.deepEqual(
+    got.files.map((f) => f.mediaType),
+    ["image/png", "application/pdf", "application/octet-stream"],
+  );
+  assert.deepEqual(got.notPassed, [["empty.png", "it is empty"]]);
+});

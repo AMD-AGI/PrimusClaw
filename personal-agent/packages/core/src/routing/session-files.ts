@@ -87,7 +87,15 @@ const WORDS = {
   noRoom: "the files before it filled what one message to a session takes",
   tooMany: `one message takes at most ${String(SESSION_FILES)} files to a session`,
   tooLarge: `one message takes at most ${String(SESSION_FILE_BYTES / 1024 / 1024)} MiB of files to a session`,
+  empty: "it is empty",
 };
+
+/** A media type as the wire takes it (`type/subtype`, lower case); one it would refuse is sent as plain bytes. */
+const WIRE_MEDIA_TYPE = /^[a-z0-9][a-z0-9.+-]{0,62}\/[a-z0-9][a-z0-9.+-]{0,62}$/u;
+function wireMediaType(mediaType: string): string {
+  const plain = (mediaType.split(";")[0] ?? "").trim().toLowerCase();
+  return WIRE_MEDIA_TYPE.test(plain) ? plain : "application/octet-stream";
+}
 
 export interface InlineOptions {
   /** The most bytes of text passed inline. */
@@ -161,11 +169,18 @@ class Gathered {
     if (this.files.length >= SESSION_FILES) return void this.notPassed.push([name, WORDS.tooMany]);
     const got = await this.fetch(file);
     if (!got.ok) return void this.notPassed.push([name, got.error.reason]);
+    // (the wire refuses a file with no bytes, and with it the whole prompt: it is named back instead)
+    if (got.value.bytes.length === 0) return void this.notPassed.push([name, WORDS.empty]);
     if (this.fileBytes + got.value.bytes.length > SESSION_FILE_BYTES) {
       return void this.notPassed.push([name, WORDS.tooLarge]);
     }
     this.fileBytes += got.value.bytes.length;
-    this.files.push({ ...got.value, name: this.unique(got.value.name, at) });
+    // (a server's `Image/PNG` is the wire's `image/png`: one it would refuse would refuse the whole prompt)
+    this.files.push({
+      ...got.value,
+      name: this.unique(got.value.name, at),
+      mediaType: wireMediaType(got.value.mediaType),
+    });
   }
 
   /**
