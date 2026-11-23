@@ -215,14 +215,12 @@ export class InboundConsumer {
     while (!this.isStopped()) {
       const generation = this.generation;
       let receiver: SessionReceiver;
+      const accepting = this.parts.client.acceptNextSession(this.parts.queue, this.stopping.signal);
       try {
-        receiver = await this.within(
-          "accept",
-          ACCEPT_DEADLINE_MS,
-          this.parts.client.acceptNextSession(this.parts.queue, this.stopping.signal),
-          true,
-        );
+        receiver = await this.within("accept", ACCEPT_DEADLINE_MS, accepting, true);
       } catch (error) {
+        // (a session the broker hands over after it was given up on is closed at once, so its lock is not held)
+        accepting.then((late) => late.close()).catch(() => undefined);
         if (this.isStopped()) return;
         await this.pause(error, generation);
         continue;

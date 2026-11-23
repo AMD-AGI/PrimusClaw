@@ -139,7 +139,8 @@ test("a stop ends the wait for the next message even when the broker call ignore
 
 test("a stop ends a wait for a session even when the broker call ignores the abort", T, async () => {
   const clock = new FakeClock();
-  const bus = new ScriptedBus([(signal) => hanging(signal, true)]);
+  const late = deferred<SessionReceiver>();
+  const bus = new ScriptedBus([() => late.promise]);
   const { consumer } = consumerOf(bus, clock, () => Promise.resolve());
   const running = consumer.run();
   await flushMicrotasks();
@@ -147,6 +148,10 @@ test("a stop ends a wait for a session even when the broker call ignores the abo
   await running;
   assert.equal(bus.accepts, 1);
   assert.equal(bus.reopened, 0);
+  const receiver = new ScriptedReceiver([]);
+  late.resolve(receiver); // (the broker hands the session over after all: it is closed, not left locked)
+  await flushMicrotasks();
+  assert.equal(receiver.closed, 1);
 });
 
 test("a message being handled when the stop comes is finished and completed before the consumer ends", T, async () => {
