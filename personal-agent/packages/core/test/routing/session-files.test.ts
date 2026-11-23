@@ -129,3 +129,28 @@ test("to a machine that takes files, a file that is not text is fetched and goes
     ["gone.pdf", "the link had expired"],
   ]);
 });
+
+test("files a channel gave one name (its safe name of two Chinese names) go to the machine under names of their own", async () => {
+  // (Teams' safe name keeps ASCII only: 报告.pdf and 图表.pdf are both `_.pdf`; Report.PDF differs from them only in case)
+  const named = (name: string) => (): Promise<Result<FetchedFile, FileRefused>> =>
+    Promise.resolve(ok({ name, mediaType: "application/pdf", bytes: enc(name) }));
+  const fetches = [named("_.pdf"), named("_.pdf"), named("_.PDF"), named("x".repeat(96) + ".pdf")];
+  const files = [file("报告.pdf"), file("图表.pdf"), file("Report.PDF"), file("long.pdf")];
+  let at = 0;
+  const got = await inlineFiles(files, () => (fetches[at++] ?? named("?"))(), shown, { asFiles: true });
+  assert.deepEqual(
+    got.files.map((f) => f.name),
+    ["_.pdf", "2-_.pdf", "3-_.PDF", "x".repeat(96) + ".pdf"],
+  );
+  assert.deepEqual(got.notPassed, []);
+  const lower = got.files.map((f) => f.name.toLowerCase());
+  assert.equal(new Set(lower).size, lower.length);
+  // (a prefix keeps a name within the wire's 100 characters, and its extension)
+  const two = await inlineFiles([file("a.pdf"), file("b.pdf")], named("y".repeat(96) + ".pdf"), shown, {
+    asFiles: true,
+  });
+  assert.deepEqual(
+    two.files.map((f) => f.name),
+    ["y".repeat(96) + ".pdf", `2-${"y".repeat(94)}.pdf`],
+  );
+});

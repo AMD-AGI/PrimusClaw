@@ -46,7 +46,10 @@ export class SessionManager {
   /** The sessions that carry a terminal's approvals (approvals.ts): their commands go there, never to an agent. */
   approvals: { owns(sid: string): boolean; decide(actionId: string, optionId: string, by: string | null): boolean; close(sid: string): void } | null = null;
 
-  constructor(private readonly env: SessionEnv) {}
+  constructor(private readonly env: SessionEnv) {
+    // (files of sessions that ended while this connector was not running, past their keep time)
+    if (env.uploadDir) sweepPromptFiles(env.uploadDir, Date.now());
+  }
 
   private agent(id: unknown): AgentConfig | undefined {
     return typeof id === "string" ? this.env.config.agents.find((a) => a.id === id) : undefined;
@@ -144,6 +147,7 @@ export class SessionManager {
     if (!(s instanceof Session)) {
       // Closing needs no disk: the record is closed and the phone told, whatever the folder's state.
       if (type === "close") {
+        if (this.env.uploadDir) dropSessionFiles(this.env.uploadDir, sid);
         this.env.store.patch(sid, { status: "closed" });
         this.env.audit.record("session_closed", { session_id: sid, reason: "closed" });
         this.env.emit(sid, "session_closed", { reason: "closed" });
@@ -174,8 +178,7 @@ export class SessionManager {
         await s.resume(cmdId);
         return false;
       case "close":
-        await s.close("closed");
-        if (this.env.uploadDir) dropSessionFiles(this.env.uploadDir, sid);
+        await s.close("closed"); // (its files go with it: Session.close)
         return false;
       case "decision":
         if (typeof cmd.action_id !== "string" || typeof cmd.option_id !== "string") s.rejectCommand("decision", cmdId, "action_and_option_required");

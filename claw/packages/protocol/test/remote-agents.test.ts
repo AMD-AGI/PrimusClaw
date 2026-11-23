@@ -72,6 +72,7 @@ test("a prompt may carry files: safe names, media types and base64 bytes, within
     ["a directory", [{ ...file, name: "a/b.txt" }], "invalid_file_name"],
     ["a line break", [{ ...file, name: "a\nb.txt" }], "invalid_file_name"],
     ["two of one name", [file, file], "invalid_file_name"],
+    ["two names that differ only in case", [file, { ...file, name: file.name.toUpperCase() }], "invalid_file_name"],
     ["no type", [{ ...file, media_type: "" }], "invalid_file_media_type"],
     ["not base64", [{ ...file, data: "eA=?" }], "invalid_file_data"],
     ["empty", [{ ...file, data: "" }], "invalid_file_data"],

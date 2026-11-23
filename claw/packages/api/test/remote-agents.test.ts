@@ -956,7 +956,7 @@ describe("remote agents", { skip }, () => {
       assert.equal(await queued("prompt"), "0", "the queue no longer remembers the command");
 
       const retry = await send(sid, "prompt", "lost-reply", { text: "once" });
-      assert.deepEqual([retry.status, retry.body.data], [200, { cmd_id: "k:lost-reply", duplicate: true }]);
+      assert.deepEqual([retry.status, retry.body.data], [200, { cmd_id: "k:lost-reply", duplicate: true, files: 0 }]);
       assert.equal(await queued("prompt"), "0", "the retry queued nothing, so the agent does not run the prompt twice");
       const audited = (await as("u1").get(`/v1/remote-agents/audit?session_id=${sid}`)).body.data
         .filter((r: any) => r.action === "command.issued" && r.detail.type === "prompt");

@@ -118,6 +118,18 @@ function headBytes(text: string, bytes: number): string {
   return new TextDecoder("utf-8", { fatal: false }).decode(encoded.slice(0, bytes)).replace(/�$/u, "");
 }
 
+/** The longest name a file sent to a machine may have (the wire contract's). */
+const PROMPT_NAME_CHARS = 100;
+
+/** `prefix` before `name`, cut (before its extension) to PROMPT_NAME_CHARS. */
+function withPrefix(prefix: string, name: string): string {
+  const named = prefix + name;
+  if (named.length <= PROMPT_NAME_CHARS) return named;
+  const dot = named.lastIndexOf(".");
+  const ext = dot > prefix.length && named.length - dot <= 10 ? named.slice(dot) : "";
+  return named.slice(0, PROMPT_NAME_CHARS - ext.length) + ext;
+}
+
 type Fetch = (file: InboundFile) => Promise<Result<FetchedFile, FileRefused>>;
 
 /** The text of a fetched file, or why it is not text. */
@@ -136,6 +148,8 @@ class Gathered {
   readonly notPassed: [string, string][] = [];
   readonly files: FetchedFile[] = [];
   private fileBytes = 0;
+  /** The names of `files`, without case. */
+  private readonly names = new Set<string>();
 
   constructor(
     private left: number,
@@ -143,7 +157,7 @@ class Gathered {
   ) {}
 
   /** A file that is not text, to a machine that takes files: fetched, and kept within the wire's limits. */
-  async asFile(file: InboundFile, name: string): Promise<void> {
+  async asFile(file: InboundFile, name: string, at: number): Promise<void> {
     if (this.files.length >= SESSION_FILES) return void this.notPassed.push([name, WORDS.tooMany]);
     const got = await this.fetch(file);
     if (!got.ok) return void this.notPassed.push([name, got.error.reason]);
@@ -151,7 +165,20 @@ class Gathered {
       return void this.notPassed.push([name, WORDS.tooLarge]);
     }
     this.fileBytes += got.value.bytes.length;
-    this.files.push(got.value);
+    this.files.push({ ...got.value, name: this.unique(got.value.name, at) });
+  }
+
+  /**
+   * `name`, or `<n>-name` when a file before it has that name: two files never share one (a channel's safe name can make
+   * two of them one, `报告.pdf` and `图表.pdf` both `_.pdf`), nor names that differ only in case (one file where the
+   * machine's file system ignores case). `at` is the file's place in the message (1-based); the name stays at most
+   * PROMPT_NAME_CHARS long, its extension kept.
+   */
+  private unique(name: string, at: number): string {
+    let candidate = name;
+    for (let n = at; this.names.has(candidate.toLowerCase()); n += 1) candidate = withPrefix(`${String(n)}-`, name);
+    this.names.add(candidate.toLowerCase());
+    return candidate;
   }
 
   /** A text file: its text, fenced, while the budget lasts (the one that reaches its end is cut and ends it). */
@@ -196,7 +223,7 @@ export async function inlineFiles(
   for (const [at, file] of files.entries()) {
     const name = shown(file, at + 1);
     if (passesInline(file)) await got.inline(file, name);
-    else if (options.asFiles) await got.asFile(file, name);
+    else if (options.asFiles) await got.asFile(file, name, at + 1);
     else got.notPassed.push([name, WORDS.notText]);
   }
   const { blocks, notPassed } = got;

@@ -563,7 +563,7 @@ function base64Bytes(data: string): number {
 /**
  * The files a prompt carries (`files`, optional): at most {@link REMOTE_AGENT_LIMITS.maxPromptFiles}, each a safe name, a
  * media type and its bytes in base64, all together at most {@link REMOTE_AGENT_LIMITS.maxPromptFileBytes} decoded, no two
- * with one name. A connector that says it can (the agent capability `prompt_files`) saves them on its machine and names
+ * with one name (compared without case). A connector that says it can (the agent capability `prompt_files`) saves them on its machine and names
  * where in the prompt; Claw keeps them only while the command waits to be delivered, never in the session's events.
  */
 export function parsePromptFiles(raw: unknown): Parsed<RemotePromptFile[]> {
@@ -575,13 +575,16 @@ export function parsePromptFiles(raw: unknown): Parsed<RemotePromptFile[]> {
   for (const f of raw) {
     if (!isObject(f)) return fail("invalid_files");
     const { name, media_type: mediaType, data } = f;
-    if (typeof name !== "string" || !PROMPT_FILE_NAME_RE.test(name) || names.has(name)) return fail("invalid_file_name");
+    // (two names that differ only in case are one file where the machine's file system ignores case: macOS, Windows)
+    if (typeof name !== "string" || !PROMPT_FILE_NAME_RE.test(name) || names.has(name.toLowerCase())) {
+      return fail("invalid_file_name");
+    }
     if (typeof mediaType !== "string" || !MEDIA_TYPE_RE.test(mediaType)) return fail("invalid_file_media_type");
     if (typeof data !== "string" || data === "" || data.length % 4 !== 0) return fail("invalid_file_data");
     total += base64Bytes(data);
     if (total > REMOTE_AGENT_LIMITS.maxPromptFileBytes) return fail("files_too_large");
     if (!BASE64_RE.test(data)) return fail("invalid_file_data");
-    names.add(name);
+    names.add(name.toLowerCase());
     files.push({ name, media_type: mediaType, data });
   }
   return { ok: true, value: files };
