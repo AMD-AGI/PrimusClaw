@@ -379,9 +379,9 @@ describe("seats", { skip }, () => {
     // An agent with no read-only mode (as Codex): nothing to hold the turn to.
     const codex = await machine("alice", "codexbox", { agents: caps({ roots: ["/home/u"], answer_only: true, ask_mode: "read-only" }) });
     await ready(codex, await chatSession("alice", codex, "/home/u/codex"), { currentMode: "read-only", unattended: false });
-    // An agent the owner set to never ask.
-    const never = await machine("alice", "neverbox", { agents: caps({ ...CLAUDE.capabilities, ask_mode: "bypassPermissions", unattended: true }) });
-    await ready(never, await chatSession("alice", never, "/home/u/never"), { currentMode: "bypassPermissions", unattended: true });
+    // An agent the owner set to never ask (whatever its session's latest event says).
+    const never = await machine("alice", "neverbox", { agents: caps({ ...CLAUDE.capabilities, unattended: true }) });
+    await ready(never, await chatSession("alice", never, "/home/u/never"), asking);
     // On a machine that can: a session switched to a mode that does not ask, and one whose mode no event names.
     const cid = await machine("alice", "devbox");
     const bypass = await chatSession("alice", cid, "/home/u/bypass");
@@ -389,6 +389,10 @@ describe("seats", { skip }, () => {
     await events("alice", cid, bypass, [["mode_update", { currentMode: "bypassPermissions", unattended: true }]]);
     await age(bypass, 30);
     await ready(cid, await chatSession("alice", cid, "/home/u/unknown"), {});
+    // ... one in its ask mode that the agent itself said will not ask (its own settings), and one in a mode that is neither the ask
+    // mode nor a read-only one (edits accepted without asking).
+    await ready(cid, await chatSession("alice", cid, "/home/u/warned"), { currentMode: "default", unattended: true });
+    await ready(cid, await chatSession("alice", cid, "/home/u/edits"), { currentMode: "acceptEdits", unattended: false });
     for (let i = 0; i < 4; i += 1) await sweep();
     assert.deepEqual(await w.q("SELECT cmd_id FROM claw_remote_commands WHERE type = 'prompt'"), [], "no session was asked");
     // The session back in a mode that asks: asked (so the mode was what kept it from being asked).

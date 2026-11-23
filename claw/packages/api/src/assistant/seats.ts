@@ -15,7 +15,8 @@
  *    at most 120, tags only words its input had), made from the folder, its git remote and branch, the titles of its conversations, the
  *    start of the user's last 20 prompts there, and, once per seat (again only when the user asks for a refresh), the session's own answer
  *    to one fixed question, asked only while the session is idle and nothing was typed there for ten minutes, in a turn that may only
- *    answer (`answer_only`: the machine refuses every permission the agent asks for in it). The guess is put to the user on a card
+ *    answer (`answer_only`: the machine runs it in the agent's read-only mode and refuses every permission, plan and question the agent
+ *    asks for in it; only a session whose machine can do that, and whose mode asks, is ever asked: {@link mayAnswerOnly}). The guess is put to the user on a card
  *    ({@link maybeSeatCard}): Right confirms it, Deny retires the seat (do not send it work), and telling the assistant what it is for
  *    instead goes through `seat_set`.
  *
