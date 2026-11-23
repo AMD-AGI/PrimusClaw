@@ -12,6 +12,7 @@
  *   E5 a newer end replaces an older one of the same conversation: one end told, the newer
  *   E6 a Codex `Stop` (the payload 0.153.4 hands the hook, measured) is told as Codex's
  *   E7 the hook program itself, run in a real pseudo-terminal: it names that terminal, and the connector tells the end
+ *   E8 while Claw opens the session: a new prompt, typing at the terminal, a chat attaching, a newer end or a stop takes the end back
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -50,17 +51,17 @@ const CODEX_STOP = {
 };
 const TTY = "/dev/pts/4";
 
-function rig(o: { refuse?: string; attached?: boolean; input?: () => number | null; awayMs?: number } = {}) {
+function rig(o: { refuse?: string; attached?: boolean | (() => boolean); input?: () => number | null; awayMs?: number; opening?: () => Promise<void> } = {}) {
   const emitted: Array<{ sid: string; type: string; data: Record<string, unknown> }> = [];
   const audited: Array<{ event: string; detail: Record<string, unknown> }> = [];
   const opened: Array<Record<string, unknown>> = [];
   const t0 = Date.now() - 600_000;
   const deps: BrokerDeps = {
-    async openSession(p) { opened.push(p); return o.refuse ? { refused: o.refuse } : { sessionId: SID }; },
+    async openSession(p) { opened.push(p); await o.opening?.(); return o.refuse ? { refused: o.refuse } : { sessionId: SID }; },
     emit: (sid, type, data) => emitted.push({ sid, type, data }),
     audit: (event, detail) => audited.push({ event, detail }),
     ttlMs: 60_000,
-    attached: () => o.attached === true,
+    attached: () => (typeof o.attached === "function" ? o.attached() : o.attached === true),
     awayMs: o.awayMs ?? 60,
     lastInputMs: o.input ?? (() => t0),
   };
@@ -199,5 +200,63 @@ describe("a turn's end in a terminal nobody is at", () => {
       assert.match(String(seen[0]), /^\/dev\/pts\/\d+$/);
       assert.equal(r.ends()[0]!.data.message, "probe done.");
     } finally { await close(); }
+  });
+
+  test("E8 what happens while Claw opens the session still takes the end back; nothing is told then", async () => {
+    /** A rig whose session opening waits until `go` is called; `during` runs once the opening has started. */
+    const held = (o: { attached?: () => boolean; input?: () => number | null } = {}) => {
+      let go = () => {};
+      const gate = new Promise<void>((res) => { go = res; });
+      const r = rig({ ...o, opening: () => gate });
+      return { r, go: () => go() };
+    };
+    const t0 = Date.now() - 600_000;
+
+    for (const next of ["UserPromptSubmit", "SessionEnd"]) {
+      const { r, go } = held();
+      r.broker.settled(CLAUDE_STOP, claude);
+      await until(() => r.opened.length === 1);
+      r.broker.settled({ session_id: CLAUDE_STOP.session_id, hook_event_name: next, cwd: "/home/u/work/claw", prompt: "go on" }, claude);
+      go();
+      await wait(100);
+      assert.equal(r.ends().length, 0, next);
+      assert.deepEqual(r.skipped(), ["terminal_active"], next);
+    }
+
+    let typedAt = t0;
+    const typed = held({ input: () => typedAt });
+    typed.r.broker.settled(CLAUDE_STOP, claude);
+    await until(() => typed.r.opened.length === 1);
+    typedAt = Date.now();
+    typed.go();
+    await until(() => typed.r.skipped().includes("terminal_input"));
+    assert.equal(typed.r.ends().length, 0);
+
+    let chat = false;
+    const attaching = held({ attached: () => chat });
+    attaching.r.broker.settled(CLAUDE_STOP, claude);
+    await until(() => attaching.r.opened.length === 1);
+    chat = true;
+    attaching.go();
+    await until(() => attaching.r.skipped().includes("attached"));
+    assert.equal(attaching.r.ends().length, 0);
+
+    const newer = held();
+    newer.r.broker.settled({ ...CLAUDE_STOP, last_assistant_message: "first" }, claude);
+    await until(() => newer.r.opened.length === 1);
+    newer.r.broker.settled({ ...CLAUDE_STOP, last_assistant_message: "second" }, claude);
+    newer.go();
+    await until(() => newer.r.ends().length === 1);
+    await wait(100);
+    assert.deepEqual(newer.r.ends().map((e) => e.data.message), ["second"]);
+
+    const stopped = held();
+    stopped.r.broker.settled(CLAUDE_STOP, claude);
+    await until(() => stopped.r.opened.length === 1);
+    stopped.r.broker.stopAll();
+    stopped.go();
+    await wait(100);
+    assert.equal(stopped.r.ends().length, 0);
+    assert.equal(stopped.r.emitted.length, 0, "not even the session's start");
   });
 });

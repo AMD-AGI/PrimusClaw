@@ -602,24 +602,41 @@ export class ApprovalBroker {
     this.d.audit("turn_end_not_sent", { ref, agent: e.agent, reason });
   }
 
-  /** The time is up for a turn's end: told, unless someone typed in that terminal since, or a chat follows the conversation now. */
+  /**
+   * The time is up for a turn's end: told, unless someone typed in that terminal since, or a chat follows the conversation now.
+   * The end stays listed while Claw opens the session, so a new prompt, a newer end, a question or a stop in that time still takes
+   * it back; and the terminal and the chat are looked at again once the session is open, just before it is told.
+   */
   private async tellEnding(e: Ending): Promise<void> {
     if (this.endings.get(e.ref) !== e) return;
-    this.endings.delete(e.ref);
-    const skip = (reason: string) => { this.d.audit("turn_end_not_sent", { ref: e.ref, agent: e.agent, reason }); };
-    const last = (this.d.lastInputMs ?? ttyLastInputMs)(e.tty);
-    // (a terminal that is gone was closed: by its person, who is not away)
-    if (last === null) { skip("terminal_gone"); return; }
-    if (last > e.at) { skip("terminal_input"); return; }
-    if (this.d.attached?.(e.ref)) { skip("attached"); return; }
+    const skip = (reason: string) => {
+      if (this.endings.get(e.ref) === e) this.endings.delete(e.ref);
+      this.d.audit("turn_end_not_sent", { ref: e.ref, agent: e.agent, reason });
+    };
+    /** Why nobody is to be told now, or the terminal's last input when the owner is still away. */
+    const away = (): { last: number } | { not: string } => {
+      const last = (this.d.lastInputMs ?? ttyLastInputMs)(e.tty);
+      // (a terminal that is gone was closed: by its person, who is not away)
+      if (last === null) return { not: "terminal_gone" };
+      if (last > e.at) return { not: "terminal_input" };
+      if (this.d.attached?.(e.ref)) return { not: "attached" };
+      return { last };
+    };
+    const before = away();
+    if ("not" in before) { skip(before.not); return; }
     const title = oneLine(path.basename(e.cwd), 80) || e.cwd;
     const opened = await this.d.openSession({ agent: e.agent, configDir: e.configDir, ref: e.ref, cwd: e.cwd, title })
       .catch((err: unknown) => ({ refused: `open_failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) }));
+    // Taken back while the session was opening (dropEnding said why), or forgotten by a stop: nothing is told.
+    if (this.endings.get(e.ref) !== e) return;
     if ("refused" in opened) { skip(opened.refused); return; }
+    const now = away();
+    if ("not" in now) { skip(now.not); return; }
+    this.endings.delete(e.ref);
     this.started(opened.sessionId, e.ref, title, e.agent, e.cwd);
     this.d.emit(opened.sessionId, REMOTE_EVENT_TERMINAL_TURN_END, {
       ref: e.ref, outcome: e.outcome, ...(e.error ? { error: e.error } : {}), message: e.message, agent: e.agent, cwd: e.cwd,
-      ended_at: new Date(e.at).toISOString(), away_ms: Math.max(0, Date.now() - last),
+      ended_at: new Date(e.at).toISOString(), away_ms: Math.max(0, Date.now() - now.last),
     });
     this.d.audit("turn_end_sent", { session_id: opened.sessionId, ref: e.ref, agent: e.agent, outcome: e.outcome });
   }

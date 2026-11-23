@@ -7,7 +7,6 @@ import type { ClawCredential } from "../../claw/credential.js";
 import type { SseEvent } from "../../claw/model.js";
 import type { RemoteConnector, RemoteEventRow, RemotePairing, RemoteSession, RemoteSetup } from "../../claw/remote.js";
 
-/** What a remote session starts with. */
 /** What Claw stored for a muted (or unmuted) terminal conversation (`PUT /v1/remote-agents/approvals/mutes`). */
 export interface TerminalMute {
   readonly item: number;
@@ -16,6 +15,7 @@ export interface TerminalMute {
   readonly title: string;
 }
 
+/** What a remote session starts with. */
 export interface NewRemoteSession {
   readonly connectorId: string;
   readonly agentId: string;
