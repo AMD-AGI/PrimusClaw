@@ -141,7 +141,7 @@ describe("assistant router read tools", { skip }, () => {
     // CLAW_USER_SKILLS_ENABLED off this is the list as it was before the router had skill_read, written out, not taken from the constant.
     assert.deepEqual(task.read_taint, {
       sources: task.tools_allowlist.filter((p: string) => p !== "mcp__assistant__*"),
-      allow_after: ["say", "work_recall", "memory_recall", "devenv_list", "devenv_pair", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state"].map((t) => `mcp__assistant__${t}`),
+      allow_after: ["say", "work_recall", "memory_recall", "devenv_list", "devenv_pair", "claw_self_status", "claw_capabilities", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state"].map((t) => `mcp__assistant__${t}`),
       // A plugin server words its own errors, so a failed read of one marks the turn like an answer; only the web is clean here.
       clean_failures: ["web_search", "web_fetch"],
     });
@@ -161,7 +161,7 @@ describe("assistant router read tools", { skip }, () => {
     }
     // Nor does the rest of the turn's reckoning know skill_read, and /metrics shows none of the personal-skill series.
     const { ROUTER_ASSISTANT_READS } = await import("../src/assistant/read-tools.js");
-    assert.deepEqual(ROUTER_ASSISTANT_READS, ["work_recall", "memory_recall", "devenv_list", "claw_self_status", "brief", "trigger_list", "job_watch_list", "pr_state"]);
+    assert.deepEqual(ROUTER_ASSISTANT_READS, ["work_recall", "memory_recall", "devenv_list", "claw_self_status", "claw_capabilities", "brief", "trigger_list", "job_watch_list", "pr_state"]);
     const { registry } = await import("../src/infra/metrics.js");
     assert.doesNotMatch(await registry.metrics(), /claw_user_skill_/);
     assert.ok(task.prompt.startsWith(`${QUESTION}\n\n`), "the user's words first");

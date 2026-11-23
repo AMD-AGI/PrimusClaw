@@ -39,6 +39,8 @@ import type { WorkItemDetail } from "@claw/protocol";
 import { getUser } from "../auth/middleware.js";
 import { getAuthMethod } from "../auth/request-credential.js";
 import { getOrCreateAssistant } from "../assistant/assistant.js";
+import { capabilityInputs, capabilityList } from "../assistant/capabilities.js";
+import { routerToolNames } from "../assistant/mcp.js";
 import { sayMaxPerHour } from "../assistant/outbound.js";
 import { retryWorkItem } from "../assistant/retry.js";
 import {
@@ -116,6 +118,17 @@ export async function registerAssistantRoutes(app: FastifyInstance): Promise<voi
     const { sessionId, created } = await getOrCreateAssistant(userId);
     // The caller's own hourly say cap: an evaluation run paces itself under it (`sa-eval.ts`, EVAL_SAY_PER_HOUR).
     return reply.send({ ok: true, data: { session_id: sessionId, created, say_max_per_hour: sayMaxPerHour(userId) } });
+  });
+
+  // What the assistant can and cannot do for the caller (`assistant/capabilities.ts`): the list its router turn's claw_capabilities gives,
+  // from the tools a router turn of this deployment is offered. An evaluation grades an answer about the assistant against it.
+  app.get("/v1/assistant/capabilities", async (req, reply) => {
+    const userId = requireRealUser(req, reply);
+    if (!userId) return;
+    const row = (await db.query("SELECT session_id FROM claw_assistants WHERE user_id = $1", [userId])).rows[0] as { session_id?: string } | undefined;
+    const inputs = await capabilityInputs((t, p) => db.query(t, p), userId, row?.session_id ?? null, routerToolNames());
+    reply.header("cache-control", "no-store");
+    return reply.send({ ok: true, data: capabilityList(inputs) });
   });
 
   app.get("/v1/work-items", async (req, reply) => {

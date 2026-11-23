@@ -128,6 +128,31 @@ release version, and its `appVersion` stays `latest`.
   permission, plan and question its agent asks for in it; it is refused in a session that does not ask, for an agent with no
   read-only mode, and while a turn runs or prompts wait there (`answer_only_busy`). The user's own prompt, or a `set_mode` sent
   during that turn, stops it; the mode is set only after it ended, and the read-only mode is never saved as the session's own.
+- Claw: the assistant knows what it can and cannot do. Its router turn has a new read tool, `claw_capabilities`, that
+  answers a list generated from what that turn really has: the tools registered on its assistant server, each by how
+  it takes effect (`acts_at_once`, `asks_first`, `reads`), the deployment's switches (pull request and job watching,
+  triggers, memory, reviews, development environments, personal skills, files and images), its lookups, the user's
+  review mode (`fully_auto` or `high_risk_confirm`) and its limits as data that is on or off (no email, calendar,
+  document stores or voice; the chat apps it is in), each lifted where the deployment provides it. The router is told
+  to call it first for any question about its abilities, limits or how it compares with other assistants and to
+  answer only from it (`router-self-v5`, `router-read-v18`); "every change goes through a work item that asks first"
+  is no longer said, since its own tools act by themselves. `GET /v1/assistant/capabilities` serves the same list to
+  the signed-in user. Asked what it could not do, it used to answer from guesswork and name limits it does not have.
+  An entry is on only where it works: web search and page reading as the Brain running the turn has each of them
+  (the Brain names them to the assistant's server in `x-claw-web-tools`; the API's own list, which no Brain serves,
+  claims neither, and where that leaves nothing else to look up lists `look_up` as not known, `on: null`, rather than
+  off), reviews and the review mode only where a review can be started from the assistant (reviews and
+  review items on) and the user has bound a GitHub account (a review as them acts with it), pull request watching and
+  GitHub comments only where the user has a GitHub token as those tools resolve it (a `GH_TOKEN` in their settings, or
+  their `/github bind` binding where bindings count), and memory only where the user's own setting has it and the
+  conversation keeps it. An entry that is off says so (and, for GitHub, what to connect), and the tools that would
+  refuse because of it are listed under `off_here` rather than as acting.
+- Claw: the super-agent evaluation grades an answer about the assistant against that list. A case with
+  `self_knowledge` reads the identity's list before it is sent; an answer that states a limit the list contradicts,
+  or claims an ability it lists as off, is flagged and is no pass without a judge, which is given the list as the
+  truth and the flagged words and decides; an entry the list does not know (`on: null`) is graded neither way; a case
+  whose list was not read never passes. Nine such cases are in
+  `sa-eval-cases/catalog/self-knowledge.jsonl`, and four in the router evaluation (`self-01`..`self-04`).
 
 - Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, how many times the
   application was started again, and `app.last_exit`, `{ returncode, at, cause }` of the last time the application

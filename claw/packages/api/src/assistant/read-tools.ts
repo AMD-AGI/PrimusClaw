@@ -104,7 +104,8 @@ function withUserSkills(tools: string[]): readonly string[] {
  * `deliver_text` speaks as `say` does, with a file only the user gets (`text-delivery.ts`). `github_comment` writes nothing: it shows
  * the user the exact comment on a card, and only their press posts it (`schedules.ts`); a draft is written from what was read, so it
  * must come after the reads. `devenv_pair` shows the user, in their own chat, a one-time code that connects nothing until they run
- * it on a machine of theirs ("connect my dev environment" finds none with devenv_list, then pairs). `pr_state` only reads where a
+ * it on a machine of theirs ("connect my dev environment" finds none with devenv_list, then pairs). `claw_capabilities` only reads what
+ * the assistant itself can do (`capabilities.ts`). `pr_state` only reads where a
  * pull request stands (`review-tools.ts`). `skill_read` reads one of the user's own personal skills (`skill-tools.ts`), and `skill_list` lists
  * them; `skill_draft` only shows the user a draft of one, saved when they press Save, so like a drafted comment it may follow the reads it
  * is written from (`skill-writes.ts`).
@@ -114,7 +115,7 @@ function withUserSkills(tools: string[]): readonly string[] {
  * describes. With CLAW_USER_SKILLS_ENABLED off the router has no skill_read, and the list is the one it was before it had one.
  */
 export const AFTER_READ_TOOLS: readonly string[] = withUserSkills([
-  "say", "work_recall", "memory_recall", "skill_read", "skill_list", "skill_draft", "devenv_list", "devenv_pair", "seat_roster", "claw_self_status", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state",
+  "say", "work_recall", "memory_recall", "skill_read", "skill_list", "skill_draft", "devenv_list", "devenv_pair", "seat_roster", "claw_self_status", "claw_capabilities", "deliver_text", "github_comment", "brief", "trigger_list", "job_watch_list", "pr_state",
 ]);
 
 /** The tool a router turn speaks with (`router-turn-end.ts`, `saidOnlyBeforeLookups`). */
@@ -125,7 +126,7 @@ export const ROUTER_SPEAK_TOOL = "say";
  * not derived from AFTER_READ_TOOLS, which also holds what speaks or drafts after a read (`deliver_text`, `github_comment`).
  */
 export const ROUTER_ASSISTANT_READS: readonly string[] = withUserSkills([
-  "work_recall", "memory_recall", "skill_read", "skill_list", "devenv_list", "seat_roster", "claw_self_status", "brief", "trigger_list", "job_watch_list", "pr_state",
+  "work_recall", "memory_recall", "skill_read", "skill_list", "devenv_list", "seat_roster", "claw_self_status", "claw_capabilities", "brief", "trigger_list", "job_watch_list", "pr_state",
 ]);
 
 /**
