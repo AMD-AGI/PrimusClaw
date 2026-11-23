@@ -8,7 +8,8 @@
  */
 import type { JsonObject } from "../cards/json.js";
 
-export type Operation = "send" | "reply" | "update" | "delete";
+/** `probe`: the delivery probe's answer (`probe/probe.ts`); the relay acks it without posting anything to Teams. */
+export type Operation = "send" | "reply" | "update" | "delete" | "probe";
 
 /** One outbound envelope. `reference` is the conversation reference (`activity.referenceOf`), `activity` the message. */
 export interface TeamsEnvelope extends JsonObject {

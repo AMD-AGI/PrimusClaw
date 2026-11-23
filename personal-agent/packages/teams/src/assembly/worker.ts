@@ -41,6 +41,7 @@ import { gateRoutes } from "../gate/routes.js";
 import { TeamsFileFetcher } from "../inbound/fetcher.js";
 import { AckRegistry } from "../messenger/acks.js";
 import { teamsVersion } from "../observability/build-info.js";
+import { DeliveryProbe } from "../probe/probe.js";
 import { InboundConsumer } from "../servicebus/consumer.js";
 import type { BusClient } from "../servicebus/client.js";
 import { TeamsSurface } from "../surface.js";
@@ -167,16 +168,18 @@ function connect(
     readonly acks: AckRegistry;
     readonly inbound: BusClient | undefined;
     readonly gate: GateEntry | undefined;
+    readonly probe: DeliveryProbe;
   },
   context: ConnectContext,
 ) {
-  const { botName, acks, inbound, gate } = parts;
+  const { botName, acks, inbound, gate, probe } = parts;
   const handle = inboundHandler({
     acks,
     route: context.route,
     botName,
     logger: context.logger,
     groupContext: context.groupContext,
+    probe,
   });
   const source =
     inbound === undefined
@@ -191,6 +194,9 @@ function connect(
           stats: {
             processed: (lag, ms, ok) => {
               context.metrics.processed(lag ?? null, ms, ok);
+            },
+            rearmed: () => {
+              context.metrics.inboundRearmed?.();
             },
           },
         });
@@ -214,11 +220,25 @@ function connect(
 function opened(teams: TeamsSettings, botName: string, gate: GateEntry | undefined, deps: SurfaceDeps): OpenedSurface {
   const { outbound, inbound } = transport(teams, gate, deps);
   const { acks, surface } = surfaceOf(teams, outbound, gate, deps);
+  let probe: DeliveryProbe | undefined;
   return {
     surface,
     typedEvent: teamsTypedEvent(botName, deps.logger),
-    connect: (context) => connect(teams, { botName, acks, inbound, gate }, context),
-    closes: [() => outbound.close(), () => inbound?.close()],
+    connect: (context) => {
+      probe = new DeliveryProbe({
+        outbox: outbound.queue,
+        acks,
+        clock: context.clock,
+        logger: context.logger,
+        stats: {
+          probed: (feedbackMs, replyMs) => {
+            context.metrics.probed?.(feedbackMs, replyMs);
+          },
+        },
+      });
+      return connect(teams, { botName, acks, inbound, gate, probe }, context);
+    },
+    closes: [() => probe?.close(), () => outbound.close(), () => inbound?.close()],
   };
 }
 

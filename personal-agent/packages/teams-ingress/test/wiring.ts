@@ -37,7 +37,7 @@ export function brokenEnqueue(ingress: Ingress): void {
 }
 
 export interface Registration {
-  trigger: "httpTrigger" | "serviceBusTrigger";
+  trigger: "httpTrigger" | "serviceBusTrigger" | "timerTrigger";
   options: Readonly<Record<string, unknown>>;
 }
 
@@ -50,6 +50,9 @@ export function functions(ingress: Ingress): Map<string, Registration> {
     },
     serviceBusQueue: (name, options) => {
       registered.set(name, { trigger: "serviceBusTrigger", options });
+    },
+    timer: (name, options) => {
+      registered.set(name, { trigger: "timerTrigger", options });
     },
   };
   register(recorder, ingress);

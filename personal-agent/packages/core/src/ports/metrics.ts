@@ -20,6 +20,14 @@ export interface MetricsPort {
   limited(reason: string): void;
   /** `count` files a person sent did not reach Claw on `path` (assistant | session | remote_agent | review | unreadable). */
   filesDropped(path: string, count?: number): void;
+  /**
+   * One delivery probe (a surface's synthetic message through its own queues): milliseconds from its sending to the
+   * worker's answer queued, and to that answer's round trip back (null: it did not come back in time). Optional: a
+   * port of one's own without it does not count them.
+   */
+  probed?(feedbackMs: number, replyMs: number | null): void;
+  /** A receiver of the surface's inbound queue whose call on the broker hung was dropped and taken again (optional). */
+  inboundRearmed?(): void;
 }
 
 /** Metrics that go nowhere: the default where a caller passes none. */
@@ -29,4 +37,6 @@ export const noMetrics: MetricsPort = {
   processed: () => undefined,
   limited: () => undefined,
   filesDropped: () => undefined,
+  probed: () => undefined,
+  inboundRearmed: () => undefined,
 };
