@@ -195,12 +195,13 @@ test("a Claw that drops a prompt's files: a redelivery of the message does not t
       await w.rw.idle();
       // (redelivered after the record that it was handled is lost, as a restart loses it: it reaches Claw again)
       const idempotency = w.rw.test.store.idempotency;
-      const seen = idempotency.seen;
-      idempotency.seen = () => false;
+      const seen = Object.getOwnPropertyDescriptor(idempotency, "seen");
+      Object.defineProperty(idempotency, "seen", { value: () => false, configurable: true, writable: true });
       try {
         await w.r.router.handle(m); // (the person is told, or not, as the send answers: before its turn is read)
       } finally {
-        idempotency.seen = seen;
+        if (seen) Object.defineProperty(idempotency, "seen", seen);
+        else delete (idempotency as { seen?: unknown }).seen;
       }
       assert.equal(w.rw.server.commandsOf("prompt").length, 1); // (Claw kept one prompt: the repeat was a duplicate)
       const told = w.rw.said().slice(before).join("\n");
