@@ -13,6 +13,7 @@ import { redactSecrets } from "@claw/utils";
 import pino from "pino";
 import { Agent, fetch as undiciFetch } from "undici";
 import { mcpToolFilter, type McpToolFilter } from "./mcp-tool-filter.js";
+import { BUILTIN_WEB_TOOLS } from "../config.js";
 import { isTransientFetchError, isTransientHttpStatus } from "../infra/transient-http.js";
 import { McpPoolEntry, type McpConnectionPool } from "./mcp-pool.js";
 
@@ -240,6 +241,17 @@ export const IDEMPOTENT_TIMEOUT_RESENDS = 1;
  */
 export const IDEMPOTENT_TRUSTED_SERVER = { name: "assistant", path: "/v1/internal/assistant-mcp" } as const;
 
+/** The header Brain names its built-in web tools in, to Claw's assistant server only (`api/src/assistant/capabilities.ts`). */
+export const WEB_TOOLS_HEADER = "x-claw-web-tools";
+
+/**
+ * The headers Brain adds of its own to a call of this server: to Claw's assistant server, the web tools it has ("none" when it has
+ * neither), so that the assistant's list of what it can do names exactly those; to any other server, nothing.
+ */
+export function trustedServerHeaders(name: string, url: string, web: readonly string[] = BUILTIN_WEB_TOOLS): Record<string, string> {
+  return trustsIdempotentHint(name, url) ? { [WEB_TOOLS_HEADER]: web.length ? web.join(",") : "none" } : {};
+}
+
 export function trustsIdempotentHint(name: string, url: string): boolean {
   if (name !== IDEMPOTENT_TRUSTED_SERVER.name) return false;
   try {
@@ -301,6 +313,10 @@ async function connectMcpServer(name: string, spec: Record<string, unknown>): Pr
   if (spec.headers && typeof spec.headers === "object") {
     Object.assign(headers, spec.headers);
   }
+  // After the spec's own, and in place of any spelling of the same name: what Brain says of itself is not the request's to set.
+  const own = trustedServerHeaders(name, url);
+  for (const k of Object.keys(headers)) if (Object.hasOwn(own, k.toLowerCase())) delete headers[k];
+  Object.assign(headers, own);
 
   const makeClient = () => new Client(
     { name: `brain-mcp-${name}`, version: "1.0.0" },

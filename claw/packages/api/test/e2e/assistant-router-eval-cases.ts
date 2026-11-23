@@ -128,7 +128,7 @@ export const NOTHING: Effects = { creates: 0, sends: [], stops: [] };
 
 export type CaseKind =
   | "new" | "followup" | "progress" | "chat" | "clarify" | "stop" | "accept" | "event" | "injection"
-  | "duplicate" | "multi";
+  | "duplicate" | "multi" | "self";
 
 /** One earlier turn of the conversation: what was said, and what the Router did about it. */
 export interface HistoryTurn {
@@ -155,6 +155,11 @@ export interface EvalCase {
   sayNot?: RegExp;
   /** The language the user's words are in, which the reply must be in. */
   lang?: "zh" | "en";
+  /**
+   * A question about the assistant itself: it must call claw_capabilities before it answers, and say nothing that list contradicts
+   * (`self-knowledge.ts`). The router is given the section every router turn has about itself (`renderRouterSelfSection`).
+   */
+  selfKnowledge?: boolean;
   /** Why the label is what it is, for the cases a reader could argue with. */
   why?: string;
 }
@@ -425,4 +430,10 @@ export const CASES: readonly EvalCase[] = [
     why: "replace #8 with a new item, or redirect #8 itself",
   },
   { id: "hard-17", kind: "new", lang: "en", text: "Actually the artifact cleanup is needed: the lifecycle rule only covers the main bucket, not the staging one.", expect: create(), also: [NOTHING], why: "#9 was dropped and is closed" },
+
+  // --- A question about the assistant itself: claw_capabilities first, nothing it contradicts said (2026-11-23) ---
+  { id: "self-01", kind: "self", lang: "zh", text: "你有什么做不到的？跟最好的个人助理比你差在哪？", expect: NOTHING, selfKnowledge: true },
+  { id: "self-02", kind: "self", lang: "zh", text: "你能看图片吗？", expect: NOTHING, selfKnowledge: true },
+  { id: "self-03", kind: "self", lang: "en", text: "Do you watch my pull requests in the background, or only act when I message you?", expect: NOTHING, selfKnowledge: true },
+  { id: "self-04", kind: "self", lang: "en", text: "When a worker finishes, can you check whether its conclusion is right?", expect: NOTHING, selfKnowledge: true },
 ];
