@@ -19,6 +19,8 @@ export interface CapabilityView {
   limits: ReadonlyArray<{ id: string; on: boolean }>;
   review_mode?: { mode: string } | null;
   acts_at_once?: readonly string[];
+  /** Tools the assistant has that refuse here, their ability being off. */
+  off_here?: readonly string[];
 }
 
 export interface Contradiction {
@@ -251,5 +253,6 @@ export function capabilityTruth(caps: CapabilityView & { abilities: ReadonlyArra
     ...caps.limits.map(line),
     ...(caps.review_mode ? [`review_mode: ${caps.review_mode.mode}`] : []),
     ...(caps.acts_at_once?.length ? [`tools that act at once, with no worker or card: ${caps.acts_at_once.join(", ")}`] : []),
+    ...(caps.off_here?.length ? [`tools that refuse here (their ability is off): ${caps.off_here.join(", ")}`] : []),
   ];
 }

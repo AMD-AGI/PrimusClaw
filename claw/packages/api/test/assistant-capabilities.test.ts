@@ -11,6 +11,9 @@
  *   K4  the router is told to call claw_capabilities first for any question about itself, and that its own tools act by themselves
  *   K5  the four false limits of 2026-11-23 are contradictions against a list that has those abilities, and none against one that lacks them
  *   K6  a claim of an ability the list has off is a contradiction; a plain answer about other things is none; the detectors name real entries
+ *   K9  reviews, pull request watching and GitHub comments are on only with the user's GitHub as the tool that acts finds it; off, they
+ *       say what to connect, and their tools move from what acts to off_here
+ *   K10 the inputs ask for the user's GitHub where the tools do: the watch token and the review service's binding
  *
  * The configuration is set before the source is imported: every switch on, so the router's server registers every tool it can.
  */
@@ -44,7 +47,7 @@ const WEB_BOTH = { search: true, fetch: true };
 function inputs(over: Partial<Inputs> = {}): Inputs {
   return {
     tools: EVERY_TOOL, features: ALL_ON, lookups: { web: WEB_BOTH, github: true, systems: ["safe", "agent-board"] },
-    reviewMode: "high_risk_confirm", userMemory: { enabled: true, here: true }, channels: ["teams"], ...over,
+    reviewMode: "high_risk_confirm", githubAccount: { token: "yes", bound: "yes" }, userMemory: { enabled: true, here: true }, channels: ["teams"], ...over,
   };
 }
 const on = (list: ReturnType<typeof caps.capabilityList>, id: string): boolean | undefined =>
@@ -53,7 +56,7 @@ const onIds = (list: ReturnType<typeof caps.capabilityList>): string[] => list.a
 
 test("K1 every ability is on with its feature and its tools, and taking one away turns exactly that entry off", () => {
   const full = caps.capabilityList(inputs());
-  assert.equal(full.version, "capabilities-v2");
+  assert.equal(full.version, "capabilities-v3");
   assert.deepEqual(full.abilities.filter((a) => !a.on).map((a) => a.id), [], "everything on");
   assert.match(full.abilities.find((a) => a.id === "see_images")!.what, /Images sent with a message are shown to you \(up to 4 per message\)/);
   assert.match(full.abilities.find((a) => a.id === "watch_pull_requests")!.what, /in the background.*read every 30 s/);
@@ -68,7 +71,21 @@ test("K1 every ability is on with its feature and its tools, and taking one away
   for (const [feature, id] of features) {
     const list = caps.capabilityList(inputs({ features: { ...ALL_ON, [feature]: false } }));
     assert.deepEqual(list.abilities.filter((a) => !a.on).map((a) => a.id), [id], `${feature} off`);
+    // Off, the entry says it is not there: never the sentence that describes it working.
+    assert.notEqual(list.abilities.find((a) => a.id === id)!.what, full.abilities.find((a) => a.id === id)!.what, `${feature} off`);
   }
+  // Every entry off says so in words of its own.
+  const nothing = caps.capabilityList(inputs({
+    tools: [], features: Object.fromEntries(Object.entries(ALL_ON).map(([k, v]) => [k, typeof v === "boolean" ? false : v])) as Inputs["features"],
+    lookups: { web: { search: false, fetch: false }, github: false, systems: [] }, githubAccount: { token: "none", bound: "none" },
+  }));
+  for (const a of nothing.abilities) {
+    assert.equal(a.on, false, a.id);
+    assert.notEqual(a.what, full.abilities.find((x) => x.id === a.id)!.what, `${a.id} off says it is not there`);
+    assert.match(a.what, /^(No |Nothing |Reviews cannot|.* needs the user's GitHub)/, `${a.id}: ${a.what}`);
+  }
+  assert.match(nothing.abilities.find((a) => a.id === "memory")!.what, /^No long-term memory on this deployment/);
+  assert.match(nothing.abilities.find((a) => a.id === "dev_environments")!.what, /^No access to the user's own machines here/);
   // Each tool's absence: the ability it is the only evidence of goes off.
   const tools: Array<[string[], string]> = [
     [["work_subscribe"], "watch_pull_requests"], [["job_watch"], "watch_jobs"], [["trigger_create", "brief"], "scheduled_tasks"],
@@ -320,7 +337,7 @@ test("K8 the inputs read the user's memory only where the deployment has it, and
   const q = (async () => ({ rows: [] })) as never;
   const asked: Array<[string, string | null]> = [];
   const deps = {
-    systems: async () => [], github: async () => false,
+    systems: async () => [], github: async () => false, githubAccount: async () => ({ token: "yes" as const, bound: "yes" as const }),
     memory: async (u: string, s: string | null) => { asked.push([u, s]); return { enabled: false, here: true }; },
   };
   const on_ = await caps.capabilityInputs(q, "alice", "sid-1", EVERY_TOOL, undefined, { ...deps, features: ALL_ON, web: { search: true, fetch: false } });
@@ -332,4 +349,104 @@ test("K8 the inputs read the user's memory only where the deployment has it, and
   assert.deepEqual(off.userMemory, { enabled: false, here: false });
   assert.equal(asked.length, 1, "not asked where the deployment has no memory");
   assert.equal(off.lookups.web, null, "no web tools named: not known");
+});
+
+test("K9 reviews, pull request watching and GitHub comments are on only with the user's GitHub, and say what to connect when it is not there", () => {
+  const ability = (list: ReturnType<typeof caps.capabilityList>, id: string) => list.abilities.find((a) => a.id === id)!;
+  const full = caps.capabilityList(inputs());
+  assert.equal(full.off_here, undefined, "everything works: nothing refuses here");
+
+  // No token (no GH_TOKEN, no binding that counts): watching and commenting are off, and their tools refuse here.
+  const noToken = caps.capabilityList(inputs({ githubAccount: { token: "none", bound: "yes" } }));
+  assert.deepEqual(noToken.abilities.filter((a) => !a.on).map((a) => a.id), ["watch_pull_requests", "github_comment"]);
+  assert.match(ability(noToken, "watch_pull_requests").what,
+    /^Watching pull requests in the background needs the user's GitHub account first, and they have not connected one: they connect it once with \/github bind \(or a GH_TOKEN kept in their Claw settings\), then ask again\.$/);
+  assert.match(ability(noToken, "github_comment").what, /^Commenting on a pull request or issue as the user needs the user's GitHub account first/);
+  assert.deepEqual(noToken.off_here, ["github_comment", "work_subscribe"]);
+  assert.ok(!noToken.acts_at_once.includes("work_subscribe") && !noToken.asks_first.includes("github_comment"));
+  assert.equal(ability(noToken, "reviews").on, true, "a review acts with the binding, which is there");
+
+  // Not bound at the identity provider: reviews are off (a GH_TOKEN does not count for them), and no review mode is claimed.
+  const unbound = caps.capabilityList(inputs({ reviewMode: "fully_auto", githubAccount: { token: "yes", bound: "none" } }));
+  assert.deepEqual(unbound.abilities.filter((a) => !a.on).map((a) => a.id), ["reviews"]);
+  assert.match(ability(unbound, "reviews").what,
+    /^Reviewing or merging a pull request as the user needs the user's GitHub account first, and they have not connected one: they connect it once with \/github bind \(a GH_TOKEN does not count for reviews\), then ask again\. Until then no review or merge is started as them\.$/);
+  assert.doesNotMatch(ability(unbound, "reviews").what, /fully_auto/);
+  assert.equal(unbound.review_mode, null);
+  assert.deepEqual(unbound.off_here, ["review_restart", "review_start"]);
+  assert.ok(!unbound.acts_at_once.includes("review_start") && !unbound.acts_at_once.includes("review_restart"));
+
+  // Run out, or not known just now: off, and said so.
+  const expired = caps.capabilityList(inputs({ githubAccount: { token: "expired", bound: "expired" } }));
+  for (const id of ["watch_pull_requests", "github_comment", "reviews"]) {
+    assert.equal(ability(expired, id).on, false, id);
+    assert.match(ability(expired, id).what, /their authorization has expired: they bind GitHub again \(\/github bind\)/, id);
+  }
+  const unknown = caps.capabilityList(inputs({ githubAccount: { token: "unknown", bound: "unknown" } }));
+  for (const id of ["watch_pull_requests", "github_comment", "reviews"]) {
+    assert.equal(ability(unknown, id).on, false, id);
+    assert.match(ability(unknown, id).what, /could not be checked just now: do not promise it/, id);
+  }
+
+  // Reviews off on the deployment while the review tools are registered: those tools refuse, so they are not listed as acting.
+  const reviewsOff = caps.capabilityList(inputs({ features: { ...ALL_ON, github_review: false } }));
+  assert.deepEqual(reviewsOff.off_here, ["review_restart", "review_start"]);
+  assert.ok(!reviewsOff.acts_at_once.includes("review_start"));
+  assert.ok(reviewsOff.acts_at_once.includes("review_mode_set"), "a tool no off entry gates stays where it acts");
+  // The user's memory off: the memory tools refuse.
+  const memOff = caps.capabilityList(inputs({ userMemory: { enabled: false, here: true } }));
+  assert.deepEqual(memOff.off_here, ["memory_forget", "memory_recall", "memory_save", "memory_undo", "memory_update"]);
+  assert.ok(!memOff.reads.includes("memory_recall") && !memOff.acts_at_once.includes("memory_save"));
+  // Off the deployment, watching says nothing of connecting GitHub.
+  const eventsOff = caps.capabilityList(inputs({ features: { ...ALL_ON, github_events: false }, githubAccount: { token: "none", bound: "yes" } }));
+  assert.match(ability(eventsOff, "watch_pull_requests").what, /^No watching pull requests in the background on this deployment/);
+
+  // The claim "I can watch your PRs" contradicts the list of a user who has not connected GitHub, and "I need your GitHub first" does not.
+  assert.deepEqual(contradictedClaims("我可以帮你在后台盯着 PR。", noToken).map((c) => c.detector), ["claims watch_pull_requests"]);
+  assert.deepEqual(contradictedClaims("我可以帮你在后台盯着 PR。", full), []);
+});
+
+test("K10 the inputs ask for the user's GitHub where the tools do: the watch token, and the review service's binding", async () => {
+  const { githubEventPorts } = await import("../src/assistant/github-events.js");
+  const { reviewItemPorts } = await import("../src/assistant/review-items.js");
+  const saved = { loadToken: githubEventPorts.loadToken, delegationOf: reviewItemPorts.delegationOf };
+  const q = (async () => ({ rows: [] })) as never;
+  const deps = { systems: async () => [], github: async () => false, memory: async () => ({ enabled: true, here: true }) };
+  const tokenAsked: string[] = [];
+  const bindAsked: Array<[string, string]> = [];
+  let token: string | null | Error = null;
+  let delegation: "on" | "off" | "not_bound" | "expired" | "unavailable" | Error = "not_bound";
+  githubEventPorts.loadToken = async (u) => { tokenAsked.push(u); if (token instanceof Error) throw token; return token; };
+  reviewItemPorts.delegationOf = async (a, r) => { bindAsked.push([a, r]); if (delegation instanceof Error) throw delegation; return delegation; };
+  const account = async (features = ALL_ON) =>
+    (await caps.capabilityInputs(q, "alice", "sid-1", EVERY_TOOL, undefined, { ...deps, features })).githubAccount;
+  try {
+    assert.deepEqual(await account(), { token: "none", bound: "none" });
+    assert.deepEqual(tokenAsked, ["alice"]);
+    assert.deepEqual(bindAsked, [["alice", "alice"]], "the review service is asked about the user acting for themselves");
+    token = "gho_x"; delegation = "off";
+    assert.deepEqual(await account(), { token: "yes", bound: "yes" }, "a binding whose delegation is off still reviews as its owner");
+    delegation = "on";
+    assert.deepEqual(await account(), { token: "yes", bound: "yes" });
+    token = new Error("identity down"); delegation = "expired";
+    assert.deepEqual(await account(), { token: "unknown", bound: "expired" });
+    delegation = "unavailable";
+    assert.equal((await account()).bound, "unknown");
+    delegation = new Error("boom");
+    assert.equal((await account()).bound, "unknown");
+    reviewItemPorts.delegationOf = null;
+    assert.equal((await account()).bound, "unknown", "reviews not set up: not known, never yes");
+    // Reviews off on the deployment: the binding is not asked for.
+    reviewItemPorts.delegationOf = async (a, r) => { bindAsked.push([a, r]); return "on"; };
+    const before = bindAsked.length;
+    assert.equal((await account({ ...ALL_ON, review_items: false })).bound, "none");
+    assert.equal(bindAsked.length, before);
+    // Given: used as it is.
+    const given = await caps.capabilityInputs(q, "alice", null, EVERY_TOOL, undefined,
+      { ...deps, features: ALL_ON, githubAccount: async () => ({ token: "yes", bound: "none" }) });
+    assert.deepEqual(given.githubAccount, { token: "yes", bound: "none" });
+  } finally {
+    githubEventPorts.loadToken = saved.loadToken;
+    reviewItemPorts.delegationOf = saved.delegationOf;
+  }
 });

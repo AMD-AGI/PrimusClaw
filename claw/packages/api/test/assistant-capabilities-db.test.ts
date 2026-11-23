@@ -12,6 +12,9 @@
  *   KD4 a router turn that reads the list and answers from it says nothing the list contradicts; the 2026-11-23 answer does
  *   KD5 the web tools are the ones the Brain names on its call (none named: not claimed), and memory is what the user's own setting and
  *       the conversation keep, read from the store
+ *   KD6 reviews, pull request watching and GitHub comments follow the user's GitHub as those tools find it: a GH_TOKEN in their
+ *       settings (read by the watch's own token lookup) for watching and comments, the review service's binding for reviews; without
+ *       them the entries are off, say what to connect, and their tools are under off_here
  *
  * Skipped without DATABASE_URL, and a skip is not a pass. The source is imported only once the world has set the configuration.
  */
@@ -30,6 +33,15 @@ describe("claw_capabilities on a database", { skip: postgresSkipReason() }, () =
   let app: FastifyInstance;
   let base = "";
   let self: typeof import("./e2e/self-knowledge.js");
+  let reviewPorts: typeof import("../src/assistant/review-items.js")["reviewItemPorts"];
+  let savedDelegation: typeof reviewPorts.delegationOf = null;
+  /** What the review service says of a user's own GitHub binding (`delegationOf`, asked of them for themselves). */
+  let binding: "on" | "not_bound" = "on";
+  /** A GH_TOKEN kept in `user`'s settings, as the watch's token lookup reads it. */
+  const keepToken = (user: string) => w.q(
+    "INSERT INTO claw_user_env_vars (user_id, key_name, key_value_enc) VALUES ($1, 'GH_TOKEN', $2) ON CONFLICT DO NOTHING",
+    [user, w.mod.crypto.encryptUserEnvValue(`gho_${user}_token`)],
+  );
 
   before(async () => {
     w = await startWorld({ CLAW_ASSISTANT_GITHUB_EVENTS: "true", CLAW_ASSISTANT_TOOLS: "on", CLAW_GITHUB_REVIEW_ENABLED: "true", CLAW_ASSISTANT_REVIEW_ITEMS: "true" });
@@ -44,8 +56,15 @@ describe("claw_capabilities on a database", { skip: postgresSkipReason() }, () =
     await app.listen({ port: 0, host: "127.0.0.1" });
     base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
     self = await import("./e2e/self-knowledge.js");
+    reviewPorts = (await import("../src/assistant/review-items.js")).reviewItemPorts;
+    savedDelegation = reviewPorts.delegationOf;
+    reviewPorts.delegationOf = async () => binding;
   });
-  after(async () => { await app?.close(); await w?.stop(); });
+  after(async () => {
+    if (reviewPorts) reviewPorts.delegationOf = savedDelegation;
+    await app?.close();
+    await w?.stop();
+  });
 
   async function connect(claims: object, extra: Record<string, string> = {}): Promise<Client> {
     const token = w.mod.token.mintAssistantToken(claims as never, TOKEN_KEY);
@@ -89,6 +108,8 @@ describe("claw_capabilities on a database", { skip: postgresSkipReason() }, () =
   test("KD2 the list of this user and turn: the router's own tools, the switches, the stored review mode and the chat app", async () => {
     await w.q("TRUNCATE claw_assistant_messages, claw_pending_messages, claw_tasks, claw_work_items, claw_assistants, claw_sessions, claw_github_review_settings CASCADE");
     const alice = await w.user("alice");
+    await keepToken("alice");
+    binding = "on";
     const router = await connect(await turnFrom(alice, "你能做什么", "slack"));
     try {
       const offered = (await router.listTools()).tools.map((t) => t.name).sort();
@@ -98,7 +119,7 @@ describe("claw_capabilities on a database", { skip: postgresSkipReason() }, () =
       assert.equal(list.ok, true);
       assert.match(list.rule, /^This list is generated from the tools and settings you have now\./);
       // Every tool the router is offered is in the list once, by how it acts; nothing else is.
-      assert.deepEqual([...list.acts_at_once, ...list.asks_first, ...list.reads, "say", "deliver_text"].sort(), offered);
+      assert.deepEqual([...list.acts_at_once, ...list.asks_first, ...list.reads, ...(list.off_here ?? []), "say", "deliver_text"].sort(), offered);
       assert.equal(list.unclassified, undefined);
       const ability = (id: string) => list.abilities.find((a: { id: string }) => a.id === id);
       assert.equal(ability("watch_pull_requests").on, true, "CLAW_ASSISTANT_GITHUB_EVENTS is on");
@@ -199,5 +220,59 @@ describe("claw_capabilities on a database", { skip: postgresSkipReason() }, () =
     assert.deepEqual(await memoryOf(alice.routerSid), { memory: { enabled: true, here: false }, on: false }, "a conversation that keeps none");
     assert.deepEqual(await memoryOf(null), { memory: { enabled: true, here: false }, on: false }, "no session yet");
     await w.q("DELETE FROM claw_user_memory_prefs WHERE user_id = 'alice'");
+  });
+
+  test("KD6 reviews, pull request watching and GitHub comments follow the user's GitHub as those tools find it", async () => {
+    await w.q("TRUNCATE claw_assistant_messages, claw_pending_messages, claw_tasks, claw_work_items, claw_assistants, claw_sessions, claw_github_review_settings CASCADE");
+    await w.q("DELETE FROM claw_user_env_vars WHERE user_id = 'carol'");
+    const carol = await w.user("carol");
+    const ability = (list: Record<string, any>, id: string) => list.abilities.find((a: { id: string }) => a.id === id);
+    const listNow = async () => {
+      const router = await connect(await turnFrom(carol, "你会盯我的 PR 吗？能帮我评审吗？"));
+      try {
+        return { list: parsed(await router.callTool({ name: "claw_capabilities", arguments: {} })), offered: (await router.listTools()).tools.map((t) => t.name).sort() };
+      } finally {
+        await router.close();
+      }
+    };
+    try {
+      // A new user: no GH_TOKEN, no binding.
+      binding = "not_bound";
+      const fresh = await listNow();
+      // (github_comment is registered with the triggers, off in this world: off either way; its wording is K9's.)
+      assert.equal(fresh.offered.includes("github_comment"), false);
+      assert.equal(ability(fresh.list, "github_comment").on, false);
+      for (const id of ["watch_pull_requests", "reviews"]) {
+        assert.equal(ability(fresh.list, id).on, false, id);
+        assert.match(ability(fresh.list, id).what, /needs the user's GitHub account first, and they have not connected one: they connect it once with \/github bind/, id);
+      }
+      assert.equal(fresh.list.review_mode, null);
+      assert.ok(["review_restart", "review_start", "work_subscribe"].every((t) => fresh.list.off_here.includes(t)), fresh.list.off_here.join(","));
+      assert.ok(!fresh.list.acts_at_once.includes("review_start") && !fresh.list.acts_at_once.includes("work_subscribe"));
+      assert.deepEqual([...fresh.list.acts_at_once, ...fresh.list.asks_first, ...fresh.list.reads, ...fresh.list.off_here, "say", "deliver_text"].sort(), fresh.offered);
+      // "I can watch your PRs" is now a claim the list contradicts.
+      assert.deepEqual(self.contradictedClaims("我可以帮你在后台盯着 PR。", fresh.list as never).map((c) => c.detector), ["claims watch_pull_requests"]);
+
+      // A GH_TOKEN in their settings: watching and comments work; reviews still need the binding.
+      await keepToken("carol");
+      const token = await listNow();
+      assert.equal(ability(token.list, "watch_pull_requests").on, true);
+      assert.equal(ability(token.list, "reviews").on, false);
+      assert.match(ability(token.list, "reviews").what, /a GH_TOKEN does not count for reviews/);
+      assert.deepEqual(token.list.off_here, ["review_restart", "review_start"]);
+
+      // Bound: reviews too, and the API's own list says the same.
+      binding = "on";
+      const bound = await listNow();
+      assert.equal(ability(bound.list, "reviews").on, true);
+      assert.equal(bound.list.off_here, undefined);
+      assert.equal(bound.list.review_mode.mode, "high_risk_confirm");
+      const r = await app.inject({ method: "GET", url: "/v1/assistant/capabilities", headers: { "x-test-user": "carol" } });
+      assert.equal(r.json().data.abilities.find((a: { id: string }) => a.id === "watch_pull_requests").on, true);
+      assert.equal(r.json().data.abilities.find((a: { id: string }) => a.id === "reviews").on, true);
+    } finally {
+      binding = "on";
+      await w.q("DELETE FROM claw_user_env_vars WHERE user_id = 'carol'");
+    }
   });
 });

@@ -22,18 +22,18 @@ import { githubMcpServers } from "../github-mcp/mcp.js";
 import { CHAT_SURFACES, chatSurface } from "./chat-surface.js";
 import { devenvToolsOn } from "./devenv-tools.js";
 import { PROMPT_IMAGES_MAX } from "./files.js";
-import { githubEventsEnabled } from "./github-events.js";
+import { githubEventPorts, githubEventsEnabled } from "./github-events.js";
 import { jobWatchesEnabled } from "./job-watch.js";
 import { assistantMemoryOn, sessionWithoutMemory } from "./memory-tools.js";
 import { getMemoryPreference } from "../memory/service.js";
-import { reviewItemsEnabled } from "./review-items.js";
+import { reviewItemPorts, reviewItemsEnabled } from "./review-items.js";
 import { ROUTER_WEB_TOOLS, routerReadTools } from "./read-tools.js";
 import { assistantSchedulesOn } from "./schedules.js";
 
 /** The tool's name on the assistant's server. */
 export const CAPABILITIES_TOOL = "claw_capabilities";
 /** The shape of the list; moves when an entry is added, removed or changes meaning. */
-export const CAPABILITIES_VERSION = "capabilities-v2";
+export const CAPABILITIES_VERSION = "capabilities-v3";
 
 /** The deployment's switches that decide what the assistant can do, beside the tools they register. */
 export interface DeploymentFeatures {
@@ -104,6 +104,24 @@ export interface Lookups {
   systems: readonly string[];
 }
 
+/** Whether the user has a GitHub account a tool can act with: yes, none, one that ran out (`expired`), or not known just now (`unknown`). */
+export type GithubAccountState = "yes" | "none" | "expired" | "unknown";
+
+/** The user's GitHub, as the tools that act with it find it. */
+export interface GithubAccount {
+  /**
+   * A token as their pull request watches and their comments resolve it (`githubEventPorts.loadToken`, `resolveGithubToken`): a GH_TOKEN
+   * kept in their settings, else the account they bound with /github bind where bindings count. Without one a watch is `no_github_token`
+   * and a comment pressed on its card is not posted.
+   */
+  token: GithubAccountState;
+  /**
+   * An account bound at the identity provider, which a review made as them acts with (the review service's credential; a GH_TOKEN does not
+   * count there). Without one a review as them is refused `actor_not_bound`.
+   */
+  bound: GithubAccountState;
+}
+
 export interface CapabilityInputs {
   /** The tools registered on the router's assistant server, without the `mcp__assistant__` prefix. */
   tools: readonly string[];
@@ -111,6 +129,8 @@ export interface CapabilityInputs {
   lookups: Lookups;
   /** The user's review mode (`getReviewMode`). */
   reviewMode: ReviewMode;
+  /** The user's GitHub account as the review, watch and comment tools find it. */
+  githubAccount: GithubAccount;
   /**
    * The user's own memory: `enabled` is their setting (`getMemoryPreference`, off: the memory tools refuse with memory_off), `here`
    * whether this conversation is one where it is kept (never a group's: `sessionWithoutMemory`).
@@ -167,6 +187,8 @@ export interface Capabilities {
   acts_at_once: string[];
   asks_first: string[];
   reads: string[];
+  /** Registered tools that refuse for this user here, because the ability they belong to is off (not in the three lists above). */
+  off_here?: string[];
   /** Registered tools that no entry of TOOL_EFFECTS classifies (none in a correct build). */
   unclassified?: string[];
   lookups: { web: WebTools | null; github: boolean; systems: string[] };
@@ -177,14 +199,20 @@ export interface Capabilities {
 export const CAPABILITIES_RULE = "This list is generated from the tools and settings you have now. Answer questions about what you can or "
   + "cannot do, and comparisons with other assistants, from it alone: an ability with on true is one you have (never say you cannot do "
   + "it), one with on false or a limit with on false is one you do not have (never claim it). acts_at_once are your own tools that change "
-  + "something when you call them, with no worker and no card; asks_first show the user a card first.";
+  + "something when you call them, with no worker and no card; asks_first show the user a card first; off_here are tools you have that "
+  + "refuse here (their ability is off): never offer what they do.";
 
 interface AbilitySpec {
   id: string;
   /** The tools that do it: on only when at least one is registered (none: decided by `needs` alone). */
   tools?: readonly string[];
   needs?: (i: CapabilityInputs) => boolean;
+  /** What it is, said where it is on. */
   what: (i: CapabilityInputs) => string;
+  /** What is said where it is off: that it is not there, and what would turn it on where the user can. */
+  off: (i: CapabilityInputs) => string;
+  /** Registered tools that refuse while this ability is off: listed under off_here instead of by how they act. */
+  gates?: readonly string[];
 }
 
 const has = (i: CapabilityInputs, t: string): boolean => i.tools.includes(t);
@@ -195,11 +223,23 @@ const webFetch = (i: CapabilityInputs): boolean => i.lookups.web?.fetch === true
 /** The web tools the turn has, by name. */
 const webToolsOf = (i: CapabilityInputs): string[] => ROUTER_WEB_TOOLS.filter((t) => (t === "web_search" ? webSearch(i) : webFetch(i)));
 const listed = (xs: readonly string[]): string => xs.join(", ");
+const hasToken = (i: CapabilityInputs): boolean => i.githubAccount.token === "yes";
+const isBound = (i: CapabilityInputs): boolean => i.githubAccount.bound === "yes";
+
+/** Why the user's GitHub cannot be acted with, and what they do about it: `doing` needs it ("Watching pull requests"). */
+function githubMissing(state: GithubAccountState, doing: string, how: string): string {
+  if (state === "expired") return `${doing} needs the user's GitHub account, and their authorization has expired: they bind GitHub again (/github bind) and then ask again.`;
+  if (state === "unknown") return `${doing} needs the user's GitHub account, which could not be checked just now: do not promise it; they can ask again shortly.`;
+  return `${doing} needs the user's GitHub account first, and they have not connected one: they connect it once with ${how}, then ask again.`;
+}
+const CONNECT_GITHUB = "/github bind (or a GH_TOKEN kept in their Claw settings)";
 
 /** Every ability the list can name, in the order it names them. */
 const ABILITIES: readonly AbilitySpec[] = [
   {
     id: "look_up",
+    off: (i) => `Nothing to look up in the same turn here: no GitHub and no other systems; a work item can look things up instead.${
+      i.lookups.web === null ? " Your web tools are not known: claim none." : " No web search here. No reading web pages here."}`,
     needs: (i) => webSearch(i) || webFetch(i) || i.lookups.github || i.lookups.systems.length > 0,
     what: (i) => `Look things up at once, in the same turn: ${[
       ...(webSearch(i) ? ["search the web (web_search)"] : []),
@@ -213,18 +253,21 @@ const ABILITIES: readonly AbilitySpec[] = [
   },
   {
     id: "see_images",
+    off: () => "No images or files here: what is sent with a message is not shown to you.",
     needs: (i) => i.features.files_and_images,
     what: (i) => `Images sent with a message are shown to you (up to ${i.features.images_per_message} per message), and every file sent `
       + "is handed to the work items you start.",
   },
   {
     id: "hand_off_work",
+    off: () => "No work items here: you cannot start a worker to write or run code.",
     tools: ["work_create", "work_send", "work_stop"],
     what: () => "Start work items: a worker in its own sandbox writes and runs code, uses a shell and a checkout, opens and updates pull "
       + "requests, and reports back; you forward instructions to it or stop it.",
   },
   {
     id: "check_work",
+    off: () => "No checking what a worker did here (no work_recall or pr_state).",
     tools: ["work_recall", "pr_state"],
     what: (i) => `Check what a worker did and concluded${has(i, "work_recall") ? " (work_recall: its reports, the tail of what it wrote, its latest steps live)" : ""}`
       + `${has(i, "pr_state") ? " and where a pull request stands (pr_state)" : ""}.`,
@@ -232,18 +275,25 @@ const ABILITIES: readonly AbilitySpec[] = [
   {
     id: "watch_pull_requests",
     tools: ["work_subscribe"],
-    needs: (i) => i.features.github_events,
+    // A watch reads GitHub with the user's own token (`githubEventPorts.loadToken`): without one it is never made (`no_github_token`).
+    needs: (i) => i.features.github_events && hasToken(i),
+    off: (i) => (i.features.github_events && has(i, "work_subscribe")
+      ? githubMissing(i.githubAccount.token, "Watching pull requests in the background", CONNECT_GITHUB)
+      : "No watching pull requests in the background on this deployment: a pull request is read only when asked."),
+    gates: ["work_subscribe"],
     what: (i) => `Watch pull requests in the background: an item that watches one gets its new comments, reviews and failed CI as they `
       + `happen (read every ${i.features.github_poll_sec} s), and a pull request named when an item starts is watched by itself.`,
   },
   {
     id: "watch_jobs",
+    off: () => "No watching jobs in the background here.",
     tools: ["job_watch"],
     needs: (i) => i.features.job_watch,
     what: (i) => `Watch a job in the background and tell the user when it changes or ends (read every ${i.features.job_poll_sec} s).`,
   },
   {
     id: "scheduled_tasks",
+    off: () => "No scheduled tasks and no brief here: nothing runs on a schedule.",
     tools: ["trigger_create", "brief"],
     needs: (i) => i.features.triggers,
     what: (i) => [
@@ -255,8 +305,10 @@ const ABILITIES: readonly AbilitySpec[] = [
     id: "memory",
     tools: ["memory_save", "memory_recall"],
     needs: (i) => i.features.memory && i.userMemory.enabled && i.userMemory.here,
-    what: (i) => (!i.features.memory || (i.userMemory.enabled && i.userMemory.here)
-      ? "Remember things across conversations: saved at once when the user asks, with Undo; read back in later conversations."
+    gates: ["memory_save", "memory_update", "memory_forget", "memory_undo", "memory_recall"],
+    what: () => "Remember things across conversations: saved at once when the user asks, with Undo; read back in later conversations.",
+    off: (i) => (!i.features.memory || (!has(i, "memory_save") && !has(i, "memory_recall"))
+      ? "No long-term memory on this deployment: nothing is saved or recalled across conversations."
       : !i.userMemory.enabled
         ? "Long-term memory is off for this user: nothing is saved or recalled; they can turn it on in their settings."
         : "Long-term memory is not kept in this conversation (one others read, such as a group's): nothing is saved or recalled here."),
@@ -264,22 +316,32 @@ const ABILITIES: readonly AbilitySpec[] = [
   {
     id: "reviews",
     tools: ["review_start"],
-    // review_start refuses without both (`review-tools.ts`, requireReviews(true)).
-    needs: reviewsHere,
-    what: (i) => (!reviewsHere(i)
-      ? "Reviews cannot be started from you on this deployment: no review or merge of a pull request is started here."
-      : `Review pull requests and merge them when asked (started at once, no worker needed to ask); ${
+    // review_start refuses without both (`review-tools.ts`, requireReviews(true)); a review made as the user acts with the GitHub
+    // account they bound at the identity provider, and is refused actor_not_bound without one (`github-review/service.ts`).
+    needs: (i) => reviewsHere(i) && isBound(i),
+    gates: ["review_start", "review_restart"],
+    what: (i) => `Review pull requests and merge them when asked (started at once, no worker needed to ask); ${
       i.reviewMode === "fully_auto"
         ? "the user's review mode is fully_auto: a merge asked for happens once the review approves, without asking them"
-        : "the user's review mode is high_risk_confirm: a high-risk approval or merge waits for their confirmation"}.`),
+        : "the user's review mode is high_risk_confirm: a high-risk approval or merge waits for their confirmation"}.`,
+    off: (i) => (!reviewsHere(i) || !has(i, "review_start")
+      ? "Reviews cannot be started from you on this deployment: no review or merge of a pull request is started here."
+      : `${githubMissing(i.githubAccount.bound, "Reviewing or merging a pull request as the user", "/github bind (a GH_TOKEN does not count for reviews)")} Until then no review or merge is started as them.`),
   },
   {
     id: "github_comment",
     tools: ["github_comment"],
+    // Posted with the user's token when they press the card (`githubCommentPorts.post`): without one it is not posted (`no_github_token`).
+    needs: hasToken,
+    gates: ["github_comment"],
     what: () => "Draft a comment on a pull request or issue, posted as the user when they press its card.",
+    off: (i) => (has(i, "github_comment")
+      ? githubMissing(i.githubAccount.token, "Commenting on a pull request or issue as the user", CONNECT_GITHUB)
+      : "No commenting on GitHub here."),
   },
   {
     id: "dev_environments",
+    off: () => "No access to the user's own machines here: their agent sessions (claude, codex, cursor) cannot be seen or sent to.",
     tools: ["devenv_list", "devenv_send", "devenv_pair"],
     needs: (i) => i.features.remote_agents,
     what: () => "See the user's own machines and the agent sessions on them (claude, codex, cursor), send an agent an instruction (a "
@@ -287,22 +349,26 @@ const ABILITIES: readonly AbilitySpec[] = [
   },
   {
     id: "personal_skills",
+    off: () => "No personal skills here: none are used, saved or changed.",
     tools: ["skill_read", "skill_save"],
     needs: (i) => i.features.user_skills,
     what: () => "Use, save and change the user's personal skills.",
   },
   {
     id: "deliver_files",
+    off: () => "No handing the user a file here: what you write is said in the message.",
     tools: ["deliver_text"],
     what: () => "Hand the user a file you wrote (a document, a report, a script).",
   },
   {
     id: "self_status",
+    off: () => "No report of how you yourself have been running here.",
     tools: ["claw_self_status"],
     what: () => "Say how you yourself have been running: reply times, failures, the version.",
   },
   {
     id: "model_choice",
+    off: () => "No choosing the model here: work items run on the deployment's default.",
     tools: ["model_default_set"],
     what: () => "Run work items on a model the user picks, and set their default.",
   },
@@ -350,7 +416,7 @@ export function capabilityList(i: CapabilityInputs): Capabilities {
     const present = (a.tools ?? []).filter((t) => has(i, t));
     const on = (a.needs ? a.needs(i) : true) && (a.tools === undefined || present.length > 0);
     return {
-      id: a.id, on, what: a.what(i),
+      id: a.id, on, what: on ? a.what(i) : a.off(i),
       ...(a.id === "look_up" && on ? { tools: [...webToolsOf(i), ...(i.lookups.github ? ["github"] : []), ...i.lookups.systems] } : {}),
       ...(present.length ? { tools: present } : {}),
     };
@@ -362,7 +428,9 @@ export function capabilityList(i: CapabilityInputs): Capabilities {
       : l.lifted !== undefined && names.some((n) => l.lifted!.test(n));
     return { id: l.id, on, what: l.what(on, i) };
   });
-  const of = (effect: ToolEffect): string[] => sorted(i.tools.filter((t) => TOOL_EFFECTS[t] === effect));
+  // A tool that refuses while its ability is off is not offered by how it acts: it is named under off_here.
+  const offHere = new Set(ABILITIES.filter((a) => !abilities.find((x) => x.id === a.id)!.on).flatMap((a) => a.gates ?? []).filter((t) => has(i, t)));
+  const of = (effect: ToolEffect): string[] => sorted(i.tools.filter((t) => TOOL_EFFECTS[t] === effect && !offHere.has(t)));
   const unclassified = sorted(i.tools.filter((t) => !Object.hasOwn(TOOL_EFFECTS, t)));
   const reviews = abilities.find((a) => a.id === "reviews")!;
   return {
@@ -380,6 +448,7 @@ export function capabilityList(i: CapabilityInputs): Capabilities {
     acts_at_once: of("at_once"),
     asks_first: of("card_first"),
     reads: of("reads"),
+    ...(offHere.size ? { off_here: sorted(offHere) } : {}),
     ...(unclassified.length ? { unclassified } : {}),
     lookups: { web: i.lookups.web === null ? null : { ...i.lookups.web }, github: i.lookups.github, systems: [...i.lookups.systems] },
     channels: [...i.channels],
@@ -389,6 +458,33 @@ export function capabilityList(i: CapabilityInputs): Capabilities {
 /** The chat apps the assistant is talked to in: those with a surface of their own and the one this message came through. */
 export function channelsOf(current?: string): string[] {
   return sorted([...Object.keys(CHAT_SURFACES), ...(current ? [chatSurface(current).channel] : [])]);
+}
+
+/**
+ * The user's GitHub as the tools that act with it find it: the token their watches and comments use (`githubEventPorts.loadToken`, which
+ * throws where the identity provider cannot be asked), and the binding a review as them uses (the review service's own credential lookup,
+ * `reviewItemPorts.delegationOf` asked of the user for themselves; absent where reviews are not set up). Each is asked only where the
+ * deployment has what needs it.
+ */
+async function githubAccountOf(userId: string, features: DeploymentFeatures): Promise<GithubAccount> {
+  let token: GithubAccountState = "none";
+  try {
+    token = (await githubEventPorts.loadToken(userId, "assistant:capabilities")) ? "yes" : "none";
+  } catch {
+    token = "unknown";
+  }
+  let bound: GithubAccountState = "none";
+  if (features.review_tools && features.github_review && features.review_items) {
+    const ask = reviewItemPorts.delegationOf;
+    let answer: Awaited<ReturnType<NonNullable<typeof ask>>> | "unavailable" = "unavailable";
+    try {
+      if (ask) answer = await ask(userId, userId);
+    } catch {
+      answer = "unavailable";
+    }
+    bound = answer === "on" || answer === "off" ? "yes" : answer === "not_bound" ? "none" : answer === "expired" ? "expired" : "unknown";
+  }
+  return { token, bound };
 }
 
 /** The user's memory as the memory tools decide it (`requireMemoryHere`): their setting, and whether this session keeps it. */
@@ -408,6 +504,7 @@ export async function capabilityInputs(
     systems?: (userId: string) => Promise<readonly string[]>;
     github?: (sessionId: string) => Promise<boolean>;
     memory?: (userId: string, sessionId: string | null) => Promise<{ enabled: boolean; here: boolean }>;
+    githubAccount?: (userId: string, features: DeploymentFeatures) => Promise<GithubAccount>;
     web?: WebTools | null;
   } = {},
 ): Promise<CapabilityInputs> {
@@ -419,7 +516,8 @@ export async function capabilityInputs(
   const { mode } = await getReviewMode({ query: (t: string, p?: unknown[]) => q(t, p) } as never, userId);
   // Only asked where the deployment has memory at all: without it the entry is off whatever the user chose.
   const userMemory = features.memory ? await (deps.memory ?? userMemoryOf)(userId, sessionId) : { enabled: false, here: false };
+  const githubAccount = await (deps.githubAccount ?? githubAccountOf)(userId, features);
   return {
-    tools, features, lookups: { web: deps.web ?? null, github, systems }, reviewMode: mode, userMemory, channels: channelsOf(channel),
+    tools, features, lookups: { web: deps.web ?? null, github, systems }, reviewMode: mode, githubAccount, userMemory, channels: channelsOf(channel),
   };
 }

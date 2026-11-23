@@ -376,6 +376,8 @@ export function capabilitiesFor(tools: readonly ToolSchema[], over: Partial<Omit
       web: { search: tools.some((t) => t.name === "web_search"), fetch: tools.some((t) => t.name === "web_fetch") }, github: false, systems: [],
     },
     reviewMode: over.reviewMode ?? "high_risk_confirm", userMemory: over.userMemory ?? { enabled: true, here: true },
+    // A user who has connected GitHub, both ways, unless the case says otherwise.
+    githubAccount: over.githubAccount ?? { token: "yes", bound: "yes" },
     channels: over.channels ?? channelsOf(),
   });
 }
