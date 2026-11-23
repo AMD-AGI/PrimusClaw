@@ -345,6 +345,14 @@ All of these run on your machine and fail closed.
   your phone can show them), after credential-shaped strings (API keys, tokens, bearer headers, private keys, JWTs) are
   masked and long tool output is cut to 8 KB. Adapter stderr never leaves; it goes to `logs/` under the state directory.
   A prompt's text is not written to the local audit log, only its hash and length.
+- **Which repository a folder is.** The heartbeat reports, for each folder the sessions and conversations work in (at most 32),
+  the git remote `origin` names and the branch checked out (`workspaces`; the agents' capabilities say `git_info: true`). They
+  are read from the files git keeps, never by running git, and leave the machine only as `host/owner/repo` and a branch name: the
+  user and any password or token in the remote's URL are dropped first, and a remote that still looks like it carries one is
+  not reported at all.
+- **A turn that may only answer.** A prompt Claw sends with `answer_only` (it asks a session, once, what it is for) refuses
+  every permission the agent asks for in that turn here, on your machine, even one an `auto_allow` rule would let through, and
+  asks nobody; the refusal is audited (`answer_only_denied`). A conversation open in a terminal never takes such a prompt.
 
 ## Taking over an existing conversation
 

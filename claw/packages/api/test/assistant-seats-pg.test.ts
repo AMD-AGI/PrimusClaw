@@ -227,8 +227,11 @@ describe("seats", { skip }, () => {
     assert.equal(card.done, false);
     // devenv_list in a turn: marked, and seat_set then refused.
     const turn2 = await userTurn(alice, "看看开发机");
-    await tools.devenvList(turn2);
+    const listed = await tools.devenvList(turn2);
     assert.equal(await untrusted(turn2), true);
+    const sessions = listed.machines[0]!.sessions;
+    assert.deepEqual(sessions.find((x) => x.cwd === "/home/u/rel")!.seat, { seat_id: first!.seat_id, alias: "发布台", role: "负责发布" });
+    assert.deepEqual(sessions.find((x) => x.cwd === "/home/u/other")!.seat, { seat_id: second!.seat_id, alias: null, role: null }, "a guess is not shown");
     assert.equal(await refusal(seats.seatSet(turn2, { seat: "发布台", role: "x" })), "read_untrusted");
   });
 
@@ -366,6 +369,19 @@ describe("seats", { skip }, () => {
     assert.deepEqual(cmds.map((c) => c.type), ["cancel"]);
     assert.equal((await seatRows())[0]!.probe_state, "cancelled");
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_says WHERE user_id = 'alice'"))[0].n, 0, "the user was not asked");
+    // Its guess fails (the model answered nothing that fits), and is tried again a day later: without asking the session again.
+    await w.q("DELETE FROM claw_remote_commands WHERE connector_id = $1", [cid]);
+    // (what the connector posts for the cancel: the request answered `cancelled`, then the turn's end)
+    await events("alice", cid, sid, [["permission_resolved", { actionId: "p1", optionId: null, outcome: "cancelled", by: "cancel" }],
+      ["turn_end", { stopReason: "cancelled", cmd_seq: cmdSeq }]]);
+    await age(sid, 60);
+    await sweep();
+    assert.equal((await seatRows())[0]!.infer_state, "failed");
+    await w.q("UPDATE claw_devenv_seats SET inferred_at = NOW() - interval '2 days'");
+    await sweep();
+    assert.equal((await seatRows())[0]!.infer_state, "failed", "guessed again, and failed again");
+    assert.deepEqual(await prompts(cid), [], "the question is put once per seat, whatever became of the first");
+    assert.equal(guessInputs.length, 2);
   });
 
   test("S5 the guess: the inputs are data; an injected title becomes neither an instruction nor a suggestion; the schema bounds the answer", async () => {
