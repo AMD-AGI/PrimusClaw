@@ -10,6 +10,7 @@
  * machine drops them too).
  */
 import { ClawError } from "../claw/errors.js";
+import { errorName } from "../errors.js";
 import { remoteAgentText } from "../locales/remote-agents.js";
 import type { RemoteState } from "../ports/store/remote.js";
 import type { JsonObject } from "../json.js";
@@ -186,19 +187,14 @@ export class Prompts {
   ): Promise<{ readonly cmdSeq: number | undefined; readonly duplicate: boolean } | false> {
     const lang = this.state.lang(p.chatKey);
     const sid = state.sessionId ?? "";
+    let out: JsonObject;
     try {
       const keys = {
         sha1Hex: (text: string) => this.ctx.digestHex("sha1", text),
         hexId: () => this.ctx.random.hexId(),
       };
-      const out = await this.ctx.claw.command(p.key, sid, promptBody(p), idempotencyKey(keys, p.chatKey, p.messageId));
+      out = await this.ctx.claw.command(p.key, sid, promptBody(p), idempotencyKey(keys, p.chatKey, p.messageId));
       this.ctx.sessionNames.titleRemoteSession(sid, sessionTitle(p.text)); // (a new session is named by its first words)
-      await this.filesTaken(p, out);
-      const seq = out["cmd_seq"];
-      return {
-        cmdSeq: typeof seq === "number" && Number.isSafeInteger(seq) ? seq : undefined,
-        duplicate: out["duplicate"] === true,
-      };
     } catch (error) {
       if (error instanceof ClawError && error.status === 409 && READ_ONLY_REASONS.includes(error.code)) {
         // (a watch this process did not know of: it restarted)
@@ -219,6 +215,14 @@ export class Prompts {
       await this.say(p.to, error instanceof ClawError ? this.failure(error, p.chatKey) : saidIn(lang, "unreachable"));
       return false;
     }
+    // (Claw has the prompt: telling the person of its files is no part of sending it, and a failure to tell them is
+    // no failure to send)
+    await this.filesTaken(p, out);
+    const seq = out["cmd_seq"];
+    return {
+      cmdSeq: typeof seq === "number" && Number.isSafeInteger(seq) ? seq : undefined,
+      duplicate: out["duplicate"] === true,
+    };
   }
 
   /**
@@ -228,8 +232,14 @@ export class Prompts {
    */
   private async filesTaken(p: Prompt, out: JsonObject): Promise<void> {
     const sent = p.files?.length ?? 0;
-    if (sent > 0 && out["files"] !== sent) {
+    if (sent === 0 || out["files"] === sent) return;
+    try {
       await this.say(p.to, saidIn(this.state.lang(p.chatKey), "filesNotTaken"));
+    } catch (error) {
+      this.ctx.logger.warn("the chat could not be told a session prompt's files were not taken", {
+        files: sent,
+        error: errorName(error),
+      });
     }
   }
 

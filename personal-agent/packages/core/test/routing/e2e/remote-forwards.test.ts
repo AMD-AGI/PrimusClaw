@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { InboundFile, InboundForward } from "@primusclaw/personal-agent";
+import type { Conversation, InboundFile, InboundForward, OutMessage } from "@primusclaw/personal-agent";
 
 import type { FakeRemote } from "../../../../../test-support/remote-fake.js";
 import { ALICE as CLAW_ALICE, Script } from "../../../../../test-support/remote-world.js";
@@ -179,6 +179,39 @@ test("a Claw that drops a prompt's files unread: the words went, and the person 
         [{ type: "prompt", text: "look" }],
       );
       assert.match(w.rw.said().slice(before).join("\n"), /the files sent with them did not/u);
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
+  ));
+
+test("a Claw that drops a prompt's files while the chat cannot be told: the prompt still went, and its turn is read", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, true);
+      w.rw.server.takesPromptFiles = false;
+      // Teams refuses the line that says the files did not go (the channel the router posts with, not the world's wrap).
+      const proto = Object.getPrototypeOf(
+        w.rw.surface.conversation({ id: "x", kind: "personal", tenantId: "", wire: {} }),
+      ) as Pick<Conversation, "send">;
+      const send = proto.send; // (called back with its `this`)
+      proto.send = function (this: Conversation, message: OutMessage): Promise<void> {
+        if (JSON.stringify(message).includes("the files sent with them did not")) {
+          return Promise.reject(new Error("Teams said no"));
+        }
+        return send.call(this, message);
+      };
+      const before = w.rw.said().length;
+      try {
+        await w.say("look", { files: [{ ...IMAGE, name: "image-1.png" }] });
+      } finally {
+        proto.send = send;
+      }
+      assert.deepEqual(
+        w.rw.server.commandsOf("prompt").map((c) => c.body),
+        [{ type: "prompt", text: "look" }],
+      );
+      const told = w.rw.said().slice(before).join("\n");
+      assert.match(told, /Done\./u, told); // (the session's answer is read: the prompt counts as sent)
+      assert.doesNotMatch(told, /did not|unreachable|could not/u, told); // (the refused line was never posted)
     },
     { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
   ));
