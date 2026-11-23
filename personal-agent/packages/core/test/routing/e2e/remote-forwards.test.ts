@@ -237,3 +237,117 @@ test("a forward longer than one prompt to a session takes is cut to fit, the per
     },
     { remote: { files: { "build.log": { mediaType: "text/plain", bytes: bytes(LOG) } } } },
   ));
+
+/** Alice's group bound to a session of hers on a machine whose connector takes files when `files` is true. */
+async function boundGroupTo(w: Routed, files: boolean): Promise<void> {
+  w.rw.server.addConnector(
+    CLAW_ALICE,
+    "dev-pod",
+    TWO_AGENTS,
+    files ? { caps: { claude: { prompt_files: true } } } : {},
+  );
+  const script = new Script();
+  script.onPrompt = oneTurn;
+  w.rw.server.onCommand = script.hook;
+  await w.say("/agent new claude /home/me/repo");
+  await w.say("/agent detach");
+  await w.say("切到 dev-pod 上的 claude 会话", { group: true });
+  assert.ok(w.rw.test.store.remoteState.attachedRemote("aad-a#g-1")?.sessionId, w.rw.said().join("\n"));
+}
+
+const GROUP_FORWARD: readonly InboundForward[] = [
+  { messageId: "2", author: "Carol", text: "see [image-1]", sentAt: "", source: "reference" },
+];
+
+test("a bound group's forward with an image and a text file: the text inline, the image to a machine that takes files", () =>
+  routed(
+    async (w) => {
+      await boundGroupTo(w, true);
+      const before = w.rw.said().length;
+      await w.say("what is wrong here?", {
+        group: true,
+        forwards: GROUP_FORWARD,
+        files: [
+          { ...IMAGE, name: "image-1.png" },
+          { name: "build.log", type: "log", handle: {} },
+        ],
+      });
+      const [prompt, ...more] = w.rw.server.commandsOf("prompt").map((c) => c.body);
+      assert.ok(prompt !== undefined && more.length === 0, w.rw.said().join("\n"));
+      const text = String(prompt["text"]);
+      assert.match(text, /Forwarded message from Carol:\n> see \[image-1\]/u, text);
+      assert.match(text, /what is wrong here\?\n\nThe file sent with this message:\n\nFile build\.log/u, text);
+      assert.deepEqual(prompt["files"], [
+        { name: "image-1.png", media_type: "image/png", data: Buffer.from(PNG).toString("base64") },
+      ]);
+      const told = w.rw.said().slice(before).join("\n");
+      assert.doesNotMatch(told, /not passed on|没有交给/u, told);
+    },
+    {
+      remote: {
+        files: {
+          "image-1.png": { mediaType: "image/png", bytes: PNG },
+          "build.log": { mediaType: "text/plain", bytes: bytes(LOG) },
+        },
+      },
+    },
+  ));
+
+test("a bound group's forwarded image to a machine that takes no files: the words go and the person is told the image did not", () =>
+  routed(
+    async (w) => {
+      await boundGroupTo(w, false);
+      const before = w.rw.said().length;
+      await w.say("what is wrong here?", {
+        group: true,
+        forwards: GROUP_FORWARD,
+        files: [{ ...IMAGE, name: "image-1.png" }],
+      });
+      const [prompt, ...more] = w.rw.server.commandsOf("prompt").map((c) => c.body);
+      assert.ok(prompt !== undefined && more.length === 0, w.rw.said().join("\n"));
+      assert.equal(prompt["files"], undefined);
+      assert.match(String(prompt["text"]), /> see \[image-1\]/u);
+      assert.match(
+        w.rw.said().slice(before).join("\n"),
+        /`image-1.png` \(a session takes text, and this is not a text file\)/u,
+      );
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
+  ));
+
+/** Alice's group bound to a session of hers on dev-pod. */
+async function boundGroup(w: Routed): Promise<void> {
+  w.rw.server.addConnector(CLAW_ALICE, "dev-pod", TWO_AGENTS);
+  const script = new Script();
+  script.onPrompt = oneTurn;
+  w.rw.server.onCommand = script.hook;
+  await w.say("/agent new claude /home/me/repo");
+  await w.say("/agent detach");
+  await w.say("切到 dev-pod 上的 claude 会话", { group: true });
+  assert.ok(w.rw.test.store.remoteState.attachedRemote("aad-a#g-1")?.sessionId, w.rw.said().join("\n"));
+}
+
+test("a bound group's forward with an image and a text file: the text inline, the image named back to the person", () =>
+  routed(
+    async (w) => {
+      await boundGroup(w);
+      const before = w.rw.said().length;
+      await w.say("what is wrong here?", {
+        group: true,
+        forwards: [{ messageId: "2", author: "Carol", text: "see [image-1]", sentAt: "", source: "reference" }],
+        files: [
+          { name: "", type: "", handle: { kind: "pasted", index: 1 } },
+          { name: "build.log", type: "log", handle: {} },
+        ],
+      });
+      const [prompt, ...more] = texts(w.rw.server);
+      assert.ok(typeof prompt === "string" && more.length === 0, w.rw.said().join("\n"));
+      assert.match(prompt, /Forwarded message from Carol:\n> see \[image-1\]/u, prompt);
+      assert.match(prompt, /what is wrong here\?\n\nThe file sent with this message:\n\nFile build\.log/u, prompt);
+      assert.match(
+        w.rw.said().slice(before).join("\n"),
+        /`image-1` \(a session takes text, and this is not a text file\)/u,
+      );
+    },
+    { remote: { files: { "build.log": { mediaType: "text/plain", bytes: bytes(LOG) } } } },
+  ));

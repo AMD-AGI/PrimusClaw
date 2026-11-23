@@ -15,7 +15,7 @@ import { fitQuote, inlineFiles, passesInline, roomAfter } from "./session-files.
 import { logTurnStarted, type TurnStarter } from "./turn-start.js";
 
 /** What a session is sent for files that came with no words (a prompt is never empty). */
-const FILES_ONLY = "The person sent the files below with no words.";
+export const FILES_ONLY = "The person sent the files below with no words.";
 
 /** What the person is told about files that did not reach the session (names in code spans). */
 function notPassedLine(notPassed: readonly (readonly [string, string])[], zh: boolean, takesFiles: boolean): string {
@@ -118,19 +118,19 @@ export class PersonalText {
   }
 
   /**
-   * The files of a message to the attached session, as text after the person's words (a session takes text only): the
-   * text files inline, and the person told about the rest.
+   * The files of a message to the session `chatKey` is attached to (the 1:1 chat's, or a bound group's): text files inline
+   * after the person's words, in `room` bytes; other files to its machine where it takes them; the person told about the rest.
    */
-  private async toSession(
+  async toSession(
     message: InboundMessage,
     chat: Chat,
+    chatKey: string,
     key: string,
     room: number,
   ): Promise<{ section: string; files: readonly FetchedFile[] }> {
     if (message.files.length === 0) return { section: "", files: [] };
     const { surface, metrics, remote } = this.ctx.deps;
-    const asFiles =
-      message.files.some((f) => !passesInline(f)) && (await remote.takesFiles?.(chat.sender.id, key)) === true;
+    const asFiles = message.files.some((f) => !passesInline(f)) && (await remote.takesFiles?.(chatKey, key)) === true;
     const inline = await inlineFiles(
       message.files,
       (file) => surface.fetchFile(file),
@@ -169,7 +169,9 @@ export class PersonalText {
     const words = messageText.withQuote(sent, quote);
     // (to a session, text files go as text after the words, in what room the words leave, and other files to its
     // machine; elsewhere they go as files)
-    const toMachine = toAgent ? await this.toSession(message, chat, key, roomAfter(words)) : { section: "", files: [] };
+    const toMachine = toAgent
+      ? await this.toSession(message, chat, userId, key, roomAfter(words))
+      : { section: "", files: [] };
     let prompt = [words, toMachine.section].filter(Boolean).join("\n\n");
     if (!prompt && toMachine.files.length > 0) prompt = FILES_ONLY;
     // (a choice picked on the assistant's card is an answer, never a switch of sessions)
