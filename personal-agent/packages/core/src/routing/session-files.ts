@@ -13,6 +13,33 @@ import type { Result } from "../result.js";
 /** The most bytes of files passed inline with one prompt (a session takes a prompt of at most 64 KiB, words included). */
 export const INLINE_FILE_BYTES = 40 * 1024;
 
+/** The most bytes of one prompt to a session: Claw takes at most 64 KiB; the rest is room for what frames it. */
+export const SESSION_PROMPT_BYTES = 63 * 1024;
+
+/** What is said where forwarded or quoted text was cut to fit one prompt. */
+export const QUOTE_CUT =
+  "\n… [cut: the rest of the forwarded and quoted messages did not fit in one message to the session]";
+
+function bytesOf(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+/**
+ * The forwarded and quoted messages (`quote`) cut so that they and the person's words (`sent`) fit one prompt to a
+ * session: the words are the person's and go whole; what others wrote is cut at its end, and says so.
+ */
+export function fitQuote(quote: string, sent: string): string {
+  const room = SESSION_PROMPT_BYTES - (sent ? bytesOf(sent) + 2 : 0);
+  if (bytesOf(quote) <= room) return quote;
+  const head = room - bytesOf(QUOTE_CUT);
+  return head > 0 ? headBytes(quote, head).trimEnd() + QUOTE_CUT : "";
+}
+
+/** The bytes of files that may follow `words` in one prompt to a session (at most `INLINE_FILE_BYTES`). */
+export function roomAfter(words: string): number {
+  return Math.max(0, Math.min(INLINE_FILE_BYTES, SESSION_PROMPT_BYTES - (words ? bytesOf(words) + 2 : 0)));
+}
+
 /** The file types passed inline: those whose bytes are text. */
 const TEXT_TYPES: ReadonlySet<string> = new Set([
   ...["txt", "text", "md", "markdown", "rst", "adoc", "tex", "log", "out", "err", "csv", "tsv", "json", "jsonl"],
@@ -93,7 +120,8 @@ export async function inlineFiles(
 ): Promise<InlineFiles> {
   const blocks: string[] = [];
   const notPassed: [string, string][] = [];
-  let left = budget;
+  // (the budget is of the whole section: its lead, and each file's heading, fences and the blank line before it)
+  let left = budget - bytesOf("The files sent with this message:");
   for (const [at, file] of files.entries()) {
     const name = shown(file, at + 1);
     if (!passesInline(file)) {
@@ -121,12 +149,20 @@ export async function inlineFiles(
       continue;
     }
     const size = got.value.bytes.length;
-    const body = headBytes(text, left);
-    const kept = new TextEncoder().encode(body).length;
-    left = kept < size ? 0 : left - kept; // (a file that was cut used the budget up)
-    const cut = kept < size ? `, cut to its first ${String(kept)}` : "";
-    const fence = fenceFor(body);
+    const fence = fenceFor(text); // (the whole text's: at least as long as any part's needs)
     const line = oneLine(name);
+    const frame = bytesOf(
+      `\n\nFile ${line} (${String(size)} bytes, cut to its first ${String(size)}):\n${fence}\n\n${fence}`,
+    );
+    if (left - frame <= 0) {
+      notPassed.push([name, WORDS.noRoom]);
+      left = 0;
+      continue;
+    }
+    const body = headBytes(text, left - frame);
+    const kept = bytesOf(body);
+    left = kept < size ? 0 : left - frame - kept; // (a file that was cut used the budget up)
+    const cut = kept < size ? `, cut to its first ${String(kept)}` : "";
     blocks.push(`File ${line} (${String(size)} bytes${cut}):\n${fence}\n${body}\n${fence}`);
   }
   if (blocks.length === 0) return { section: "", passed: 0, notPassed };
