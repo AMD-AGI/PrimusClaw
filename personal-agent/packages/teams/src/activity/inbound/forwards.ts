@@ -279,6 +279,9 @@ export function forwardsInText(activity: Activity): boolean {
   return FORWARD_ITEMTYPE.test(pyStr(activity.text));
 }
 
+/** The ` <address>` a forwarded text says after a link's words (quotes-html). */
+const LINK_ADDRESS = / <https?:\/\/[^\s<>]+>/gu;
+
 /**
  * `text` (the person's words) without the forwarded messages' text that Teams also put there: a client that sends the
  * forward as plain text writes the forwarded messages into `text` as well, after the person's words and in their order,
@@ -294,13 +297,11 @@ export function ownWords(text: string, forwards: readonly InboundForward[], keep
   if (said.length === 0) return text;
   let own = squashSpaces(text);
   for (const one of [...said].reverse()) {
-    if (own === one) {
-      own = "";
-    } else if (own.endsWith(` ${one}`)) {
-      own = own.slice(0, own.length - one.length - 1);
-    } else {
-      return text;
-    }
+    // (a link's address, ` <https://...>` after its words in the forwarded text, is not in a plain-text copy)
+    const shown = squashSpaces(one.replace(LINK_ADDRESS, ""));
+    const copy = [one, shown].find((words) => words !== "" && (own === words || own.endsWith(` ${words}`)));
+    if (copy === undefined) return text;
+    own = own === copy ? "" : own.slice(0, own.length - copy.length - 1);
   }
   // (a text that only refers to its forwards, `<attachment id="..."/>`, names them apart from the person's words: a text
   // that is all a forwarded message's words is then the person saying them, kept rather than lost)

@@ -400,6 +400,10 @@ test("the person's words that equal a forwarded text stay theirs when the text i
     attachments: [reference({ html: "<p>The deploy failed on node 3</p>" })],
   });
   assert.equal(eventOf(copied).text, "please look");
+  const linked = teamsDm('please look Open the dashboard <attachment id="1727881360458"></attachment>', null, {
+    attachments: [reference({ html: '<p><a href="https://example.test/d">Open the dashboard</a></p>' })],
+  });
+  assert.equal(eventOf(linked).text, "please look");
 });
 
 test("a link in a forwarded message comes with the message, not as a link of the person's words", () => {
