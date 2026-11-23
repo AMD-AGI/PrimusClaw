@@ -68,6 +68,7 @@ test("a prompt may carry files: safe names, media types and base64 bytes, within
     ["too many", Array.from({ length: REMOTE_AGENT_LIMITS.maxPromptFiles + 1 }, (_, i) => ({ ...file, name: `f${i}` })), "invalid_files"],
     ["a path", [{ ...file, name: "../etc/passwd" }], "invalid_file_name"],
     ["a dot file", [{ ...file, name: ".bashrc" }], "invalid_file_name"],
+    ["the parent", [{ ...file, name: ".." }], "invalid_file_name"],
     ["a directory", [{ ...file, name: "a/b.txt" }], "invalid_file_name"],
     ["a line break", [{ ...file, name: "a\nb.txt" }], "invalid_file_name"],
     ["two of one name", [file, file], "invalid_file_name"],

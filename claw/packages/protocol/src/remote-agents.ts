@@ -549,6 +549,7 @@ export interface RemotePromptFile {
   data: string;
 }
 
+// (no "/" and no leading dot: never a directory, never "." or "..", never a hidden file)
 const PROMPT_FILE_NAME_RE = /^(?!\.)[A-Za-z0-9._ -]{1,100}$/;
 const MEDIA_TYPE_RE = /^[a-z0-9][a-z0-9.+-]{0,62}\/[a-z0-9][a-z0-9.+-]{0,62}$/;
 const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -574,7 +575,7 @@ export function parsePromptFiles(raw: unknown): Parsed<RemotePromptFile[]> {
   for (const f of raw) {
     if (!isObject(f)) return fail("invalid_files");
     const { name, media_type: mediaType, data } = f;
-    if (typeof name !== "string" || !PROMPT_FILE_NAME_RE.test(name) || name.includes("..") || names.has(name)) return fail("invalid_file_name");
+    if (typeof name !== "string" || !PROMPT_FILE_NAME_RE.test(name) || names.has(name)) return fail("invalid_file_name");
     if (typeof mediaType !== "string" || !MEDIA_TYPE_RE.test(mediaType)) return fail("invalid_file_media_type");
     if (typeof data !== "string" || data === "" || data.length % 4 !== 0) return fail("invalid_file_data");
     total += base64Bytes(data);
