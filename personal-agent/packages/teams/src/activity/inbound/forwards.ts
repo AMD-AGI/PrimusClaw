@@ -46,8 +46,11 @@ function str(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-/** The Forward blockquotes of the activity's HTML: its text when that is HTML, then its `text/html` attachments. */
-function htmlForwards(activity: Activity): Read[] {
+/**
+ * The Forward blockquotes of the activity's HTML, one list per markup that has any: its text when that is HTML, then
+ * its `text/html` attachments (most often the same message said again).
+ */
+function htmlForwards(activity: Activity): Read[][] {
   const markups = [pyStr(activity.text)];
   for (const attachment of attachmentsOf(activity)) {
     const content = attachment["content"];
@@ -55,10 +58,10 @@ function htmlForwards(activity: Activity): Read[] {
       markups.push(content);
     }
   }
-  const found: Read[] = [];
+  const found: Read[][] = [];
   for (const markup of markups) {
     if (!FORWARD_ITEMTYPE.test(markup)) continue;
-    for (const [attrs, inner] of cutForwards(markup).cut) found.push({ ...htmlForward(attrs, inner), source: "html" });
+    found.push(cutForwards(markup).cut.map(([attrs, inner]) => ({ ...htmlForward(attrs, inner), source: "html" })));
   }
   return found;
 }
@@ -120,24 +123,33 @@ function sameForward(known: Read, other: Read): boolean {
 
 /**
  * The messages the activity forwards, in the order Teams gave them: references first (they carry the most), then
- * Forward blockquotes no reference describes; one blockquote said in both the text and its HTML copy is one message.
+ * Forward blockquotes no reference describes. A message is matched across markups (the text and its HTML copy, a
+ * reference and its blockquote), never within one: each blockquote of a markup is its own message, so two forwarded
+ * messages that say the same words (two people's "+1") stay two, and one already read can stand for only one
+ * blockquote of each markup.
  */
 function forwardsRead(activity: Activity): Read[] {
   const found = referenceForwards(activity);
-  for (const html of htmlForwards(activity)) {
-    const same = found.findIndex((known) => sameForward(known, html));
-    const known = found[same];
-    if (known === undefined) {
-      found.push(html);
-      continue;
+  for (const markup of htmlForwards(activity)) {
+    /** The messages a blockquote of this markup has already been matched to (or added as). */
+    const taken = new Set<number>();
+    for (const html of markup) {
+      const same = found.findIndex((known, at) => !taken.has(at) && sameForward(known, html));
+      const known = found[same];
+      if (known === undefined) {
+        taken.add(found.length);
+        found.push(html);
+        continue;
+      }
+      taken.add(same);
+      found[same] = {
+        ...known,
+        senderId: known.senderId || html.senderId,
+        sender: known.sender || html.sender,
+        time: known.time || html.time,
+        ...(plainText(known) || known.images.length ? {} : { text: html.text, images: html.images }),
+      };
     }
-    found[same] = {
-      ...known,
-      senderId: known.senderId || html.senderId,
-      sender: known.sender || html.sender,
-      time: known.time || html.time,
-      ...(plainText(known) || known.images.length ? {} : { text: html.text, images: html.images }),
-    };
   }
   return found;
 }
