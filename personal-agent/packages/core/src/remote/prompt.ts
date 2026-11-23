@@ -227,12 +227,12 @@ export class Prompts {
 
   /**
    * A Claw that knows no `files` field took the words and dropped the files unread: the person is told. A repeat of a
-   * prompt whose first answer was lost is answered with the count too by a Claw that takes files; one that does not
-   * answers without it, and the person is told then as well (they may hear it twice, never not at all).
+   * prompt Claw already has (`duplicate`) says nothing: the first send's answer was where they were told, and a
+   * redelivered message is never told twice.
    */
   private async filesTaken(p: Prompt, out: JsonObject): Promise<void> {
     const sent = p.files?.length ?? 0;
-    if (sent === 0 || out["files"] === sent) return;
+    if (sent === 0 || out["files"] === sent || out["duplicate"] === true) return;
     try {
       await this.say(p.to, saidIn(this.state.lang(p.chatKey), "filesNotTaken"));
     } catch (error) {

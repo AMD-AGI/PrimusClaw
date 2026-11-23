@@ -10,6 +10,7 @@ import type { Conversation, InboundFile, InboundForward, OutMessage } from "@pri
 
 import type { FakeRemote } from "../../../../../test-support/remote-fake.js";
 import { ALICE as CLAW_ALICE, Script } from "../../../../../test-support/remote-world.js";
+import { message } from "../world.js";
 import { attachedThroughRouter, routed, TWO_AGENTS, type Routed } from "./remote-routed.js";
 
 async function oneTurn(srv: FakeRemote, sid: string): Promise<void> {
@@ -179,6 +180,31 @@ test("a Claw that drops a prompt's files unread: the words went, and the person 
         [{ type: "prompt", text: "look" }],
       );
       assert.match(w.rw.said().slice(before).join("\n"), /the files sent with them did not/u);
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
+  ));
+
+test("a Claw that drops a prompt's files: a redelivery of the message does not tell the person again", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, true);
+      w.rw.server.takesPromptFiles = false;
+      const before = w.rw.said().length;
+      const m = { ...message("look", { id: "act-redelivered" }), files: [{ ...IMAGE, name: "image-1.png" }] };
+      await w.r.router.handle(m);
+      await w.rw.idle();
+      // (redelivered after the record that it was handled is lost, as a restart loses it: it reaches Claw again)
+      const idempotency = w.rw.test.store.idempotency;
+      const seen = idempotency.seen;
+      idempotency.seen = () => false;
+      try {
+        await w.r.router.handle(m); // (the person is told, or not, as the send answers: before its turn is read)
+      } finally {
+        idempotency.seen = seen;
+      }
+      assert.equal(w.rw.server.commandsOf("prompt").length, 1); // (Claw kept one prompt: the repeat was a duplicate)
+      const told = w.rw.said().slice(before).join("\n");
+      assert.equal(told.split("the files sent with them did not").length - 1, 1, told);
     },
     { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
   ));
