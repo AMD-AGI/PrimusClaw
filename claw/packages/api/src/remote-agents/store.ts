@@ -1003,7 +1003,11 @@ async function commandIssued(q: Querier, owner: string, connectorId: string, cmd
     [owner, connectorId, cmdId],
   )).rows[0];
   if (!a) return null;
-  return { cmd_seq: null, cmd_id: cmdId, session_id: a.session_id, type: a.detail?.type, payload: { option_id: a.detail?.option_id } };
+  // (a prompt's files as the audit names them: a repeat is answered with how many the original carried)
+  return {
+    cmd_seq: null, cmd_id: cmdId, session_id: a.session_id, type: a.detail?.type,
+    payload: { option_id: a.detail?.option_id, files: a.detail?.files },
+  };
 }
 
 export type IssueOutcome =

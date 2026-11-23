@@ -6,11 +6,11 @@
  * what the words look like on the screen: a link written with other words than its address shows only those words.
  * Teams sends the address beside it: in the message's `text/html` attachment (`<a href>`), in a link preview card
  * (`url`, an `openUrl` action's `value`), or in an entity's `url`. The links of a quote are the quote's (its Reply
- * blockquote is left out here); a file's `downloadUrl` is a credential and is never read; a picture is not a link.
+ * blockquote is left out here), and so are a forwarded message's (its Forward blockquote, whose text carries them); a file's `downloadUrl` is a credential and is never read; a picture is not a link.
  */
 import { pyStr, squashSpaces, type InboundLink } from "@primusclaw/personal-agent";
 import { attrValue, tokenize } from "../../html/lexer.js";
-import { cutReplies, webUrl } from "./markup.js";
+import { cutForwards, cutReplies, webUrl } from "./markup.js";
 import { attachmentsOf, entitiesOf, isFields, type Activity, type Fields } from "./schema.js";
 
 /** The most links that are added to a text. */
@@ -92,7 +92,7 @@ function attachmentLinks(activity: Activity): Link[] {
     const kind = pyStr(attachment["contentType"]).toLowerCase();
     const content = attachment["content"];
     if (kind === "text/html" && typeof content === "string") {
-      found.push(...htmlLinks(cutReplies(content).kept));
+      found.push(...htmlLinks(cutForwards(cutReplies(content).kept).kept));
     } else if (CARD_TYPES.some((prefix) => kind.startsWith(prefix))) {
       found.push(...cardLinks(content, pyStr(attachment["name"])));
       const url = "contentUrl" in attachment ? webUrl(attachment["contentUrl"]) : "";
@@ -104,7 +104,7 @@ function attachmentLinks(activity: Activity): Link[] {
 
 /**
  * The hyperlinks the person's own words carry, each address once, in the order found, at most LINK_COUNT: those of
- * the message's HTML (its quote left out), of a link preview's card, and of an entity.
+ * the message's HTML (its quote and forwarded messages left out), of a link preview's card, and of an entity.
  */
 export function linksOf(activity: Activity): Link[] {
   const found = attachmentLinks(activity);

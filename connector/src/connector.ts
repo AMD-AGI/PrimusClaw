@@ -27,7 +27,7 @@ import { failureKind, PoisonFinder } from "./poison.js";
 import { ApprovalBroker, type HookAgent, serveApprovals, TURN_END_AWAY_MS } from "./approvals.js";
 import { cursorConfigDir } from "./cursor-approvals.js";
 import {
-  childrenFile, identityFile, identityKeepFile, logDir, outboxDir, pauseFile, pidFile, quarantineFile, sessionsFile, type Dirs,
+  childrenFile, identityFile, identityKeepFile, logDir, outboxDir, uploadsDir, pauseFile, pidFile, quarantineFile, sessionsFile, type Dirs,
 } from "./paths.js";
 import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, type RemoteAgentDescriptor } from "./protocol.js";
 import { redactDeep, storableDeep } from "./redact.js";
@@ -446,7 +446,7 @@ export class Connector {
     }
     const env: SessionEnv = {
       config: d.config, audit: d.audit, registry: this.registry, store: this.store, attach: this.attach, timing: this.timing,
-      logDir: logDir(d.dirs), version: d.version, log: d.log,
+      logDir: logDir(d.dirs), uploadDir: uploadsDir(d.dirs), version: d.version, log: d.log,
       emit: (sid, type, data, after, at) => this.emit(sid, type, data, after, at),
     };
     this.manager = new SessionManager(env);
@@ -548,6 +548,8 @@ export class Connector {
         ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes,
         // `withdraw`: a prompt that has not started can be taken back without stopping anything (Session.withdraw)
         withdraw: true,
+        // `prompt_files`: a prompt's files (`prompt.files`) are saved on this machine and named in the prompt (prompt-files.ts)
+        prompt_files: true,
         ...(support ? { watch_live: true, ...(support.typesIntoTerminals() ? { terminal_input: true } : {}) } : {}),
         ...(a.readOnlyModes.length ? { read_only_modes: a.readOnlyModes } : {}),
         ...(readOnly ? { edits: false, edits_hint: READ_ONLY_HINT } : {}),

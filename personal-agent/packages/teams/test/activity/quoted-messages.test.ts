@@ -342,6 +342,8 @@ test("a placeholder with no data is logged by its shape only", () => {
       "a quoted placeholder came with no quote data",
       { entityTypes: "clientInfo", attachmentTypes: "text/plain" },
     ],
+    // (an attachment no reader here reads: its kind is logged, so a new shape a client sends shows)
+    ["info", "an attachment of a kind not read", { attachmentTypes: "text/plain", entityTypes: "clientInfo" }],
     ["info", "the message quotes earlier messages", { count: 1, sources: "placeholder" }],
   ]);
   assert.ok(!JSON.stringify(lines).includes("secret plan") && !JSON.stringify(lines).includes("private words"));

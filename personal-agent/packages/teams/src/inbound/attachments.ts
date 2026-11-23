@@ -16,6 +16,9 @@ import { cpHead, pyStr, type InboundFile } from "@primusclaw/personal-agent";
 
 export const FILE_DOWNLOAD_INFO = "application/vnd.microsoft.teams.file.download.info";
 
+/** Attachments that name no file: the HTML copy of the message, and a forwarded message (read as one, not as a file). */
+const NOT_FILES: ReadonlySet<string> = new Set(["text/html", "forwardedmessagereference"]);
+
 /** How a file is fetched: a pasted image from the Bot Connector with the bot's token, or a download link without one. */
 export type TeamsFileKind = "pasted" | "download";
 
@@ -82,7 +85,7 @@ export function inboundFiles(activity: unknown): MessageFiles {
       files.push(teamsFile(name, "", { kind: "pasted", url: contentUrl, index }));
     } else if (kind === FILE_DOWNLOAD_INFO && typeof downloadUrl === "string") {
       files.push(teamsFile(name, sentFileType(content["fileType"]), { kind: "download", url: downloadUrl, index }));
-    } else if (name && kind !== "text/html" && !kind.startsWith("application/vnd.microsoft.card.")) {
+    } else if (name && !NOT_FILES.has(kind) && !kind.startsWith("application/vnd.microsoft.card.")) {
       unreadable.push(name);
     }
   }
