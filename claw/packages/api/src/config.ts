@@ -676,6 +676,14 @@ export const CLAW_REMOTE_AGENTS_ENABLED = envBool("CLAW_REMOTE_AGENTS_ENABLED", 
 // Days a closed remote-agent session, with its stored events, is kept. Zero or
 // less keeps them for ever. The audit trail is not touched by this.
 export const CLAW_REMOTE_AGENTS_RETENTION_DAYS = envInt("CLAW_REMOTE_AGENTS_RETENTION_DAYS", 30);
+// Seats (default OFF): what each folder an agent works in on a user's machines is for, as the user confirmed it (`assistant/seats.ts`,
+// docs/remote-agents.md "Seats"). `on` turns it on for every user of the assistant; off (the default), only the users named in
+// CLAW_DEVENV_SEATS_USERS (Claw user ids, comma-separated) get it: the canary. Needs CLAW_REMOTE_AGENTS_ENABLED and the assistant.
+// Shown only: nothing is sent to a seat because of its role yet.
+export const CLAW_DEVENV_SEATS = env("CLAW_DEVENV_SEATS", "off").trim().toLowerCase() === "on";
+export const CLAW_DEVENV_SEATS_USERS: ReadonlySet<string> = new Set(
+  env("CLAW_DEVENV_SEATS_USERS").split(",").map((u) => u.trim()).filter(Boolean),
+);
 
 // --- GitHub pull request review (default OFF) ---
 // When false: no tables, no routes, no MCP server offered to a session, and a session

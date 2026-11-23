@@ -28,6 +28,7 @@ import {
 } from "../marketplace/skill-service.js";
 import { handleWorkerSkillWrites } from "../assistant/skill-writes.js";
 import { maybeAutoDraft } from "../assistant/skill-auto-draft.js";
+import { maybeSeatCard, seatsAnywhere } from "../assistant/seats.js";
 import { appEventIdentity } from "./app-events.js";
 import { ensureEventIdUniqueness, normalizeLegacyEventIdsOnce } from "./legacy-event-ids.js";
 import { enqueueEvolutionJob } from "../marketplace/evolve-worker.js";
@@ -1217,6 +1218,7 @@ export const completionPorts = {
   releaseRunHolds,
   deliverUnsaidAnswer,
   maybeAutoDraft,
+  maybeSeatCard,
   rerunOnFallback,
 };
 
@@ -1668,6 +1670,13 @@ async function handleComplete(
   if (CLAW_ASSISTANT_ENABLED && CLAW_USER_SKILLS_ENABLED && endedRunIds.length && !rerun && !failed && !interrupted && messageId) {
     void completionPorts.maybeAutoDraft({ sessionId, userId, messageId })
       .catch((err) => logger.error({ err, sessionId }, "assistant.skill_auto_draft_failed"));
+  }
+
+  // 9d. A router turn that answered the user's own message: a guess of what one of their seats is for, waiting, is put to them on a
+  //     card (`seats.ts`), one at a time and a few a day. In the background, as the skill draft is.
+  if (CLAW_ASSISTANT_ENABLED && seatsAnywhere() && endedRunIds.length && !rerun && !failed && !interrupted && messageId) {
+    void completionPorts.maybeSeatCard({ sessionId, userId, messageId })
+      .catch((err) => logger.error({ err, sessionId }, "assistant.seat_card_failed"));
   }
 
   logger.info({ sessionId, failed, userId }, "exec_complete.handled");

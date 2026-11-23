@@ -20,11 +20,15 @@ export {
   REMOTE_EVENT_SESSION_CLOSED,
   REMOTE_OUTBOX_REPORT_MAX_SESSIONS,
   isRemoteCommandType,
+  normalizeGitBranch,
+  normalizeGitRemote,
   parseRemoteId,
   REMOTE_COMMANDS,
+  REMOTE_WORKSPACE_LIMITS,
 } from "../../claw/packages/protocol/src/remote-agents.js";
 export type {
   RemoteAgentDescriptor,
   RemoteCommandType,
   RemoteEventIn,
+  RemoteWorkspace,
 } from "../../claw/packages/protocol/src/remote-agents.js";

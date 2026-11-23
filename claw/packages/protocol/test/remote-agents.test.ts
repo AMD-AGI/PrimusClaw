@@ -7,6 +7,7 @@ import {
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES,
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
   parseHiddenRequest, parseRemoteId, parseSessionNew, sseFrame, REMOTE_HIDDEN_INCLUDE, REMOTE_HIDE_LIMITS,
+  normalizeGitBranch, normalizeGitRemote, normalizedRemote, parseWorkspacesReport, REMOTE_WORKSPACE_LIMITS,
 } from "../src/remote-agents.js";
 
 const SID = "0f8fad5b-d9cb-469f-a165-70867728950e";
@@ -227,4 +228,48 @@ test("a terminal's session open: agent, conversation ref, folder and a title cut
   assert.deepEqual(parseApprovalsSetting({ enabled: false }), { ok: true, value: { enabled: false } });
   assert.deepEqual(parseApprovalsSetting({ enabled: "false" }), { ok: false, error: "enabled_required" });
   assert.deepEqual([...TERMINAL_HOOK_COMMANDS], ["decision", "close"]);
+});
+
+test("a heartbeat's workspaces: each folder's remote as host/owner/repo with no user or credential, a checked branch, bounded; absent from an older connector", () => {
+  const hb = (workspaces?: unknown) => parseHeartbeat({ version: "0.3.1", agents: [], ...(workspaces === undefined ? {} : { workspaces }) });
+  const old = hb();
+  assert.ok(old.ok);
+  assert.equal(old.value.workspaces, null, "an older connector sends none, and its heartbeat is taken");
+  const bad = hb("not a list");
+  assert.ok(bad.ok, "a malformed report never refuses the heartbeat");
+  assert.equal(bad.value.workspaces, null);
+  const got = hb([
+    { cwd: "/w/a", git_remote: "github.com/Org/Repo", git_branch: "main" },
+    { cwd: "/w/b", git_remote: "https://user:s3cret@gitlab.example.com/g/p.git", git_branch: "feat/x" },
+    { cwd: "/w/c", git_remote: "github.com/ghp_abcdefghijklmnopqrstuvwxyz0123456789/x", git_branch: "a..b" },
+    { cwd: "/w/a", git_remote: "github.com/dup/dup", git_branch: "dup" },
+    { cwd: "/w/\u0007bell", git_remote: null, git_branch: null },
+    { cwd: 5 }, "x", null,
+    { cwd: "/w/d", git_remote: "GitHub.com/Upper/Case", git_branch: "x;rm -rf /" },
+  ]);
+  assert.ok(got.ok);
+  assert.deepEqual(got.value.workspaces, [
+    { cwd: "/w/a", git_remote: "github.com/Org/Repo", git_branch: "main" },
+    { cwd: "/w/b", git_remote: "gitlab.example.com/g/p", git_branch: "feat/x" },
+    { cwd: "/w/c", git_remote: null, git_branch: null },
+    { cwd: "/w/d", git_remote: null, git_branch: null },
+  ]);
+  assert.ok(!JSON.stringify(got.value).includes("s3cret"));
+  const many = hb(Array.from({ length: 100 }, (_, i) => ({ cwd: `/w/${i}`, git_remote: null, git_branch: null })));
+  assert.ok(many.ok);
+  assert.equal(many.value.workspaces!.length, REMOTE_WORKSPACE_LIMITS.maxEntries);
+  assert.equal(normalizedRemote("github.com/Org/Repo"), "github.com/Org/Repo");
+  assert.equal(normalizedRemote("github.com/Org/Repo.git"), null, "the normalized shape exactly, or nothing");
+  assert.equal(normalizeGitRemote("git@github.com:Org/Repo.git"), "github.com/Org/Repo");
+  assert.equal(normalizeGitRemote("/srv/repo.git"), null);
+  assert.equal(normalizeGitBranch("refs/heads/release/1.2"), "release/1.2");
+  assert.equal(normalizeGitBranch("-x"), null);
+});
+
+test("a prompt may ask for an answer only; anything but a boolean there is refused", () => {
+  assert.deepEqual(REMOTE_COMMANDS.prompt.parse({ text: "hi", answer_only: true }), { ok: true, value: { text: "hi", answer_only: true } });
+  assert.deepEqual(REMOTE_COMMANDS.prompt.parse({ text: "hi", answer_only: false }), { ok: true, value: { text: "hi" } });
+  assert.deepEqual(REMOTE_COMMANDS.prompt.parse({ text: "hi" }), { ok: true, value: { text: "hi" } });
+  assert.deepEqual(REMOTE_COMMANDS.prompt.parse({ text: "hi", answer_only: "yes" }), { ok: false, error: "invalid_answer_only" });
+  assert.deepEqual(REMOTE_COMMANDS.prompt.audit({ text: "hi", answer_only: true }).answer_only, true);
 });

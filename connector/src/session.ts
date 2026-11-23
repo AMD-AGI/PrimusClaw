@@ -138,6 +138,9 @@ export class SessionRefusal extends Error {
 }
 
 /** Why Claude Code leaves `bypassPermissions` out of its modes, for the log line of a refused session (claude-mode.ts). */
+/** Why a prompt that asks for an answer only is refused: its session types into a terminal, whose turns no one here can hold to that. */
+export const ANSWER_ONLY_UNSUPPORTED = "answer_only_unsupported";
+
 const BYPASS_HINT = ` (Claude Code offers it to root only with IS_SANDBOX set, and never when permissions.disableBypassPermissionsMode is "disable"; "claw-connector doctor" names the fix)`;
 
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024;
@@ -202,7 +205,9 @@ export class Session {
    * it again.
    */
   private readonly recording = new Set<Promise<unknown>>();
-  private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun }> = [];
+  private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun; answerOnly?: boolean }> = [];
+  /** The turn running now only answers (`prompt.answer_only`): every permission its agent asks for is refused here, never put to anyone. */
+  private answerOnlyTurn = false;
   private launching: Promise<void> | null = null;
   private idle: NodeJS.Timeout | undefined;
   /**
@@ -1206,6 +1211,15 @@ export class Session {
     const options = normalizeOptions(params.options);
     if (this.closed || options.length === 0) return Promise.resolve({ outcome: { outcome: "cancelled" } });
 
+    if (this.answerOnlyTurn) {
+      // A turn asked only to answer: nothing it wants to run or change is let through, not even by the owner's own rules, and nobody
+      // is asked. Refused as the agent offers a refusal, else cancelled.
+      // (never `reject_always`: that would outlive this turn as a rule of the agent's)
+      const reject = options.find((o) => o.kind === "reject_once");
+      this.audit("answer_only_denied", { tool: toolCall.title, tool_kind: toolCall.kind, option_id: reject?.optionId ?? null });
+      this.emit("permission_auto_denied", { tool: str(toolCall.title, 200), kind: str(toolCall.kind, 64), reason: "answer_only" });
+      return Promise.resolve(reject ? { outcome: { outcome: "selected", optionId: reject.optionId } } : { outcome: { outcome: "cancelled" } });
+    }
     const rule = matchAutoAllow(this.agent.autoAllow, toolCall, this.cwd);
     const allowOnce = options.find((o) => o.kind === "allow_once");
     if (rule && allowOnce) {
@@ -1297,8 +1311,17 @@ export class Session {
    * the session closed): only then does the connector count the command as handled, so a restart before that
    * delivers it again instead of losing it.
    */
-  enqueuePrompt(text: string, cmdId: string | null, started: () => void = () => {}, cmdSeq: number | null = null, mayRun?: MayRun): void {
+  enqueuePrompt(
+    text: string, cmdId: string | null, started: () => void = () => {}, cmdSeq: number | null = null, mayRun?: MayRun, answerOnly = false,
+  ): void {
     if (this.closed) { this.rejectCommand("prompt", cmdId, "session_closed", cmdSeq); return started(); }
+    if (answerOnly && this.readOnly) {
+      // A terminal's conversation answers in the terminal's own mode: no turn there can be held to answering only, so none is typed.
+      this.audit("prompt_refused", { reason: ANSWER_ONLY_UNSUPPORTED });
+      this.rejectCommand("prompt", cmdId, ANSWER_ONLY_UNSUPPORTED, cmdSeq);
+      this.emit("turn_end", { stopReason: "error", error: ANSWER_ONLY_UNSUPPORTED, cmd_id: cmdId, cmd_seq: cmdSeq });
+      return started();
+    }
     if (this.readOnly && (this.terminal || this.terminalRestoring)) return this.enqueueTerminal(text, cmdId, cmdSeq, started, mayRun);
     if (this.readOnly) {
       // Never queued, never sent: what the person typed does not reach the conversation the terminal is writing.
@@ -1308,7 +1331,7 @@ export class Session {
       return started();
     }
     if (this.queue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts", cmdSeq); return started(); }
-    this.queue.push({ text, cmdId, cmdSeq, started, mayRun });
+    this.queue.push({ text, cmdId, cmdSeq, started, mayRun, ...(answerOnly ? { answerOnly: true } : {}) });
     if (!this.turnRunning) void this.pump();
   }
 
@@ -1352,7 +1375,12 @@ export class Session {
         if (verdict === "keep") { this.queue.unshift(next); break; }
         if (verdict === "drop") { next.started(); continue; }
         if (this.closed) { this.rejectCommand("prompt", next.cmdId, "session_closed", next.cmdSeq); next.started(); break; }
-        await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq);
+        this.answerOnlyTurn = next.answerOnly === true;
+        try {
+          await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq);
+        } finally {
+          this.answerOnlyTurn = false;
+        }
       }
     } finally {
       this.turnRunning = false;

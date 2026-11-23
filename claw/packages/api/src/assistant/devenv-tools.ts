@@ -163,6 +163,8 @@ export interface DevenvSession {
   queued_prompts?: number;
   /** With `terminal_state: "waiting_for_you"`: what it waits for, in the agent's words ("input needed"). */
   waiting_for?: string | null;
+  /** The seat this session's folder is (`seats.ts`, where seats are on): its alias, and its role once the user confirmed it. */
+  seat?: { seat_id: string; alias: string | null; role: string | null };
 }
 
 export interface DevenvMachine {
@@ -622,6 +624,13 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
     sessionActivity(userId, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser),
   ]);
   const shown = flat;
+  // Each session's seat (its folder's alias and confirmed role), for a user who has seats.
+  const seatsMod = await import("./seats.js");
+  const seats = seatsMod.seatsOn(userId) ? await seatsMod.seatsByPlace(userId).catch(() => null) : null;
+  const seatOf = (connectorId: string, agentId: string, cwd: unknown) => {
+    const s = seats && typeof cwd === "string" ? seats.get(seatsMod.seatPlaceKey(connectorId, agentId, cwd)) : undefined;
+    return s ? { seat: s } : {};
+  };
 
   const machines: DevenvMachine[] = [];
   const attachable: Attachable[] = [];
@@ -651,6 +660,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
         ref: online ? ref : null, attach_command: online ? attachCommand(ref) : null,
         ...(online ? {} : { why_not: "the machine is offline" }),
         ...(s.read_only === true ? { read_only: true, note: READ_ONLY_NOTE } : {}),
+        ...seatOf(String(c.connector_id), String(s.agent_id), s.cwd),
       };
       if (activity) Object.assign(row, { step: reading.step, last_answer: reading.answer, asked: reading.asked, last_stop: reading.last_stop, queued_prompts: Number(s.queued) || 0 });
       sessions.push(row);
@@ -670,6 +680,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
           ref: can ? r.ref : null, attach_command: can ? attachCommand(r.ref) : null,
           ...(can ? {} : { why_not: !online ? "the machine is offline" : "it is open in a terminal on that machine; only the terminal can use it now" }),
           ...(can && inTerminal ? (r.typed ? { typed_into_terminal: true as const, note: TYPED_NOTE } : { read_only: true as const, note: READ_ONLY_NOTE }) : {}),
+          ...seatOf(String(c.connector_id), String(a.agent_id), r.cwd),
         };
         if (inTerminal && r.terminal_state) row.terminal_state = r.terminal_state;
         if (activity) {

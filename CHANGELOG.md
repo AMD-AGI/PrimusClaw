@@ -113,6 +113,18 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: seats (default off; `CLAW_DEVENV_SEATS=on`, or the users in `CLAW_DEVENV_SEATS_USERS`). Each folder an agent works in on a
+  user's machines is a seat (`claw_devenv_seats`), made and kept from the sessions and conversations Claw already has. What it is for
+  counts only once the user confirmed it on a card: their own words (`seat_set`, in a turn answering their own signed-in message), or
+  Claw's guess (one tool-less model call with a schema-bounded answer, from the folder, its git remote and branch, the conversations'
+  titles, the start of the user's last 20 prompts there and, once per seat, the session's answer to one fixed question asked only while
+  it is idle and quiet for ten minutes, as an answer-only turn). `seat_roster` lists only what Claw computed or the user confirmed and
+  does not mark the turn; `devenv_list` and `GET /v1/remote-agents/seats` show each seat's alias and confirmed role. Shown only: nothing
+  is sent to a seat because of its role. See `claw/docs/remote-agents.md`, "Seats".
+- Connector: the heartbeat reports each session folder's git remote and branch (`workspaces`, capability `git_info`), read from git's
+  files and normalized on the machine (`host/owner/repo`, no user or credential); a prompt with `answer_only: true` (capability
+  `answer_only`) refuses every permission its agent asks for in that turn, on the machine.
+
 - Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, how many times the
   application was started again, and `app.last_exit`, `{ returncode, at, cause }` of the last time the application
   stopped (`null` until then), moved on every exit. A crash-looping application used to read only `status: running`

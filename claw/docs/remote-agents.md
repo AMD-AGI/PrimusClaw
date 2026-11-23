@@ -653,6 +653,49 @@ answer carries `why_card`: `confirm_first`, or why the turn could not have acted
 refused with `cards_off`. A turn answering no message (a worker's report) cannot even propose it. What a machine
 reported reaches the model only after the choice, and the turn has read it from then on.
 
+### Seats
+
+A seat is one folder an agent works in on one of the user's machines (`claw_devenv_seats`: owner, connector, agent, folder, and an
+optional conversation ref that no seat uses yet). Sessions end, are compacted or are taken over, and their ids change; the folder does
+not, so that is what the user's word about it is kept on. Claw makes and keeps the seats from what it already has: every folder a
+session open through Claw works in, and every folder of a conversation a connector reports (open now, or updated within 30 days). A seat
+whose machine registers again under its name (a reinstall that revoked the old row) moves to the new row, with what the user said of it.
+
+What a seat is for (`alias`, at most 16 characters, and `role`, at most 120) counts only once the user confirmed it on a card, from one
+of two sources:
+
+- the user says it: the router's `seat_set{seat? | machine?, agent?, cwd? | session_id?, alias?, role?}`, only in a turn that answers
+  the user's own message sent signed in (as every acting tool), puts the seat it found and their words on a card (`seat_set`
+  confirmation); pressing it keeps them. A role or alias that holds an address, code or a command is refused;
+- Claw guesses, and puts the guess on a card (`seat_role` confirmation, after a router turn that answered the user, one card at a time
+  and at most three a day): Right (or `批准 #<ref>`) confirms it, Deny (or `拒绝 #<ref>`) retires the seat (nothing is to be sent to
+  it), and telling the assistant what it handles instead goes through `seat_set`. The guess is one model call with no tools, never in
+  the router's prompt, whose answer is kept only if it fits the schema (a role that is a description, an alias that is a name, tags
+  only from Claw's own slugs of the folder's git remote and branch). Its inputs are data: the folder, its git remote and branch, the
+  titles of its conversations, the start (80 characters) of the user's last 20 prompts there, and once per seat (again only when the
+  user asks for a refresh, `seat_set{refresh: true}`) the session's own answer to one fixed question: *"Please describe in two or
+  three sentences what you are responsible for in this directory and what you have been working on recently. Only answer; do not
+  run any tool or change anything."* It is asked only in a session open through Claw that is idle with nothing in it for ten minutes,
+  and no conversation of that folder open in a terminal busy or typed into within ten minutes. It is sent as Claw's (`client:
+  seat_probe` on its `user_prompt` event, command id `seat-probe:<seat>:<n>`), filed as no item, with `answer_only: true`: a connector
+  with the agent capability `answer_only` refuses every permission the agent asks for in that turn on the machine
+  (`permission_auto_denied`), and for an older one Claw cancels the turn as soon as it asks for one.
+
+`seat_roster` (a router read) lists the seats with only what Claw computed or the user confirmed: `seat_id`, `alias`, the confirmed
+`role`, `role_state` (`new`, `suggested`, `confirmed`, `retired`), `tags`, `machine_online`, `state` (from the types of the session's
+events and the machine's presence), `dispatch_mode` and the latest item. Nothing in it was written by a machine or an agent, so
+reading it does not mark the turn as having read untrusted text (`devenv_list` still does). `devenv_list` shows each session's seat
+(alias, confirmed role), and `GET /v1/remote-agents/seats` lists the caller's seats with their machine and folder, for a card.
+
+The connector reports each folder's git remote and branch in its heartbeat (`workspaces`, agent capability `git_info`), read from
+the files git keeps (never by running git) and normalized on the machine and again by Claw: `host/owner/repo` with no user or
+credential, a remote that still looks like it carries one is not reported, at most 32 folders. An older connector's heartbeat has
+none, and is taken as before.
+
+Seats are shown only: nothing is sent to a seat because of its role. They are off unless `CLAW_DEVENV_SEATS=on` (every user of the
+assistant) or the user's Claw id is in `CLAW_DEVENV_SEATS_USERS` (comma-separated), and need `CLAW_REMOTE_AGENTS_ENABLED` and the
+assistant.
+
 ## Retention
 
 A closed session is deleted with all of its events `CLAW_REMOTE_AGENTS_RETENTION_DAYS`

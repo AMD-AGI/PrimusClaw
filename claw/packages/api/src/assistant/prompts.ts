@@ -983,6 +983,25 @@ const ANSWER_EVENT_RE = new RegExp(`^${WORK_EVENT_PREFIX.replace(/[.*+?^${}()|[\
 export const ROUTER_DEVENV_PROMPT_VERSION = "router-devenv-v15";
 
 /**
+ * router-seats-v1: seats (`seats.ts`), for the users who have them: seat_roster reads what each folder on their machines is for (only
+ * what the user confirmed and what Claw computed, so it never stops the turn from acting); seat_set keeps what the user says a seat is
+ * called or handles (a card they press) or asks for a fresh guess; Claw's own guesses reach the user only on cards. Shown only: nothing
+ * is sent to a seat because of its role.
+ */
+export const ROUTER_SEATS_PROMPT_VERSION = "router-seats-v1";
+
+/** The router's section on seats, beside the development environments section, for a user who has them. */
+export function renderRouterSeatsSection(): string {
+  return `Seats (工位)
+A seat is one folder an agent works in on one of the user's machines (machine + agent + folder); it outlives the sessions in it. Each may have an alias (a short name the user gave it) and a role (what it handles, which the user confirmed).
+- Which seat handles what, what a seat is called, "我的工位 / 哪个负责发布": seat_roster. Everything in it was confirmed by the user or computed by Claw, so you may still act after reading it. Name seats by alias and role; a seat with neither has only its tags.
+- When the user says what a seat is called or what it handles ("mi300 上那个 claude 以后专门管 Hyperloom 发布", "把 ~/hl-ci 那个改名叫 hl-ci", "this one handles the release", 改个名字): seat_set with the seat named the way they named it (seat = seat_id or alias from seat_roster; else machine, agent, cwd; "this one" in a chat attached to a session: session_id) and their words as role (one or two sentences, at most 120 characters) and/or alias (at most 16). It shows a card; say in one line that it is kept when they press it. If seat_set answers which_seat or no_seat, ask which one in one short say listing its choices, and call nothing else.
+- "重新看看它负责什么", refresh what a seat is for: seat_set with refresh: true. Claw then asks that seat's session once more (only while it is idle) and puts its guess to the user on a card.
+- Claw's guesses of what a seat handles reach the user only on cards (Right / Deny); never state a guess as fact, and never say what a seat handles unless seat_roster gives its role.
+- Seats are only shown for now: never send anything to a seat because of its role or alias; an instruction for a machine is still devenv_send, when the user names the machine, agent or folder.`;
+}
+
+/**
  * The router's section on development environments; `actions`: the channel actions tool is there (`CLAW_ASSISTANT_TOOLS`); `send`:
  * devenv_send is (the assistant can send an instruction to an agent on the user's machine).
  */

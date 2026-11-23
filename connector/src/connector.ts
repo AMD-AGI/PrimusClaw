@@ -32,6 +32,7 @@ import {
 import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, type RemoteAgentDescriptor } from "./protocol.js";
 import { redactDeep, storableDeep } from "./redact.js";
 import { DEFAULT_SESSION_TIMING, type SessionEnv, type SessionTiming } from "./session.js";
+import { WorkspaceFacts } from "./git-info.js";
 import { SessionStore } from "./session-store.js";
 import type { SseFrame } from "./sse.js";
 import { backoffMs, errMessage, isObject, sleep, type Logger, type MayRun, type Verdict } from "./util.js";
@@ -321,6 +322,8 @@ export class Connector {
   readonly registry: ChildRegistry;
   readonly manager: SessionManager;
   readonly store: SessionStore;
+  /** The folders' git facts the heartbeat reports (`git-info.ts`). */
+  private readonly workspaceFacts = new WorkspaceFacts();
   private readonly attach = new Map<string, AttachSupport>();
   /** The questions terminals ask through the approval hooks (approvals.ts). */
   readonly approvals: ApprovalBroker;
@@ -543,6 +546,9 @@ export class Connector {
         ask_mode: a.askMode, modes: a.safeModes, roots: a.roots.slice(0, 8), protocol: 1, unattended: a.unattended, unattended_allowed: a.allowUnsafeModes,
         // `withdraw`: a prompt that has not started can be taken back without stopping anything (Session.withdraw)
         withdraw: true,
+        // `answer_only`: a prompt can ask for a turn that only answers: every permission its agent asks for in it is refused here
+        // (Session.onPermission). `git_info`: the heartbeat reports each folder's git remote and branch (`workspaces`, git-info.ts).
+        answer_only: true, git_info: true,
         ...(support ? { watch_live: true, ...(support.typesIntoTerminals() ? { terminal_input: true } : {}) } : {}),
         ...(a.readOnlyModes.length ? { read_only_modes: a.readOnlyModes } : {}),
         ...(readOnly ? { edits: false, edits_hint: READ_ONLY_HINT } : {}),
@@ -639,9 +645,12 @@ export class Connector {
   }
 
   private async heartbeat(): Promise<void> {
+    const agents = await this.descriptors();
     const body = {
-      version: this.d.version, agents: await this.descriptors(), cmd_cursor: this.ledger.cursor > 0 ? this.ledger.cursor : null,
+      version: this.d.version, agents, cmd_cursor: this.ledger.cursor > 0 ? this.ledger.cursor : null,
       outbox: this.outboxReport(),
+      // The git repository of each folder the sessions work in (`git-info.ts`): what is known now, never waited for.
+      workspaces: this.workspaceFacts.report(this.workspaceCwds(agents)),
     };
     // How long the answer takes is watched (`tick`): one held back in the network says command frames may be held back too.
     const since = performance.now();
@@ -661,6 +670,21 @@ export class Connector {
       // Answered late, or not at all: the window after it starts now, whatever order its answer and held frames come in.
       if (late || failed || performance.now() - since > this.timing.transitMs) this.netTrouble(failed ? "heartbeat_failed" : "heartbeat_late");
     }
+  }
+
+  /** The folders whose repository the heartbeat reports: the open sessions' first, then the conversations' (newest first), then the roots. */
+  private workspaceCwds(agents: RemoteAgentDescriptor[]): string[] {
+    const out: string[] = [];
+    for (const id of this.store.ids()) {
+      const r = this.store.get(id);
+      if (r && r.status === "active" && typeof r.cwd === "string") out.push(r.cwd);
+    }
+    for (const a of agents) {
+      const list = Array.isArray(a.capabilities.resumable) ? a.capabilities.resumable : [];
+      for (const r of list) if (isObject(r) && typeof r.cwd === "string") out.push(r.cwd);
+    }
+    for (const a of agents) for (const r of Array.isArray(a.capabilities.roots) ? a.capabilities.roots : []) if (typeof r === "string") out.push(r);
+    return out;
   }
 
   /**
