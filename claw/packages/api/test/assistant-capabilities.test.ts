@@ -297,6 +297,9 @@ test("K7 what is listed is what works: the web tools as the Brain has them, revi
     const list = caps.capabilityList(inputs({ reviewMode: "fully_auto", features: { ...ALL_ON, [off]: false } }));
     assert.equal(on(list, "reviews"), false, `${off} off`);
     assert.equal(list.review_mode, null, `${off} off: no fully_auto merge claimed`);
+    const what = list.abilities.find((a) => a.id === "reviews")!.what;
+    assert.match(what, /^Reviews cannot be started from you on this deployment/, `${off} off`);
+    assert.doesNotMatch(what, /fully_auto|merge them when asked/, `${off} off: the entry says nothing of merging`);
   }
   assert.equal(caps.capabilityList(inputs({ reviewMode: "fully_auto" })).review_mode?.mode, "fully_auto");
 

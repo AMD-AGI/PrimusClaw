@@ -188,6 +188,8 @@ interface AbilitySpec {
 }
 
 const has = (i: CapabilityInputs, t: string): boolean => i.tools.includes(t);
+/** Reviews as `review_start` has them: the assistant's review tools, Claw's reviews and review items, all three. */
+const reviewsHere = (i: CapabilityInputs): boolean => i.features.review_tools && i.features.github_review && i.features.review_items;
 const webSearch = (i: CapabilityInputs): boolean => i.lookups.web?.search === true;
 const webFetch = (i: CapabilityInputs): boolean => i.lookups.web?.fetch === true;
 /** The web tools the turn has, by name. */
@@ -263,11 +265,13 @@ const ABILITIES: readonly AbilitySpec[] = [
     id: "reviews",
     tools: ["review_start"],
     // review_start refuses without both (`review-tools.ts`, requireReviews(true)).
-    needs: (i) => i.features.review_tools && i.features.github_review && i.features.review_items,
-    what: (i) => `Review pull requests and merge them when asked (started at once, no worker needed to ask); ${
+    needs: reviewsHere,
+    what: (i) => (!reviewsHere(i)
+      ? "Reviews cannot be started from you on this deployment: no review or merge of a pull request is started here."
+      : `Review pull requests and merge them when asked (started at once, no worker needed to ask); ${
       i.reviewMode === "fully_auto"
         ? "the user's review mode is fully_auto: a merge asked for happens once the review approves, without asking them"
-        : "the user's review mode is high_risk_confirm: a high-risk approval or merge waits for their confirmation"}.`,
+        : "the user's review mode is high_risk_confirm: a high-risk approval or merge waits for their confirmation"}.`),
   },
   {
     id: "github_comment",
