@@ -10,7 +10,7 @@
 import { readFileSync } from "node:fs";
 
 import type { Clock, Logger } from "@primusclaw/personal-agent";
-import { silentLogger } from "@primusclaw/personal-agent";
+import { silentLogger, turn } from "@primusclaw/personal-agent";
 import { StartupError } from "@primusclaw/personal-agent-runtime/worker";
 
 import { FederatedCredential, readWorkerKey } from "../azure/workload-identity.js";
@@ -25,10 +25,16 @@ import type { GateEntry } from "../gate/entry-env.js";
 import { GateToken, NoQueue } from "../gate/no-queue.js";
 import type { Outbox } from "../outbound/outbox.js";
 import { azureBusClient, type BusClient, type BusConnection } from "../servicebus/client.js";
+import { RECEIVE_DEADLINE_MS, SESSION_HOLD_MS } from "../servicebus/consumer.js";
 import { ServiceBusOutbox } from "../servicebus/outbox.js";
 
-/** The longest a session's lock is renewed for while one conversation's messages are handled. */
-export const LOCK_RENEWAL_MS = 5 * 60_000;
+/**
+ * The longest a session's lock is renewed for, from its accept: past the consumer's hold of a session (SESSION_HOLD_MS),
+ * the wait for one more message (RECEIVE_DEADLINE_MS), and a handler that runs as long as the chat follows a turn
+ * (TURN_DEADLINE_SECONDS), so the lock never lapses while a message is in hand. A closed session releases its lock at
+ * once, and a worker that dies loses it after the queue's lock duration: this bound only caps the renewal.
+ */
+export const LOCK_RENEWAL_MS = SESSION_HOLD_MS + RECEIVE_DEADLINE_MS + turn.TURN_DEADLINE_SECONDS * 1000;
 
 export interface AssemblyDeps {
   readonly clock: Clock;

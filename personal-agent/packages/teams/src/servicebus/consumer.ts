@@ -21,6 +21,10 @@
  * connection is closed only once no receiver still holds a session taken on it: another receiver may be handling a message
  * there, and closing the connection under it would drop its session lock, so the broker would hand the same message to a
  * receiver on the new connection while the first is still handling it (a duplicate reply).
+ *
+ * A session is held for at most SESSION_HOLD_MS of messages: then it is closed and taken again, so the lock renewal of
+ * the bus client (which must outlast that hold, plus the wait for one more message, plus the longest message handled)
+ * never runs out while a message is in hand; a lapsed lock would hand that message to another receiver (a duplicate).
  */
 import type { Clock, Logger } from "@primusclaw/personal-agent";
 import { errorName, silentLogger } from "@primusclaw/personal-agent";
@@ -43,6 +47,12 @@ export const ACCEPT_DEADLINE_MS = 120_000;
 export const RECEIVE_DEADLINE_MS = IDLE_MS + 40_000;
 /** A settlement (the SDK retries one itself) or a close that has not ended in this long is on a wedged connection. */
 export const SETTLE_DEADLINE_MS = 60_000;
+/**
+ * A receiver that has held one session this long takes no further message from it: it closes the session, and the next
+ * accept takes it (or another) again. The session's lock is renewed for a bounded time from the accept (the bus client's
+ * lock renewal), so a busy conversation never keeps one lock past that bound while its messages keep coming.
+ */
+export const SESSION_HOLD_MS = 4 * 60_000;
 
 /** What the handled messages are counted in: how long each waited in the queue and took to handle. */
 export interface InboundStats {
@@ -309,7 +319,9 @@ export class InboundConsumer {
   }
 
   private async drain(receiver: SessionReceiver): Promise<void> {
+    const taken = this.parts.clock.monotonicMs();
     for (;;) {
+      if (this.parts.clock.monotonicMs() - taken >= SESSION_HOLD_MS) return; // (closed, and taken again by the next accept)
       let messages: Received[];
       try {
         messages = await this.within(

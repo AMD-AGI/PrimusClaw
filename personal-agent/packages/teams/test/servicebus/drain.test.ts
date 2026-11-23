@@ -16,8 +16,11 @@ import {
   ACCEPT_DEADLINE_MS,
   InboundConsumer,
   RECEIVE_DEADLINE_MS,
+  SESSION_HOLD_MS,
   SETTLE_DEADLINE_MS,
 } from "../../src/servicebus/consumer.js";
+import { LOCK_RENEWAL_MS } from "../../src/assembly/outbound.js";
+import { turn } from "@primusclaw/personal-agent";
 import { received } from "./fakes.js";
 
 const T = { timeout: 5000 };
@@ -321,3 +324,43 @@ test(
     assert.equal(bus.retired, 1);
   },
 );
+
+test(
+  "a session held for SESSION_HOLD_MS is closed and taken again, so its lock renewal never runs out in hand",
+  T,
+  async () => {
+    const clock = new FakeClock();
+    const first = received(JSON.stringify({ type: "message" }), undefined, "m-1", 1);
+    const second = received(JSON.stringify({ type: "message" }), undefined, "m-2", 1);
+    const held = new ScriptedReceiver([() => Promise.resolve([first]), () => Promise.resolve([second])]);
+    const again = new ScriptedReceiver([() => Promise.resolve([second])]);
+    const bus = new ScriptedBus([() => Promise.resolve(held), () => Promise.resolve(again)]);
+    const handled: string[] = [];
+    const { consumer } = consumerOf(bus, clock, async () => {
+      handled.push(handled.length === 0 ? "m-1" : "m-2");
+      if (handled.length === 1) await clock.advance(SESSION_HOLD_MS); // (a busy conversation: the hold is used up)
+    });
+    const running = consumer.run();
+    await flushMicrotasks();
+    await flushMicrotasks();
+    consumer.stop();
+    await running;
+    assert.deepEqual(
+      held.done.map(([kind, m]) => [kind, m.messageId]),
+      [["complete", "m-1"]],
+    );
+    assert.equal(held.closed, 1); // (m-2 was not taken on the session held past the bound)
+    assert.equal(bus.accepts >= 2, true);
+    assert.deepEqual(
+      again.done.map(([kind, m]) => [kind, m.messageId]),
+      [["complete", "m-2"]],
+    );
+  },
+);
+
+test("the lock renewal outlasts a held session, one more wait and a handler as long as a turn is followed", () => {
+  // (30 minutes of turn, 4 of hold and one minute's wait: the literal bound, not the formula the code uses)
+  assert.equal(turn.TURN_DEADLINE_SECONDS, 30 * 60);
+  assert.equal(LOCK_RENEWAL_MS >= (30 + 4 + 1) * 60_000, true);
+  assert.equal(SESSION_HOLD_MS + RECEIVE_DEADLINE_MS + turn.TURN_DEADLINE_SECONDS * 1000 <= LOCK_RENEWAL_MS, true);
+});
