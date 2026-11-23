@@ -126,6 +126,8 @@ export interface SessionEnv {
   attach: ReadonlyMap<string, AttachSupport>;
   timing: SessionTiming;
   logDir: string;
+  /** Where the files a prompt carries are saved (`prompt-files.ts`); absent, a prompt's files are not taken. */
+  uploadDir?: string;
   version: string;
   log: Logger;
 }

@@ -55,6 +55,8 @@ export const outboxDir = (d: Dirs) => path.join(d.state, "outbox");
 /** Events Claw would not take, set aside unsent (session, number, type and why: never the content). One JSON line each. */
 export const quarantineFile = (d: Dirs) => path.join(d.state, "quarantine.jsonl");
 export const logDir = (d: Dirs) => path.join(d.state, "logs");
+/** The files prompts carried, saved where the agents can open them (prompt-files.ts). */
+export const uploadsDir = (d: Dirs) => path.join(d.state, "uploads");
 export const disconnectsFile = (d: Dirs) => path.join(d.state, "disconnects.jsonl");
 export const needsLoginFile = (d: Dirs) => path.join(d.state, "needs-login.json");
 export const supervisorPidFile = (d: Dirs) => path.join(d.state, "supervisor.pid");

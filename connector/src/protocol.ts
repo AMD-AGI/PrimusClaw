@@ -21,10 +21,12 @@ export {
   REMOTE_OUTBOX_REPORT_MAX_SESSIONS,
   isRemoteCommandType,
   parseRemoteId,
+  parsePromptFiles,
   REMOTE_COMMANDS,
 } from "../../claw/packages/protocol/src/remote-agents.js";
 export type {
   RemoteAgentDescriptor,
   RemoteCommandType,
   RemoteEventIn,
+  RemotePromptFile,
 } from "../../claw/packages/protocol/src/remote-agents.js";

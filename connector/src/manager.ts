@@ -8,7 +8,8 @@ import { Session, type SessionEnv } from "./session.js";
 import os from "node:os";
 import { withHint } from "./hints.js";
 import { resolveCwd } from "./roots.js";
-import { REMOTE_COMMAND_TYPES, isRemoteCommandType } from "./protocol.js";
+import { REMOTE_COMMAND_TYPES, isRemoteCommandType, parsePromptFiles } from "./protocol.js";
+import { dropSessionFiles, savePromptFiles, sweepPromptFiles, withSavedFiles, withUnsavedFiles } from "./prompt-files.js";
 import { sha256, errMessage, verdictOf, type MayRun } from "./util.js";
 
 export interface Command {
@@ -157,7 +158,7 @@ export class SessionManager {
     switch (type) {
       case "prompt":
         if (typeof cmd.text !== "string" || cmd.text === "") { s.rejectCommand("prompt", cmdId, "text_required", cmdSeqOf(cmd)); return false; }
-        s.enqueuePrompt(cmd.text, cmdId, handled, cmdSeqOf(cmd), mayRun);
+        s.enqueuePrompt(this.withFiles(cmd.text, cmd), cmdId, handled, cmdSeqOf(cmd), mayRun);
         return true;
       case "cancel":
         await s.cancel();
@@ -174,6 +175,7 @@ export class SessionManager {
         return false;
       case "close":
         await s.close("closed");
+        if (this.env.uploadDir) dropSessionFiles(this.env.uploadDir, sid);
         return false;
       case "decision":
         if (typeof cmd.action_id !== "string" || typeof cmd.option_id !== "string") s.rejectCommand("decision", cmdId, "action_and_option_required");
@@ -181,6 +183,34 @@ export class SessionManager {
         return false;
     }
     return false;
+  }
+
+  /**
+   * A prompt's text with the files it carries saved on this machine and named by their paths (prompt-files.ts). The words
+   * always go: files that cannot be taken or saved are said to be missing in the text the agent reads.
+   */
+  private withFiles(text: string, cmd: Command): string {
+    if (cmd.files === undefined) return text;
+    const parsed = parsePromptFiles(cmd.files);
+    const count = Array.isArray(cmd.files) ? cmd.files.length : 0;
+    if (!parsed.ok || !this.env.uploadDir) {
+      const why = parsed.ok ? "this connector does not take files" : parsed.error;
+      this.env.audit.record("prompt_files_refused", { session_id: cmd.session_id, cmd_id: cmd.cmd_id, count, reason: why });
+      return count ? withUnsavedFiles(text, count, why) : text;
+    }
+    if (parsed.value.length === 0) return text;
+    try {
+      sweepPromptFiles(this.env.uploadDir, Date.now());
+      const saved = savePromptFiles(this.env.uploadDir, cmd.session_id, cmd.cmd_id, parsed.value);
+      this.env.audit.record("prompt_files_saved", {
+        session_id: cmd.session_id, cmd_id: cmd.cmd_id, count: saved.length, bytes: saved.reduce((n, f) => n + f.size, 0),
+      });
+      return withSavedFiles(text, saved);
+    } catch (e) {
+      this.env.log.warn("the files of a prompt were not saved", { session: cmd.session_id, error: errMessage(e) });
+      this.env.audit.record("prompt_files_refused", { session_id: cmd.session_id, cmd_id: cmd.cmd_id, count, reason: "not_saved" });
+      return withUnsavedFiles(text, count, errMessage(e).slice(0, 200));
+    }
   }
 
   private async sessionNew(cmd: Command): Promise<void> {

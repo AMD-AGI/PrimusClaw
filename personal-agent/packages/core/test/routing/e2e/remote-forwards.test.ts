@@ -9,8 +9,8 @@ import { test } from "node:test";
 import type { InboundFile, InboundForward } from "@primusclaw/personal-agent";
 
 import type { FakeRemote } from "../../../../../test-support/remote-fake.js";
-import { Script } from "../../../../../test-support/remote-world.js";
-import { attachedThroughRouter, routed } from "./remote-routed.js";
+import { ALICE as CLAW_ALICE, Script } from "../../../../../test-support/remote-world.js";
+import { attachedThroughRouter, routed, TWO_AGENTS, type Routed } from "./remote-routed.js";
 
 async function oneTurn(srv: FakeRemote, sid: string): Promise<void> {
   await srv.say(sid, "Done.");
@@ -88,4 +88,97 @@ test("files alone, with no words, go to the session as their text", () =>
       ]);
     },
     { remote: { files: { "notes.md": { mediaType: "text/markdown", bytes: bytes("# hi\n") } } } },
+  ));
+
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+
+/** Alice's chat attached to a session of an agent whose connector takes files (`prompt_files`) when `files` is true. */
+async function attachedTo(w: Routed, files: boolean, script = new Script()): Promise<void> {
+  w.rw.server.addConnector(CLAW_ALICE, "dev-pod", TWO_AGENTS, files ? { caps: { codex: { prompt_files: true } } } : {});
+  w.rw.server.onCommand = script.hook;
+  await w.say("/agent new codex /home/me/repo");
+  assert.ok(w.attachedSession(), w.rw.said().join("\n"));
+  script.onPrompt = oneTurn;
+}
+
+const IMAGE: InboundFile = { name: "", type: "", handle: { kind: "pasted", index: 1 } };
+
+test("an image sent to a chat attached to a machine that takes files goes to it as a file, with the words", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, true);
+      const before = w.rw.said().length;
+      await w.say("what is on this screen?", {
+        files: [
+          { ...IMAGE, name: "image-1.png" },
+          { name: "build.log", type: "log", handle: {} },
+        ],
+      });
+      const [prompt, ...more] = w.rw.server.commandsOf("prompt").map((c) => c.body);
+      assert.ok(prompt !== undefined && more.length === 0);
+      assert.equal(
+        prompt["text"],
+        `what is on this screen?\n\nThe file sent with this message:\n\nFile build.log (${String(bytes(LOG).length)} bytes):\n\`\`\`\`\n${LOG}\n\`\`\`\``,
+      );
+      assert.deepEqual(prompt["files"], [
+        { name: "image-1.png", media_type: "image/png", data: Buffer.from(PNG).toString("base64") },
+      ]);
+      const told = w.rw.said().slice(before).join("\n");
+      assert.doesNotMatch(told, /not passed on|没有交给/u, told);
+    },
+    {
+      remote: {
+        files: {
+          "image-1.png": { mediaType: "image/png", bytes: PNG },
+          "build.log": { mediaType: "text/plain", bytes: bytes(LOG) },
+        },
+      },
+    },
+  ));
+
+test("files alone, to a machine that takes them, go with a line that says so", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, true);
+      await w.say("", { files: [{ ...IMAGE, name: "image-1.png" }] });
+      const [prompt] = w.rw.server.commandsOf("prompt").map((c) => c.body);
+      assert.ok(prompt !== undefined);
+      assert.equal(prompt["text"], "The person sent the files below with no words.");
+      assert.equal((prompt["files"] as unknown[]).length, 1);
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
+  ));
+
+test("a machine whose connector does not take files gets the words; the image is named back with what would send it", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, false);
+      const before = w.rw.said().length;
+      await w.say("look", { files: [{ ...IMAGE, name: "image-1.png" }] });
+      const [prompt] = w.rw.server.commandsOf("prompt").map((c) => c.body);
+      assert.deepEqual(prompt, { type: "prompt", text: "look" });
+      const told = w.rw.said().slice(before).join("\n");
+      assert.match(
+        told,
+        /`image-1.png` \(a session takes text, and this is not a text file\).*once it is upgraded/su,
+        told,
+      );
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
+  ));
+
+test("a Claw that drops a prompt's files unread: the words went, and the person is told the files did not", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, true);
+      w.rw.server.takesPromptFiles = false;
+      const before = w.rw.said().length;
+      await w.say("look", { files: [{ ...IMAGE, name: "image-1.png" }] });
+      assert.deepEqual(
+        w.rw.server.commandsOf("prompt").map((c) => c.body),
+        [{ type: "prompt", text: "look" }],
+      );
+      assert.match(w.rw.said().slice(before).join("\n"), /the files sent with them did not/u);
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
   ));

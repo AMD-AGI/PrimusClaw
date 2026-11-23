@@ -527,6 +527,31 @@ describe("remote agents", { skip }, () => {
       assert.deepEqual(prompt.json(), { text: "do it", v: 1, cmd_id: sent.body.data.cmd_id, type: "prompt", session_id: sid, issued_at: issuedAt(prompt.json()), sent_at: sentAt(prompt.json()) });
     });
 
+    test("a prompt's files reach the connector with it, are counted in the answer, and are kept in no event or audit row", async () => {
+      const { cid, stream } = await online1();
+      const sid = await session("u1", cid, "/work/repo");
+      await stream.nextEvent("command"); // (session.new)
+      const files = [{ name: "image-1.png", media_type: "image/png", data: Buffer.from("not really a png").toString("base64") }];
+      const sent = await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "see the image", files });
+      assert.equal(sent.status, 202, JSON.stringify(sent.body));
+      assert.equal(sent.body.data.files, 1);
+      const prompt = (await stream.nextEvent("command")).json();
+      assert.deepEqual([prompt.type, prompt.text, prompt.files], ["prompt", "see the image", files]);
+      // what the session's readers see of it is the words only; the audit trail names the file, never its bytes
+      const events = await q("SELECT data::text AS data FROM claw_remote_events WHERE session_id = $1", [sid]);
+      assert.ok(events.rows.every((r: any) => !r.data.includes(files[0]!.data)), JSON.stringify(events.rows));
+      const audit = await q("SELECT detail::text AS detail FROM claw_remote_audit WHERE session_id = $1 AND action = 'command.issued'", [sid]);
+      const said = audit.rows.map((r: any) => r.detail).join("\n");
+      assert.ok(said.includes("image-1.png") && !said.includes(files[0]!.data), said);
+      // a prompt without files says it carries none
+      const plain = await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "and now?" });
+      assert.equal(plain.body.data.files, 0);
+      const refused = await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, {
+        type: "prompt", text: "x", files: [{ name: "../x", media_type: "text/plain", data: "eA==" }],
+      });
+      assert.deepEqual([refused.status, refused.body.error], [400, "invalid_file_name"]);
+    });
+
     test("a session that names an existing session passes the reference to the connector as given, and a malformed one is refused", async () => {
       const { cid, stream } = await online1();
       const ref = "0f8fad5b-d9cb-469f-a165-70867728950e";

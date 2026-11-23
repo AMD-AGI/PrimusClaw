@@ -812,8 +812,11 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       return reply.send({ ok: true, data: { cmd_id: cmdId, duplicate: true } });
     }
     waker.wake(`c:${session.connector_id}`);
+    // `files`: how many files the prompt carries on to the machine, so a client can tell a Claw that took them from one
+    // that knows no `files` field (and dropped them unread).
+    const files = type === "prompt" ? { files: ((parsed.value as { files?: unknown[] }).files ?? []).length } : {};
     return reply.status(202).send({
-      ok: true, data: { cmd_id: cmdId, cmd_seq: Number(out.row.cmd_seq), connector_online: !!connector.online },
+      ok: true, data: { cmd_id: cmdId, cmd_seq: Number(out.row.cmd_seq), connector_online: !!connector.online, ...files },
     });
   }
 
