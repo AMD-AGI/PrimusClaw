@@ -89,8 +89,9 @@ test("past the budget a file is cut, never in half a character, and the files af
     [file("a.txt"), file("b.txt")],
     fetchFrom({ "a.txt": enc(big), "b.txt": enc("later") }),
     shown,
-    { budget: 40 },
+    { budget: 126 }, // (the section's lead, the file's heading and fences, and 39 bytes of it)
   );
+  assert.ok(enc(got.section).length <= 126, String(enc(got.section).length));
   assert.equal(
     got.section,
     `The file sent with this message:\n\nFile a.txt (90 bytes, cut to its first 39):\n\`\`\`\n${"日本語".repeat(4)}日\n\`\`\``,

@@ -232,21 +232,29 @@ export function forwardsOf(activity: Activity, files: readonly InboundFile[], lo
 }
 
 /**
- * `text` (the person's words) without a forwarded message's text that Teams also put there: a client that sends the
- * forward as plain text writes it into `text` as well, and it must not read as the person's own words. Untouched when
- * no forwarded text stands in it.
+ * `text` (the person's words) without the forwarded messages' text that Teams also put there: a client that sends the
+ * forward as plain text writes the forwarded messages into `text` as well, after the person's words and in their order,
+ * and they must not read as the person's own words. Only that shape is cut: every forwarded message's text, in order, at
+ * the end of `text` (after a space, or as all of it). A forwarded text the person happens to repeat in their own words
+ * ("who said LGTM on this?" with "LGTM" forwarded), or one written anywhere else, stays theirs; `text` is untouched then.
  */
 export function ownWords(text: string, forwards: readonly InboundForward[]): string {
+  // (a forwarded message with no text, an image alone, leaves nothing in `text`)
+  const said = forwards
+    .map((f) => squashSpaces(f.text.replace(/\[image(?:-[0-9]+| not passed on)\]/gu, "")))
+    .filter(Boolean);
+  if (said.length === 0) return text;
   let own = squashSpaces(text);
-  let cut = false;
-  for (const forward of forwards) {
-    const said = squashSpaces(forward.text.replace(/\[image(?:-[0-9]+| not passed on)\]/gu, ""));
-    if (said && own.includes(said)) {
-      own = own.replace(said, () => " ");
-      cut = true;
+  for (const one of said.reverse()) {
+    if (own === one) {
+      own = "";
+    } else if (own.endsWith(` ${one}`)) {
+      own = own.slice(0, own.length - one.length - 1);
+    } else {
+      return text;
     }
   }
-  return cut ? squashSpaces(own) : text;
+  return squashSpaces(own);
 }
 
 const READ_KINDS =

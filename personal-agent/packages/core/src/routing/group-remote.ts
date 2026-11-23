@@ -11,6 +11,7 @@ import { splitOnce } from "../text/py-text.js";
 import type { Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
 import type { PersonalText } from "./personal-text.js";
+import { fitQuote } from "./session-files.js";
 import { wireOf } from "./personal-router.js";
 
 export interface GroupWords {
@@ -83,8 +84,12 @@ export class GroupRemote {
     // Every @-message of the binder goes to the session, whatever the chat box mode: in a group the bot is only ever reached by
     // an @-mention, so the 1:1 "chat box stays the bot's" reading would leave nothing that reaches the session. "回到助理" (or the
     // card's button) is the way back. A reply quoting the session card names the session, not what to read: only the words go.
-    const quote = remote.quotesWindow(bound.id, message) ? "" : words.quote;
-    const prompt = this.ctx.deps.messageText.withQuote(words.sent, quote);
+    // (what the person forwarded with such a reply still goes)
+    const { messageText } = this.ctx.deps;
+    const quoted = remote.quotesWindow(bound.id, message)
+      ? messageText.quoteBlock({ ...message, quotes: [] }, true)
+      : words.quote;
+    const prompt = messageText.withQuote(words.sent, fitQuote(quoted, words.sent));
     const files = await this.text.attachments(message, chat, true);
     if (!prompt) return files.length > 0; // (files alone: told they do not go; nothing is sent to the agent)
     await remote.prompt({ message, chat: bound, credential: key, prompt, conversation: chat.conversation, provider });

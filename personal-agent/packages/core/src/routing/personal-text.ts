@@ -11,7 +11,7 @@ import type { FetchedFile, InboundFile, InboundMessage } from "../ports/surface.
 import type { Chat } from "./chat.js";
 import type { CommandTable } from "./command-table.js";
 import type { RouterContext } from "./context.js";
-import { inlineFiles, passesInline } from "./session-files.js";
+import { fitQuote, inlineFiles, passesInline, roomAfter } from "./session-files.js";
 import { logTurnStarted, type TurnStarter } from "./turn-start.js";
 
 /** What a session is sent for files that came with no words (a prompt is never empty). */
@@ -125,6 +125,7 @@ export class PersonalText {
     message: InboundMessage,
     chat: Chat,
     key: string,
+    room: number,
   ): Promise<{ section: string; files: readonly FetchedFile[] }> {
     if (message.files.length === 0) return { section: "", files: [] };
     const { surface, metrics, remote } = this.ctx.deps;
@@ -134,7 +135,7 @@ export class PersonalText {
       message.files,
       (file) => surface.fetchFile(file),
       (file, index) => file.name || `image-${String(index)}`,
-      { asFiles },
+      { asFiles, budget: room },
     );
     if (inline.notPassed.length > 0) {
       metrics.filesDropped("remote_agent", inline.notPassed.length);
@@ -155,14 +156,21 @@ export class PersonalText {
     const userId = chat.sender.id;
     const text = this.textOf(message);
     const toAgent = this.talksToAgent(message);
-    // (a reply quoting the session card says which session, not what to read: only the words go to it)
-    const quote =
-      toAgent && this.ctx.deps.remote.quotesWindow(userId, message) ? "" : messageText.quoteBlock(message, false);
+    // (a reply quoting the session card says which session, not what to read: the card is not sent on, what the
+    // person forwarded with it is)
+    const quoted =
+      toAgent && this.ctx.deps.remote.quotesWindow(userId, message)
+        ? messageText.quoteBlock({ ...message, quotes: [] }, false)
+        : messageText.quoteBlock(message, false);
     const sent = messageText.withLinks(text, message);
+    // (a session takes one prompt of a bounded size: what was forwarded or quoted is cut to fit before the words are)
+    const quote = toAgent ? fitQuote(quoted, sent) : quoted;
     const files = await this.attachments(message, chat, toAgent);
-    // (to a session, text files go as text after the words and other files to its machine; elsewhere they go as files)
-    const toMachine = toAgent ? await this.toSession(message, chat, key) : { section: "", files: [] };
-    let prompt = [messageText.withQuote(sent, quote), toMachine.section].filter(Boolean).join("\n\n");
+    const words = messageText.withQuote(sent, quote);
+    // (to a session, text files go as text after the words, in what room the words leave, and other files to its
+    // machine; elsewhere they go as files)
+    const toMachine = toAgent ? await this.toSession(message, chat, key, roomAfter(words)) : { section: "", files: [] };
+    let prompt = [words, toMachine.section].filter(Boolean).join("\n\n");
     if (!prompt && toMachine.files.length > 0) prompt = FILES_ONLY;
     // (a choice picked on the assistant's card is an answer, never a switch of sessions)
     const control = message.choice !== true && this.sessionControl(userId, prompt, toAgent, quote, message.files, text);
