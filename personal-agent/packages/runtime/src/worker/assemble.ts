@@ -106,6 +106,12 @@ export function withInboundStats(prometheus: PrometheusMetrics, stats: InboundSt
     filesDropped: (path, count) => {
       prometheus.filesDropped(path, count);
     },
+    probed: (feedbackMs, replyMs) => {
+      prometheus.probed(feedbackMs, replyMs);
+    },
+    inboundRearmed: () => {
+      prometheus.inboundRearmed();
+    },
   };
 }
 

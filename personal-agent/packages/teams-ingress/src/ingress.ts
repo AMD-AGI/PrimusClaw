@@ -45,6 +45,9 @@ import {
   connectorUrl,
   type ConnectorResponse,
   dictGet,
+  PROBE_CONVERSATION,
+  PROBE_OPERATION,
+  PROBE_TYPE,
   responseJson,
   withReference,
 } from "./outbound.js";
@@ -112,6 +115,8 @@ export interface Deps {
   /** Starts the start-up prefetch in the background; tests record the call instead. */
   spawn?: (name: string, task: () => Promise<void>) => void;
   uuid?: () => string;
+  /** The wall clock, epoch milliseconds (the delivery probe's `sent_at`). */
+  now?: () => number;
 }
 
 /** The loggers one request writes to. */
@@ -199,6 +204,7 @@ export class Ingress {
   private readonly serviceBus: ServiceBusFactory;
   private readonly clock: Clock;
   private readonly uuid: () => string;
+  private readonly now: () => number;
 
   private senderClient: QueueClient | null = null;
   /** The inbound-queue sender, opened once per instance and kept. */
@@ -219,6 +225,7 @@ export class Ingress {
     this.serviceBus = deps.serviceBus;
     this.clock = deps.clock ?? SYSTEM_CLOCK;
     this.uuid = deps.uuid ?? randomUUID;
+    this.now = deps.now ?? Date.now;
     this.health = new InboundHealth(this.clock);
     this.settings = readSettings(deps.env);
     this.auth = new Auth(authSettings(deps.env, coreLogger(deps.log, "connector_hosts")), deps.fetch, this.clock);
@@ -589,6 +596,10 @@ export class Ingress {
     if (!isObject(reference) || !isObject(activity)) {
       throw new PyValueError("outbound envelope needs reference and activity objects");
     }
+    if (operation === PROBE_OPERATION) {
+      await this.answerProbe(envelope, logs.app);
+      return;
+    }
     const url = this.connectorUrl(reference, operation, get(envelope, "activity_id"));
     const body = withReference(activity, reference);
     if (operation === "update") {
@@ -597,6 +608,48 @@ export class Ingress {
     const resp = await this.post(url, operation, body, logs);
     const ack = get(envelope, "ack");
     if (truthy(ack) && operation !== "update") await this.ackDelivery(str(ack), reference, resp, logs.app);
+  }
+
+  /**
+   * The worker's answer to a delivery probe: nothing goes to Teams (the bot's token is not even fetched), and the ack goes
+   * back on the probe's own session as a posted message's would, with the activity id "probe". An answer that names
+   * another conversation, or carries no ack, is refused (the trigger dead-letters it after its retries).
+   */
+  private async answerProbe(envelope: JsonObject, log: Logger): Promise<void> {
+    const conversation = or(get(or(get(envelope, "reference"), EMPTY) as JsonObject, "conversation"), EMPTY);
+    const ack = get(envelope, "ack");
+    if (!isObject(conversation) || get(conversation, "id") !== PROBE_CONVERSATION || typeof ack !== "string" || !ack) {
+      throw new PyValueError("a probe answer needs the probe conversation and an ack");
+    }
+    await this.sendAck(ack, PROBE_CONVERSATION, PROBE_OPERATION, log);
+  }
+
+  /**
+   * Put a delivery probe on the inbound queue (the probe timer), under its own session: the worker answers it through the
+   * outbound queue, and the relay's ack of that answer comes back, so the worker can time the whole path (`probe/probe.ts`).
+   * A probe that cannot be queued is an enqueue failure like any other (the health records, and its alert).
+   */
+  async probe(sink?: LogSink): Promise<void> {
+    const logs = sink === undefined ? this.logs : this.logsFor(sink);
+    const id = this.uuid();
+    const document = new Map<string, unknown>([
+      ["type", PROBE_TYPE],
+      ["id", id],
+      ["sent_at", new Date(this.now()).toISOString()],
+      ["conversation", new Map<string, unknown>([["id", PROBE_CONVERSATION]])],
+    ]);
+    await this.sendInbound(
+      {
+        body: Buffer.from(dumps(document), "utf8"),
+        contentType: "application/json",
+        correlationId: id,
+        sessionId: PROBE_CONVERSATION,
+        messageId: id,
+      },
+      logs.app,
+      "probe",
+    );
+    logs.app.info(`delivery probe ${id} queued`);
   }
 
   /** The Connector call itself, and what its answer means: 401, 429 and 5xx throw (the trigger retries), as do refusals. */
@@ -653,23 +706,28 @@ export class Ingress {
       return;
     }
     const conversationId = or(dictGet(or(get(reference, "conversation"), EMPTY), "id"), ack);
+    try {
+      await this.sendAck(ack, str(conversationId), activityIdNode ?? activityId, log);
+    } catch (error) {
+      log.error(`failed to ack delivery ${ack}`, error);
+    }
+  }
+
+  /** A `primusclaw.delivered` for `ack` on the conversation's session of the inbound queue. */
+  private async sendAck(ack: string, conversationId: string, activityId: unknown, log: Logger): Promise<void> {
     const document = new Map<string, unknown>([
       ["type", ACK_TYPE],
       ["ack", ack],
-      ["activity_id", activityIdNode ?? activityId],
+      ["activity_id", activityId],
     ]);
     const message: QueueMessage = {
       body: Buffer.from(dumps(document), "utf8"),
       contentType: "application/json",
       correlationId: ack,
-      sessionId: boundedId(str(conversationId)),
+      sessionId: boundedId(conversationId),
       messageId: this.uuid(),
     };
-    try {
-      await this.sendInbound(message, log, "ack");
-    } catch (error) {
-      log.error(`failed to ack delivery ${ack}`, error);
-    }
+    await this.sendInbound(message, log, "ack");
   }
 
   connectorUrl(reference: JsonObject, operation: string, activityId: unknown): string {

@@ -86,6 +86,33 @@ export const HELP: Readonly<Record<string, readonly [string, string]>> = {
   ],
 };
 
+/**
+ * The series added after the names changed: written under their `personal_agent_` names only (no earlier release wrote
+ * them), after both halves above, so that the text an earlier release wrote stays as it was.
+ */
+export const HELP_CURRENT_ONLY: Readonly<Record<string, readonly [string, string]>> = {
+  personal_agent_probe_total: [
+    "counter",
+    "Delivery probes the worker answered, by outcome: answered (the relay's ack came back) or unanswered.",
+  ],
+  personal_agent_probe_feedback_ms: [
+    "gauge",
+    "Milliseconds from the last probe's sending (by the ingress) to the worker's answer queued for the relay.",
+  ],
+  personal_agent_probe_reply_ms: [
+    "gauge",
+    "Milliseconds from the last answered probe's sending to the relay's ack of the answer reaching the worker.",
+  ],
+  personal_agent_probe_last_answered_seconds: [
+    "gauge",
+    "Unix time of the last answered probe (0: none since the worker started).",
+  ],
+  personal_agent_inbound_rearmed_total: [
+    "counter",
+    "Inbound queue receivers whose call on the broker hung and that were taken again on a new connection.",
+  ],
+};
+
 /** Python's ordering of `(event, ((name, value), ...))` tuples. */
 function compareTuples(a: readonly string[], b: readonly string[]): number {
   for (let i = 0; i < Math.min(a.length, b.length); i++) {
@@ -114,6 +141,8 @@ export class PrometheusMetrics implements MetricsPort {
   /** (when, lag): decreasing lags, the sliding-window maximum. */
   private readonly lags: Array<readonly [number, number]> = [];
   /** Event type -> (receipt to sent, occurred to sent), each written from the start. */
+  private probes = { answered: 0, unanswered: 0, feedbackMs: 0, replyMs: 0, answeredAt: 0 };
+  private rearmed = 0;
   private readonly eventTimes = new Map(
     DELIVERED_EVENT_TYPES.map((t) => [t as string, [new Histogram(EVENT_BUCKETS), new Histogram(EVENT_BUCKETS)]]),
   );
@@ -174,6 +203,25 @@ export class PrometheusMetrics implements MetricsPort {
     this.dropped.set(path, current + Math.trunc(count));
   }
 
+  probed(feedbackMs: number, replyMs: number | null): void {
+    const feedback = Math.max(Math.trunc(feedbackMs), 0);
+    if (replyMs === null) {
+      this.probes = { ...this.probes, unanswered: this.probes.unanswered + 1, feedbackMs: feedback };
+      return;
+    }
+    this.probes = {
+      answered: this.probes.answered + 1,
+      unanswered: this.probes.unanswered,
+      feedbackMs: feedback,
+      replyMs: Math.max(Math.trunc(replyMs), 0),
+      answeredAt: Math.trunc(this.clock.epochMs() / 1000),
+    };
+  }
+
+  inboundRearmed(): void {
+    this.rearmed += 1;
+  }
+
   /** The longest wait of the messages handled in the window, in milliseconds (0: none). */
   lagMaxMs(): number {
     this.expire(this.clock.monotonicMs());
@@ -190,7 +238,31 @@ export class PrometheusMetrics implements MetricsPort {
    */
   render(): string {
     const lagMaxMs = this.lagMaxMs();
-    return this.renderAs(METRIC_PREFIX, lagMaxMs) + this.renderAs(LEGACY_METRIC_PREFIX, lagMaxMs);
+    return (
+      this.renderAs(METRIC_PREFIX, lagMaxMs) + this.renderAs(LEGACY_METRIC_PREFIX, lagMaxMs) + this.renderCurrentOnly()
+    );
+  }
+
+  private renderCurrentOnly(): string {
+    const lines: string[] = [];
+    const head = (name: string): void => {
+      const [kind, text] = own(HELP_CURRENT_ONLY, name) ?? ["untyped", ""];
+      lines.push(`# HELP ${name} ${text}`, `# TYPE ${name} ${kind}`);
+    };
+    head("personal_agent_probe_total");
+    lines.push(`personal_agent_probe_total{outcome="answered"} ${String(this.probes.answered)}`);
+    lines.push(`personal_agent_probe_total{outcome="unanswered"} ${String(this.probes.unanswered)}`);
+    const gauges: ReadonlyArray<readonly [string, number]> = [
+      ["personal_agent_probe_feedback_ms", this.probes.feedbackMs],
+      ["personal_agent_probe_reply_ms", this.probes.replyMs],
+      ["personal_agent_probe_last_answered_seconds", this.probes.answeredAt],
+      ["personal_agent_inbound_rearmed_total", this.rearmed],
+    ];
+    for (const [name, value] of gauges) {
+      head(name);
+      lines.push(`${name} ${String(value)}`);
+    }
+    return lines.join("\n") + "\n";
   }
 
   private renderAs(prefix: string, lagMaxMs: number): string {

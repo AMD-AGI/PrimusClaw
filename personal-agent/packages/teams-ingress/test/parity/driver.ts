@@ -121,6 +121,9 @@ function registrations(ingress: Ingress, result: Result): void {
     serviceBusQueue: (name, options) => {
       registered.set(name, options);
     },
+    timer: (name, options) => {
+      registered.set(name, options);
+    },
   };
   register(recorder, ingress);
   result.functions = [...registered.keys()].sort();

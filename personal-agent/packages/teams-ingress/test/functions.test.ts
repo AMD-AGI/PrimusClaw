@@ -71,6 +71,7 @@ test("records outside an invocation go to the console, at their level", (t) => {
 interface Handlers {
   messages?: (request: HttpRequest, context: InvocationContext) => Promise<HttpResponseInit>;
   outbound?: (message: unknown, context: InvocationContext) => Promise<void>;
+  probe?: { schedule: string; handler: (timer: unknown, context: InvocationContext) => Promise<void> };
 }
 
 function registered(ingress: Parameters<typeof register>[1]): Handlers {
@@ -81,6 +82,9 @@ function registered(ingress: Parameters<typeof register>[1]): Handlers {
     },
     serviceBusQueue: (_name, options) => {
       handlers.outbound = options.handler;
+    },
+    timer: (_name, options) => {
+      handlers.probe = options;
     },
   };
   register(recorder, ingress);
@@ -147,10 +151,13 @@ test("start registers the messaging endpoint, and the outbound trigger when its 
   const recorder: Registrar = {
     http: (name) => names.push(name),
     serviceBusQueue: (name) => names.push(name),
+    timer: (name) => names.push(name),
   };
   start(recorder, { PRIMUSCLAW_BOT_APP_ID: "claw-app" });
   start(recorder, { PRIMUSCLAW_BOT_APP_ID: "claw-app", PRIMUSCLAW_OUTBOUND_SERVICEBUS__fullyQualifiedNamespace: "x" });
-  assert.deepEqual(names, ["messages", "messages", "outbound"]);
+  start(recorder, { PRIMUSCLAW_BOT_APP_ID: "claw-app", PRIMUSCLAW_PROBE_SCHEDULE: " " });
+  start(recorder, { PRIMUSCLAW_BOT_APP_ID: "claw-app", PRIMUSCLAW_PROBE_SCHEDULE: "0 */5 * * * *" });
+  assert.deepEqual(names, ["messages", "messages", "outbound", "messages", "messages", "probe"]);
 });
 
 test("the deployable entry registers the functions when it is loaded", () => {

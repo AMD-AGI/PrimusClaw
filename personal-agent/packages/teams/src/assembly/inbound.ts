@@ -3,7 +3,8 @@
 
 /**
  * One inbound queue message (or a body the gate's test entry posted), as the Python worker's `Agent.handle` took it: a
- * `primusclaw.delivered` ack from the relay settles the post that waits for it; a message or an invoke becomes core's
+ * `primusclaw.delivered` ack from the relay settles the post that waits for it; a `primusclaw.probe` is the delivery probe's
+ * (`probe/probe.ts`); a message or an invoke becomes core's
  * event and goes to the router; anything else is not for the worker. An activity that cannot be read is logged by its kind
  * of failure and dropped (a redelivery cannot make it readable).
  */
@@ -13,6 +14,7 @@ import { silentLogger } from "@primusclaw/personal-agent";
 import { applyGroupChange, toInboundEvent, type GroupContextChanges } from "../activity/inbound/index.js";
 import type { JsonObject } from "../cards/json.js";
 import type { AckRegistry } from "../messenger/acks.js";
+import { DeliveryProbe } from "../probe/probe.js";
 
 export const DELIVERED = "primusclaw.delivered";
 
@@ -23,6 +25,8 @@ export interface InboundParts {
   readonly logger?: Logger;
   /** The recent messages kept of group chats: a removal, delete or edit in a group changes them (none: nothing kept). */
   readonly groupContext?: GroupContextChanges;
+  /** Answers the delivery probe (`primusclaw.probe`); none: a probe is dropped unanswered. */
+  readonly probe?: DeliveryProbe;
 }
 
 /** Python's `str(body.get(key) or "")` of an ack's field. */
@@ -38,6 +42,10 @@ export function inboundHandler(parts: InboundParts): (body: JsonObject) => Promi
     if (body["type"] === DELIVERED) {
       const activityId = text(body["activity_id"]);
       parts.acks.resolve(text(body["ack"]), activityId || undefined);
+      return;
+    }
+    if (DeliveryProbe.is(body)) {
+      await parts.probe?.answer(body);
       return;
     }
     if (body["type"] !== "message" && body["type"] !== "invoke") {

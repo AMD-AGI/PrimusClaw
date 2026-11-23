@@ -119,6 +119,8 @@ export interface Outbound {
   readonly tokens: TokenSource | undefined;
   /** Where the bot's token may go. */
   readonly policy: ServiceUrlPolicy;
+  /** The outbound queue itself (the delivery probe's answer always goes through the relay); none for the gate. */
+  readonly queue?: Outbox;
   close(): Promise<void>;
 }
 
@@ -144,7 +146,7 @@ export function gateOutbound(gate: GateEntry, deps: AssemblyDeps): Outbound {
 export function productionOutbound(settings: TeamsSettings, outbound: BusClient, deps: AssemblyDeps): Outbound {
   const queue = new ServiceBusOutbox(outbound, settings.bus.outboundQueue, deps.clock, deps.logger);
   if (settings.outboundMode !== "direct") {
-    return { outbox: queue, tokens: undefined, policy: DEFAULT_CONNECTOR_HOSTS, close: () => queue.close() };
+    return { outbox: queue, queue, tokens: undefined, policy: DEFAULT_CONNECTOR_HOSTS, close: () => queue.close() };
   }
   (deps.logger ?? silentLogger).info("outbound mode: direct to the Bot Connector (the queue is the fallback)");
   const tokens = botTokenSource(settings, deps);
@@ -157,6 +159,7 @@ export function productionOutbound(settings: TeamsSettings, outbound: BusClient,
   });
   return {
     outbox,
+    queue,
     tokens,
     policy: DEFAULT_CONNECTOR_HOSTS,
     close: async () => {
