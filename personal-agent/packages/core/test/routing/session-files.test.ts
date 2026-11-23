@@ -16,10 +16,14 @@ import {
 } from "@primusclaw/personal-agent";
 
 import {
+  fitQuote,
   inlineFiles,
   passesInline,
+  QUOTE_CUT,
+  QUOTE_DROPPED,
   SESSION_FILE_BYTES,
   SESSION_FILES,
+  SESSION_PROMPT_BYTES,
   typeOf,
 } from "../../src/routing/session-files.js";
 
@@ -176,4 +180,14 @@ test("a file to a machine goes with the media type the wire takes, and an empty 
     ["image/png", "application/pdf", "application/octet-stream"],
   );
   assert.deepEqual(got.notPassed, [["empty.png", "it is empty"]]);
+});
+
+test("forwarded text is cut to fit beside the person's words, and when none fits the notice alone stands for it", () => {
+  assert.equal(fitQuote("> hello", "hi"), "> hello");
+  const long = `> ${"x".repeat(SESSION_PROMPT_BYTES)}`;
+  const cut = fitQuote(long, "hi");
+  assert.ok(cut.endsWith(QUOTE_CUT) && enc(cut).length + 4 <= SESSION_PROMPT_BYTES, String(enc(cut).length));
+  // (the person's words nearly fill the prompt: what was forwarded is said to be cut, never dropped in silence)
+  const full = "y".repeat(SESSION_PROMPT_BYTES - 10);
+  assert.equal(fitQuote(long, full), QUOTE_DROPPED);
 });
