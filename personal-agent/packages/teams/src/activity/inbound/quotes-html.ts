@@ -63,7 +63,8 @@ export function imageMarker(index: number): string {
 
 export const IMAGE_MARKER = /\uE010img([0-9]+)\uE011/gu;
 
-const EMOJI_ITEMTYPE = /schema\.skype\.com\/Emoji/iu;
+/** The `itemtype` of an emoji's `<img>`, the whole value. */
+const EMOJI_ITEMTYPE = /^https?:\/\/schema\.skype\.com\/Emoji$/iu;
 
 /** What the inside of a Reply blockquote says: who, when, and the quoted text. */
 class ReplyReader {
@@ -127,7 +128,7 @@ class ReplyReader {
   private image(attrs: Parameters<typeof attrValue>[0]): void {
     if (this.images === undefined) return;
     const alt = squashSpaces(pyStr(attrValue(attrs, "alt")).replace(MARKS, ""));
-    if (EMOJI_ITEMTYPE.test(pyStr(attrValue(attrs, "itemtype")))) {
+    if (EMOJI_ITEMTYPE.test(pyStr(attrValue(attrs, "itemtype")).trim())) {
       this.say(alt);
       return;
     }
