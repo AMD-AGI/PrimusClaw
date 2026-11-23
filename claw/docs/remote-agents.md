@@ -683,8 +683,11 @@ of two sources:
   as its latest `session_started`, `session_resumed` or `mode_update` names it, asks (`unattended: false`) and is the agent's ask
   mode or a read-only one. The connector runs the turn in the read-only mode (switching to it for that turn and back), refuses every
   permission, plan and question the agent asks for in it (`permission_auto_denied`), stops it if the agent leaves that mode, and
-  refuses the prompt (`answer_only_unsupported`) where it cannot do that. Claw never cancels anything in that session: a permission
-  request there is a turn of the user's.
+  refuses the prompt (`answer_only_unsupported`) where it cannot do that. The user comes first: the prompt is refused
+  (`answer_only_busy`) while a turn runs or prompts wait in that session; a prompt of the user's stops that turn and runs next; a
+  `set_mode` sent during it stops it and is set once it ended, never while it runs. The read-only mode is never made the session's
+  own: an agent that dies in that turn comes back in the session's mode. Claw never cancels anything in that session: a permission
+  request there is a turn of the user's. A question refused or stopped is not put again (only a refresh the user asks for does).
 
 `seat_roster` (a router read) lists the seats with only what Claw computed or the user confirmed: `seat_id`, `alias`, the confirmed
 `role`, `role_state` (`new`, `suggested`, `confirmed`, `retired`), `machine_online`, `state` (from the types of the session's

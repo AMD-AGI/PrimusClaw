@@ -125,8 +125,9 @@ release version, and its `appVersion` stays `latest`.
 - Connector: the heartbeat reports each session folder's git remote and branch (`workspaces`, capability `git_info`), read from git's
   files and normalized on the machine (`host/owner/repo`, no user or credential); a prompt with `answer_only: true` (capability
   `answer_only`) runs in the agent's read-only mode (switched to for that turn and back) and refuses, on the machine, every
-  permission, plan and question its agent asks for in it; it is refused in a session that does not ask and for an agent with no
-  read-only mode.
+  permission, plan and question its agent asks for in it; it is refused in a session that does not ask, for an agent with no
+  read-only mode, and while a turn runs or prompts wait there (`answer_only_busy`). The user's own prompt, or a `set_mode` sent
+  during that turn, stops it; the mode is set only after it ended, and the read-only mode is never saved as the session's own.
 
 - Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, how many times the
   application was started again, and `app.last_exit`, `{ returncode, at, cause }` of the last time the application

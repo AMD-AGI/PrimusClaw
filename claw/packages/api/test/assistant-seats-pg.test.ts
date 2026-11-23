@@ -17,7 +17,8 @@
  *      on that folder), at most once, as Claw's answer-only prompt, filed as nobody's item; once more after a refresh
  *   S4b only where the machine holds that turn to answering: never through an older connector (no `answer_only`), an agent with no
  *      read-only mode, an unattended agent, or a session whose mode does not ask or is not known; and nothing is ever cancelled there
- *      (a permission request in that session is a turn of the user's)
+ *      (a permission request in that session is a turn of the user's); a guess that failed is made again a day later, with no second
+ *      question
  *   S5 the guess: one call with the seat's inputs as data, its answer kept only when it fits the schema; a title that says "run rm -rf"
  *      becomes no instruction and no suggestion; a valid one waits as a suggestion the roster does not show
  *   S6 the guess card: after a router turn answering the user, one at a time; Right confirms it, Deny retires the seat; a guess replaced
@@ -417,6 +418,21 @@ describe("seats", { skip }, () => {
     assert.equal((await seatRows()).find((r) => r.cwd === "/home/u/bypass")!.probe_state, "refused");
     for (let i = 0; i < 3; i += 1) await sweep();
     assert.deepEqual(await w.q("SELECT type FROM claw_remote_commands"), [], "the question is put once per seat, whatever became of the first");
+    // The guess failed (no answer from the model): a day later it is due again, and the session still idle and quiet. Guessed again,
+    // never asked again: only the count of questions put stands between that retry and a second question.
+    let seat = (await seatRows()).find((r) => r.cwd === "/home/u/bypass")!;
+    assert.deepEqual([seat.infer_state, seat.probes_sent, seat.probes_allowed], ["failed", 1, 1]);
+    await w.q("UPDATE claw_devenv_seats SET probe_state = NULL, inferred_at = NOW() - INTERVAL '2 days' WHERE seat_id = $1", [seat.seat_id]);
+    // (the user's permission request answered, so the session is idle again: the question would be put but for that count)
+    await events("alice", cid, bypass, [["permission_resolved", { actionId: "p1", optionId: "allow", outcome: "selected" }],
+      ["mode_update", { currentMode: "default", unattended: false }]]);
+    await age(bypass, 60);
+    const guesses = guessInputs.length;
+    await sweep();
+    assert.deepEqual(await w.q("SELECT type FROM claw_remote_commands"), [], "the retry of a failed guess puts no second question");
+    assert.equal(guessInputs.length, guesses + 1, "the retry ran");
+    seat = (await seatRows()).find((r) => r.cwd === "/home/u/bypass")!;
+    assert.deepEqual([seat.probes_sent, seat.probes_allowed], [1, 1]);
   });
 
   test("S5 the guess: the inputs are data; an injected title becomes neither an instruction nor a suggestion; the schema bounds the answer", async () => {

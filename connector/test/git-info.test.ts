@@ -15,6 +15,9 @@
  *   A1b a plan the agent proposes and a question it asks in that turn (Cursor's extension requests) are refused, put to nobody
  *   A2 the same prompt without answer_only still asks, so the refusal is the flag's doing
  *   A3 refused, never reaching the agent, in a session that does not ask (unattended) and for an agent with no read-only mode
+ *   A4 the user is there: a set_mode sent in that turn stops it and is set only after it (never a turn that only answers going on in a
+ *      mode that does not ask), the user's own prompt stops it, it is refused while a turn of the user's runs, and an agent that dies
+ *      in it comes back in the session's own mode, not the read-only one; a resume in it keeps it in the read-only mode
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -224,6 +227,100 @@ describe("G3 and A1-A3 end to end", () => {
       assert.equal(fs.existsSync(path.join(h.work, "probe.txt")), false, why);
       assert.equal(h.claw.eventsOf(sid, "permissionRequest").length, 0, why);
     }
+  });
+
+  test("A4a a set_mode sent in that turn stops it and is set after it: the turn never goes on in the mode the user chose", async () => {
+    const h = await make({ preset: "claude", topToml: "allow_unsafe_modes = true\n" });
+    const sid = await h.newSession();
+    const gate = path.join(h.work, "gate-open");
+    h.prompt(sid, `gate ${gate} write probe.txt something`, { answer_only: true });
+    await h.claw.until("the turn reached the agent", () => h.adapterLog().find((l) => typeof l.prompt === "string" && l.prompt.startsWith("gate ")));
+    // The user picks a mode that does not ask, while that turn runs.
+    h.claw.issue("set_mode", sid, { mode_id: "bypassPermissions" });
+    await h.claw.until("the set_mode handled", () => h.turnEnds(sid)[0]
+      ?? h.adapterLog().find((l) => l.method === "session/set_mode" && l.params.modeId === "bypassPermissions"));
+    fs.writeFileSync(gate, "");
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.stopReason, "cancelled", "the turn that only answers gave way to the user");
+    assert.equal(h.adapterLog().filter((l) => l.gateOpened).length, 0, "it never went on, in any mode");
+    assert.equal(fs.existsSync(path.join(h.work, "probe.txt")), false, "nothing was written without asking");
+    assert.ok(h.audit().some((a) => a.kind === "answer_only_stopped" && a.why === "set_mode"));
+    // The user's mode is set after that turn, and is the one the session stays in: never overwritten by the mode it was switched from.
+    await h.claw.until("the user's mode set", () => h.claw.eventsOf(sid, "mode_update").at(-1)?.data.currentMode === "bypassPermissions");
+    const modes = h.adapterLog().filter((l) => l.method === "session/set_mode").map((l) => l.params.modeId);
+    assert.deepEqual(modes.slice(modes.indexOf("plan")), ["plan", "bypassPermissions"]);
+    assert.equal(h.claw.eventsOf(sid, "command_rejected").filter((e) => e.data.type === "set_mode").length, 0);
+  });
+
+  test("A4b the user's own prompt stops that turn; theirs runs next, in the session's own mode, and asks", async () => {
+    const h = await make({ preset: "claude" });
+    const sid = await h.newSession();
+    h.prompt(sid, `gate ${path.join(h.work, "never")} say hi`, { answer_only: true });
+    await h.claw.until("the turn reached the agent", () => h.adapterLog().find((l) => typeof l.prompt === "string" && l.prompt.startsWith("gate ")));
+    h.prompt(sid, "write mine.txt");
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.stopReason, "cancelled");
+    assert.ok(h.audit().some((a) => a.kind === "answer_only_stopped" && a.why === "user_prompt"));
+    const perm = await h.permission(sid);
+    assert.ok(perm.data.actionId);
+    assert.equal(h.adapterLog().find((l) => l.prompt === "write mine.txt")!.mode, "default");
+  });
+
+  test("A4b2 the user's prompt sent while that turn is still being readied: it never runs, theirs does", async () => {
+    const h = await make({ preset: "claude", env: { FAKE_PLAN_DELAY_MS: "600" } });
+    const sid = await h.newSession();
+    const seq = h.prompt(sid, "say probe", { answer_only: true });
+    await h.claw.until("switching to the read-only mode", () => h.adapterLog().find((l) => l.method === "session/set_mode" && l.params.modeId === "plan"));
+    h.prompt(sid, "write mine.txt");
+    const refused = await h.turnEnd(sid);
+    assert.equal(refused.data.error, "answer_only_busy");
+    assert.equal(refused.data.cmd_seq, seq);
+    const perm = await h.permission(sid);
+    assert.ok(perm.data.actionId);
+    assert.equal(h.adapterLog().filter((l) => l.prompt === "say probe").length, 0, "the agent never saw it");
+    assert.equal(h.adapterLog().find((l) => l.prompt === "write mine.txt")!.mode, "default");
+  });
+
+  test("A4e a resume in that turn re-asserts its read-only mode, never the session's own", async () => {
+    const h = await make({ preset: "claude" });
+    const sid = await h.newSession();
+    const gate = path.join(h.work, "gate-open");
+    h.prompt(sid, `gate ${gate} write probe.txt something`, { answer_only: true });
+    await h.claw.until("the turn reached the agent", () => h.adapterLog().find((l) => typeof l.prompt === "string" && l.prompt.startsWith("gate ")));
+    h.claw.issue("resume", sid, {});
+    await h.claw.until("resumed", () => h.claw.eventsOf(sid, "session_resumed")[0]);
+    fs.writeFileSync(gate, "");
+    await h.turnEnd(sid);
+    assert.equal(h.adapterLog().find((l) => l.gateOpened)!.mode, "plan", "the rest of the turn ran in the read-only mode");
+    assert.equal(fs.existsSync(path.join(h.work, "probe.txt")), false);
+    await h.claw.until("the mode put back", () => h.claw.eventsOf(sid, "mode_update").at(-1)?.data.currentMode === "default");
+  });
+
+  test("A4c refused while a turn of the user's runs: it never waits behind it, nor reaches the agent", async () => {
+    const h = await make({ preset: "claude" });
+    const sid = await h.newSession();
+    const gate = path.join(h.work, "gate-open");
+    h.prompt(sid, `gate ${gate} say mine`);
+    await h.claw.until("the user's turn runs", () => h.adapterLog().find((l) => typeof l.prompt === "string" && l.prompt.startsWith("gate ")));
+    const seq = h.prompt(sid, "say probe", { answer_only: true });
+    const refused = await h.turnEnd(sid);
+    assert.equal(refused.data.error, "answer_only_busy");
+    assert.equal(refused.data.cmd_seq, seq);
+    fs.writeFileSync(gate, "");
+    const mine = await h.turnEnd(sid, 2);
+    assert.equal(mine.data.stopReason, "end_turn");
+    assert.equal(h.adapterLog().filter((l) => l.prompt === "say probe").length, 0, "the agent never saw it");
+  });
+
+  test("A4d an agent that dies in that turn comes back in the session's own mode, not the read-only one", async () => {
+    const h = await make({ preset: "claude" });
+    const sid = await h.newSession();
+    h.prompt(sid, "crash", { answer_only: true });
+    await h.turnEnd(sid);
+    h.prompt(sid, "write after.txt");
+    const perm = await h.permission(sid);
+    assert.ok(perm.data.actionId);
+    assert.equal(h.adapterLog().find((l) => l.prompt === "write after.txt")!.mode, "default", "the user's turn runs in the session's own mode");
   });
 
   test("A2 the same prompt without answer_only asks the person", async () => {

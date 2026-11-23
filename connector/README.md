@@ -355,8 +355,10 @@ All of these run on your machine and fail closed.
   switched to for that turn only and back after it. In that turn every permission the agent asks for is refused here, on your
   machine, even one an `auto_allow` rule would let through, and so is a plan it proposes or a question it asks; nobody is asked,
   and the refusal is audited (`answer_only_denied`). It is refused, and never reaches the agent, in a session that does not ask
-  (`approval = "never"`, whose agent would run anything its own rules allow), for an agent with no such mode (Codex), and in a
-  conversation open in a terminal.
+  (`approval = "never"`, whose agent would run anything its own rules allow), for an agent with no such mode (Codex), in a
+  conversation open in a terminal, and while a turn of yours runs or waits in that session (`answer_only_busy`). You come first:
+  a prompt of yours stops that turn and runs next, and a mode you pick during it stops it and is set once it ended, never while it
+  runs. The read-only mode is never saved as the session's: if the agent dies in that turn, the session comes back in its own mode.
 
 ## Taking over an existing conversation
 

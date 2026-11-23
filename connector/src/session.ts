@@ -137,10 +137,12 @@ export class SessionRefusal extends Error {
   constructor(readonly reason: string, message?: string) { super(message ?? reason); }
 }
 
-/** Why Claude Code leaves `bypassPermissions` out of its modes, for the log line of a refused session (claude-mode.ts). */
 /** Why a prompt that asks for an answer only is refused: its session types into a terminal, whose turns no one here can hold to that. */
 export const ANSWER_ONLY_UNSUPPORTED = "answer_only_unsupported";
+/** Why a prompt that asks for an answer only is refused: a turn runs in its session, or prompts wait there. */
+export const ANSWER_ONLY_BUSY = "answer_only_busy";
 
+/** Why Claude Code leaves `bypassPermissions` out of its modes, for the log line of a refused session (claude-mode.ts). */
 const BYPASS_HINT = ` (Claude Code offers it to root only with IS_SANDBOX set, and never when permissions.disableBypassPermissionsMode is "disable"; "claw-connector doctor" names the fix)`;
 
 const MAX_TOOL_OUTPUT_BYTES = 8 * 1024;
@@ -208,6 +210,13 @@ export class Session {
   private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun; answerOnly?: boolean }> = [];
   /** The turn running now only answers (`prompt.answer_only`): every permission its agent asks for is refused here, never put to anyone. */
   private answerOnlyTurn = false;
+  /**
+   * From the start of readying a turn that may only answer to the end of putting the session's mode back: the read-only mode it runs in
+   * (`mode`, once switched to; never the session's own, `targetMode`, so a restart meanwhile comes back in the session's mode), and a
+   * `set_mode` the user sent meanwhile (`deferred`), which stops that turn and is applied once it ended, never in it. `userPresent`: the
+   * user sent a prompt or a mode meanwhile, so the turn gives way (never started, or stopped).
+   */
+  private answerOnlySpan: { mode: string | null; deferred: { modeId: string; cmdId: string | null } | null; userPresent: boolean } | null = null;
   private launching: Promise<void> | null = null;
   private idle: NodeJS.Timeout | undefined;
   /**
@@ -1049,7 +1058,7 @@ export class Session {
    * notification that arrives after the change. If neither confirms `mode`, the
    * session is not opened.
    */
-  private async enforceMode(mode: string): Promise<void> {
+  private async enforceMode(mode: string, temporary = false): Promise<void> {
     const a = this.adapter;
     if (!a || !this.acpId) throw new SessionRefusal("adapter_gone");
     if (this.modes.length && !this.modes.some((m) => m.id === mode)) throw new SessionRefusal("mode_unavailable", `the adapter offers no mode ${mode}${mode === "bypassPermissions" ? BYPASS_HINT : ""}`);
@@ -1065,8 +1074,11 @@ export class Session {
       if (confirmed === null) throw new SessionRefusal("mode_not_confirmed", `the adapter did not confirm mode ${mode}`);
       if (confirmed !== mode) throw new SessionRefusal("mode_mismatch", `asked for mode ${mode}, the adapter reports ${confirmed}`);
       this.currentMode = confirmed;
-      this.targetMode = mode;
-      this.env.store.patch(this.id, { mode: confirmed });
+      // A mode for one turn only (a turn that may only answer) is never the session's own: not what a relaunch or a restart goes back to.
+      if (!temporary) {
+        this.targetMode = mode;
+        this.env.store.patch(this.id, { mode: confirmed });
+      }
     } finally {
       this.enforcing = false;
     }
@@ -1095,19 +1107,19 @@ export class Session {
   /** An adapter reported its mode. A mode this machine does not allow is undone at once. */
   private noteMode(mode: string): void {
     this.modeSeen.push(mode);
+    // Checked before anything else, a mode this connector is setting included: a turn that may only answer runs in a read-only mode or
+    // not at all.
+    if (this.answerOnlyTurn && !this.agent.readOnlyModes.includes(mode)) this.stopAnswerOnly("left_read_only_mode", { from: this.currentMode, to: mode });
     if (this.enforcing) return;
     if (mode === this.currentMode) return;
     const from = this.currentMode;
     this.currentMode = mode;
-    if (this.answerOnlyTurn && !this.agent.readOnlyModes.includes(mode) && this.adapter && this.acpId) {
-      // The agent left the read-only mode a turn that may only answer runs in: the turn is stopped (then the mode is put back after it).
-      this.audit("answer_only_stopped", { from, to: mode });
-      void this.adapter.notify("session/cancel", { sessionId: this.acpId }).catch(() => undefined);
-    }
     if (!this.modeAllowed(mode)) {
-      this.audit("mode_reverted", { from, to: mode, back_to: this.agent.askMode });
+      // In the span of a turn that may only answer, back to its read-only mode (and the session's own after the turn).
+      const span = this.answerOnlySpan?.mode ?? null;
+      this.audit("mode_reverted", { from, to: mode, back_to: span ?? this.agent.askMode });
       this.emit("mode_update", { currentMode: mode, reverted: true, unattended: this.unattended });
-      void this.enforceMode(this.agent.askMode).then(
+      void (span ? this.enforceMode(span, true) : this.enforceMode(this.agent.askMode)).then(
         () => this.emit("mode_update", { currentMode: this.currentMode, unattended: this.unattended }),
         (e) => this.refuse(e),
       );
@@ -1119,6 +1131,24 @@ export class Session {
   /** `set_mode`: a user-chosen mode, only from the allowed list, always read back. */
   async setMode(modeId: string, cmdId: string | null): Promise<void> {
     if (this.readOnly) return this.rejectCommand("set_mode", cmdId, this.terminal ? TERMINAL_OWNS_REASON : READ_ONLY_REASON);
+    if (!this.modeAllowed(modeId)) return this.rejectCommand("set_mode", cmdId, "mode_not_allowed");
+    const span = this.answerOnlySpan;
+    if (span) {
+      // A turn that may only answer is being readied, run or ended: its mode is this connector's until it is over. The user is here, so
+      // that turn is stopped, and the mode they chose is set once it ended (`endAnswerOnly`), never while it runs. The latest choice wins.
+      if (span.deferred) this.audit("mode_deferred_replaced", { mode: span.deferred.modeId, cmd_id: span.deferred.cmdId });
+      span.deferred = { modeId, cmdId };
+      span.userPresent = true;
+      this.audit("mode_deferred", { mode: modeId, cmd_id: cmdId });
+      this.stopAnswerOnly("set_mode", { to: modeId });
+      return;
+    }
+    return this.setModeNow(modeId, cmdId);
+  }
+
+  /** `set_mode` once no turn that may only answer holds the mode: set, read back, else back to the mode the session had. */
+  private async setModeNow(modeId: string, cmdId: string | null): Promise<void> {
+    if (this.closed) return this.rejectCommand("set_mode", cmdId, "session_closed");
     if (!this.adapter) await this.ensureAdapter();
     if (!this.modeAllowed(modeId)) return this.rejectCommand("set_mode", cmdId, "mode_not_allowed");
     if (this.modes.length && !this.modes.some((m) => m.id === modeId)) return this.rejectCommand("set_mode", cmdId, "mode_unavailable");
@@ -1328,6 +1358,14 @@ export class Session {
     text: string, cmdId: string | null, started: () => void = () => {}, cmdSeq: number | null = null, mayRun?: MayRun, answerOnly = false,
   ): void {
     if (this.closed) { this.rejectCommand("prompt", cmdId, "session_closed", cmdSeq); return started(); }
+    if (answerOnly && !this.readOnly && (this.turnRunning || this.queue.length > 0)) {
+      // Claw asks only an idle session, but a turn of the user's may have started since: the question never waits behind it, nor runs
+      // between the user's prompts.
+      this.audit("prompt_refused", { reason: ANSWER_ONLY_BUSY });
+      this.rejectCommand("prompt", cmdId, ANSWER_ONLY_BUSY, cmdSeq);
+      this.emit("turn_end", { stopReason: "error", error: ANSWER_ONLY_BUSY, cmd_id: cmdId, cmd_seq: cmdSeq });
+      return started();
+    }
     if (answerOnly && this.readOnly) {
       // A terminal's conversation answers in the terminal's own mode: no turn there can be held to answering only, so none is typed.
       this.audit("prompt_refused", { reason: ANSWER_ONLY_UNSUPPORTED });
@@ -1345,6 +1383,11 @@ export class Session {
     }
     if (this.queue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts", cmdSeq); return started(); }
     this.queue.push({ text, cmdId, cmdSeq, started, mayRun, ...(answerOnly ? { answerOnly: true } : {}) });
+    // The user's own prompt: a turn that may only answer gives way to it (stopped; the user's runs next, in the session's own mode).
+    if (!answerOnly && this.answerOnlySpan) {
+      this.answerOnlySpan.userPresent = true;
+      this.stopAnswerOnly("user_prompt", {});
+    }
     if (!this.turnRunning) void this.pump();
   }
 
@@ -1399,41 +1442,73 @@ export class Session {
   /**
    * The turn of a prompt that may only answer (`prompt.answer_only`), readied once its agent runs: it runs in a mode of the agent's that
    * changes nothing (`readOnlyModes`: Claude Code's `plan`, Cursor's `ask`), the session's own when it is one, else one switched to for
-   * this turn only (and back after it, {@link leaveAnswerOnly}). Refused, and never run, in a session that does not ask (`unattended`:
-   * the agent's own rules would let it run anything, and nothing of that reaches here), for an agent with no such mode, or when the mode
-   * cannot be set. In the turn every permission and every question the agent asks is refused here and put to nobody
-   * ({@link onPermission}, {@link onExtension}), and the agent leaving the read-only mode stops it ({@link noteMode}).
+   * this turn only (never made the session's own mode: a restart meanwhile comes back in that) and back after it ({@link endAnswerOnly}).
+   * Refused, and never run, in a session that does not ask (`unattended`: the agent's own rules would let it run anything, and nothing of
+   * that reaches here), for an agent with no such mode, when the mode cannot be set, or when the user chose a mode meanwhile. In the turn
+   * every permission and every question the agent asks is refused here and put to nobody ({@link onPermission}, {@link onExtension});
+   * the agent leaving the read-only mode, a `set_mode` of the user's, or a prompt of the user's stops it ({@link stopAnswerOnly}).
    * Returns the mode to go back to (null: none), or `false` when refused (the turn's end already said so).
    */
   private async enterAnswerOnly(cmdId: string | null, cmdSeq: number | null, started: () => void): Promise<string | null | false> {
-    const refuse = (reason: string): false => {
+    const refuse = (detail: string, reason = ANSWER_ONLY_UNSUPPORTED): false => {
       started();
-      this.audit("prompt_refused", { reason: ANSWER_ONLY_UNSUPPORTED, detail: reason });
-      this.rejectCommand("prompt", cmdId, ANSWER_ONLY_UNSUPPORTED, cmdSeq);
-      this.emit("turn_end", { stopReason: "error", error: ANSWER_ONLY_UNSUPPORTED, cmd_id: cmdId, cmd_seq: cmdSeq });
+      this.audit("prompt_refused", { reason, detail });
+      this.rejectCommand("prompt", cmdId, reason, cmdSeq);
+      this.emit("turn_end", { stopReason: "error", error: reason, cmd_id: cmdId, cmd_seq: cmdSeq });
       this.env.store.endTurn(this.id);
       return false;
     };
+    const span = this.answerOnlySpan!;
     if (this.unattended) return refuse("unattended");
+    // The user sent a prompt or chose a mode while the agent was being made ready: theirs comes first, this one never runs.
+    if (span.userPresent) return refuse("user_present", ANSWER_ONLY_BUSY);
     const readOnly = this.agent.readOnlyModes;
     const from = this.currentMode;
-    if (from !== null && readOnly.includes(from)) return null;
+    if (from !== null && readOnly.includes(from)) {
+      span.mode = from;
+      return null;
+    }
     const to = readOnly.find((m) => this.modeAllowed(m) && (this.modes.length === 0 || this.modes.some((x) => x.id === m)));
     if (!to || from === null) return refuse("no_read_only_mode");
+    span.mode = to;
     try {
-      await this.enforceMode(to);
+      await this.enforceMode(to, true);
     } catch (e) {
       this.audit("mode_set_failed", { mode: to, error: errMessage(e), answer_only: true });
-      try { await this.enforceMode(from); } catch (again) { refuse("mode_not_set"); await this.refuse(again); return false; }
-      return refuse("mode_not_set");
+      span.mode = null;
+      // The prompt is refused once; a session whose mode then cannot be put back either is closed (its mode is not known).
+      refuse("mode_not_set");
+      try { await this.enforceMode(from); } catch (again) { await this.refuse(again); }
+      return false;
     }
+    // The user sent a prompt or chose a mode while it was being switched to: never run (a mode of theirs is set after it, `endAnswerOnly`).
+    if (span.userPresent) { refuse("user_present", ANSWER_ONLY_BUSY); return from; }
     this.emit("mode_update", { currentMode: this.currentMode, unattended: this.unattended, answer_only: true });
     return from;
   }
 
-  /** After a turn that may only answer: back to the mode it was switched from. Failing that it stays read-only, which runs nothing. */
-  private async leaveAnswerOnly(back: string | null): Promise<void> {
+  /** Stop the turn that may only answer as it runs (nothing when none does): it never goes on in a mode, or a moment, that is not its. */
+  private stopAnswerOnly(why: string, detail: Record<string, unknown>): void {
+    if (!this.answerOnlyTurn || !this.adapter || !this.acpId) return;
+    this.audit("answer_only_stopped", { why, ...detail });
+    void this.adapter.notify("session/cancel", { sessionId: this.acpId }).catch(() => undefined);
+  }
+
+  /**
+   * After a turn that may only answer (run or refused): the mode the user chose meanwhile, set now (as any `set_mode`: read back, else
+   * back to the session's own); else back to the mode it was switched from. Failing that it stays read-only, which runs nothing.
+   */
+  private async endAnswerOnly(back: string | null): Promise<void> {
+    const wanted = this.answerOnlySpan?.deferred ?? null;
     this.answerOnlyTurn = false;
+    this.answerOnlySpan = null;
+    if (wanted) {
+      // (an agent that cannot be brought back for it: the mode is refused by name, as a set_mode sent outside that turn would fail)
+      return this.setModeNow(wanted.modeId, wanted.cmdId).catch((e) => {
+        this.audit("mode_set_failed", { mode: wanted.modeId, error: errMessage(e), deferred: true });
+        this.rejectCommand("set_mode", wanted.cmdId, e instanceof SessionRefusal ? e.reason : "set_mode_failed");
+      });
+    }
     if (back === null || this.closed || !this.adapter) return;
     try {
       await this.enforceMode(back);
@@ -1445,6 +1520,20 @@ export class Session {
 
   /** Every `turn_end` of the turn names its prompt: `cmd_id`, and `cmd_seq` (a number, which no credential scrub ever masks). */
   private async runTurn(text: string, started: () => void, cmdId: string | null, cmdSeq: number | null, answerOnly = false): Promise<void> {
+    if (!answerOnly) return this.runTurnReady(text, started, cmdId, cmdSeq, false);
+    this.answerOnlySpan = { mode: null, deferred: null, userPresent: false };
+    let back: string | null = null;
+    try {
+      await this.runTurnReady(text, started, cmdId, cmdSeq, true, (b) => { back = b; });
+    } finally {
+      await this.endAnswerOnly(back);
+    }
+  }
+
+  /** The turn, its agent made ready first (and, for one that may only answer, its read-only mode; `entered` gets the mode to go back to). */
+  private async runTurnReady(
+    text: string, started: () => void, cmdId: string | null, cmdSeq: number | null, answerOnly: boolean, entered: (back: string | null) => void = () => {},
+  ): Promise<void> {
     if (this.agent.attach) {
       const refused = await this.preflight();
       if (refused) {
@@ -1471,12 +1560,10 @@ export class Session {
     if (!answerOnly) return this.runAdapterTurn(text, started, cmdId, cmdSeq);
     const back = await this.enterAnswerOnly(cmdId, cmdSeq, started);
     if (back === false) return;
+    entered(back);
+    if (this.answerOnlySpan?.userPresent) return;
     this.answerOnlyTurn = true;
-    try {
-      await this.runAdapterTurn(text, started, cmdId, cmdSeq);
-    } finally {
-      await this.leaveAnswerOnly(back);
-    }
+    await this.runAdapterTurn(text, started, cmdId, cmdSeq);
   }
 
   /** The turn itself, its agent running (and, for a turn that may only answer, in a read-only mode). */
@@ -1642,7 +1729,9 @@ export class Session {
       return;
     }
     try {
-      if (this.adapter && !this.adapter.exited) await this.enforceMode(this.targetMode);
+      // (in a turn that may only answer, its read-only mode is the one re-asserted: never the session's own in the middle of that turn)
+      const span = this.answerOnlySpan?.mode;
+      if (this.adapter && !this.adapter.exited) await (span ? this.enforceMode(span, true) : this.enforceMode(this.targetMode));
       else await this.launch("resume");
     } catch (e) {
       // Not signed in (yet): the resume is refused with the fix and the session stays, as for a prompt.
