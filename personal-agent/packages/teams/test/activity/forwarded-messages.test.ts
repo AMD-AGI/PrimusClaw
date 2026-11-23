@@ -164,6 +164,27 @@ test("one forward said in both the text and its HTML copy is one forwarded messa
   assert.equal(event.forwards?.length, 1);
 });
 
+/** A Forward blockquote with its author and time but no message id, as some clients write it. */
+function forwardNoId(body: string, who: { name: string; id: string; time: string }): string {
+  return (
+    `<blockquote itemtype="http://schema.skype.com/Forward"><strong itemprop="mri" itemid="${who.id}">${who.name}` +
+    `</strong><span itemprop="time" itemid="${who.time}"></span>${body}</blockquote>`
+  );
+}
+
+test("two forwarded messages with the same words and no message id are two, each with its own author", () => {
+  const html = forwardNoId("<p>+1</p>", BOB) + forwardNoId("<p>+1</p>", CAROL);
+  for (const a of [teamsDm("", html), teamsDm(html, null), teamsDm(html, html)]) {
+    assert.deepEqual(
+      eventOf(a).forwards?.map((f) => [f.author, f.text, f.sentAt]),
+      [
+        ["Bob Li", "+1", WHEN_MS],
+        ["Carol Wu", "+1", "1793695060000"],
+      ],
+    );
+  }
+});
+
 test("Graph's forward reference: the original's author, time and text, and its placeholder is not the person's words", () => {
   for (const asObject of [false, true]) {
     const a = teamsDm('<attachment id="1727881360458"></attachment>', null, {
