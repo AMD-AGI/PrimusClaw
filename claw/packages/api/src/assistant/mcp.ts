@@ -24,7 +24,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import pino from "pino";
 import { z } from "zod";
 import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_ASSISTANT_TOOLS, CLAW_USER_SKILLS_ENABLED } from "../config.js";
-import { db } from "../infra/db.js";
+import { db, inTransaction } from "../infra/db.js";
 import { ASSISTANT_MCP_PATH } from "./role-profile.js";
 import { PASS_REASONS, SAY_MAX_CHARS, WORK_CREATE_REPO_PARAM } from "./prompts.js";
 import { REPORT_ANSWER_MAX, REPORT_SUMMARY_MAX } from "./report.js";
@@ -51,6 +51,9 @@ import { REVIEWS_STARTED_AT_ONCE } from "./review-items.js";
 import { observeEveryTool, recordObservation } from "./observe.js";
 import { assistantCitationsOn } from "./citations.js";
 import { readSelfStatus, selfStatusOn } from "./self-status.js";
+import { CAPABILITIES_RULE, CAPABILITIES_TOOL, capabilityInputs, capabilityList } from "./capabilities.js";
+import { turnMessage } from "./inbound.js";
+import { assertLiveRun } from "./tools.js";
 import { CITE_MAX_PER_CALL, citeSourcesAsked } from "@claw/protocol";
 
 /** `sources` given as one string that is a JSON-encoded list: that list (`citeSourcesAsked`); any other value as it came. */
@@ -441,12 +444,41 @@ export const SAY_SOURCES_PARAM = `Only when the text cites a lookup of this turn
   + `GitHub result or the user's message gave it). At most ${CITE_MAX_PER_CALL}. `
   + "An address no lookup of this turn returned is dropped. Write it after text.";
 
+/**
+ * The names of the tools registered on `mcp` from now on, as they are registered: what `claw_capabilities` lists is what this very
+ * server offers the turn, never a list kept beside it.
+ */
+export function recordToolNames(mcp: McpServer): readonly string[] {
+  const names: string[] = [];
+  const server = mcp as unknown as Record<string, (...a: unknown[]) => unknown>;
+  for (const method of ["tool", "registerTool"]) {
+    const original = server[method];
+    if (typeof original !== "function") throw new Error(`assistant.cannot_record_${method}`);
+    server[method] = (name: unknown, ...rest: unknown[]) => {
+      names.push(String(name));
+      return original.call(mcp, name, ...rest);
+    };
+  }
+  return names;
+}
+
+/** The tools a router turn of this deployment is offered (`createAssistantMcpServer` with its defaults), for the API's own list. */
+export function routerToolNames(): string[] {
+  const names: string[] = [];
+  createAssistantMcpServer({ sid: "", mid: "", task_id: "", exp: 0, role: "router" }, undefined, undefined, undefined, undefined,
+    undefined, undefined, undefined, undefined, names);
+  return names;
+}
+
 export function createAssistantMcpServer(
   claims: AssistantTokenClaims, reviewTools: boolean = CLAW_ASSISTANT_TOOLS, memoryTools: boolean = assistantMemoryOn(),
   modelChoice: boolean = modelChoiceOn(), citations: boolean = assistantCitationsOn(), devenv: boolean = devenvToolsOn(),
   suggested: boolean = suggestedRepliesOn(), choices: boolean = sayChoicesOn(), userSkills: boolean = CLAW_USER_SKILLS_ENABLED,
+  registered?: string[],
 ): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
+  // Every tool registered below, in order: the router's claw_capabilities reads it when it is called, once all are registered.
+  const tools = recordToolNames(mcp);
   if (claims.role === "observer") {
     // Before anything is registered: from here on every tool, the router's below and any added to them later, only
     // records what the turn would have done (`observe.ts`).
@@ -545,6 +577,25 @@ export function createAssistantMcpServer(
         + "failures and the version running. Counts only; it only reads.",
         { hours: z.number().int().min(1).max(168).optional().describe("The window in hours; 24 when left out.") },
         (args) => answer(claims, "claw_self_status", () => readSelfStatus(args.hours ?? 24)),
+      );
+    }
+    // What the assistant can and cannot do, generated from this server's own tools and the deployment (`capabilities.ts`). The router's
+    // only: an observer answers nobody's question about itself.
+    if (claims.role === "router") {
+      mcp.tool(
+        CAPABILITIES_TOOL,
+        "What you yourself can and cannot do for this user, here and now: generated from the tools you have and the deployment's "
+        + "settings, with the user's review mode and your limits. Call it before answering any question about your abilities, your "
+        + "limits or how you compare with other assistants, and answer from it alone. It only reads.",
+        {},
+        () => answer(claims, CAPABILITIES_TOOL, async () => {
+          const { userId, channel } = await inTransaction(async (q) => {
+            const run = await assertLiveRun(q, claims);
+            return { userId: run.userId, channel: (await turnMessage(q, claims.sid, claims.mid))?.context.channel };
+          });
+          const list = capabilityList(await capabilityInputs((t, p) => db.query(t, p), userId, claims.sid, tools, channel));
+          return { ok: true, rule: CAPABILITIES_RULE, ...list };
+        }),
       );
     }
     if (githubEventsEnabled()) {
@@ -697,6 +748,7 @@ export function createAssistantMcpServer(
     }
     if (memoryTools) registerMemoryRecall(mcp, claims);
   }
+  if (registered) registered.push(...tools);
   return mcp;
 }
 

@@ -85,7 +85,7 @@ import {
   ownSays, SYSTEM_TURN_NOTICES, asksUser,
   bareItemNumber, clockAnswer, clockQuery, clockValue, clockValues, descriptiveValue, flatVars, githubReadOnlyQuery, oracleValues, withToolFailures, storedTurnCalls,
   cardsLeftError, freshSessionEvery, setupTriggerBody, waitingCards, memoryRows, memoriesMatching, newMemoryIds,
-  TURN_CONTEXT_KEYS, problemsOf, tokenRequestRefusal, turnMessageBody,
+  TURN_CONTEXT_KEYS, problemsOf, tokenRequestRefusal, turnMessageBody, SELF_KNOWLEDGE_NOTE, type SelfCapabilities,
 } from "./e2e/sa-eval-lib.js";
 import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
@@ -1604,4 +1604,61 @@ test("S-cited cited: the final answer carries a source; one that names its sourc
   assert.equal(parseCases(JSON.stringify({ ...c, cited: "yes" })).bad.length, 1, "only a boolean");
   const shipped = loadCases(SEED_DIR).cases.find((x) => x.id === "cat-general-cite-001");
   assert.equal(shipped?.cited, true, "the catalog case asks for a cited answer");
+});
+
+test("S-self self_knowledge: the final answer is held to the identity's capability list; a limit it contradicts fails, an unread list is no pass", () => {
+  const c: EvalCase = {
+    id: "c", pipeline: "catalog", area: "general", lang: "zh", route: "answer", self_knowledge: true,
+    turns: [{ user: "你有什么做不到的？" }],
+  };
+  const list: SelfCapabilities = {
+    abilities: [
+      { id: "see_images", on: true, what: "Images sent with a message are shown to you." }, { id: "watch_pull_requests", on: true },
+      { id: "check_work", on: true }, { id: "reviews", on: true },
+    ],
+    limits: [{ id: "email", on: false, what: "No email." }, { id: "voice", on: false }],
+    review_mode: { mode: "fully_auto" }, acts_at_once: ["review_start", "memory_save"],
+  };
+  const NAME = "no limit the capability list contradicts";
+  const check = (o: Partial<Observed>) => grade(c, observed(o)).find((x) => x.name === NAME || x.name === "capability list read");
+  // The 2026-11-23 answer: flagged, so no pass without a judge, and the judge's FAIL fails it.
+  const wrongObs = { capabilities: list, final: "我没有后台监控能力，只有你发消息时才工作；我看不到你发的图片；所有写操作都需要开 worker 并经过你的确认；我无法检查 worker 的结论对不对。" };
+  const wrong = check(wrongObs);
+  assert.equal(wrong?.unverified, true);
+  assert.match(wrong!.detail!, /denies see_images/);
+  assert.match(wrong!.detail!, /denies background: .*\(the list has watch_pull_requests on\)/);
+  const wrongChecks = grade(c, observed(wrongObs));
+  assert.deepEqual(verdictOf(c, wrongChecks, null), { pass: false, unjudged: true }, "flagged: never a pass without a judge");
+  assert.deepEqual(verdictOf(c, wrongChecks, { pass: false }), { pass: false });
+  assert.deepEqual(verdictOf(c, wrongChecks, { pass: true }), { pass: true }, "the judge, given the list and the flagged words, decides");
+  const right = check({ capabilities: list, final: "我可以看你发的图片，也会在后台盯你的 PR；我不能读写你的邮件，也不能接语音电话。" });
+  assert.deepEqual([right?.pass, right?.unverified], [true, undefined]);
+  assert.equal(check({ capabilities: list, final: "我可以帮你回复邮件。" })?.unverified, true, "an ability the list has off");
+  const unread = check({ final: "我可以看图片。" });
+  assert.equal(unread?.pass, false, "a list not read is never a pass");
+  assert.equal(unread?.name, "capability list read");
+  assert.deepEqual(verdictOf(c, grade(c, observed({ final: "我可以看图片。" })), { pass: true }), { pass: false }, "not even with a judge's PASS");
+  assert.equal(check({ mode: "baseline" })?.skipped, true);
+  assert.equal(grade({ ...c, self_knowledge: undefined }, observed({})).some((x) => x.name === NAME), false);
+  assert.equal(parseCases(JSON.stringify({ ...c, self_knowledge: "yes" })).bad.length, 1, "only a boolean");
+  // The judge is given the list as the truth.
+  const prompt = judgePrompt(c, c.turns, "我看不到图片", [], [], list);
+  assert.ok(prompt.includes(SELF_KNOWLEDGE_NOTE));
+  assert.match(prompt, /- see_images: on \(Images sent with a message are shown to you\.\)\n/);
+  assert.match(prompt, /- email: off \(No email\.\)\n/);
+  assert.match(prompt, /- review_mode: fully_auto\n- tools that act at once, with no worker or card: review_start, memory_save\n/);
+  assert.ok(!judgePrompt(c, c.turns, "x", [], []).includes(SELF_KNOWLEDGE_NOTE), "no list read, none told");
+  assert.match(prompt, /Words of the reply a detector reads as contradicting the list .*"看不到图片" \(the list has see_images on\)/);
+  assert.ok(!judgePrompt(c, c.turns, "我能看图片", [], [], list).includes("Words of the reply a detector reads"), "nothing flagged, nothing said");
+  // The shipped cases: each asks the assistant about itself, needs the tool, and runs where the list is.
+  const shipped = loadCases(SEED_DIR).cases.filter((x) => x.self_knowledge);
+  assert.ok(shipped.length >= 8, `${shipped.length} self_knowledge cases`);
+  for (const x of shipped) {
+    assert.deepEqual(x.tools_must, ["mcp__assistant__claw_capabilities"], x.id);
+    assert.deepEqual(x.modes, ["assistant"], x.id);
+    assert.equal(x.route, "answer", x.id);
+  }
+  for (const asked of ["你能看图片吗", "盯 PR", "你有什么做不到的", "What can't you do", "检查它的结论"]) {
+    assert.ok(shipped.some((x) => x.turns[0]!.user.includes(asked)), asked);
+  }
 });

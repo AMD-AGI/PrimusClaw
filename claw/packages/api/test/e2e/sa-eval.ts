@@ -180,7 +180,7 @@ import {
   freshSessionEvery, waitingCards, cardsLeftError, cardsShownBy, clearsSkillDrafts, foreignDraftAnswers, skillDraftCards, skillDraftIds, setupTriggerBody, tokenRequestRefusal, turnMessageBody,
   memoryRows, memoriesMatching, newMemoryIds, type MemoryEntrySeen,
   type SayMark, type WaitingCard, type Arms, type Attempt, type Check, type CaseResult, type EvalCase, type ItemSeen, type LiveEvent, type Mode, type Observed, type OracleQuery,
-  type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec,
+  type Recording, type Turn, type TurnFile, type Vars, type HoldSeen, type HoldSpec, type SelfCapabilities,
 } from "./sa-eval-lib.js";
 import * as readTools from "../../src/assistant/read-tools.js";
 import { assistantNameOf } from "../../src/assistant/assistant-name.js";
@@ -583,6 +583,20 @@ async function factValues(c: EvalCase): Promise<Array<string[] | null>> {
   return out;
 }
 
+/**
+ * A `self_knowledge` case's truth: the identity's capability list, as the deployment generates it now (`GET /v1/assistant/capabilities`).
+ * One that cannot be read (an older server, an outage) makes the attempt the run's error before anything is sent: never a pass.
+ */
+async function readCapabilities(c: EvalCase): Promise<SelfCapabilities | undefined> {
+  if (!c.self_knowledge) return undefined;
+  const r = await api("GET", "/v1/assistant/capabilities").catch((err: unknown) => ({ status: 0, json: { error: String(err) } }));
+  const data = (r.json as { data?: SelfCapabilities } | null)?.data;
+  if (r.status !== 200 || !Array.isArray(data?.abilities) || !Array.isArray(data?.limits)) {
+    throw new Error(`infra: the capability list could not be read (the Claw API answered ${r.status}): not graded`);
+  }
+  return data;
+}
+
 async function readOracle(q: OracleQuery): Promise<string[]> {
   if (q.via === "claw") {
     const r = await api("GET", q.path);
@@ -664,7 +678,7 @@ async function judge(c: EvalCase, turns: Turn[], o: Observed, checksPass: boolea
   // Every case, not only those with content only a judge can grade: the no-false-denial rule is in every prompt.
   if (!url || !model || !keyFile) return null;
   const key = readFileSync(keyFile, "utf8").trim();
-  const prompt = judgePrompt(c, turns, o.final, o.calls, o.factValues);
+  const prompt = judgePrompt(c, turns, o.final, o.calls, o.factValues, o.capabilities);
   const first = await judgeOnce(url, model, key, prompt);
   if (first.failed || first.pass || !checksPass) return first;
   const votes = [first, await judgeOnce(url, model, key, prompt)];
@@ -765,6 +779,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
   if (!(await idle(sessionId, turnWaitMs(true)))) throw new Error(`the assistant session was still running ${turnWaitMs(true) / 1000} s before ${c.id}: nothing sent, not graded`);
   const floor = Math.max(0, ...(await board()).map((i) => i.seq));
   const values = await factValues(c);
+  const capabilities = await readCapabilities(c);
   const start = Date.now();
   const messageIds: string[] = [];
   const sentAt: number[] = [];
@@ -868,6 +883,7 @@ async function runAssistant(c: EvalCase, turns: Turn[], session: AssistantSessio
     firstReplyMs: firstOwn === null ? null : firstOwn - lastSent, finalMs: final ? final.at - lastSent : null,
     replyMs: messageIds.map((id, k) => { const s = says.find((x) => x.turn === id); return s ? s.at - sentAt[k]! : null; }),
     items, factValues: values, delivered: filesFrom(says, lastIds), ownSays: ownSays(says, lastId, ME_USER_ID), ...(hold ? { hold } : {}), ...(seqMax ? { itemSeqMax: seqMax } : {}),
+    ...(capabilities ? { capabilities } : {}),
   };
   const allCalls = [...turnCalls(stream.events, messageIds)];
   for (const i of items) if (!lastIds.includes(i.item_id)) allCalls.push(...(await read(`item ${i.seq}'s worker calls`, workerCalls(i.item_id), [])));

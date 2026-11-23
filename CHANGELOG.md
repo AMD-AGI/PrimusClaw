@@ -113,6 +113,21 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: the assistant knows what it can and cannot do. Its router turn has a new read tool, `claw_capabilities`, that
+  answers a list generated from what that turn really has: the tools registered on its assistant server, each by how
+  it takes effect (`acts_at_once`, `asks_first`, `reads`), the deployment's switches (pull request and job watching,
+  triggers, memory, reviews, development environments, personal skills, files and images), its lookups, the user's
+  review mode (`fully_auto` or `high_risk_confirm`) and its limits as data that is on or off (no email, calendar,
+  document stores or voice; the chat apps it is in), each lifted where the deployment provides it. The router is told
+  to call it first for any question about its abilities, limits or how it compares with other assistants and to
+  answer only from it (`router-self-v5`, `router-read-v18`); "every change goes through a work item that asks first"
+  is no longer said, since its own tools act by themselves. `GET /v1/assistant/capabilities` serves the same list to
+  the signed-in user. Asked what it could not do, it used to answer from guesswork and name limits it does not have.
+- Claw: the super-agent evaluation grades an answer about the assistant against that list. A case with
+  `self_knowledge` reads the identity's list before it is sent; an answer that states a limit the list contradicts,
+  or claims an ability it lists as off, fails, and the judge is given the list as the truth. Nine such cases are in
+  `sa-eval-cases/catalog/self-knowledge.jsonl`, and four in the router evaluation (`self-01`..`self-04`).
+
 - Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, how many times the
   application was started again, and `app.last_exit`, `{ returncode, at, cause }` of the last time the application
   stopped (`null` until then), moved on every exit. A crash-looping application used to read only `status: running`

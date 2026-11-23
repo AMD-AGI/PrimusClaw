@@ -1,0 +1,367 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * What the assistant can and cannot do, for this user on this deployment (`claw_capabilities`), generated from what the router turn
+ * really has: the tools registered on its assistant server (`mcp.ts`), the deployment's features that are on, the lookups it is given
+ * (`read-tools.ts`), the user's review mode, and the limits that hold here. Never prose written by hand: asked "what can't you do" or
+ * "how do you compare", the router answered from guesswork (2026-11-23) and said it had no background watching (`github-events.ts`
+ * watches pull requests, `job-watch.ts` jobs, triggers run on schedules), could not see images (`files.ts` shows them to it), that every
+ * write needs a worker and a confirmation (its own tools act at once, and under fully_auto a review merges by itself), and that it
+ * cannot check a worker's conclusions (`work_recall`, `pr_state`). Each entry here is on only when the tool or the setting behind it is.
+ *
+ * The list is pure (`capabilityList`); what it is built from is read by `capabilityInputs`. The same list is what the API serves the
+ * user (`GET /v1/assistant/capabilities`), which the evaluation grades an answer against (`test/e2e/sa-eval-lib.ts`, `self_knowledge`).
+ */
+import {
+  CLAW_ASSISTANT_GITHUB_POLL_SEC, CLAW_ASSISTANT_JOB_POLL_SEC, CLAW_ASSISTANT_TOOLS, CLAW_GITHUB_REVIEW_ENABLED, CLAW_USER_SKILLS_ENABLED,
+} from "../config.js";
+import { type Querier } from "../infra/db.js";
+import { getReviewMode, type ReviewMode } from "../github-review/store.js";
+import { githubMcpServers } from "../github-mcp/mcp.js";
+import { CHAT_SURFACES, chatSurface } from "./chat-surface.js";
+import { devenvToolsOn } from "./devenv-tools.js";
+import { PROMPT_IMAGES_MAX } from "./files.js";
+import { githubEventsEnabled } from "./github-events.js";
+import { jobWatchesEnabled } from "./job-watch.js";
+import { assistantMemoryOn } from "./memory-tools.js";
+import { ROUTER_WEB_TOOLS, routerReadTools } from "./read-tools.js";
+import { assistantSchedulesOn } from "./schedules.js";
+
+/** The tool's name on the assistant's server. */
+export const CAPABILITIES_TOOL = "claw_capabilities";
+/** The shape of the list; moves when an entry is added, removed or changes meaning. */
+export const CAPABILITIES_VERSION = "capabilities-v1";
+
+/** The deployment's switches that decide what the assistant can do, beside the tools they register. */
+export interface DeploymentFeatures {
+  /** CLAW_ASSISTANT_TOOLS: the router starts reviews and changes settings itself. */
+  review_tools: boolean;
+  /** CLAW_GITHUB_REVIEW_ENABLED: Claw reviews pull requests. */
+  github_review: boolean;
+  /** CLAW_ASSISTANT_GITHUB_EVENTS: items watch pull requests in the background. */
+  github_events: boolean;
+  /** CLAW_ASSISTANT_MEMORY_TOOLS: long-term memory. */
+  memory: boolean;
+  /** CLAW_REMOTE_AGENTS_ENABLED: the user's own machines, through the connector. */
+  remote_agents: boolean;
+  /** Triggers and the brief (`assistantSchedulesOn`). */
+  triggers: boolean;
+  /** CLAW_ASSISTANT_JOB_EVENTS: jobs watched in the background. */
+  job_watch: boolean;
+  /** Files sent with a message, and the images among them shown to the router (`files.ts`). */
+  files_and_images: boolean;
+  /** CLAW_USER_SKILLS_ENABLED: the user's personal skills. */
+  user_skills: boolean;
+  /** How often a watched pull request and a watched job are read, in seconds. */
+  github_poll_sec: number;
+  job_poll_sec: number;
+  /** At most this many images of one message are shown to the router. */
+  images_per_message: number;
+}
+
+/** The deployment's features as this process has them. */
+export function deploymentFeatures(): DeploymentFeatures {
+  return {
+    review_tools: CLAW_ASSISTANT_TOOLS, github_review: CLAW_GITHUB_REVIEW_ENABLED, github_events: githubEventsEnabled(),
+    memory: assistantMemoryOn(), remote_agents: devenvToolsOn(), triggers: assistantSchedulesOn(), job_watch: jobWatchesEnabled(),
+    // Unconditional where the assistant runs: a channel's files are named with the message, and its images shown to the router.
+    files_and_images: PROMPT_IMAGES_MAX > 0, user_skills: CLAW_USER_SKILLS_ENABLED,
+    github_poll_sec: CLAW_ASSISTANT_GITHUB_POLL_SEC, job_poll_sec: CLAW_ASSISTANT_JOB_POLL_SEC, images_per_message: PROMPT_IMAGES_MAX,
+  };
+}
+
+/** What the router turn may look up itself, besides its own tools. */
+export interface Lookups {
+  /** web_search and web_fetch: offered to every router turn (Brain serves them where its deployment has a search provider). */
+  web: boolean;
+  /** The user's GitHub, as them (their linked account). */
+  github: boolean;
+  /** The read servers of the deployment's assistant plugin (`routerReadTools`). */
+  systems: readonly string[];
+}
+
+export interface CapabilityInputs {
+  /** The tools registered on the router's assistant server, without the `mcp__assistant__` prefix. */
+  tools: readonly string[];
+  features: DeploymentFeatures;
+  lookups: Lookups;
+  /** The user's review mode (`getReviewMode`). */
+  reviewMode: ReviewMode;
+  /** The chat apps the assistant is talked to in: the channels with a surface of their own, and the one this message came through. */
+  channels: readonly string[];
+}
+
+/** How a tool of the assistant's own takes effect. */
+export type ToolEffect = "speaks" | "reads" | "at_once" | "card_first";
+
+/**
+ * Every tool the router's server can register, by how it takes effect: `at_once` changes something when called (with an Undo where it
+ * has one), `card_first` only shows the user a card and nothing happens until they press it. A tool registered and not listed here is
+ * reported in `unclassified` and fails the tests, so a new tool is classified before it ships.
+ */
+export const TOOL_EFFECTS: Readonly<Record<string, ToolEffect>> = {
+  say: "speaks", deliver_text: "speaks",
+  work_recall: "reads", memory_recall: "reads", skill_read: "reads", skill_list: "reads", devenv_list: "reads", claw_self_status: "reads",
+  brief: "reads", trigger_list: "reads", job_watch_list: "reads", pr_state: "reads", [CAPABILITIES_TOOL]: "reads",
+  work_create: "at_once", work_send: "at_once", work_stop: "at_once", model_default_set: "at_once", work_subscribe: "at_once",
+  work_unsubscribe: "at_once", review_start: "at_once", review_restart: "at_once", review_mode_set: "at_once", channel_action: "at_once",
+  confirmation_answer: "at_once", job_watch: "at_once", job_unwatch: "at_once", memory_save: "at_once", memory_update: "at_once",
+  memory_forget: "at_once", memory_undo: "at_once", skill_save: "at_once", skill_update: "at_once", skill_disable: "at_once",
+  skill_enable: "at_once", skill_delete: "at_once", skill_undo: "at_once", devenv_pair: "at_once",
+  github_comment: "card_first", trigger_create: "card_first", trigger_cancel: "card_first", devenv_send: "card_first",
+  devenv_hide: "card_first", skill_draft: "card_first",
+};
+
+export interface Ability {
+  id: string;
+  on: boolean;
+  what: string;
+  /** The assistant's own tools that do it (those it has now), or the lookups. */
+  tools?: string[];
+}
+
+export interface Limit {
+  id: string;
+  /** Whether the assistant can do it after all: a limit is data, and a deployment that has what it needs turns it on. */
+  on: boolean;
+  what: string;
+}
+
+export interface Capabilities {
+  version: string;
+  /** What the router is told to do with the list (the tool's answer only). */
+  rule?: string;
+  abilities: Ability[];
+  limits: Limit[];
+  review_mode: { mode: ReviewMode; means: string } | null;
+  /** The assistant's own tools, by how they take effect. */
+  acts_at_once: string[];
+  asks_first: string[];
+  reads: string[];
+  /** Registered tools that no entry of TOOL_EFFECTS classifies (none in a correct build). */
+  unclassified?: string[];
+  lookups: { web: boolean; github: boolean; systems: string[] };
+  channels: string[];
+}
+
+/** What the router is told with the list. */
+export const CAPABILITIES_RULE = "This list is generated from the tools and settings you have now. Answer questions about what you can or "
+  + "cannot do, and comparisons with other assistants, from it alone: an ability with on true is one you have (never say you cannot do "
+  + "it), one with on false or a limit with on false is one you do not have (never claim it). acts_at_once are your own tools that change "
+  + "something when you call them, with no worker and no card; asks_first show the user a card first.";
+
+interface AbilitySpec {
+  id: string;
+  /** The tools that do it: on only when at least one is registered (none: decided by `needs` alone). */
+  tools?: readonly string[];
+  needs?: (i: CapabilityInputs) => boolean;
+  what: (i: CapabilityInputs) => string;
+}
+
+const has = (i: CapabilityInputs, t: string): boolean => i.tools.includes(t);
+const listed = (xs: readonly string[]): string => xs.join(", ");
+
+/** Every ability the list can name, in the order it names them. */
+const ABILITIES: readonly AbilitySpec[] = [
+  {
+    id: "look_up",
+    needs: (i) => i.lookups.web || i.lookups.github || i.lookups.systems.length > 0,
+    what: (i) => `Look things up at once, in the same turn: ${[
+      ...(i.lookups.web ? ["the web (search, and read a page)"] : []),
+      ...(i.lookups.github ? ["the user's GitHub as them (pull requests, issues, checks, reviews, files)"] : []),
+      ...(i.lookups.systems.length ? [`these systems: ${listed(i.lookups.systems)}`] : []),
+    ].join("; ")}.`,
+  },
+  {
+    id: "see_images",
+    needs: (i) => i.features.files_and_images,
+    what: (i) => `Images sent with a message are shown to you (up to ${i.features.images_per_message} per message), and every file sent `
+      + "is handed to the work items you start.",
+  },
+  {
+    id: "hand_off_work",
+    tools: ["work_create", "work_send", "work_stop"],
+    what: () => "Start work items: a worker in its own sandbox writes and runs code, uses a shell and a checkout, opens and updates pull "
+      + "requests, and reports back; you forward instructions to it or stop it.",
+  },
+  {
+    id: "check_work",
+    tools: ["work_recall", "pr_state"],
+    what: (i) => `Check what a worker did and concluded${has(i, "work_recall") ? " (work_recall: its reports, the tail of what it wrote, its latest steps live)" : ""}`
+      + `${has(i, "pr_state") ? " and where a pull request stands (pr_state)" : ""}.`,
+  },
+  {
+    id: "watch_pull_requests",
+    tools: ["work_subscribe"],
+    needs: (i) => i.features.github_events,
+    what: (i) => `Watch pull requests in the background: an item that watches one gets its new comments, reviews and failed CI as they `
+      + `happen (read every ${i.features.github_poll_sec} s), and a pull request named when an item starts is watched by itself.`,
+  },
+  {
+    id: "watch_jobs",
+    tools: ["job_watch"],
+    needs: (i) => i.features.job_watch,
+    what: (i) => `Watch a job in the background and tell the user when it changes or ends (read every ${i.features.job_poll_sec} s).`,
+  },
+  {
+    id: "scheduled_tasks",
+    tools: ["trigger_create", "brief"],
+    needs: (i) => i.features.triggers,
+    what: (i) => [
+      has(i, "trigger_create") ? "Run a task on a schedule, as the user (a card first)" : "",
+      has(i, "brief") ? "put together the user's daily or weekly brief" : "",
+    ].filter(Boolean).join("; ") + ".",
+  },
+  {
+    id: "memory",
+    tools: ["memory_save", "memory_recall"],
+    needs: (i) => i.features.memory,
+    what: () => "Remember things across conversations: saved at once when the user asks, with Undo; read back in later conversations.",
+  },
+  {
+    id: "reviews",
+    tools: ["review_start"],
+    needs: (i) => i.features.review_tools,
+    what: (i) => `Review pull requests and merge them when asked (started at once, no worker needed to ask); ${
+      i.reviewMode === "fully_auto"
+        ? "the user's review mode is fully_auto: a merge asked for happens once the review approves, without asking them"
+        : "the user's review mode is high_risk_confirm: a high-risk approval or merge waits for their confirmation"}.`,
+  },
+  {
+    id: "github_comment",
+    tools: ["github_comment"],
+    what: () => "Draft a comment on a pull request or issue, posted as the user when they press its card.",
+  },
+  {
+    id: "dev_environments",
+    tools: ["devenv_list", "devenv_send", "devenv_pair"],
+    needs: (i) => i.features.remote_agents,
+    what: () => "See the user's own machines and the agent sessions on them (claude, codex, cursor), send an agent an instruction (a "
+      + "card first), and pair a new machine.",
+  },
+  {
+    id: "personal_skills",
+    tools: ["skill_read", "skill_save"],
+    needs: (i) => i.features.user_skills,
+    what: () => "Use, save and change the user's personal skills.",
+  },
+  {
+    id: "deliver_files",
+    tools: ["deliver_text"],
+    what: () => "Hand the user a file you wrote (a document, a report, a script).",
+  },
+  {
+    id: "self_status",
+    tools: ["claw_self_status"],
+    what: () => "Say how you yourself have been running: reply times, failures, the version.",
+  },
+  {
+    id: "model_choice",
+    tools: ["model_default_set"],
+    what: () => "Run work items on a model the user picks, and set their default.",
+  },
+];
+
+/** A limit, and the words in the name of a lookup server or tool that would lift it. */
+interface LimitSpec { id: string; lifted?: RegExp; what: (on: boolean, i: CapabilityInputs) => string }
+
+const LIMITS: readonly LimitSpec[] = [
+  {
+    id: "email",
+    lifted: /mail|outlook|exchange/i,
+    what: (on) => (on ? "Email: a system you can look up handles mail." : "No email: you cannot read or send the user's mail."),
+  },
+  {
+    id: "calendar",
+    lifted: /calendar|outlook|exchange/i,
+    what: (on) => (on ? "Calendar: a system you can look up handles calendars." : "No calendar: you cannot read or book the user's meetings."),
+  },
+  {
+    id: "documents",
+    lifted: /sharepoint|onedrive|gdrive|google-?docs|confluence|notion/i,
+    what: (on) => (on
+      ? "Documents: a system you can look up holds the user's documents."
+      : "No document stores: you cannot open the user's SharePoint, OneDrive or Google Docs (a file they send you is read)."),
+  },
+  {
+    // Messages carry text, files and images; nothing in Claw hears audio or takes a call.
+    id: "voice",
+    what: () => "No voice: no voice messages heard and no calls; text, files and images only.",
+  },
+  {
+    id: "other_chat_apps",
+    what: (on, i) => (on
+      ? `Chat apps: ${listed(i.channels)}.`
+      : `Only in ${listed(i.channels)}: not in other chat apps (Slack, WeChat, email).`),
+  },
+];
+
+const sorted = (xs: Iterable<string>): string[] => [...new Set(xs)].sort();
+
+/** The list, from what it is built from. Pure. */
+export function capabilityList(i: CapabilityInputs): Capabilities {
+  const abilities = ABILITIES.map((a): Ability => {
+    const present = (a.tools ?? []).filter((t) => has(i, t));
+    const on = (a.needs ? a.needs(i) : true) && (a.tools === undefined || present.length > 0);
+    return {
+      id: a.id, on, what: a.what(i),
+      ...(a.id === "look_up" && on ? { tools: [...(i.lookups.web ? ROUTER_WEB_TOOLS : []), ...(i.lookups.github ? ["github"] : []), ...i.lookups.systems] } : {}),
+      ...(present.length ? { tools: present } : {}),
+    };
+  });
+  const names = [...i.lookups.systems];
+  const limits = LIMITS.map((l): Limit => {
+    const on = l.id === "other_chat_apps"
+      ? i.channels.length > 1
+      : l.lifted !== undefined && names.some((n) => l.lifted!.test(n));
+    return { id: l.id, on, what: l.what(on, i) };
+  });
+  const of = (effect: ToolEffect): string[] => sorted(i.tools.filter((t) => TOOL_EFFECTS[t] === effect));
+  const unclassified = sorted(i.tools.filter((t) => !Object.hasOwn(TOOL_EFFECTS, t)));
+  const reviews = abilities.find((a) => a.id === "reviews")!;
+  return {
+    version: CAPABILITIES_VERSION,
+    abilities,
+    limits,
+    review_mode: reviews.on
+      ? {
+        mode: i.reviewMode,
+        means: i.reviewMode === "fully_auto"
+          ? "a merge the user asked for happens once the review approves, without asking them (what the repository itself requires still holds it)"
+          : "a high-risk approval or merge waits for the user's confirmation",
+      }
+      : null,
+    acts_at_once: of("at_once"),
+    asks_first: of("card_first"),
+    reads: of("reads"),
+    ...(unclassified.length ? { unclassified } : {}),
+    lookups: { web: i.lookups.web, github: i.lookups.github, systems: [...i.lookups.systems] },
+    channels: [...i.channels],
+  };
+}
+
+/** The chat apps the assistant is talked to in: those with a surface of their own and the one this message came through. */
+export function channelsOf(current?: string): string[] {
+  return sorted([...Object.keys(CHAT_SURFACES), ...(current ? [chatSurface(current).channel] : [])]);
+}
+
+/** What the list of a user is built from, read now; `sessionId` is their router session (null: none yet). */
+export async function capabilityInputs(
+  q: Querier, userId: string, sessionId: string | null, tools: readonly string[], channel?: string,
+  deps: {
+    features?: DeploymentFeatures;
+    systems?: (userId: string) => Promise<readonly string[]>;
+    github?: (sessionId: string) => Promise<boolean>;
+  } = {},
+): Promise<CapabilityInputs> {
+  const systems = await (deps.systems ?? (async (u: string) => (await routerReadTools(u))?.servers ?? []))(userId);
+  const github = sessionId
+    ? await (deps.github ?? (async (s: string) => Object.keys(await githubMcpServers(s)).length > 0))(sessionId)
+    : false;
+  const { mode } = await getReviewMode({ query: (t: string, p?: unknown[]) => q(t, p) } as never, userId);
+  return {
+    tools, features: deps.features ?? deploymentFeatures(), lookups: { web: true, github, systems }, reviewMode: mode,
+    channels: channelsOf(channel),
+  };
+}

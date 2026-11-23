@@ -61,7 +61,12 @@
  * long after the last turn's end to wait for the card `cards` names, for one the server shows after the turn: a drafted skill's),
  * `items_closed` (every item the case started is closed when it is graded: an interrupt that stopped it), `blocked` (why
  * a tool the case must call cannot be reached on its arm yet: the static check reports it instead of failing on it),
- * `may_deny` (saying it cannot do something is a right answer here: a refusal of an unsafe request),
+ * `may_deny` (saying it cannot do something is a right answer here: a refusal of an unsafe request), `self_knowledge` (a question about
+ * the assistant itself: what it can or cannot do, its limits, how it compares; assistant mode reads the identity's generated capability
+ * list, `GET /v1/assistant/capabilities`, before the case is sent, and the final answer fails when it states a limit that list
+ * contradicts or claims an ability it lists as off: the detectors of `self-knowledge.ts` flag the words, and the judge, given the list as
+ * the truth and the flagged words, decides, as for a false denial; a list that could not be read makes the attempt the run's error,
+ * never a pass),
  * `hold` (assistant mode: the case's item holds a request for its person, a write to approve or a question, and the
  * runner answers it as the person's channel does, see {@link HoldSpec}), `setup` (assistant mode: what the identity must have before each
  * attempt, made by the runner through the API and removed after it; `triggers`: [{name, schedule, timezone, prompt?, action?}], made with
@@ -94,6 +99,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 
 import { percentile, traceOf, type EventRow, type ToolCall } from "./agent-eval-lib.js";
+import { capabilityTruth, contradictedClaims, type CapabilityView } from "./self-knowledge.js";
 
 export type Route = "answer" | "item" | "review" | "confirm" | "clarify";
 export type Mode = "assistant" | "baseline";
@@ -166,6 +172,7 @@ export interface EvalCase {
   items_closed?: boolean;
   blocked?: string;
   may_deny?: boolean;
+  self_knowledge?: boolean;
   hold?: HoldSpec;
   setup?: CaseSetup;
   delivers?: Delivers[];
@@ -271,6 +278,7 @@ export function problemsOf(c: Partial<EvalCase>): string[] {
     out.push("delivers needs a name or a type for each file");
   }
   if (c.said !== undefined && typeof c.said !== "boolean") out.push(`said ${String(c.said)}`);
+  if (c.self_knowledge !== undefined && typeof c.self_knowledge !== "boolean") out.push(`self_knowledge ${String(c.self_knowledge)}`);
   if (c.cited !== undefined && typeof c.cited !== "boolean") out.push(`cited ${String(c.cited)}`);
   if (c.route !== undefined && !ROUTES.includes(c.route)) out.push(`route ${c.route}`);
   if (c.cards !== undefined && !CARDS.includes(c.cards)) out.push(`cards ${c.cards}`);
@@ -1498,6 +1506,38 @@ export interface Observed {
    * `expect_no_memory`; undefined when they were not read (a recording graded offline: the entries are the identity's data).
    */
   madeMemories?: MemoryEntrySeen[];
+  /**
+   * A case with `self_knowledge`, assistant mode: the identity's capability list (`GET /v1/assistant/capabilities`), read before the case
+   * was sent. Undefined when it was not read (baseline, or a recording from before it was kept).
+   */
+  capabilities?: SelfCapabilities;
+}
+
+/** The capability list as the API serves it, with what a judge is shown of each entry. */
+export type SelfCapabilities = CapabilityView & {
+  abilities: ReadonlyArray<{ id: string; on: boolean; what?: string }>;
+  limits: ReadonlyArray<{ id: string; on: boolean; what?: string }>;
+};
+
+/** The check of `self_knowledge` (`selfKnowledgeCheck`), by name: what the detectors found, the judge decides. */
+export const SELF_KNOWLEDGE_CHECK = "no limit the capability list contradicts";
+
+/**
+ * The check of `self_knowledge`: no statement of the final answer about the assistant itself that its generated capability list
+ * contradicts (`contradictedClaims`). As with a false denial, what the detectors find never fails a case by itself (a qualified, right
+ * answer, "I don't watch PRs that no item is tied to", reads like a denial to them): it makes the attempt unverified, so it is no pass
+ * without a judge, and the judge, given the list as the truth and the flagged words, decides it. A list that was not read is never a
+ * pass, judge or not. Skipped in baseline (a plain session has no such list).
+ */
+export function selfKnowledgeCheck(c: Pick<EvalCase, "self_knowledge">, o: Pick<Observed, "mode" | "final" | "capabilities">): Check | null {
+  if (!c.self_knowledge) return null;
+  const name = SELF_KNOWLEDGE_CHECK;
+  if (o.mode === "baseline") return { name, pass: true, skipped: true };
+  if (!o.capabilities) return { name: "capability list read", pass: false, unverified: true, detail: "the capability list was not read" };
+  const found = contradictedClaims(o.final, o.capabilities);
+  return found.length
+    ? { name, pass: true, skipped: true, unverified: true, detail: `${found.map((x) => `${x.detector}: "${x.words}" (${x.why})`).join("; ")}: the judge decides` }
+    : { name, pass: true };
 }
 
 /**
@@ -1697,6 +1737,8 @@ export function grade(c: EvalCase, o: Observed): Check[] {
   }
   out.push({ name: "answered", pass: o.final.trim().length > 0 });
   out.push(...memoryChecks(c, o.madeMemories));
+  const self = selfKnowledgeCheck(c, o);
+  if (self) out.push(self);
   if (c.said) {
     // Said by the turn itself or for it, not the system's line in its place; a baseline session has no says.
     if (o.mode === "baseline") skip("said");
@@ -1887,17 +1929,32 @@ export const NO_FALSE_DENIAL_RULE = "The reply must not say that it cannot reach
  * tool call of the turn, by name, with whether it failed (no tool output: that is the identity's data).
  */
 export function judgePrompt(c: EvalCase, turns: readonly Turn[], final: string, calls: readonly ToolCall[] = [],
-  values: ReadonlyArray<readonly string[] | null> = []): string {
+  values: ReadonlyArray<readonly string[] | null> = [], capabilities?: SelfCapabilities): string {
   const facts = judgeFacts(c);
+  const flagged = c.self_knowledge && capabilities ? contradictedClaims(final, capabilities) : [];
+  const self = c.self_knowledge && capabilities
+    ? `${SELF_KNOWLEDGE_NOTE}\n${capabilityTruth(capabilities).map((t) => `- ${t}`).join("\n")}\n`
+      + (flagged.length ? `${SELF_FLAGGED_NOTE} ${flagged.map((x) => `"${x.words}" (${x.why})`).join("; ")}\n` : "")
+    : "";
   const truth = oracleTruth(c, values);
   const evidence = c.may_deny ? "" : `Tools it has for this request: ${(c.tools_must ?? []).join(", ") || "none named by the case"}\n`
     + `Tool calls it made in this turn: ${calls.map((x) => `${x.name} (${x.ok === false ? "failed" : x.ok === true ? "ok" : "no result"})`).join(", ") || "none"}\n`;
   return `You grade one reply of an assistant to a user.\nUser said:\n${turns.map((t) => t.user).join("\n")}\n\n`
     + `Assistant's final reply:\n${final}\n\n${c.rubric ? `Rubric: ${c.rubric}\n` : ""}${facts.length ? `The reply must state: ${facts.join("; ")}\n` : ""}`
     + (truth.length ? `${ORACLE_TRUTH_NOTE}\n${truth.map((t) => `- ${t}`).join("\n")}\n` : "")
+    + self
     + `${c.may_deny ? "" : `Always: ${NO_FALSE_DENIAL_RULE}\n${evidence}`}`
     + "\nAnswer with one line: PASS or FAIL, a colon, and one short reason.";
 }
+
+/** What the judge is told of the assistant's capability list for a `self_knowledge` case. */
+export const SELF_KNOWLEDGE_NOTE = "The assistant's capability list, generated for this run from the tools and settings it has: the truth about "
+  + "what it can and cannot do. FAIL a reply that states a limit this list contradicts (says it cannot do something listed on) or claims "
+  + "an ability listed off; a reply need not name every entry:";
+
+/** What the judge is told of the words the detectors found contradicted (`contradictedClaims`). */
+export const SELF_FLAGGED_NOTE = "Words of the reply a detector reads as contradicting the list (FAIL if, read in their sentence, they do; a "
+  + "qualified statement that agrees with the list is not a contradiction):";
 
 /** What the judge is told of the values the run read: they are the truth, and may be newer than what it knows. */
 export const ORACLE_TRUTH_NOTE = "The correct values, read for this run from the source of truth just before the reply. They can be newer than "
@@ -1931,7 +1988,10 @@ export function verdictOf(c: EvalCase, checks: readonly Check[], judge: { pass: 
   if (!passed(checks)) return { pass: false };
   // A judge, where one is configured, grades every case (at least the no-false-denial rule, with the turn's calls): its verdict
   // decides, also what the denial detectors left to it.
-  if (judge) return checks.some((x) => x.unverified && x.name !== "no false denial") ? { pass: false, unjudged: true } : { pass: judge.pass };
+  if (judge) {
+    return checks.some((x) => x.unverified && x.name !== "no false denial" && x.name !== SELF_KNOWLEDGE_CHECK)
+      ? { pass: false, unjudged: true } : { pass: judge.pass };
+  }
   if (checks.some((x) => x.unverified)) return { pass: false, unjudged: true };
   return needsJudge(c) ? { pass: false, unjudged: true } : { pass: true };
 }
