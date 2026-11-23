@@ -802,6 +802,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     // (a withdraw sent right after a prompt takes that prompt back) and the item counts them in that order.
     const ordered = type === "prompt" || type === "cancel" || type === "withdraw";
     const out = ordered ? await inRemoteSessionOrder(sessionId, send) : await send();
+    // `files`: how many files the prompt carries on to the machine, so a client can tell a Claw that took them from one
+    // that knows no `files` field (and dropped them unread).
+    const files = type === "prompt" ? { files: ((parsed.value as { files?: unknown[] }).files ?? []).length } : {};
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");
     if (out.status === "gone") return notFound(reply);
     if (out.status === "terminal_hook_session") return fail(reply, 409, "terminal_hook_session");
@@ -809,11 +812,15 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       const same = out.row.type === type && out.row.session_id === sessionId
         && (type !== "decision" || out.row.payload?.option_id === (parsed.value as { option_id: string }).option_id);
       if (!same) return fail(reply, 409, type === "decision" ? "already_decided" : "idempotency_key_reused");
-      return reply.send({ ok: true, data: { cmd_id: cmdId, duplicate: true } });
+      // (a repeat says the files too, as many as the original carried, not this request: a client that lost the first answer
+      // still learns whether they were taken, and a repeat that adds files is not told they went)
+      const kept = out.row.payload?.files;
+      const original = type === "prompt" ? { files: Array.isArray(kept) ? kept.length : 0 } : {};
+      return reply.send({ ok: true, data: { cmd_id: cmdId, duplicate: true, ...original } });
     }
     waker.wake(`c:${session.connector_id}`);
     return reply.status(202).send({
-      ok: true, data: { cmd_id: cmdId, cmd_seq: Number(out.row.cmd_seq), connector_online: !!connector.online },
+      ok: true, data: { cmd_id: cmdId, cmd_seq: Number(out.row.cmd_seq), connector_online: !!connector.online, ...files },
     });
   }
 

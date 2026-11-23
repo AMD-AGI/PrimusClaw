@@ -10,7 +10,7 @@ import type { InboundMessage, UserRef } from "../ports/surface.js";
 import { splitOnce } from "../text/py-text.js";
 import type { Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
-import type { PersonalText } from "./personal-text.js";
+import { FILES_ONLY, type PersonalText } from "./personal-text.js";
 import { fitQuote, roomAfter } from "./session-files.js";
 import { wireOf } from "./personal-router.js";
 
@@ -91,12 +91,21 @@ export class GroupRemote {
       : words.quote;
     const said = messageText.withQuote(words.sent, fitQuote(quoted, words.sent));
     await this.text.attachments(message, chat, true); // (the ones Teams would not let us read: the person is told)
-    // (as in 1:1: text files inline after the words, the person told about the rest; a forward's images are among the
-    // message's files)
-    const inline = await this.text.toSession(message, chat, roomAfter(said));
-    const prompt = [said, inline].filter(Boolean).join("\n\n");
+    // (as in 1:1: text files inline after the words, other files to the session's machine where it takes them, the
+    // person told about the rest; a forward's images are among the message's files)
+    const toMachine = await this.text.toSession(message, chat, bound.id, key, roomAfter(said));
+    let prompt = [said, toMachine.section].filter(Boolean).join("\n\n");
+    if (!prompt && toMachine.files.length > 0) prompt = FILES_ONLY;
     if (!prompt) return message.files.length > 0; // (files alone, none of which could go: the person was told)
-    await remote.prompt({ message, chat: bound, credential: key, prompt, conversation: chat.conversation, provider });
+    await remote.prompt({
+      message,
+      chat: bound,
+      credential: key,
+      prompt,
+      conversation: chat.conversation,
+      provider,
+      ...(toMachine.files.length ? { files: toMachine.files } : {}),
+    });
     return true;
   }
 }

@@ -15,7 +15,7 @@ import { getEventListeners } from "node:events";
 import { processStart } from "../src/children.js";
 import { sleep } from "../src/util.js";
 import { FakeClaw } from "./support/fake-claw.js";
-import { disconnectsFile, identityFile, identityKeepFile } from "../src/paths.js";
+import { disconnectsFile, identityFile, identityKeepFile, uploadsDir } from "../src/paths.js";
 import { Harness, tmpdir } from "./support/harness.js";
 
 const hs: Harness[] = [];
@@ -1633,5 +1633,51 @@ describe("a session opened and never used, across a restart", () => {
     const end = await h.turnEnd(sid, 2);
     assert.equal(end.data.stopReason, "error");
     assert.ok(!h.adapterLog().slice(-5).some((l) => l.method === "session/new"));
+  });
+});
+
+describe("files sent with a prompt", () => {
+  const b64 = (text: string) => Buffer.from(text).toString("base64");
+
+  test("are saved on this machine for this user only, named in the prompt by their paths, and the agent opens them", async () => {
+    const h = await make();
+    await h.claw.until("a heartbeat", () => h.claw.heartbeats.length > 0);
+    const agents = h.claw.heartbeats.at(-1)!.agents as Array<{ capabilities: Record<string, unknown> }>;
+    assert.ok(agents.length > 0 && agents.every((a) => a.capabilities.prompt_files === true));
+    const sid = await h.newSession();
+    const files = [
+      { name: "notes.txt", media_type: "text/plain", data: b64("hello from the chat") },
+      { name: "image-1.png", media_type: "image/png", data: b64("PNG bytes") },
+    ];
+    h.prompt(sid, "open files", { files, cmd_id: "p-files" });
+    await h.turnEnd(sid);
+    assert.deepEqual(h.messages(sid), ["notes.txt=hello from the chat;image-1.png=PNG bytes"]);
+    const dir = path.join(uploadsDir(h.dirs), sid);
+    const [folder, ...more] = fs.readdirSync(dir);
+    assert.ok(folder !== undefined && more.length === 0);
+    assert.equal(fs.statSync(path.join(dir, folder)).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(path.join(dir, folder, "notes.txt")).mode & 0o777, 0o600);
+    // the audit trail counts them, and never holds their bytes
+    const saved = h.audit().filter((r) => r.kind === "prompt_files_saved");
+    assert.equal(saved.length, 1, JSON.stringify(h.audit().slice(-5)));
+    assert.ok(!JSON.stringify(h.audit()).includes(b64("hello from the chat")));
+    // a closed session's files are removed with it
+    h.claw.issue("close", sid);
+    await h.claw.until("closed", () => h.claw.eventsOf(sid, "session_closed")[0]);
+    await h.claw.until("its files removed", () => !fs.existsSync(dir));
+  });
+
+  test("files this connector cannot take are said to be missing in the prompt, and the words still go", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    // (Claw refuses such a name; a connector checks again what it is sent)
+    h.prompt(sid, "open files", { files: [{ name: "../escape.txt", media_type: "text/plain", data: b64("x") }] });
+    await h.turnEnd(sid);
+    assert.deepEqual(h.messages(sid), ["no files"]);
+    assert.ok(!fs.existsSync(path.join(uploadsDir(h.dirs), "..", "escape.txt")));
+    assert.ok(!fs.existsSync(path.join(uploadsDir(h.dirs), sid)));
+    const refused = h.audit().filter((r) => r.kind === "prompt_files_refused");
+    assert.equal(refused.length, 1);
+    assert.equal(refused[0].reason, "invalid_file_name");
   });
 });

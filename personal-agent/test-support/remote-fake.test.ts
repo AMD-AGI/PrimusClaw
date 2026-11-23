@@ -87,7 +87,7 @@ test("a session is the owner's alone and refusals carry Claw's error words", asy
     { "Idempotency-Key": "k1" },
   );
   assert.equal(first.status, 202);
-  assert.deepEqual(again.body.data, { cmd_id: "k:k1", duplicate: true });
+  assert.deepEqual(again.body.data, { cmd_id: "k:k1", duplicate: true, files: 0 });
   assert.equal(srv.commandsOf("prompt").length, 1);
   await srv.ask(sid, "a1", "Bash", CODEX_OPTIONS);
   assert.equal(

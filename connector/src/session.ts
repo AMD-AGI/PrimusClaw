@@ -31,6 +31,7 @@ import { hintFor, withHint } from "./hints.js";
 import {
   PermissionBook, boundedInput, matchAutoAllow, normalizeOptions, type OfferedOption,
 } from "./permissions.js";
+import { dropSessionFiles } from "./prompt-files.js";
 import { redactDeep } from "./redact.js";
 import type { SessionStore } from "./session-store.js";
 import { errMessage, isObject, sleep, truncateBytes, verdictOf, type Logger, type MayRun } from "./util.js";
@@ -126,6 +127,8 @@ export interface SessionEnv {
   attach: ReadonlyMap<string, AttachSupport>;
   timing: SessionTiming;
   logDir: string;
+  /** Where the files a prompt carries are saved (`prompt-files.ts`); absent, a prompt's files are not taken. */
+  uploadDir?: string;
   version: string;
   log: Logger;
 }
@@ -1655,6 +1658,8 @@ export class Session {
     const a = this.adapter;
     if (a && this.acpId && (a.caps.sessionCapabilities as AcpParams | undefined)?.close) await a.request("session/close", { sessionId: this.acpId }, 5_000).catch(() => undefined);
     await this.dropAdapter();
+    // (however it ended, closed from the chat or from its own side, the files sent to it go with it)
+    if (this.env.uploadDir) dropSessionFiles(this.env.uploadDir, this.id);
     this.env.store.patch(this.id, { status: "closed" });
     this.audit("session_closed", { reason });
     this.emit("session_closed", withHint({ reason }, this.agent));

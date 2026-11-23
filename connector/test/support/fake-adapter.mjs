@@ -125,6 +125,14 @@ async function prompt(id, params) {
     })();
     return done("end_turn");
   }
+  // `open files`: open each file the prompt names by its path (prompt-files.ts's lines), and say its name and first bytes
+  if (text.startsWith("open files")) {
+    const opened = [...text.matchAll(/^- (\/.+) \([^,]+, [0-9]+ bytes\)$/gm)].map(([, file]) => {
+      try { return `${path.basename(file)}=${fs.readFileSync(file, "utf8").slice(0, 20)}`; } catch (e) { return `${path.basename(file)}!${e.code}`; }
+    });
+    update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: opened.join(";") || "no files" } });
+    return done("end_turn");
+  }
   if (text.startsWith("say ")) {
     update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: text.slice(4) } });
     return done("end_turn");

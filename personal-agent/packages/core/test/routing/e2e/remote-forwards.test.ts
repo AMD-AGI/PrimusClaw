@@ -6,10 +6,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { InboundFile, InboundForward } from "@primusclaw/personal-agent";
+import type { Conversation, InboundFile, InboundForward, OutMessage } from "@primusclaw/personal-agent";
 
 import type { FakeRemote } from "../../../../../test-support/remote-fake.js";
 import { ALICE as CLAW_ALICE, Script } from "../../../../../test-support/remote-world.js";
+import { message } from "../world.js";
 import { attachedThroughRouter, routed, TWO_AGENTS, type Routed } from "./remote-routed.js";
 
 async function oneTurn(srv: FakeRemote, sid: string): Promise<void> {
@@ -90,6 +91,158 @@ test("files alone, with no words, go to the session as their text", () =>
     { remote: { files: { "notes.md": { mediaType: "text/markdown", bytes: bytes("# hi\n") } } } },
   ));
 
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+
+/** Alice's chat attached to a session of an agent whose connector takes files (`prompt_files`) when `files` is true. */
+async function attachedTo(w: Routed, files: boolean, script = new Script()): Promise<void> {
+  w.rw.server.addConnector(CLAW_ALICE, "dev-pod", TWO_AGENTS, files ? { caps: { codex: { prompt_files: true } } } : {});
+  w.rw.server.onCommand = script.hook;
+  await w.say("/agent new codex /home/me/repo");
+  assert.ok(w.attachedSession(), w.rw.said().join("\n"));
+  script.onPrompt = oneTurn;
+}
+
+const IMAGE: InboundFile = { name: "", type: "", handle: { kind: "pasted", index: 1 } };
+
+test("an image sent to a chat attached to a machine that takes files goes to it as a file, with the words", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, true);
+      const before = w.rw.said().length;
+      await w.say("what is on this screen?", {
+        files: [
+          { ...IMAGE, name: "image-1.png" },
+          { name: "build.log", type: "log", handle: {} },
+        ],
+      });
+      const [prompt, ...more] = w.rw.server.commandsOf("prompt").map((c) => c.body);
+      assert.ok(prompt !== undefined && more.length === 0);
+      assert.equal(
+        prompt["text"],
+        `what is on this screen?\n\nThe file sent with this message:\n\nFile build.log (${String(bytes(LOG).length)} bytes):\n\`\`\`\`\n${LOG}\n\`\`\`\``,
+      );
+      assert.deepEqual(prompt["files"], [
+        { name: "image-1.png", media_type: "image/png", data: Buffer.from(PNG).toString("base64") },
+      ]);
+      const told = w.rw.said().slice(before).join("\n");
+      assert.doesNotMatch(told, /not passed on|没有交给/u, told);
+    },
+    {
+      remote: {
+        files: {
+          "image-1.png": { mediaType: "image/png", bytes: PNG },
+          "build.log": { mediaType: "text/plain", bytes: bytes(LOG) },
+        },
+      },
+    },
+  ));
+
+test("files alone, to a machine that takes them, go with a line that says so", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, true);
+      await w.say("", { files: [{ ...IMAGE, name: "image-1.png" }] });
+      const [prompt] = w.rw.server.commandsOf("prompt").map((c) => c.body);
+      assert.ok(prompt !== undefined);
+      assert.equal(prompt["text"], "The person sent the files below with no words.");
+      assert.equal((prompt["files"] as unknown[]).length, 1);
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
+  ));
+
+test("a machine whose connector does not take files gets the words; the image is named back with what would send it", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, false);
+      const before = w.rw.said().length;
+      await w.say("look", { files: [{ ...IMAGE, name: "image-1.png" }] });
+      const [prompt] = w.rw.server.commandsOf("prompt").map((c) => c.body);
+      assert.deepEqual(prompt, { type: "prompt", text: "look" });
+      const told = w.rw.said().slice(before).join("\n");
+      assert.match(
+        told,
+        /`image-1.png` \(a session takes text, and this is not a text file\).*once it is upgraded/su,
+        told,
+      );
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
+  ));
+
+test("a Claw that drops a prompt's files unread: the words went, and the person is told the files did not", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, true);
+      w.rw.server.takesPromptFiles = false;
+      const before = w.rw.said().length;
+      await w.say("look", { files: [{ ...IMAGE, name: "image-1.png" }] });
+      assert.deepEqual(
+        w.rw.server.commandsOf("prompt").map((c) => c.body),
+        [{ type: "prompt", text: "look" }],
+      );
+      assert.match(w.rw.said().slice(before).join("\n"), /the files sent with them did not/u);
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
+  ));
+
+test("a Claw that drops a prompt's files: a redelivery of the message does not tell the person again", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, true);
+      w.rw.server.takesPromptFiles = false;
+      const before = w.rw.said().length;
+      const m = { ...message("look", { id: "act-redelivered" }), files: [{ ...IMAGE, name: "image-1.png" }] };
+      await w.r.router.handle(m);
+      await w.rw.idle();
+      // (redelivered after the record that it was handled is lost, as a restart loses it: it reaches Claw again)
+      const idempotency = w.rw.test.store.idempotency;
+      const seen = Object.getOwnPropertyDescriptor(idempotency, "seen");
+      Object.defineProperty(idempotency, "seen", { value: () => false, configurable: true, writable: true });
+      try {
+        await w.r.router.handle(m); // (the person is told, or not, as the send answers: before its turn is read)
+      } finally {
+        if (seen) Object.defineProperty(idempotency, "seen", seen);
+        else delete (idempotency as { seen?: unknown }).seen;
+      }
+      assert.equal(w.rw.server.commandsOf("prompt").length, 1); // (Claw kept one prompt: the repeat was a duplicate)
+      const told = w.rw.said().slice(before).join("\n");
+      assert.equal(told.split("the files sent with them did not").length - 1, 1, told);
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
+  ));
+
+test("a Claw that drops a prompt's files while the chat cannot be told: the prompt still went, and its turn is read", () =>
+  routed(
+    async (w) => {
+      await attachedTo(w, true);
+      w.rw.server.takesPromptFiles = false;
+      // Teams refuses the line that says the files did not go (the channel the router posts with, not the world's wrap).
+      const proto = Object.getPrototypeOf(
+        w.rw.surface.conversation({ id: "x", kind: "personal", tenantId: "", wire: {} }),
+      ) as Pick<Conversation, "send">;
+      const send = proto.send; // (called back with its `this`)
+      proto.send = function (this: Conversation, message: OutMessage): Promise<void> {
+        if (JSON.stringify(message).includes("the files sent with them did not")) {
+          return Promise.reject(new Error("Teams said no"));
+        }
+        return send.call(this, message);
+      };
+      const before = w.rw.said().length;
+      try {
+        await w.say("look", { files: [{ ...IMAGE, name: "image-1.png" }] });
+      } finally {
+        proto.send = send;
+      }
+      assert.deepEqual(
+        w.rw.server.commandsOf("prompt").map((c) => c.body),
+        [{ type: "prompt", text: "look" }],
+      );
+      const told = w.rw.said().slice(before).join("\n");
+      assert.match(told, /Done\./u, told); // (the session's answer is read: the prompt counts as sent)
+      assert.doesNotMatch(told, /did not|unreachable|could not/u, told); // (the refused line was never posted)
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
+  ));
+
 test("a reply quoting the session card that also forwards a message: the card is not sent on, the forward is", () =>
   routed(async (w) => {
     const script = new Script();
@@ -143,6 +296,83 @@ test("a forward longer than one prompt to a session takes is cut to fit, the per
       assert.match(w.rw.said().slice(before).join("\n"), /`build\.log` \(the files before it filled/u);
     },
     { remote: { files: { "build.log": { mediaType: "text/plain", bytes: bytes(LOG) } } } },
+  ));
+
+/** Alice's group bound to a session of hers on a machine whose connector takes files when `files` is true. */
+async function boundGroupTo(w: Routed, files: boolean): Promise<void> {
+  w.rw.server.addConnector(
+    CLAW_ALICE,
+    "dev-pod",
+    TWO_AGENTS,
+    files ? { caps: { claude: { prompt_files: true } } } : {},
+  );
+  const script = new Script();
+  script.onPrompt = oneTurn;
+  w.rw.server.onCommand = script.hook;
+  await w.say("/agent new claude /home/me/repo");
+  await w.say("/agent detach");
+  await w.say("切到 dev-pod 上的 claude 会话", { group: true });
+  assert.ok(w.rw.test.store.remoteState.attachedRemote("aad-a#g-1")?.sessionId, w.rw.said().join("\n"));
+}
+
+const GROUP_FORWARD: readonly InboundForward[] = [
+  { messageId: "2", author: "Carol", text: "see [image-1]", sentAt: "", source: "reference" },
+];
+
+test("a bound group's forward with an image and a text file: the text inline, the image to a machine that takes files", () =>
+  routed(
+    async (w) => {
+      await boundGroupTo(w, true);
+      const before = w.rw.said().length;
+      await w.say("what is wrong here?", {
+        group: true,
+        forwards: GROUP_FORWARD,
+        files: [
+          { ...IMAGE, name: "image-1.png" },
+          { name: "build.log", type: "log", handle: {} },
+        ],
+      });
+      const [prompt, ...more] = w.rw.server.commandsOf("prompt").map((c) => c.body);
+      assert.ok(prompt !== undefined && more.length === 0, w.rw.said().join("\n"));
+      const text = String(prompt["text"]);
+      assert.match(text, /Forwarded message from Carol:\n> see \[image-1\]/u, text);
+      assert.match(text, /what is wrong here\?\n\nThe file sent with this message:\n\nFile build\.log/u, text);
+      assert.deepEqual(prompt["files"], [
+        { name: "image-1.png", media_type: "image/png", data: Buffer.from(PNG).toString("base64") },
+      ]);
+      const told = w.rw.said().slice(before).join("\n");
+      assert.doesNotMatch(told, /not passed on|没有交给/u, told);
+    },
+    {
+      remote: {
+        files: {
+          "image-1.png": { mediaType: "image/png", bytes: PNG },
+          "build.log": { mediaType: "text/plain", bytes: bytes(LOG) },
+        },
+      },
+    },
+  ));
+
+test("a bound group's forwarded image to a machine that takes no files: the words go and the person is told the image did not", () =>
+  routed(
+    async (w) => {
+      await boundGroupTo(w, false);
+      const before = w.rw.said().length;
+      await w.say("what is wrong here?", {
+        group: true,
+        forwards: GROUP_FORWARD,
+        files: [{ ...IMAGE, name: "image-1.png" }],
+      });
+      const [prompt, ...more] = w.rw.server.commandsOf("prompt").map((c) => c.body);
+      assert.ok(prompt !== undefined && more.length === 0, w.rw.said().join("\n"));
+      assert.equal(prompt["files"], undefined);
+      assert.match(String(prompt["text"]), /> see \[image-1\]/u);
+      assert.match(
+        w.rw.said().slice(before).join("\n"),
+        /`image-1.png` \(a session takes text, and this is not a text file\)/u,
+      );
+    },
+    { remote: { files: { "image-1.png": { mediaType: "image/png", bytes: PNG } } } },
   ));
 
 /** Alice's group bound to a session of hers on dev-pod. */
