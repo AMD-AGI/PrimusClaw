@@ -812,8 +812,11 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       const same = out.row.type === type && out.row.session_id === sessionId
         && (type !== "decision" || out.row.payload?.option_id === (parsed.value as { option_id: string }).option_id);
       if (!same) return fail(reply, 409, type === "decision" ? "already_decided" : "idempotency_key_reused");
-      // (a repeat says the files too: a client that lost the first answer still learns they were taken)
-      return reply.send({ ok: true, data: { cmd_id: cmdId, duplicate: true, ...files } });
+      // (a repeat says the files too, as many as the original carried, not this request: a client that lost the first answer
+      // still learns whether they were taken, and a repeat that adds files is not told they went)
+      const kept = out.row.payload?.files;
+      const original = type === "prompt" ? { files: Array.isArray(kept) ? kept.length : 0 } : {};
+      return reply.send({ ok: true, data: { cmd_id: cmdId, duplicate: true, ...original } });
     }
     waker.wake(`c:${session.connector_id}`);
     return reply.status(202).send({

@@ -546,6 +546,12 @@ describe("remote agents", { skip }, () => {
       // a prompt without files says it carries none
       const plain = await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", text: "and now?" });
       assert.equal(plain.body.data.files, 0);
+      // a repeat (same key) is answered with the files the queued original carries, whatever the repeat itself carries
+      const keyed = (body: Record<string, unknown>) =>
+        as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, { type: "prompt", ...body }, { "idempotency-key": "files-repeat" });
+      assert.equal((await keyed({ text: "first", files })).body.data.files, 1);
+      const repeat = await keyed({ text: "first" });
+      assert.deepEqual([repeat.body.data.duplicate, repeat.body.data.files], [true, 1]);
       const refused = await as("u1").post(`/v1/remote-agents/sessions/${sid}/commands`, {
         type: "prompt", text: "x", files: [{ name: "../x", media_type: "text/plain", data: "eA==" }],
       });
@@ -957,6 +963,10 @@ describe("remote agents", { skip }, () => {
 
       const retry = await send(sid, "prompt", "lost-reply", { text: "once" });
       assert.deepEqual([retry.status, retry.body.data], [200, { cmd_id: "k:lost-reply", duplicate: true, files: 0 }]);
+      // (a repeat that carries files the original did not is told the files the original carried: none went)
+      const image = [{ name: "a.png", media_type: "image/png", data: "eA==" }];
+      const more = await send(sid, "prompt", "lost-reply", { text: "once", files: image });
+      assert.deepEqual([more.status, more.body.data], [200, { cmd_id: "k:lost-reply", duplicate: true, files: 0 }]);
       assert.equal(await queued("prompt"), "0", "the retry queued nothing, so the agent does not run the prompt twice");
       const audited = (await as("u1").get(`/v1/remote-agents/audit?session_id=${sid}`)).body.data
         .filter((r: any) => r.action === "command.issued" && r.detail.type === "prompt");
@@ -971,6 +981,12 @@ describe("remote agents", { skip }, () => {
       // A different key is a different command.
       const mine = await send(sid, "prompt", "fresh-key", { text: "next" });
       assert.equal(mine.status, 202);
+      // A prompt with a file, acknowledged, then repeated: the repeat is told the file the original carried.
+      const withFile = await send(sid, "prompt", "lost-files", { text: "see", files: image });
+      assert.deepEqual([withFile.status, withFile.body.data.files], [202, 1]);
+      assert.equal((await heartbeat("u1", cid, { cmd_cursor: withFile.body.data.cmd_seq })).status, 200);
+      const repeated = await send(sid, "prompt", "lost-files", { text: "see", files: image });
+      assert.deepEqual([repeated.status, repeated.body.data], [200, { cmd_id: "k:lost-files", duplicate: true, files: 1 }]);
     });
 
     test("closing a session closes it for further commands", async () => {

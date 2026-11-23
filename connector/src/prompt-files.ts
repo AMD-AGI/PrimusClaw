@@ -42,6 +42,15 @@ function plainFolder(dir: string): boolean {
   }
 }
 
+/** Whether `file` exists as a symbolic link. */
+function isLink(file: string): boolean {
+  try {
+    return fs.lstatSync(file).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 /** Refuses `dir` when it is a symbolic link, or anything but a folder: a file saved through it could land anywhere. */
 function ownFolder(dir: string): void {
   if (!plainFolder(dir)) throw new Error(`refused a folder that is not a plain folder: ${dir}`);
@@ -67,7 +76,9 @@ export function savePromptFiles(root: string, sid: string, cmdId: string, files:
     const file = path.join(dir, f.name);
     if (path.dirname(file) !== dir || f.name.startsWith(".")) throw new Error(`refused a file name: ${JSON.stringify(f.name)}`);
     const bytes = Buffer.from(f.data, "base64");
-    // (a redelivered prompt finds its files already there: they are the same bytes, written again)
+    // (a redelivered prompt finds its files already there: they are the same bytes, written again; a link at the name is
+    // refused before the open too, for a platform that has no O_NOFOLLOW)
+    if (isLink(file)) throw new Error(`refused a file that is a symbolic link: ${JSON.stringify(f.name)}`);
     const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | NO_FOLLOW, 0o600);
     try {
       fs.writeFileSync(fd, bytes);
