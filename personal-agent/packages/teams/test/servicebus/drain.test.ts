@@ -19,7 +19,7 @@ import {
   SESSION_HOLD_MS,
   SETTLE_DEADLINE_MS,
 } from "../../src/servicebus/consumer.js";
-import { LOCK_RENEWAL_MS } from "../../src/assembly/outbound.js";
+import { HANDLER_MARGIN_MS, LOCK_RENEWAL_MS } from "../../src/assembly/outbound.js";
 import { turn } from "@primusclaw/personal-agent";
 import { received } from "./fakes.js";
 
@@ -358,9 +358,128 @@ test(
   },
 );
 
-test("the lock renewal outlasts a held session, one more wait and a handler as long as a turn is followed", () => {
-  // (30 minutes of turn, 4 of hold and one minute's wait: the literal bound, not the formula the code uses)
+/**
+ * A broker with one session that keeps its lock the way the SDK does: renewed for `renewalMs` from the accept and then
+ * let go. A lock that lapses with a message in hand gives the message back to the queue (a redelivery, its count one
+ * higher), and the settlement of the receiver that had it fails as the SDK's does (SessionLockLost).
+ */
+class LockingBroker implements BusClient {
+  readonly queued: Received[];
+  redelivered = 0;
+  completed: string[] = [];
+  constructor(
+    private readonly clock: FakeClock,
+    private readonly renewalMs: number,
+    messages: Received[],
+  ) {
+    this.queued = [...messages];
+  }
+  sender(): BusSender {
+    throw new Error("not used");
+  }
+  acceptNextSession(): Promise<SessionReceiver> {
+    if (this.queued.length === 0)
+      return Promise.reject(Object.assign(new Error("no session"), { code: "ServiceTimeout" }));
+    const released = new AbortController();
+    let inHand: Received | undefined;
+    let lost = false;
+    this.clock.sleep(this.renewalMs, released.signal).then(
+      () => {
+        lost = true;
+        if (inHand === undefined) return;
+        this.redelivered += 1;
+        this.queued.unshift({ ...inHand, deliveryCount: (inHand.deliveryCount ?? 1) + 1 });
+        inHand = undefined;
+      },
+      () => undefined,
+    );
+    const settle = (message: Received): Promise<void> => {
+      if (lost || inHand !== message)
+        return Promise.reject(Object.assign(new Error("session lock lost"), { code: "SessionLockLost" }));
+      inHand = undefined;
+      return Promise.resolve();
+    };
+    return Promise.resolve({
+      receive: () => {
+        if (lost) return Promise.reject(Object.assign(new Error("session lock lost"), { code: "SessionLockLost" }));
+        const next = this.queued.shift();
+        if (next === undefined) return Promise.resolve([]);
+        inHand = next;
+        return Promise.resolve([next]);
+      },
+      complete: async (message) => {
+        await settle(message);
+        this.completed.push(message.messageId ?? "");
+      },
+      abandon: (message) =>
+        settle(message).then(() => {
+          this.queued.unshift(message);
+        }),
+      deadLetter: settle,
+      close: () => {
+        released.abort();
+        return Promise.resolve();
+      },
+    });
+  }
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+/**
+ * One message whose handler runs `handleMs` on the fake clock the first time (a redelivery is handled at once), on a
+ * broker renewing locks for `renewalMs`.
+ */
+async function longHandler(renewalMs: number, handleMs: number) {
+  const clock = new FakeClock();
+  const broker = new LockingBroker(clock, renewalMs, [
+    received(JSON.stringify({ type: "message" }), undefined, "m-1", 1),
+  ]);
+  let handled = 0;
+  const { consumer } = consumerOf(broker, clock, async () => {
+    handled += 1;
+    if (handled === 1) await clock.advance(handleMs); // (a turn followed for this long, on the fake clock)
+  });
+  const running = consumer.run();
+  for (let i = 0; i < 20; i += 1) {
+    await flushMicrotasks();
+    await clock.advance(1_000);
+  }
+  consumer.stop();
+  await running;
+  return { broker, handled };
+}
+
+test(
+  "a handler running past the old 5-minute renewal keeps its lock: the message is completed once, not redelivered",
+  T,
+  async () => {
+    const handleMs = turn.TURN_DEADLINE_SECONDS * 1000 + 5 * 60_000; // (the longest turn followed, and the work around it)
+    const { broker, handled } = await longHandler(LOCK_RENEWAL_MS, handleMs);
+    assert.equal(handled, 1);
+    assert.equal(broker.redelivered, 0);
+    assert.deepEqual(broker.completed, ["m-1"]);
+  },
+);
+
+test(
+  "the broker model is not vacuous: with the old 5-minute renewal the same handler's message is redelivered",
+  T,
+  async () => {
+    const handleMs = turn.TURN_DEADLINE_SECONDS * 1000 + 5 * 60_000;
+    const { broker, handled } = await longHandler(5 * 60_000, handleMs);
+    assert.equal(broker.redelivered, 1);
+    assert.equal(handled, 2); // (the request ran twice: the duplicate this renewal bound prevents)
+  },
+);
+
+test("the lock renewal outlasts a held session, one more wait, a followed turn and the work around it", () => {
+  // (the literal bound, not the formula the code uses: 30 minutes of turn, 4 of hold, one of wait, 10 of margin)
   assert.equal(turn.TURN_DEADLINE_SECONDS, 30 * 60);
-  assert.equal(LOCK_RENEWAL_MS >= (30 + 4 + 1) * 60_000, true);
-  assert.equal(SESSION_HOLD_MS + RECEIVE_DEADLINE_MS + turn.TURN_DEADLINE_SECONDS * 1000 <= LOCK_RENEWAL_MS, true);
+  assert.equal(LOCK_RENEWAL_MS >= (30 + 4 + 1 + 10) * 60_000, true);
+  assert.equal(
+    SESSION_HOLD_MS + RECEIVE_DEADLINE_MS + turn.TURN_DEADLINE_SECONDS * 1000 + HANDLER_MARGIN_MS + SETTLE_DEADLINE_MS,
+    LOCK_RENEWAL_MS,
+  );
 });
