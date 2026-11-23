@@ -11,9 +11,16 @@ import type { InboundFile, InboundMessage } from "../ports/surface.js";
 import type { Chat } from "./chat.js";
 import type { CommandTable } from "./command-table.js";
 import type { RouterContext } from "./context.js";
+import { inlineFiles } from "./session-files.js";
 import { logTurnStarted, type TurnStarter } from "./turn-start.js";
 
-const ELSEWHERE = "Files are not passed on from this chat while it talks to an agent; only your words were sent.";
+/** What the person is told about files that did not reach the session (names in code spans). */
+function notPassedLine(notPassed: readonly (readonly [string, string])[], zh: boolean): string {
+  const named = notPassed.map(([name, why]) => `\`${name.replaceAll("`", "'")}\` (${why})`).join("; ");
+  return zh
+    ? `这些文件没有交给会话：${named}。会话只收文字：文本文件会附在消息里一起发过去。`
+    : `These files were not passed on to the session: ${named}. A session takes text: text files go with the message, inline.`;
+}
 
 /**
  * A 1:1 message that is not one of the chat's commands, as it goes on (the Python `Agent._text_of`, `_on_text`,
@@ -101,12 +108,27 @@ export class PersonalText {
       metrics.filesDropped("unreadable", unreadable.count);
       await chat.say(unreadable.line);
     }
-    if (message.files.length > 0 && elsewhere) {
-      metrics.filesDropped("remote_agent", message.files.length);
-      await chat.say(ELSEWHERE);
-      return [];
-    }
+    if (message.files.length > 0 && elsewhere) return []; // (a session's are passed inline: `toSession`)
     return message.files;
+  }
+
+  /**
+   * The files of a message to the attached session, as text after the person's words (a session takes text only): the
+   * text files inline, and the person told about the rest.
+   */
+  private async toSession(message: InboundMessage, chat: Chat): Promise<string> {
+    if (message.files.length === 0) return "";
+    const { surface, metrics } = this.ctx.deps;
+    const inline = await inlineFiles(
+      message.files,
+      (file) => surface.fetchFile(file),
+      (file, index) => file.name || `image-${String(index)}`,
+    );
+    if (inline.notPassed.length > 0) {
+      metrics.filesDropped("remote_agent", inline.notPassed.length);
+      await chat.say(notPassedLine(inline.notPassed, chat.lang() === "zh"));
+    }
+    return inline.section;
   }
 
   /** What the chat is attached to, for the assistant (only where remote agents are on). */
@@ -125,10 +147,12 @@ export class PersonalText {
     const quote =
       toAgent && this.ctx.deps.remote.quotesWindow(userId, message) ? "" : messageText.quoteBlock(message, false);
     const sent = messageText.withLinks(text, message);
-    const prompt = messageText.withQuote(sent, quote);
     const files = await this.attachments(message, chat, toAgent);
+    // (to a session, the files go as text after the words; elsewhere they go as files)
+    const inline = toAgent ? await this.toSession(message, chat) : "";
+    const prompt = [messageText.withQuote(sent, quote), inline].filter(Boolean).join("\n\n");
     // (a choice picked on the assistant's card is an answer, never a switch of sessions)
-    const control = message.choice !== true && this.sessionControl(userId, prompt, toAgent, quote, files, text);
+    const control = message.choice !== true && this.sessionControl(userId, prompt, toAgent, quote, message.files, text);
     if (control && assistant.understands(userId)) {
       await this.understand(message, chat, key); // (the switch is put to the person as a button)
     } else if (prompt && toAgent && !control) {

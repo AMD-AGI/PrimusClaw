@@ -73,10 +73,35 @@ export function replaceTags(text: string, tags: readonly TagMatch[], by: string)
 export const REPLY_ITEMTYPE = new RegExp(caseless("schema.skype.com/Reply"), "u");
 
 /**
+ * The itemtype of a Forward blockquote: a message forwarded into this chat, one blockquote per message forwarded, after
+ * the forwarder's own words (`<p>FYI</p><blockquote itemtype="http://schema.skype.com/Forward">...</blockquote>`).
+ */
+export const FORWARD_ITEMTYPE = new RegExp(caseless("schema.skype.com/Forward"), "u");
+
+/** What `cutReplies` / `cutForwards` give: the markup without the blockquotes cut, and each one cut. */
+export interface CutBlockquotes {
+  readonly kept: string;
+  readonly cut: [attrs: string, inner: string][];
+}
+
+/**
  * (`markup` without its Reply blockquotes, [the attributes of each, what is inside it]). A blockquote inside a Reply
  * blockquote belongs to it; a blockquote that is not a Reply stays where it is; one never closed runs to the end.
  */
-export function cutReplies(markup: string): { kept: string; cut: [attrs: string, inner: string][] } {
+export function cutReplies(markup: string): CutBlockquotes {
+  return cutBlockquotes(markup, REPLY_ITEMTYPE);
+}
+
+/** `cutReplies` for Forward blockquotes: each message forwarded, and the forwarder's own words around them. */
+export function cutForwards(markup: string): CutBlockquotes {
+  return cutBlockquotes(markup, FORWARD_ITEMTYPE);
+}
+
+/**
+ * Every top-level blockquote whose attributes match `itemtype` cut out of `markup`. A blockquote nested in one cut
+ * belongs to it, whatever its own itemtype; a blockquote of any other kind is passed over, and so is what it holds.
+ */
+function cutBlockquotes(markup: string, itemtype: RegExp): CutBlockquotes {
   const kept: string[] = [];
   const cut: [string, string][] = [];
   let depth = 0;
@@ -85,7 +110,7 @@ export function cutReplies(markup: string): { kept: string; cut: [attrs: string,
   let resume = 0;
   for (const tag of findTags(markup, ["blockquote"], true)) {
     if (depth === 0) {
-      if (!tag.closing && REPLY_ITEMTYPE.test(tag.attrs)) {
+      if (!tag.closing && itemtype.test(tag.attrs)) {
         kept.push(markup.slice(resume, tag.start));
         [depth, attrs, start] = [1, tag.attrs, tag.end];
       }
@@ -107,14 +132,20 @@ export function cutReplies(markup: string): { kept: string; cut: [attrs: string,
 
 /**
  * `text` as the person wrote it: without what Teams puts there for a quote (the `<quoted .../>` placeholder, and the
- * Reply blockquote of a text that is HTML, with the paragraph tags that come with such a text).
+ * Reply blockquote of a text that is HTML, with the paragraph tags that come with such a text) or for a forwarded
+ * message (its Forward blockquote, or the `<attachment id="..."/>` that stands for it).
  */
 export function written(activity: Activity): string {
   let text = pyStr(activity.text);
-  if (REPLY_ITEMTYPE.test(text)) {
-    const { kept } = cutReplies(text);
+  const reply = REPLY_ITEMTYPE.test(text);
+  const forward = FORWARD_ITEMTYPE.test(text);
+  if (reply || forward) {
+    let kept = forward ? cutForwards(text).kept : text;
+    kept = reply ? cutReplies(kept).kept : kept;
     text = replaceTags(kept, findTags(kept, ["p", "div", "br", "span"], true), " ");
   }
+  // (`<attachment id="..."></attachment>`: where a forwarded message stands in a text that only refers to it)
+  text = replaceTags(text, findTags(text, ["attachment"], true), "");
   return replaceTags(text, findTags(text, ["quoted"], true), "");
 }
 
