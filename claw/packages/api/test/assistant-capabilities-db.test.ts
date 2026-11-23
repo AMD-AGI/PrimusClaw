@@ -8,7 +8,8 @@
  *   KD1 a router turn's system prompt tells it to call claw_capabilities first; the router is offered the tool, a worker is not
  *   KD2 the tool answers the list for this user and this turn: exactly the tools the router's server offers, the deployment's switches
  *       (pull request watching on, jobs off), the user's review mode as stored, read again on every call, and the turn's chat app
- *   KD3 GET /v1/assistant/capabilities serves the same list to the user it is about, and nothing to a caller without a user
+ *   KD3 GET /v1/assistant/capabilities serves the same list to the user it is about, and nothing to a caller without a user; not
+ *       knowing the Brain's web tools, it lists look_up as not known, never off, while a turn whose Brain names web_search has it on
  *   KD4 a router turn that reads the list and answers from it says nothing the list contradicts; the 2026-11-23 answer does
  *   KD5 the web tools are the ones the Brain names on its call (none named: not claimed), and memory is what the user's own setting and
  *       the conversation keep, read from the store
@@ -162,6 +163,19 @@ describe("claw_capabilities on a database", { skip: postgresSkipReason() }, () =
     assert.equal(bob.statusCode, 200);
     assert.equal(bob.json().data.review_mode.mode, "high_risk_confirm");
     assert.equal((await app.inject({ method: "GET", url: "/v1/assistant/capabilities" })).statusCode, 403);
+    // No GitHub and no other systems here: the API's list cannot tell whether the turn can look anything up (its Brain's web tools are
+    // named only to the turn's server), so look_up is not known, while the turn of a Brain with web_search has it on (2026-11-23).
+    const lookUp = (list: Record<string, any>) => list.abilities.find((a: { id: string }) => a.id === "look_up");
+    assert.equal(lookUp(r.json().data).on, null);
+    assert.equal(lookUp(bob.json().data).on, null);
+    const searching = await connect(await turnFrom(alice, "你能上网查吗"), { "x-claw-web-tools": "web_search" });
+    try {
+      const turn = parsed(await searching.callTool({ name: "claw_capabilities", arguments: {} }));
+      assert.equal(lookUp(turn).on, true);
+      assert.deepEqual(lookUp(turn).tools, ["web_search"]);
+    } finally {
+      await searching.close();
+    }
   });
 
   test("KD4 a router turn that reads the list and answers from it says nothing it contradicts; the 2026-11-23 answer does", async () => {
@@ -197,7 +211,9 @@ describe("claw_capabilities on a database", { skip: postgresSkipReason() }, () =
         const list = parsed(await router.callTool({ name: "claw_capabilities", arguments: {} }));
         assert.deepEqual(list.lookups.web, web, `header ${header}`);
         assert.deepEqual((lookUp(list)?.tools ?? []).filter((t: string) => t.startsWith("web_")), tools, `header ${header}`);
-        if (header !== "web_search,web_fetch") assert.doesNotMatch(lookUp(list).what, /search the web/, `header ${header}`);
+        // Not named: not known, neither claimed nor denied (no GitHub, no other systems here); named as none: off; named: on.
+        assert.equal(lookUp(list).on, header === undefined ? null : tools.length > 0, `header ${header}`);
+        if (header !== "web_search,web_fetch") assert.doesNotMatch(lookUp(list).what, /search the web \(web_search\)/, `header ${header}`);
       } finally {
         await router.close();
       }

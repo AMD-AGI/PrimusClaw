@@ -15,8 +15,9 @@
 
 /** The parts of the list the detectors read (`Capabilities`). */
 export interface CapabilityView {
-  abilities: ReadonlyArray<{ id: string; on: boolean }>;
-  limits: ReadonlyArray<{ id: string; on: boolean }>;
+  /** `on` null: not known to the list (`look_up` in the API's own list), neither a claim nor a denial of it is contradicted. */
+  abilities: ReadonlyArray<{ id: string; on: boolean | null }>;
+  limits: ReadonlyArray<{ id: string; on: boolean | null }>;
   review_mode?: { mode: string } | null;
   acts_at_once?: readonly string[];
   /** Tools the assistant has that refuse here, their ability being off. */
@@ -40,7 +41,7 @@ interface Detector {
   contradicted: Contradicted;
 }
 
-const entry = (caps: CapabilityView, id: string): { id: string; on: boolean } | undefined =>
+const entry = (caps: CapabilityView, id: string): { id: string; on: boolean | null } | undefined =>
   caps.abilities.find((a) => a.id === id) ?? caps.limits.find((l) => l.id === id);
 
 /** A denial of these entries: contradicted when any of them is on. */
@@ -246,8 +247,9 @@ export function contradictedClaims(text: string, caps: CapabilityView): Contradi
 }
 
 /** The list for a judge: what is on and what is off, one line each, as the truth about the assistant for this run. */
-export function capabilityTruth(caps: CapabilityView & { abilities: ReadonlyArray<{ id: string; on: boolean; what?: string }>; limits: ReadonlyArray<{ id: string; on: boolean; what?: string }> }): string[] {
-  const line = (e: { id: string; on: boolean; what?: string }): string => `${e.id}: ${e.on ? "on" : "off"}${e.what ? ` (${e.what})` : ""}`;
+export function capabilityTruth(caps: CapabilityView & { abilities: ReadonlyArray<{ id: string; on: boolean | null; what?: string }>; limits: ReadonlyArray<{ id: string; on: boolean | null; what?: string }> }): string[] {
+  const state = (on: boolean | null): string => (on === true ? "on" : on === false ? "off" : "not known to this list (neither a claim nor a denial of it is wrong)");
+  const line = (e: { id: string; on: boolean | null; what?: string }): string => `${e.id}: ${state(e.on)}${e.what ? ` (${e.what})` : ""}`;
   return [
     ...caps.abilities.map(line),
     ...caps.limits.map(line),

@@ -65,8 +65,9 @@
  * the assistant itself: what it can or cannot do, its limits, how it compares; assistant mode reads the identity's generated capability
  * list, `GET /v1/assistant/capabilities`, before the case is sent, and the final answer fails when it states a limit that list
  * contradicts or claims an ability it lists as off: the detectors of `self-knowledge.ts` flag the words, and the judge, given the list as
- * the truth and the flagged words, decides, as for a false denial; a list that could not be read makes the attempt the run's error,
- * never a pass),
+ * the truth and the flagged words, decides, as for a false denial; an entry the API's list cannot know, such as whether the turn can
+ * search the web (the Brain's web tools, named only to the turn's own server), is listed as not known and graded neither way; a list
+ * that could not be read makes the attempt the run's error, never a pass),
  * `hold` (assistant mode: the case's item holds a request for its person, a write to approve or a question, and the
  * runner answers it as the person's channel does, see {@link HoldSpec}), `setup` (assistant mode: what the identity must have before each
  * attempt, made by the runner through the API and removed after it; `triggers`: [{name, schedule, timezone, prompt?, action?}], made with
@@ -1515,8 +1516,9 @@ export interface Observed {
 
 /** The capability list as the API serves it, with what a judge is shown of each entry. */
 export type SelfCapabilities = CapabilityView & {
-  abilities: ReadonlyArray<{ id: string; on: boolean; what?: string }>;
-  limits: ReadonlyArray<{ id: string; on: boolean; what?: string }>;
+  /** `on` null: an entry the API's list cannot know (`look_up`: the web tools of the Brain that runs the turn), graded neither way. */
+  abilities: ReadonlyArray<{ id: string; on: boolean | null; what?: string }>;
+  limits: ReadonlyArray<{ id: string; on: boolean | null; what?: string }>;
 };
 
 /** The check of `self_knowledge` (`selfKnowledgeCheck`), by name: what the detectors found, the judge decides. */
@@ -1950,7 +1952,8 @@ export function judgePrompt(c: EvalCase, turns: readonly Turn[], final: string, 
 /** What the judge is told of the assistant's capability list for a `self_knowledge` case. */
 export const SELF_KNOWLEDGE_NOTE = "The assistant's capability list, generated for this run from the tools and settings it has: the truth about "
   + "what it can and cannot do. FAIL a reply that states a limit this list contradicts (says it cannot do something listed on) or claims "
-  + "an ability listed off; a reply need not name every entry:";
+  + "an ability listed off; an entry listed as not known is graded neither way (saying it can, or cannot, is not a contradiction); a "
+  + "reply need not name every entry:";
 
 /** What the judge is told of the words the detectors found contradicted (`contradictedClaims`). */
 export const SELF_FLAGGED_NOTE = "Words of the reply a detector reads as contradicting the list (FAIL if, read in their sentence, they do; a "

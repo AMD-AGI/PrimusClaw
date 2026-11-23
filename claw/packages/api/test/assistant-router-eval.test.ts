@@ -545,7 +545,7 @@ test("R8s a question about the assistant is answered from claw_capabilities, cal
   // The tool answered the list generated from the tools this turn is offered; the say is made of its entries.
   const answered = trace.calls.find((x) => x.tool === "claw_capabilities")!.result as Record<string, any>;
   assert.equal(answered.ok, true);
-  assert.equal(answered.version, "capabilities-v3");
+  assert.equal(answered.version, "capabilities-v4");
   assert.deepEqual(answered.reads.includes("work_recall") && answered.acts_at_once.includes("work_create"), true);
   assert.equal(answered.abilities.find((x: { id: string }) => x.id === "see_images").on, true, "images are shown to every router turn");
   const said = String(trace.calls.find((x) => x.tool === "say")!.input.text);

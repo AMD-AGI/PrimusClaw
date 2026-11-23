@@ -125,7 +125,8 @@ release version, and its `appVersion` stays `latest`.
   the signed-in user. Asked what it could not do, it used to answer from guesswork and name limits it does not have.
   An entry is on only where it works: web search and page reading as the Brain running the turn has each of them
   (the Brain names them to the assistant's server in `x-claw-web-tools`; the API's own list, which no Brain serves,
-  claims neither), reviews and the review mode only where a review can be started from the assistant (reviews and
+  claims neither, and where that leaves nothing else to look up lists `look_up` as not known, `on: null`, rather than
+  off), reviews and the review mode only where a review can be started from the assistant (reviews and
   review items on) and the user has bound a GitHub account (a review as them acts with it), pull request watching and
   GitHub comments only where the user has a GitHub token as those tools resolve it (a `GH_TOKEN` in their settings, or
   their `/github bind` binding where bindings count), and memory only where the user's own setting has it and the
@@ -134,7 +135,8 @@ release version, and its `appVersion` stays `latest`.
 - Claw: the super-agent evaluation grades an answer about the assistant against that list. A case with
   `self_knowledge` reads the identity's list before it is sent; an answer that states a limit the list contradicts,
   or claims an ability it lists as off, is flagged and is no pass without a judge, which is given the list as the
-  truth and the flagged words and decides; a case whose list was not read never passes. Nine such cases are in
+  truth and the flagged words and decides; an entry the list does not know (`on: null`) is graded neither way; a case
+  whose list was not read never passes. Nine such cases are in
   `sa-eval-cases/catalog/self-knowledge.jsonl`, and four in the router evaluation (`self-01`..`self-04`).
 
 - Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, how many times the

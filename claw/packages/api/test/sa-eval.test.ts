@@ -1650,6 +1650,13 @@ test("S-self self_knowledge: the final answer is held to the identity's capabili
   assert.ok(!judgePrompt(c, c.turns, "x", [], []).includes(SELF_KNOWLEDGE_NOTE), "no list read, none told");
   assert.match(prompt, /Words of the reply a detector reads as contradicting the list .*"看不到图片" \(the list has see_images on\)/);
   assert.ok(!judgePrompt(c, c.turns, "我能看图片", [], [], list).includes("Words of the reply a detector reads"), "nothing flagged, nothing said");
+  // An entry the API's list cannot know (look_up: the turn's web tools) is graded neither way, and the judge is told so.
+  const unknown: SelfCapabilities = { ...list, abilities: [...list.abilities, { id: "look_up", on: null, what: "Not known to this list." }] };
+  const searched = check({ capabilities: unknown, final: "我可以帮你上网搜索资料。" });
+  assert.deepEqual([searched?.pass, searched?.unverified], [true, undefined]);
+  const told = judgePrompt(c, c.turns, "我可以帮你上网搜索资料。", [], [], unknown);
+  assert.match(told, /- look_up: not known to this list \(neither a claim nor a denial of it is wrong\) \(Not known to this list\.\)\n/);
+  assert.match(told, /an entry listed as not known is graded neither way/);
   // The shipped cases: each asks the assistant about itself, needs the tool, and runs where the list is.
   const shipped = loadCases(SEED_DIR).cases.filter((x) => x.self_knowledge);
   assert.ok(shipped.length >= 8, `${shipped.length} self_knowledge cases`);

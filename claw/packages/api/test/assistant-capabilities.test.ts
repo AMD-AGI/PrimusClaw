@@ -14,6 +14,8 @@
  *   K9  reviews, pull request watching and GitHub comments are on only with the user's GitHub as the tool that acts finds it; off, they
  *       say what to connect, and their tools move from what acts to off_here
  *   K10 the inputs ask for the user's GitHub where the tools do: the watch token and the review service's binding
+ *   K11 a list that does not know the Brain's web tools (the API's own) never lists look_up off for want of GitHub and other systems:
+ *       it is not known (on null), neither claimed nor denied, and the grading holds no answer about it either way
  *
  * The configuration is set before the source is imported: every switch on, so the router's server registers every tool it can.
  */
@@ -33,7 +35,7 @@ const caps = await import("../src/assistant/capabilities.js");
 const { createAssistantMcpServer, recordToolNames, routerToolNames } = await import("../src/assistant/mcp.js");
 const { renderRouterSelfSection, ROUTER_SELF_PROMPT_VERSION } = await import("../src/assistant/self-status.js");
 const { renderRouterAbilities } = await import("../src/assistant/prompts.js");
-const { contradictedClaims, DETECTOR_ENTRY_IDS } = await import("./e2e/self-knowledge.js");
+const { capabilityTruth, contradictedClaims, DETECTOR_ENTRY_IDS } = await import("./e2e/self-knowledge.js");
 
 type Inputs = Parameters<typeof caps.capabilityList>[0];
 
@@ -56,7 +58,7 @@ const onIds = (list: ReturnType<typeof caps.capabilityList>): string[] => list.a
 
 test("K1 every ability is on with its feature and its tools, and taking one away turns exactly that entry off", () => {
   const full = caps.capabilityList(inputs());
-  assert.equal(full.version, "capabilities-v3");
+  assert.equal(full.version, "capabilities-v4");
   assert.deepEqual(full.abilities.filter((a) => !a.on).map((a) => a.id), [], "everything on");
   assert.match(full.abilities.find((a) => a.id === "see_images")!.what, /Images sent with a message are shown to you \(up to 4 per message\)/);
   assert.match(full.abilities.find((a) => a.id === "watch_pull_requests")!.what, /in the background.*read every 30 s/);
@@ -281,7 +283,7 @@ test("K7 what is listed is what works: the web tools as the Brain has them, revi
   // Brain's defaults: neither tool. Nothing to look up, and the list says the web is not there.
   const none = look({ search: false, fetch: false });
   assert.equal(none.on, false);
-  assert.match(none.what, /No web search here\. No reading web pages here\.$/);
+  assert.match(none.what, /no web search and no reading web pages; a work item can look things up instead\.$/);
   assert.deepEqual(none.web, { search: false, fetch: false });
   // Each on its own: only that one is listed, and the other is said to be missing.
   const search = look({ search: true, fetch: false });
@@ -449,4 +451,31 @@ test("K10 the inputs ask for the user's GitHub where the tools do: the watch tok
     githubEventPorts.loadToken = saved.loadToken;
     reviewItemPorts.delegationOf = saved.delegationOf;
   }
+});
+
+test("K11 without the Brain's web tools (the API's own list), look_up is not known rather than off, and is graded neither way", () => {
+  const nothing = { web: null, github: false, systems: [] as string[] };
+  const list = caps.capabilityList(inputs({ lookups: nothing }));
+  const a = list.abilities.find((x) => x.id === "look_up")!;
+  assert.equal(a.on, null, "the turn's Brain may have web_search or web_fetch: never off");
+  assert.equal(a.tools, undefined, "and no tool is claimed");
+  assert.match(a.what, /^Not known to this list: .*web tools \(web_search, web_fetch\) of the Brain that runs the turn\.$/);
+  assert.equal(list.lookups.web, null);
+  assert.match(caps.CAPABILITIES_RULE, /on null is not known to this list \(neither claim nor deny it\)/);
+  // The same user, as the turn's own list has it once its Brain names its web tools: on with them, off without either.
+  const withSearch = caps.capabilityList(inputs({ lookups: { ...nothing, web: { search: true, fetch: false } } }));
+  assert.equal(on(withSearch, "look_up"), true);
+  assert.deepEqual(withSearch.abilities.find((x) => x.id === "look_up")!.tools, ["web_search"]);
+  assert.equal(on(caps.capabilityList(inputs({ lookups: { ...nothing, web: { search: false, fetch: false } } })), "look_up"), false);
+  // Only look_up can be unknown: every other entry is on or off whatever the web is.
+  for (const e of [...list.abilities, ...list.limits]) if (e.id !== "look_up") assert.equal(typeof e.on, "boolean", e.id);
+  // Nothing else moves: an unknown entry turns no tool off and claims no review mode it would not.
+  assert.deepEqual(list.acts_at_once, caps.capabilityList(inputs()).acts_at_once);
+  assert.equal(list.off_here, undefined);
+  // The grading: an entry not known contradicts neither a claim nor a denial, and the judge is told it is not known.
+  const unknownImages = { abilities: [{ id: "see_images", on: null }], limits: [] };
+  assert.deepEqual(contradictedClaims("I can see images you send.", unknownImages), []);
+  assert.deepEqual(contradictedClaims("我看不到你发的图片。", unknownImages), []);
+  assert.deepEqual(contradictedClaims("我看不到你发的图片。", { abilities: [{ id: "see_images", on: true }], limits: [] }).map((x) => x.detector), ["denies see_images"]);
+  assert.ok(capabilityTruth(list).includes(`look_up: not known to this list (neither a claim nor a denial of it is wrong) (${a.what})`));
 });

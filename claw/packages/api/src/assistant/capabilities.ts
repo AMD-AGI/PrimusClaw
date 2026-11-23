@@ -12,6 +12,9 @@
  *
  * The list is pure (`capabilityList`); what it is built from is read by `capabilityInputs`. The same list is what the API serves the
  * user (`GET /v1/assistant/capabilities`), which the evaluation grades an answer against (`test/e2e/sa-eval-lib.ts`, `self_knowledge`).
+ * The API's list has no Brain to name its web tools, so an entry that depends on them alone (`look_up` without GitHub or other systems)
+ * is neither on nor off there but not known (`on: null`), which the evaluation grades neither way: listing it off told the user, and
+ * the grader, that a turn which can search the web cannot (2026-11-23).
  */
 import {
   CLAW_ASSISTANT_GITHUB_POLL_SEC, CLAW_ASSISTANT_JOB_POLL_SEC, CLAW_ASSISTANT_TOOLS, CLAW_GITHUB_REVIEW_ENABLED, CLAW_USER_SKILLS_ENABLED,
@@ -33,7 +36,7 @@ import { assistantSchedulesOn } from "./schedules.js";
 /** The tool's name on the assistant's server. */
 export const CAPABILITIES_TOOL = "claw_capabilities";
 /** The shape of the list; moves when an entry is added, removed or changes meaning. */
-export const CAPABILITIES_VERSION = "capabilities-v3";
+export const CAPABILITIES_VERSION = "capabilities-v4";
 
 /** The deployment's switches that decide what the assistant can do, beside the tools they register. */
 export interface DeploymentFeatures {
@@ -163,7 +166,12 @@ export const TOOL_EFFECTS: Readonly<Record<string, ToolEffect>> = {
 
 export interface Ability {
   id: string;
-  on: boolean;
+  /**
+   * True: the assistant has it; false: it does not. Null: this list cannot tell, because it depends on something the list was not given
+   * (`look_up` in the API's own list, which does not know the web tools of the Brain that runs a turn, `Lookups.web`): neither claimed
+   * nor denied.
+   */
+  on: boolean | null;
   what: string;
   /** The assistant's own tools that do it (those it has now), or the lookups. */
   tools?: string[];
@@ -198,7 +206,8 @@ export interface Capabilities {
 /** What the router is told with the list. */
 export const CAPABILITIES_RULE = "This list is generated from the tools and settings you have now. Answer questions about what you can or "
   + "cannot do, and comparisons with other assistants, from it alone: an ability with on true is one you have (never say you cannot do "
-  + "it), one with on false or a limit with on false is one you do not have (never claim it). acts_at_once are your own tools that change "
+  + "it), one with on false or a limit with on false is one you do not have (never claim it), one with on null is not known to this list "
+  + "(neither claim nor deny it). acts_at_once are your own tools that change "
   + "something when you call them, with no worker and no card; asks_first show the user a card first; off_here are tools you have that "
   + "refuse here (their ability is off): never offer what they do.";
 
@@ -211,6 +220,11 @@ interface AbilitySpec {
   what: (i: CapabilityInputs) => string;
   /** What is said where it is off: that it is not there, and what would turn it on where the user can. */
   off: (i: CapabilityInputs) => string;
+  /**
+   * Whether an ability that `needs` leaves off could still be there through something the list was not given: then it is neither on
+   * nor off (`on: null`), and `unknown` says so.
+   */
+  unknown?: { when: (i: CapabilityInputs) => boolean; what: (i: CapabilityInputs) => string };
   /** Registered tools that refuse while this ability is off: listed under off_here instead of by how they act. */
   gates?: readonly string[];
 }
@@ -238,8 +252,15 @@ const CONNECT_GITHUB = "/github bind (or a GH_TOKEN kept in their Claw settings)
 const ABILITIES: readonly AbilitySpec[] = [
   {
     id: "look_up",
-    off: (i) => `Nothing to look up in the same turn here: no GitHub and no other systems; a work item can look things up instead.${
-      i.lookups.web === null ? " Your web tools are not known: claim none." : " No web search here. No reading web pages here."}`,
+    off: () => "Nothing to look up in the same turn here: no GitHub, no other systems, no web search and no reading web pages; a work item "
+      + "can look things up instead.",
+    // Brain's web tools are named only to a turn's own server (WEB_TOOLS_HEADER): without them, no GitHub and no other systems does not
+    // mean nothing to look up, since the Brain running the turn may have web_search or web_fetch (the API's own list, 2026-11-23).
+    unknown: {
+      when: (i) => i.lookups.web === null,
+      what: () => "Not known to this list: no GitHub and no other systems to look up here, and whether you can search the web or read a "
+        + "web page in the same turn depends on the web tools (web_search, web_fetch) of the Brain that runs the turn.",
+    },
     needs: (i) => webSearch(i) || webFetch(i) || i.lookups.github || i.lookups.systems.length > 0,
     what: (i) => `Look things up at once, in the same turn: ${[
       ...(webSearch(i) ? ["search the web (web_search)"] : []),
@@ -414,10 +435,12 @@ const sorted = (xs: Iterable<string>): string[] => [...new Set(xs)].sort();
 export function capabilityList(i: CapabilityInputs): Capabilities {
   const abilities = ABILITIES.map((a): Ability => {
     const present = (a.tools ?? []).filter((t) => has(i, t));
-    const on = (a.needs ? a.needs(i) : true) && (a.tools === undefined || present.length > 0);
+    const registered = a.tools === undefined || present.length > 0;
+    const needed = a.needs ? a.needs(i) : true;
+    const on: boolean | null = needed && registered ? true : registered && a.unknown?.when(i) ? null : false;
     return {
-      id: a.id, on, what: on ? a.what(i) : a.off(i),
-      ...(a.id === "look_up" && on ? { tools: [...webToolsOf(i), ...(i.lookups.github ? ["github"] : []), ...i.lookups.systems] } : {}),
+      id: a.id, on, what: on === true ? a.what(i) : on === null ? a.unknown!.what(i) : a.off(i),
+      ...(a.id === "look_up" && on === true ? { tools: [...webToolsOf(i), ...(i.lookups.github ? ["github"] : []), ...i.lookups.systems] } : {}),
       ...(present.length ? { tools: present } : {}),
     };
   });
@@ -428,8 +451,8 @@ export function capabilityList(i: CapabilityInputs): Capabilities {
       : l.lifted !== undefined && names.some((n) => l.lifted!.test(n));
     return { id: l.id, on, what: l.what(on, i) };
   });
-  // A tool that refuses while its ability is off is not offered by how it acts: it is named under off_here.
-  const offHere = new Set(ABILITIES.filter((a) => !abilities.find((x) => x.id === a.id)!.on).flatMap((a) => a.gates ?? []).filter((t) => has(i, t)));
+  // A tool that refuses while its ability is off (or may: not known) is not offered by how it acts: it is named under off_here.
+  const offHere = new Set(ABILITIES.filter((a) => abilities.find((x) => x.id === a.id)!.on !== true).flatMap((a) => a.gates ?? []).filter((t) => has(i, t)));
   const of = (effect: ToolEffect): string[] => sorted(i.tools.filter((t) => TOOL_EFFECTS[t] === effect && !offHere.has(t)));
   const unclassified = sorted(i.tools.filter((t) => !Object.hasOwn(TOOL_EFFECTS, t)));
   const reviews = abilities.find((a) => a.id === "reviews")!;
@@ -437,7 +460,7 @@ export function capabilityList(i: CapabilityInputs): Capabilities {
     version: CAPABILITIES_VERSION,
     abilities,
     limits,
-    review_mode: reviews.on
+    review_mode: reviews.on === true
       ? {
         mode: i.reviewMode,
         means: i.reviewMode === "fully_auto"
