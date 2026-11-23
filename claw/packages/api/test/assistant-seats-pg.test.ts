@@ -397,6 +397,7 @@ describe("seats", { skip }, () => {
     guessAnswer = { role: injection.slice(0, 110), alias: "evil", tags: ["evil-repo"] };
     await sweep();
     let seat = (await seatRows())[0]!;
+    assert.equal(seat.connector_id, cid, "the folder of a conversation the machine reports is a seat of that machine");
     assert.equal(guessInputs.length, 1);
     const input = guessInputs[0]!;
     assert.deepEqual(input.titles, [injection.slice(0, 79) + "…"]);
