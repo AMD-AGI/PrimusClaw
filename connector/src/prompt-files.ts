@@ -32,23 +32,34 @@ function sessionDir(root: string, sid: string): string {
 /** Opening a file this way never follows a symbolic link at its last component (0 where the platform has no such flag). */
 const NO_FOLLOW = fs.constants.O_NOFOLLOW ?? 0;
 
+/** Whether `dir` is a folder itself, not a symbolic link to one (nor anything else). */
+function plainFolder(dir: string): boolean {
+  try {
+    const st = fs.lstatSync(dir);
+    return !st.isSymbolicLink() && st.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /** Refuses `dir` when it is a symbolic link, or anything but a folder: a file saved through it could land anywhere. */
 function ownFolder(dir: string): void {
-  const st = fs.lstatSync(dir);
-  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`refused a folder that is not a plain folder: ${dir}`);
+  if (!plainFolder(dir)) throw new Error(`refused a folder that is not a plain folder: ${dir}`);
 }
 
 /**
  * Saves `files` for the prompt `cmdId` of session `sid` under `root`. A name was checked by the wire contract (one path
  * component, no leading dot); it is checked again here, as the path it makes must stay inside the folder. Nothing is
- * written through a symbolic link: the session's and the prompt's folders must be plain folders, and a file is opened
+ * written through a symbolic link: the uploads folder, the session's and the prompt's must be plain folders, and a file is opened
  * without following one, so a link put there (by an agent of the session, say) cannot send the bytes elsewhere.
  */
 export function savePromptFiles(root: string, sid: string, cmdId: string, files: readonly RemotePromptFile[]): SavedFile[] {
   const session = sessionDir(root, sid);
   const dir = path.join(session, createHash("sha256").update(cmdId).digest("hex").slice(0, 16));
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  ownFolder(root); // (each folder before anything is made in it)
   fs.mkdirSync(session, { recursive: true, mode: 0o700 });
-  ownFolder(session); // (before anything is made in it)
+  ownFolder(session);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   ownFolder(dir);
   const saved: SavedFile[] = [];
@@ -80,13 +91,18 @@ export function withUnsavedFiles(text: string, count: number, why: string): stri
   return `${text}\n\n(${count} file${count === 1 ? " was" : "s were"} sent with this message but could not be saved on this machine: ${why})`;
 }
 
-/** Removes a closed session's files. Best effort. */
+/** Removes a closed session's files. Best effort; nothing is removed through an uploads folder that is a symbolic link. */
 export function dropSessionFiles(root: string, sid: string): void {
+  if (!plainFolder(root)) return;
   try { fs.rmSync(sessionDir(root, sid), { recursive: true, force: true }); } catch { /* best effort */ }
 }
 
-/** Removes every session folder not written to for `keepMs`. Best effort. */
+/**
+ * Removes every session folder not written to for `keepMs`. Best effort; nothing is removed through an uploads folder
+ * that is a symbolic link (a link inside it is removed as a link, never what it points at).
+ */
 export function sweepPromptFiles(root: string, now: number, keepMs: number = UPLOADS_KEEP_MS): void {
+  if (!plainFolder(root)) return;
   let names: string[];
   try { names = fs.readdirSync(root); } catch { return; }
   for (const name of names) {

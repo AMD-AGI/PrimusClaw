@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
-import { savePromptFiles } from "../src/prompt-files.js";
+import { dropSessionFiles, savePromptFiles, sweepPromptFiles } from "../src/prompt-files.js";
 import { tmpdir } from "./support/tmp.js";
 
 const SID = "6f1c2a9b-8e7d-4c5b-a43f-2e1d0c9b8a7f";
@@ -47,4 +47,18 @@ test("a session's or a prompt's folder that is a symbolic link is refused: nothi
     assert.throws(() => savePromptFiles(root, SID, "c3", [FILE]), /not a plain folder/u);
     assert.deepEqual(fs.readdirSync(elsewhere), []);
   }
+});
+
+test("an uploads folder that is a symbolic link is neither written through nor cleaned through", () => {
+  const elsewhere = tmpdir();
+  const stale = path.join(elsewhere, SID);
+  fs.mkdirSync(stale);
+  fs.utimesSync(stale, 0, 0);
+  const root = path.join(tmpdir(), "uploads");
+  fs.symlinkSync(elsewhere, root);
+  assert.throws(() => savePromptFiles(root, SID, "c4", [FILE]), /not a plain folder/u);
+  sweepPromptFiles(root, Date.now(), 1);
+  dropSessionFiles(root, SID);
+  assert.deepEqual(fs.readdirSync(elsewhere), [SID]);
+  assert.deepEqual(fs.readdirSync(stale), []);
 });
