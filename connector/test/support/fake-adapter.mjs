@@ -253,6 +253,9 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
       if (!s) return fail(id, -32602, "no such session");
       // FAKE_PLAN_DELAY_MS: switching to plan takes that long (the connector readying a turn that may only answer, as the user acts).
       if (params.modeId === "plan" && env.FAKE_PLAN_DELAY_MS) await new Promise((r) => setTimeout(r, Number(env.FAKE_PLAN_DELAY_MS)));
+      // FAKE_MODE_DELAYS ("mode:ms,..."): switching to those modes takes that long (a set_mode of the user's arriving meanwhile).
+      const slow = (env.FAKE_MODE_DELAYS || "").split(",").map((x) => x.split(":")).find(([m]) => m === params.modeId);
+      if (slow) await new Promise((r) => setTimeout(r, Number(slow[1])));
       if (env.FAKE_IGNORE_SET_MODE !== "1") s.mode = params.modeId;
       reply(id, {});
       if (env.FAKE_WARN_AFTER_LOCK === "1") setTimeout(() => process.stderr.write("Warning: canUseTool will not be invoked: late\n"), 300);

@@ -17,7 +17,8 @@
  *   A3 refused, never reaching the agent, in a session that does not ask (unattended) and for an agent with no read-only mode
  *   A4 the user is there: a set_mode sent in that turn stops it and is set only after it (never a turn that only answers going on in a
  *      mode that does not ask), the user's own prompt stops it, it is refused while a turn of the user's runs, and an agent that dies
- *      in it comes back in the session's own mode, not the read-only one; a resume in it keeps it in the read-only mode
+ *      in it comes back in the session's own mode, not the read-only one; a resume in it keeps it in the read-only mode; a cancel while
+ *      it is readied stops it; a set_mode sent while the mode is settled after it is set after that, never under it
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -322,6 +323,64 @@ describe("G3 and A1-A3 end to end", () => {
     assert.ok(perm.data.actionId);
     assert.equal(h.adapterLog().find((l) => l.prompt === "write after.txt")!.mode, "default", "the user's turn runs in the session's own mode");
   });
+
+  test("A4f a cancel while that turn is still being readied: it never runs, and the session is back in its own mode", async () => {
+    const h = await make({ preset: "claude", env: { FAKE_PLAN_DELAY_MS: "600" } });
+    const sid = await h.newSession();
+    const seq = h.prompt(sid, "say probe", { answer_only: true });
+    await h.claw.until("switching to the read-only mode", () => h.adapterLog().find((l) => l.method === "session/set_mode" && l.params.modeId === "plan"));
+    h.claw.issue("cancel", sid);
+    const refused = await h.turnEnd(sid);
+    assert.equal(refused.data.error, "answer_only_busy");
+    assert.equal(refused.data.cmd_seq, seq);
+    await h.claw.until("the mode put back", () => h.claw.eventsOf(sid, "mode_update").at(-1)?.data.currentMode === "default");
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(h.adapterLog().filter((l) => l.prompt === "say probe").length, 0, "the agent never saw it");
+  });
+
+  test("A4f2 a cancel while that turn is still being confirmed with Claw (`endAsking`): it is dropped, never run", async () => {
+    const h = await make({ preset: "claude" });
+    const sid = await h.newSession();
+    h.claw.holdConfirms = true;
+    const seq = h.prompt(sid, "say probe", { answer_only: true, sent_at: Date.now() - 10_000, cmd_id: "c-probe" });
+    await h.claw.until("the prompt being confirmed", () => h.claw.confirmAsked.includes("c-probe") || undefined);
+    h.claw.issue("cancel", sid);
+    await h.claw.until("the cancel handled", () => h.audit().some((a) => a.kind === "command" && a.type === "cancel") || undefined);
+    h.claw.holdConfirms = false;
+    h.claw.releaseConfirms();
+    const rejected = await h.claw.until("the prompt refused", () => h.claw.eventsOf(sid, "command_rejected").find((e) => e.data.cmd_id === "c-probe"));
+    assert.deepEqual([rejected.data.status, rejected.data.cmd_seq], ["cancelled", seq]);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(h.adapterLog().filter((l) => l.prompt === "say probe").length, 0, "the agent never saw it");
+    assert.equal(h.adapterLog().filter((l) => l.method === "session/set_mode" && l.params.modeId === "plan").length, 0, "nor was it readied");
+  });
+
+  // The user's latest set_mode is the mode the session ends in, whether it comes while the one chosen in that turn is being set after
+  // it (`deferred`), or while the mode it was switched from is being put back (`back`): never an earlier one set over it.
+  for (const [name, slow] of [["deferred", "acceptEdits"], ["back", "default"]] as const) {
+    test(`A4g a set_mode sent while the mode is being settled after that turn (${name}) is set after it, never under it`, async () => {
+      const h = await make({ preset: "claude", topToml: "allow_unsafe_modes = true\n", env: { FAKE_MODE_DELAYS: `${slow}:800` } });
+      const sid = await h.newSession();
+      const gate = path.join(h.work, "gate-open");
+      h.prompt(sid, `gate ${gate} say probe`, { answer_only: true });
+      await h.claw.until("the turn reached the agent", () => h.adapterLog().find((l) => typeof l.prompt === "string" && l.prompt.startsWith("gate ")));
+      if (name === "deferred") h.claw.issue("set_mode", sid, { mode_id: "acceptEdits" });
+      else fs.writeFileSync(gate, "");
+      await h.turnEnd(sid);
+      const setModes = () => h.adapterLog().filter((l) => l.method === "session/set_mode").map((l) => l.params.modeId as string);
+      await h.claw.until(`the slow ${slow} being set`, () => { const m = setModes(); return m.slice(m.lastIndexOf("plan")).includes(slow) || undefined; });
+      h.claw.issue("set_mode", sid, { mode_id: "bypassPermissions" });
+      await h.claw.until("both set", () => h.adapterLog().filter((l) => l.method === "session/set_mode" && l.params.modeId === "bypassPermissions").length === 1
+        && h.claw.eventsOf(sid, "mode_update").at(-1)?.data.currentMode === "bypassPermissions" ? true : undefined);
+      await new Promise((r) => setTimeout(r, 1_200));
+      const modes = setModes();
+      assert.deepEqual(modes.slice(modes.lastIndexOf("plan")), ["plan", slow, "bypassPermissions"], "the latest last");
+      assert.equal(h.claw.eventsOf(sid, "mode_update").at(-1)?.data.currentMode, "bypassPermissions");
+      h.prompt(sid, "say after");
+      await h.turnEnd(sid, 2);
+      assert.equal(h.adapterLog().find((l) => l.prompt === "say after")!.mode, "bypassPermissions", "the agent is in the user's latest mode");
+    });
+  }
 
   test("A2 the same prompt without answer_only asks the person", async () => {
     const h = await make();

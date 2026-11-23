@@ -1499,23 +1499,40 @@ export class Session {
    * back to the session's own); else back to the mode it was switched from. Failing that it stays read-only, which runs nothing.
    */
   private async endAnswerOnly(back: string | null): Promise<void> {
-    const wanted = this.answerOnlySpan?.deferred ?? null;
     this.answerOnlyTurn = false;
-    this.answerOnlySpan = null;
-    if (wanted) {
-      // (an agent that cannot be brought back for it: the mode is refused by name, as a set_mode sent outside that turn would fail)
-      return this.setModeNow(wanted.modeId, wanted.cmdId).catch((e) => {
-        this.audit("mode_set_failed", { mode: wanted.modeId, error: errMessage(e), deferred: true });
-        this.rejectCommand("set_mode", wanted.cmdId, e instanceof SessionRefusal ? e.reason : "set_mode_failed");
-      });
-    }
-    if (back === null || this.closed || !this.adapter) return;
+    const span = this.answerOnlySpan;
+    // The span stays until the mode is settled: a set_mode the user sends while the mode is being set or put back is deferred again
+    // and set after it, one at a time, never alongside it (two at once could leave an earlier choice set over the latest).
+    // (its read-only mode is no longer the one to go back to: a mode the agent leaves to is undone to the session's own)
+    if (span) span.mode = null;
+    let restore = back;
     try {
-      await this.enforceMode(back);
-    } catch (e) {
-      this.audit("mode_set_failed", { mode: back, error: errMessage(e), answer_only: true });
+      for (;;) {
+        const wanted = span?.deferred ?? null;
+        if (wanted) {
+          span!.deferred = null;
+          restore = null;
+          // (an agent that cannot be brought back for it: the mode is refused by name, as a set_mode sent outside that turn would fail)
+          await this.setModeNow(wanted.modeId, wanted.cmdId).catch((e) => {
+            this.audit("mode_set_failed", { mode: wanted.modeId, error: errMessage(e), deferred: true });
+            this.rejectCommand("set_mode", wanted.cmdId, e instanceof SessionRefusal ? e.reason : "set_mode_failed");
+          });
+          continue;
+        }
+        if (restore === null || this.closed || !this.adapter) break;
+        const to = restore;
+        restore = null;
+        try {
+          await this.enforceMode(to);
+        } catch (e) {
+          this.audit("mode_set_failed", { mode: to, error: errMessage(e), answer_only: true });
+        }
+        this.emit("mode_update", { currentMode: this.currentMode, unattended: this.unattended });
+      }
+    } finally {
+      // (no await between the last look at `deferred` and here: a set_mode from now on is set at once)
+      if (this.answerOnlySpan === span) this.answerOnlySpan = null;
     }
-    this.emit("mode_update", { currentMode: this.currentMode, unattended: this.unattended });
   }
 
   /** Every `turn_end` of the turn names its prompt: `cmd_id`, and `cmd_seq` (a number, which no credential scrub ever masks). */
@@ -1797,6 +1814,9 @@ export class Session {
       else this.emit("turn_end", { stopReason: "cancelled", cmd_id: null, cmd_seq: null });
       return;
     }
+    // A turn that may only answer still being readied (its mode switched, no session/prompt sent yet): the session/cancel below reaches
+    // no turn, so it is told here that the user is present, and it never runs (`enterAnswerOnly`, `runTurnReady`).
+    if (this.answerOnlySpan) this.answerOnlySpan.userPresent = true;
     const dropped = this.queue.map((q) => [q.cmdId, q.cmdSeq] as const);
     const queued = dropped.length;
     this.dropQueued();
