@@ -20,7 +20,8 @@ import * as entry from "@primusclaw/personal-agent-teams-ingress";
 import { consoleSink, contextSink, type Registrar, register } from "../src/functions.js";
 import { type LogRecord } from "../src/log.js";
 import { start } from "../src/app.js";
-import { defined, FULL_ENV, load, MESSAGE, PACKAGE } from "./helpers.js";
+import { createIngress } from "../src/ingress.js";
+import { defined, FULL_ENV, load, MESSAGE, PACKAGE, RecordingBus } from "./helpers.js";
 
 type Calls = [string, unknown[]][];
 
@@ -158,6 +159,21 @@ test("start registers the messaging endpoint, and the outbound trigger when its 
   start(recorder, { PRIMUSCLAW_BOT_APP_ID: "claw-app", PRIMUSCLAW_PROBE_SCHEDULE: " " });
   start(recorder, { PRIMUSCLAW_BOT_APP_ID: "claw-app", PRIMUSCLAW_PROBE_SCHEDULE: "0 */5 * * * *" });
   assert.deepEqual(names, ["messages", "messages", "outbound", "messages", "messages", "probe"]);
+  // (a registrar from before the probe, without timers: the endpoint still registers, and the start says no probe is sent)
+  const older: string[] = [];
+  const records: string[] = [];
+  const ingress = createIngress({
+    env: { PRIMUSCLAW_BOT_APP_ID: "claw-app", PRIMUSCLAW_PROBE_SCHEDULE: "0 */5 * * * *" },
+    fetch: () => Promise.reject(new Error("no network")),
+    log: (record) => records.push(`${record.level} ${record.message}`),
+    serviceBus: new RecordingBus(),
+    spawn: () => undefined,
+  });
+  register({ http: (name) => older.push(name), serviceBusQueue: (name) => older.push(name) }, ingress);
+  assert.deepEqual(older, ["messages"]);
+  assert.ok(
+    records.some((r) => r.startsWith("warning PRIMUSCLAW_PROBE_SCHEDULE is set but the registrar has no timers")),
+  );
 });
 
 test("the deployable entry registers the functions when it is loaded", () => {

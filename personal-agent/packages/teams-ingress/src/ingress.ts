@@ -73,6 +73,7 @@ import {
   namespaceHost,
   OUTBOUND_CONNECTION_SETTING,
   OUTBOUND_IDENTITY_SETTING,
+  PROBE_SCHEDULE_SETTING,
   readSettings,
   type Settings,
 } from "./settings.js";
@@ -622,6 +623,13 @@ export class Ingress {
       throw new PyValueError("a probe answer needs the probe conversation and an ack");
     }
     await this.sendAck(ack, PROBE_CONVERSATION, PROBE_OPERATION, log);
+  }
+
+  /** The probe's schedule is set, but the app it is registered on has no timers: said at start, and nothing is sent. */
+  noProbeTimer(): void {
+    this.logs.app.warning(
+      `${PROBE_SCHEDULE_SETTING} is set but the registrar has no timers: no delivery probe is sent`,
+    );
   }
 
   /**

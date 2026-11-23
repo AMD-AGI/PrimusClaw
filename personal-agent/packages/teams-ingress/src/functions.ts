@@ -31,7 +31,8 @@ export interface Registrar {
       handler: (message: unknown, context: InvocationContext) => Promise<void>;
     },
   ): void;
-  timer(
+  /** Optional (a registrar from before the delivery probe has none): without it the probe's timer is not registered. */
+  timer?(
     name: string,
     options: {
       schedule: string;
@@ -92,6 +93,10 @@ export function register(app: Registrar, ingress: Ingress): void {
     });
   }
   if (ingress.settings.probeConfigured) {
+    if (app.timer === undefined) {
+      ingress.noProbeTimer();
+      return;
+    }
     // The host resolves the schedule from the app setting, so it can change without a new package.
     app.timer("probe", {
       schedule: `%${PROBE_SCHEDULE_SETTING}%`,
