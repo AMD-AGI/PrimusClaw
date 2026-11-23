@@ -270,16 +270,13 @@ export function forwardsOf(activity: Activity, files: readonly InboundFile[], lo
   return { forwards, files: all };
 }
 
-const ATTACHMENT_TAG = /<attachment\b/iu;
-
 /**
- * Whether the message's own `text` already says where its forwards stand (a Forward blockquote, or the
- * `<attachment id="..."/>` tag of a reference): `written` takes those out, so what is left is all the person's own words
- * and nothing of it is a copy of a forward (their "LGTM" before a forwarded "LGTM" stays theirs).
+ * Whether the message's own `text` holds its forwards as Forward blockquotes: `written` cuts them out, so what is left
+ * is all the person's own words and nothing of it is a copy of a forward (their "LGTM" before a forwarded "LGTM" stays
+ * theirs).
  */
-export function forwardsMarkedInText(activity: Activity): boolean {
-  const text = pyStr(activity.text);
-  return FORWARD_ITEMTYPE.test(text) || ATTACHMENT_TAG.test(text);
+export function forwardsInText(activity: Activity): boolean {
+  return FORWARD_ITEMTYPE.test(pyStr(activity.text));
 }
 
 /**
@@ -289,7 +286,7 @@ export function forwardsMarkedInText(activity: Activity): boolean {
  * the end of `text` (after a space, or as all of it). A forwarded text the person happens to repeat in their own words
  * ("who said LGTM on this?" with "LGTM" forwarded), or one written anywhere else, stays theirs; `text` is untouched then.
  */
-export function ownWords(text: string, forwards: readonly InboundForward[]): string {
+export function ownWords(text: string, forwards: readonly InboundForward[], keepSome = false): string {
   // (a forwarded message with no text, an image alone, leaves nothing in `text`)
   const said = forwards
     .map((f) => squashSpaces(f.text.replace(/\[image(?:-[0-9]+| not passed on)\]/gu, "")))
@@ -305,6 +302,9 @@ export function ownWords(text: string, forwards: readonly InboundForward[]): str
       return text;
     }
   }
+  // (a text that only refers to its forwards, `<attachment id="..."/>`, names them apart from the person's words: a text
+  // that is all a forwarded message's words is then the person saying them, kept rather than lost)
+  if (own === "" && keepSome) return text;
   // (the cut is whole words at the end; what is left is cut from `text` as written, its line breaks and indents kept)
   return firstWords(text, pySplit(own).length);
 }

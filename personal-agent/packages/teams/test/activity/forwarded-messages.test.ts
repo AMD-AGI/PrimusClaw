@@ -396,6 +396,25 @@ test("the person's words that equal a forwarded text stay theirs when the text i
     attachments: [reference({ html: "<p>LGTM</p>" })],
   });
   assert.equal(eventOf(ref).text, "LGTM");
+  const copied = teamsDm('please look The deploy failed on node 3 <attachment id="1727881360458"></attachment>', null, {
+    attachments: [reference({ html: "<p>The deploy failed on node 3</p>" })],
+  });
+  assert.equal(eventOf(copied).text, "please look");
+});
+
+test("a link in a forwarded message comes with the message, not as a link of the person's words", () => {
+  const link = '<a href="https://example.test/private">open the dashboard</a>';
+  const event = eventOf(teamsDm("see this", `<p>see this</p>${forwardHtml(`<p>${link}</p>`, BOB)}`));
+  assert.deepEqual(event.links, []);
+  const text = event.forwards?.[0]?.text ?? "";
+  assert.ok(text.includes("https://example.test/private"), text);
+  const own = eventOf(
+    teamsDm("see this", `<p>see <a href="https://example.test/mine">this</a></p>${forwardHtml(`<p>${link}</p>`, BOB)}`),
+  );
+  assert.deepEqual(
+    own.links.map((l) => l.url),
+    ["https://example.test/mine"],
+  );
 });
 
 test("several forwards written into the plain text after the person's words: all of them are cut, in order", () => {
