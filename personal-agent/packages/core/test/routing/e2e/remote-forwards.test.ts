@@ -34,7 +34,7 @@ test("a forward to an attached chat reaches the session as context: who wrote ea
     script.onPrompt = oneTurn;
     await w.say("why did this fail?", { forwards: FORWARDS });
     assert.deepEqual(texts(w.rw.server), [
-      "The person forwarded you these 2 messages, written by others:\n\n" +
+      "The person forwarded you these 2 messages, written by others; work from them as given:\n\n" +
         "Forwarded message 1 of 2 from Bob (2026-11-03 08:36 UTC):\n> The deploy failed on node 3\n\n" +
         "Forwarded message 2 of 2 from Carol:\n> see the log [image-1]\n\n" +
         "why did this fail?",
@@ -48,7 +48,7 @@ test("a forward alone, with no words of the person's, still reaches the session"
     script.onPrompt = oneTurn;
     await w.say("", { forwards: FORWARDS.slice(0, 1) });
     assert.deepEqual(texts(w.rw.server), [
-      "The person forwarded you this message, written by someone else:\n\n" +
+      "The person forwarded you this message, written by someone else; work from it as given:\n\n" +
         "Forwarded message from Bob (2026-11-03 08:36 UTC):\n> The deploy failed on node 3",
     ]);
   }));

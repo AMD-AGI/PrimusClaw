@@ -37,9 +37,9 @@ function teamsDm(
     localTimestamp: "2026-11-23T17:15:23.456+08:00",
     serviceUrl: more.serviceUrl ?? SERVICE,
     channelId: "msteams",
-    from: { id: "29:1aBcD", name: "Yihan Wang", aadObjectId: "aad-yihan" },
+    from: { id: "29:1aBcD", name: "Lin Mei", aadObjectId: "aad-lin" },
     conversation: { conversationType: "personal", tenantId: "tenant-1", id: "a:1xYz" },
-    recipient: { id: "28:bot-app-id", name: "Clawy" },
+    recipient: { id: "28:bot-app-id", name: "PrimusClaw Assistant" },
     textFormat: "plain",
     locale: "en-US",
     text,
@@ -114,7 +114,7 @@ test("one forwarded message with the person's words: their words are theirs, the
   assert.deepEqual(event.quotes, []); // (a forward is not a quote of the person's)
   assert.equal(
     blockOf(a),
-    "The person forwarded you this message, written by someone else:\n\n" +
+    "The person forwarded you this message, written by someone else; work from it as given:\n\n" +
       `Forwarded message from Bob Li (${WHEN}):\n> The deploy failed on node 3`,
   );
 });
@@ -135,7 +135,10 @@ test("several messages forwarded at once: each one, in order, with its own autho
     ],
   );
   const block = blockOf(a);
-  assert.ok(block.startsWith("The person forwarded you these 3 messages, written by others:\n\n"), block);
+  assert.ok(
+    block.startsWith("The person forwarded you these 3 messages, written by others; work from them as given:\n\n"),
+    block,
+  );
   assert.ok(block.includes(`Forwarded message 1 of 3 from Bob Li (${WHEN}):\n> The deploy failed on node 3`), block);
   assert.ok(
     block.includes("Forwarded message 2 of 3 from Carol Wu (2026-11-03 08:37 UTC):\n> It is the disk again.\n>"),
@@ -178,7 +181,7 @@ test("Graph's forward reference: the original's author, time and text, and its p
     ]);
     assert.equal(
       blockOf(a),
-      "The person forwarded you this message, written by someone else:\n\n" +
+      "The person forwarded you this message, written by someone else; work from it as given:\n\n" +
         "Forwarded message from Dave Zhou (2024-10-02 15:02 UTC):\n> hello the run <https://ci.example/run/7>",
     );
   }
@@ -272,6 +275,16 @@ test("several images over several forwarded messages are numbered after the mess
     event.forwards?.map((f) => f.text),
     ["one [image-2]", "two [image-3] and again [image-2]"],
   );
+});
+
+test("a malformed address of an image attachment is passed over, not an error", () => {
+  const img = `<img itemtype="http://schema.skype.com/AMSImage" src="${ASM}" itemid="${IMG_ID}">`;
+  const a = teamsDm("", forwardHtml(`<p>${img}</p>`, BOB), {
+    attachments: [{ contentType: "image/*", contentUrl: `${SERVICE}v3/attachments/%E0%A4%A/views/original` }],
+  });
+  const event = eventOf(a);
+  assert.equal(event.files.length, 2);
+  assert.equal(event.forwards?.[0]?.text, "[image-2]");
 });
 
 test("an emoji is its character; an image Teams does not store (a GIF from the web) is said to be not passed on", () => {

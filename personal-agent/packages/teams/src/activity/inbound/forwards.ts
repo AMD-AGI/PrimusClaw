@@ -158,6 +158,15 @@ function connectorImageUrl(serviceUrl: string, objectId: string): string {
   return `${base}v3/attachments/${encodeURIComponent(objectId)}/views/original`;
 }
 
+/** `decodeURIComponent`, or the text as it is when it is no valid escape (a malformed address is not an error here). */
+function decoded(text: string): string {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
 /** A forwarded text as lines: each paragraph's tags made one line break, the ends trimmed, no line only spaces. */
 function tidy(text: string): string {
   return text
@@ -189,7 +198,7 @@ export function forwardsOf(activity: Activity, files: readonly InboundFile[], lo
   for (const [at, file] of all.entries()) {
     const url = str(file.handle["url"]);
     const id = file.handle["kind"] === "pasted" ? (/\/attachments\/([^/]+)\/views\//u.exec(url)?.[1] ?? "") : "";
-    if (id) placeOf.set(decodeURIComponent(id), at + 1);
+    if (id) placeOf.set(decoded(id), at + 1);
   }
   const forwards = read.map((forward): InboundForward => {
     const words = forward.images.map((image) => {

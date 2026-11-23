@@ -65,9 +65,10 @@ export function forwardBlock(forwards: readonly InboundForward[], options: Forwa
   }
   const hidden = forwards.length - blocks.length;
   if (hidden > 0) blocks.push(`(${String(hidden)} more forwarded message${hidden === 1 ? "" : "s"} not shown)`);
+  // (the person handed these over to be worked on: they are not asked to say again what the messages say)
   const lead =
     forwards.length === 1
-      ? "The person forwarded you this message, written by someone else:"
-      : `The person forwarded you these ${String(forwards.length)} messages, written by others:`;
+      ? "The person forwarded you this message, written by someone else; work from it as given:"
+      : `The person forwarded you these ${String(forwards.length)} messages, written by others; work from them as given:`;
   return [lead, ...blocks].join("\n\n");
 }
