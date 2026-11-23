@@ -255,6 +255,8 @@ export class SessionManager {
   followsRef(ref: string): boolean {
     const want = ref.toLowerCase();
     for (const s of this.sessions.values()) if (!s.closed && s.acpId?.toLowerCase() === want) return true;
+    // An attach still looking the conversation up follows it too: its chat is about to show what the conversation does.
+    for (const claim of this.attaching) if (claim.endsWith(`:${want}`)) return true;
     return false;
   }
 

@@ -379,6 +379,11 @@ interface Ending {
   error: string | null;
   message: string;
   timer: NodeJS.Timeout;
+  /**
+   * Why the end was taken back, when that also decides what becomes of a session opened for it meanwhile: the conversation
+   * ended (`closed` is the session the end of it closed, if one was known then), or the connector is stopping.
+   */
+  gone?: { ended: true; closed: string | undefined } | { stopped: true };
 }
 
 interface Card { actionId: string; spec: CardSpec; chosen: string | null }
@@ -559,6 +564,10 @@ export class ApprovalBroker {
       for (const p of mine) this.settle(p, null, "terminal");
     }
     // A new prompt or the end of the conversation: someone is at the terminal, and an end not yet told is not news to them.
+    if (event === "SessionEnd") {
+      const e = this.endings.get(ref);
+      if (e) e.gone = { ended: true, closed: this.sessions.get(ref) };
+    }
     if (event === "UserPromptSubmit" || event === "SessionEnd") this.dropEnding(ref, "terminal_active");
     if (event === "Stop" || event === "StopFailure") this.turnEnded(raw, ref, from);
     if (event === "SessionEnd") this.ended(ref);
@@ -628,10 +637,10 @@ export class ApprovalBroker {
     const opened = await this.d.openSession({ agent: e.agent, configDir: e.configDir, ref: e.ref, cwd: e.cwd, title })
       .catch((err: unknown) => ({ refused: `open_failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) }));
     // Taken back while the session was opening (dropEnding said why), or forgotten by a stop: nothing is told.
-    if (this.endings.get(e.ref) !== e) return;
+    if (this.endings.get(e.ref) !== e) { if (!("refused" in opened)) this.unused(e, opened.sessionId, title); return; }
     if ("refused" in opened) { skip(opened.refused); return; }
     const now = away();
-    if ("not" in now) { skip(now.not); return; }
+    if ("not" in now) { skip(now.not); this.unused(e, opened.sessionId, title); return; }
     this.endings.delete(e.ref);
     this.started(opened.sessionId, e.ref, title, e.agent, e.cwd);
     this.d.emit(opened.sessionId, REMOTE_EVENT_TERMINAL_TURN_END, {
@@ -639,6 +648,21 @@ export class ApprovalBroker {
       ended_at: new Date(e.at).toISOString(), away_ms: Math.max(0, Date.now() - now.last),
     });
     this.d.audit("turn_end_sent", { session_id: opened.sessionId, ref: e.ref, agent: e.agent, outcome: e.outcome });
+  }
+
+  /**
+   * A session Claw opened for an end that is not told after all is not left open with nobody to close it: when the
+   * conversation has ended meanwhile it is closed (unless the end of the conversation closed it already); otherwise it is the
+   * conversation's session from now on, so its end closes it, and a later question finds it rather than opening another.
+   * A connector that is stopping says nothing more.
+   */
+  private unused(e: Ending, sid: string, title: string): void {
+    if (e.gone && "stopped" in e.gone) return;
+    if (e.gone && "ended" in e.gone) {
+      if (e.gone.closed !== sid) this.d.emit(sid, "session_closed", { reason: "terminal_ended" });
+      return;
+    }
+    this.started(sid, e.ref, title, e.agent, e.cwd);
   }
 
   /**
@@ -681,7 +705,7 @@ export class ApprovalBroker {
   /** The connector is stopping: every waiting hook is let go (the terminal still asks), every card withdrawn. */
   stopAll(): void {
     for (const p of [...this.pending.values()]) this.settle(p, null, "connector_restart");
-    for (const e of this.endings.values()) clearTimeout(e.timer);
+    for (const e of this.endings.values()) { clearTimeout(e.timer); e.gone = { stopped: true }; }
     this.endings.clear();
   }
 

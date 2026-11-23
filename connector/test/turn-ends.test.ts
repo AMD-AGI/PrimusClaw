@@ -13,6 +13,8 @@
  *   E6 a Codex `Stop` (the payload 0.153.4 hands the hook, measured) is told as Codex's
  *   E7 the hook program itself, run in a real pseudo-terminal: it names that terminal, and the connector tells the end
  *   E8 while Claw opens the session: a new prompt, typing at the terminal, a chat attaching, a newer end or a stop takes the end back
+ *   E9 a session Claw opened for an end that is then not told is not left open: the end of the conversation closes it (once)
+ *   E10 a chat still attaching to the conversation counts as following it (manager.ts `followsRef`), so its end is not told twice
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -21,6 +23,9 @@ import path from "node:path";
 import test, { describe } from "node:test";
 import { fileURLToPath } from "node:url";
 import { ApprovalBroker, approvalSocketFile, serveApprovals, type BrokerDeps } from "../src/approvals.js";
+import type { AttachSupport } from "../src/attach.js";
+import { SessionManager } from "../src/manager.js";
+import type { SessionEnv } from "../src/session.js";
 import { tmpdir } from "./support/tmp.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -258,5 +263,91 @@ describe("a turn's end in a terminal nobody is at", () => {
     await wait(100);
     assert.equal(stopped.r.ends().length, 0);
     assert.equal(stopped.r.emitted.length, 0, "not even the session's start");
+  });
+
+  test("E9 a session opened for an end that is then not told is closed when the conversation ends, once", async () => {
+    const held = () => {
+      let go = () => {};
+      let gate = Promise.resolve();
+      const r = rig({ opening: () => gate });
+      return { r, hold: () => { gate = new Promise<void>((res) => { go = res; }); }, go: () => go() };
+    };
+    const end = (r: ReturnType<typeof rig>) => r.broker.settled({ session_id: CLAUDE_STOP.session_id, hook_event_name: "SessionEnd", cwd: "/home/u/work/claw", reason: "prompt_input_exit" }, claude);
+    const lifecycle = (r: ReturnType<typeof rig>) => r.emitted.filter((e) => e.type === "session_started" || e.type === "session_closed").map((e) => `${e.type}:${e.sid}`);
+
+    // A new prompt takes it back: the session is the conversation's from now on, and the conversation's end closes it.
+    const prompt = held();
+    prompt.hold();
+    prompt.r.broker.settled(CLAUDE_STOP, claude);
+    await until(() => prompt.r.opened.length === 1);
+    prompt.r.broker.settled({ session_id: CLAUDE_STOP.session_id, hook_event_name: "UserPromptSubmit", cwd: "/home/u/work/claw", prompt: "go on" }, claude);
+    prompt.go();
+    await until(() => lifecycle(prompt.r).length === 1);
+    end(prompt.r);
+    assert.deepEqual(lifecycle(prompt.r), [`session_started:${SID}`, `session_closed:${SID}`]);
+    assert.equal(prompt.r.ends().length, 0);
+
+    // Typing at the terminal once it is open: the same.
+    let typedAt = Date.now() - 600_000;
+    let typedGo = () => {};
+    const typedGate = new Promise<void>((res) => { typedGo = res; });
+    const tr = rig({ opening: () => typedGate, input: () => typedAt });
+    tr.broker.settled(CLAUDE_STOP, claude);
+    await until(() => tr.opened.length === 1);
+    typedAt = Date.now();
+    typedGo();
+    await until(() => tr.skipped().includes("terminal_input"));
+    end(tr);
+    assert.deepEqual(lifecycle(tr), [`session_started:${SID}`, `session_closed:${SID}`]);
+
+    // The conversation ends while it opens: closed at once, never said started.
+    const ended = held();
+    ended.hold();
+    ended.r.broker.settled(CLAUDE_STOP, claude);
+    await until(() => ended.r.opened.length === 1);
+    end(ended.r);
+    ended.go();
+    await until(() => lifecycle(ended.r).length === 1);
+    await wait(100);
+    assert.deepEqual(lifecycle(ended.r), [`session_closed:${SID}`]);
+    assert.equal(ended.r.emitted.find((e) => e.type === "session_closed")?.data.reason, "terminal_ended");
+
+    // ...and when the conversation already had that session, the end of the conversation closed it: not closed twice.
+    const known = held();
+    known.r.broker.settled({ ...CLAUDE_STOP, last_assistant_message: "first" }, claude);
+    await until(() => known.r.ends().length === 1);
+    known.hold();
+    known.r.broker.settled({ ...CLAUDE_STOP, last_assistant_message: "second" }, claude);
+    await until(() => known.r.opened.length === 2);
+    end(known.r);
+    known.go();
+    await wait(150);
+    assert.deepEqual(lifecycle(known.r), [`session_started:${SID}`, `session_closed:${SID}`]);
+    assert.equal(known.r.ends().length, 1);
+  });
+
+  test("E10 a chat still attaching to the conversation follows it already", async () => {
+    const REF = CLAUDE_STOP.session_id;
+    let found: (v: { ok: false; reason: string }) => void = () => {};
+    const lookup = new Promise<{ ok: false; reason: string }>((res) => { found = res; });
+    const closed: Array<Record<string, unknown>> = [];
+    const env = {
+      config: { agents: [{ id: "claude", attach: { cli: "claude" }, roots: ["/home/u"], env: {} }] },
+      audit: { record: () => {} },
+      emit: (_sid: string, type: string, data: Record<string, unknown>) => { if (type === "session_closed") closed.push(data); },
+      store: { get: () => undefined },
+      attach: new Map([["claude", { resolve: () => lookup } as unknown as AttachSupport]]),
+      timing: {},
+      log: { error: () => {}, warn: () => {}, info: () => {}, debug: () => {} },
+    } as unknown as SessionEnv;
+    const manager = new SessionManager(env);
+    assert.equal(manager.followsRef(REF), false);
+    const handled = manager.handle({ type: "session.new", session_id: SID, agent_id: "claude", resume_ref: REF.toUpperCase(), cwd: "/home/u/work/claw" } as never);
+    await until(() => manager.followsRef(REF));
+    assert.equal(manager.followsRef("01a207e4-9e92-76f3-a734-09b243374f33"), false, "another conversation is not followed");
+    found({ ok: false, reason: "not_found" });
+    await handled;
+    assert.equal(manager.followsRef(REF), false, "a refused attach follows nothing");
+    assert.equal(closed[0]?.reason, "not_found");
   });
 });
