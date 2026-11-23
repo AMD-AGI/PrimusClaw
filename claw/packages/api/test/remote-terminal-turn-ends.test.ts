@@ -69,7 +69,6 @@ describe("turn ends and mutes from terminals", { skip }, () => {
   }
   const post = (user: string, path: string, body: unknown) => call(user, "POST", path, body);
   const CLAUDE = { agent_id: "claude", kind: "claude", name: "Claude Code", capabilities: { roots: ["/home/u"] } };
-  const CURSOR = { agent_id: "cursor", kind: "cursor", name: "Cursor", capabilities: { roots: ["/home/u"] } };
   const CODEX = { agent_id: "codex", kind: "codex", name: "Codex", capabilities: { roots: ["/home/u"] } };
   async function machine(owner: string, name: string, agents: Recorded[] = [CLAUDE]): Promise<string> {
     const row = await store.registerConnector(owner, name, "0.1.23", null, 10);
@@ -97,7 +96,6 @@ describe("turn ends and mutes from terminals", { skip }, () => {
   ];
   const ask = (actionId: string, tool = "Which color?"): [string, Recorded] =>
     ["permissionRequest", { actionId, tool, kind: "question", input: null, toolCallId: null, options: OPTIONS, timeout_ms: 3_600_000, origin: "terminal_hook", cwd: "/home/u/work/claw" }];
-  const resolved = (actionId: string, by: string, optionId: string | null = null): [string, Recorded] => ["permission_resolved", { actionId, optionId, by }];
   const remoteItem = async (sid: string) => (await w.q("SELECT * FROM claw_work_items WHERE worker_session_id = $1", [`remote:${sid}`]))[0];
   /** What was pushed of the session of `itemId` (filed under the item or not), oldest first. */
   const pushed = async (itemId: string) => (await w.q(
