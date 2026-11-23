@@ -410,8 +410,7 @@ test("a link in a forwarded message comes with the message, not as a link of the
   const link = '<a href="https://example.test/private">open the dashboard</a>';
   const event = eventOf(teamsDm("see this", `<p>see this</p>${forwardHtml(`<p>${link}</p>`, BOB)}`));
   assert.deepEqual(event.links, []);
-  const text = event.forwards?.[0]?.text ?? "";
-  assert.ok(text.includes("https://example.test/private"), text);
+  assert.equal(event.forwards?.[0]?.text, "open the dashboard <https://example.test/private>");
   const own = eventOf(
     teamsDm("see this", `<p>see <a href="https://example.test/mine">this</a></p>${forwardHtml(`<p>${link}</p>`, BOB)}`),
   );
