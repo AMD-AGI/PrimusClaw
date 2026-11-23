@@ -8,6 +8,14 @@ import type { SseEvent } from "../../claw/model.js";
 import type { RemoteConnector, RemoteEventRow, RemotePairing, RemoteSession, RemoteSetup } from "../../claw/remote.js";
 
 /** What a remote session starts with. */
+/** What Claw stored for a muted (or unmuted) terminal conversation (`PUT /v1/remote-agents/approvals/mutes`). */
+export interface TerminalMute {
+  readonly item: number;
+  readonly muted: boolean;
+  readonly machine: string;
+  readonly title: string;
+}
+
 export interface NewRemoteSession {
   readonly connectorId: string;
   readonly agentId: string;
@@ -46,6 +54,11 @@ export interface ClawRemoteAgentsPort {
   approvals(key: ClawCredential): Promise<boolean>;
   /** Turn them on or off (`PUT /approvals`); answers the setting as Claw stored it. */
   setApprovals(key: ClawCredential, enabled: boolean): Promise<boolean>;
+  /**
+   * Mute (or unmute) one conversation open in a terminal, named by its work item (`#<item>`): nothing it asks, waits for or finishes
+   * is pushed while muted (`PUT /approvals/mutes`). Answers what Claw stored, and the machine and conversation it names.
+   */
+  muteTerminal(key: ClawCredential, item: number, muted: boolean): Promise<TerminalMute>;
   createSession(key: ClawCredential, session: NewRemoteSession): Promise<RemoteSession>;
   sessions(key: ClawCredential): Promise<RemoteSession[]>;
   session(key: ClawCredential, sessionId: string): Promise<RemoteSession>;

@@ -258,7 +258,7 @@ describe("claw-connector pair", () => {
       assert.deepEqual(asked, [["Add them? [Y/n] ", true]]);
       const cmds = commands(cc);
       assert.equal(cmds.filter((c) => c.includes("terminal-hook.js")).length, 2);
-      assert.equal(cmds.filter((c) => c.includes("approval-hook.js") && c.includes(path.join(a.c.dirs.state, "approvals.sock"))).length, 6);
+      assert.equal(cmds.filter((c) => c.includes("approval-hook.js") && c.includes(path.join(a.c.dirs.state, "approvals.sock"))).length, 7);
       assert.equal(JSON.parse(fs.readFileSync(path.join(cc, "settings.json"), "utf8")).model, "opus");
       assert.match(a.text(), /paired "box"[\s\S]*installed the approval hooks[\s\S]*is coming online/);
     });
@@ -303,7 +303,7 @@ describe("claw-connector pair", () => {
           assert.match(a.text(), /Claude Code has not run here yet: .* is created with only entries marked --managed-by claw-connector/);
           const cmds = commands(cc);
           assert.equal(cmds.filter((c) => c.includes("terminal-hook.js")).length, 2);
-          assert.equal(cmds.filter((c) => c.includes("approval-hook.js")).length, 6);
+          assert.equal(cmds.filter((c) => c.includes("approval-hook.js")).length, 7);
           assert.match(a.text(), /installed the approval hooks/);
         } else {
           assert.equal(fs.existsSync(cc), false, `${how}: nothing created`);
@@ -323,7 +323,7 @@ describe("claw-connector pair", () => {
       const fc = path.join(forced, ".claude");
       const b = ctx(forced, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: "", CLAUDE_CONFIG_DIR: fc }, ...scripts(), ask: async () => assert.fail("--hooks must not ask") });
       assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start", "--hooks"], b.c), EXIT.ok, b.errText());
-      assert.equal(commands(fc).filter((c) => c.includes("approval-hook.js")).length, 6);
+      assert.equal(commands(fc).filter((c) => c.includes("approval-hook.js")).length, 7);
     });
 
     test("paired again on a machine that has the hooks: nothing asked, nothing changed", async () => {

@@ -9,8 +9,9 @@
  * needed"). Someone at that terminal answers a question or a permission in seconds; one who walked away does not. So a conversation
  * that has been waiting for `noticeAfterMs` (a minute, as Claude Code's own "waiting for your input" notification) on a machine that is
  * online is said to its owner once (`recordSystemNotice`, keyed by the episode); one answered at the terminal before then is never
- * said, and neither is anything else a terminal does (working, finishing): the person at the terminal sees that, and only the need of
- * one who is not there is worth a push. The episode ends when the conversation stops waiting (answered, ended, or its machine went
+ * said, and neither is anything else a terminal does here (working; a turn that finished while its person was away is told by its
+ * connector, `terminal_turn_end`): only the need of one who is not there is worth a push. Nothing is said while the owner has their
+ * terminals' pushes off (`/approvals off`) or muted that conversation (`/approvals mute #<item>`). The episode ends when the conversation stops waiting (answered, ended, or its machine went
  * offline, on a report that says so: one heartbeat that could not see its terminals ends nothing), and a later wait is a new one.
  *
  * A sweep, every few seconds on whichever replica takes the lock, keeps one row per waiting conversation
@@ -21,7 +22,7 @@
 import pino from "pino";
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
-import { onlineSql } from "./store.js";
+import { approvalsEnabled, onlineSql, terminalMuted } from "./store.js";
 
 const logger = pino({ name: "remote-agents-terminal-waits" });
 
@@ -182,6 +183,8 @@ export async function sweepTerminalWaits(onlineWindowMs: number, noticeAfterMs: 
       const r = byKey.get(keyOf(d.connector_id, d.agent_id, d.ref));
       if (!r) continue;
       if (carded.has(`${d.connector_id}\u0000${d.ref}`)) continue;
+      // The owner turned their terminals' pushes off (`/approvals off`), or muted this conversation (`/approvals mute #<item>`).
+      if (!await approvalsEnabled(r.owner_user_id, q) || await terminalMuted(r.owner_user_id, d.connector_id, d.ref, q)) continue;
       notices.push({
         owner: r.owner_user_id, connectorId: r.connector_id, agentId: r.agent_id, ref: r.ref, machine: r.machine, agent: r.agent,
         title: r.title, cwd: r.cwd, waitingFor: r.waiting_for, since: new Date(d.since),

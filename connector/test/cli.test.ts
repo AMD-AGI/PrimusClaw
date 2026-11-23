@@ -858,7 +858,7 @@ describe("init and hooks: the Claude Code session hooks", () => {
     assert.match(enter.text(), /installed the Claude Code session hooks in .*settings\.json/);
     assert.match(enter.text(), /installed the approval hooks in .*settings\.json: questions Claude Code asks in a terminal also go to your chat/);
     assert.equal(sessionCmds(dir).length, 2);
-    assert.equal(approvalCmds(dir).length, 6, "PermissionRequest, PostToolUse, PostToolUseFailure, UserPromptSubmit, Stop, SessionEnd");
+    assert.equal(approvalCmds(dir).length, 7, "PermissionRequest, PostToolUse, PostToolUseFailure, UserPromptSubmit, Stop, StopFailure, SessionEnd");
     assert.ok(approvalCmds(dir).every((c) => c.includes(`--socket '${path.join(enter.c.dirs.state, "approvals.sock")}'`)), "they talk to this connector's socket");
     assert.ok(hookCommands(dir).includes("mine.sh"), "the user's own hook is still there");
     assert.equal(JSON.parse(fs.readFileSync(settings(dir), "utf8")).model, "opus");
@@ -896,7 +896,7 @@ describe("init and hooks: the Claude Code session hooks", () => {
     const yes = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async () => true });
     assert.equal(await main(["init"], yes.c), EXIT.ok);
     assert.equal(sessionCmds(dir).length, 2);
-    assert.equal(approvalCmds(dir).length, 6);
+    assert.equal(approvalCmds(dir).length, 7);
     assert.ok(hookCommands(dir).includes("mine.sh"));
   });
 
@@ -908,7 +908,7 @@ describe("init and hooks: the Claude Code session hooks", () => {
     assert.match(a.text(), /installed the Claude Code session hooks/);
     assert.match(a.text(), /installed the approval hooks/);
     assert.equal(sessionCmds(dir).length, 2);
-    assert.equal(approvalCmds(dir).length, 6);
+    assert.equal(approvalCmds(dir).length, 7);
     const only = tmpdir();
     const onlyDir = claudeDir(only);
     const o = ctx(only, { hookScript: stand(), approvalHookScript: standApproval(), ask: async () => assert.fail("--hooks must not ask") });

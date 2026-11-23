@@ -38,7 +38,9 @@ import {
   CURSOR_HOLD_DEFAULT_S, CURSOR_HOLD_MAX_S, CURSOR_HOLD_MIN_S, type CursorDecision, type CursorRules, cursorWouldAsk, loadCursorRules, mapCursorRequest,
   parseCursorEvent,
 } from "./cursor-approvals.js";
+import { lastInputMs as ttyLastInputMs } from "./codex-terminal.js";
 import { boundedInput, type OfferedOption } from "./permissions.js";
+import { REMOTE_EVENT_TERMINAL_TURN_END } from "./protocol.js";
 import { redactDeep } from "./redact.js";
 
 /** What a card's options say, in the order shown. */
@@ -323,7 +325,7 @@ export const approvalSocketFile = (stateDir: string): string => path.join(stateD
 /** One line each way: the hook's request, the connector's answer. */
 export type HookMessage =
   | { v: 1; type: "ask"; event: Record<string, unknown>; agent?: HookAgent; hold_ms?: number }
-  | { v: 1; type: "settled"; event: Record<string, unknown>; agent?: HookAgent };
+  | { v: 1; type: "settled"; event: Record<string, unknown>; agent?: HookAgent; tty?: string };
 export type ConnectorReply = { v: 1; decision: AnyDecision | null; why?: string };
 
 /** Which coding agent's hooks a request came from. */
@@ -342,6 +344,41 @@ export interface BrokerDeps {
   ttlMs: number;
   /** Cursor's rules for a Cursor config directory and the conversation's workspace roots (default: read from their files). */
   cursorRules?: (configDir: string, workspaceRoots: string[]) => CursorRules;
+  /**
+   * Whether a chat follows this conversation through a session of this connector (attached, watched or typed into from the phone):
+   * that chat shows the turn's end itself, so it is not told again.
+   */
+  attached?: (ref: string) => boolean;
+  /** How long a terminal must go without input after a turn ends before its owner is told (default {@link TURN_END_AWAY_MS}). */
+  awayMs?: number;
+  /** When a terminal last had input (default: its device's access time). */
+  lastInputMs?: (tty: string) => number | null;
+}
+
+/**
+ * How long nobody may type in a terminal after a turn ended there before its owner is told it ended: the person who sent the
+ * prompt and stayed sees the end themselves, and someone who walked away is told once a minute has passed, as Claw tells a wait.
+ */
+export const TURN_END_AWAY_MS = 60_000;
+/** The most of the agent's last message an end carries (its end: where an answer sums up). Claw keeps less. */
+export const TURN_END_MESSAGE_MAX = 2000;
+/** What a hook names as the terminal a session runs in (codex-terminal.ts `terminalOf`). */
+const TTY_RE = /^\/dev\/(?:pts\/\d+|tty[A-Za-z0-9]+)$/;
+/** The errors Claude Code names in `StopFailure` are words; anything else is cut to one. */
+const ERROR_RE = /^[a-z_]{1,40}$/;
+
+/** A turn that ended in a terminal, waiting to see whether anyone is there. */
+interface Ending {
+  ref: string;
+  agent: HookAgent;
+  configDir: string;
+  cwd: string;
+  tty: string;
+  at: number;
+  outcome: "done" | "error";
+  error: string | null;
+  message: string;
+  timer: NodeJS.Timeout;
 }
 
 interface Card { actionId: string; spec: CardSpec; chosen: string | null }
@@ -375,6 +412,8 @@ export class ApprovalBroker {
   /** Claw sessions this connector opened for terminal conversations, by conversation id. */
   private readonly sessions = new Map<string, string>();
   private readonly owned = new Set<string>();
+  /** Turns that ended in a terminal, one per conversation: told once the terminal has had no input for `awayMs`. */
+  private readonly endings = new Map<string, Ending>();
 
   constructor(private readonly d: BrokerDeps) {}
 
@@ -435,6 +474,8 @@ export class ApprovalBroker {
     once: (r: ConnectorReply) => void, isDone: () => boolean,
   ): Promise<() => void> {
     const { mapping } = q;
+    // The conversation is at work again (a background task woke it): an end said before is not the end any more.
+    this.dropEnding(q.ref, "asked");
     const title = oneLine(path.basename(q.cwd), 80) || q.cwd;
     const opened = await this.d.openSession({ agent: q.agent, configDir: q.configDir, ref: q.ref, cwd: q.cwd, title }).catch((err: unknown) => ({ refused: `open_failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) }));
     if ("refused" in opened) {
@@ -444,12 +485,7 @@ export class ApprovalBroker {
     }
     if (isDone()) return () => {};
     const sid = opened.sessionId;
-    if (this.sessions.get(q.ref) !== sid) {
-      this.sessions.set(q.ref, sid);
-      this.owned.add(sid);
-      // Not `read_only`: Claw refuses a decision on a read-only session. What makes it carry nothing but cards is its origin.
-      this.d.emit(sid, "session_started", { origin: "terminal_hook", ref: q.ref, title, agent: q.agent, cwd: q.cwd });
-    }
+    this.started(sid, q.ref, title, q.agent, q.cwd);
     const p: Pending = {
       id: randomUUID(), ref: q.ref, sessionId: sid, tool: q.tool, input: q.input, toolUseId: q.toolUseId, mapping,
       cards: mapping.cards.map((spec) => ({ actionId: randomUUID(), spec, chosen: null })),
@@ -475,6 +511,15 @@ export class ApprovalBroker {
     return () => this.settle(p, null, "terminal");
   }
 
+  /** The conversation's Claw session is known to be `sid`: said once, as the session's start. */
+  private started(sid: string, ref: string, title: string, agent: HookAgent, cwd: string): void {
+    if (this.sessions.get(ref) === sid) return;
+    this.sessions.set(ref, sid);
+    this.owned.add(sid);
+    // Not `read_only`: Claw refuses a decision on a read-only session. What makes it carry nothing but cards is its origin.
+    this.d.emit(sid, "session_started", { origin: "terminal_hook", ref, title, agent, cwd });
+  }
+
   /** The owner chose `optionId` on card `actionId`. False when no card waits under that id or the option was not offered. */
   decide(actionId: string, optionId: string, by: string | null): boolean {
     const p = this.byAction.get(actionId);
@@ -498,10 +543,10 @@ export class ApprovalBroker {
    * An event that follows an answer in the terminal. A tool's result settles the waiting request for the same call; a new
    * prompt, a turn's end or the session's end settles every request of that conversation.
    */
-  settled(raw: Record<string, unknown>): void {
+  settled(raw: Record<string, unknown>, from: { agent?: HookAgent; configDir?: string; tty?: unknown } = {}): void {
     if (!isObject(raw)) return;
     if (typeof raw.conversation_id === "string") { this.settledCursor(raw); return; }
-    if (typeof raw.session_id !== "string") return;
+    if (typeof raw.session_id !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(raw.session_id)) return;
     const ref = raw.session_id;
     const event = raw.hook_event_name;
     const mine = [...this.pending.values()].filter((p) => p.ref === ref);
@@ -510,10 +555,73 @@ export class ApprovalBroker {
       const input = canon(raw.tool_input);
       const hit = mine.find((p) => p.tool === tool && p.input === input) ?? (MATCH_BY_NAME.has(tool) ? mine.find((p) => p.tool === tool) : undefined);
       if (hit) this.settle(hit, null, "terminal");
-    } else if (event === "UserPromptSubmit" || event === "Stop" || event === "SessionEnd") {
+    } else if (event === "UserPromptSubmit" || event === "Stop" || event === "StopFailure" || event === "SessionEnd") {
       for (const p of mine) this.settle(p, null, "terminal");
     }
+    // A new prompt or the end of the conversation: someone is at the terminal, and an end not yet told is not news to them.
+    if (event === "UserPromptSubmit" || event === "SessionEnd") this.dropEnding(ref, "terminal_active");
+    if (event === "Stop" || event === "StopFailure") this.turnEnded(raw, ref, from);
     if (event === "SessionEnd") this.ended(ref);
+  }
+
+  /**
+   * A turn ended in a terminal (Claude Code's `Stop` or `StopFailure`, Codex's `Stop`). Its owner is told (a `terminal_turn_end`
+   * event on the conversation's Claw session, which Claw puts to them) only once the terminal has had no input for `awayMs` since:
+   * someone who stayed at it saw the end there. Not told at all when the hook could not name the terminal (nobody can tell whether
+   * a person is at it), when a chat follows the conversation (it shows the end itself), when a newer turn ended (that one is told
+   * instead), or when a new prompt or the end of the conversation came first. A `Stop` that leaves background work running is not
+   * an end: Claude Code wakes the conversation again when that work finishes.
+   */
+  private turnEnded(raw: Record<string, unknown>, ref: string, from: { agent?: HookAgent; configDir?: string; tty?: unknown }): void {
+    this.dropEnding(ref, "superseded");
+    const agent = from.agent ?? "claude";
+    const failed = raw.hook_event_name === "StopFailure";
+    const skip = (reason: string) => { this.d.audit("turn_end_not_sent", { ref, agent, reason }); };
+    if (agent === "cursor") return;
+    if (!failed && Array.isArray(raw.background_tasks) && raw.background_tasks.length > 0) { skip("background_tasks"); return; }
+    const tty = typeof from.tty === "string" && TTY_RE.test(from.tty) ? from.tty : null;
+    if (!tty) { skip("no_terminal"); return; }
+    const cwd = typeof raw.cwd === "string" && path.isAbsolute(raw.cwd) ? raw.cwd : null;
+    if (!cwd || !from.configDir) { skip("no_folder"); return; }
+    const error = failed ? (typeof raw.error === "string" && ERROR_RE.test(raw.error) ? raw.error : "unknown") : null;
+    const said = typeof raw.last_assistant_message === "string" ? raw.last_assistant_message : "";
+    const e: Ending = {
+      ref, agent, configDir: from.configDir, cwd, tty, at: Date.now(), outcome: failed ? "error" : "done", error,
+      message: said.length > TURN_END_MESSAGE_MAX ? `…${said.slice(-(TURN_END_MESSAGE_MAX - 1))}` : said,
+      timer: setTimeout(() => { void this.tellEnding(e); }, this.d.awayMs ?? TURN_END_AWAY_MS),
+    };
+    e.timer.unref?.();
+    this.endings.set(ref, e);
+  }
+
+  private dropEnding(ref: string, reason: string): void {
+    const e = this.endings.get(ref);
+    if (!e) return;
+    clearTimeout(e.timer);
+    this.endings.delete(ref);
+    this.d.audit("turn_end_not_sent", { ref, agent: e.agent, reason });
+  }
+
+  /** The time is up for a turn's end: told, unless someone typed in that terminal since, or a chat follows the conversation now. */
+  private async tellEnding(e: Ending): Promise<void> {
+    if (this.endings.get(e.ref) !== e) return;
+    this.endings.delete(e.ref);
+    const skip = (reason: string) => { this.d.audit("turn_end_not_sent", { ref: e.ref, agent: e.agent, reason }); };
+    const last = (this.d.lastInputMs ?? ttyLastInputMs)(e.tty);
+    // (a terminal that is gone was closed: by its person, who is not away)
+    if (last === null) { skip("terminal_gone"); return; }
+    if (last > e.at) { skip("terminal_input"); return; }
+    if (this.d.attached?.(e.ref)) { skip("attached"); return; }
+    const title = oneLine(path.basename(e.cwd), 80) || e.cwd;
+    const opened = await this.d.openSession({ agent: e.agent, configDir: e.configDir, ref: e.ref, cwd: e.cwd, title })
+      .catch((err: unknown) => ({ refused: `open_failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 200) }));
+    if ("refused" in opened) { skip(opened.refused); return; }
+    this.started(opened.sessionId, e.ref, title, e.agent, e.cwd);
+    this.d.emit(opened.sessionId, REMOTE_EVENT_TERMINAL_TURN_END, {
+      ref: e.ref, outcome: e.outcome, ...(e.error ? { error: e.error } : {}), message: e.message, agent: e.agent, cwd: e.cwd,
+      ended_at: new Date(e.at).toISOString(), away_ms: Math.max(0, Date.now() - last),
+    });
+    this.d.audit("turn_end_sent", { session_id: opened.sessionId, ref: e.ref, agent: e.agent, outcome: e.outcome });
   }
 
   /**
@@ -556,6 +664,8 @@ export class ApprovalBroker {
   /** The connector is stopping: every waiting hook is let go (the terminal still asks), every card withdrawn. */
   stopAll(): void {
     for (const p of [...this.pending.values()]) this.settle(p, null, "connector_restart");
+    for (const e of this.endings.values()) clearTimeout(e.timer);
+    this.endings.clear();
   }
 
   private settle(p: Pending, decision: AnyDecision | null, by: string): void {
@@ -603,7 +713,12 @@ export async function serveApprovals(stateDir: string, broker: ApprovalBroker, c
       try { msg = JSON.parse(buf.slice(0, nl)); } catch { sock.destroy(); return; }
       if (!isObject(msg) || msg.v !== 1 || !isObject(msg.event)) { sock.destroy(); return; }
       const event = msg.event;
-      if (msg.type === "settled") { broker.settled(event); sock.end(); return; }
+      if (msg.type === "settled") {
+        const agent = msg.agent === "codex" ? "codex" : msg.agent === "cursor" ? "cursor" : "claude";
+        broker.settled(event, { agent, configDir: configDirOf(msg as Record<string, unknown>), tty: msg.tty });
+        sock.end();
+        return;
+      }
       if (msg.type !== "ask") { sock.destroy(); return; }
       const onReply = (r: ConnectorReply) => {
         gone = null;

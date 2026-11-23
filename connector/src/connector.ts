@@ -24,7 +24,7 @@ import { SnapshotFile, STATE_WRITE_WAIT_MS, within, writeWhole, type WriteReport
 import { SessionManager, type Command } from "./manager.js";
 import { Outbox, type OutEvent } from "./outbox.js";
 import { failureKind, PoisonFinder } from "./poison.js";
-import { ApprovalBroker, type HookAgent, serveApprovals } from "./approvals.js";
+import { ApprovalBroker, type HookAgent, serveApprovals, TURN_END_AWAY_MS } from "./approvals.js";
 import { cursorConfigDir } from "./cursor-approvals.js";
 import {
   childrenFile, identityFile, identityKeepFile, logDir, outboxDir, pauseFile, pidFile, quarantineFile, sessionsFile, type Dirs,
@@ -59,6 +59,8 @@ export interface ConnectorTiming extends SessionTiming {
   heartbeatMs: number;
   /** How long a terminal's question waits on the phone before its card is withdrawn (it stays open in the terminal). */
   approvalTtlMs: number;
+  /** How long a terminal goes without input after a turn ended there before its owner is told the turn ended (approvals.ts). */
+  turnEndAwayMs: number;
   /** No byte on the command stream for this long: drop it and reconnect. */
   watchdogMs: number;
   /** Events are posted this long after the first one is waiting, or at once when `batchMax` are. */
@@ -135,6 +137,7 @@ export const DEFAULT_TIMING: ConnectorTiming = {
   ...DEFAULT_SESSION_TIMING,
   heartbeatMs: REMOTE_AGENT_TIMING.heartbeatMs,
   approvalTtlMs: 60 * 60_000,
+  turnEndAwayMs: TURN_END_AWAY_MS,
   watchdogMs: REMOTE_AGENT_TIMING.watchdogMs,
   batchMs: 150,
   batchMax: 20,
@@ -452,6 +455,8 @@ export class Connector {
       emit: (sid, type, data) => this.emit(sid, type, data),
       audit: (event, detail) => d.audit.record(event, detail),
       ttlMs: this.timing.approvalTtlMs,
+      attached: (ref) => this.manager.followsRef(ref),
+      awayMs: this.timing.turnEndAwayMs,
     });
     this.manager.approvals = this.approvals;
   }
