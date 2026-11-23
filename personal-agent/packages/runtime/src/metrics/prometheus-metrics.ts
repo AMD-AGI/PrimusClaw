@@ -109,7 +109,7 @@ export const HELP_CURRENT_ONLY: Readonly<Record<string, readonly [string, string
   ],
   personal_agent_inbound_rearmed_total: [
     "counter",
-    "Inbound queue receivers whose call on the broker hung and that were taken again on a new connection.",
+    "Times the inbound receivers' connection was re-opened because a call on the broker hung (once per connection).",
   ],
 };
 

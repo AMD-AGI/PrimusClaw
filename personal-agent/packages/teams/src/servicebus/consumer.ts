@@ -16,8 +16,11 @@
  * messages without waiting for the lock to expire. Nothing taken is left unsettled on purpose.
  *
  * A call on the broker that hangs (a dead AMQP connection the SDK does not notice: the ingress met one, #896) is given up
- * after its deadline: the receiver is dropped, the connection re-opened (`BusClient.reopen`), and the session taken again,
- * so a wedged receiver re-arms itself instead of leaving its conversations waiting (`inbound receiver re-armed`).
+ * after its deadline: the receiver is dropped, a new connection opened (`BusClient.reopen`), and the session taken again,
+ * so a wedged receiver re-arms itself instead of leaving its conversations waiting (`inbound receiver re-armed`). The old
+ * connection is closed only once no receiver still holds a session taken on it: another receiver may be handling a message
+ * there, and closing the connection under it would drop its session lock, so the broker would hand the same message to a
+ * receiver on the new connection while the first is still handling it (a duplicate reply).
  */
 import type { Clock, Logger } from "@primusclaw/personal-agent";
 import { errorName, silentLogger } from "@primusclaw/personal-agent";
@@ -44,7 +47,7 @@ export const SETTLE_DEADLINE_MS = 60_000;
 /** What the handled messages are counted in: how long each waited in the queue and took to handle. */
 export interface InboundStats {
   processed(queueLagMs: number | undefined, handleMs: number, ok: boolean): void;
-  /** A receiver whose call on the broker hung was dropped and its connection re-opened. */
+  /** A call on the broker hung and the receivers' connection was re-opened (once per connection, however many hung). */
   rearmed?(): void;
 }
 
@@ -165,6 +168,10 @@ export class InboundConsumer {
   private readonly logger: Logger;
   /** Which connection the receivers are on: a receiver re-opens it only if no other has since it took its session. */
   private generation = 0;
+  /** How many receivers are in a pass on each connection (by generation): a session taken there may be in hand. */
+  private readonly holders = new Map<number, number>();
+  /** The close of each connection given up on, run once its last holder lets go. */
+  private readonly retiring = new Map<number, () => Promise<void>>();
 
   constructor(private readonly parts: ConsumerParts) {
     this.logger = parts.logger ?? silentLogger;
@@ -214,31 +221,64 @@ export class InboundConsumer {
   private async loop(): Promise<void> {
     while (!this.isStopped()) {
       const generation = this.generation;
-      let receiver: SessionReceiver;
-      const accepting = this.parts.client.acceptNextSession(this.parts.queue, this.stopping.signal);
+      this.hold(generation);
+      let failed: { error: unknown; rearmed: boolean } | undefined;
       try {
-        receiver = await this.within("accept", ACCEPT_DEADLINE_MS, accepting, true);
-      } catch (error) {
-        // (a session the broker hands over after it was given up on is closed at once, so its lock is not held)
-        accepting.then((late) => late.close()).catch(() => undefined);
-        if (this.isStopped()) return;
-        await this.pause(error, generation);
-        continue;
+        failed = await this.pass(generation);
+      } finally {
+        this.letGo(generation);
       }
-      let failed: { error: unknown } | undefined;
-      try {
-        await this.drain(receiver);
-      } catch (error) {
-        failed = { error };
-        // (a hung call re-opens the connection first: closing a receiver on a wedged one would hang as well)
-        if (error instanceof WedgedCall && !this.isStopped()) this.rearm(error.call, generation);
-      }
-      // (closed before any pause: the session's lock is released for whoever takes it next)
-      await this.within("close", SETTLE_DEADLINE_MS, receiver.close()).catch((error: unknown) => {
-        this.logger.info("closing a session receiver failed", { error: errorName(error) });
-      });
-      if (failed !== undefined && !this.isStopped()) await this.pause(failed.error, generation, true);
+      if (failed !== undefined && !this.isStopped()) await this.pause(failed.error, generation, failed.rearmed);
     }
+  }
+
+  /** Take a session on the current connection and handle it until it goes quiet; what failed, for the pause after. */
+  private async pass(generation: number): Promise<{ error: unknown; rearmed: boolean } | undefined> {
+    let receiver: SessionReceiver;
+    const accepting = this.parts.client.acceptNextSession(this.parts.queue, this.stopping.signal);
+    try {
+      receiver = await this.within("accept", ACCEPT_DEADLINE_MS, accepting, true);
+    } catch (error) {
+      // (a session the broker hands over after it was given up on is closed at once, so its lock is not held)
+      accepting.then((late) => late.close()).catch(() => undefined);
+      return { error, rearmed: false };
+    }
+    let failed: { error: unknown; rearmed: boolean } | undefined;
+    try {
+      await this.drain(receiver);
+    } catch (error) {
+      failed = { error, rearmed: true };
+      // (a hung call opens a new connection first: closing a receiver on a wedged one would hang as well)
+      if (error instanceof WedgedCall && !this.isStopped()) this.rearm(error.call, generation);
+    }
+    // (closed before any pause: the session's lock is released for whoever takes it next)
+    await this.within("close", SETTLE_DEADLINE_MS, receiver.close()).catch((error: unknown) => {
+      this.logger.info("closing a session receiver failed", { error: errorName(error) });
+    });
+    return failed;
+  }
+
+  private hold(generation: number): void {
+    this.holders.set(generation, (this.holders.get(generation) ?? 0) + 1);
+  }
+
+  private letGo(generation: number): void {
+    const left = (this.holders.get(generation) ?? 1) - 1;
+    if (left > 0) this.holders.set(generation, left);
+    else {
+      this.holders.delete(generation);
+      this.retire(generation);
+    }
+  }
+
+  /** Close a connection given up on, once no receiver holds a session taken on it (a wedged close is not waited for). */
+  private retire(generation: number): void {
+    const close = this.retiring.get(generation);
+    if (close === undefined || this.holders.has(generation)) return;
+    this.retiring.delete(generation);
+    void close().catch((error: unknown) => {
+      this.logger.info("closing a re-opened inbound connection failed", { error: errorName(error) });
+    });
   }
 
   private async pause(error: unknown, generation: number, rearmed = false): Promise<void> {
@@ -248,19 +288,24 @@ export class InboundConsumer {
       return;
     }
     if (!(error instanceof WedgedCall)) this.logger.warn("inbound receiver error", { error: errorName(error) });
-    else if (!rearmed) this.rearm(error.call, generation);
+    else if (!rearmed && !this.isStopped()) this.rearm(error.call, generation);
     await this.parts.clock.sleep(BACKOFF_MS, this.stopping.signal).catch(() => undefined);
   }
 
-  /** A call hung: the connection is re-opened, once for all receivers that were on it, and the session taken again. */
+  /**
+   * A call hung: a new connection is opened, once for all receivers that were on the old one, and the session taken
+   * again. The old connection is closed when its last holder lets go (`retire`), not now: see the head of this file.
+   */
   private rearm(call: string, generation: number): void {
-    const reopened = generation === this.generation && this.parts.client.reopen !== undefined;
+    const reopen = this.parts.client.reopen?.bind(this.parts.client);
+    const reopened = generation === this.generation && reopen !== undefined;
     if (reopened) {
+      this.retiring.set(generation, reopen());
       this.generation += 1;
-      this.parts.client.reopen?.();
+      this.retire(generation);
     }
     this.logger.warn("inbound receiver re-armed", { call, reopened });
-    this.parts.stats?.rearmed?.();
+    if (reopened || reopen === undefined) this.parts.stats?.rearmed?.();
   }
 
   private async drain(receiver: SessionReceiver): Promise<void> {

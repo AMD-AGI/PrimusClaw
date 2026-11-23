@@ -4,7 +4,7 @@
 /**
  * The inbound consumer at a cutover and on a wedged connection: a stop drains (the waits end, what is being handled is
  * settled, what arrives after it goes back to the queue, every session is closed), and a call on the broker that hangs
- * re-arms the receiver on a new connection.
+ * re-arms the receiver on a new connection, closing the old one only once no receiver still holds a session taken on it.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -71,6 +71,8 @@ class ScriptedReceiver implements SessionReceiver {
 /** A bus whose acceptNextSession is scripted per call; after the script, "no session" (the documented timeout). */
 class ScriptedBus implements BusClient {
   reopened = 0;
+  /** How many of the connections given up on were closed. */
+  retired = 0;
   accepts = 0;
   constructor(private readonly script: Array<(signal: AbortSignal | undefined) => Promise<SessionReceiver>>) {}
   sender(): BusSender {
@@ -82,8 +84,12 @@ class ScriptedBus implements BusClient {
     if (next) return next(signal);
     return Promise.reject(Object.assign(new Error("no session"), { code: "ServiceTimeout" }));
   }
-  reopen(): void {
+  reopen(): () => Promise<void> {
     this.reopened += 1;
+    return () => {
+      this.retired += 1;
+      return Promise.resolve();
+    };
   }
   close(): Promise<void> {
     return Promise.resolve();
@@ -232,6 +238,7 @@ test("a wait for the next message that hangs re-arms the receiver on a new conne
   assert.equal(bus.reopened, 1);
   assert.equal(made.rearmed(), 1);
   assert.equal(wedged.closed, 1);
+  assert.equal(bus.retired, 1); // (nothing else was on the old connection: it is closed at once)
   await clock.advance(3000); // (the back-off before the session is taken again)
   assert.equal(handled, 1);
   assert.deepEqual(
@@ -260,12 +267,57 @@ test("receivers wedged on one connection re-open it once, and a hanging settleme
   const running = made.consumer.run();
   await flushMicrotasks();
   await clock.advance(ACCEPT_DEADLINE_MS);
-  assert.equal(made.rearmed(), 2);
+  assert.equal(made.rearmed(), 1); // (counted once per connection, not once per receiver that was on it)
   assert.equal(bus.reopened, 1); // (the second receiver found the connection already re-opened)
+  assert.equal(bus.retired, 1);
+  assert.equal(made.logger.lines.filter((l) => l.message === "inbound receiver re-armed").length, 2);
   await clock.advance(3000);
   await clock.advance(SETTLE_DEADLINE_MS);
   assert.equal(bus.reopened, 2);
+  assert.equal(made.rearmed(), 2);
   assert.equal(stuck.closed, 1);
   made.consumer.stop();
   await running;
 });
+
+test(
+  "a re-arm leaves the old connection open until a message another receiver is handling there is settled",
+  T,
+  async () => {
+    const clock = new FakeClock();
+    const gate = deferred<undefined>();
+    const message = received(JSON.stringify({ type: "message" }), undefined, "m-5", 1);
+    const busy = new ScriptedReceiver([() => Promise.resolve([message])]);
+    const wedged = new ScriptedReceiver([(signal) => hanging(signal, true)]);
+    const bus = new ScriptedBus([() => Promise.resolve(busy), () => Promise.resolve(wedged)]);
+    let handled = 0;
+    const made = consumerOf(
+      bus,
+      clock,
+      async () => {
+        await gate.promise; // (a turn that takes longer than the other receiver's deadline)
+        handled += 1;
+      },
+      2,
+    );
+    const running = made.consumer.run();
+    await flushMicrotasks();
+    await clock.advance(RECEIVE_DEADLINE_MS);
+    assert.equal(bus.reopened, 1);
+    assert.equal(wedged.closed, 1);
+    assert.equal(bus.retired, 0); // (the first receiver still holds its session, and the message's lock, on it)
+    assert.equal(busy.closed, 0);
+    gate.resolve(undefined);
+    await flushMicrotasks();
+    assert.equal(handled, 1);
+    assert.deepEqual(
+      busy.done.map(([kind, m]) => [kind, m.messageId]),
+      [["complete", "m-5"]],
+    );
+    assert.equal(busy.closed, 1);
+    assert.equal(bus.retired, 1); // (closed once its last session was settled and closed)
+    made.consumer.stop();
+    await running;
+    assert.equal(bus.retired, 1);
+  },
+);

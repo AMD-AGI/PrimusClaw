@@ -52,11 +52,13 @@ export interface BusClient {
   /** The next session that has messages; rejects (a timeout) when none has any, or when `signal` is aborted. */
   acceptNextSession(queue: string, signal?: AbortSignal): Promise<SessionReceiver>;
   /**
-   * Drop the connection and open a new one for what is asked next (the receivers' re-arm, when a call on the old one
-   * hangs). The old connection is closed in the background; what was opened on it fails and is opened again. Optional:
-   * a client without it is only asked again.
+   * Open a new connection for what is asked next (the receivers' re-arm, when a call on the old one hangs). The old one
+   * is left open, since other receivers on it may still be handling a message whose session lock it holds: closing it
+   * then would drop their locks and the broker would hand the message to someone else while it is still being handled.
+   * Returns the old connection's close, for the caller to run once nothing it took on the old connection is in hand.
+   * Optional: a client without it is only asked again.
    */
-  reopen?(): void;
+  reopen?(): () => Promise<void>;
   close(): Promise<void>;
 }
 
@@ -128,8 +130,7 @@ export function azureBusClient(connection: BusConnection, lockRenewalMs: number)
     reopen() {
       const old = client;
       client = open();
-      // (best effort: the old connection is the one that hangs, and its receivers fail and are taken again on the new one)
-      void old.close().catch(() => undefined);
+      return () => old.close();
     },
     close: () => client.close(),
   };

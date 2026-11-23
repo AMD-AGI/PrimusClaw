@@ -82,8 +82,10 @@ goes blind in between.
 Written under the new names only (no earlier release had them): `personal_agent_probe_total` (by `outcome`: answered or
 unanswered), `personal_agent_probe_feedback_ms`, `personal_agent_probe_reply_ms` and
 `personal_agent_probe_last_answered_seconds` (the delivery probe, "The Teams ingress" below), and
-`personal_agent_inbound_rearmed_total`: inbound receivers whose call on Service Bus hung (a dead connection) and that
-were taken again on a new connection.
+`personal_agent_inbound_rearmed_total`: how many times the inbound receivers' connection was re-opened because a call on
+Service Bus hung (a dead connection); counted once per connection, however many receivers were on it. The old connection
+is closed only after every message taken on it has been settled, so a re-arm never hands a message being handled to a
+second receiver.
 
 ## Secrets
 
