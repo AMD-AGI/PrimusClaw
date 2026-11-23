@@ -139,6 +139,18 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
       updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  // The conversations open in a terminal whose pushes their owner muted (`/approvals mute #<item>`, `store.setTerminalMute`): no
+  // question, wait or end of theirs is put to the owner; the terminal keeps asking. No row: not muted.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_remote_terminal_mutes (
+      owner_user_id TEXT NOT NULL,
+      connector_id  UUID NOT NULL REFERENCES claw_remote_connectors(connector_id) ON DELETE CASCADE,
+      ref           TEXT NOT NULL,
+      title         TEXT NOT NULL DEFAULT '',
+      muted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (owner_user_id, connector_id, ref)
+    )
+  `);
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_remote_events (
       id          BIGSERIAL PRIMARY KEY,

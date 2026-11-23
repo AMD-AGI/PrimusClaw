@@ -139,6 +139,17 @@ release version, and its `appVersion` stays `latest`.
   whose list was not read never passes. Nine such cases are in
   `sa-eval-cases/catalog/self-knowledge.jsonl`, and four in the router evaluation (`self-01`..`self-04`).
 
+- Claw, connector, personal agent: a turn of a Claude Code or Codex conversation open in one of your terminals that ends
+  while nobody is at that terminal is said in your 1:1 chat: finished, with the end of what the agent last said, or
+  stopped with an error (Claude Code's `StopFailure` reason). The connector's approval hooks now also run on
+  `StopFailure` (Claude Code) and `Stop` (Codex); the connector posts `terminal_turn_end` only once that terminal has had
+  no input for a minute after the turn ended, never while a chat follows the conversation, and not for a `Stop` that
+  leaves background tasks running. Claw files it under the conversation's work item and says at most one end per
+  conversation every five minutes. `/approvals off` turns these off with the questions; `/approvals mute #<item>` (and
+  `unmute`) does it for one conversation (`PUT /v1/remote-agents/approvals/mutes`): its open card session is closed,
+  and its questions, waits and ends stay in the terminal. See `connector/README.md`, "When a turn ends while you are
+  away".
+
 - Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, how many times the
   application was started again, and `app.last_exit`, `{ returncode, at, cause }` of the last time the application
   stopped (`null` until then), moved on every exit. A crash-looping application used to read only `status: running`

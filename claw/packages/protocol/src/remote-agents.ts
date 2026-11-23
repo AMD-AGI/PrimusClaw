@@ -133,6 +133,15 @@ export const REMOTE_EVENT_PERMISSION_REQUEST = "permissionRequest";
 export const REMOTE_EVENT_PERMISSION_RESOLVED = "permission_resolved";
 export const REMOTE_EVENT_SESSION_CLOSED = "session_closed";
 /**
+ * A turn of a conversation open in a terminal ended while nobody was at that terminal, posted on the conversation's terminal-hook
+ * session (`origin` "terminal_hook") by its connector: `{ref, outcome: "done" | "error", error?, message, agent, cwd, ended_at,
+ * away_ms}`. `message` is the end of what the agent last said (untrusted text); `error` names why a turn that failed did
+ * (Claude Code's `StopFailure` reason, such as `rate_limit`). The connector posts it only once the terminal has had no input for a
+ * minute after the turn ended, and never while a chat follows the conversation; Claw tells the owner, unless they turned the
+ * terminal pushes off or muted that conversation.
+ */
+export const REMOTE_EVENT_TERMINAL_TURN_END = "terminal_turn_end";
+/**
  * What the person sent a session (a `prompt` command), written by Claw itself when it queues the prompt: `{text, cmd_id, cmd_seq,
  * client, by: "claw"}` with a negative `seq`. An agent's events carry only its own side, so without it a window opened on the
  * session elsewhere (another device, the web page beside a Teams chat) shows answers to questions it cannot see. A connector may
@@ -447,6 +456,13 @@ export function parseTerminalSessionOpen(body: unknown): Parsed<RemoteTerminalSe
 export function parseApprovalsSetting(body: unknown): Parsed<{ enabled: boolean }> {
   if (!isObject(body) || typeof body.enabled !== "boolean") return fail("enabled_required");
   return { ok: true, value: { enabled: body.enabled } };
+}
+
+/** `PUT /v1/remote-agents/approvals/mutes`: mute (or unmute) the conversation behind work item `#item`, one open in a terminal. */
+export function parseTerminalMute(body: unknown): Parsed<{ item: number; muted: boolean }> {
+  if (!isObject(body) || typeof body.muted !== "boolean") return fail("muted_required");
+  if (typeof body.item !== "number" || !Number.isSafeInteger(body.item) || body.item < 1) return fail("item_required");
+  return { ok: true, value: { item: body.item, muted: body.muted } };
 }
 
 /**

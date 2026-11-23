@@ -26,7 +26,7 @@ import {
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_PROTOCOL_VERSION, REMOTE_AGENT_TIMING, REMOTE_COMMANDS,
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
   REMOTE_HIDDEN_INCLUDE, parseHiddenRequest, parseRemoteId, parseSessionNew, sseFrame, type RemoteCommandType,
-  REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS, parseApprovalsSetting, parseTerminalSessionOpen,
+  REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS, parseApprovalsSetting, parseTerminalMute, parseTerminalSessionOpen,
 } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED, CLAW_REMOTE_AGENTS_RETENTION_DAYS } from "../config.js";
 import { getUser } from "../auth/middleware.js";
@@ -567,6 +567,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (out.status !== "opened") {
       if (out.status === "gone") return fail(reply, 401, "revoked");
       if (out.status === "approvals_off") return fail(reply, 409, "approvals_off");
+      if (out.status === "session_muted") return fail(reply, 409, "session_muted");
       if (out.status === "agent_not_found") return fail(reply, 404, "agent_not_found");
       return fail(reply, 429, "rate_limited");
     }
@@ -588,6 +589,17 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!body.ok) return fail(reply, 400, body.error);
     await store.setApprovalsEnabled(owner, body.value.enabled, clientLabel(req));
     return reply.send({ ok: true, data: { enabled: body.value.enabled } });
+  });
+
+  // One conversation open in a terminal, named by its work item (`#<seq>`): its pushes muted or back on (`store.setTerminalMute`).
+  app.put("/v1/remote-agents/approvals/mutes", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    const body = parseTerminalMute(req.body);
+    if (!body.ok) return fail(reply, 400, body.error);
+    const out = await store.setTerminalMute(owner, body.value.item, body.value.muted, clientLabel(req));
+    if (out.status !== "ok") return out.status === "not_found" ? fail(reply, 404, "item_not_found") : fail(reply, 409, "not_a_terminal_item");
+    return reply.send({ ok: true, data: { item: out.seq, muted: out.muted, machine: out.machine, title: out.title } });
   });
 
   app.get<{ Params: { cid: string }; Querystring: { after?: string } }>(

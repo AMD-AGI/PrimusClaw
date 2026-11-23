@@ -248,6 +248,18 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Whether a session of this connector follows that conversation now (taken over, typed into or watched read-only from the
+   * phone), for any agent: the chat it is attached to shows what the conversation does.
+   */
+  followsRef(ref: string): boolean {
+    const want = ref.toLowerCase();
+    for (const s of this.sessions.values()) if (!s.closed && s.acpId?.toLowerCase() === want) return true;
+    // An attach still looking the conversation up follows it too: its chat is about to show what the conversation does.
+    for (const claim of this.attaching) if (claim.endsWith(`:${want}`)) return true;
+    return false;
+  }
+
   /** The ids of the existing sessions this connector holds open, by agent. */
   attachedRefs(agentId: string): Set<string> {
     const out = new Set<string>();
