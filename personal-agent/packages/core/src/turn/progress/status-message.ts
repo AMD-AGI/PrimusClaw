@@ -260,12 +260,14 @@ export class StatusMessage<S> {
    * part out of sight (2026-11-24: "(cont. 2/2)" under a queued message's notice, part 1 above both). So nothing of the agent's goes
    * into the bubble from now on: while it shows only a status, that floats on until the turn ends; one that shows words already is
    * closed at once. Either way it ends with `line`, and the whole answer comes as messages of its own, below what was said since.
+   * When it comes while the answer is going out (its first part in the bubble already), the whole answer is sent again below.
    * Nothing when no stream is open or one is already closing. Never fails the turn.
    */
   movedOn(line: string): void {
     const live = this.live;
-    if (this.closed || !live || this.streamOver || this.expiring || this.wentOn) return;
+    if (!live || this.streamOver || this.expiring || this.wentOn) return;
     this.wentOn = line;
+    if (this.closed) return; // (the turn is ending: `finish` reads it, even while its answer is going out)
     this.moving = detach(async (signal) => {
       if (this.opening && !this.opening.done) await unlessAborted(this.opening.settled(), signal);
       if (this.flusher && !this.flusher.done) await unlessAborted(this.flusher.settled(), signal); // (an update on its way)
@@ -557,7 +559,14 @@ export class StatusMessage<S> {
       });
       rest = messages;
     }
-    for (const message of rest) await this.surface.send(message);
+    for (const message of rest) {
+      if (closed.ok && this.wentOn) {
+        // (the chat went on below the bubble while the answer went out: the whole answer again below that, never its middle)
+        for (const whole of messages) await this.surface.send(whole);
+        return;
+      }
+      await this.surface.send(message);
+    }
   }
 
   /** Wait until FINAL_SETTLE_SECONDS have passed since the last progress edit left. */

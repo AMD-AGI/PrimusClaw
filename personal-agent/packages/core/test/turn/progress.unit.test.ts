@@ -480,3 +480,24 @@ it("the chat going on before the stream opened closes it as soon as it opens; wi
   assert.equal(plain.streamOps.length, 0);
   assert.ok(!plain.texts.includes("BELOW"));
 });
+
+it("the chat going on while the answer goes out sends the whole answer below it, not the rest only", async () => {
+  const clock = new Timeline();
+  const held: { status?: StatusMessage<Step> } = {};
+  // (the person's next message comes while the stream's final, with the answer's first part, is on its way)
+  const refuse = (op: { op: string }): undefined => {
+    if (op.op === "finish") held.status?.movedOn("BELOW");
+    return undefined;
+  };
+  const bus = new Bus(clock, { stream: { refuse } });
+  const status = turnStatusMessage(bus, { clock, log: new RecordingLogger(), streamReplyTo: "act" });
+  held.status = status;
+  status.begin();
+  await clock.advanceTo(clock.start + 2);
+  await clock.pump(status.finish(["Part one", "Part two"]));
+  assert.deepEqual(
+    bus.streamOps.filter((o) => o.op === "finish").map((o) => o.text),
+    ["Part one"],
+  );
+  assert.deepEqual(bus.texts, ["Part one", "Part two"]);
+});

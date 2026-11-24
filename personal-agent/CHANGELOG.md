@@ -26,7 +26,7 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   message's notice, so the first part looked lost. Once the chat goes on below the stream, nothing of the agent's goes into
   the bubble: a status-only bubble floats on until the turn ends, one that already shows words is closed at once, and either
   way it ends with "The answer follows below, as new messages."; the whole answer then comes below what was said since, every
-  part as a new message, in order.
+  part as a new message, in order. When the chat goes on while the answer is going out, the whole answer is sent again below.
 - `@primusclaw/personal-agent`: in a group chat with no language set (or set to follow the asker), a message that says no
   language of its own ("help", the bare @mention, `/whoami`, "ok #3") is answered in English. It was answered in the
   sender's own language, the one their 1:1 messages were written in or their Teams client's, so "help" from a member who
