@@ -30,6 +30,7 @@
  *   D22 the same words sent to a task twice in one router turn (at once, or one after the other) go once: one command to a running
  *       task, one reopening of a finished one, one card, one place in the queue; the second call answers that they were already sent;
  *       the next turn sends them again
+ *   D23 a follow-up whose command went but whose noting failed is noted when the call fails, and the call made again sends nothing more
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -844,6 +845,33 @@ describe("seat dispatch", { skip }, () => {
     assert.equal(first.dispatch, "queued", JSON.stringify(first));
     assert.equal((await send(busy, old.item_id, "再清理一次")).dispatch, "already_sent");
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_items WHERE params->>'seat_id' = $1 AND params ? 'queued'", [s3.seatId]))[0].n, 1);
+  });
+
+  test("D23 a follow-up whose command went but whose noting failed: noted then, and the same call again sends nothing more", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    // The task's noting fails once, after the command's own commit.
+    await w.q("CREATE SEQUENCE IF NOT EXISTS d23_fail");
+    await w.q(`CREATE OR REPLACE FUNCTION d23_fail_once() RETURNS trigger AS $$
+      BEGIN IF NEW.source = 'remote' AND NEW.kind = 'progress' AND nextval('d23_fail') = 1 THEN RAISE EXCEPTION 'd23 injected'; END IF; RETURN NEW; END
+      $$ LANGUAGE plpgsql`);
+    await w.q("CREATE TRIGGER d23_fail BEFORE INSERT ON claw_work_item_events FOR EACH ROW EXECUTE FUNCTION d23_fail_once()");
+    try {
+      const turn = await userTurn(alice, "顺便更新 changelog");
+      await assert.rejects(tools.workSend(turn, { item_id: String(out.item_id), text: "顺便更新 changelog" }), /d23 injected/);
+      const sent = await prompted(cid);
+      assert.equal(sent.length, 1, "its command went");
+      assert.ok((await item(out.item_id)).params.open_cmd_seqs.map(Number).includes(Number(sent[0].cmd_seq)), "and is the task's now");
+      assert.equal(((await tools.workSend(turn, { item_id: String(out.item_id), text: "顺便更新 changelog" })) as Recorded).dispatch, "already_sent");
+      assert.equal((await prompted(cid)).length, 1, "nothing more was sent");
+    } finally {
+      await w.q("DROP TRIGGER IF EXISTS d23_fail ON claw_work_item_events");
+      await w.q("DROP FUNCTION IF EXISTS d23_fail_once()");
+      await w.q("DROP SEQUENCE IF EXISTS d23_fail");
+    }
   });
 
   test("D12 the prompt asks for parking only from a connector that can park", async () => {

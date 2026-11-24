@@ -31,7 +31,7 @@ import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordSystemNotice } from "./outbound.js";
 import {
-  errandNotice, errandText, errandWorkerSessionId, langOf, reportErrand, SEAT_QUEUE_REASONS, type ErrandParams, type ErrandQueue,
+  errandNotice, errandText, errandWorkerSessionId, langOf, noteErrandPrompt, reportErrand, SEAT_QUEUE_REASONS, type ErrandParams, type ErrandQueue,
   type RemoteLang,
 } from "./remote-items.js";
 import { SEAT_QUEUE_MAX, seatDispatchOn, seatsLive, syncSeats, type SeatLive } from "./seats.js";
@@ -690,6 +690,29 @@ async function commandWasIssued(owner: string, cmdId: string): Promise<boolean> 
   )).rows.length > 0;
 }
 
+/**
+ * A task's command that was issued but whose noting failed (`executeSend` notes it after the queue's commit): noted now, while the
+ * queue still holds it, so its turn's end is the task's and its answer reaches the router. Best effort: a command the machine has
+ * already collected left no number to note it by.
+ */
+async function noteIssuedPrompt(owner: string, itemId: string, cmdId: string): Promise<void> {
+  const c = (await db.query(
+    `SELECT c.cmd_seq, c.session_id::text AS session_id, c.connector_id::text AS connector_id, s.agent_id, k.name AS machine
+       FROM claw_remote_commands c
+       JOIN claw_remote_connectors k ON k.connector_id = c.connector_id AND k.owner_user_id = $2
+       JOIN claw_remote_sessions s ON s.session_id = c.session_id
+      WHERE c.cmd_id = $1 LIMIT 1`,
+    [`k:${cmdId}`, owner],
+  )).rows[0] as { cmd_seq: string; session_id: string; connector_id: string; agent_id: string; machine: string } | undefined;
+  if (!c) return;
+  const open = (await db.query("SELECT params->'open_cmd_seqs' AS seqs FROM claw_work_items WHERE item_id = $1 AND user_id = $2", [itemId, owner]))
+    .rows[0]?.seqs as unknown;
+  if (Array.isArray(open) && open.map(Number).includes(Number(c.cmd_seq))) return;
+  await noteErrandPrompt({
+    owner, itemId, sessionId: c.session_id, connectorId: c.connector_id, agentId: c.agent_id, machine: c.machine, cmdSeq: Number(c.cmd_seq),
+  });
+}
+
 /** A claim whose instruction went nowhere, given back: the same words may be sent again in this turn. */
 async function releaseTurnSend(q: Querier, itemId: string, task: string, key: string): Promise<void> {
   await q(
@@ -782,7 +805,9 @@ export async function errandWorkSend(
     try {
       out = await sendFollowup(userId, itemId, text, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "auto", unattended: false }, cmdId);
     } catch (err) {
-      if (!await commandWasIssued(userId, cmdId).catch(() => true)) await giveBack();
+      // Its command went (only its noting failed): noted now, and the turn's words stay claimed. Else nothing went: given back.
+      if (await commandWasIssued(userId, cmdId).catch(() => true)) await noteIssuedPrompt(userId, itemId, cmdId).catch(() => undefined);
+      else await giveBack();
       throw err;
     }
     if ("error" in out) await giveBack();
@@ -799,8 +824,13 @@ export async function errandWorkSend(
   try {
     out = (await dispatchErrand(userId, itemId))!;
   } catch (err) {
-    // Failed after its command was queued (`dispatchErrand` sends under this generation's id): it went, so it stays open and claimed.
-    if (await commandWasIssued(userId, `errand:${itemId}:${prior.generation}`).catch(() => true)) throw err;
+    // Failed after its command was queued (`dispatchErrand` sends under this generation's id): it went, so it stays open and claimed,
+    // and is noted now if its noting was what failed.
+    const sentId = `errand:${itemId}:${prior.generation}`;
+    if (await commandWasIssued(userId, sentId).catch(() => true)) {
+      await noteIssuedPrompt(userId, itemId, sentId).catch(() => undefined);
+      throw err;
+    }
     await restoreErrand(q, itemId, prior).catch(() => undefined);
     await giveBack();
     throw err;
