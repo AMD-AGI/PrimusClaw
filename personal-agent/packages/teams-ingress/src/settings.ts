@@ -12,6 +12,8 @@ export const INBOUND_IDENTITY_PREFIX = "PRIMUSCLAW_SERVICEBUS";
 export const OUTBOUND_CONNECTION_SETTING = "PRIMUSCLAW_OUTBOUND_SERVICEBUS";
 export const OUTBOUND_QUEUE_SETTING = "PRIMUSCLAW_OUTBOUND_QUEUE";
 export const OUTBOUND_IDENTITY_SETTING = `${OUTBOUND_CONNECTION_SETTING}__fullyQualifiedNamespace`;
+// The delivery probe's timer: an NCRONTAB schedule, such as "0 */5 * * * *" (every five minutes); unset, no probe is sent.
+export const PROBE_SCHEDULE_SETTING = "PRIMUSCLAW_PROBE_SCHEDULE";
 
 // A hosted Functions instance. The host takes its instance id from WEBSITE_POD_NAME or CONTAINER_NAME on Linux
 // Consumption and Flex Consumption and from WEBSITE_INSTANCE_ID on the other plans.
@@ -26,6 +28,8 @@ export interface Settings {
   inboundQueue: string;
   outboundQueueExpression: string;
   outboundConfigured: boolean;
+  /** Whether the delivery probe's timer is registered (PRIMUSCLAW_PROBE_SCHEDULE is set). */
+  probeConfigured: boolean;
   hosted: boolean;
 }
 
@@ -53,6 +57,7 @@ export function readSettings(env: Env): Settings {
     // it unregistered keeps the HTTP route up. The host accepts either a connection string under the setting itself
     // or an identity-based connection under "<setting>__fullyQualifiedNamespace".
     outboundConfigured: Boolean(env[OUTBOUND_CONNECTION_SETTING] || env[OUTBOUND_IDENTITY_SETTING]),
+    probeConfigured: strip(env[PROBE_SCHEDULE_SETTING] ?? "") !== "",
     hosted: HOSTED_INSTANCE_SETTINGS.some((name) => env[name]),
   };
 }

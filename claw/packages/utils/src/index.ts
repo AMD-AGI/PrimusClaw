@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-export { sleep } from "./async.js";
+export { sleep, setLongTimeout, MAX_TIMER_DELAY_MS, type LongTimeout } from "./async.js";
 export { constantTimeEquals } from "./security/constant-time.js";
 export {
   redactSecrets, redactLogSecrets, safePreview, scanForSecretLeak, looksLikeCredentialValue,

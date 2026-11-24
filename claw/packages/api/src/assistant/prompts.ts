@@ -263,8 +263,11 @@ export const ROUTER_DISCIPLINE_PROMPT = `Acting only when asked
  * support left out rather than said again as quiet or unchanged (N13, 2026-11-08).
  * router-read-v17: v16 with the GitHub binding line naming the assistant as its client calls it (`channel_context.assistant_name`), or
  * "the assistant" when the client names none, instead of a name Claw wrote in.
+ * router-read-v18: v17 with what the router can do answered from claw_capabilities first (`capabilities.ts`), and its own tools said to
+ * act by themselves (with no worker, some with no card): "every change goes through a work item that asks first" was false for them and
+ * for a fully_auto merge, and was said as a limit (2026-11-23).
  */
-export const ROUTER_READ_PROMPT_VERSION = "router-read-v17";
+export const ROUTER_READ_PROMPT_VERSION = "router-read-v18";
 
 /**
  * The read section's citing (`CLAW_ASSISTANT_CITATIONS`), logged beside it when on.
@@ -334,8 +337,9 @@ function githubLookups(tools: readonly string[], binding = false, where: string 
 
 /**
  * What the router can do, for a question about it (#2 我能做什么, #15 能评论吗, #17 能关掉吗): from the tool catalog, so it moves with
- * the servers. Reads are made at once; every write is done by a work item, whose worker holds each catalogued write until the user
- * approves it on a card (`tool-classes.ts`, Brain's `approval-policy.ts`). The router is never "read-only", and a failure of the
+ * the servers. Reads are made at once; a write to one of these systems is done by a work item, whose worker holds each catalogued write
+ * until the user approves it on a card (`tool-classes.ts`, Brain's `approval-policy.ts`); the router's own tools act by themselves, as
+ * claw_capabilities lists them (`capabilities.ts`). The router is never "read-only", and a failure of the
  * system (a sandbox that did not start, a 403) is its item's to tell, never a limit of what can be done.
  */
 export function renderRouterAbilities(servers: readonly string[], github: boolean): string {
@@ -349,9 +353,10 @@ export function renderRouterAbilities(servers: readonly string[], github: boolea
     "anything that needs code, a shell, a checkout, a run or many steps",
   ];
   return `What you can do
-When the user asks what you can do, or whether you can do something, answer from this, plainly and in a few lines. Never call yourself read-only, and never say you cannot write, change or send something listed here. Never label any part of the answer read-only either (no 只读 or read-only as a heading, in brackets or beside the lookups): looking things up is simply 查询 / looking up, and the user only needs to know that changes go through a work item that asks them first.
+When the user asks what you can do, or whether you can do something, call claw_capabilities first and answer from it and from this, plainly and in a few lines. Never call yourself read-only, and never say you cannot write, change or send something listed here or there. Never label any part of the answer read-only either (no 只读 or read-only as a heading, in brackets or beside the lookups): looking things up is simply 查询 / looking up.
 - Look things up at once, in this turn: the lookups above.
-- Change things, through a work item: ${changes.join("; ")}. Its worker asks the user on a card before each write runs, so say yes: you can, and it will ask them to approve the change first. Start the item when they ask for the change.
+- Change things in these systems, through a work item: ${changes.join("; ")}. Its worker asks the user on a card before each of these writes runs, so say yes: you can, and it will ask them to approve the change first. Start the item when they ask for the change.
+- Your own tools change things themselves, with no worker: claw_capabilities lists which act at once (acts_at_once) and which show the user a card first (asks_first), and how a review's merge goes under the user's review mode. Never say every change needs a worker or a confirmation.
 - Never give the system's own failures as a limit of what you can do: not a sandbox that would not start, a permission error, a status code (such as 403), a missing token of the system or another item's failure, even when the item list shows one. Such a failure is its item's to tell; a new item is started all the same.`;
 }
 

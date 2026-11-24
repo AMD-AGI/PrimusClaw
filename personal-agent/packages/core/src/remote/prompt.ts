@@ -10,9 +10,11 @@
  * machine drops them too).
  */
 import { ClawError } from "../claw/errors.js";
+import { errorName } from "../errors.js";
 import { remoteAgentText } from "../locales/remote-agents.js";
 import type { RemoteState } from "../ports/store/remote.js";
-import { type Conversation, textMessage } from "../ports/surface.js";
+import type { JsonObject } from "../json.js";
+import { type Conversation, type FetchedFile, textMessage } from "../ports/surface.js";
 import { READ_ONLY_REASONS, readOnlyRefused, sessionTitle, terminalClosedLine } from "./lines.js";
 import type { StatusBoard } from "./board.js";
 import type { RemoteContext } from "./context.js";
@@ -39,6 +41,23 @@ export interface Prompt {
   readonly source: SentFrom;
   /** The message replies quoting this chat's session card. */
   readonly quotesWindow: boolean;
+  /** Files the machine saves and names in the prompt (its agent `takesFiles`). */
+  readonly files?: readonly FetchedFile[];
+}
+
+/** `bytes` as base64 (the wire's `prompt.files[].data`). */
+export function base64Of(bytes: Uint8Array): string {
+  let binary = "";
+  for (let at = 0; at < bytes.length; at += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000));
+  }
+  return btoa(binary);
+}
+
+/** The prompt command: the words, and the files as the wire carries them (`prompt.files`). */
+function promptBody(p: Prompt): JsonObject {
+  const files = (p.files ?? []).map((f) => ({ name: f.name, media_type: f.mediaType, data: base64Of(f.bytes) }));
+  return { type: "prompt", text: p.text, ...(files.length ? { files } : {}) };
 }
 
 export class Prompts {
@@ -168,23 +187,14 @@ export class Prompts {
   ): Promise<{ readonly cmdSeq: number | undefined; readonly duplicate: boolean } | false> {
     const lang = this.state.lang(p.chatKey);
     const sid = state.sessionId ?? "";
+    let out: JsonObject;
     try {
       const keys = {
         sha1Hex: (text: string) => this.ctx.digestHex("sha1", text),
         hexId: () => this.ctx.random.hexId(),
       };
-      const out = await this.ctx.claw.command(
-        p.key,
-        sid,
-        { type: "prompt", text: p.text },
-        idempotencyKey(keys, p.chatKey, p.messageId),
-      );
+      out = await this.ctx.claw.command(p.key, sid, promptBody(p), idempotencyKey(keys, p.chatKey, p.messageId));
       this.ctx.sessionNames.titleRemoteSession(sid, sessionTitle(p.text)); // (a new session is named by its first words)
-      const seq = out["cmd_seq"];
-      return {
-        cmdSeq: typeof seq === "number" && Number.isSafeInteger(seq) ? seq : undefined,
-        duplicate: out["duplicate"] === true,
-      };
     } catch (error) {
       if (error instanceof ClawError && error.status === 409 && READ_ONLY_REASONS.includes(error.code)) {
         // (a watch this process did not know of: it restarted)
@@ -204,6 +214,32 @@ export class Prompts {
       this.follow.ensure(p.chatKey); // (nothing was sent: no turn will read the session, so the reader goes on)
       await this.say(p.to, error instanceof ClawError ? this.failure(error, p.chatKey) : saidIn(lang, "unreachable"));
       return false;
+    }
+    // (Claw has the prompt: telling the person of its files is no part of sending it, and a failure to tell them is
+    // no failure to send)
+    await this.filesTaken(p, out);
+    const seq = out["cmd_seq"];
+    return {
+      cmdSeq: typeof seq === "number" && Number.isSafeInteger(seq) ? seq : undefined,
+      duplicate: out["duplicate"] === true,
+    };
+  }
+
+  /**
+   * A Claw that knows no `files` field took the words and dropped the files unread: the person is told. A repeat of a
+   * prompt Claw already has (`duplicate`) says nothing: the first send's answer was where they were told, and a
+   * redelivered message is never told twice.
+   */
+  private async filesTaken(p: Prompt, out: JsonObject): Promise<void> {
+    const sent = p.files?.length ?? 0;
+    if (sent === 0 || out["files"] === sent || out["duplicate"] === true) return;
+    try {
+      await this.say(p.to, saidIn(this.state.lang(p.chatKey), "filesNotTaken"));
+    } catch (error) {
+      this.ctx.logger.warn("the chat could not be told a session prompt's files were not taken", {
+        files: sent,
+        error: errorName(error),
+      });
     }
   }
 

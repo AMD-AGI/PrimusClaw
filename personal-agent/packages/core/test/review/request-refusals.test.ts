@@ -78,7 +78,7 @@ test("a reviewer who has not allowed it starts nothing", async () => {
   await refused(
     world,
     `请 {Bob} 帮我 review 合入 ${PR}`,
-    "Bob 还没有授权我代 TA review 合入（需要 TA 在 1:1 里发 `/github auto-merge on`",
+    "Bob 还不能被我代审：还差第 3 步「发 `/github auto-merge on` 开启代审授权」",
   );
 });
 
@@ -130,7 +130,7 @@ test("a reviewer who has not allowed it is told for a review only too", async ()
   await refused(
     world,
     `请 {Bob} 帮我 review ${PR}`,
-    "Bob 还没有授权我代 TA review（需要 TA 在 1:1 里发 `/github auto-merge on`",
+    "Bob 还不能被我代审：还差第 3 步「发 `/github auto-merge on` 开启代审授权」",
   );
 });
 
@@ -169,7 +169,10 @@ test("a reviewer with no name the worker knows is called the other person", asyn
     lang: () => "zh",
   });
   assert.equal(world.started.length, 0);
-  assert.ok(saidIn(world.surface, CONV).includes("还没有授权我代 TA review 合入"), saidIn(world.surface, CONV));
+  assert.ok(
+    saidIn(world.surface, CONV).includes("对方 还不能被我代审：还差第 3 步「发 `/github auto-merge on` 开启代审授权」"),
+    saidIn(world.surface, CONV),
+  );
 });
 
 test("a reviewer whose token the exchange is not set up to give starts nothing", async () => {

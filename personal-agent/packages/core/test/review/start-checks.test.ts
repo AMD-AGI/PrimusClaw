@@ -55,7 +55,7 @@ test("the requesters own account is never the stand in", async () => {
   assert.deepEqual(world.started, []);
   // (Alice's own account is not asked about, and is not used)
   assert.deepEqual(world.identity.askedAbout(), ["external:teams.microsoft.com|aad-b"]);
-  assert.ok(groupText(world).includes("还没有绑定 GitHub"), groupText(world));
+  assert.ok(groupText(world).includes("还差第 2 步「发 `/github bind` 连接 GitHub」"), groupText(world));
   world.identity.users.delete("aad-b"); // not even a Primus account any more
   await ask(world, undefined, { id: "g2" });
   assert.deepEqual(world.started, []);

@@ -27,6 +27,10 @@
  *                      0: a few more spellings of a number are read as well (the count of references by number rather than
  *                      by id is printed either way).
  *
+ * A case with `selfKnowledge` (kind self) is also held to the capability list claw_capabilities answers (`self-knowledge.ts`): read
+ * first, and nothing said that it contradicts. The list is generated from the tools offered and this process's switches
+ * (CLAW_ASSISTANT_GITHUB_EVENTS, CLAW_ASSISTANT_JOB_EVENTS, ...), so set them as the deployment under test has them.
+ *
  * The last line is a JSON summary: the model, how many cases ran and whether that is the whole set (`full_set`), the
  * strictness of the item references (`strict_ids`), the runs, the gate, each run's accuracy and `passed`.
  */
@@ -96,11 +100,13 @@ async function main(): Promise<void> {
     console.log(`  item references by number rather than by id: ${inexact}; calls the tools refused: ${refused}`);
     console.log(`  replies written in the same step as a work call, before its result: ${scores.reduce((n, s) => n + s.saidBeforeResult, 0)}; of those beside a call that was refused: ${scores.reduce((n, s) => n + s.saidBesideRefusal, 0)}`);
     console.log(`  turns that ended in plain text and no say, delivered as a say by the turn end: ${scores.filter((s) => s.rescued).length}`);
+    const self = done.filter((d) => d.c.selfKnowledge);
+    if (self.length) console.log(`  questions about itself answered from claw_capabilities with nothing it contradicts: ${self.filter((d) => d.score.selfOk).length}/${self.length}`);
     for (const { c, trace, score } of done) {
       if (score.turnOk) continue;
       const why = [
         !score.dispatchOk ? "DISPATCH" : "", !score.spokeOk ? "NO-SAY" : "", !score.sayItemOk ? "SAY-ITEM" : "", !score.langOk ? "LANG" : "",
-        score.error ? `ERROR(${score.error})` : "",
+        !score.selfOk ? `SELF(${(score.contradictions ?? []).join("; ")})` : "", score.error ? `ERROR(${score.error})` : "",
       ].filter(Boolean).join(" ");
       console.log(`  MISS ${c.id} [${why}] "${c.text.slice(0, 90).replace(/\n/g, " ")}"`);
       console.log(`       wanted: ${[c.expect, ...(c.also ?? [])].map(describeEffects).join("  |  ")}`);

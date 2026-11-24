@@ -205,6 +205,8 @@ export const APPROVAL_HOOKED = [
   { event: "PostToolUseFailure", arg: "settled", timeout: 5, async: true },
   { event: "UserPromptSubmit", arg: "settled", timeout: 5, async: true },
   { event: "Stop", arg: "settled", timeout: 5, async: true },
+  // A turn that ended on an API error (Claude Code runs it instead of `Stop`): told to the owner like a finished one.
+  { event: "StopFailure", arg: "settled", timeout: 5, async: true },
   { event: "SessionEnd", arg: "settled", timeout: 1, async: false },
 ] as const;
 
@@ -324,11 +326,13 @@ export const CODEX_IDLE_S = 30;
 
 /**
  * The Codex approval hooks. `PermissionRequest` waits as long as a card may (Codex shows its own prompt only after it exits, so
- * it gives the question back as soon as someone types in the terminal); `SessionEnd` closes the conversation's Claw session.
- * Codex runs hooks only once the person has trusted them (it asks at its next start, or under /hooks).
+ * it gives the question back as soon as someone types in the terminal); `Stop` says a turn ended (told to the owner only when
+ * nobody is at the terminal, approvals.ts); `SessionEnd` closes the conversation's Claw session. Codex runs hooks only once the
+ * person has trusted them (it asks at its next start, or under /hooks).
  */
 export const CODEX_APPROVAL_HOOKED = [
   { event: "PermissionRequest", arg: "ask", timeout: 3600, statusMessage: "Asked on your phone (Claw); type anything here to answer in this terminal" },
+  { event: "Stop", arg: "settled", timeout: 5 },
   { event: "SessionEnd", arg: "settled", timeout: 1 },
 ] as const;
 

@@ -101,6 +101,26 @@ export interface InboundQuote {
   readonly source: "entity" | "html" | "placeholder";
 }
 
+/**
+ * A message someone else wrote that the person forwarded into this chat (Teams' Forward), or one of several they
+ * forwarded at once. What it says is never part of the person's own words.
+ */
+export interface InboundForward {
+  /** The channel's id of the original message ("" when not said). */
+  readonly messageId: string;
+  /** Who wrote it ("" when the channel did not say). */
+  readonly author: string;
+  /**
+   * What it says. An image it showed stands where it stood: `[image-<n>]` when it is file n of the message's files (the
+   * name it is passed on under starts so), `[image not passed on]` when it could not be.
+   */
+  readonly text: string;
+  /** When it was written, as the channel said it ("" when not said). */
+  readonly sentAt: string;
+  /** Where the adapter read it (for a log line, never the text): the message's HTML, or a forward reference. */
+  readonly source: "html" | "reference";
+}
+
 /** Someone the message @mentions (never the bot itself: the adapter removes its own mention). */
 export interface InboundMention {
   /** The channel's id of the person (Teams: "29:..."). */
@@ -149,6 +169,9 @@ export interface InboundMessage extends InboundBase {
   readonly mentions: readonly InboundMention[];
   readonly links: readonly InboundLink[];
   readonly quotes: readonly InboundQuote[];
+  /** The messages the person forwarded with this one, in the order the channel gave them (absent: none). */
+  readonly forwards?: readonly InboundForward[];
+  /** Includes the images of the forwarded messages that the channel gave a way to fetch. */
   readonly files: readonly InboundFile[];
   /**
    * The names of attachments the channel gave no way to fetch (a file shared as a link), told back to the person

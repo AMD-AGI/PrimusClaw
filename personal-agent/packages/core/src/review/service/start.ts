@@ -5,13 +5,13 @@
  * Every prerequisite of a review, checked before anything exists in Claw (a session spends a model key, and a review that
  * cannot be finished must not cost one): the asker's identity, the reviewer's GitHub binding and standing authorization, the
  * reviewer's own token and key for a review asked of them, the model the request names, and that the reviewer did not write
- * the pull request. Whichever is missing: one line where it was asked, and the steps in the person's own chat.
+ * the pull request. Whichever is missing: one line where it was asked naming it, and the steps in the person's own chat.
  */
 
 import { errorKind } from "../../claw/errors.js";
 import { reviewStartText as t } from "../../locales/review-start.js";
 import { describeRefusal, usable, type GithubState } from "../../ports/github.js";
-import type { Conversation, ConversationRef, InboundMessage, UserRef } from "../../ports/surface.js";
+import type { ConversationRef } from "../../ports/surface.js";
 import { oneLine } from "../../review-text/names.js";
 import { shortName, slug } from "../../review-text/pull-ref.js";
 import type { PullRef } from "../../claw/model.js";
@@ -23,19 +23,12 @@ import type { ReviewDeps, ReviewTaskSlots } from "./deps.js";
 import { clawFailure, tokenFor } from "./identity.js";
 import type { ReviewItems } from "./items.js";
 import type { Notices } from "./notices.js";
+import type { ReviewerOnboarding } from "./onboarding.js";
 import type { Actor, ReviewerReader } from "./reviewer.js";
 import { say } from "./chat.js";
+import type { RequestContext } from "./context.js";
 
-/** Where and by whom a request was made. */
-export interface RequestContext {
-  readonly message: InboundMessage;
-  readonly sender: UserRef;
-  readonly conversation: Conversation;
-  readonly scope: string;
-  /** What the person wrote (the asker's note to the reviewer). */
-  readonly text: string;
-  readonly group: boolean;
-}
+export type { RequestContext } from "./context.js";
 
 /** What `take` settled, for the start: who asks and for whom, with what. */
 export interface Settled {
@@ -67,6 +60,7 @@ export class ReviewChecks {
     private readonly reviewers: ReviewerReader,
     private readonly items: ReviewItems,
     private readonly notices: Notices,
+    private readonly onboarding: ReviewerOnboarding,
     private readonly launch: Launch,
   ) {}
 
@@ -156,7 +150,10 @@ export class ReviewChecks {
     return actor;
   }
 
-  /** The reviewer's GitHub binding, usable and authorized, or undefined when the asker was told why not. */
+  /**
+   * The reviewer's GitHub binding, usable and authorized, or undefined when the asker was told why not. A review asked of
+   * someone else who has a step left is kept until they have done it (`ReviewerOnboarding`), and the asker is told which.
+   */
   private async reviewerState(
     ctx: RequestContext,
     ask: ReviewAsk,
@@ -164,22 +161,25 @@ export class ReviewChecks {
     pulls: readonly PullRef[],
   ): Promise<GithubState | undefined> {
     const status = await this.deps.credentials.status(actor.userId);
-    if (!status.ok) {
-      if (status.error.kind === "not_bound") {
-        await this.notices.noGithub(asked(ctx), ctx.group, ctx.sender, actor, pulls, ctx.conversation, false);
-        return undefined;
-      }
+    if (!status.ok && status.error.kind !== "not_bound") {
       this.deps.logger.warn("github status call failed", { error: describeRefusal(status.error) });
       await this.say(ctx, t.githubUnknown(actor.name || "对方"));
       return undefined;
     }
-    if (!usable(status.value)) {
-      await this.notices.noGithub(asked(ctx), ctx.group, ctx.sender, actor, pulls, ctx.conversation, true);
+    if (actor.userId === ctx.sender.id) {
+      // (a review of the asker's own: their own steps, in their own chat)
+      if (status.ok && usable(status.value)) return status.value;
+      await this.notices.noGithub(asked(ctx), ctx.group, ctx.sender, actor, pulls, ctx.conversation, status.ok);
+      return undefined;
+    }
+    if (!status.ok) {
+      await this.onboarding.refused(ctx, ask, actor, pulls, "identity");
       return undefined;
     }
     // (the authorization is the switch; Claw refuses every tool without it)
-    if (!status.value.delegation && actor.userId !== ctx.sender.id) {
-      await this.say(ctx, t.notAuthorized(actor.name || "对方", ask.merge));
+    const step = !usable(status.value) ? "bind" : !status.value.delegation ? "auto_merge" : undefined;
+    if (step !== undefined) {
+      await this.onboarding.refused(ctx, ask, actor, pulls, step);
       return undefined;
     }
     return status.value;
@@ -188,13 +188,15 @@ export class ReviewChecks {
   /** A review asked of someone else runs on their own token and key: both, or undefined when the asker was told. */
   private async actingCredentials(
     ctx: RequestContext,
+    ask: ReviewAsk,
     actor: Actor,
+    pulls: readonly PullRef[],
   ): Promise<{ token: string; key: string } | undefined> {
     if (actor.userId === ctx.sender.id) return { token: "", key: "" };
     const who = actor.name || "对方";
     const key = this.deps.store.links.getKey(actor.userId) ?? "";
     if (!key.startsWith("ak-")) {
-      await this.say(ctx, t.reviewerNotLinked(who, this.deps.botName));
+      await this.onboarding.refused(ctx, ask, actor, pulls, "link");
       return undefined;
     }
     const token = await tokenFor(this.deps, actor.userId);
@@ -263,7 +265,7 @@ export class ReviewChecks {
     }
     const state = await this.reviewerState(ctx, ask, actor, pulls);
     if (state === undefined) return;
-    const acting = await this.actingCredentials(ctx, actor);
+    const acting = await this.actingCredentials(ctx, ask, actor, pulls);
     if (acting === undefined) return;
     const who = actor.name || "对方";
     const model = await this.modelFor(ctx, ask, token, acting.key || modelKey, Boolean(acting.key), who);

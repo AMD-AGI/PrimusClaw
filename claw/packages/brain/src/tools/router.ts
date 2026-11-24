@@ -21,7 +21,7 @@ import { callWithWorkspaceFanout, fansOut } from "./workspace-fanout.js";
 import type { ToolSchema, PendingSkill, PendingSkillFileMutation } from "@claw/protocol";
 import { MEMORY_TOOLS, MEMORY_TOOL_SCHEMAS, callMemoryTool } from "./memory-tools.js";
 import {
-  WEB_SEARCH_PROVIDER, WEB_FETCH_ENABLED, TODO_WRITE_ENABLED, BG_SHELL_ENABLED,
+  BUILTIN_WEB_TOOLS, TODO_WRITE_ENABLED, BG_SHELL_ENABLED,
   EXIT_PLAN_MODE_ENABLED, ASK_USER_QUESTION_ENABLED, A2A_CLIENT_ENABLED,
   BASH_FOREGROUND_DEFAULT_SEC, WAIT_DEFAULT_SEC, SUB_AGENT_MODELS,
   HANDS_CALL_DEFAULT_TIMEOUT_MS,
@@ -983,7 +983,7 @@ export class ToolRouter {
       ...(DELIVER_FILE_ENABLED ? [deliverFileSchema()] : []),
 
       // ── Web tools (P0, gated by feature flags) ──
-      ...(WEB_SEARCH_PROVIDER !== "disabled" ? [{
+      ...(BUILTIN_WEB_TOOLS.includes("web_search") ? [{
         name: "web_search", description: "Search the web for up-to-date information. Use for facts the model may not know (recent releases, APIs, errors). Returns links for each hit. You MUST cite sources using markdown hyperlinks.", input_schema: {
           type: "object", properties: {
             query: { type: "string", description: "Search query (min 2 chars)" },
@@ -996,7 +996,7 @@ export class ToolRouter {
         },
       } as ToolSchema] : []),
 
-      ...(WEB_FETCH_ENABLED ? [{
+      ...(BUILTIN_WEB_TOOLS.includes("web_fetch") ? [{
         name: "web_fetch", description: "Fetch a URL and return its content. Use after web_search to read a specific page. Does not execute JavaScript. If `prompt` is set and summarization is enabled, content is condensed by a small fast model before returning. A page longer than one answer is read in parts: set find to a word of the part you need (a feature's or a product's name) to get the page around each place it appears, or offset to read on from where the last part ended.", input_schema: {
           type: "object", properties: {
             url: { type: "string", description: "Absolute http(s) URL" },

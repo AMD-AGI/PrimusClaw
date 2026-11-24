@@ -7,13 +7,25 @@ import { menuCommand, parseCommand } from "../commands/parse.js";
 import { hasCjk } from "../language/detect.js";
 import { routingText } from "../locales/routing.js";
 import type { JsonObject } from "../json.js";
-import type { InboundFile, InboundMessage } from "../ports/surface.js";
+import type { FetchedFile, InboundFile, InboundMessage } from "../ports/surface.js";
 import type { Chat } from "./chat.js";
 import type { CommandTable } from "./command-table.js";
 import type { RouterContext } from "./context.js";
+import { fitQuote, inlineFiles, passesInline, roomAfter } from "./session-files.js";
 import { logTurnStarted, type TurnStarter } from "./turn-start.js";
 
-const ELSEWHERE = "Files are not passed on from this chat while it talks to an agent; only your words were sent.";
+/** What a session is sent for files that came with no words (a prompt is never empty). */
+export const FILES_ONLY = "The person sent the files below with no words.";
+
+/** What the person is told about files that did not reach the session (names in code spans). */
+function notPassedLine(notPassed: readonly (readonly [string, string])[], zh: boolean, takesFiles: boolean): string {
+  const named = notPassed.map(([name, why]) => `\`${name.replaceAll("`", "'")}\` (${why})`).join("; ");
+  if (takesFiles)
+    return zh ? `这些文件没有交给会话：${named}。` : `These files were not passed on to the session: ${named}.`;
+  return zh
+    ? `这些文件没有交给会话：${named}。这台机器上的 connector 只收文字：文本文件会附在消息里一起发过去；升级 connector 后图片和其他文件也能发。`
+    : `These files were not passed on to the session: ${named}. The connector on that machine takes text only: text files go with the message, inline; once it is upgraded, images and other files go too.`;
+}
 
 /**
  * A 1:1 message that is not one of the chat's commands, as it goes on (the Python `Agent._text_of`, `_on_text`,
@@ -101,12 +113,35 @@ export class PersonalText {
       metrics.filesDropped("unreadable", unreadable.count);
       await chat.say(unreadable.line);
     }
-    if (message.files.length > 0 && elsewhere) {
-      metrics.filesDropped("remote_agent", message.files.length);
-      await chat.say(ELSEWHERE);
-      return [];
-    }
+    if (message.files.length > 0 && elsewhere) return []; // (a session's are passed inline: `toSession`)
     return message.files;
+  }
+
+  /**
+   * The files of a message to the session `chatKey` is attached to (the 1:1 chat's, or a bound group's): text files inline
+   * after the person's words, in `room` bytes; other files to its machine where it takes them; the person told about the rest.
+   */
+  async toSession(
+    message: InboundMessage,
+    chat: Chat,
+    chatKey: string,
+    key: string,
+    room: number,
+  ): Promise<{ section: string; files: readonly FetchedFile[] }> {
+    if (message.files.length === 0) return { section: "", files: [] };
+    const { surface, metrics, remote } = this.ctx.deps;
+    const asFiles = message.files.some((f) => !passesInline(f)) && (await remote.takesFiles?.(chatKey, key)) === true;
+    const inline = await inlineFiles(
+      message.files,
+      (file) => surface.fetchFile(file),
+      (file, index) => file.name || `image-${String(index)}`,
+      { asFiles, budget: room },
+    );
+    if (inline.notPassed.length > 0) {
+      metrics.filesDropped("remote_agent", inline.notPassed.length);
+      await chat.say(notPassedLine(inline.notPassed, chat.lang() === "zh", asFiles));
+    }
+    return { section: inline.section, files: inline.files };
   }
 
   /** What the chat is attached to, for the assistant (only where remote agents are on). */
@@ -121,18 +156,30 @@ export class PersonalText {
     const userId = chat.sender.id;
     const text = this.textOf(message);
     const toAgent = this.talksToAgent(message);
-    // (a reply quoting the session card says which session, not what to read: only the words go to it)
-    const quote =
-      toAgent && this.ctx.deps.remote.quotesWindow(userId, message) ? "" : messageText.quoteBlock(message, false);
+    // (a reply quoting the session card says which session, not what to read: the card is not sent on, what the
+    // person forwarded with it is)
+    const quoted =
+      toAgent && this.ctx.deps.remote.quotesWindow(userId, message)
+        ? messageText.quoteBlock({ ...message, quotes: [] }, false)
+        : messageText.quoteBlock(message, false);
     const sent = messageText.withLinks(text, message);
-    const prompt = messageText.withQuote(sent, quote);
+    // (a session takes one prompt of a bounded size: what was forwarded or quoted is cut to fit before the words are)
+    const quote = toAgent ? fitQuote(quoted, sent) : quoted;
     const files = await this.attachments(message, chat, toAgent);
+    const words = messageText.withQuote(sent, quote);
+    // (to a session, text files go as text after the words, in what room the words leave, and other files to its
+    // machine; elsewhere they go as files)
+    const toMachine = toAgent
+      ? await this.toSession(message, chat, userId, key, roomAfter(words))
+      : { section: "", files: [] };
+    let prompt = [words, toMachine.section].filter(Boolean).join("\n\n");
+    if (!prompt && toMachine.files.length > 0) prompt = FILES_ONLY;
     // (a choice picked on the assistant's card is an answer, never a switch of sessions)
-    const control = message.choice !== true && this.sessionControl(userId, prompt, toAgent, quote, files, text);
+    const control = message.choice !== true && this.sessionControl(userId, prompt, toAgent, quote, message.files, text);
     if (control && assistant.understands(userId)) {
       await this.understand(message, chat, key); // (the switch is put to the person as a button)
     } else if (prompt && toAgent && !control) {
-      await this.remotePrompt(message, chat, key, prompt);
+      await this.remotePrompt(message, chat, key, prompt, toMachine.files);
     } else if (prompt || files.length > 0) {
       await this.toAssistantOrTurn(message, chat, key, { text, quote, sent, prompt, files });
     }
@@ -197,7 +244,13 @@ export class PersonalText {
   }
 
   /** A prompt for the attached agent, within the task limit (the slot is held until the remote turn counts as running). */
-  private async remotePrompt(message: InboundMessage, chat: Chat, key: string, prompt: string): Promise<void> {
+  private async remotePrompt(
+    message: InboundMessage,
+    chat: Chat,
+    key: string,
+    prompt: string,
+    files: readonly FetchedFile[] = [],
+  ): Promise<void> {
     const { remote } = this.ctx.deps;
     const request = {
       message,
@@ -206,6 +259,7 @@ export class PersonalText {
       prompt,
       conversation: chat.conversation,
       provider: this.ctx.credentials.provider(chat.sender.id, key),
+      ...(files.length ? { files } : {}),
     };
     if (remote.running(chat.sender.id)) {
       await remote.prompt(request); // (refused by the agent's own rule: one remote turn at a time)

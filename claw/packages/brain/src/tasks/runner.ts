@@ -39,7 +39,7 @@ import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { buildOutstandingStartHint, classifyResumeOutcome } from "./resume-outcome.js";
 import {
   sleep, redactSecrets, isSensitiveKey, looksLikeCredentialValue, isCredentialFreeLocator,
-  decodeAeadKey,
+  decodeAeadKey, setLongTimeout,
 } from "@claw/utils";
 import {
   BRAIN_ID, BRAIN_VERSION, CHECKPOINT_TTL_MS,
@@ -4930,9 +4930,11 @@ class TaskRunner {
       fire();
       return () => {};
     }
-    const timer = setTimeout(fire, delay);
-    timer.unref();
-    return () => clearTimeout(timer);
+    // Not a bare setTimeout: an app run's deadline is its own time limit, which
+    // can be weeks away, and Node fires a timer longer than about 24.8 days after
+    // 1 ms -- the run would be stopped as soon as it started.
+    const timer = setLongTimeout(fire, delay, { unref: true });
+    return () => timer.clear();
   }
 
   /**

@@ -32,6 +32,7 @@ import pino from "pino";
 import { db } from "../infra/db.js";
 import { openAppRunSecret, sealAppRunSecret } from "../crypto/app-run-secrets.js";
 import { dropSessionAppMcpOfRun } from "./session-app-mcp.js";
+import { sandboxStateSql } from "./app-run-status.js";
 
 const logger = pino({ name: "app-run-state" });
 
@@ -73,6 +74,13 @@ export interface AppRunView {
   task_status: string;
   /** The run's session was deleted. */
   session_deleted: boolean;
+  /**
+   * The run's time limit in seconds, counted from `created_at`: the smaller of the
+   * manifest's `limits.max_runtime_sec` and the request's grant, recorded at admission
+   * (`metadata.app_max_runtime_sec` on the task), and the task's `deadline_at`. Null
+   * for a run with no limit, or admitted before it was recorded.
+   */
+  max_runtime_sec: number | null;
 }
 
 interface RunRow {
@@ -97,18 +105,22 @@ interface RunRow {
   created_by: string | null;
   task_status: string;
   session_deleted: boolean;
+  max_runtime_sec: number | null;
 }
 
 /** The task's status as the user last saw it; see {@link AppRunView.task_status}. Reads `t.status` and `t.metadata`. */
 const TASK_STATUS_SQL = "COALESCE(t.metadata->'app_finish_prior'->>'status', t.status)";
 /** Whether the run's session is deleted; a session row that is missing altogether counts as deleted. */
 const SESSION_DELETED_SQL = `NOT EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = r.session_id AND s.deleted_at IS NULL)`;
+/** The run's time limit recorded at admission (see {@link AppRunView.max_runtime_sec}). Reads `t.metadata`. */
+const MAX_RUNTIME_SQL = `(CASE WHEN t.metadata->>'app_max_runtime_sec' ~ '^[0-9]{1,9}$'
+                               THEN (t.metadata->>'app_max_runtime_sec')::int END)`;
 
 const VIEW_SQL = `
   SELECT r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
          r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_templates, r.grant_expires_at, r.grant_revoked_at, r.created_at,
          r.created_by, t.input, t.sandbox_spec, t.workspace_id,
-         ${TASK_STATUS_SQL} AS task_status, ${SESSION_DELETED_SQL} AS session_deleted
+         ${TASK_STATUS_SQL} AS task_status, ${SESSION_DELETED_SQL} AS session_deleted, ${MAX_RUNTIME_SQL} AS max_runtime_sec
     FROM claw_app_runs r JOIN claw_tasks t ON t.task_id = r.task_id`;
 
 function toView(row: RunRow): AppRunView {
@@ -134,6 +146,7 @@ function toView(row: RunRow): AppRunView {
     user_id: row.created_by,
     task_status: row.task_status,
     session_deleted: row.session_deleted === true,
+    max_runtime_sec: typeof row.max_runtime_sec === "number" && row.max_runtime_sec > 0 ? row.max_runtime_sec : null,
   };
 }
 
@@ -216,7 +229,7 @@ export async function appRunHeldBy(taskId: string, fence: AppRunFence): Promise<
 }
 
 /** The `last_exit` fields that carry free text, the only ones a secret can ride in. */
-const LAST_EXIT_TEXT_FIELDS = ["stop_reason", "error"] as const;
+const LAST_EXIT_TEXT_FIELDS = ["stop_reason", "error", "sandbox_message"] as const;
 
 /**
  * `last_exit` with secrets removed. The secrets are opened only when there is text
@@ -253,12 +266,23 @@ export async function patchAppRun(
   expectState?: AppRunState,
 ): Promise<PatchOutcome> {
   const sets: string[] = [];
+  /** The sandbox columns, kept apart: see the retry below. */
+  const sandboxSets: string[] = [];
   const params: unknown[] = [taskId, fence.brainId, expectState ?? null, fence.claimCount, patch.restarts ?? null];
   const add = (column: string, value: unknown, cast = "") => {
     params.push(value);
     sets.push(`${column} = $${params.length}${cast}`);
   };
-  if (patch.state !== undefined) add("state", patch.state);
+  if (patch.state !== undefined) {
+    add("state", patch.state);
+    // The sandbox's state follows the run's (see sandboxStateSql), and its `since`
+    // moves when it changes -- or when the run goes back to provisioning to make a
+    // new sandbox, whose wait starts now.
+    const next = sandboxStateSql(`$${params.length}::text`, patch.last_exit?.sandbox_gone === true ? "TRUE" : "FALSE");
+    const fresh = patch.state === "provisioning" && patch.sandbox_workload_id === null ? "TRUE" : "FALSE";
+    sandboxSets.push(`sandbox_state = ${next}`);
+    sandboxSets.push(`sandbox_since = CASE WHEN ${fresh} OR ${next} IS DISTINCT FROM r.sandbox_state THEN NOW() ELSE r.sandbox_since END`);
+  }
   if (patch.restarts !== undefined) add("restarts", patch.restarts);
   if (patch.events_cursor !== undefined) add("events_cursor", JSON.stringify(patch.events_cursor), "::jsonb");
   if (patch.state_dir !== undefined) add("state_dir", patch.state_dir);
@@ -284,7 +308,7 @@ export async function patchAppRun(
   // waits is seen, because Postgres re-evaluates the locked row's condition once the
   // lock is granted. Checking the lease through a plain join would test a snapshot
   // from before the wait, and a stale holder could still write.
-  const updated = await db.query(
+  const update = (assignments: string[]) => db.query(
     `WITH t AS (
        SELECT task_id, input, sandbox_spec, workspace_id, status, metadata
          FROM claw_tasks
@@ -294,7 +318,7 @@ export async function patchAppRun(
           AND claim_count = $4::int
           FOR UPDATE
      )
-     UPDATE claw_app_runs r SET ${sets.join(", ")}
+     UPDATE claw_app_runs r SET ${assignments.join(", ")}
        FROM t
       WHERE r.task_id = t.task_id
         AND r.state <> 'ended'
@@ -310,9 +334,17 @@ export async function patchAppRun(
       RETURNING r.task_id, r.session_id, r.state, r.restarts, r.last_exit, r.events_cursor, r.state_dir,
                 r.sandbox_workload_id, r.manifest, r.grant_id, r.grant_limits, r.grant_templates, r.grant_expires_at, r.grant_revoked_at, r.created_at,
                 r.created_by, t.input, t.sandbox_spec, t.workspace_id,
-                ${TASK_STATUS_SQL} AS task_status, ${SESSION_DELETED_SQL} AS session_deleted`,
+                ${TASK_STATUS_SQL} AS task_status, ${SESSION_DELETED_SQL} AS session_deleted, ${MAX_RUNTIME_SQL} AS max_runtime_sec`,
     params,
   );
+  // With APP_RUNS_ENABLED off the schema guard only warns about missing app-run
+  // columns, and a run already going must still move: on a database without the
+  // sandbox columns the same write is made without them (it is one statement, so
+  // the failed one wrote nothing), and the reads derive the state from the run's.
+  const updated = await update([...sandboxSets, ...sets]).catch((err: unknown) => {
+    if ((err as { code?: unknown })?.code !== "42703" || sandboxSets.length === 0) throw err;
+    return update(sets);
+  });
   if (updated.rowCount === 1) {
     // The session's MCP of an ended run is gone with it, whoever ended it.
     // Best effort: the state change has committed, so a failed delete must not turn

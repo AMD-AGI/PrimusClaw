@@ -582,8 +582,8 @@ Claude Code not installed and no `--config-dir`, it refuses and says so, since t
 The card names the tool that asked and the machine, as in "Claude Code in a terminal on dev-pod (fix CI, work/claw) is waiting
 for you" (or Codex, or Cursor, for their hooks below).
 
-This adds a `PermissionRequest` hook, plus `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop` (all run in the
-background) and `SessionEnd`, to the Claude config directory's user-level `settings.json`, merged the same way as the session
+This adds a `PermissionRequest` hook, plus `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `StopFailure` (all
+run in the background) and `SessionEnd`, to the Claude config directory's user-level `settings.json`, merged the same way as the session
 hooks above (marked `--managed-by claw-connector`, nothing else in the file is touched). They run `approval-hook.js` from this
 installation, which talks to the running connector over a socket in its state directory (`approvals.sock`, 0600, in a
 directory only you can enter).
@@ -621,6 +621,27 @@ directory only you can enter).
   leave every question to the terminal.
 - A card nobody answers is withdrawn after an hour; the terminal still has the question. The audit log records each request,
   answer and withdrawal (`approval_requested`, `permission_resolved`, `approval_withdrawn`), never what was typed.
+
+### When a turn ends while you are away
+
+The same hooks also tell you when a turn ends in a terminal you walked away from: Claude Code's `Stop` (it finished) and
+`StopFailure` (it stopped on an API error: a rate limit, a billing or sign-in problem, an unknown model), and Codex's `Stop`
+(installed with `hooks install --agent codex`; Codex asks you to trust the new hook once). At the end of a turn the hook names
+the terminal the session runs in, and the connector waits: if nobody types in that terminal for a minute after the turn
+ended (its last-input time, as `w` reads it), the chat gets one message naming the machine, the tool, the conversation and
+its folder, with the end of what the agent last said, or the error. Nothing is said:
+
+- when someone typed in that terminal, sent a new prompt or ended the conversation within that minute;
+- while a chat follows the conversation (taken over, typed into or watched from the phone): it shows the end itself;
+- for a `Stop` that leaves background tasks running (Claude Code wakes the conversation again when they finish);
+- when the hook cannot name the terminal (nobody can tell whether a person is at it), and for `claude -p`, `codex exec` and
+  the sessions this connector runs;
+- more than once every five minutes for one conversation (the work item still records every end).
+
+`/approvals off` turns these off with the questions. To stop hearing from one conversation, send the command its message
+ends with, `/approvals mute #<item>` (`/approvals unmute #<item>` brings it back): its questions, waits and ends then stay in
+its terminal, and Claw refuses to open a card session for it (`session_muted`). The audit log records each end told or not
+(`turn_end_sent`, `turn_end_not_sent` with the reason), never the agent's words.
 
 ### The same for Codex
 

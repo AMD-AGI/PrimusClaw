@@ -36,8 +36,11 @@ function messageIdOf(message: ServiceBusReceivedMessage): string | undefined {
 
 /** A receiver locked on one session: messages in order, settled one by one. */
 export interface SessionReceiver {
-  /** At most `count` messages, waiting at most `waitMs` for the first (none: the session has gone quiet). */
-  receive(count: number, waitMs: number): Promise<Received[]>;
+  /**
+   * At most `count` messages, waiting at most `waitMs` for the first (none: the session has gone quiet). With `signal`,
+   * the wait ends (rejects) when it is aborted.
+   */
+  receive(count: number, waitMs: number, signal?: AbortSignal): Promise<Received[]>;
   complete(message: Received): Promise<void>;
   abandon(message: Received): Promise<void>;
   deadLetter(message: Received, reason: string, description: string): Promise<void>;
@@ -46,8 +49,16 @@ export interface SessionReceiver {
 
 export interface BusClient {
   sender(queue: string): BusSender;
-  /** The next session that has messages; rejects (a timeout) when none has any. */
-  acceptNextSession(queue: string): Promise<SessionReceiver>;
+  /** The next session that has messages; rejects (a timeout) when none has any, or when `signal` is aborted. */
+  acceptNextSession(queue: string, signal?: AbortSignal): Promise<SessionReceiver>;
+  /**
+   * Open a new connection for what is asked next (the receivers' re-arm, when a call on the old one hangs). The old one
+   * is left open, since other receivers on it may still be handling a message whose session lock it holds: closing it
+   * then would drop their locks and the broker would hand the message to someone else while it is still being handled.
+   * Returns the old connection's close, for the caller to run once nothing it took on the old connection is in hand.
+   * Optional: a client without it is only asked again.
+   */
+  reopen?(): () => Promise<void>;
   close(): Promise<void>;
 }
 
@@ -63,10 +74,11 @@ function rawBody(message: ServiceBusReceivedMessage): Uint8Array {
 
 /** The SDK's client behind `BusClient`. Bodies are sent as one data section of bytes and read back unparsed. */
 export function azureBusClient(connection: BusConnection, lockRenewalMs: number): BusClient {
-  const client =
+  const open = (): ServiceBusClient =>
     typeof connection === "string"
       ? new ServiceBusClient(connection)
       : new ServiceBusClient(connection.namespace, connection.credential);
+  let client = open();
   return {
     sender(queue) {
       const sender = client.createSender(queue);
@@ -75,10 +87,11 @@ export function azureBusClient(connection: BusConnection, lockRenewalMs: number)
         close: () => sender.close(),
       };
     },
-    async acceptNextSession(queue) {
+    async acceptNextSession(queue, signal) {
       const receiver = await client.acceptNextSession(queue, {
         maxAutoLockRenewalDurationInMs: lockRenewalMs,
         skipParsingBodyAsJson: true,
+        ...(signal ? { abortSignal: signal } : {}),
       });
       const held = new Map<Received, ServiceBusReceivedMessage>();
       const sdk = (message: Received): ServiceBusReceivedMessage => {
@@ -88,8 +101,11 @@ export function azureBusClient(connection: BusConnection, lockRenewalMs: number)
         return found;
       };
       return {
-        async receive(count, waitMs) {
-          const messages = await receiver.receiveMessages(count, { maxWaitTimeInMs: waitMs });
+        async receive(count, waitMs, signal) {
+          const messages = await receiver.receiveMessages(count, {
+            maxWaitTimeInMs: waitMs,
+            ...(signal ? { abortSignal: signal } : {}),
+          });
           return messages.map((m) => {
             const received: Received = {
               body: rawBody(m),
@@ -110,6 +126,11 @@ export function azureBusClient(connection: BusConnection, lockRenewalMs: number)
           }),
         close: () => receiver.close(),
       };
+    },
+    reopen() {
+      const old = client;
+      client = open();
+      return () => old.close();
     },
     close: () => client.close(),
   };

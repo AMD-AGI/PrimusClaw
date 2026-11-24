@@ -90,7 +90,7 @@ test("a reviewer without github gets the steps in their own chat once a day", as
   await ask(world);
   await ask(world);
   assert.deepEqual(world.started, []);
-  assert.ok(saidIn(world.surface, CONV).includes("Bob 还没有绑定 GitHub"));
+  assert.ok(saidIn(world.surface, CONV).includes("Bob 还不能被我代审：还差第 2 步「发 `/github bind` 连接 GitHub」"));
   const steps = saidIn(world.surface, "personal:aad-b");
   assert.equal(steps.split("asked me in a group chat to review and merge").length - 1, 1);
 });
@@ -100,7 +100,9 @@ test("a reviewer whose switch is off starts nothing and the group is told", asyn
   world.identity.know("aad-b", "u-bob", "bob-gh", false);
   await ask(world);
   assert.deepEqual(world.started, []);
-  assert.ok(saidIn(world.surface, CONV).includes("Bob 还没有授权我代 TA review 合入"));
+  assert.ok(
+    saidIn(world.surface, CONV).includes("Bob 还不能被我代审：还差第 3 步「发 `/github auto-merge on` 开启代审授权」"),
+  );
 });
 
 test("a committer cannot review and merge their own pull request and nothing is started", async () => {

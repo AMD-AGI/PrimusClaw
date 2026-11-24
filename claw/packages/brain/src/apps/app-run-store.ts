@@ -50,6 +50,23 @@ export interface AppLastExit {
    * do not spend `max_restarts`. Absent means none.
    */
   platform_losses?: number;
+  /**
+   * Why the run has no sandbox right now, when the platform did not provide one:
+   * the provisioning code (`sandbox_rejected`, `sandbox_unschedulable`,
+   * `sandbox_create_failed`, ...; see sandbox/errors.ts). Set when an attempt to
+   * get a sandbox fails, carried while the run is still provisioning (into a
+   * deadline or a cancel that ends it there), and cleared once a sandbox is Running.
+   * It is what tells a caller that a run ended because it never got a sandbox.
+   */
+  sandbox_reason?: string;
+  /** What the platform said with {@link AppLastExit.sandbox_reason}: one line, bounded, scrubbed. */
+  sandbox_message?: string;
+  /**
+   * Set on the move to `finishing` made because the run's sandbox was lost (the
+   * platform reported it gone): there is no sandbox left for the finish to stop, and
+   * callers read the run's sandbox as ended from here.
+   */
+  sandbox_gone?: true;
 }
 
 /**
@@ -99,6 +116,14 @@ export interface AppRunRecord {
   task_status?: string;
   /** The run's session was deleted. Absent from an API older than the field. */
   session_deleted?: boolean;
+  /**
+   * The run's time limit in seconds, counted from `created_at`: the smaller of the
+   * manifest's `limits.max_runtime_sec` and the request's grant, as admitted (and the
+   * task's `deadline_at`). Null for a run with no limit or admitted before it was
+   * recorded; absent from an API older than the field. Either way the manifest's
+   * limit is what is left.
+   */
+  max_runtime_sec?: number | null;
 }
 
 /**

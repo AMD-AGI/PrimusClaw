@@ -108,7 +108,9 @@ test("a reviewer who is not linked starts nothing and the asker is told why", as
   world.store.links.unlink("aad-b");
   await ask(world, `请 {Bob} 帮我 review 合入 ${PR}`);
   assert.deepEqual(starts(world), []);
-  assert.ok(saidIn(world.surface, CONV).includes("Bob 还没有在 PrimusClaw Assistant 里连接自己的 Primus key"));
+  assert.ok(
+    saidIn(world.surface, CONV).includes("Bob 还不能被我代审：还差第 4 步「发 `/link` 连接自己的 PrimusClaw key」"),
+  );
 });
 
 test("an asker without a key of her own can ask bob", async () => {

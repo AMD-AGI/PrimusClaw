@@ -10,7 +10,7 @@ import type { HttpRequest, HttpResponseInit, InvocationContext } from "@azure/fu
 
 import { type Ingress } from "./ingress.js";
 import { type LogRecord, type LogSink } from "./log.js";
-import { OUTBOUND_CONNECTION_SETTING } from "./settings.js";
+import { OUTBOUND_CONNECTION_SETTING, PROBE_SCHEDULE_SETTING } from "./settings.js";
 
 /** The registration calls of `@azure/functions`' `app` that the ingress makes. */
 export interface Registrar {
@@ -29,6 +29,14 @@ export interface Registrar {
       connection: string;
       queueName: string;
       handler: (message: unknown, context: InvocationContext) => Promise<void>;
+    },
+  ): void;
+  /** Optional (a registrar from before the delivery probe has none): without it the probe's timer is not registered. */
+  timer?(
+    name: string,
+    options: {
+      schedule: string;
+      handler: (timer: unknown, context: InvocationContext) => Promise<void>;
     },
   ): void;
 }
@@ -57,7 +65,10 @@ export const consoleSink: LogSink = (record) => {
   else console.error(...a);
 };
 
-/** Register the messaging endpoint, and the outbound trigger when its connection is configured. */
+/**
+ * Register the messaging endpoint, the outbound trigger when its connection is configured, and the delivery probe's timer
+ * when its schedule is.
+ */
 export function register(app: Registrar, ingress: Ingress): void {
   // The bot's messaging endpoint is https://<app>/api/messages; Bot Framework sends no function key.
   app.http("messages", {
@@ -79,6 +90,17 @@ export function register(app: Registrar, ingress: Ingress): void {
       connection: OUTBOUND_CONNECTION_SETTING,
       queueName: ingress.settings.outboundQueueExpression,
       handler: (message, context) => ingress.outbound(message, contextSink(context)),
+    });
+  }
+  if (ingress.settings.probeConfigured) {
+    if (app.timer === undefined) {
+      ingress.noProbeTimer();
+      return;
+    }
+    // The host resolves the schedule from the app setting, so it can change without a new package.
+    app.timer("probe", {
+      schedule: `%${PROBE_SCHEDULE_SETTING}%`,
+      handler: (_timer, context) => ingress.probe(contextSink(context)),
     });
   }
 }

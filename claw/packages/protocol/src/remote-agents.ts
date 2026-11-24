@@ -33,6 +33,10 @@ export const REMOTE_AGENT_LIMITS = {
   maxCapabilitiesBytes: 4 * 1024,
   /** Bytes of one prompt. */
   maxPromptBytes: 64 * 1024,
+  /** Files one prompt may carry (`prompt.files`). */
+  maxPromptFiles: 10,
+  /** Bytes of all the files of one prompt together, decoded (base64 makes them a third larger on the wire). */
+  maxPromptFileBytes: 2 * 1024 * 1024,
   /** Commands one user may issue per minute, across all connectors. */
   commandsPerMinute: 60,
 } as const;
@@ -132,6 +136,15 @@ export function connectorVersionStatus(
 export const REMOTE_EVENT_PERMISSION_REQUEST = "permissionRequest";
 export const REMOTE_EVENT_PERMISSION_RESOLVED = "permission_resolved";
 export const REMOTE_EVENT_SESSION_CLOSED = "session_closed";
+/**
+ * A turn of a conversation open in a terminal ended while nobody was at that terminal, posted on the conversation's terminal-hook
+ * session (`origin` "terminal_hook") by its connector: `{ref, outcome: "done" | "error", error?, message, agent, cwd, ended_at,
+ * away_ms}`. `message` is the end of what the agent last said (untrusted text); `error` names why a turn that failed did
+ * (Claude Code's `StopFailure` reason, such as `rate_limit`). The connector posts it only once the terminal has had no input for a
+ * minute after the turn ended, and never while a chat follows the conversation; Claw tells the owner, unless they turned the
+ * terminal pushes off or muted that conversation.
+ */
+export const REMOTE_EVENT_TERMINAL_TURN_END = "terminal_turn_end";
 /**
  * What the person sent a session (a `prompt` command), written by Claw itself when it queues the prompt: `{text, cmd_id, cmd_seq,
  * client, by: "claw"}` with a negative `seq`. An agent's events carry only its own side, so without it a window opened on the
@@ -449,6 +462,13 @@ export function parseApprovalsSetting(body: unknown): Parsed<{ enabled: boolean 
   return { ok: true, value: { enabled: body.enabled } };
 }
 
+/** `PUT /v1/remote-agents/approvals/mutes`: mute (or unmute) the conversation behind work item `#item`, one open in a terminal. */
+export function parseTerminalMute(body: unknown): Parsed<{ item: number; muted: boolean }> {
+  if (!isObject(body) || typeof body.muted !== "boolean") return fail("muted_required");
+  if (typeof body.item !== "number" || !Number.isSafeInteger(body.item) || body.item < 1) return fail("item_required");
+  return { ok: true, value: { item: body.item, muted: body.muted } };
+}
+
 /**
  * Hiding conversations of a machine from its owner's lists (`POST /v1/remote-agents/connectors/:cid/hidden`), and the
  * listing that leaves them out (`GET /v1/remote-agents/connectors`, `?hidden=include` to list them too). Nothing on the
@@ -536,6 +556,56 @@ export interface RemoteCommandSpec {
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
+/** A file a prompt carries, as the connector receives it. */
+export interface RemotePromptFile {
+  /** One safe path component: letters, digits, `._ -`, no leading dot, at most 100 characters. */
+  name: string;
+  media_type: string;
+  /** The bytes, base64. */
+  data: string;
+}
+
+// (no "/" and no leading dot: never a directory, never "." or "..", never a hidden file)
+const PROMPT_FILE_NAME_RE = /^(?!\.)[A-Za-z0-9._ -]{1,100}$/;
+const MEDIA_TYPE_RE = /^[a-z0-9][a-z0-9.+-]{0,62}\/[a-z0-9][a-z0-9.+-]{0,62}$/;
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/** Bytes a base64 text decodes to (it is already known to be base64). */
+function base64Bytes(data: string): number {
+  const pad = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  return (data.length / 4) * 3 - pad;
+}
+
+/**
+ * The files a prompt carries (`files`, optional): at most {@link REMOTE_AGENT_LIMITS.maxPromptFiles}, each a safe name, a
+ * media type and its bytes in base64, all together at most {@link REMOTE_AGENT_LIMITS.maxPromptFileBytes} decoded, no two
+ * with one name (compared without case). A connector that says it can (the agent capability `prompt_files`) saves them on its machine and names
+ * where in the prompt; Claw keeps them only while the command waits to be delivered, never in the session's events.
+ */
+export function parsePromptFiles(raw: unknown): Parsed<RemotePromptFile[]> {
+  if (raw === undefined) return { ok: true, value: [] };
+  if (!Array.isArray(raw) || raw.length > REMOTE_AGENT_LIMITS.maxPromptFiles) return fail("invalid_files");
+  const files: RemotePromptFile[] = [];
+  const names = new Set<string>();
+  let total = 0;
+  for (const f of raw) {
+    if (!isObject(f)) return fail("invalid_files");
+    const { name, media_type: mediaType, data } = f;
+    // (two names that differ only in case are one file where the machine's file system ignores case: macOS, Windows)
+    if (typeof name !== "string" || !PROMPT_FILE_NAME_RE.test(name) || names.has(name.toLowerCase())) {
+      return fail("invalid_file_name");
+    }
+    if (typeof mediaType !== "string" || !MEDIA_TYPE_RE.test(mediaType)) return fail("invalid_file_media_type");
+    if (typeof data !== "string" || data === "" || data.length % 4 !== 0) return fail("invalid_file_data");
+    total += base64Bytes(data);
+    if (total > REMOTE_AGENT_LIMITS.maxPromptFileBytes) return fail("files_too_large");
+    if (!BASE64_RE.test(data)) return fail("invalid_file_data");
+    names.add(name.toLowerCase());
+    files.push({ name, media_type: mediaType, data });
+  }
+  return { ok: true, value: files };
+}
+
 export const REMOTE_COMMANDS: Record<RemoteCommandType, RemoteCommandSpec> = {
   prompt: {
     needsOnline: true,
@@ -544,9 +614,25 @@ export const REMOTE_COMMANDS: Record<RemoteCommandType, RemoteCommandSpec> = {
       const text = body.text;
       if (typeof text !== "string" || text.trim() === "") return fail("text_required");
       if (new TextEncoder().encode(text).length > REMOTE_AGENT_LIMITS.maxPromptBytes) return fail("prompt_too_large");
-      return { ok: true, value: { text } };
+      const files = parsePromptFiles(body.files);
+      if (!files.ok) return files;
+      return { ok: true, value: files.value.length ? { text, files: files.value } : { text } };
     },
-    audit: (p) => ({ sha256: sha256(String(p.text)), length: String(p.text).length }),
+    // (a file's name, type and size and the hash of its bytes; never the bytes)
+    audit: (p) => ({
+      sha256: sha256(String(p.text)),
+      length: String(p.text).length,
+      ...(Array.isArray(p.files) && p.files.length
+        ? {
+            files: (p.files as RemotePromptFile[]).map((f) => ({
+              name: f.name,
+              media_type: f.media_type,
+              size: base64Bytes(f.data),
+              sha256: createHash("sha256").update(Buffer.from(f.data, "base64")).digest("hex"),
+            })),
+          }
+        : {}),
+    }),
   },
   cancel: {
     needsOnline: false,

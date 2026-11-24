@@ -17,7 +17,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.0 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.10.4 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.11.0 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
 The Teams app package (its manifest `version`) is not covered by these rules.
@@ -113,6 +113,85 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: the assistant knows what it can and cannot do. Its router turn has a new read tool, `claw_capabilities`, that
+  answers a list generated from what that turn really has: the tools registered on its assistant server, each by how
+  it takes effect (`acts_at_once`, `asks_first`, `reads`), the deployment's switches (pull request and job watching,
+  triggers, memory, reviews, development environments, personal skills, files and images), its lookups, the user's
+  review mode (`fully_auto` or `high_risk_confirm`) and its limits as data that is on or off (no email, calendar,
+  document stores or voice; the chat apps it is in), each lifted where the deployment provides it. The router is told
+  to call it first for any question about its abilities, limits or how it compares with other assistants and to
+  answer only from it (`router-self-v5`, `router-read-v18`); "every change goes through a work item that asks first"
+  is no longer said, since its own tools act by themselves. `GET /v1/assistant/capabilities` serves the same list to
+  the signed-in user. Asked what it could not do, it used to answer from guesswork and name limits it does not have.
+  An entry is on only where it works: web search and page reading as the Brain running the turn has each of them
+  (the Brain names them to the assistant's server in `x-claw-web-tools`; the API's own list, which no Brain serves,
+  claims neither, and where that leaves nothing else to look up lists `look_up` as not known, `on: null`, rather than
+  off), reviews and the review mode only where a review can be started from the assistant (reviews and
+  review items on) and the user has bound a GitHub account (a review as them acts with it), pull request watching and
+  GitHub comments only where the user has a GitHub token as those tools resolve it (a `GH_TOKEN` in their settings, or
+  their `/github bind` binding where bindings count), and memory only where the user's own setting has it and the
+  conversation keeps it. An entry that is off says so (and, for GitHub, what to connect), and the tools that would
+  refuse because of it are listed under `off_here` rather than as acting.
+- Claw: the super-agent evaluation grades an answer about the assistant against that list. A case with
+  `self_knowledge` reads the identity's list before it is sent; an answer that states a limit the list contradicts,
+  or claims an ability it lists as off, is flagged and is no pass without a judge, which is given the list as the
+  truth and the flagged words and decides; an entry the list does not know (`on: null`) is graded neither way; a case
+  whose list was not read never passes. Nine such cases are in
+  `sa-eval-cases/catalog/self-knowledge.jsonl`, and four in the router evaluation (`self-01`..`self-04`).
+
+- Claw, connector, personal agent: a turn of a Claude Code or Codex conversation open in one of your terminals that ends
+  while nobody is at that terminal is said in your 1:1 chat: finished, with the end of what the agent last said, or
+  stopped with an error (Claude Code's `StopFailure` reason). The connector's approval hooks now also run on
+  `StopFailure` (Claude Code) and `Stop` (Codex); the connector posts `terminal_turn_end` only once that terminal has had
+  no input for a minute after the turn ended, never while a chat follows the conversation, and not for a `Stop` that
+  leaves background tasks running. Claw files it under the conversation's work item and says at most one end per
+  conversation every five minutes. `/approvals off` turns these off with the questions; `/approvals mute #<item>` (and
+  `unmute`) does it for one conversation (`PUT /v1/remote-agents/approvals/mutes`): its open card session is closed,
+  and its questions, waits and ends stay in the terminal. See `connector/README.md`, "When a turn ends while you are
+  away".
+
+- Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, how many times the
+  application was started again, and `app.last_exit`, `{ returncode, at, cause }` of the last time the application
+  stopped (`null` until then), moved on every exit. A crash-looping application used to read only `status: running`
+  with nothing else until its run ended. `cause` is a closed list (`exited`, `start_failed`, `sandbox_lost`,
+  `restarts_exhausted`, `deadline`, `cancelled`, `task_closed`); no free text is carried. See `claw/docs/run-api.md`,
+  "App runs".
+- Claw: `app.restarts` is split by kind. `app.crash_restarts` counts the restarts for the application's own failure (an
+  exit without `final`, a launch that kept failing, its container failing), the ones `restart.max_restarts` bounds;
+  `app.platform_losses` counts the sandboxes the platform took away (node lost, no node to run on) that were replaced.
+  `app.restarts` is now their total, so a reader of it keeps working; before, it carried only the first and a platform
+  loss was in no count. Both are on `GET /v1/tasks/:id` (`item.app`) and `GET /v1/runs` (`app`), and keep their value
+  once the run has ended (the Brain now carries the platform-loss count onto the run's final `last_exit`). See
+  `claw/docs/run-api.md`, "App runs".
+- Claw: a plugin can let an app run change its manifest's sandbox templates. `overridable.sandbox_templates` declares,
+  per template name, which of `fromImage` (a string rule with an `enum` or a `pattern`), `per_gpu_count` (an integer
+  `enum` or range) and `resources` (a `max` Kubernetes quantity for each of `cpu`, `memory`, `ephemeralStorage` and
+  `sharedMemory`) a launch may set; `overrides.sandbox_templates` on `POST /v1/sessions/:id/tasks` (`mode: "app"`) names
+  the values, for example `{ "runner": { "fromImage": "...", "per_gpu_count": 4, "resources": { "requests": { "cpu":
+  "24", "memory": "1400Gi" } } } }`. The values are checked against the declaration and applied to a copy of the
+  manifest (the card count becomes `[n]`; `fromImage` and `resources` land where Agent Sandbox reads them; each given
+  request or limit replaces that entry; `sharedMemory` becomes `gpu.sharedMemory`), which must still validate: a request
+  above its limit, a shared memory above the memory the template will get (its memory limit, else its request, else
+  the per-card default of 224Gi times its fewest cards), or two templates of one role with the same card count is
+  refused. Quantities are compared exactly, as Kubernetes rounds them, not as floating-point numbers. A refusal is `400 plugin_overrides_invalid` naming each field, and nothing is created. The run stores and
+  grants the effective templates, records the values in `metadata.plugin_overrides`, logs only the keys, and binds them
+  to the `Idempotency-Key`. One generic plugin can so serve several model sizes instead of one plugin per size. A plugin
+  that declares nothing launches exactly as before. Agent Sandbox applies a template's `resources` and
+  `gpu.sharedMemory` from the release that reads them. See `claw/docs/plugins.md` section 4.
+- Claw: an app run (`mode: "app"`) carries an `app` block on `GET /v1/tasks/{id}` (`item.app`) and on every form of
+  `GET /v1/runs` (`app`, `null` for other runs). `app.sandbox` says where the run's sandbox is -- `state` (`pending`
+  while it is being created, queued or starting, `running` once the platform reports it Running, `ended`),
+  `workload_id` and `since` -- where until now the task read `running` from the moment a worker accepted it, however
+  long its sandbox stayed queued or pulled its image. `app.outcome`, once the run has ended, says how as stable fields:
+  `cause` (a closed list: `exited`, `restarts_exhausted`, `start_failed`, `deadline`, `cancelled`, `task_closed`,
+  `no_exit_record`, `sandbox_rejected`, `sandbox_create_failed`, `sandbox_unschedulable`, `sandbox_start_timeout`,
+  `sandbox_failed`), `returncode`, `final` and `error` (the application's `exit.json` `error`, or the platform's reason
+  for a `sandbox_*` cause; masked, one line, at most 300 characters), so a caller no longer matches on the prose of
+  `failure_reason`, which is unchanged. `placement.workload_id` on `GET /v1/runs` now names an app run's sandbox; it was
+  always empty. To tell a run that never got a sandbox from one whose application failed, the run's row now records why
+  it has no sandbox (the provisioning code and the platform's words, scrubbed) while it waits, until one is Running.
+  A wait for a sandbox cut short by the run's own cancel or deadline is never counted as a sandbox the platform failed
+  to give, so such a run ends as `cancelled` or `deadline`. See `claw/docs/run-api.md`, "App runs".
 - Claw: metrics for the API's event consumer: `claw_api_event_consumer_consecutive_failures` (deliveries this replica
   retried since it last stored or set aside an event), `claw_api_event_quarantined_total{reason}` (`unparseable`,
   `unstorable`, `bounded`), `claw_api_event_sanitised_total` (events stored with a character replaced), and, read from the server every 30 seconds,
@@ -178,6 +257,36 @@ release version, and its `appVersion` stays `latest`.
 
 ### Changed
 
+- Agent Sandbox: a GPU template's CPU, memory, pod storage and `/dev/shm` now come from the template when it sets them,
+  instead of always 24 CPU, 224Gi memory, 187.5Gi storage and 125Gi shared memory per card. A sandbox can ask for what
+  it needs (for example 16 CPU and 448Gi for two cards, or 32 CPU and 1792Gi for eight) and leave the rest of the node
+  to CPU sandboxes. Before, `resources` on a grant or owner policy template with GPU counts was silently overwritten.
+  Each of `cpu`, `memory` and `ephemeral-storage` in `resources.requests`/`resources.limits` is resolved on its own: a
+  value given only as a request is also the limit, one given only as a limit is also the request, and one given in
+  neither keeps the per-card size times the card count. `/dev/shm` is the spec's `gpu.sharedMemory`, else 125Gi per card
+  lowered to the memory limit when that is smaller. The card count still comes only from `perGpuCount`. A template with
+  no `resources` or `gpu` is sized exactly as before. A value that is zero, negative or not a quantity, a request above
+  its limit, a shared memory above the memory limit, any other resource name on a GPU template, or a `gpu` key other than
+  `sharedMemory` (`count`, `product` and `resourceName` are still accepted and ignored, so a stored policy with them keeps
+  applying), is refused with `400` (`invalid_grant` or `invalid_owner_policy`) naming the field, and nothing is
+  registered. A template without GPU counts keeps its `resources` as written, and its `cpu`, `memory` and
+  `ephemeral-storage` are now checked the same way. Claw already passes a manifest template's fields through unchanged, so an app manifest's
+  `sandbox_templates` entries can set these now. See `sandbox/docs/E2B.md` (GPU template size). Deploy the sandbox control
+  plane (`agent-sandbox-controlplane`); Claw is unchanged. Templates registered before the release keep their size until
+  their grant is issued again.
+- Claw: an app task's `deadline_at` is the run's own time limit, the smaller of the manifest's
+  `limits.max_runtime_sec` and the request's `resources.grant.max_runtime_sec`, counted from the run's creation: the
+  moment the Brain stops it. It used to be the generic task budget (72 hours) from the task's start, which said
+  nothing about when the run would end. An app run with neither limit keeps that budget, and other tasks are
+  unchanged. A run whose request asked for less than its manifest's limit is now stopped at the request's (the Brain
+  used to stop it at the manifest's only). The deadline backstop now gives an app run its application's
+  `stop_grace_sec` (at most an hour) past the deadline before it closes the task, so it no longer closes a run the
+  Brain is still stopping as `run_budget_exhausted`.
+  The request's `resources.grant.max_runtime_sec`, the manifest's `limits.max_runtime_sec` and
+  `APP_SANDBOX_CAPS.max_runtime_sec` must now be a whole number of seconds from 1 to 2147483 (about 24.8 days): a
+  fraction or 0, which the grant issuer already refused, or a longer limit, is refused at admission with
+  `400 app_resources_invalid` (an `APP_SANDBOX_CAPS` outside it stops the API at start-up). Limits in use today are at
+  most 259200 seconds.
 - Claw API: a review asked of someone else ("review and merge", R asking X) is now merged with the reviewer's account
   whenever the reviewer can merge it, and the requester's own account is used only when the reviewer cannot, and only on
   the requester's yes. Under X's `fully_auto` the merge is made at once; under `high_risk_confirm` a held merge waits for
@@ -219,6 +328,10 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: a run whose deadline was more than about 24.8 days away was stopped at once. The Brain stops a run at its
+  `deadline_at` with a timer, and Node fires a timer longer than 2^31 - 1 ms after 1 ms; an app run's deadline can be
+  its own time limit, which a request or manifest could set that far out. The timer now waits in steps no longer than
+  that, so any deadline fires when it comes, and admission refuses a time limit above 2147483 seconds (see Changed).
 - Claw: an A2A push notification that its webhook keeps refusing no longer holds back every later notification for that
   webhook for up to an hour. After eight failed attempts (about twenty minutes) it is set aside: its outbox row is
   closed, a copy is kept in the new `claw_a2a_push_dead_letters` table for 14 days, the log line
@@ -296,6 +409,24 @@ release version, and its `appVersion` stays `latest`.
 - Claw API: a message whose text or request carries a NUL character or a lone UTF-16 surrogate is now queued with
   U+FFFD in its place. PostgreSQL stores neither (TEXT refuses the NUL byte; `jsonb` refuses the `\u0000` escape and a
   lone surrogate escape), so such a message used to be refused with a server error when the session was busy.
+- Personal agent: a review asked of a colleague who cannot be acted as yet no longer stops at the first step they finish.
+  Reviewing for someone else takes three steps of theirs (connecting their Primus account at the identity service,
+  `/github bind`, `/github auto-merge on`, and `/link` when their own key is missing too), and confirming the identity
+  card looked like being done. Now the request is kept (new store table `review_onboarding`, kept a week): the reviewer's
+  first message lists every step with the current one marked, in English and Chinese, and each step they finish is
+  answered once with the next one (a button runs `/github bind`, another turns the authorization on or declines it). The
+  identity service tells the worker nothing when someone confirms there, so the reviewer's state is read again on any
+  message of theirs and every minute. The asker is told which step is missing ("还差第 N 步「…」"), and once every step is
+  done hears "<name> 已完成授权，可以开始代审了" where they asked, with a button that starts the same request again (same
+  pull requests, same merge flag, the same handoff within a day, the same model) through every check, the model's
+  included, so nothing starts without the reviewer's authorization on and nothing runs on a model nobody chose. A
+  reviewer who declines, or turns the authorization off while asked, is not asked again for those requests, and each
+  asker is told once; a later new request of them sends the steps once more. The reviewer's first message stays at most once a day. A step that could not be said (the
+  reviewer's chat not reachable yet, or a send whose text failed) is said on the next read rather than counted as said;
+  once its text went, a button that failed after it does not send the step again. The asker's "ready" and "declined"
+  messages are marked sent only once they went out, and one that failed is sent by the next minute's read. A GitHub notice
+  that already went to the reviewer earlier the same day for something else no longer keeps the step they are at from
+  being sent. Asked again for the same pull requests, a button sent for the earlier request no longer starts the new one.
 - Claw: in the SaFE deployment mode with `LLM_KEY_SOURCE=platformKey`, a caller signed in with an `ak-` key (in
   `Authorization: Bearer`, `x-api-key` or a download URL) or a default session cookie has their email again:
   `GET /v1/me` answers it and the request's user carries it, as in 0.5.8. Since 0.5.9 the API no longer asked SaFE's

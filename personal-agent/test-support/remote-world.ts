@@ -36,7 +36,7 @@ import { activityOf } from "../packages/teams/src/messenger/render.js";
 import { FakeClock } from "./clock.js";
 import { SeededRandom } from "./random.js";
 import { type FakeCommand, FakeRemote, KEYS } from "./remote-fake.js";
-import { type Recorded, FakeSurface } from "./surface.js";
+import { type FakeSurfaceOptions, type Recorded, FakeSurface } from "./surface.js";
 import { parseAgentCommand } from "../packages/core/src/commands/agent-args.js";
 import { commandArgs, menuCommand } from "../packages/core/src/commands/parse.js";
 import { naturalCommand } from "../packages/core/src/capabilities/natural.js";
@@ -119,6 +119,8 @@ export interface WorldOptions {
   readonly timings?: FollowTimings;
   /** A turn is shown by a stream (Teams' floating status, then the answer in its bubble), as in a 1:1 chat that streams. */
   readonly streaming?: boolean;
+  /** Files the surface's `fetchFile` returns, by name (FakeSurface's `files`). */
+  readonly files?: FakeSurfaceOptions["files"];
 }
 
 export class RemoteWorld {
@@ -159,7 +161,10 @@ export class RemoteWorld {
     readonly server: FakeRemote,
     options: WorldOptions,
   ) {
-    this.surface = new FakeSurface({ caps: { streaming: options.streaming ?? false } });
+    this.surface = new FakeSurface({
+      caps: { streaming: options.streaming ?? false },
+      ...(options.files ? { files: options.files } : {}),
+    });
     const store = this.test.store;
     const claw = createClawClient({ baseUrl: server.url, clock: systemClock });
     this.claw = claw.remoteAgents;
