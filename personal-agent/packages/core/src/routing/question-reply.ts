@@ -10,14 +10,14 @@
 import { cardQuestions, typedAnswers, type CardQuestion } from "../approvals/questions.js";
 import { viewMessage } from "../approvals/click.js";
 import { errorName } from "../errors.js";
-import { answerLang } from "../language/detect.js";
+import { answerLang, pickLang, writtenLang } from "../language/detect.js";
 import { approvalText } from "../locales/approval.js";
 import { zoneOf } from "../proactive/quiet.js";
 import type { PendingQuestion } from "../ports/store/index.js";
 import { pyStrip } from "../text/py-text.js";
 import { ClawError } from "../claw/errors.js";
 import { isClawOrNetwork, statusOrKind } from "../turn/engine/claw-errors.js";
-import type { Chat } from "./chat.js";
+import { groupChosenLang, type Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
 
 /**
@@ -31,6 +31,11 @@ export const TYPED_ANSWER_MARGIN_SECONDS = 15;
 export interface TypedReply {
   readonly chat: Chat;
   readonly text: string;
+  /**
+   * What the message forwards, as text for the model ("" none), read once there is a question to answer: it goes to Claw with
+   * the answer, since no other message carries it (the card shows only the words).
+   */
+  readonly forward?: () => string;
   /** The Claw credential of the person, read when there is a question to answer. */
   readonly credential: () => Promise<string>;
 }
@@ -53,7 +58,13 @@ export async function answerWaitingQuestion(ctx: RouterContext, reply: TypedRepl
   if (!store.approvals.closeApproval(sessionId, toolUseId, "sending")) return false; // (the card was pressed meanwhile)
   const answers = typedAnswers(questions, reply.text);
   try {
-    await claw.sessions.answer(key, sessionId, toolUseId, Object.fromEntries(answers.answers), answers.skipped);
+    await claw.sessions.answer(
+      key,
+      sessionId,
+      toolUseId,
+      withForward(ctx, answers.answers, reply.forward?.() ?? ""),
+      answers.skipped,
+    );
   } catch (error) {
     if (!isClawOrNetwork(error)) throw error;
     const stale = error instanceof ClawError && [404, 409, 410].includes(error.status);
@@ -69,11 +80,37 @@ export async function answerWaitingQuestion(ctx: RouterContext, reply: TypedRepl
     questions: questions.length,
     card: pending.cardId ? "edited" : "not editable",
   });
-  // The card speaks the chat's language (the person's chosen or learnt language, else the client's locale, as `chat.lang()`),
-  // and without either the question's: never the reply's alone, since "1" or "a" typed in a Chinese chat is no English.
-  const lang = answerLang(store.prefs.getPrefs(chat.sender.id).lang, chat.locale, questions[0]?.question, reply.text);
-  await settleCard(ctx, chat, pending.cardId, [...answers.answers], lang);
+  await settleCard(ctx, chat, pending.cardId, [...answers.answers], answeredCardLang(ctx, reply, questions));
   return true;
+}
+
+/**
+ * The language of the answered card. It speaks the chat's language (the person's chosen or learnt language, else the
+ * client's locale, as `chat.lang()`), and without either the question's: never the reply's alone, since "1" or "a" typed in
+ * a Chinese chat is no English. In a group the person's own language and locale are not read (`groupLangOf`): the group's,
+ * else the reply's words, else the question's.
+ */
+function answeredCardLang(ctx: RouterContext, reply: TypedReply, questions: readonly CardQuestion[]) {
+  const { store } = ctx.deps;
+  const { chat } = reply;
+  return chat.scope
+    ? (groupChosenLang(store, chat.scope) ?? writtenLang(reply.text) ?? pickLang(questions[0]?.question, reply.text))
+    : answerLang(store.prefs.getPrefs(chat.sender.id).lang, chat.locale, questions[0]?.question, reply.text);
+}
+
+/**
+ * The answers as Claw takes them: what the message forwards goes before the first answer's words, as it goes before the words
+ * of a new message (once: the other questions are answered with the same words, and the forward is said already).
+ */
+function withForward(
+  ctx: RouterContext,
+  answers: ReadonlyMap<string, string>,
+  forward: string,
+): Record<string, string> {
+  const entries = [...answers];
+  const [first] = entries;
+  if (first !== undefined && forward) entries[0] = [first[0], ctx.deps.messageText.withQuote(first[1], forward)];
+  return Object.fromEntries(entries);
 }
 
 /** The person's question card waiting in the chat's session, in time, with the questions it asks; undefined when none. */

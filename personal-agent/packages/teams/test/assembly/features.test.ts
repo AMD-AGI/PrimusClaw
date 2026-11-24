@@ -629,18 +629,11 @@ describe("/whoami of a person whose chats run on an exchanged identity token (TE
     assert.deepEqual(tokenSafe.requests, []);
   });
 
-  it('in a group in Chinese it is not "SaFE 没告诉我是谁的账号"', async () => {
-    const { features, surface } = bound();
-    await features.router.handle(
-      inboundMessage({
-        id: "g-who-zh",
-        sender: ALICE,
-        conversation: GROUP_CHAT,
-        text: "/whoami",
-        mentioned: true,
-        locale: "zh-CN",
-      }),
-    );
+  it('in a group set to Chinese it is not "SaFE 没告诉我是谁的账号"', async () => {
+    const { features, surface, store } = bound();
+    store.groupLanguage.setGroupLanguage(GROUP_CHAT.id, "zh"); // (a Chinese client alone is no group's language)
+    const zh = { id: "g-who-zh", sender: ALICE, conversation: GROUP_CHAT, mentioned: true, locale: "zh-CN" };
+    await features.router.handle(inboundMessage({ ...zh, text: "/whoami" }));
     await features.router.settled();
     assert.deepEqual(texts(surface), ["Alice 已连接到 SaFE 用户 Liu, Alice。"]);
   });

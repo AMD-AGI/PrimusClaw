@@ -402,7 +402,8 @@ jobs:
   personal-agent:
     name: Personal agent (TypeScript)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The suite under c8 takes about 10 of these minutes; the static gates run in personal-agent-static beside it.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: personal-agent
@@ -437,6 +438,35 @@ jobs:
 
       - run: npm ci
 
+      # The whole suite, once, under V8 coverage; each package is held to its floor by c8 (core 90%, runtime 85%, teams
+      # 85%, teams-ingress 85%: lines, statements, functions and branches), the packages' reports side by side. The
+      # names of the tests that ran feed the ported-tests check.
+      - name: Tests and coverage floors
+        run: npm run coverage
+
+      # Every TS test a ported-tests ledger names ran and passed in the run above.
+      - name: Ported-tests ledgers
+        run: npm run ported-tests
+
+  # The personal agent's static gates, apart from its tests so the two run side by side.
+  personal-agent-static:
+    name: Personal agent (typecheck, lint, format, layers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: personal-agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: claw/.nvmrc
+          cache: npm
+          cache-dependency-path: personal-agent/package-lock.json
+
+      - run: npm ci
+
       # strict, noUncheckedIndexedAccess and exactOptionalPropertyTypes, over every package, test and fake.
       - name: Typecheck
         run: npm run typecheck
@@ -453,15 +483,6 @@ jobs:
       # packages used through their entry, no test code in src, protocol only through core/src/protocol.ts.
       - name: Layers (dependency-cruiser)
         run: npm run depcruise
-
-      # The whole suite, once, under c8; each package is held to its floor (core 90%, runtime 85%, teams 85%: lines,
-      # statements, functions and branches). The names of the tests that ran feed the ported-tests check.
-      - name: Tests and coverage floors
-        run: npm run coverage
-
-      # Every TS test a ported-tests ledger names ran and passed in the run above.
-      - name: Ported-tests ledgers
-        run: npm run ported-tests
 
   # The connector against the REAL Claude adapter, as the runner's own user and as root: Claude Code offers
   # bypassPermissions to root only with IS_SANDBOX set, and an agent with approval = "never" was refused with

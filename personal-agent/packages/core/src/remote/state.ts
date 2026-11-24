@@ -9,7 +9,7 @@
 import { ClawError, ClawUnreachable } from "../claw/errors.js";
 import type { Lang } from "../locales/lang.js";
 import type { RemotePermission, RemoteState } from "../ports/store/remote.js";
-import { isGroupKey, personOf } from "./chat-key.js";
+import { groupConversationOf, isGroupKey, personOf } from "./chat-key.js";
 import type { ChatRegistry } from "./chats.js";
 import type { RemoteContext } from "./context.js";
 import { isTerminalPermission } from "./terminal-asks.js";
@@ -34,9 +34,14 @@ export class ChatState {
     return this.ctx.remoteState.attachedRemote(chatKey);
   }
 
-  /** The language the chat is answered in ("en" when it cannot be read). */
+  /**
+   * The language the chat is answered in ("en" when it cannot be read): a 1:1 chat's is its person's; a group binding's is the
+   * group's, the one its members set (`/lang zh|en`, `groupLangOf`), else English, never the binder's own.
+   */
   lang(chatKey: string): Lang {
     try {
+      if (isGroupKey(chatKey))
+        return this.ctx.groupLanguage?.groupLanguage(groupConversationOf(chatKey)) === "zh" ? "zh" : "en";
       return this.ctx.langOf(personOf(chatKey)) === "zh" ? "zh" : "en";
     } catch {
       return "en";
