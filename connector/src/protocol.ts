@@ -21,13 +21,17 @@ export {
   REMOTE_EVENT_TERMINAL_TURN_END,
   REMOTE_OUTBOX_REPORT_MAX_SESSIONS,
   isRemoteCommandType,
+  normalizeGitBranch,
+  normalizeGitRemote,
   parseRemoteId,
   parsePromptFiles,
   REMOTE_COMMANDS,
+  REMOTE_WORKSPACE_LIMITS,
 } from "../../claw/packages/protocol/src/remote-agents.js";
 export type {
   RemoteAgentDescriptor,
   RemoteCommandType,
   RemoteEventIn,
+  RemoteWorkspace,
   RemotePromptFile,
 } from "../../claw/packages/protocol/src/remote-agents.js";

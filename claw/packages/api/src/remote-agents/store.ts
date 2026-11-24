@@ -15,7 +15,7 @@ import { redactPublicJson } from "../events/redaction.js";
 import {
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS,
   REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED, REMOTE_EVENT_USER_PROMPT,
-  type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteCommandType, type RemoteTerminalSessionOpen, type RemoteEventRejection, type RemoteHeartbeat, type RemoteHidden,
+  type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteCommandType, type RemoteTerminalSessionOpen, type RemoteEventRejection, type RemoteHeartbeat, type RemoteHidden, type RemoteWorkspace,
 } from "@claw/protocol";
 import { withHidden } from "./hidden.js";
 
@@ -396,8 +396,39 @@ export async function recordHeartbeat(connectorId: string, owner: string, hb: Re
         [connectorId, a.agent_id, owner, a.kind, a.name, storableJsonText(a.capabilities)],
       );
     }
+    // The folders' git facts (`workspaces`): only from a connector that reports them, each written only when it changed. A folder no
+    // longer reported is forgotten a day later (a heartbeat that has not read it yet reports less, and must not wipe it).
+    if (Array.isArray(hb.workspaces)) await recordWorkspaces(q, connectorId, hb.workspaces);
     return undelivered;
   });
+}
+
+async function recordWorkspaces(q: Querier, connectorId: string, list: RemoteWorkspace[]): Promise<void> {
+  if (list.length) {
+    await q(
+      `INSERT INTO claw_remote_workspaces (connector_id, cwd, git_remote, git_branch)
+       SELECT $1, w.cwd, w.git_remote, w.git_branch
+         FROM unnest($2::text[], $3::text[], $4::text[]) AS w(cwd, git_remote, git_branch)
+       ON CONFLICT (connector_id, cwd) DO UPDATE SET git_remote = EXCLUDED.git_remote, git_branch = EXCLUDED.git_branch, reported_at = NOW()
+        WHERE (claw_remote_workspaces.git_remote, claw_remote_workspaces.git_branch) IS DISTINCT FROM (EXCLUDED.git_remote, EXCLUDED.git_branch)
+           OR claw_remote_workspaces.reported_at < NOW() - INTERVAL '1 hour'`,
+      [connectorId, list.map((w) => w.cwd), list.map((w) => w.git_remote), list.map((w) => w.git_branch)],
+    );
+  }
+  await q(
+    `DELETE FROM claw_remote_workspaces WHERE connector_id = $1 AND NOT (cwd = ANY($2::text[])) AND reported_at < NOW() - INTERVAL '1 day'`,
+    [connectorId, list.map((w) => w.cwd)],
+  );
+}
+
+/** The folders' git facts the owner's connectors reported (`claw_remote_workspaces`), by connector and folder. */
+export async function workspacesOf(owner: string, q: Querier = direct): Promise<Map<string, { git_remote: string | null; git_branch: string | null }>> {
+  const rows = (await q(
+    `SELECT w.connector_id::text AS connector_id, w.cwd, w.git_remote, w.git_branch FROM claw_remote_workspaces w
+       JOIN claw_remote_connectors c ON c.connector_id = w.connector_id WHERE c.owner_user_id = $1`,
+    [owner],
+  )).rows;
+  return new Map(rows.map((r) => [`${r.connector_id}\u0000${r.cwd}`, { git_remote: r.git_remote ?? null, git_branch: r.git_branch ?? null }]));
 }
 
 /**

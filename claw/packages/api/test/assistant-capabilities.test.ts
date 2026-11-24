@@ -28,7 +28,7 @@ Object.assign(process.env, {
   CLAW_ASSISTANT_ENABLED: "true", CLAW_ASSISTANT_TOOLS: "on", CLAW_ASSISTANT_MEMORY_TOOLS: "on", CLAW_ASSISTANT_GITHUB_EVENTS: "true",
   CLAW_ASSISTANT_JOB_EVENTS: "true", CLAW_REMOTE_AGENTS_ENABLED: "true", CLAW_USER_SKILLS_ENABLED: "true", CLAW_ASSISTANT_MODEL_CHOICE: "on",
   CLAW_ASSISTANT_SELF_STATUS: "true", CLAW_GITHUB_REVIEW_ENABLED: "true", CLAW_MEMORY_ENABLED: "true", CLAW_TRIGGERS_ENABLED: "true",
-  CLAW_TRIGGER_TOOLS_ENABLED: "true", CLAW_ASSISTANT_MODELS: "model-a=default,model-b=fast",
+  CLAW_TRIGGER_TOOLS_ENABLED: "true", CLAW_ASSISTANT_MODELS: "model-a=default,model-b=fast", CLAW_DEVENV_SEATS: "on",
 });
 
 const caps = await import("../src/assistant/capabilities.js");

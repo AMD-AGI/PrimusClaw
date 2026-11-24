@@ -154,12 +154,14 @@ export type ToolEffect = "speaks" | "reads" | "at_once" | "card_first";
 export const TOOL_EFFECTS: Readonly<Record<string, ToolEffect>> = {
   say: "speaks", deliver_text: "speaks",
   work_recall: "reads", memory_recall: "reads", skill_read: "reads", skill_list: "reads", devenv_list: "reads", claw_self_status: "reads",
-  brief: "reads", trigger_list: "reads", job_watch_list: "reads", pr_state: "reads", [CAPABILITIES_TOOL]: "reads",
+  brief: "reads", trigger_list: "reads", job_watch_list: "reads", pr_state: "reads", [CAPABILITIES_TOOL]: "reads", seat_roster: "reads",
   work_create: "at_once", work_send: "at_once", work_stop: "at_once", model_default_set: "at_once", work_subscribe: "at_once",
   work_unsubscribe: "at_once", review_start: "at_once", review_restart: "at_once", review_mode_set: "at_once", channel_action: "at_once",
   confirmation_answer: "at_once", job_watch: "at_once", job_unwatch: "at_once", memory_save: "at_once", memory_update: "at_once",
   memory_forget: "at_once", memory_undo: "at_once", skill_save: "at_once", skill_update: "at_once", skill_disable: "at_once",
   skill_enable: "at_once", skill_delete: "at_once", skill_undo: "at_once", devenv_pair: "at_once",
+  // (a role or an alias is a card the user presses; `refresh` asks the seat again at once, so it is listed as acting)
+  seat_set: "at_once",
   github_comment: "card_first", trigger_create: "card_first", trigger_cancel: "card_first", devenv_send: "card_first",
   devenv_hide: "card_first", skill_draft: "card_first",
 };

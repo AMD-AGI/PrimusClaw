@@ -113,6 +113,23 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: seats (default off; `CLAW_DEVENV_SEATS=on`, or the users in `CLAW_DEVENV_SEATS_USERS`). Each folder an agent works in on a
+  user's machines is a seat (`claw_devenv_seats`), made and kept from the sessions and conversations Claw already has. What it is for
+  counts only once the user confirmed it on a card: their own words (`seat_set`, in a turn answering their own signed-in message), or
+  Claw's guess (one tool-less model call with a schema-bounded answer, from the folder, its git remote and branch, the conversations'
+  titles, the start of the user's last 20 prompts there and, once per seat, the session's answer to one fixed question asked only while
+  it is idle and quiet for ten minutes, as an answer-only turn, and only of a connector that holds such a turn to a read-only mode and
+  a session that asks; the question opens with a fixed line saying the user's assistant asks it, read-only, once, so a
+  chat attached to that session that shows it is understood).
+  The router never reads a guess: a waiting guess card is named to it by its machine and reference only. `seat_roster` lists only what Claw computed or the user confirmed (no tags: a branch's name is the machine's)
+  and does not mark the turn; `devenv_list` and `GET /v1/remote-agents/seats` show each seat's alias and confirmed role. Shown only: nothing
+  is sent to a seat because of its role. See `claw/docs/remote-agents.md`, "Seats".
+- Connector: the heartbeat reports each session folder's git remote and branch (`workspaces`, capability `git_info`), read from git's
+  files and normalized on the machine (`host/owner/repo`, no user or credential); a prompt with `answer_only: true` (capability
+  `answer_only`) runs in the agent's read-only mode (switched to for that turn and back) and refuses, on the machine, every
+  permission, plan and question its agent asks for in it; it is refused in a session that does not ask, for an agent with no
+  read-only mode, and while a turn runs or prompts wait there (`answer_only_busy`). The user's own prompt, or a `set_mode` sent
+  during that turn, stops it; the mode is set only after it ended, and the read-only mode is never saved as the session's own.
 - Claw: the assistant knows what it can and cannot do. Its router turn has a new read tool, `claw_capabilities`, that
   answers a list generated from what that turn really has: the tools registered on its assistant server, each by how
   it takes effect (`acts_at_once`, `asks_first`, `reads`), the deployment's switches (pull request and job watching,

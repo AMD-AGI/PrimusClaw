@@ -64,6 +64,66 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
       PRIMARY KEY (owner_user_id, connector_id, ref)
     )
   `);
+  // The git repository of each folder a connector's sessions work in, as its heartbeat last reported it (`workspaces`, normalized by
+  // `parseWorkspacesReport`: `host/owner/repo` and a branch, never a URL with its user or a credential). What a seat's tags are made of.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_remote_workspaces (
+      connector_id UUID NOT NULL REFERENCES claw_remote_connectors(connector_id) ON DELETE CASCADE,
+      cwd          TEXT NOT NULL,
+      git_remote   TEXT,
+      git_branch   TEXT,
+      reported_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (connector_id, cwd)
+    )
+  `);
+  // Seats (`assistant/seats.ts`): a folder an agent works in on one of the owner's machines, and what it is for. Its alias and role are
+  // only ever what the owner confirmed (a card they pressed); a guess waits in `suggestion` until they do. Kept apart from any one
+  // session: a session ends, compacts or is taken over, the seat stays (`current_session_id` is the one open through Claw now).
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claw_devenv_seats (
+      seat_id              TEXT PRIMARY KEY,
+      owner_user_id        TEXT NOT NULL,
+      connector_id         UUID NOT NULL REFERENCES claw_remote_connectors(connector_id) ON DELETE CASCADE,
+      agent_id             TEXT NOT NULL,
+      cwd                  TEXT NOT NULL,
+      -- A seat held to one conversation of that folder; NULL (every seat made so far): the folder itself.
+      conversation_ref     TEXT,
+      alias                TEXT CHECK (alias IS NULL OR char_length(alias) BETWEEN 1 AND 16),
+      role                 TEXT CHECK (role IS NULL OR char_length(role) BETWEEN 1 AND 120),
+      tags                 TEXT[] NOT NULL DEFAULT '{}',
+      -- NULL: nothing known yet; suggested: a guess waits for the owner (suggestion); confirmed: role is theirs; retired: not to be used.
+      role_state           TEXT CHECK (role_state IN ('suggested', 'confirmed', 'retired')),
+      current_session_id   UUID,
+      dispatch_mode        TEXT NOT NULL DEFAULT 'card' CHECK (dispatch_mode IN ('card', 'auto')),
+      suggestion           JSONB,
+      -- The one question put to the seat's session (asked, answered, timed_out, cancelled, refused), and how many it may be put.
+      probe_state          TEXT,
+      probe_session_id     UUID,
+      probe_cmd_seq        BIGINT,
+      probe_asked_at       TIMESTAMPTZ,
+      probes_allowed       INT NOT NULL DEFAULT 1,
+      probes_sent          INT NOT NULL DEFAULT 0,
+      -- The end of the session's answer to it (untrusted: only ever an input of the guess).
+      probe_answer         TEXT,
+      -- due (since infer_due_at): a guess is to be made; done; failed (tried again after a day).
+      infer_state          TEXT,
+      infer_due_at         TIMESTAMPTZ,
+      inferred_at          TIMESTAMPTZ,
+      -- The card that asks the owner about the guess: shown, answered.
+      card_state           TEXT,
+      card_confirmation_id TEXT,
+      refreshed_at         TIMESTAMPTZ,
+      last_seen_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      confirmed_at         TIMESTAMPTZ,
+      created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await client.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_devenv_seats_place
+      ON claw_devenv_seats(owner_user_id, connector_id, agent_id, cwd, COALESCE(conversation_ref, ''))`,
+  );
+  await client.query("CREATE INDEX IF NOT EXISTS idx_devenv_seats_owner ON claw_devenv_seats(owner_user_id, last_seen_at DESC)");
   // Every change of presence the sweep saw. No owner index: it is read per connector.
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_remote_connector_transitions (

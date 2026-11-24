@@ -345,6 +345,20 @@ All of these run on your machine and fail closed.
   your phone can show them), after credential-shaped strings (API keys, tokens, bearer headers, private keys, JWTs) are
   masked and long tool output is cut to 8 KB. Adapter stderr never leaves; it goes to `logs/` under the state directory.
   A prompt's text is not written to the local audit log, only its hash and length.
+- **Which repository a folder is.** The heartbeat reports, for each folder the sessions and conversations work in (at most 32),
+  the git remote `origin` names and the branch checked out (`workspaces`; the agents' capabilities say `git_info: true`). They
+  are read from the files git keeps, never by running git, and leave the machine only as `host/owner/repo` and a branch name: the
+  user and any password or token in the remote's URL are dropped first, and a remote that still looks like it carries one is
+  not reported at all.
+- **A turn that may only answer.** A prompt Claw sends with `answer_only` (it asks a session, once, what it is for) runs in a
+  mode of the agent's that changes nothing (Claude Code's `plan`, Cursor's `ask`): the session's own when it is one, else one
+  switched to for that turn only and back after it. In that turn every permission the agent asks for is refused here, on your
+  machine, even one an `auto_allow` rule would let through, and so is a plan it proposes or a question it asks; nobody is asked,
+  and the refusal is audited (`answer_only_denied`). It is refused, and never reaches the agent, in a session that does not ask
+  (`approval = "never"`, whose agent would run anything its own rules allow), for an agent with no such mode (Codex), in a
+  conversation open in a terminal, and while a turn of yours runs or waits in that session (`answer_only_busy`). You come first:
+  a prompt of yours stops that turn and runs next, and a mode you pick during it stops it and is set once it ended, never while it
+  runs. The read-only mode is never saved as the session's: if the agent dies in that turn, the session comes back in its own mode.
 
 ## Taking over an existing conversation
 

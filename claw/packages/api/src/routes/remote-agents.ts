@@ -48,6 +48,7 @@ import { startTerminalWaitSweep, TERMINAL_WAIT_NOTICE_MS } from "../remote-agent
 import { DELIVERY_SWEEP_MS, deliveryWritesIdle, noteEventsPost, recordOutboxReport, startDeliveryHealthSweep } from "../remote-agents/delivery-health.js";
 import { metrics } from "../infra/metrics.js";
 import { closeCardsOfConnector } from "../assistant/devenv-tools.js";
+import { startSeatSweep } from "../assistant/seats.js";
 import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
 const logger = pino({ name: "remote-agents" });
@@ -83,6 +84,8 @@ export interface RemoteAgentOptions {
   terminalWaitNoticeMs?: number;
   /** How often this replica sweeps delivery health (`remote-agents/delivery-health.ts`); zero or less runs no sweep. */
   deliverySweepMs?: number;
+  /** How often seats are swept (`assistant/seats.ts`); 0 never. */
+  seatSweepMs?: number;
   /** How long a connector's events must have failed before its owner is told their replies are delayed. */
   deliveryStallNoticeMs?: number;
   /** Pairing a machine with a one-time code (`remote-agents/pairing-routes.ts`). */
@@ -373,6 +376,18 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       app.addHook("onClose", async () => { stopped = true; clearTimeout(timer); });
     },
   });
+  // Seats (`assistant/seats.ts`): kept up to date with the users' sessions, each asked its one question when idle, and guessed. A pass
+  // looks at nobody unless seats are on for someone (CLAW_DEVENV_SEATS, CLAW_DEVENV_SEATS_USERS); a lock per user makes each pass one
+  // replica's.
+  const seatSweepMs = opts.seatSweepMs ?? 60_000;
+  loops.push({
+    name: "remote_agents.seat_sweep",
+    when: seatSweepMs > 0,
+    start: () => {
+      const stop = startSeatSweep({ sweepMs: seatSweepMs, onlineWindowMs });
+      app.addHook("onClose", async () => stop());
+    },
+  });
   // Claimed codes that never registered, and old codes (`remote-agents/pairing-routes.ts`).
   loops.push({ name: "remote_agents.pairing_prune", start: () => startPairingPrune(app) });
   await startBackgroundLoops(opts.background ?? true, loops, logger);
@@ -438,6 +453,18 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const includeHidden = (req.query as { hidden?: string } | undefined)?.hidden === REMOTE_HIDDEN_INCLUDE;
     const rows = await store.listConnectors(owner, onlineWindowMs, { includeHidden });
     return reply.send({ ok: true, data: rows.map((r) => ({ ...r, ...versionVerdict(r.version as string | null, policy) })) });
+  });
+
+  /**
+   * The caller's seats (`assistant/seats.ts`): each folder an agent works in on their machines, with the alias and the role they
+   * confirmed, for a card that lists them. 404 `not_enabled` where seats are not on for them.
+   */
+  app.get("/v1/remote-agents/seats", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    const seats = await import("../assistant/seats.js");
+    if (!seats.seatsOn(owner)) return fail(reply, 404, "not_enabled");
+    return reply.send({ ok: true, data: await seats.listSeatsForOwner(owner) });
   });
 
   /**
