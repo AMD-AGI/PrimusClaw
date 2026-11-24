@@ -33,7 +33,8 @@
  *   D23 a follow-up whose command went but whose noting failed is noted when the call fails, and the call made again sends nothing more;
  *       one the machine collected before it could be noted is noted all the same
  *   D24 two different instructions at once to a finished task: it is opened once, and both reach the machine
- *   D25 calls to one task waiting for each other hold no main-pool connection while they wait (the lock is on the lock pool)
+ *   D25 calls to one task waiting for each other hold no main-pool connection while they wait (the lock is on the lock pool); a task
+ *       opened again by another call after this one read it is not opened over it (refused, nothing sent, the words free again)
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -973,6 +974,30 @@ describe("seat dispatch", { skip }, () => {
     const done = await Promise.all(calls);
     assert.deepEqual(done.map((r) => r.dispatch).sort(), [...Array(n - 1).fill("already_sent"), "sent"].sort(), JSON.stringify(done));
     assert.equal((await prompted(cid)).length, 1, "one command reached the machine");
+  });
+
+  test("D25 a finished task opened again by another call after this one read it: refused, nothing sent, and the words go when said again", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/docs", { alias: "文档台", role: "负责文档", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid, s, "整理文档");
+    // Between this call's read and its reopening, the task moves to a new generation (as another call reopening it would).
+    await w.q("CREATE SEQUENCE IF NOT EXISTS d25_gen");
+    await w.q(`CREATE OR REPLACE FUNCTION d25_bump_once() RETURNS trigger AS $$
+      BEGIN IF NEW.params ? 'turn_sends' AND NOT (OLD.params ? 'turn_sends') AND nextval('d25_gen') = 1 THEN NEW.generation := OLD.generation + 1; END IF;
+      RETURN NEW; END $$ LANGUAGE plpgsql`);
+    await w.q("CREATE TRIGGER d25_gen BEFORE UPDATE ON claw_work_items FOR EACH ROW EXECUTE FUNCTION d25_bump_once()");
+    const turn = await userTurn(alice, "补一节安装");
+    try {
+      assert.equal((await refusal(tools.workSend(turn, { item_id: String(done.item_id), text: "补一节安装" }))).code, "item_changed");
+    } finally {
+      await w.q("DROP TRIGGER IF EXISTS d25_gen ON claw_work_items");
+      await w.q("DROP FUNCTION IF EXISTS d25_bump_once()");
+      await w.q("DROP SEQUENCE IF EXISTS d25_gen");
+    }
+    assert.equal((await prompted(cid)).length, 0, "nothing was sent");
+    assert.equal((await item(done.item_id)).board_state, "done", "and it was not opened again");
+    assert.equal(((await tools.workSend(turn, { item_id: String(done.item_id), text: "补一节安装" })) as Recorded).dispatch, "sent");
   });
 
   test("D12 the prompt asks for parking only from a connector that can park", async () => {

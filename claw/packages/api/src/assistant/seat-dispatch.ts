@@ -24,7 +24,7 @@ import pino from "pino";
 import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_EVENT_USER_PROMPT, type AssistantConfirmOption } from "@claw/protocol";
 import { readTrustedSessionCredentials, sealedCredentialFields } from "../auth/sealed-session-credentials.js";
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS, CLAW_ASSISTANT_WORKER_MODEL } from "../config.js";
-import { db, inTransaction, type Querier } from "../infra/db.js";
+import { connectionLost, db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { executeSend, inertMd, resumableOf, type SendPlan } from "./devenv-tools.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
@@ -769,6 +769,13 @@ async function withSeatSendLock<T>(itemId: string, fn: () => Promise<T>): Promis
     client.release(err as Error);
     throw err;
   }
+  // Taken on a connection that has since gone is not held (the server released it with the backend): nothing is done under it. A
+  // loss after this point is not seen by the call; the task's reopening checks its generation (`reopenErrand`) for that.
+  const lost = connectionLost(client);
+  if (lost) {
+    client.release(lost);
+    throw lost;
+  }
   try {
     return await fn();
   } finally {
@@ -870,8 +877,9 @@ async function errandWorkSendOnce(
   }
   let prior: ErrandBefore;
   try {
-    prior = await inTransaction((tx) => reopenErrand(tx, itemId, text, newSession, { by: "auto" }));
+    prior = await inTransaction((tx) => reopenErrand(tx, itemId, text, newSession, { by: "auto" }, Number(item.generation)));
   } catch (err) {
+    // (Opened again by another call since this one read it, `ReopenedMeanwhile`: refused, nothing sent, the words free to send again.)
     await giveBack();
     throw err;
   }
@@ -905,17 +913,27 @@ interface ErrandBefore {
   pending_question: string | null; summary: string; params: Record<string, unknown>;
 }
 
+/** The task was opened again (a new generation) since the caller read it: its reopening is not done twice. */
+class ReopenedMeanwhile extends ToolRefused {
+  constructor() {
+    super("item_changed", "that task was just given another instruction: nothing was sent; send this one again");
+  }
+}
+
 /**
  * A seat's task opened again for a new instruction: in progress, a new generation, the instruction its brief, let through as `approved`
- * says (without a card, or by a card pressed, with its agent as unattended as the card said). Returns how it stood before.
+ * says (without a card, or by a card pressed, with its agent as unattended as the card said). Returns how it stood before. With
+ * `generation`: only from that one (else `ReopenedMeanwhile`), so two callers that read it ended never both open it again.
  */
 async function reopenErrand(
   q: Querier, itemId: string, text: string, newSession: boolean, approved: { by: "auto" } | { by: "card"; unattended: boolean },
+  generation?: number,
 ): Promise<ErrandBefore> {
-  const before = (await q(
-    "SELECT board_state, outcome, closed_at, last_report_kind, pending_question, summary, params FROM claw_work_items WHERE item_id = $1 FOR UPDATE",
+  const { generation: was, ...before } = (await q(
+    "SELECT generation, board_state, outcome, closed_at, last_report_kind, pending_question, summary, params FROM claw_work_items WHERE item_id = $1 FOR UPDATE",
     [itemId],
-  )).rows[0] as Omit<ErrandBefore, "generation">;
+  )).rows[0] as Omit<ErrandBefore, "generation"> & { generation: number };
+  if (generation !== undefined && Number(was) !== generation) throw new ReopenedMeanwhile();
   const reopened = (await q(
     `UPDATE claw_work_items
         SET board_state = 'in_progress', outcome = NULL, closed_at = NULL, last_report_kind = 'progress', pending_question = NULL, summary = '',
