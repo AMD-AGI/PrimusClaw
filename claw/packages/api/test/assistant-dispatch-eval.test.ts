@@ -30,10 +30,9 @@ process.env.CLAW_DEVENV_SEAT_DISPATCH = "on";
 const assert = (await import("node:assert/strict")).default;
 const { test } = await import("node:test");
 const { existsSync, readFileSync } = await import("node:fs");
-const { routerTools } = await import("./e2e/assistant-router-eval-lib.js");
 const { CASES, ITEM, SEAT, SEATS } = await import("./e2e/assistant-dispatch-eval-cases.js");
 const {
-  DispatchStub, dispatchSystem, misDispatches, missingDispatch, runDispatchCase, runPassed, scoreDispatch, summarize,
+  DispatchStub, dispatchRouterTools, dispatchSystem, misDispatches, missingDispatch, runDispatchCase, runPassed, scoreDispatch, summarize,
 } = await import("./e2e/assistant-dispatch-eval-lib.js");
 type Llm = Parameters<typeof runDispatchCase>[1]["llm"];
 type Case = (typeof CASES)[number];
@@ -53,7 +52,7 @@ const byId = (id: string): Case => {
   assert.ok(c, id);
   return c as Case;
 };
-const tools = await routerTools();
+const tools = await dispatchRouterTools();
 const m1 = missingDispatch(tools) === null;
 // The scripted model never reads the system prompt: a build without seat dispatch is scored with a placeholder.
 const system = m1 ? dispatchSystem() : "(no seat dispatch in this build)";
@@ -145,6 +144,14 @@ test("V3 the stand-in keeps the tool layer's rules", () => {
   assert.equal(roster.find((s) => s.seat_id === SEAT.hlci)?.queue_len, 1);
   assert.equal(roster.find((s) => s.seat_id === SEAT.docs)?.role, null);
   for (const s of roster) for (const k of ["cwd", "machine", "title"]) assert.ok(!(k in s), k);
+  // Where the user said: by machine, agent and folder, compared and never listed.
+  const where = (args: Record<string, string>) => r(user().call("seat_roster", args)) as { seats: Array<Record<string, unknown>>; where?: string };
+  assert.deepEqual(where({ machine: "mi300" }).seats.map((s) => s.seat_id), [SEAT.hlci, SEAT.codex]);
+  assert.deepEqual(where({ machine: "mi300", agent: "codex" }).seats.map((s) => s.seat_id), [SEAT.codex]);
+  assert.deepEqual(where({ folder: "~/hl-ci2" }).seats.map((s) => s.seat_id), [SEAT.hlci2]);
+  const none = where({ machine: "nowhere" });
+  assert.deepEqual([none.seats.length, /no seat/.test(none.where ?? "")], [0, true]);
+  for (const s of where({ machine: "mi300" }).seats) for (const k of ["cwd", "machine", "title"]) assert.ok(!(k in s), k);
   // confirm_each takes effect without a card; an alias names the seat for seat_set.
   assert.equal(r(user().call("seat_set", { seat: "发布台", confirm_each: true })).confirm_each, true);
 });

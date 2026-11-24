@@ -28,11 +28,11 @@ process.env.CLAW_DEVENV_SEAT_DISPATCH ??= "on";
 
 const { readFileSync, mkdirSync, writeFileSync } = await import("node:fs");
 const { join } = await import("node:path");
-const { routerTools, pool } = await import("./assistant-router-eval-lib.js");
+const { pool } = await import("./assistant-router-eval-lib.js");
 const { CASES } = await import("./assistant-dispatch-eval-cases.js");
-const { callLine, dispatchSystem, messagesLlm, missingDispatch, runDispatchCase, runPassed, scoreDispatch, summarize } = await import("./assistant-dispatch-eval-lib.js");
+const { callLine, dispatchRouterTools, dispatchSystem, messagesLlm, missingDispatch, runDispatchCase, runPassed, scoreDispatch, summarize } = await import("./assistant-dispatch-eval-lib.js");
 
-const tools = await routerTools();
+const tools = await dispatchRouterTools();
 const missing = missingDispatch(tools);
 if (missing) {
   console.log(JSON.stringify({ skipped: true, reason: `this build has no seat dispatch: ${missing}` }));

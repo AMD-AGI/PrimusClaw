@@ -101,18 +101,18 @@ export const ERRAND_SEAT: Record<string, string> = { [ITEM.e31]: SEAT.rel, [ITEM
 export const MANIFEST: ManifestItem[] = [
   { itemId: ITEM.e31, seq: 31, title: "把 PrimusClaw 版本号改成 0.4.0 并写 CHANGELOG", boardState: "in_progress", summary: "", lastReportKind: null,
     resultVersion: 0, pendingQuestion: null, createdAt: "2026-11-24T08:40:00.000Z",
-    remote: { machine: "devbox", agent: "claude", session: "5b1f0c2e-7d4a-4c1b-9a51-0f3e2d1c0b31", online: true } },
+    remote: { machine: "devbox", agent: "claude", session: "5b1f0c2e-7d4a-4c1b-9a51-0f3e2d1c0b31", online: true, errand: { seat_id: SEAT.rel, alias: "发布台" } } },
   { itemId: ITEM.e32, seq: 32, title: "Run the Hyperloom GPU regression suite", boardState: "in_progress", summary: "", lastReportKind: null,
     resultVersion: 0, pendingQuestion: null, createdAt: "2026-11-24T07:10:00.000Z",
-    remote: { machine: "mi300", agent: "claude", session: "8e2a4b6c-1d3f-4a5b-8c7d-9e0f1a2b3c32", online: true } },
-  { itemId: ITEM.e33, seq: 33, title: "Rerun the flaky attention test", boardState: "in_progress", summary: "", lastReportKind: null,
+    remote: { machine: "mi300", agent: "claude", session: "8e2a4b6c-1d3f-4a5b-8c7d-9e0f1a2b3c32", online: true, errand: { seat_id: SEAT.hlci, alias: "hl-ci" } } },
+  { itemId: ITEM.e33, seq: 33, title: "Bisect the ROCm build break in the collectives library", boardState: "in_progress", summary: "", lastReportKind: null,
     resultVersion: 0, pendingQuestion: null, createdAt: "2026-11-24T08:05:00.000Z",
-    remote: { machine: "mi300", agent: "claude", session: "", online: true } },
+    remote: { machine: "mi300", agent: "claude", session: "", online: true, errand: { seat_id: SEAT.hlci, alias: "hl-ci", waiting: "seat_busy" } } },
   { itemId: ITEM.s34, seq: 34, title: "Q4 路线图草稿", boardState: "in_progress", summary: "outline written, 3 of 5 sections drafted",
     lastReportKind: "progress", resultVersion: 0, pendingQuestion: null, createdAt: "2026-11-24T06:00:00.000Z" },
   { itemId: ITEM.e35, seq: 35, title: "发布 connector 0.3.1", boardState: "done", summary: "published 0.3.1 to npm", lastReportKind: "answer",
     resultVersion: 0, pendingQuestion: null, outcome: "accepted", createdAt: "2026-11-23T10:00:00.000Z", closedAt: "2026-11-23T10:40:00.000Z",
-    remote: { machine: "devbox", agent: "claude", session: "c0ffee12-3456-4789-abcd-ef0123456735", online: true } },
+    remote: { machine: "devbox", agent: "claude", session: "c0ffee12-3456-4789-abcd-ef0123456735", online: true, errand: { seat_id: SEAT.rel, alias: "发布台" } } },
 ];
 
 /** The channel's actions with this message, as a chat client declares them in a 1:1 chat. */

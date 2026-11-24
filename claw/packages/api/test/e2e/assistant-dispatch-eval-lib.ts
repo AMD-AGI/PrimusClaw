@@ -15,6 +15,9 @@
  */
 import * as prompts from "../../src/assistant/prompts.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
+import { createAssistantMcpServer } from "../../src/assistant/mcp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import * as seats from "../../src/assistant/seats.js";
 import { messagesLlm, promptFor, userTurn, type Block, type Llm, type Message, type ModelResponse, type ToolSchema } from "./assistant-router-eval-lib.js";
 import {
@@ -49,6 +52,23 @@ export function missingDispatch(tools: readonly ToolSchema[]): string | null {
   const props = (create?.input_schema as { properties?: Record<string, unknown> } | undefined)?.properties ?? {};
   if (!("target" in props)) return "work_create takes no target";
   return null;
+}
+
+/** The router's tools as a user with seat dispatch is offered them (the route passes `seatDispatchOn(user)`). */
+export async function dispatchRouterTools(): Promise<ToolSchema[]> {
+  const server = createAssistantMcpServer({ sid: "eval", mid: "eval", task_id: "eval", exp: 4102444800, role: "router" },
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, null, true);
+  const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "assistant-dispatch-eval", version: "1.0.0" });
+  await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
+  try {
+    return (await client.listTools()).tools
+      .map((t) => ({ name: `${P}${t.name}`, description: t.description || t.name, input_schema: (t.inputSchema as Record<string, unknown>) || { type: "object", properties: {} } }))
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  } finally {
+    await client.close();
+    await server.close();
+  }
 }
 
 // --- What the model is given ---------------------------------------------------------------------------------------------------
@@ -115,8 +135,11 @@ export class DispatchStub {
     return s.state === "idle" && (this.queues.get(s.seat_id)?.length ?? 0) > 0 ? "queued" : s.state;
   }
 
-  roster(): Record<string, unknown>[] {
-    return SEATS.map((s) => ({
+  roster(where: { machine?: string; agent?: string; folder?: string } = {}): Record<string, unknown>[] {
+    // Where the user said (seats.ts: machine by name, folder by its path or last parts); the names are compared, never listed.
+    const there = SEATS.filter((s) => (!where.machine || seats.machineIs(where.machine, s.machine, s.seat_id))
+      && (!where.agent || seats.agentIs(where.agent, s.agent, s.kind)) && (!where.folder || seats.folderIs(where.folder, s.cwd)));
+    return there.map((s) => ({
       seat_id: s.seat_id, alias: s.alias, role: s.role_state === "confirmed" ? s.role : null, role_state: s.role_state,
       machine_online: MACHINES.find((m) => m.machine === s.machine)?.online === true, state: this.stateOf(s), dispatch_mode: s.dispatch_mode,
       last_item: s.last_item, queue_len: this.queues.get(s.seat_id)?.length ?? 0,
@@ -132,7 +155,13 @@ export class DispatchStub {
         return str("text") ? ok({ ok: true, say_id: `say_${++this.n}`, subscribers: 1 }) : refuse("empty_text", "say needs text");
       case "seat_roster":
         // Every field was computed by Claw or confirmed by the user: reading it never marks the turn.
-        return ok({ ok: true, seats: this.roster(), note: seats.ROSTER_NOTE });
+      {
+        const where = { ...(str("machine") ? { machine: str("machine") } : {}), ...(str("agent") ? { agent: str("agent") } : {}), ...(str("folder") ? { folder: str("folder") } : {}) };
+        const list = this.roster(where);
+        const asked = Object.keys(where).length > 0;
+        return ok({ ok: true, seats: list, note: seats.ROSTER_NOTE,
+          ...(asked ? { where: list.length ? "only the seats where the user said (machine, agent, folder)" : "no seat of the user's is where they said (machine, agent, folder)" } : {}) });
+      }
       case "seat_set": {
         if (this.c.wake) return refuse("not_from_user", "only the user's own message can change a seat: a report cannot");
         const asked = str("seat").toLowerCase();
