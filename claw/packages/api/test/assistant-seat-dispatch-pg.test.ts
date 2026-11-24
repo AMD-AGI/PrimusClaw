@@ -847,6 +847,18 @@ describe("seat dispatch", { skip }, () => {
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_items WHERE params->>'seat_id' = $1 AND params ? 'queued'", [s3.seatId]))[0].n, 1);
   });
 
+  test("D22 the same words twice at once to a finished task that cannot go: both calls are refused, neither says it was sent", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid, s, "发布 1.2.1");
+    assert.equal((await create(await userTurn(alice, "任务 1"), `seat:${s.seatId}`, "任务 1")).dispatch, "sent");
+    for (let i = 2; i <= 4; i += 1) assert.equal((await create(await userTurn(alice, `任务 ${i}`), `seat:${s.seatId}`, `任务 ${i}`)).dispatch, "queued");
+    const turn = await userTurn(alice, "再打个 tag");
+    const both = await Promise.allSettled([0, 1].map(() => tools.workSend(turn, { item_id: String(done.item_id), text: "再打个 tag" })));
+    assert.deepEqual(both.map((r) => r.status === "rejected" ? (r.reason as { code?: string }).code : (r.value as Recorded).dispatch), ["seat_queue_full", "seat_queue_full"]);
+  });
+
   test("D23 a follow-up whose command went but whose noting failed: noted then, and the same call again sends nothing more", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox");

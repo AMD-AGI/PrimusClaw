@@ -733,6 +733,17 @@ async function releaseTurnSend(q: Querier, itemId: string, task: string, key: st
 export async function errandWorkSend(
   claims: AssistantTokenClaims, userId: string, itemId: string, text: string, newSession: boolean,
 ): Promise<Record<string, unknown>> {
+  // Two calls with the same words in one turn, at once: the second waits for the first, then finds its claim (it went) or none (it
+  // went nowhere, and the second tries for itself), so neither is told "already sent" of words that were not.
+  return inTransaction(async (lk) => {
+    await lk("SELECT pg_advisory_xact_lock(hashtext($1))", [`claw-seat-turn-send:${itemId}:${claims.task_id}:${sendKey(text)}`]);
+    return errandWorkSendOnce(claims, userId, itemId, text, newSession);
+  });
+}
+
+async function errandWorkSendOnce(
+  claims: AssistantTokenClaims, userId: string, itemId: string, text: string, newSession: boolean,
+): Promise<Record<string, unknown>> {
   const q: Querier = (t, p) => db.query(t, p);
   if (!seatDispatchOn(userId)) throw new ToolRefused("not_enabled", "tasks cannot be handed to seats for this user now");
   const item = (await q("SELECT item_id, seq, board_state, outcome, closed_at, last_report_kind, generation, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2",
