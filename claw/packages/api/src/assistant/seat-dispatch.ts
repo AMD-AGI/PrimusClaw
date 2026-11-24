@@ -390,7 +390,8 @@ export async function seatWorkCreate(claims: AssistantTokenClaims, args: SeatCre
     ? [
       ...target.seats.map((id) => {
         const l = all.get(id)!;
-        return { id, label: seatLabel(l), detail: flat(l.seat.cwd, 200) };
+        const label = l.unattended ? `${seatLabel(l).slice(0, LABEL_MAX - 8)}${zh ? "（无人值守）" : " (unattended)"}` : seatLabel(l);
+        return { id, label: flat(label, LABEL_MAX), detail: flat(l.seat.cwd, 200) };
       }),
       ...(target.sandbox ? [{ id: SANDBOX_TARGET, label: zh ? "沙箱" : "Sandbox" }] : []),
     ]
@@ -415,8 +416,10 @@ export async function seatWorkCreate(claims: AssistantTokenClaims, args: SeatCre
     if (!why) return { itemId, seq: inserted.seq, card: null, duplicate: false };
     const makesAuto = !!live && live.seat.role_state === "confirmed" && live.seat.confirm_each !== true && !live.unattended;
     const cardParams = {
-      item_id: itemId, seat_id: seatId, title, brief, lang, why_card: why,
-      ...(choice ? { choices: params.choices, options } : { label: seatLabel(live!), cwd: flat(live!.seat.cwd, 300) }),
+      item_id: itemId, seat_id: seatId, title, brief, lang, why_card: why, unattended: live?.unattended === true,
+      ...(choice
+        ? { choices: params.choices, options, unattended_seats: target.seats.filter((id) => all.get(id)!.unattended) }
+        : { label: seatLabel(live!), cwd: flat(live!.seat.cwd, 300) }),
     };
     const card = await proposeConfirmation(tx, claims, userId, "seat_dispatch", cardParams, {
       text: (ref) => seatCardText({
@@ -480,7 +483,13 @@ export async function seatDispatchDecided(
     };
   }
   const live = (await seatsLive(userId, undefined, [seatId])).get(seatId);
-  const refused = seatRefusal(live, seatId);
+  const refused = seatRefusal(live, seatId)
+    // A seat whose agent runs unattended now, when the card did not say so (or, on a choice card, never could): what the person
+    // pressed is not what would happen, so nothing is sent and they are asked again.
+    ?? (live!.unattended && params.unattended !== true
+      && !(Array.isArray(params.unattended_seats) && (params.unattended_seats as unknown[]).includes(seatId))
+      ? new ToolRefused("seat_unattended", "that seat's agent now runs unattended, which the card did not say: nothing was sent; ask the user again")
+      : null);
   if (refused) {
     if (!followup) await dropErrand(q, itemId, refused.message);
     return { result: { ok: false, error: refused.code, message: refused.message } };
@@ -599,6 +608,7 @@ export async function errandWorkSend(
       if (!running) await reopenErrand(tx, itemId, text, newSession, true);
       const made = await proposeConfirmation(tx, claims, userId, "seat_dispatch", {
         item_id: itemId, seat_id: p.seat_id, title: String(item.title ?? ""), brief: text, lang, why_card: why, label: seatLabel(live!),
+        unattended: live!.unattended,
         cwd: flat(live!.seat.cwd, 300), ...(running ? { followup: text } : {}),
       }, {
         text: (ref) => seatCardText({ label: seatLabel(live!), cwd: flat(live!.seat.cwd, 300), brief: text, why, makesAuto: false, unattended: live!.unattended }, ref, zh),

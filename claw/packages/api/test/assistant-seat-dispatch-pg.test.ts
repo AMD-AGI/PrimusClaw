@@ -239,6 +239,15 @@ describe("seat dispatch", { skip }, () => {
     assert.equal((await w.q("SELECT dispatch_mode FROM claw_devenv_seats WHERE seat_id = $1", [bot.seatId]))[0].dispatch_mode, "card");
     const card = (await w.q("SELECT params FROM claw_assistant_confirmations WHERE confirmation_id = $1", [unat.confirmation_id]))[0];
     assert.equal(card.params.why_card, "first_dispatch");
+    // A card made while the agent asked, pressed after it turned unattended: nothing is sent, and the task is dropped.
+    const cid3 = await machine("alice", "gpu-box");
+    const gpu = await seat(cid3, "/home/u/gpu", { alias: "gpu", role: "跑训练", role_state: "confirmed" });
+    const before = await create(await userTurn(alice, "让 gpu 跑"), `seat:${gpu.seatId}`, "跑训练");
+    await beat("alice", cid3, [claude({ unattended: true })]);
+    const late = await press(before.confirmation_id);
+    assert.deepEqual([late.status, late.result?.error], ["failed", "seat_unattended"], JSON.stringify(late));
+    assert.deepEqual(await prompted(cid3), []);
+    assert.equal((await item(before.item_id)).outcome, "dropped");
   });
 
   test("D3 several seats are a choice card: a press must name one of its options, and that seat is the one sent to", async () => {
