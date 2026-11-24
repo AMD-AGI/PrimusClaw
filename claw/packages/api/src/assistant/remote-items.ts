@@ -45,7 +45,7 @@ import { approvalsEnabled, DELIVERY_UNCONFIRMED, findSession, issueCommand, onli
 import { newWorkItemId } from "../tasks/ids.js";
 import type { AssistantRemoteAsk, AssistantRemoteNotice } from "../notifications/assistant-events.js";
 import { personWritesChinese, recordSystemNotice } from "./outbound.js";
-import { clipOneLine, clipWords, graphemes, TITLE_MAX } from "./work-items.js";
+import { applyWorkerReport, clipOneLine, clipWords, graphemes, TITLE_MAX } from "./work-items.js";
 
 const logger = pino({ name: "assistant-remote-items" });
 
@@ -1456,36 +1456,36 @@ export interface NoteErrandPrompt {
 
 /**
  * A seat task's prompt was queued: the item is running in that session, the prompt one of its own. One more instruction that reached it
- * just after its turn ended is a new turn of it: the end still to be reported is reported first, and an item that end closed is opened
- * again (a new generation), so neither answer is lost. Then its events are caught up.
+ * just after its turn ended is a new turn of it: the end still to be reported is reported in the same transaction, and an item that end
+ * closed is opened again (a new generation), so neither answer is lost.
  */
 export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
-  // The end still to be reported is reported before the prompt is noted, and the note is made only once the item, locked, has none
-  // left (one recorded meanwhile is reported, and the note tried again). Past the tries the note is made all the same, in a new
-  // generation, so the new prompt's end is never lost to an old report closing the item.
-  for (let attempt = 0; ; attempt += 1) {
-    const pending = (await db.query("SELECT params->'report_due' AS due FROM claw_work_items WHERE item_id = $1 AND user_id = $2", [p.itemId, p.owner]))
-      .rows[0]?.due as ErrandParams["report_due"] | null | undefined;
-    if (pending) {
-      await reportErrand({ itemId: p.itemId, generation: Number(pending.generation), kind: pending.kind, summary: String(pending.summary) })
-        .catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_report_failed"));
-    }
-    if (await notePromptLocked(p, attempt >= ERRAND_NOTE_TRIES - 1)) return;
-  }
-}
-
-/** How often a prompt's note waits for an end being reported. */
-const ERRAND_NOTE_TRIES = 5;
-
-/** The note itself, the item locked; false (nothing written) while an end is still to be reported, unless `anyway`. */
-async function notePromptLocked(p: NoteErrandPrompt, anyway: boolean): Promise<boolean> {
-  return inTransaction(async (q) => {
+  const woke = await inTransaction(async (q) => {
     const row = (await q(
       "SELECT board_state, outcome, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' FOR UPDATE", [p.itemId, p.owner],
     )).rows[0] as { board_state: string; outcome: string | null; params: ErrandParams } | undefined;
-    if (!row) return true;
-    if (row.params.report_due && !anyway) return false;
-    if ((row.board_state === "done" && row.outcome === "answered") || row.params.report_due) {
+    if (!row) return null;
+    // An end recorded and not yet reported is reported here, in this transaction, before the item is opened again for this prompt: its
+    // answer reaches the router, and the report made of it elsewhere afterwards finds the item moved on (a new generation) and does nothing.
+    let wake: { sessionId: string; userId: string } | null = null;
+    const due = row.params.report_due;
+    if (due) {
+      const applied = await applyWorkerReport({ query: q }, {
+        itemId: p.itemId, generation: Number(due.generation), workerSessionId: errandWorkerSessionId(p.itemId), source: "remote", runId: null,
+        report: { kind: due.kind, summary: String(due.summary) },
+      });
+      if (applied.applied && applied.wake) {
+        const { queueRouterWake } = await import("./reports.js");
+        const queued = await queueRouterWake({ query: q }, {
+          itemId: p.itemId, userId: applied.userId, eventId: applied.eventId, kind: due.kind, version: applied.resultVersion,
+          summary: String(due.summary), question: null,
+        });
+        if (queued.status === "queued") wake = { sessionId: queued.sessionId, userId: queued.userId };
+      }
+      row.board_state = applied.applied ? applied.boardState : row.board_state;
+      if (applied.applied && due.kind === "answer") row.outcome = "answered";
+    }
+    if ((row.board_state === "done" && row.outcome === "answered") || due) {
       await q(
         `UPDATE claw_work_items SET board_state = 'in_progress', outcome = NULL, closed_at = NULL, last_report_kind = 'progress', summary = '',
                 generation = generation + 1, params = params - 'report_due', updated_at = NOW()
@@ -1515,8 +1515,12 @@ async function notePromptLocked(p: NoteErrandPrompt, anyway: boolean): Promise<b
        SELECT item_id, 'progress', 'remote', generation, $2 FROM claw_work_items WHERE item_id = $1`,
       [p.itemId, p.machine],
     );
-    return true;
+    return wake;
   });
+  if (woke) {
+    const { drainSessionIfIdle } = await import("./messages.js");
+    await drainSessionIfIdle(woke.sessionId, woke.userId).catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_wake_failed"));
+  }
 }
 
 interface ErrandPass { notices: Notice[]; reports: Array<{ itemId: string; generation: number; kind: "answer" | "failed"; summary: string }> }
