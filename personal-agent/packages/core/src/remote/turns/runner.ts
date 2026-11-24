@@ -230,7 +230,7 @@ export class TurnRunner {
     signal: AbortSignal,
   ): Promise<void> {
     const sid = request.state.sessionId ?? "";
-    const reading = { cursor: from, handled: 0, came: false };
+    const reading = { cursor: from, from, handled: 0, came: false };
     let failures = 0;
     while (!isOver(fold)) {
       reading.came = false;
@@ -241,7 +241,8 @@ export class TurnRunner {
         this.ctx.logger.warn("remote stream dropped", { error: errorKind(error) });
       } finally {
         if (cameIn(reading)) failures = 0; // (an event came: the failures in a row start again)
-        if (reading.cursor) this.ctx.remoteState.setRemoteCursor(request.chatKey, sid, reading.cursor);
+        const held = fold.holdCursor(reading.cursor, from); // (never past the start of a turn Claw put for itself)
+        if (held) this.ctx.remoteState.setRemoteCursor(request.chatKey, sid, held);
       }
       if (isOver(fold)) return;
       failures += 1;
@@ -255,7 +256,7 @@ export class TurnRunner {
     request: TurnRequest,
     display: TurnDisplay,
     fold: RemoteTurnState,
-    reading: { cursor: string; handled: number; came: boolean },
+    reading: { cursor: string; from: string; handled: number; came: boolean },
     signal: AbortSignal,
   ): Promise<void> {
     const sid = request.state.sessionId ?? "";
@@ -265,8 +266,9 @@ export class TurnRunner {
       if (event.id) reading.cursor = event.id;
       await this.apply(request, fold.feed(event), display);
       reading.handled += 1;
-      if (event.id && reading.handled % CURSOR_EVERY === 0)
-        this.ctx.remoteState.setRemoteCursor(request.chatKey, sid, event.id);
+      const held = fold.holdCursor(event.id, reading.from);
+      if (event.id && held && reading.handled % CURSOR_EVERY === 0)
+        this.ctx.remoteState.setRemoteCursor(request.chatKey, sid, held);
       if (isOver(fold)) break;
     }
   }

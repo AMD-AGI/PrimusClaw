@@ -148,3 +148,35 @@ test("a turn Claw put for itself ends at its refusal, at the session's end, and 
   mine.feed(acp("agent_message_chunk", "2", { content: { text: "Shown." } }));
   assert.equal(mine.answer, "Shown.");
 });
+
+test("a connector that restarts in the middle of a turn Claw put for itself hides what follows while that turn goes on", () => {
+  const going = turn();
+  going.feed(frame("user_prompt", { cmd_seq: 3, client: "seat_probe" }, "1"));
+  going.feed(frame("session_recovered", { interrupted: true, continuing: true }, "2"));
+  going.feed(acp("agent_message_chunk", "3", { content: { text: "billing" } }));
+  assert.equal(going.hiding, true);
+  assert.equal(going.answer, "");
+  going.feed(frame("turn_end", { stopReason: "end_turn", cmd_seq: 3 }, "4"));
+  assert.equal(going.hiding, false);
+
+  const gone = turn();
+  gone.feed(frame("user_prompt", { cmd_seq: 3, client: "seat_probe" }, "1"));
+  const step = gone.feed(frame("session_recovered", { interrupted: true, continuing: false }, "2"));
+  assert.notEqual(step.recovered, null);
+  assert.equal(gone.hiding, false);
+});
+
+test("the read position a reader writes stays before a turn Claw put for itself until that turn ends", () => {
+  const state = turn();
+  state.feed(acp("agent_message_chunk", "5", { content: { text: "mine" } }));
+  assert.equal(state.holdCursor("5", "4"), "5");
+  state.feed(frame("user_prompt", { cmd_seq: 3, client: "seat_probe" }, "6"));
+  state.feed(acp("agent_message_chunk", "7", { content: { text: "billing" } }));
+  assert.equal(state.holdCursor("7", "4"), "5");
+  state.feed(frame("turn_end", { stopReason: "end_turn", cmd_seq: 3 }, "8"));
+  assert.equal(state.holdCursor("8", "4"), "8");
+  // a hidden turn that began with the first event read holds the position the reader started from
+  const first = turn();
+  first.feed(frame("user_prompt", { cmd_seq: 3, client: "seat_probe" }, "6"));
+  assert.equal(first.holdCursor("6", "4"), "4");
+});
