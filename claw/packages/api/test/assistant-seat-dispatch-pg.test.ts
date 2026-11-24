@@ -30,7 +30,10 @@
  *   D22 the same words sent to a task twice in one router turn (at once, or one after the other) go once: one command to a running
  *       task, one reopening of a finished one, one card, one place in the queue; the second call answers that they were already sent;
  *       the next turn sends them again
- *   D23 a follow-up whose command went but whose noting failed is noted when the call fails, and the call made again sends nothing more
+ *   D23 a follow-up whose command went but whose noting failed is noted when the call fails, and the call made again sends nothing more;
+ *       one the machine collected before it could be noted is noted all the same
+ *   D24 two different instructions at once to a finished task: it is opened once, and both reach the machine
+ *   D25 calls to one task waiting for each other hold no main-pool connection while they wait (the lock is on the lock pool)
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -901,6 +904,75 @@ describe("seat dispatch", { skip }, () => {
       await w.q("DROP FUNCTION IF EXISTS d23_fail_once()");
       await w.q("DROP SEQUENCE IF EXISTS d23_fail");
     }
+  });
+
+  test("D23 a follow-up the machine collected before its noting could be repaired is still noted, by its prompt event", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    // The noting fails twice: once as it is sent, once more as the failed call repairs it.
+    await w.q("CREATE SEQUENCE IF NOT EXISTS d23b_fail");
+    await w.q(`CREATE OR REPLACE FUNCTION d23b_fail_twice() RETURNS trigger AS $$
+      BEGIN IF NEW.source = 'remote' AND NEW.kind = 'progress' AND nextval('d23b_fail') <= 2 THEN RAISE EXCEPTION 'd23b injected'; END IF; RETURN NEW; END
+      $$ LANGUAGE plpgsql`);
+    await w.q("CREATE TRIGGER d23b_fail BEFORE INSERT ON claw_work_item_events FOR EACH ROW EXECUTE FUNCTION d23b_fail_twice()");
+    let seq = 0;
+    try {
+      const turn = await userTurn(alice, "顺便更新 changelog");
+      await assert.rejects(tools.workSend(turn, { item_id: String(out.item_id), text: "顺便更新 changelog" }), /d23b injected/);
+      const sent = await prompted(cid);
+      assert.equal(sent.length, 1, "its command went");
+      seq = Number(sent[0].cmd_seq);
+      assert.ok(!(await item(out.item_id)).params.open_cmd_seqs.map(Number).includes(seq), "and is not noted yet");
+    } finally {
+      await w.q("DROP TRIGGER IF EXISTS d23b_fail ON claw_work_item_events");
+      await w.q("DROP FUNCTION IF EXISTS d23b_fail_twice()");
+      await w.q("DROP SEQUENCE IF EXISTS d23b_fail");
+    }
+    // The machine collects it (the queue forgets it); the repair still finds its number.
+    await collect(cid);
+    assert.equal((await prompted(cid)).length, 0);
+    const cmdId = String((await w.q(
+      "SELECT detail->>'cmd_id' AS id FROM claw_remote_audit WHERE action = 'command.issued' AND detail->>'type' = 'prompt' ORDER BY id DESC LIMIT 1",
+    ))[0].id).replace(/^k:/, "");
+    await dispatch.noteIssuedPrompt("alice", String(out.item_id), cmdId);
+    assert.ok((await item(out.item_id)).params.open_cmd_seqs.map(Number).includes(seq), "noted after the machine collected it");
+  });
+
+  test("D25 calls to one task waiting for each other hold no main-pool connection while they wait", async () => {
+    const { db } = await import("../src/infra/db.js");
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    const turn = await userTurn(alice, "顺便更新 changelog");
+    // Someone holds the task's lock: every call waits for it.
+    const holder = await db.lockPool.connect();
+    const key = `claw-seat-work-send:${String(out.item_id)}`;
+    await holder.query("SELECT pg_advisory_lock(hashtext($1))", [key]);
+    const n = 6;
+    let calls: Array<Promise<Recorded>> = [];
+    try {
+      calls = Array.from({ length: n }, () => tools.workSend(turn, { item_id: String(out.item_id), text: "顺便更新 changelog" }) as Promise<Recorded>);
+      for (const c of calls) c.catch(() => undefined);
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const waiting = (await w.q("SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"))[0].n;
+        if (waiting >= n) break;
+        assert.ok(Date.now() < deadline, `only ${waiting} of ${n} calls reached the lock`);
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(db.pool.totalCount - db.pool.idleCount, 0, "no main-pool connection is held by a call waiting for the lock");
+    } finally {
+      await holder.query("SELECT pg_advisory_unlock(hashtext($1))", [key]);
+      holder.release();
+    }
+    const done = await Promise.all(calls);
+    assert.deepEqual(done.map((r) => r.dispatch).sort(), [...Array(n - 1).fill("already_sent"), "sent"].sort(), JSON.stringify(done));
+    assert.equal((await prompted(cid)).length, 1, "one command reached the machine");
   });
 
   test("D12 the prompt asks for parking only from a connector that can park", async () => {
