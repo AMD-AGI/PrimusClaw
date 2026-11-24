@@ -48,6 +48,7 @@ export function failureText(status: number, code: string): string {
 /** Where an item stands, for a press that arrived too late (or too early) to do what its card offered. */
 export function statusText(item: WorkItem): string {
   const label = itemLabel(item);
+  if (item.delivered) return t.alreadyDelivered({ label, version: item.delivered.version });
   if (item.boardState === "done") return t.alreadyClosed({ label, outcome: item.outcome ?? "closed" });
   if (item.canAccept) return t.waitingVersion({ label, version: item.resultVersion });
   if (item.boardState === "needs_you") return t.waitingForYou({ label, question: item.pendingQuestion ?? "" });

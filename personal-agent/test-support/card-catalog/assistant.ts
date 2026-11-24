@@ -3,7 +3,8 @@
 
 /**
  * The assistant's cards (W5): the Python catalog's board, board_asked, work_result, work_question, work_done, work_stopped,
- * assistant_action, and assistant_confirm entries, with the same inputs.
+ * assistant_action, and assistant_confirm entries, with the same inputs; and a result Claw delivered without an Accept
+ * (work_delivered, work_delivered_watching).
  */
 import type { AskerView, ReviewAskedOfOther, WorkItem } from "@primusclaw/personal-agent";
 
@@ -163,6 +164,34 @@ export const ASSISTANT_CARDS = entries(
       ),
   ],
   ["work_question", () => work(question, "告警发到哪个 Teams 频道？", "card-3")],
+  [
+    "work_delivered",
+    () =>
+      assistantRenderers.workDelivered({
+        item: wi({
+          ...done,
+          title: "修复 SaFE 节点驱动升级脚本",
+          outcome: "accepted",
+          delivered: { version: 2, watching: [] },
+        }),
+        text: "改好了：升级脚本在重启前先排空节点，已推到 fix-drain 分支，单测全绿。",
+        lang: null,
+      }),
+  ],
+  [
+    "work_delivered_watching",
+    () =>
+      assistantRenderers.workDelivered({
+        item: wi({
+          ...running,
+          title: "Fix the flaky parser test",
+          lastReportKind: "ready",
+          delivered: { version: 1, watching: ["AMD-AGI/Primus-SaFE#481"] },
+        }),
+        text: "Opened AMD-AGI/Primus-SaFE#481 with the fix; CI is green.",
+        lang: null,
+      }),
+  ],
   ["work_done", () => assistantRenderers.workDone({ verb: "Accepted", item: result })],
   ["work_stopped", () => assistantRenderers.workDone({ verb: "已停止 / Stopped", item: result })],
   [

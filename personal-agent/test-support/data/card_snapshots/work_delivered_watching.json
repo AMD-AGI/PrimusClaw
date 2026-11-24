@@ -1,0 +1,69 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Good",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "✅ #12 Fix the flaky parser test",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         },
+         {
+          "isSubtle": true,
+          "size": "Small",
+          "spacing": "None",
+          "text": "v1 delivered; still watching PR AMD-AGI/Primus-SaFE#481",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "text": "Opened AMD-AGI/Primus-SaFE#481 with the fix; CI is green.",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "isSubtle": true,
+      "size": "Small",
+      "text": "Reply to me to have it changed.",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

@@ -258,6 +258,28 @@ it("a person with no linked key presses with their exchanged token", async () =>
   assert.equal(await unbound.handler.beforeCredential(unbound.click({ primusclaw: "work", op: "stop" }).route), false);
 });
 
+it("an accept on a card drawn before claw delivered the result says it was delivered", async () => {
+  const w = clicksWorld();
+  w.claw.add(
+    workItem({
+      itemId: "it-1",
+      seq: 2,
+      boardState: "done",
+      outcome: "accepted",
+      canAccept: false,
+      delivered: { version: 1, watching: [] },
+    }),
+  );
+  const { route, settled } = w.click({ primusclaw: "work", op: "accept", card: cardFor(w, "it-1") });
+  await w.handler.withCredential(route, KEY);
+  assert.deepEqual(w.claw.calls, ["accept ak-alice it-1 v1"]);
+  assert.equal(
+    settled[0]?.card,
+    "#2 Fix the flaky test v1 已交付，不用再接受；要改直接回复我。 / #2 Fix the flaky test v1 was delivered; there is nothing to accept. " +
+      "Reply to me to have it changed.",
+  );
+});
+
 it("failure and status texts say where the item stands", () => {
   assert.equal(
     failureText(403, ""),

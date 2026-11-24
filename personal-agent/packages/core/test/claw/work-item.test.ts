@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   decidedItem,
+  deliveredOf,
   isFinished,
   parseRequesterView,
   parseWorkItem,
@@ -178,5 +179,40 @@ describe("the asker's view of a review", () => {
     );
     assert.equal(decidedItem("i9", { item_id: "i9", board_state: "done" })?.boardState, "done");
     assert.equal(decidedItem("i9", { title: "no view, no id" }), null);
+  });
+});
+
+describe("deliveredOf: a result Claw delivered without an Accept", () => {
+  it("is read from an event's item, and from a board row's state and params", () => {
+    assert.deepEqual(deliveredOf({ delivered_version: 2, watching_pr: ["acme/app#7", 3, ""] }), {
+      version: 2,
+      watching: ["acme/app#7"],
+    });
+    assert.equal(deliveredOf({ delivered_version: "2" }), null);
+    assert.equal(deliveredOf({ delivered_version: 0 }), null);
+    assert.deepEqual(deliveredOf({ board_state: "done", outcome: "accepted", params: { delivered: 3 } }), {
+      version: 3,
+      watching: [],
+    });
+    assert.deepEqual(
+      deliveredOf({ board_state: "in_progress", params: { delivered: 1, watching_pr: ["acme/app#7"] } }),
+      { version: 1, watching: ["acme/app#7"] },
+    );
+    // Stopped after it, worked on again, accepted by the person, or nothing of the kind: not delivered.
+    assert.equal(deliveredOf({ board_state: "done", outcome: "stopped", params: { delivered: 1 } }), null);
+    assert.equal(deliveredOf({ board_state: "in_progress", params: { delivered: 1 } }), null);
+    assert.equal(deliveredOf({ board_state: "done", outcome: "accepted", params: {} }), null);
+    assert.equal(deliveredOf({ board_state: "done", outcome: "accepted" }), null);
+  });
+
+  it("is on the parsed item only when there is one, so an item not delivered reads as before", () => {
+    const row = { item_id: "x", board_state: "done", outcome: "accepted", result_version: 2 };
+    assert.equal("delivered" in (parseWorkItem(row) ?? {}), false);
+    assert.deepEqual(parseWorkItem({ ...row, params: { delivered: 2 } })?.delivered, { version: 2, watching: [] });
+    assert.deepEqual(
+      parseWorkItem({ item_id: "y", board_state: "in_progress", delivered_version: 1, watching_pr: ["a/b#1"] })
+        ?.delivered,
+      { version: 1, watching: ["a/b#1"] },
+    );
   });
 });
