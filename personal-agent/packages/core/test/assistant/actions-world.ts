@@ -96,6 +96,8 @@ class SteeredExchange implements TokenExchange {
 export class ActionsWorld {
   readonly store = openTestStore().store;
   readonly decided: [string, string, string][] = [];
+  /** The choice each press sent with its answer (undefined: none), in the order of `decided`. */
+  readonly choices: (string | undefined)[] = [];
   readonly ran: string[] = [];
   readonly warned: string[] = [];
   readonly settled: Settled[] = [];
@@ -126,7 +128,7 @@ export class ActionsWorld {
   ) {
     this.actions = new AssistantActions({
       store: this.store,
-      claw: { decideConfirmation: (token, id, decision) => this.decide(token, id, decision) },
+      claw: { decideConfirmation: (token, id, decision, choice) => this.decide(token, id, decision, choice) },
       exchange: this.exchange,
       runCommand: (text) => this.command(text),
       exactCommand,
@@ -149,8 +151,9 @@ export class ActionsWorld {
     return logger;
   }
 
-  private decide(token: string, confirmationId: string, decision: string): Promise<JsonObject> {
+  private decide(token: string, confirmationId: string, decision: string, choice?: string): Promise<JsonObject> {
     this.decided.push([token, confirmationId, decision]);
+    this.choices.push(choice);
     const held = this.held;
     if (held instanceof Error) return Promise.reject(held);
     return Promise.resolve(held ?? answer(confirmationId, decision));

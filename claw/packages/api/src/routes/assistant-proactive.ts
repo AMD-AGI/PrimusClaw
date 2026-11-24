@@ -7,7 +7,8 @@
  *   GET  /v1/assistant/brief?lang=zh|en&timezone=&range=day|week  the caller's brief, put together now (`assistant/brief.ts`);
  *        range=week is their week (the last seven days), for a weekly report
  *   GET  /v1/assistant/confirmations              the cards waiting for the caller's press (`assistant/schedules.ts`)
- *   POST /v1/assistant/confirmations/:id/decision {decision: allow | deny}: the caller's answer to one of them, or to a merge or an
+ *   POST /v1/assistant/confirmations/:id/decision {decision: allow | deny, choice?}: the caller's answer to one of them (`choice`: the
+ *        option picked on a choice card, required there to allow, refused on any other card), or to a merge or an
  *        approval a review the assistant started holds for them (`github_merge`, `github_review` cards: `review-items.ts`), made
  *        exactly as `POST /v1/github-review/confirmations/:id/decision` makes it
  *
@@ -86,10 +87,15 @@ export async function registerAssistantProactiveRoutes(
   app.post("/v1/assistant/confirmations/:id/decision", async (req, reply) => {
     const user = requireRealUser(req, reply);
     if (!user) return;
-    const decision = ((req.body ?? {}) as { decision?: unknown }).decision;
+    const body = (req.body ?? {}) as { decision?: unknown; choice?: unknown };
+    const decision = body.decision;
     if (decision !== "allow" && decision !== "deny") {
       return reply.status(400).send({ ok: false, error: "invalid_request", message: "decision must be allow or deny" });
     }
+    if (body.choice !== undefined && body.choice !== null && (typeof body.choice !== "string" || !body.choice || body.choice.length > 64)) {
+      return reply.status(400).send({ ok: false, error: "invalid_choice", message: "choice is the id of one of the card's options" });
+    }
+    const choice = typeof body.choice === "string" ? body.choice : null;
     const caller = classifyAttendedCaller(getAuthMethod(req), { delegation: user.delegation }, readGithubReviewSettings().decisionClientIds);
     if (!caller.ok) {
       return reply.status(403).send({
@@ -99,13 +105,14 @@ export async function registerAssistantProactiveRoutes(
     const id = (req.params as { id: string }).id;
     // A merge or an approval a review holds for them: the review's own decision, with every gate it reads (N54).
     if (await asksForGithubWrite(user.userId, id)) {
+      if (choice !== null) return reply.status(400).send({ ok: false, error: "invalid_choice", message: "that card offers no options" });
       const answer = await reviewToolPorts.decide(user.userId, id, decision, caller.via);
       if (answer.http >= 400) return reply.status(answer.http).send(answer.body);
       return reply.send({ ok: true, data: answer.body });
     }
     try {
       const out = await decideConfirmation({
-        userId: user.userId, confirmationId: id, decision, via: caller.via ? `button:${caller.via.clientId}` : "button",
+        userId: user.userId, confirmationId: id, decision, via: caller.via ? `button:${caller.via.clientId}` : "button", choice,
         creds: { platformKey: user.platformKey || "", virtualKey: user.virtualKey || "", userName: user.userName || "" },
       });
       return reply.send({ ok: true, data: out });

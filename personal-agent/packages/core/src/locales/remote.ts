@@ -23,6 +23,9 @@ export const remoteText = defineCatalog({
     asksPermission: (p: { who: string }) => `${p.who} asks permission.`,
     asksPermissionKind: (p: { kind: string; who: string }) => `${p.who} asks permission (${p.kind}).`,
     validUntil: (p: { until: string; zone: string }) => `Valid until ${p.until} (${p.zone}). After that it is refused.`,
+    seatNeedsApproval: (p: { seat: string }) => `${p.seat} needs your approval`,
+    stillWaiting: (p: { until: string; zone: string }) =>
+      `Still waiting for your approval, until ${p.until} (${p.zone}) at the latest.`,
     alwaysChanges:
       "An always option changes what this agent may do on your machine from now on, not only for this request.",
     needsApproval: "Needs your approval",
@@ -234,6 +237,8 @@ It installs the connector, pairs the machine with you and keeps it running. I wi
     asksPermission: (p) => `${p.who} 请求权限。`,
     asksPermissionKind: (p) => `${p.who} 请求权限（${p.kind}）。`,
     validUntil: (p) => `${p.until}（${p.zone}）前有效，过时自动拒绝。`,
+    seatNeedsApproval: (p) => `${p.seat} 需要你批准`,
+    stillWaiting: (p) => `还在等你批准，最晚到 ${p.until}（${p.zone}）。`,
     alwaysChanges: "选“始终允许”会改变这个 agent 以后在你机器上能做的事，不只是这一次。",
     needsApproval: "需要你批准",
     waitsForYou: (p) => `${p.who} 在等你：${p.about}`,

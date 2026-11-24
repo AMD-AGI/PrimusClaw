@@ -85,6 +85,16 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
     `CREATE INDEX IF NOT EXISTS idx_work_items_watching_pr ON claw_work_items(updated_at)
      WHERE params ? 'watching_pr' AND board_state <> 'done'`,
   );
+  // Tasks the assistant handed to one of the user's seats (`seat-dispatch.ts`): remote items with `params.errand`, one per task, read by
+  // seat (its queue, in order) and by the session they run in (which of its events are theirs).
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_work_items_errand_seat ON claw_work_items((params->>'seat_id'), seq)
+     WHERE kind = 'remote' AND params->>'errand' = 'true' AND board_state <> 'done'`,
+  );
+  await client.query(
+    `CREATE INDEX IF NOT EXISTS idx_work_items_errand_session ON claw_work_items((params->>'session_id'))
+     WHERE kind = 'remote' AND params->>'errand' = 'true' AND board_state <> 'done'`,
+  );
   // The reviews a person asked of others, which their own assistant lists read-only (`requester-view.ts`) on every turn.
   await client.query(
     `CREATE INDEX IF NOT EXISTS idx_work_items_requested_by ON claw_work_items((params->>'requested_by'), updated_at DESC)
@@ -334,7 +344,7 @@ export async function ensureAssistantSchema(client: pg.PoolClient): Promise<void
       -- The router session and the turn that proposed it.
       session_id      TEXT NOT NULL,
       message_id      TEXT NOT NULL,
-      -- trigger_create | trigger_cancel
+      -- trigger_create | trigger_cancel | github_comment | devenv_send | devenv_hide | skill_save | seat_role | seat_set | seat_dispatch
       kind            TEXT NOT NULL,
       params          JSONB NOT NULL,
       -- The same proposal twice in one turn is one card.

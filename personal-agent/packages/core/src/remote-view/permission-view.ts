@@ -38,10 +38,20 @@ export function optionButtons(
   }));
 }
 
-/** When a request runs out, and what an always option changes: the notes under a permission card. */
-function expiryNotes(options: readonly PermissionOption[], expiresAt: number, zone: string, lang: Lang): string[] {
+/**
+ * When a request runs out, and what an always option changes: the notes under a permission card. A parked request's reminder says
+ * it still waits, until when.
+ */
+function expiryNotes(
+  options: readonly PermissionOption[],
+  expiresAt: number,
+  zone: string,
+  lang: Lang,
+  parked = false,
+): string[] {
   const words = remoteText.in(lang);
-  const notes = [words.validUntil({ until: clock(expiresAt, zone), zone })];
+  const until = { until: clock(expiresAt, zone), zone };
+  const notes = [parked ? words.stillWaiting(until) : words.validUntil(until)];
   if (offersAlways(options)) notes.push(words.alwaysChanges);
   return notes;
 }
@@ -101,6 +111,10 @@ export interface RemoteAsk {
   readonly agent: string;
   /** Which errand: `#seq title`. */
   readonly about: string;
+  /** The name the person gave the seat the errand went to (absent: none): the card's title names it. */
+  readonly seat?: string | undefined;
+  /** The one reminder of a request the agent keeps waiting on: the card says it still waits, until when. */
+  readonly parked?: boolean | undefined;
   readonly expiresAt: number;
   readonly zone: string;
 }
@@ -111,10 +125,10 @@ export function remoteAskView(input: RemoteAsk, lang: Lang = "en"): RemoteAskVie
   const who = words.agentOnHost({ agent: lit(input.agent, 40), host: lit(input.machine, 60) });
   return {
     lang,
-    title: words.needsApproval,
+    title: input.seat ? words.seatNeedsApproval({ seat: lit(input.seat, 40) }) : words.needsApproval,
     tool: `**${lit(input.ask["tool"] || words.anAction, 200)}**`,
     waits: words.waitsForYou({ who, about: lit(input.about, 120) }),
-    notes: expiryNotes(input.options, input.expiresAt, input.zone, lang),
+    notes: expiryNotes(input.options, input.expiresAt, input.zone, lang, input.parked === true),
     buttons: optionButtons(input.options, input.sessionId, pyStr(input.ask["action_id"]), lang),
   };
 }

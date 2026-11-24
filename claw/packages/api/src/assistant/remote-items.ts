@@ -36,16 +36,16 @@ import { randomUUID } from "node:crypto";
 import pino from "pino";
 import { storableJsonText } from "@claw/utils";
 import {
-  REMOTE_AGENT_LIMITS, REMOTE_COMMANDS, REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED,
-  REMOTE_EVENT_TERMINAL_TURN_END, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_ASKS, type TerminalAsks,
+  REMOTE_AGENT_LIMITS, REMOTE_COMMANDS, REMOTE_EVENT_PERMISSION_PARKED, REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED,
+  REMOTE_EVENT_SESSION_CLOSED, REMOTE_EVENT_TERMINAL_TURN_END, REMOTE_EVENT_USER_PROMPT, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_ASKS, type TerminalAsks,
 } from "@claw/protocol";
 import { CLAW_ASSISTANT_ENABLED, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { approvalsEnabled, DELIVERY_UNCONFIRMED, findSession, issueCommand, onlineSql, terminalMuted, wakeConnector } from "../remote-agents/store.js";
 import { newWorkItemId } from "../tasks/ids.js";
 import type { AssistantRemoteAsk, AssistantRemoteNotice } from "../notifications/assistant-events.js";
-import { personWritesChinese, recordSystemNotice } from "./outbound.js";
-import { clipOneLine, clipWords, graphemes, TITLE_MAX } from "./work-items.js";
+import { ensureLiveAssistant, itemSession, personWritesChinese, recordSystemNotice, storeAnswerWhole } from "./outbound.js";
+import { applyWorkerReport, clipOneLine, clipWords, graphemes, TITLE_MAX } from "./work-items.js";
 
 const logger = pino({ name: "assistant-remote-items" });
 
@@ -591,6 +591,8 @@ export async function noteRemoteEvents(owner: string, sessionIds: readonly strin
   if (!remoteItemsOn() || !sessionIds.length) return 0;
   let changed = 0;
   for (const sessionId of new Set(sessionIds)) {
+    // A seat's tasks running in this session first: the events they own are theirs, and the session's own item passes over them.
+    if (await noteErrandEvents(owner, sessionId)) changed += 1;
     try {
       const notices = await applySession(owner, sessionId);
       if (notices === null) continue;
@@ -602,6 +604,13 @@ export async function noteRemoteEvents(owner: string, sessionIds: readonly strin
     } catch (err) {
       logger.warn({ err, sessionId }, "assistant.remote_item_update_failed");
     }
+  }
+  // A seat whose session has nothing of its tasks left running takes the next one waiting for it (`seat-dispatch.ts`).
+  try {
+    const { drainSeatsOf } = await import("./seat-dispatch.js");
+    await drainSeatsOf(owner, [...new Set(sessionIds)]);
+  } catch (err) {
+    logger.warn({ err }, "assistant.seat_drain_failed");
   }
   return changed;
 }
@@ -870,8 +879,17 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, storableJsonText(p)]);
       return notices;
     }
+    // What a seat's task sent this session, and whether one runs there now: its events are its own, never this item's. (Read only
+    // for a session a task was ever sent to.)
+    const hadErrand = (await q(
+      "SELECT 1 FROM claw_work_items WHERE user_id = $1 AND kind = 'remote' AND params->>'errand' = 'true' AND params->>'session_id' = $2 LIMIT 1",
+      [owner, sessionId],
+    )).rows.length > 0;
+    const errandSeqs = hadErrand ? await errandSeqsOf(q, sessionId) : new Set<number>();
+    const errandRunning = hadErrand && await errandRunningOn(q, owner, sessionId);
     for (const e of events) {
       p.last_event_id = e.id;
+      if (errandOwns(e, errandSeqs, errandRunning)) continue;
       // A connector that names the prompt a turn's end ends (`cmd_seq`, null for a cancel that found nothing running) is followed by
       // name, while the item knows every prompt open by its number. A turn's end, or a refusal of a prompt that never runs, that names
       // none (an older connector) makes the item count them instead, as it did before names were kept.
@@ -1192,7 +1210,11 @@ async function applyTerminal(
  * empty and `title` is the item's without it): the machines the user has are what `devenv_list` reads, and a name from anywhere else
  * was said as one of them.
  */
-export interface RemoteManifest { machine: string; agent: string; session: string; online: boolean; removed?: true; title?: string }
+export interface RemoteManifest {
+  machine: string; agent: string; session: string; online: boolean; removed?: true; title?: string;
+  /** A task handed to a seat: which (its alias when the user confirmed one), why it waits if it does, and its latest step (untrusted). */
+  errand?: { seat_id: string; alias: string | null; waiting?: ErrandQueue; progress?: { current: string; done: number; total: number } };
+}
 
 /** The remote items among `items`, by item id, with whether their machine is online now, or removed. */
 export async function remoteManifest(
@@ -1216,14 +1238,28 @@ export async function remoteManifest(
   }
   for (const i of remote) {
     const p = (i.params ?? {}) as Partial<RemoteParams>;
+    const e = p as Partial<ErrandParams>;
+    const errand = e.errand === true ? {
+      seat_id: String(e.seat_id ?? ""), alias: typeof e.alias === "string" ? e.alias : null,
+      ...(e.queued ? { waiting: e.queued } : {}),
+      ...(e.progress && e.progress.current ? { progress: { current: e.progress.current, done: Number(e.progress.done) || 0, total: Number(e.progress.total) || 0 } } : {}),
+    } : undefined;
+    // A task still waiting for its card names no machine yet.
+    if (errand && !p.connector_id) {
+      out.set(i.item_id, { machine: "", agent: String(p.agent_id ?? ""), session: "", online: false, errand });
+      continue;
+    }
     const connectorId = String(p.connector_id ?? "");
     const machine = String(p.machine ?? "");
     const online = byId.has(connectorId) ? byId.get(connectorId) : machine && byName.has(machine) ? byName.get(machine) : undefined;
     if (online === undefined) {
-      out.set(i.item_id, { machine: "", agent: String(p.agent_id ?? ""), session: String(p.session_id ?? ""), online: false, removed: true, title: remoteTitleWithoutMachine(p) });
+      out.set(i.item_id, {
+        machine: "", agent: String(p.agent_id ?? ""), session: String(p.session_id ?? ""), online: false, removed: true,
+        ...(errand ? { errand } : { title: remoteTitleWithoutMachine(p) }),
+      });
       continue;
     }
-    out.set(i.item_id, { machine, agent: String(p.agent_id ?? ""), session: String(p.session_id ?? ""), online: online === true });
+    out.set(i.item_id, { machine, agent: String(p.agent_id ?? ""), session: String(p.session_id ?? ""), online: online === true, ...(errand ? { errand } : {}) });
   }
   return out;
 }
@@ -1245,6 +1281,11 @@ export async function remoteAnswerTail(sessionId: string, max: number): Promise<
  * stop does. Best effort: the item is closed whether or not the machine hears it, and a session already closed needs nothing.
  */
 export async function cancelRemoteItem(userId: string, params: unknown): Promise<void> {
+  const errand = (params as Partial<ErrandParams> | null)?.errand === true ? params as Partial<ErrandParams> : null;
+  if (errand) {
+    await cancelErrand(userId, errand);
+    return;
+  }
   const sessionId = String((params as Partial<RemoteParams> | null)?.session_id ?? "");
   if (!sessionId) return;
   try {
@@ -1264,5 +1305,497 @@ export async function cancelRemoteItem(userId: string, params: unknown): Promise
     if (queued) wakeConnector(s.connector_id);
   } catch (err) {
     logger.warn({ err, sessionId }, "assistant.remote_cancel_failed");
+  }
+}
+
+// --- Tasks handed to a seat (errands) ---------------------------------------------------------------------------------------
+
+/**
+ * A task the assistant handed to one of the user's seats (`seat-dispatch.ts`): a remote item of its own (`params.errand`), one per task,
+ * its `worker_session_id` `errand:<item id>` (no Claw session). It runs in a session of the seat's, as prompts sent as
+ * {@link ERRAND_CLIENT}; which of that session's events are its own is read by the prompt they name (`cmd_seq` in `open_cmd_seqs`), and
+ * the session's own item (`remote:<session>`) never takes them, nor the other way round.
+ *
+ * Its end is a report (`ingestReport`, source `remote`): a turn that finished closes it with the end of the agent's answer and wakes the
+ * router to say it (no `done` notice of its own); one that failed, a refusal, a session that closed, or an approval nobody answered in
+ * time, fails it, said as an `error` notice too. A permission request is a `needs_you` notice with its buttons; a parked one is said once
+ * more (`ask.parked`). A task that has run an hour is said in one line each hour, with its latest step.
+ */
+export const ERRAND_CLIENT = "assistant_seat";
+export const errandWorkerSessionId = (itemId: string): string => `errand:${itemId}`;
+/** Why a task waits rather than runs: its card, or its seat (busy, used in a terminal, or its machine offline). */
+export type ErrandQueue = "card" | "seat_busy" | "in_terminal" | "machine_offline";
+export const SEAT_QUEUE_REASONS: readonly ErrandQueue[] = ["seat_busy", "in_terminal", "machine_offline"];
+
+export interface ErrandParams extends RemoteParams {
+  errand: true;
+  /** The seat it is for; "" while a choice card waits. */
+  seat_id: string;
+  /** The seat's name as the user confirmed it, when it has one. */
+  alias?: string | null;
+  /** What the router wrote for the seat's agent (sent behind the fixed opening, `errandText`). */
+  brief: string;
+  queued?: ErrandQueue;
+  queued_at?: string;
+  /** A task waiting for its machine to come back: when it fails instead (24 hours). */
+  queue_expires_at?: string;
+  confirmation_id?: string;
+  /** A choice card's options: seat ids, or `sandbox`. */
+  choices?: string[];
+  /** In a new session in the seat's folder, even when its conversation is open in a terminal. */
+  new_session?: true;
+  dispatched_at?: string;
+  /** The latest step of the agent's plan (untrusted, one line, cut), and how far along the plan is. */
+  progress?: { current: string; done: number; total: number; at: string };
+  progress_told_at?: string;
+  /** The hours of running already said (one line per hour). */
+  progress_told_h?: number;
+  offline_told?: true;
+  /** The seat's agent runs in a mode that asks nothing (`unattended`). */
+  unattended?: true;
+  /**
+   * How the user let it through: `auto`, without a card (the seat took tasks directly then), or `card`, pressing one for it, which said
+   * whether its agent runs unattended (`approved_unattended`). Checked again when it leaves the queue (`seat-dispatch.ts`).
+   */
+  approved?: "auto" | "card";
+  approved_unattended?: boolean;
+  /** An end recorded and not yet reported (`ingestReport` runs after the commit; the sweep retries what it missed). */
+  report_due?: { kind: "answer" | "failed"; summary: string; generation: number };
+}
+
+/** How much of the agent's answer an errand's report carries (its end). */
+const ERRAND_ANSWER_MAX = 4000;
+/** A plan step as an errand keeps it. */
+const STEP_MAX = 80;
+/** Errand asks put to the user one by one in a minute, across all their seats; past that one line says how many wait. */
+export const ERRAND_ASKS_PER_MINUTE = 5;
+/** The events an errand reads. */
+const ERRAND_EVENTS = [...MOVING, REMOTE_EVENT_PERMISSION_PARKED, "plan"];
+
+/** The fixed opening of every task sent to a seat, in the user's language, then the brief. */
+export function errandText(seq: number, brief: string, lang: RemoteLang): string {
+  return lang === "zh"
+    ? `（你的助手 代你交代的任务，事项 #${seq}。完成时用一段话总结：结果、改了什么、还剩什么。）\n\n${brief}`
+    : `(A task your assistant hands over for you, item #${seq}. When you finish, sum up in one paragraph: the result, what you changed, what is left.)\n\n${brief}`;
+}
+
+/** Who a seat's task is with, as the user knows it: the alias they confirmed, else machine/agent. */
+export const errandWho = (p: Partial<ErrandParams>): string =>
+  (typeof p.alias === "string" && p.alias) || `${String(p.machine ?? "") || "?"}/${String(p.agent_id ?? "")}`;
+
+export type ErrandNoticeKind = "needs_you" | "parked" | "failed" | "progress" | "offline" | "asks_waiting";
+
+/** What a seat's task says to the user, in their language. Words of the agent's (`detail`) are quoted text. */
+export function errandNotice(kind: ErrandNoticeKind, p: Partial<ErrandParams>, seq: number, detail = "", extra: { hours?: number; waiting?: number } = {}): string {
+  const zh = p.lang === "zh";
+  const who = errandWho(p);
+  switch (kind) {
+    case "needs_you":
+      return zh ? `#${seq} ${who} 在等你批准：${detail}。在下面选，或发 /agent attach ${p.session_id} 切过去处理。`
+        : `#${seq} ${who} is waiting for your approval: ${detail}. Choose below, or send /agent attach ${p.session_id} to answer it there.`;
+    case "parked":
+      return zh ? `#${seq} ${who} 还在等你批准：${detail}。它会一直等你回答（最多 24 小时）。`
+        : `#${seq} ${who} is still waiting for your approval: ${detail}. It keeps waiting for your answer (24 hours at most).`;
+    case "failed":
+      return zh ? `#${seq} ${who} 没有做完：${detail}。回复“继续”重发，或说“改交沙箱”。`
+        : `#${seq} ${who} did not finish: ${detail}. Reply "continue" to send it again, or "use the sandbox instead".`;
+    case "progress": {
+      const h = extra.hours ?? 1;
+      const step = p.progress?.current ? `${zh ? "：" : ": "}“${p.progress.current}”${p.progress.total ? (zh ? `（${p.progress.done}/${p.progress.total}）` : ` (${p.progress.done}/${p.progress.total})`) : ""}`
+        : detail ? `${zh ? "：" : ": "}“${detail}”` : "";
+      return zh ? `#${seq} ${who} 已进行 ${h} 小时${step}` : `#${seq} ${who} has been at it for ${h} hour${h === 1 ? "" : "s"}${step}`;
+    }
+    case "offline":
+      return zh ? `#${seq} ${who} 所在的机器离线超过 1 小时了，上线后会接着做。` : `#${seq}: the machine of ${who} has been offline for over an hour; it goes on when the machine is back.`;
+    case "asks_waiting":
+      return zh ? `还有 ${extra.waiting ?? 0} 个交给工位的事项在等你批准，见事项列表。` : `${extra.waiting ?? 0} more seat tasks are waiting for your approval; see your items.`;
+  }
+}
+
+/** The seq numbers of the prompts sent to this session as seat tasks (from their `user_prompt` events): never the session item's. */
+async function errandSeqsOf(q: Querier, sessionId: string): Promise<Set<number>> {
+  const rows = (await q(
+    `SELECT (data->>'cmd_seq')::bigint AS seq FROM claw_remote_events
+      WHERE session_id = $1 AND type = $2 AND data->>'client' = $3 AND data ? 'cmd_seq'`,
+    [sessionId, REMOTE_EVENT_USER_PROMPT, ERRAND_CLIENT],
+  )).rows as Array<{ seq: string }>;
+  return new Set(rows.map((r) => Number(r.seq)));
+}
+
+/** Whether the session has a seat task running now (a prompt of it open). */
+async function errandRunningOn(q: Querier, owner: string, sessionId: string): Promise<boolean> {
+  return (await q(
+    `SELECT 1 FROM claw_work_items WHERE user_id = $1 AND kind = 'remote' AND params->>'errand' = 'true' AND params->>'session_id' = $2
+        AND board_state <> 'done' AND jsonb_array_length(COALESCE(params->'open_cmd_seqs', '[]'::jsonb)) > 0 LIMIT 1`,
+    [owner, sessionId],
+  )).rows.length > 0;
+}
+
+/**
+ * Whether a session event that names no prompt is one of a seat task's: only when its connector does not name prompts at all (no
+ * `cmd_seq` key: an older connector) and a task runs there. One that says it names none (`cmd_seq: null`, such as the end a cancel
+ * brings when nothing was running) is never a task's.
+ */
+const unnamedIsErrands = (e: MovingEvent, running: boolean): boolean => running && !Object.hasOwn(e.data, "cmd_seq");
+
+/**
+ * Whether a session event belongs to a seat task, so the session's own item passes over it: a turn's end, a refusal or a permission
+ * event naming a task's prompt, or naming none from a connector that names no prompts while a task runs there.
+ */
+function errandOwns(e: MovingEvent, seqs: ReadonlySet<number>, running: boolean): boolean {
+  const seq = Number.isSafeInteger(e.data.cmd_seq) ? Number(e.data.cmd_seq) : null;
+  const moving = e.type === REMOTE_EVENT_TURN_END || e.type === REMOTE_EVENT_COMMAND_REJECTED || e.type === REMOTE_EVENT_PERMISSION_REQUEST
+    || e.type === REMOTE_EVENT_PERMISSION_RESOLVED || e.type === REMOTE_EVENT_PERMISSION_PARKED;
+  if (!moving) return false;
+  return seq !== null ? seqs.has(seq) : unnamedIsErrands(e, running);
+}
+
+export interface NoteErrandPrompt {
+  owner: string; itemId: string; sessionId: string; connectorId: string; agentId: string; machine: string; cmdSeq: number; since?: number;
+}
+
+/**
+ * A seat task's prompt was queued: the item is running in that session, the prompt one of its own. One more instruction that reached it
+ * just after its turn ended is a new turn of it: the end still to be reported is reported in the same transaction, and an item that end
+ * closed is opened again (a new generation), so neither answer is lost.
+ */
+export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
+  const reports = await import("./reports.js");
+  const woke = await inTransaction(async (q) => {
+    const row = (await q(
+      "SELECT board_state, outcome, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' FOR UPDATE", [p.itemId, p.owner],
+    )).rows[0] as { board_state: string; outcome: string | null; params: ErrandParams } | undefined;
+    if (!row) return null;
+    // An end recorded and not yet reported is reported here, in this transaction, before the item is opened again for this prompt: its
+    // answer reaches the router, and the report made of it elsewhere afterwards finds the item moved on (a new generation) and does nothing.
+    // As `ingestReport` does it: a long answer stored to be said whole, the router woken, and, when it cannot be, the system says it.
+    let wake: { sessionId: string; userId: string } | null = null;
+    let whole: { announce: () => Promise<void> } | null = null;
+    // An end the router cannot be woken to say and that nothing here could store (the user's assistant session was deleted: no session
+    // to store it in): said after the commit, in a session made again for it. A seat task is never swept for later, so it is said now.
+    let untold: { kind: "answer" | "failed"; summary: string; generation: number } | null = null;
+    const due = row.params.report_due;
+    if (due) {
+      const applied = await applyWorkerReport({ query: q }, {
+        itemId: p.itemId, generation: Number(due.generation), workerSessionId: errandWorkerSessionId(p.itemId), source: "remote", runId: null,
+        report: { kind: due.kind, summary: String(due.summary) },
+      });
+      if (applied.applied) {
+        whole = reports.answerSentWhole(due.kind, String(due.summary)) ? await storeAnswerWhole(q, p.itemId, reports.reportPorts.sayDeps) : null;
+      }
+      if (applied.applied && applied.wake) {
+        const queued = await reports.queueRouterWake({ query: q }, {
+          itemId: p.itemId, userId: applied.userId, eventId: applied.eventId, kind: due.kind, version: applied.resultVersion,
+          summary: String(due.summary), question: null, sentInFull: whole !== null,
+        });
+        if (queued.status === "queued") wake = { sessionId: queued.sessionId, userId: queued.userId };
+        // The router cannot be woken to say it: the system says the answer itself, stored now, while the item still stands answered.
+        else if (queued.status === "refused" && !whole) whole = await storeAnswerWhole(q, p.itemId, reports.reportPorts.sayDeps);
+        // (A failure is also said by its own error notice, in the session it was recorded for: said again only when that one is gone.)
+        if (queued.status === "refused" && !whole && !(await itemSession(q, p.itemId))?.sessionId) {
+          untold = { kind: due.kind, summary: String(due.summary), generation: Number(due.generation) };
+        }
+      }
+      row.board_state = applied.applied ? applied.boardState : row.board_state;
+      if (applied.applied && due.kind === "answer") row.outcome = "answered";
+    }
+    if ((row.board_state === "done" && row.outcome === "answered") || due) {
+      await q(
+        `UPDATE claw_work_items SET board_state = 'in_progress', outcome = NULL, closed_at = NULL, last_report_kind = 'progress', summary = '',
+                generation = generation + 1, params = params - 'report_due', updated_at = NOW()
+          WHERE item_id = $1`,
+        [p.itemId],
+      );
+    }
+    const was = row.params;
+    const same = was.session_id === p.sessionId && Array.isArray(was.open_cmd_seqs) && was.open_cmd_seqs.length > 0;
+    const since = p.since !== undefined ? Math.max(0, Number(p.since) || 0) : Number((await q(
+      "SELECT COALESCE(MAX(id), 0) AS id FROM claw_remote_events WHERE session_id = $1", [p.sessionId],
+    )).rows[0].id);
+    const patch = {
+      session_id: p.sessionId, connector_id: p.connectorId, agent_id: p.agentId, machine: p.machine,
+      open_cmd_seqs: same ? [...was.open_cmd_seqs!, p.cmdSeq] : [p.cmdSeq], open_turns: same ? (Number(was.open_turns) || 0) + 1 : 1,
+      ...(same ? {} : { last_event_id: since, waiting: [], dispatched_at: new Date().toISOString() }),
+    };
+    await q(
+      `UPDATE claw_work_items SET params = (params - 'queued' - 'queued_at' - 'queue_expires_at' - 'progress_told_at' - 'progress_told_h' - 'offline_told') || $2::jsonb,
+              board_state = CASE WHEN board_state = 'needs_you' AND last_report_kind = 'waiting' THEN board_state ELSE 'in_progress' END,
+              updated_at = NOW()
+        WHERE item_id = $1`,
+      [p.itemId, storableJsonText(patch)],
+    );
+    await q(
+      `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
+       SELECT item_id, 'progress', 'remote', generation, $2 FROM claw_work_items WHERE item_id = $1`,
+      [p.itemId, p.machine],
+    );
+    return { wake, whole, untold };
+  });
+  if (!woke) return;
+  if (woke.whole) await woke.whole.announce().catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_answer_not_announced"));
+  if (woke.untold) await tellUntold(p.owner, p.itemId, woke.untold).catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_end_not_told"));
+  if (woke.wake) {
+    const { drainSessionIfIdle } = await import("./messages.js");
+    await drainSessionIfIdle(woke.wake.sessionId, woke.wake.userId).catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_wake_failed"));
+  }
+}
+
+/**
+ * A seat task's end that its router could not be woken to say, and that had no session to be stored in, said by the system in the
+ * user's assistant session (made again when they deleted it, as `recordNeedsYouFallback` does). Once per end (its key).
+ */
+async function tellUntold(owner: string, itemId: string, end: { kind: "answer" | "failed"; summary: string; generation: number }): Promise<void> {
+  await ensureLiveAssistant(itemId);
+  const row = (await db.query(
+    `SELECT w.seq, w.title, w.params->>'lang' AS lang, a.session_id
+       FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id
+      WHERE w.item_id = $1 AND w.user_id = $2`,
+    [itemId, owner],
+  )).rows[0] as { seq: number; title: string; lang: string | null; session_id: string | null } | undefined;
+  if (!row?.session_id) return;
+  const zh = row.lang === "zh";
+  const text = end.kind === "answer"
+    ? (zh ? `#${row.seq} ${row.title}：${end.summary}` : `#${row.seq} "${row.title}": ${end.summary}`)
+    : (zh ? `#${row.seq} ${row.title} 没有完成：${end.summary}` : `#${row.seq} "${row.title}" did not finish: ${end.summary}`);
+  await recordSystemNotice({ userId: owner, sessionId: row.session_id, text, key: `errand-untold:${itemId}:${end.generation}`, itemId });
+}
+
+interface ErrandPass { notices: Notice[]; reports: Array<{ itemId: string; generation: number; kind: "answer" | "failed"; summary: string }> }
+
+/** The open seat tasks running in this session take the events they have not applied (`last_event_id`), each in its own order. */
+async function applyErrands(owner: string, sessionId: string): Promise<ErrandPass | null> {
+  return inTransaction(async (q) => {
+    const items = (await q(
+      `SELECT w.item_id, w.seq, w.generation, w.board_state, w.last_report_kind, w.params, a.session_id AS router_sid
+         FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id
+        WHERE w.user_id = $1 AND w.kind = 'remote' AND w.params->>'errand' = 'true' AND w.params->>'session_id' = $2
+          AND w.board_state <> 'done' AND w.params ? 'dispatched_at' AND NOT (w.params ? 'queued')
+        ORDER BY w.seq FOR UPDATE OF w`,
+      [owner, sessionId],
+    )).rows as Array<{ item_id: string; seq: number; generation: number; board_state: string; last_report_kind: string | null; params: ErrandParams; router_sid: string }>;
+    if (!items.length) return null;
+    const pass: ErrandPass = { notices: [], reports: [] };
+    for (const item of items) {
+      const events = (await q(
+        `SELECT id, type, occurred_at, data FROM claw_remote_events
+          WHERE session_id = $1 AND id > $2 AND type = ANY($3::text[]) AND COALESCE(data->>'replay', '') <> 'true'
+          ORDER BY id LIMIT $4`,
+        [sessionId, Number(item.params.last_event_id) || 0, ERRAND_EVENTS, EVENTS_PER_PASS],
+      )).rows.map((r) => ({
+        id: Number(r.id), type: String(r.type), occurred_at: new Date(r.occurred_at).toISOString(), data: (r.data ?? {}) as Record<string, unknown>,
+      })) as MovingEvent[];
+      if (!events.length) continue;
+      const p: ErrandParams = {
+        ...item.params, waiting: Array.isArray(item.params.waiting) ? [...item.params.waiting] : [],
+        open_cmd_seqs: Array.isArray(item.params.open_cmd_seqs) ? [...item.params.open_cmd_seqs] : [],
+      };
+      let board = item.board_state;
+      const seat = p.seat_id ? { seat_id: p.seat_id, alias: typeof p.alias === "string" ? p.alias : null } : undefined;
+      const tell = (key: string, kind: AssistantRemoteNotice["kind"], text: string, ask?: AssistantRemoteAsk, attach = true) => {
+        pass.notices.push({
+          userId: owner, routerSid: item.router_sid, itemId: attach ? item.item_id : undefined, key: `remote:${item.item_id}:${key}`, text,
+          remote: {
+            kind, session_id: sessionId, machine: p.machine, agent: p.agent_id, item_seq: Number(item.seq), ...(seat ? { seat } : {}), ...(ask ? { ask } : {}),
+          },
+        });
+      };
+      const write = async (set: string, values: unknown[], ev: { kind: string; summary: string | null; question?: string | null }) => {
+        await q(`UPDATE claw_work_items SET ${set}, updated_at = NOW() WHERE item_id = $1`, [item.item_id, ...values]);
+        await q(
+          `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary, question)
+           SELECT item_id, $2, 'remote', generation, $3, $4 FROM claw_work_items WHERE item_id = $1`,
+          [item.item_id, ev.kind, ev.summary, ev.question ?? null],
+        );
+      };
+      const fail = (key: string, reason: string) => {
+        p.open_cmd_seqs = [];
+        p.open_turns = 0;
+        p.waiting = [];
+        p.report_due = { kind: "failed", summary: reason, generation: Number(item.generation) };
+        tell(key, "error", errandNotice("failed", p, item.seq, reason), undefined, false);
+      };
+      for (const e of events) {
+        p.last_event_id = e.id;
+        const seq = Number.isSafeInteger(e.data.cmd_seq) ? Number(e.data.cmd_seq) : null;
+        const open = p.open_cmd_seqs ?? [];
+        const running = open.length > 0;
+        const mine = seq !== null ? open.includes(seq) : unnamedIsErrands(e, running);
+        if (e.type === REMOTE_EVENT_TURN_END) {
+          if (!mine) continue;
+          p.open_cmd_seqs = seq !== null ? open.filter((c) => c !== seq) : [];
+          p.open_turns = p.open_cmd_seqs.length;
+          if (p.open_cmd_seqs.length) continue;
+          const stop = flat(e.data.stopReason, 40);
+          p.waiting = [];
+          if (undelivered(e)) {
+            fail(`undelivered:${e.id}`, p.lang === "zh" ? "机器在确认收到前断开了，可能没有执行" : "the machine went before confirming it had the task; it may not have run");
+          } else if (stop === "cancelled") {
+            // Stopped where it runs (its terminal, or the session's own stop): the user's doing, not a failure, and not news to them.
+            const summary = p.lang === "zh" ? "在终端里停止" : "stopped on the machine";
+            board = "done";
+            await write(
+              "board_state = 'done', outcome = 'stopped', last_report_kind = 'dropped', summary = $2, pending_question = NULL, closed_at = NOW()",
+              [summary], { kind: "stopped", summary },
+            );
+          } else if (FAILED_STOPS.has(stop)) {
+            fail(`end:${e.id}`, stopWords(stop, flat(e.data.error, 200), p.lang, flat(e.data.terminal_mode, 40)) || stop);
+          } else {
+            const whole = await answerOf(q, sessionId, e.id);
+            const answer = tailLines(whole, ERRAND_ANSWER_MAX) || (p.lang === "zh" ? "已结束，没有回答文字" : "ended with no answer text");
+            p.report_due = { kind: "answer", summary: answer, generation: Number(item.generation) };
+          }
+        } else if (e.type === REMOTE_EVENT_COMMAND_REJECTED) {
+          const reason = e.data.type === "prompt" ? flat(e.data.reason, 80) : "";
+          if (!mine || seq === null || !(PROMPT_REFUSED_UNQUEUED.has(reason) || reason === PROMPT_DROPPED_BY_CANCEL)) continue;
+          p.open_cmd_seqs = open.filter((c) => c !== seq);
+          p.open_turns = p.open_cmd_seqs.length;
+          if (!p.open_cmd_seqs.length) fail(`refused:${e.id}`, p.lang === "zh" ? `机器拒绝了这条指令（${reason}）` : `the machine refused it (${reason})`);
+        } else if (e.type === REMOTE_EVENT_PERMISSION_REQUEST) {
+          const actionId = flat(e.data.actionId, 128);
+          if (!mine || !actionId || p.waiting.includes(actionId)) continue;
+          p.waiting.push(actionId);
+          const what = flat(e.data.tool, 120) || (p.lang === "zh" ? "一个操作" : "an action");
+          const question = p.lang === "zh" ? `等你批准：${what}` : `Waiting for your approval: ${what}`;
+          board = "needs_you";
+          await write(
+            "board_state = 'needs_you', last_report_kind = 'waiting', pending_question = $2, attention_seq = attention_seq + 1",
+            [question], { kind: "waiting", summary: question, question },
+          );
+          // At most ERRAND_ASKS_PER_MINUTE asks a minute across the user's seats; past that, one line a minute says how many wait.
+          const recent = Number((await q(
+            `SELECT COUNT(*)::int AS n FROM claw_work_item_events e JOIN claw_work_items w ON w.item_id = e.item_id
+              WHERE w.user_id = $1 AND w.kind = 'remote' AND w.params->>'errand' = 'true' AND e.kind = 'waiting' AND e.source = 'remote'
+                AND e.created_at > NOW() - INTERVAL '1 minute'`,
+            [owner],
+          )).rows[0].n);
+          if (recent <= ERRAND_ASKS_PER_MINUTE) {
+            tell(`ask:${e.id}`, "needs_you", errandNotice("needs_you", p, item.seq, what), askOf(e, actionId, what) ?? undefined);
+          } else {
+            const waiting = Number((await q(
+              `SELECT COUNT(*)::int AS n FROM claw_work_items WHERE user_id = $1 AND kind = 'remote' AND params->>'errand' = 'true'
+                  AND board_state = 'needs_you' AND last_report_kind = 'waiting'`,
+              [owner],
+            )).rows[0].n);
+            pass.notices.push({
+              userId: owner, routerSid: item.router_sid, itemId: undefined,
+              key: `remote:errand-asks:${owner}:${Math.floor(Date.now() / MINUTE_MS)}`,
+              text: errandNotice("asks_waiting", p, item.seq, "", { waiting }),
+              remote: { kind: "needs_you", session_id: sessionId, machine: p.machine, agent: p.agent_id, item_seq: Number(item.seq), ...(seat ? { seat } : {}) },
+            });
+          }
+        } else if (e.type === REMOTE_EVENT_PERMISSION_PARKED) {
+          const actionId = flat(e.data.actionId, 128);
+          if (!actionId || !p.waiting.includes(actionId)) continue;
+          // The request itself, for its options: the reminder is a card as the request was, once per request.
+          const asked = (await q(
+            `SELECT id, type, occurred_at, data FROM claw_remote_events WHERE session_id = $1 AND type = $2 AND data->>'actionId' = $3
+              ORDER BY id DESC LIMIT 1`,
+            [sessionId, REMOTE_EVENT_PERMISSION_REQUEST, actionId],
+          )).rows[0];
+          const req: MovingEvent | null = asked
+            ? { id: Number(asked.id), type: String(asked.type), occurred_at: new Date(asked.occurred_at).toISOString(), data: asked.data ?? {} } : null;
+          const what = flat(req?.data.tool, 120) || (p.lang === "zh" ? "一个操作" : "an action");
+          const ask = req ? askOf(req, actionId, what) : null;
+          const until = typeof e.data.parked_until === "string" && Number.isFinite(Date.parse(e.data.parked_until)) ? new Date(e.data.parked_until).toISOString() : undefined;
+          if (ask) {
+            ask.parked = true;
+            if (until) ask.expires_at = until;
+          }
+          // (Not filed under the item: the request's own notice is its one message for this wait.)
+          tell(`parked:${actionId}`, "needs_you", errandNotice("parked", p, item.seq, what), ask ?? undefined, false);
+        } else if (e.type === REMOTE_EVENT_PERMISSION_RESOLVED) {
+          const actionId = flat(e.data.actionId, 128);
+          if (!p.waiting.includes(actionId)) continue;
+          p.waiting = p.waiting.filter((a) => a !== actionId);
+          const by = flat(e.data.by, 64);
+          if (by === "timeout" || by === "park_expired") {
+            fail(`timeout:${e.id}`, p.lang === "zh"
+              ? (by === "timeout" ? "因审批超时停了" : "审批等了 24 小时没有人回答，停了")
+              : (by === "timeout" ? "it stopped: the approval timed out" : "it stopped: nobody answered the approval in 24 hours"));
+            continue;
+          }
+          if (board === "needs_you" && !p.waiting.length) {
+            board = "in_progress";
+            await write("board_state = 'in_progress', last_report_kind = 'progress', pending_question = NULL", [],
+              { kind: "progress", summary: p.lang === "zh" ? "已批准，继续" : "answered, going on" });
+          }
+        } else if (e.type === REMOTE_EVENT_SESSION_CLOSED) {
+          if (!running && !p.waiting.length) continue;
+          fail(`closed:${e.id}`, p.lang === "zh" ? "它的会话关闭了" : "its session closed");
+        } else if (e.type === "plan" && running) {
+          const entries = Array.isArray((e.data.update as Record<string, unknown> | undefined)?.entries)
+            ? ((e.data.update as Record<string, unknown>).entries as unknown[])
+            : Array.isArray(e.data.entries) ? (e.data.entries as unknown[]) : [];
+          const steps = entries.filter((x): x is Record<string, unknown> => !!x && typeof x === "object");
+          if (!steps.length) continue;
+          const doneN = steps.filter((x) => x.status === "completed").length;
+          const current = steps.find((x) => x.status !== "completed");
+          p.progress = { current: flat(current?.content, STEP_MAX), done: doneN, total: steps.length, at: e.occurred_at };
+        }
+      }
+      await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, storableJsonText(p)]);
+      if (p.report_due && p.report_due !== item.params.report_due) {
+        pass.reports.push({ itemId: item.item_id, generation: p.report_due.generation, kind: p.report_due.kind, summary: p.report_due.summary });
+      }
+    }
+    return pass;
+  });
+}
+
+/** A seat task's end, reported: the router is woken to say it (or the answer is said whole). Then nothing is due any more. */
+export async function reportErrand(r: { itemId: string; generation: number; kind: "answer" | "failed"; summary: string }): Promise<void> {
+  const { ingestReport } = await import("./reports.js");
+  // (Applied, or stale: a newer instruction or a stop moved the item on. Either way nothing is due; a failure leaves it for the sweep.)
+  await ingestReport({ itemId: r.itemId, workerSessionId: errandWorkerSessionId(r.itemId), generation: r.generation, runId: null },
+    { kind: r.kind, summary: r.summary }, "remote");
+  await db.query("UPDATE claw_work_items SET params = params - 'report_due' WHERE item_id = $1 AND (params->'report_due'->>'generation')::int = $2",
+    [r.itemId, r.generation]);
+}
+
+/** The session's seat tasks take their events, their ends are reported, and what they say is said. Never throws. */
+async function noteErrandEvents(owner: string, sessionId: string): Promise<boolean> {
+  let pass: ErrandPass | null = null;
+  try {
+    pass = await applyErrands(owner, sessionId);
+  } catch (err) {
+    logger.warn({ err, sessionId }, "assistant.errand_update_failed");
+    return false;
+  }
+  if (!pass) return false;
+  for (const n of pass.notices) {
+    await recordSystemNotice({ userId: n.userId, sessionId: n.routerSid, text: n.text, key: n.key, itemId: n.itemId, remote: n.remote })
+      .catch((err) => logger.warn({ err, itemId: n.itemId }, "assistant.errand_notice_failed"));
+  }
+  for (const r of pass.reports) await reportErrand(r).catch((err) => logger.warn({ err, itemId: r.itemId }, "assistant.errand_report_failed"));
+  return true;
+}
+
+/**
+ * A seat's task the user stopped (`work_stop`, its stop button), already closed: a card it waited on is closed unanswered, and a turn of
+ * it running is cancelled on its machine. One waiting in its seat's queue simply leaves it: nothing was sent there.
+ */
+async function cancelErrand(userId: string, p: Partial<ErrandParams>): Promise<void> {
+  try {
+    if (p.confirmation_id) {
+      await db.query(
+        `UPDATE claw_assistant_confirmations SET status = 'expired', decided_via = 'item_stopped', decided_at = NOW(),
+                result = jsonb_build_object('voided_reason', 'item_stopped')
+          WHERE confirmation_id = $1 AND user_id = $2 AND status = 'pending'`,
+        [p.confirmation_id, userId],
+      );
+    }
+    const sessionId = String(p.session_id ?? "");
+    if (!sessionId || !Array.isArray(p.open_cmd_seqs) || !p.open_cmd_seqs.length) return;
+    const s = await findSession(userId, sessionId);
+    if (!s || s.status !== "active") return;
+    // (Not noted on the session's own item: the end this cancel brings names the task's prompt, which that item passes over.)
+    const out = await inRemoteSessionOrder(sessionId, () => issueCommand({
+      owner: userId, client: ERRAND_CLIENT, connectorId: s.connector_id, agentId: s.agent_id, sessionId, type: "cancel",
+      cmdId: randomUUID(), payload: {}, auditDetail: REMOTE_COMMANDS.cancel.audit({}), closesSession: false,
+      commandsPerMinute: REMOTE_AGENT_LIMITS.commandsPerMinute,
+    }));
+    if (out.status === "queued") wakeConnector(s.connector_id);
+  } catch (err) {
+    logger.warn({ err }, "assistant.errand_cancel_failed");
   }
 }

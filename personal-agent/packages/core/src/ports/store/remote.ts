@@ -131,6 +131,11 @@ export interface NewRemotePermission {
 export interface RemotePermissionRepository {
   /** Recorded before it is shown; false when this request already has a row. */
   saveRemotePermission(permission: NewRemotePermission): boolean;
+  /**
+   * A request the agent keeps waiting on past its first wait (parked): pending again until `expiresAt`, unless it was answered or an
+   * answer is on its way. True when it waits now.
+   */
+  keepRemotePermission(sessionId: string, actionId: string, expiresAt: number): boolean;
   getRemotePermission(sessionId: string, actionId: string): RemotePermission | null;
   /** Pending and not run out, oldest first. */
   pendingRemotePermissions(userId: string, sessionId: string): RemotePermission[];

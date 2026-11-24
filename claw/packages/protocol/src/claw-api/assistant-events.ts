@@ -85,10 +85,47 @@ export interface AssistantConfirmWrite {
    * started for the person's own account holds for them (`claw_github_confirmations`, `assistant/review-items.ts`); the same decision
    * route answers it, and it is made exactly as `POST /v1/github-review/confirmations/{confirmation_id}/decision` makes it.
    */
-  kind: "trigger_create" | "trigger_cancel" | "github_comment" | "devenv_send" | "devenv_hide" | "skill_save" | "seat_role" | "seat_set" | "github_merge" | "github_review";
+  kind:
+    | "trigger_create"
+    | "trigger_cancel"
+    | "github_comment"
+    | "devenv_send"
+    | "devenv_hide"
+    | "skill_save"
+    | "seat_role"
+    | "seat_set"
+    | "seat_dispatch"
+    | "github_merge"
+    | "github_review";
   /** What the button that lets it through says, in the language of the text. */
   allow_label: string;
   expires_at: string;
+  /**
+   * Only on `seat_dispatch` when the router named several places a task could go (2 to 5): a choice card. A channel draws one button per
+   * option and one that cancels (`deny`); the button carries only the card, and the channel reads which option it was from its own record
+   * of the card, then posts `{decision: "allow", choice: option.id}`. Claw checks the choice is one it offered. A channel that cannot draw
+   * buttons shows the text; the person names the place in the chat.
+   */
+  options?: AssistantConfirmOption[];
+}
+
+/** One place a `seat_dispatch` choice card offers. */
+export interface AssistantConfirmOption {
+  /** Opaque, at most 64 characters (a seat's id, or `sandbox`). */
+  id: string;
+  /** The name the person confirmed for the seat, else `<machine>/<agent>`: one plain line of at most 40 code points. */
+  label: string;
+  /** The folder, as the machine reported it: shown as text only. */
+  detail?: string;
+}
+
+/**
+ * The body of `POST /v1/assistant/confirmations/{confirmation_id}/decision`. `choice` only on a card with `options`, and required there
+ * for `allow`: the `id` of the option picked.
+ */
+export interface AssistantConfirmationDecision {
+  decision: "allow" | "deny";
+  choice?: string;
 }
 
 /**
@@ -156,9 +193,10 @@ export interface AssistantRemoteNotice {
   /**
    * `resolved` (only for a terminal's request, `ask.origin` "terminal"): a request this channel was sent as a card was answered, or stopped
    * waiting, somewhere else (`resolved`), so a channel that still shows that card marks it so in place; the text says the same in one line
-   * for a channel that does not.
+   * for a channel that does not. `progress` (only for a task the assistant handed to a seat): the hourly line of a task that has run
+   * more than an hour, naming its latest step.
    */
-  kind: "done" | "needs_you" | "error" | "resolved";
+  kind: "done" | "needs_you" | "error" | "resolved" | "progress";
   session_id: string;
   machine: string;
   agent: string;
@@ -168,8 +206,15 @@ export interface AssistantRemoteNotice {
    */
   tool?: "claude" | "codex" | "cursor";
   ask?: AssistantRemoteAsk;
-  /** With `kind: "resolved"`: which request, and who ended it (`terminal`, or `timeout`, `session_end`, `connector_restart` when nobody did). */
+  /**
+   * With `kind: "resolved"`: which request, and who ended it (`terminal`, or `timeout`, `park_expired`, `session_end`, `connector_restart`
+   * when nobody did).
+   */
   resolved?: { action_id: string; by: string };
+  /** A task the assistant handed to a seat: its item number (`#N`). Absent for a session's own message. */
+  item_seq?: number;
+  /** A task the assistant handed to a seat: which seat; `alias` is the name the person confirmed for it, null when none. */
+  seat?: { seat_id: string; alias: string | null };
 }
 
 /** A permission request a development environment's agent waits on (`permissionRequest`), as its connector posted it. */
@@ -206,6 +251,11 @@ export interface AssistantRemoteAsk {
    * which withdraws the card (Codex).
    */
   terminal_asks?: TerminalAsks;
+  /**
+   * The request outlived its first wait and the connector keeps waiting (a task the assistant handed to a seat): `expires_at` is then
+   * when that longer wait ends. The one reminder Claw sends for it carries this.
+   */
+  parked?: true;
 }
 
 /** When a terminal asks a request that is also on a card, besides alongside it: see {@link AssistantRemoteAsk.terminal_asks}. */

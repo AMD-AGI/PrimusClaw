@@ -265,9 +265,13 @@ function redactedRemote(r: AssistantRemoteNotice): AssistantRemoteNotice {
         ...(r.ask.question_index !== undefined ? { question_index: r.ask.question_index } : {}),
         ...(r.ask.question_count !== undefined ? { question_count: r.ask.question_count } : {}),
         ...(r.ask.terminal_asks ? { terminal_asks: r.ask.terminal_asks } : {}),
+        ...(r.ask.parked ? { parked: true as const } : {}),
       },
     } : {}),
     ...(r.resolved ? { resolved: { action_id: r.resolved.action_id, by: r.resolved.by } } : {}),
+    // A task handed to a seat (`seat-dispatch.ts`): its number, and the seat with the name the user confirmed.
+    ...(r.item_seq !== undefined ? { item_seq: r.item_seq } : {}),
+    ...(r.seat ? { seat: { seat_id: r.seat.seat_id, alias: r.seat.alias === null ? null : redact(r.seat.alias) } } : {}),
   };
 }
 
@@ -1013,7 +1017,7 @@ export async function itemSession(q: Querier, itemId: string): Promise<{ session
  * it made now, as their next visit would (`getOrCreateAssistant`), so the message has a session that is read. Otherwise it would be
  * shown nowhere and, for a user with no channel, never be said.
  */
-async function ensureLiveAssistant(itemId: string): Promise<void> {
+export async function ensureLiveAssistant(itemId: string): Promise<void> {
   const row = (await db.query(
     `SELECT w.user_id, EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = a.session_id AND s.deleted_at IS NULL) AS live
        FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id WHERE w.item_id = $1`,

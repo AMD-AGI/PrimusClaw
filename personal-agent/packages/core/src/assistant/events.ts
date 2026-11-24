@@ -29,6 +29,7 @@ export const CONFIRM_KINDS = [
   "skill_save",
   "seat_role",
   "seat_set",
+  "seat_dispatch",
   "github_merge",
   "github_review",
 ] as const;
@@ -87,25 +88,80 @@ export function confirmActionOf(event: Event, exactCommand: (text: string) => bo
   return { channelMessageId, name, args };
 }
 
+/** One place a seat dispatch's choice card offers (`confirm_write.options`): what a press answers with, and what it shows. */
+export interface ConfirmOption {
+  /** What Claw is told was picked (a seat's id, or `sandbox`). */
+  readonly id: string;
+  /** The name the person gave the seat, else `<machine>/<agent>`: the button's words. */
+  readonly label: string;
+  /** The folder, as the machine reported it ("" none): shown as text only. */
+  readonly detail: string;
+}
+
+/** The fewest and the most places a seat dispatch's choice card offers (Claw sends 2 to 5). */
+export const CONFIRM_OPTIONS_MIN = 2;
+export const CONFIRM_OPTIONS_MAX = 5;
+/** Code points of an option's id, its label and its folder. */
+const CONFIRM_OPTION_ID_MAX = 64;
+const CONFIRM_OPTION_LABEL_MAX = 40;
+const CONFIRM_OPTION_DETAIL_MAX = 200;
+
 export interface ConfirmWrite {
   readonly confirmationId: string;
   readonly kind: (typeof CONFIRM_KINDS)[number];
   readonly allowLabel: string;
+  /** A choice card (`seat_dispatch` only): one button per option; absent for a card that is let through or not. */
+  readonly options?: readonly ConfirmOption[];
 }
 
-/** The write Claw holds for the person (`confirm_write` of an `assistant.say`); undefined when it carries none this worker draws. */
+/** One plain line: no control characters, spaces squashed; "" for anything else. */
+function plainLine(value: unknown, max: number): string {
+  // eslint-disable-next-line no-control-regex -- control characters are exactly what is refused
+  if (typeof value !== "string" || /[\u0000-\u001f\u007f\u2028\u2029]/u.test(value)) return "";
+  const line = pySplit(value).join(" ");
+  return cpLength(line) <= max ? line : "";
+}
+
+/**
+ * The places a seat dispatch's choice card offers, read whole or not at all (null): too few or too many, an id or a label that is
+ * not one plain line, or two alike, and there is no choice card. A folder that is not one plain line is left out (it is only shown).
+ */
+function confirmOptionsOf(raw: unknown): ConfirmOption[] | null {
+  if (!Array.isArray(raw)) return null;
+  const options: ConfirmOption[] = [];
+  for (const entry of raw as unknown[]) {
+    const option = record(entry);
+    const id = typeof option?.["id"] === "string" ? option["id"] : "";
+    const label = plainLine(option?.["label"], CONFIRM_OPTION_LABEL_MAX);
+    // eslint-disable-next-line no-control-regex -- an id a button's record carries back: no control characters, no spaces
+    if (!id || cpLength(id) > CONFIRM_OPTION_ID_MAX || /[\s\u0000-\u001f\u007f]/u.test(id) || !label) return null;
+    if (options.some((o) => o.id === id)) return null;
+    options.push({ id, label, detail: plainLine(option?.["detail"], CONFIRM_OPTION_DETAIL_MAX) });
+  }
+  return options.length >= CONFIRM_OPTIONS_MIN && options.length <= CONFIRM_OPTIONS_MAX ? options : null;
+}
+
+/**
+ * The write Claw holds for the person (`confirm_write` of an `assistant.say`); undefined when it carries none this worker draws. A
+ * seat dispatch that offers places it cannot read whole is none (its words still name them, for the person to answer in the chat):
+ * a card without them could only send a choice Claw refuses.
+ */
 export function confirmWriteOf(event: Event): ConfirmWrite | undefined {
   const confirm = record(event["confirm_write"]);
   if (event["type"] !== "assistant.say" || confirm === undefined) return undefined;
   const confirmationId = field(confirm["confirmation_id"]);
   const kind = CONFIRM_KINDS.find((k) => k === field(confirm["kind"]));
   if (!confirmationId || cpLength(confirmationId) > 64 || kind === undefined) return undefined;
+  const offered = kind === "seat_dispatch" && confirm["options"] !== undefined && confirm["options"] !== null;
+  const options = offered ? confirmOptionsOf(confirm["options"]) : undefined;
+  if (options === null) return undefined;
   return {
     confirmationId,
     kind,
     allowLabel: Array.from(pySplit(field(confirm["allow_label"])).join(" "))
       .slice(0, 40)
       .join(""),
+    ...(options ? { options } : {}),
   };
 }
 
@@ -233,17 +289,47 @@ export function choiceOf(event: Event): SayChoice | undefined {
 }
 
 export interface RemoteNotice {
-  /** `resolved`: a question a terminal asked no longer waits here (answered there, or given up); `resolved` says which. */
-  readonly kind: "done" | "needs_you" | "error" | "resolved";
+  /**
+   * `resolved`: a question a terminal asked no longer waits here (answered there, or given up); `resolved` says which. `progress`:
+   * the hourly line of a task handed to a seat that has run more than an hour (its words say all).
+   */
+  readonly kind: "done" | "needs_you" | "error" | "resolved" | "progress";
   readonly sessionId: string;
   readonly ask: Event | undefined;
   readonly machine: string;
   /** Who asked, as the person knows it: the tool's name (Claude Code, Codex, Cursor) when Claw said which, else the agent's id. */
   readonly agent: string;
   readonly resolved?: { readonly actionId: string; readonly by: string };
+  /** A task the assistant handed to a seat: its item number (`#N`); undefined for a session's own message. */
+  readonly itemSeq?: number;
+  /** A task the assistant handed to a seat: the name the person gave that seat ("" none). */
+  readonly seatAlias?: string;
+  /**
+   * The request outlived its first wait and the agent keeps waiting until `ask.expires_at` (`ask.parked`): the one reminder of a
+   * request whose card may be in the chat already.
+   */
+  readonly parked?: boolean;
 }
 
-const REMOTE_KINDS = new Set(["done", "needs_you", "error", "resolved"]);
+const REMOTE_KINDS = new Set(["done", "needs_you", "error", "resolved", "progress"]);
+/** Code points of a seat's name as a card says it (Claw sends at most 40). */
+const SEAT_ALIAS_MAX = 40;
+
+/**
+ * A seat's item number and its name, and whether a request is a parked one's reminder, as far as they are what Claw says they are;
+ * nothing of any of them otherwise.
+ */
+function seatOf(remote: Event, ask: Event | undefined): Pick<RemoteNotice, "itemSeq" | "seatAlias" | "parked"> {
+  const seq = remote["item_seq"];
+  const itemSeq = typeof seq === "number" && Number.isSafeInteger(seq) && seq > 0 ? seq : undefined;
+  const alias = plainLine(record(remote["seat"])?.["alias"], SEAT_ALIAS_MAX);
+  const parked = remote["kind"] === "needs_you" && ask?.["parked"] === true;
+  return {
+    ...(itemSeq !== undefined ? { itemSeq } : {}),
+    ...(alias ? { seatAlias: alias } : {}),
+    ...(parked ? { parked } : {}),
+  };
+}
 
 /**
  * The tools a terminal's question can come from (`remote.tool`, Claw names it when the connector said which), by the names their
@@ -274,11 +360,13 @@ export function remoteNoticeOf(event: Event): RemoteNotice | undefined {
   if (typeof sessionId !== "string" || !sessionId) return undefined;
   const resolved = kind === "resolved" ? resolvedOf(remote) : undefined;
   if (kind === "resolved" && resolved === undefined) return undefined;
+  const ask = record(remote["ask"]);
   return {
     ...(resolved ? { resolved } : {}),
+    ...seatOf(remote, ask),
     kind: kind as RemoteNotice["kind"],
     sessionId,
-    ask: record(remote["ask"]),
+    ask,
     machine: field(remote["machine"]),
     agent: toolName(remote["tool"]) ?? field(remote["agent"]),
   };

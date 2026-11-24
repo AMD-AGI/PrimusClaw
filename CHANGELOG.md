@@ -113,6 +113,12 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: tasks handed to the user's seats (for users with seats; `CLAW_DEVENV_SEAT_DISPATCH=off` turns it off). `work_create` takes
+  `target: "seat:<seat_id>"`, or 2 to 5 places for a choice card (`confirm_write.options`, decided with `choice`). Each task is its own
+  remote item; a card is required unless the user's own attended message names one confirmed seat they already approved a card for
+  (and did not ask to confirm each time, and its agent asks before it acts). One task runs per seat, up to three queue; a terminal in use
+  is not typed into; the end wakes the router; permission requests are pushed with the item number and seat, parked requests reminded
+  once; a task running over an hour is said hourly with its latest step. Prompt `router-dispatch-v1`. See `claw/docs/remote-agents.md`.
 - Claw: a sandbox template of an app manifest can mount host directories read-only, `sandbox_templates[].host_mounts:
   [{ "hostPath": "/shared/team/cache", "readOnly": true }]`, for example a cache the application writes through the
   workspace's read-write mount and its measurement sandboxes only read. Each mount is a hostPath volume of the Agent
