@@ -104,6 +104,7 @@ export const ADDED_COLUMNS: readonly (readonly [string, readonly (readonly [stri
       ["render_json", "TEXT NOT NULL DEFAULT ''"],
     ],
   ],
+  ["assistant_confirm_cards", [["options_json", "TEXT NOT NULL DEFAULT '[]'"]]], // a choice card's places; '[]' none
   [
     "pending_requests",
     [

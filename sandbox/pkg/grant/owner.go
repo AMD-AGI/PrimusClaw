@@ -237,6 +237,9 @@ func (s *Service) prepareOwnerPolicy(ctx context.Context, p OwnerPolicy) (*owner
 	if err != nil {
 		return nil, err
 	}
+	if err := validateSpecKeys(stored, "invalid_owner_policy"); err != nil {
+		return nil, err
+	}
 	if err := validateTemplateResources(stored, "invalid_owner_policy"); err != nil {
 		return nil, err
 	}

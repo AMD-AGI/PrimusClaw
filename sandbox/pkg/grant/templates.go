@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path"
 	"strings"
+	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -95,6 +97,135 @@ func validateTemplateLayers(templates []runtimev1alpha1.GrantTemplate) error {
 		}
 		if err := sandboxlayer.Validate(base.template.Layers, sandboxlayer.TemplateMounts(base.template)); err != nil {
 			return opWrap(http.StatusBadRequest, "invalid_grant", "template "+tpl.Name+" layers are invalid", err)
+		}
+	}
+	return nil
+}
+
+// validateTemplateMounts rejects a grant template whose hostPath volumes are
+// anything but read-only host directories mounted at their own path. A grant
+// template comes from an application platform, which lets a template reach a
+// host path only through a mount it has checked against the workspace (an
+// absolute, clean path under a directory the workspace mounts for
+// sandboxes, outside the system directories, which this check refuses as
+// well): the sandbox workload mounts each hostPath volume read-only at
+// the same path and has no field for another mount path, so any other shape
+// would not be what it says. Volumes of other sources are not this check's.
+//
+// A read-only mount nested inside a read-write workspace mount (workspace
+// /shared, template /shared/team/cache) relies on the nested mount being
+// applied after its parent. The workload's mounts are ordered by path depth
+// before the pod is made, and the runtimes order them again: Kubernetes CRI
+// runtimes and the Docker daemon sort a container's mounts by path depth, and
+// Apptainer sorts its user binds the same way.
+func validateTemplateMounts(templates []runtimev1alpha1.GrantTemplate) error {
+	for _, tpl := range templates {
+		base, ok, err := templateFromSpec(tpl.Spec)
+		if err != nil {
+			return specError("invalid_grant", tpl.Name, err)
+		}
+		if !ok {
+			continue
+		}
+		if err := checkTemplateMounts(base.template); err != nil {
+			return opWrap(http.StatusBadRequest, "invalid_grant", "template "+tpl.Name+": "+err.Error(), err)
+		}
+	}
+	return nil
+}
+
+// checkTemplateMounts holds one template to validateTemplateMounts.
+func checkTemplateMounts(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate) error {
+	hostPaths := map[string]string{}
+	names := map[string]bool{}
+	for _, vol := range tmpl.Volumes {
+		if names[vol.Name] {
+			return fmt.Errorf("volume %q is defined twice", vol.Name)
+		}
+		names[vol.Name] = true
+		if vol.HostPath == nil {
+			continue
+		}
+		if vol.VolumeSource != (corev1.VolumeSource{HostPath: vol.HostPath}) {
+			return fmt.Errorf("volume %q sets a hostPath and another source", vol.Name)
+		}
+		if err := checkMountPath(vol.HostPath.Path); err != nil {
+			return fmt.Errorf("volume %q: %w", vol.Name, err)
+		}
+		hostPaths[vol.Name] = vol.HostPath.Path
+	}
+	mounted := map[string]bool{}
+	for _, m := range tmpl.VolumeMounts {
+		if !names[m.Name] {
+			return fmt.Errorf("volume mount %q names no volume of the template", m.Name)
+		}
+		hostPath, ok := hostPaths[m.Name]
+		if !ok {
+			continue
+		}
+		if mounted[m.Name] {
+			return fmt.Errorf("volume %q is mounted twice", m.Name)
+		}
+		mounted[m.Name] = true
+		if m.MountPath != hostPath || m.SubPath != "" {
+			return fmt.Errorf("volume %q must be mounted at its hostPath %s, without subPath", m.Name, hostPath)
+		}
+		if m.ReadOnly != nil && !*m.ReadOnly {
+			return fmt.Errorf("volume %q must be mounted read-only", m.Name)
+		}
+	}
+	for name := range hostPaths {
+		if !mounted[name] {
+			return fmt.Errorf("volume %q is not mounted", name)
+		}
+	}
+	// A sidecar mounts a volume with Kubernetes' own default, read-write: a
+	// host directory is the main container's alone.
+	for _, c := range tmpl.Sidecars {
+		for _, m := range c.VolumeMounts {
+			if _, ok := hostPaths[m.Name]; ok {
+				return fmt.Errorf("sidecar %q mounts host directory volume %q", c.Name, m.Name)
+			}
+		}
+		for _, d := range c.VolumeDevices {
+			if _, ok := hostPaths[d.Name]; ok {
+				return fmt.Errorf("sidecar %q uses host directory volume %q as a device", c.Name, d.Name)
+			}
+		}
+	}
+	return nil
+}
+
+// systemPaths are the host directories a template's hostPath volume may not
+// be, be under, or be above. /var and / are refused as the parents of
+// /var/run, /var/lib and everything else.
+var systemPaths = []string{
+	"/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/proc", "/root", "/run",
+	"/sbin", "/sys", "/tmp", "/usr", "/var/lib", "/var/run", "/var/tmp",
+}
+
+// pathWithin reports whether p is root or lies under it; both are clean and absolute.
+func pathWithin(root, p string) bool {
+	return p == root || strings.HasPrefix(p, root+"/")
+}
+
+// checkMountPath accepts an absolute, clean path other than / that a bind
+// spec can carry (no ':' or ',', no blank or control character) and that is
+// not a system directory, under one, or above one. It checks the decoded
+// template, so a key the JSON decoder folds onto hostPath (hoſtPath, with
+// U+017F) is checked like hostPath itself.
+func checkMountPath(p string) error {
+	if !strings.HasPrefix(p, "/") || p == "/" || path.Clean(p) != p {
+		return fmt.Errorf("hostPath %q must be an absolute, clean path other than /", p)
+	}
+	for _, r := range p {
+		if r == ':' || r == ',' || unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("hostPath %q must not contain ':', ',', a blank or a control character", p)
+		}
+	}
+	for _, s := range systemPaths {
+		if pathWithin(s, p) || pathWithin(p, s) {
+			return fmt.Errorf("hostPath %q must not be, be under, or contain the system directory %s", p, s)
 		}
 	}
 	return nil

@@ -484,3 +484,51 @@ test("a choice is radio buttons (check boxes for several) whose places are the v
   assert.deepEqual(texts(body(sent)), ["✅ You picked: a, c", "Which?"]);
   assert.deepEqual(actions(sent), [], "nothing left to press");
 });
+
+test("a seat dispatch's choice card is a button for each place, its folder under it as text, and Cancel", () => {
+  const choice = cardOf(
+    assistantRenderers.confirmWrite({
+      text: "两个工位都合适，交给哪里？",
+      cardId: "c9",
+      allowLabel: "发送",
+      kind: "seat_dispatch",
+      options: [
+        { label: "发布台", detail: "~/rel_[x](http://e.x)" },
+        { label: "mi300/claude", detail: "" },
+        { label: "沙箱", detail: "" },
+      ],
+      lang: "zh",
+    }),
+  );
+  valid(choice);
+  assert.deepEqual(texts(body(choice)), ["⚠️ 交给哪里？", "两个工位都合适，交给哪里？", "~/rel\\_\\[x\\](http://e.x)"]);
+  const sets = body(choice).filter((e) => e["type"] === "ActionSet");
+  assert.deepEqual(
+    sets.map((set) => (set["actions"] as JsonObject[]).map((a) => [a["title"], a["data"]])),
+    [
+      [["发布台", { primusclaw: "assistant_confirm", op: "allow", card: "c9", pick: "0" }]],
+      [["mi300/claude", { primusclaw: "assistant_confirm", op: "allow", card: "c9", pick: "1" }]],
+      [["沙箱", { primusclaw: "assistant_confirm", op: "allow", card: "c9", pick: "2" }]],
+    ],
+  );
+  assert.deepEqual(
+    actions(choice).map((a) => [a["title"], a["data"]]),
+    [["取消", { primusclaw: "assistant_confirm", op: "deny", card: "c9" }]],
+  );
+  // One seat: the card lets it through or not, as any held write.
+  const one = cardOf(
+    assistantRenderers.confirmWrite({
+      text: "交给 发布台？",
+      cardId: "c8",
+      allowLabel: "发送",
+      kind: "seat_dispatch",
+      options: [],
+      lang: "zh",
+    }),
+  );
+  valid(one);
+  assert.deepEqual(
+    actions(one).map((a) => a["title"]),
+    ["发送", "不要"],
+  );
+});

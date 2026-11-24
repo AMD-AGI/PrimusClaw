@@ -103,7 +103,7 @@ it("a remote notice names its session and kind", () => {
   });
   for (const bad of [
     { type: "assistant.say", remote: { kind: "started", session_id: "rs-1" } },
-    { type: "assistant.say", remote: { kind: "progress", session_id: "rs-1" } },
+    { type: "assistant.say", remote: { kind: "later_kind", session_id: "rs-1" } },
     { type: "assistant.say", remote: { kind: "done" } },
     { type: "assistant.say", remote: { kind: "done", session_id: "" } },
     { type: "work_item.needs_you", remote: { kind: "done", session_id: "rs-1" } },
