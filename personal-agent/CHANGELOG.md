@@ -15,7 +15,45 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
-## Unreleased
+## 0.13.0
+
+A minor release, because core's exported API changes incompatibly: `groupLangOf` no longer takes the sender's id and
+locale, and `AskerLanguages` is no longer exported (#897). No plugin port (core's `src/plugins/`) changed, and the store is
+unchanged: nothing to do for a deployment of the published packages. A seat card from Claw (what a folder on the person's
+machine is for) is drawn with its buttons (#910), a result Claw delivered without an Accept is shown as delivered instead
+of with an Accept button (#875), a group message that says no language of its own is answered in English (#897), and a
+forward whose words answer a waiting question card reaches Claw with the answer (#914).
+
+**Claw:** seat cards are sent by claw-v0.5.13 and later with seats turned on (`CLAW_DEVENV_SEATS`); a worker before
+0.13.0 shows such a card's words with no buttons, so it cannot be answered by a press. The delivered card needs a Claw
+that delivers a result without an Accept (claw-v0.5.8 and later, `CLAW_ASSISTANT_AUTO_DELIVER`); with any other Claw
+nothing changes.
+
+**Breaking for code that uses core's exports directly:** In `@primusclaw/personal-agent`, `groupLangOf` takes
+`(store, conversationId, written)` instead of `(store, conversationId, userId, locale, written)`, since a group's
+language no longer reads the sender's own, and `AskerLanguages` (each member's last language in a group) is removed
+(#897). A surface of one's own also has a new view to draw, `workDelivered` (`WorkDeliveredModel`; a registry typed
+over every key of `ViewMap` needs its renderer, as Teams' has) (#875), and two more held-write kinds, `seat_role` and
+`seat_set`, in `ConfirmWriteModel` (#910).
+
+### Added
+
+- `@primusclaw/personal-agent`: a seat card from Claw is drawn as a held write's card with its buttons (held-write kinds
+  `seat_role` and `seat_set`). A seat is one folder an agent works in on one of the person's machines; Claw asks the
+  person to confirm what it guessed the seat is for (Right keeps it, Deny marks the seat as not to be used), or to keep
+  what the person said it is for. What came of a press is said in one line in both languages: what was kept (the seat's
+  alias and role), that the seat is marked as not to be used, that nothing changed, that the card expired or was already
+  answered, that the guess was replaced or the seat is gone, or why it could not be kept. Until now such a card showed
+  only its words, which ask for a press, and no buttons. Needs claw-v0.5.13 or later with seats on (#910).
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: a result Claw delivered without an Accept (an
+  item's `delivered_version` and `watching_pr`, or a board row's `params.delivered` and `params.watching_pr`) is shown
+  as a card that says so, in place of the card with Accept: the item, "v2 delivered" / 「v2 已交付」, or "v1 delivered; still
+  watching PR owner/repo#7" / 「v1 已交付，继续盯 PR owner/repo#7」, the assistant's words when they fit, and "Reply to me to
+  have it changed." / 「要改直接回复我。」, with no buttons. A say that puts a choice or offers replies of its own keeps them,
+  and the system's own notice of the delivery is its words alone. An Accept pressed on a card drawn before the delivery
+  says the result was delivered and there is nothing to accept, and the refusal to retry at the running-task limit no
+  longer says to accept a task. Core adds `WorkItem.delivered` (optional), `Delivered`, `deliveredOf` and the
+  `workDelivered` view. Works with any Claw: without these fields nothing changes (#875).
 
 ### Fixed
 
@@ -25,14 +63,14 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   writes Chinese to the bot got Chinese help in a group of English speakers. Words of their own still pick the language
   ("你能做什么" gets Chinese help), and a group set with `/lang zh|en` keeps its language; such a turn is asked for an English
   answer too (`[Reply language: English]`), even when the sender's last question in the group was in another (a group no
-  longer remembers each member's last language), and its own texts say the same language as the line. An answered question card in a group follows the group, the reply's words or the
-  question, never the sender's own language. A 1:1 chat is unchanged: the approval card a group binding sends to the
+  longer remembers each member's last language), and its own texts say the same language as the line. An answered question card in a group follows the group, the
+  reply's words or the question, never the sender's own language. A 1:1 chat is unchanged: the approval card a group binding sends to the
   binder's 1:1 chat, and what its click and settled card say, stay in that chat's language; only the group's notice that
-  it waits follows the group.
+  it waits follows the group (#897).
 - A message that forwards messages and whose words answer a question card waiting in the chat no longer loses what it
   forwards. The words answered the card, and the forwarded messages, which no other message carried, never reached Claw.
   They now go to Claw with the answer, before its words, as they go with a new message; the card still shows only the
-  words. This holds in a group and in a 1:1 chat; a forward with no words still goes on as a new message.
+  words. This holds in a group and in a 1:1 chat; a forward with no words still goes on as a new message (#914).
 
 ## 0.12.0
 
