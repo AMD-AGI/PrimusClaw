@@ -37,6 +37,7 @@ import { callMemoryLLM } from "../llm/client.js";
 import { issueCommand, listConnectors, sessionActivity, wakeConnector, workspacesOf, type Row } from "../remote-agents/store.js";
 import { inertMd, readSession } from "./devenv-tools.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
+import { briefLanguage } from "./brief.js";
 import { langOf } from "./remote-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
@@ -87,9 +88,19 @@ export const ROSTER_MAX = 40;
 /** A refresh of one seat at most this often. */
 const REFRESH_MIN_MS = 60 * 60_000;
 
-/** The one question a seat's session is ever asked, word for word. */
-export const PROBE_TEXT = "Please describe in two or three sentences what you are responsible for in this directory and what you have been working "
-  + "on recently. Only answer; do not run any tool or change anything.";
+/**
+ * The one question a seat's session is ever asked, word for word, in the user's language. It opens with a plain line saying who asks
+ * and why: a chat attached to that session shows the question and its answer like any other turn.
+ */
+export const PROBE_TEXTS = {
+  en: "(Clawy, read-only: asked once to learn what this folder's session is for; nothing will be changed.)\n\n"
+    + "Please describe in two or three sentences what you are responsible for in this directory and what you have been working "
+    + "on recently. Only answer; do not run any tool or change anything.",
+  zh: "（Clawy 只读询问：只问这一次，用来了解这个目录里的会话负责什么；不会改动任何东西。）\n\n"
+    + "请用两三句话说明你在这个目录里负责什么、最近在做什么。只回答，不要运行任何工具，也不要改动任何东西。",
+} as const;
+/** The question in `lang`. */
+export const probeText = (lang: "zh" | "en"): string => PROBE_TEXTS[lang];
 /** The client the question is sent as: what marks it, in the session's events (`user_prompt.client`), as Claw's and not the user's. */
 export const PROBE_CLIENT = "seat_probe";
 /** The command id of a seat's `n`th question. */
@@ -637,7 +648,7 @@ export async function seatInputs(q: Querier, seat: Row, onlineWindowMs: number =
     }
     const p = flat(r.text, PROMPT_HEAD);
     // (the question itself, replayed by a transcript, is not the user's)
-    if (!p || PROBE_TEXT.startsWith(p.replace(/…$/, "")) || prompts.includes(p)) continue;
+    if (!p || Object.values(PROBE_TEXTS).some((t) => flat(t, 4096)!.startsWith(p.replace(/…$/, ""))) || prompts.includes(p)) continue;
     if (prompts.length < PROMPTS_MAX) prompts.push(p);
   }
   const vocabulary = tagVocabulary(git?.git_remote ?? null, git?.git_branch ?? null);
@@ -731,11 +742,12 @@ async function probeOutcome(q: Querier, seat: Row, now: number): Promise<{ state
 
 /**
  * Put the question to the seat's session: a prompt that may only answer, sent as Claw's (`seat_probe`), never filed as the user's item.
- * Its `user_prompt` names that client, and a chat attached to the session (personal-agent's reader) shows nothing of its turn.
+ * Its `user_prompt` names that client. A chat attached to the session shows it and its answer like any other turn; its first line says
+ * who asks and why.
  */
 async function ask(seat: Row, activity: Row): Promise<boolean> {
   const n = Number(seat.probes_sent) + 1;
-  const parsed = REMOTE_COMMANDS.prompt.parse({ text: PROBE_TEXT, answer_only: true });
+  const parsed = REMOTE_COMMANDS.prompt.parse({ text: probeText(await briefLanguage(String(seat.owner_user_id))), answer_only: true });
   if (!parsed.ok) return false;
   const out = await issueCommand({
     owner: String(seat.owner_user_id), client: PROBE_CLIENT, connectorId: String(seat.connector_id), agentId: String(activity.agent_id),
@@ -825,8 +837,8 @@ async function sweepUser(owner: string, now: number, onlineWindowMs: number, res
   )).rows as Row[]) {
     const got = await probeOutcome(q, seat, now);
     if (!got) continue;
-    // (Nothing is ever cancelled here: only a connector that refuses every permission in the question's turn is asked, so a permission
-    // request in that session is a turn of the user's, which must not be stopped.)
+    // (Nothing is ever cancelled here, a timed-out question included: a cancel stops whatever runs in the session, and a prompt of the
+    // user's may have just come in. A question's turn that still runs shows as a turn in progress; the user's own prompt stops it.)
     if (got.state === "answered") result.answered += 1;
     await q("UPDATE claw_devenv_seats SET probe_state = $2, probe_answer = $3, updated_at = NOW() WHERE seat_id = $1", [seat.seat_id, got.state, got.answer]);
   }

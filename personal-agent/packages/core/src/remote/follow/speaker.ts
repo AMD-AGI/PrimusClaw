@@ -114,7 +114,7 @@ export class BurstSpeaker {
   }
 
   settleAt(cursor: string): void {
-    if (!this.turn.hiding) this.safe = cursor; // (never past the start of a turn Claw put for itself: a reader after this one hides it too)
+    this.safe = cursor;
   }
 
   /** Milliseconds until the text that waits is due, 0 when it is, null when none waits (then only an event can matter). */
@@ -175,7 +175,7 @@ export class BurstSpeaker {
     this.turn.takeAnswer();
     this.sent = [];
     this.pendingSince = null;
-    this.settleAt(cursor);
+    this.safe = cursor;
   }
 
   private mayWake(): boolean {

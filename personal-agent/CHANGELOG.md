@@ -19,13 +19,6 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
 
 ### Fixed
 
-- A chat attached to a session never shows a turn Claw put to that session for itself: Claw's one question of what a seat
-  handles (claw seats, `seat_probe`), whose answer is Claw's alone. Its prompt (`user_prompt`, naming that client) starts it
-  and its end ends it; none of its text, steps or mode switches reach the chat, whether the chat follows the session between
-  turns, reads its own turn queued behind it, or attaches while it runs (it is not the session at work then). No reader writes
-  the read position past its start while it runs, so a worker that restarts, a stream that is given up, or a chat that attaches
-  in the middle of it hides the rest too. `RemoteStep` (exported from core) has a new field, `prompted`; code
-  that builds one itself, not through `remoteStep`, must set it (null).
 - `@primusclaw/personal-agent`: in a group chat with no language set (or set to follow the asker), a message that says no
   language of its own ("help", the bare @mention, `/whoami`, "ok #3") is answered in English. It was answered in the
   sender's own language, the one their 1:1 messages were written in or their Teams client's, so "help" from a member who

@@ -83,11 +83,6 @@ export interface RemoteStep {
   readonly terminalMode: string | null;
   /** The conversation id the agent runs the session under on the machine. */
   readonly acp: string | null;
-  /**
-   * A prompt Claw queued for the session (its `user_prompt`): Claw's number of it, and whether Claw put it for itself
-   * ({@link CLAW_OWN_CLIENTS}: no chat shows its turn). Null for every other event.
-   */
-  readonly prompted: { readonly seq: number; readonly own: boolean } | null;
 }
 
 export const NOTHING: RemoteStep = Object.freeze({
@@ -121,7 +116,6 @@ export const NOTHING: RemoteStep = Object.freeze({
   terminal: null,
   terminalMode: null,
   acp: null,
-  prompted: null,
 });
 
 /** A step that says only `fields`. */
@@ -379,20 +373,7 @@ function failed(payload: Json, _kind: string, errors: PublicErrors): RemoteStep 
   });
 }
 
-/**
- * The clients Claw puts a prompt to a session as, for itself and not for the person: Claw's question of what a seat handles
- * (`seat_probe`, an answer-only turn whose answer is Claw's alone). Their `user_prompt` names the client.
- */
-export const CLAW_OWN_CLIENTS: ReadonlySet<string> = new Set(["seat_probe"]);
-
-/** What was asked (`user_prompt`, written by Claw as it queues a prompt): its number, and whether Claw put it for itself. */
-function userPrompt(payload: Json): RemoteStep {
-  const seq = seqOf(payload["cmd_seq"]);
-  return seq === null ? NOTHING : remoteStep({ prompted: { seq, own: CLAW_OWN_CLIENTS.has(str(payload["client"])) } });
-}
-
 const READERS: Readonly<Record<string, Reader>> = {
-  user_prompt: userPrompt,
   agent_message_chunk: chunk,
   agent_thought_chunk: chunk,
   user_message_chunk: typed,

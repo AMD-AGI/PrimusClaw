@@ -12,7 +12,6 @@ import { type RemoteStep } from "./events.js";
 import type { JsonObject } from "../json.js";
 import { recordOf, textOf } from "./fields.js";
 import { noteStep } from "./follow/steps.js";
-import { OwnTurns } from "./turn-state.js";
 
 /** Events read per page of the replay; a shorter page is the last. */
 export const TAIL_PAGE = 1000;
@@ -62,19 +61,10 @@ export class TailFold {
   private open = false;
   private readonly asked = new Map<string, Readonly<Record<string, unknown>>>();
   private readonly steps = new Map<string, boolean>();
-  private readonly own = new OwnTurns();
 
-  /**
-   * One row and what it decoded to. A replayed event is not the session's own: it moves nothing, not even the cursor. A turn Claw
-   * put to the session for itself is nothing here either, and while it is open the tail's cursor stays before its start, so the
-   * reader that starts there hides the rest of it.
-   */
+  /** One row and what it decoded to. A replayed event is not the session's own: it moves nothing, not even the cursor. */
   add(rowId: string, step: RemoteStep): void {
     if (step.replay) return;
-    if (this.own.hides(rowId, step)) {
-      this.cursor = rowId;
-      return;
-    }
     this.noteModes(step);
     if (step.finished) {
       this.open = false;
@@ -102,7 +92,7 @@ export class TailFold {
 
   result(): SessionTail {
     return {
-      cursor: this.own.hold(this.cursor, this.cursor),
+      cursor: this.cursor,
       mode: this.mode,
       modes: this.modes ?? [],
       unattended: this.unattended,

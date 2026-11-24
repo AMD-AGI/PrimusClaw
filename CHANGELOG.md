@@ -119,7 +119,8 @@ release version, and its `appVersion` stays `latest`.
   Claw's guess (one tool-less model call with a schema-bounded answer, from the folder, its git remote and branch, the conversations'
   titles, the start of the user's last 20 prompts there and, once per seat, the session's answer to one fixed question asked only while
   it is idle and quiet for ten minutes, as an answer-only turn, and only of a connector that holds such a turn to a read-only mode and
-  a session that asks; a chat attached to that session never shows that turn, which needs the personal-agent release after 0.12.0).
+  a session that asks; the question opens with a line saying Clawy asks it, read-only, once, so a chat attached to that session that
+  shows it is understood).
   The router never reads a guess: a waiting guess card is named to it by its machine and reference only. `seat_roster` lists only what Claw computed or the user confirmed (no tags: a branch's name is the machine's)
   and does not mark the turn; `devenv_list` and `GET /v1/remote-agents/seats` show each seat's alias and confirmed role. Shown only: nothing
   is sent to a seat because of its role. See `claw/docs/remote-agents.md`, "Seats".

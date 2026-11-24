@@ -380,7 +380,8 @@ describe("seats", { skip }, () => {
     let sent = await prompts(cid);
     assert.equal(sent.length, 1);
     assert.equal(sent[0]!.session_id, sid);
-    assert.deepEqual(sent[0]!.payload, { text: seats.PROBE_TEXT, answer_only: true });
+    assert.deepEqual(sent[0]!.payload, { text: seats.probeText("en"), answer_only: true });
+    assert.match(String(sent[0]!.payload.text), /^\(Clawy, read-only: asked once/, "it says who asks and why, for a chat attached to the session");
     assert.match(String(sent[0]!.cmd_id), /^seat-probe:seat_/);
     const asked = (await w.q("SELECT data FROM claw_remote_events WHERE session_id = $1 AND type = 'user_prompt'", [sid]))[0]!.data;
     assert.equal(asked.client, seats.PROBE_CLIENT, "marked as Claw's question, not the user's");
@@ -390,13 +391,17 @@ describe("seats", { skip }, () => {
     // The answer comes: kept (its end) as the guess's input; nothing is said to the user, no item.
     const cmdSeq = Number((await w.q("SELECT probe_cmd_seq FROM claw_devenv_seats WHERE cwd = '/home/u/hl-ci'"))[0]!.probe_cmd_seq);
     await w.q("DELETE FROM claw_remote_commands WHERE connector_id = $1", [cid]);
-    await events("alice", cid, sid, [chunk("I maintain the Hyperloom CI fixes in this checkout; "), chunk("lately the flaky e2e job."), ["turn_end", { stopReason: "end_turn", cmd_seq: cmdSeq }]]);
+    await events("alice", cid, sid, [
+      ["user_message_chunk", { update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: seats.probeText("en") } } }],
+      chunk("I maintain the Hyperloom CI fixes in this checkout; "), chunk("lately the flaky e2e job."), ["turn_end", { stopReason: "end_turn", cmd_seq: cmdSeq }],
+    ]);
     guessAnswer = { role: "修 Hyperloom CI，最近在处理不稳定的 e2e 作业", alias: "hl-ci", tags: [] };
     await sweep();
     let seat = (await seatRows())[0]!;
     assert.equal(seat.probe_state, "answered");
     assert.match(String(seat.probe_answer), /flaky e2e job/);
     assert.equal(guessInputs.at(-1)!.answer, seat.probe_answer, "the guess was made with the answer");
+    assert.ok(!guessInputs.at(-1)!.prompts.some((p: string) => p.includes("Clawy")), "the question, as the transcript echoes it, is not the user's");
     assert.equal(await items(), before);
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_says WHERE user_id = 'alice'"))[0].n, 0, "nothing said to the user");
     assert.equal((await prompts(cid)).length, 0);
@@ -411,6 +416,7 @@ describe("seats", { skip }, () => {
     sent = await prompts(cid);
     assert.equal(sent.length, 1, "asked once more after the refresh");
     assert.match(String(sent[0]!.cmd_id), /:2$/);
+    assert.equal(sent[0]!.payload.text, seats.probeText("zh"), "asked in the user's language (their latest message)");
     seat = (await seatRows())[0]!;
     assert.deepEqual([seat.probes_sent, seat.probes_allowed], [2, 2]);
   });

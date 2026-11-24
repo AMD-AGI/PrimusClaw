@@ -104,22 +104,3 @@ test("a full page that names no row past the cursor ends the tail rather than be
   assert.equal(asks, 1);
   assert.equal(tail.cursor, "");
 });
-
-test("a turn Claw put to the session for itself is not the session at work, and the tail stops before it while it runs", async () => {
-  const rows = (more: EventRow[] = []): EventRow[] => [
-    { id: "10", type: "agent_message_chunk", data: { update: { content: { text: "done" } } } },
-    { id: "11", type: "turn_end", data: { stopReason: "end_turn", cmd_seq: 1 } },
-    { id: "12", type: "user_prompt", data: { text: "What do you handle?", cmd_seq: 2, client: "seat_probe" } },
-    { id: "13", type: "mode_update", data: { currentMode: "plan" } },
-    { id: "14", type: "agent_message_chunk", data: { update: { content: { text: "I handle billing" } } } },
-    ...more,
-  ];
-  const tailOf = (list: EventRow[]) => readTail(() => Promise.resolve(list), decodeStep);
-  const running = await tailOf(rows());
-  assert.equal(running.cursor, "11"); // (a reader that starts here reads the question, and hides the rest of its turn)
-  assert.equal(running.active, false);
-  assert.equal(running.mode, null); // (the read-only mode of that turn is not the session's own)
-  const ended = await tailOf(rows([{ id: "15", type: "turn_end", data: { stopReason: "end_turn", cmd_seq: 2 } }]));
-  assert.equal(ended.cursor, "15");
-  assert.equal(ended.active, false);
-});

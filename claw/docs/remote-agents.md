@@ -673,9 +673,11 @@ of two sources:
   the router's prompt, whose answer is kept only if it fits the schema (a role that is a description, an alias that is a name, tags
   only from Claw's own slugs of the folder's git remote and branch). Its inputs are data: the folder, its git remote and branch, the
   titles of its conversations, the start (80 characters) of the user's last 20 prompts there, and once per seat (again only when the
-  user asks for a refresh, `seat_set{refresh: true}`) the session's own answer to one fixed question: *"Please describe in two or
-  three sentences what you are responsible for in this directory and what you have been working on recently. Only answer; do not
-  run any tool or change anything."* It is asked only in a session open through Claw that is idle with nothing in it for ten minutes,
+  user asks for a refresh, `seat_set{refresh: true}`) the session's own answer to one fixed question, in the user's language (that of their latest message; English
+  when there is none): *"(Clawy, read-only: asked once to learn what this folder's session is for; nothing will be changed.)
+  Please describe in two or three sentences what you are responsible for in this directory and what you have been working on
+  recently. Only answer; do not run any tool or change anything."* Its first line is there for the person: a chat attached to that
+  session shows the question and its answer like any other turn. It is asked only in a session open through Claw that is idle with nothing in it for ten minutes,
   and no conversation of that folder open in a terminal busy or typed into within ten minutes. It is sent as Claw's (`client:
   seat_probe` on its `user_prompt` event, command id `seat-probe:<seat>:<n>`), filed as no item, with `answer_only: true`, and only
   where that turn is held to answering on the machine: the agent's capabilities say `answer_only` (an older connector's do not, and
@@ -686,8 +688,11 @@ of two sources:
   refuses the prompt (`answer_only_unsupported`) where it cannot do that. The user comes first: the prompt is refused
   (`answer_only_busy`) while a turn runs or prompts wait in that session; a prompt of the user's stops that turn and runs next; a
   `set_mode` sent during it stops it and is set once it ended, never while it runs. The read-only mode is never made the session's
-  own: an agent that dies in that turn comes back in the session's mode. Claw never cancels anything in that session: a permission
-  request there is a turn of the user's. A question refused or stopped is not put again (only a refresh the user asks for does).
+  own: an agent that dies in that turn comes back in the session's mode. Claw never cancels anything in that session: a cancel
+  stops whatever runs there, and a prompt of the user's may have just come in. A question not answered within 15 minutes is given up
+  (`timed_out`) and the guess is made without it; should its turn still run, the session shows a turn in progress until the user
+  stops it or sends a prompt, which stops it. A question refused, stopped or given up is not put again (only a refresh the user asks
+  for does). The answer is data to the guess and nothing else: it is never shown as Claw's words, and it only shapes a suggestion card.
 
 `seat_roster` (a router read) lists the seats with only what Claw computed or the user confirmed: `seat_id`, `alias`, the confirmed
 `role`, `role_state` (`new`, `suggested`, `confirmed`, `retired`), `machine_online`, `state` (from the types of the session's

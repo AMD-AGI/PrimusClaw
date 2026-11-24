@@ -15,7 +15,6 @@ import { remoteText } from "../locales/remote.js";
 import type { RemoteState } from "../ports/store/remote.js";
 import { type Conversation, textMessage } from "../ports/surface.js";
 import { type RemoteStep, decode } from "./events.js";
-import { OwnTurns } from "./turn-state.js";
 import { noAskLine, readOnlyRefused, rowUnreadableLine } from "./lines.js";
 import { neutral } from "../text/neutral.js";
 import type { StatusBoard } from "./board.js";
@@ -92,23 +91,20 @@ export class Watches {
     signal: AbortSignal,
   ): Promise<RemoteStep | null> {
     const state = this.state.attached(chatKey);
-    const from = state?.sessionId === sessionId ? state.cursor : "";
-    let cursor = from;
-    const own = new OwnTurns(); // (a turn Claw put to the session for itself is nothing here, and the position stays before it)
+    let cursor = state?.sessionId === sessionId ? state.cursor : "";
     const limit = AbortSignal.any([signal, AbortSignal.timeout(seconds * 1000)]);
     try {
       for await (const event of this.ctx.claw.stream(await credential(), sessionId, cursor || undefined, limit)) {
         const step = decode(event, this.ctx.errors);
         if (event.id) cursor = event.id;
-        if (own.hides(event.id, step) || step.replay) continue;
+        if (step.replay) continue;
         if (saysModes(step)) this.ctx.remoteState.setRemoteModes(chatKey, sessionId, step);
         if (step.closed !== null || wanted(step)) return step;
       }
     } catch (error) {
       if (!watchEnds(error, limit, signal)) throw error;
     } finally {
-      const held = own.hold(cursor, from);
-      if (held) this.ctx.remoteState.setRemoteCursor(chatKey, sessionId, held);
+      if (cursor) this.ctx.remoteState.setRemoteCursor(chatKey, sessionId, cursor);
     }
     return null;
   }
