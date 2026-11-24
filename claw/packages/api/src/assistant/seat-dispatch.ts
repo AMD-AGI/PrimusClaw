@@ -19,20 +19,20 @@
  * the last ten minutes, busy, or one that can only be watched) is not typed into; one quiet for ten minutes is. A task waiting for its
  * machine fails after a day.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import pino from "pino";
-import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, type AssistantConfirmOption } from "@claw/protocol";
+import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_EVENT_USER_PROMPT, type AssistantConfirmOption } from "@claw/protocol";
 import { readTrustedSessionCredentials, sealedCredentialFields } from "../auth/sealed-session-credentials.js";
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS, CLAW_ASSISTANT_WORKER_MODEL } from "../config.js";
-import { db, inTransaction, type Querier } from "../infra/db.js";
+import { connectionLost, db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
 import { executeSend, inertMd, resumableOf, type SendPlan } from "./devenv-tools.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordSystemNotice } from "./outbound.js";
 import {
-  errandNotice, errandText, errandWorkerSessionId, langOf, reportErrand, SEAT_QUEUE_REASONS, type ErrandParams, type ErrandQueue,
-  type RemoteLang,
+  errandNotice, errandText, errandWorkerSessionId, langOf, noteErrandPrompt, REMOTE_EVENT_COMMAND_REJECTED, REMOTE_EVENT_TURN_END, reportErrand,
+  SEAT_QUEUE_REASONS, type ErrandParams, type ErrandQueue, type RemoteLang,
 } from "./remote-items.js";
 import { SEAT_QUEUE_MAX, seatDispatchOn, seatsLive, syncSeats, type SeatLive } from "./seats.js";
 import type { AssistantTokenClaims } from "./token.js";
@@ -320,6 +320,8 @@ async function sendFollowup(
   owner: string, itemId: string, text: string, onlineWindowMs: number,
   /** How the user let this instruction through: without a card, or pressing one (that said whether its agent runs unattended). */
   approved: { by: "auto" | "card"; unattended: boolean },
+  /** The command's id, when a repeat of this instruction must be the same command (one router turn's words); else a new one. */
+  cmdId?: string,
 ): Promise<DispatchOutcome> {
   const read = async () => (await db.query(
     "SELECT item_id, seq, board_state, outcome, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote'",
@@ -331,13 +333,13 @@ async function sendFollowup(
   return (await withSeatLock(String(first.params.seat_id), true, async () => {
     const item = await read();
     if (!item || (item.board_state === "done" && item.outcome !== "answered")) return { error: "item_closed", message: "that task is closed" };
-    return followupLocked(owner, itemId, item, text, onlineWindowMs, approved);
+    return followupLocked(owner, itemId, item, text, onlineWindowMs, approved, cmdId);
   }))!;
 }
 
 async function followupLocked(
   owner: string, itemId: string, item: { seq: number; params: ErrandParams }, text: string, onlineWindowMs: number,
-  approved: { by: "auto" | "card"; unattended: boolean },
+  approved: { by: "auto" | "card"; unattended: boolean }, cmdId?: string,
 ): Promise<DispatchOutcome> {
   const p = item.params;
   const live = (await seatsLive(owner, onlineWindowMs, [p.seat_id])).get(p.seat_id);
@@ -352,7 +354,7 @@ async function followupLocked(
     cwd: String(live!.seat.cwd), label: `${p.machine}/${p.agent_id}`,
   };
   const caps = live!.agent?.capabilities as Row | undefined;
-  const sent = await executeSend(owner, plan, errandText(Number(item.seq), text, lang), `errand:${itemId}:f:${randomUUID().slice(0, 8)}`, lang,
+  const sent = await executeSend(owner, plan, errandText(Number(item.seq), text, lang), cmdId ?? `errand:${itemId}:f:${randomUUID().slice(0, 8)}`, lang,
     onlineWindowMs, { errandItemId: itemId, parkPermissions: caps?.permission_park === true, queueBehind: true });
   if (!sent.ok) return { error: sent.error, message: sent.message };
   return { dispatch: "sent", session_id: sent.session_id };
@@ -652,13 +654,142 @@ async function errandToSandbox(
 
 // --- work_send to a task of a seat --------------------------------------------------------------------------------------------
 
+/** The words of an instruction as one turn's repeat is told by: the same text, spacing aside. */
+function sendKey(text: string): string {
+  return createHash("sha256").update(text.replace(/\s+/g, " ").trim()).digest("hex").slice(0, 32);
+}
+
+/** Whether these words were already let through to the task in this router turn (sent, queued, opened again or put on a card). */
+function sentThisTurn(p: ErrandParams, task: string, key: string): boolean {
+  return p.turn_sends?.task === task && Array.isArray(p.turn_sends.keys) && p.turn_sends.keys.includes(key);
+}
+
+/**
+ * The turn's claim on sending these words to the task, taken once: false when this turn already took it (a replayed or doubled
+ * `work_send`). One statement on the item's row, so two calls at once meet there and only one goes on.
+ */
+async function claimTurnSend(q: Querier, itemId: string, task: string, key: string): Promise<boolean> {
+  return (await q(
+    `UPDATE claw_work_items
+        SET params = params || jsonb_build_object('turn_sends', jsonb_build_object('task', $2::text, 'keys',
+              CASE WHEN params->'turn_sends'->>'task' = $2::text THEN COALESCE(params->'turn_sends'->'keys', '[]'::jsonb) ELSE '[]'::jsonb END
+              || to_jsonb($3::text))),
+            updated_at = NOW()
+      WHERE item_id = $1
+        AND NOT COALESCE(params->'turn_sends'->>'task' = $2::text AND params->'turn_sends'->'keys' ? $3::text, false)
+      RETURNING 1`,
+    [itemId, task, key],
+  )).rows.length > 0;
+}
+
+/** Whether the command `cmdId` (as `executeSend` was given it) was issued to the owner's machine: the audit trail keeps every one. */
+async function commandWasIssued(owner: string, cmdId: string): Promise<boolean> {
+  return (await db.query(
+    "SELECT 1 FROM claw_remote_audit WHERE owner_user_id = $1 AND action = 'command.issued' AND detail->>'cmd_id' = $2 LIMIT 1",
+    [owner, `k:${cmdId}`],
+  )).rows.length > 0;
+}
+
+/**
+ * A task's command that was issued but whose noting failed (`executeSend` notes it after the queue's commit): noted now, so its turn's
+ * end is the task's and its answer reaches the router. Found by the prompt event Claw writes with the command (its number, and where the
+ * session's events stood), which stays after the machine has collected the command and the queue has forgotten it. Not noted when the
+ * task already reads that session's events past the command's own end: that end has gone by, and the task would wait for it forever.
+ */
+export async function noteIssuedPrompt(owner: string, itemId: string, cmdId: string): Promise<void> {
+  const c = (await db.query(
+    `SELECT e.id AS event_id, e.data->>'cmd_seq' AS cmd_seq, a.session_id::text AS session_id, a.connector_id::text AS connector_id,
+            a.agent_id, k.name AS machine
+       FROM claw_remote_audit a
+       JOIN claw_remote_connectors k ON k.connector_id = a.connector_id AND k.owner_user_id = a.owner_user_id
+       JOIN claw_remote_events e ON e.session_id = a.session_id AND e.type = $3 AND e.data->>'cmd_id' = $1
+      WHERE a.owner_user_id = $2 AND a.action = 'command.issued' AND a.detail->>'cmd_id' = $1
+      ORDER BY a.id LIMIT 1`,
+    [`k:${cmdId}`, owner, REMOTE_EVENT_USER_PROMPT],
+  )).rows[0] as { event_id: string; cmd_seq: string | null; session_id: string; connector_id: string; agent_id: string; machine: string } | undefined;
+  const cmdSeq = Number(c?.cmd_seq);
+  if (!c || !Number.isSafeInteger(cmdSeq)) return;
+  const item = (await db.query(
+    "SELECT params->'open_cmd_seqs' AS seqs, params->>'session_id' AS session_id, params->>'last_event_id' AS last FROM claw_work_items WHERE item_id = $1 AND user_id = $2",
+    [itemId, owner],
+  )).rows[0] as { seqs: unknown; session_id: string | null; last: string | null } | undefined;
+  if (!item) return;
+  const open = Array.isArray(item.seqs) ? item.seqs.map(Number) : [];
+  if (open.includes(cmdSeq)) return;
+  const read = Number(item.last) || 0;
+  if (item.session_id === c.session_id && open.length > 0 && read > Number(c.event_id)) {
+    const gone = (await db.query(
+      `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND id > $2 AND id <= $3 AND type = ANY($4::text[]) AND data->>'cmd_seq' = $5 LIMIT 1`,
+      [c.session_id, c.event_id, read, [REMOTE_EVENT_TURN_END, REMOTE_EVENT_COMMAND_REJECTED], String(cmdSeq)],
+    )).rows.length > 0;
+    if (gone) return;
+  }
+  await noteErrandPrompt({
+    owner, itemId, sessionId: c.session_id, connectorId: c.connector_id, agentId: c.agent_id, machine: c.machine, cmdSeq,
+    since: Number(c.event_id) - 1,
+  });
+}
+
+/** A claim whose instruction went nowhere, given back: the same words may be sent again in this turn. */
+async function releaseTurnSend(q: Querier, itemId: string, task: string, key: string): Promise<void> {
+  await q(
+    `UPDATE claw_work_items SET params = jsonb_set(params, '{turn_sends,keys}', (params->'turn_sends'->'keys') - $3::text)
+      WHERE item_id = $1 AND params->'turn_sends'->>'task' = $2::text`,
+    [itemId, task, key],
+  );
+}
+
 /**
  * `work_send` to a seat's task: the same say as `work_create` for its seat. Running: one more instruction into its session. Ended
  * (finished within a week, failed, or stopped where it ran): opened again and sent again, as a new task to the same seat; put back as it
  * ended when nothing could be sent. When the seat asks for a card, nothing changes until the card is pressed: an ended task is opened
  * again only then, and a no leaves it as it ended. Not sent yet (its card waits, or its queue): nothing is added to what the user was shown.
+ * The same words to the same task twice in one router turn go once (one send, one card, one task opened again): the second call is
+ * answered that they were already sent.
  */
 export async function errandWorkSend(
+  claims: AssistantTokenClaims, userId: string, itemId: string, text: string, newSession: boolean,
+): Promise<Record<string, unknown>> {
+  // Two calls to one task at once wait for each other. The same words in one turn: the second finds the first's claim (it went) or
+  // none (it went nowhere, and the second tries for itself), so neither is told "already sent" of words that were not. Other words:
+  // the second finds the task the first opened again and follows it up, rather than opening it again over the first's instruction.
+  // Held on the dedicated lock pool (`db.lockPool`, as the sessions idempotency lock is): the call's own queries and transactions take
+  // main-pool connections, and calls waiting here must not hold the ones it needs. Released when the call ends, whatever its outcome.
+  return withSeatSendLock(itemId, () => errandWorkSendOnce(claims, userId, itemId, text, newSession));
+}
+
+/** `fn` under the session advisory lock of one item's `work_send`, taken on a `db.lockPool` connection and given back after it. */
+async function withSeatSendLock<T>(itemId: string, fn: () => Promise<T>): Promise<T> {
+  const key = `claw-seat-work-send:${itemId}`;
+  const client = await db.lockPool.connect();
+  try {
+    await client.query("SELECT pg_advisory_lock(hashtext($1))", [key]);
+  } catch (err) {
+    // Not taken: the connection is dropped rather than pooled, in case the wait was cut short after the server granted it.
+    client.release(err as Error);
+    throw err;
+  }
+  // Taken on a connection that has since gone is not held (the server released it with the backend): nothing is done under it. A
+  // loss after this point is not seen by the call; the task's reopening checks its generation (`reopenErrand`) for that.
+  const lost = connectionLost(client);
+  if (lost) {
+    client.release(lost);
+    throw lost;
+  }
+  try {
+    return await fn();
+  } finally {
+    try {
+      await client.query("SELECT pg_advisory_unlock(hashtext($1))", [key]);
+      client.release();
+    } catch (err) {
+      // Not released: dropping the connection releases it, and no later call waits on a pooled connection still holding it.
+      client.release(err as Error);
+    }
+  }
+}
+
+async function errandWorkSendOnce(
   claims: AssistantTokenClaims, userId: string, itemId: string, text: string, newSession: boolean,
 ): Promise<Record<string, unknown>> {
   const q: Querier = (t, p) => db.query(t, p);
@@ -667,6 +798,13 @@ export async function errandWorkSend(
     [itemId, userId])).rows[0] as Row | undefined;
   if (!item) throw new ToolRefused("item_not_found", "no such item");
   const p = item.params as ErrandParams;
+  const key = sendKey(text);
+  const already = (): Record<string, unknown> => ({
+    ok: true, item_id: itemId, seq: Number(item.seq), dispatch: "already_sent",
+    note: "Already sent: this turn already sent these words to that task (or put them to the user on a card); nothing was sent again. Do not say it twice.",
+  });
+  // Asked first: the first call may have queued the task, opened it again or put a card up, which would read as another refusal.
+  if (sentThisTurn(p, claims.task_id, key)) return already();
   if (p.queued) {
     throw new ToolRefused("item_not_started", p.queued === "card"
       ? "that task still waits for the user's card: ask them to press it (or say no), then send more"
@@ -700,6 +838,8 @@ export async function errandWorkSend(
     const card = await inTransaction(async (tx) => {
       await assertLiveRun(tx, claims);
       await tx("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [userId]);
+      // One card for the turn's words (given back with the card if it is not made).
+      if (!await claimTurnSend(tx, itemId, claims.task_id, key)) return null;
       // The task is left as it is until the card is pressed: an ended one is opened again only then (`seatDispatchDecided`).
       return proposeConfirmation(tx, claims, userId, "seat_dispatch", {
         item_id: itemId, seat_id: p.seat_id, title: String(item.title ?? ""), brief: text, lang, why_card: why, label: seatLabel(live!),
@@ -711,23 +851,59 @@ export async function errandWorkSend(
         allowLabel: zh ? "发送" : "Send",
       });
     });
+    if (!card) return already();
     if (card.announce) await card.announce();
     return { ok: true, item_id: itemId, seq: Number(item.seq), dispatch: "card", why_card: why, ...proposed(card.row, card.subscribers, "sent", lang) };
   }
+  if (!await claimTurnSend(q, itemId, claims.task_id, key)) return already();
+  const giveBack = () => releaseTurnSend(q, itemId, claims.task_id, key).catch(() => undefined);
   if (running) {
-    const out = await sendFollowup(userId, itemId, text, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "auto", unattended: false });
+    // One command id for the turn's words: a call made again after a failure that came once the command was queued is that command.
+    const cmdId = `errand:${itemId}:f:${createHash("sha256").update(`${claims.task_id}\u0000${key}`).digest("hex").slice(0, 16)}`;
+    let out: DispatchOutcome;
+    try {
+      out = await sendFollowup(userId, itemId, text, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "auto", unattended: false }, cmdId);
+    } catch (err) {
+      // Its command went (only its noting failed): noted now, and the turn's words stay claimed. Else nothing went: given back. Not
+      // known (the audit could not be read): noted if it went, and given back, so the call made again in this turn tries again; under
+      // the same command id, which the queue and the audit answer with the first, so nothing reaches the machine twice.
+      const issued = await commandWasIssued(userId, cmdId).catch(() => null);
+      if (issued !== false) await noteIssuedPrompt(userId, itemId, cmdId).catch(() => undefined);
+      if (issued !== true) await giveBack();
+      throw err;
+    }
+    if ("error" in out) await giveBack();
     return { ok: true, item_id: itemId, seq: Number(item.seq), ...dispatchAnswer(out) };
   }
-  const prior = await inTransaction((tx) => reopenErrand(tx, itemId, text, newSession, { by: "auto" }));
+  let prior: ErrandBefore;
+  try {
+    prior = await inTransaction((tx) => reopenErrand(tx, itemId, text, newSession, { by: "auto" }, Number(item.generation)));
+  } catch (err) {
+    // (Opened again by another call since this one read it, `ReopenedMeanwhile`: refused, nothing sent, the words free to send again.)
+    await giveBack();
+    throw err;
+  }
   let out: DispatchOutcome;
   try {
     out = (await dispatchErrand(userId, itemId))!;
   } catch (err) {
+    // Failed after its command was queued (`dispatchErrand` sends under this generation's id): it went, so it stays open and claimed,
+    // and is noted now if its noting was what failed. Not known (the audit could not be read): kept claimed and open as if it went, since
+    // a call made again would open the task again under a new generation's command id, which nothing would recognise as this one.
+    const sentId = `errand:${itemId}:${prior.generation}`;
+    if (await commandWasIssued(userId, sentId).catch(() => true)) {
+      await noteIssuedPrompt(userId, itemId, sentId).catch(() => undefined);
+      throw err;
+    }
     await restoreErrand(q, itemId, prior).catch(() => undefined);
+    await giveBack();
     throw err;
   }
   // Refused (its queue full, the seat gone meanwhile): the task is put back as it ended, not left open with nothing sent.
-  if ("error" in out) await restoreErrand(q, itemId, prior);
+  if ("error" in out) {
+    await restoreErrand(q, itemId, prior);
+    await giveBack();
+  }
   return { ok: true, item_id: itemId, seq: Number(item.seq), ...dispatchAnswer(out) };
 }
 
@@ -737,17 +913,27 @@ interface ErrandBefore {
   pending_question: string | null; summary: string; params: Record<string, unknown>;
 }
 
+/** The task was opened again (a new generation) since the caller read it: its reopening is not done twice. */
+class ReopenedMeanwhile extends ToolRefused {
+  constructor() {
+    super("item_changed", "that task was just given another instruction: nothing was sent; send this one again");
+  }
+}
+
 /**
  * A seat's task opened again for a new instruction: in progress, a new generation, the instruction its brief, let through as `approved`
- * says (without a card, or by a card pressed, with its agent as unattended as the card said). Returns how it stood before.
+ * says (without a card, or by a card pressed, with its agent as unattended as the card said). Returns how it stood before. With
+ * `generation`: only from that one (else `ReopenedMeanwhile`), so two callers that read it ended never both open it again.
  */
 async function reopenErrand(
   q: Querier, itemId: string, text: string, newSession: boolean, approved: { by: "auto" } | { by: "card"; unattended: boolean },
+  generation?: number,
 ): Promise<ErrandBefore> {
-  const before = (await q(
-    "SELECT board_state, outcome, closed_at, last_report_kind, pending_question, summary, params FROM claw_work_items WHERE item_id = $1 FOR UPDATE",
+  const { generation: was, ...before } = (await q(
+    "SELECT generation, board_state, outcome, closed_at, last_report_kind, pending_question, summary, params FROM claw_work_items WHERE item_id = $1 FOR UPDATE",
     [itemId],
-  )).rows[0] as Omit<ErrandBefore, "generation">;
+  )).rows[0] as Omit<ErrandBefore, "generation"> & { generation: number };
+  if (generation !== undefined && Number(was) !== generation) throw new ReopenedMeanwhile();
   const reopened = (await q(
     `UPDATE claw_work_items
         SET board_state = 'in_progress', outcome = NULL, closed_at = NULL, last_report_kind = 'progress', pending_question = NULL, summary = '',
