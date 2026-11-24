@@ -58,12 +58,24 @@ export interface ConfirmCard {
   readonly cardId: string;
   readonly userId: string;
   readonly confirmationId: string;
-  /** trigger_create | trigger_cancel | devenv_send | github_comment */
+  /** trigger_create | trigger_cancel | devenv_send | github_comment | seat_dispatch | ... */
   readonly kind: string;
   /** What the button that lets it through says. */
   readonly label: string;
+  /**
+   * A choice card's places (`seat_dispatch`), in the card's order: a button carries only the card and the place's index here, and
+   * what Claw is told was picked is read from this record. Empty for a card that is let through or not.
+   */
+  readonly options: readonly ConfirmCardOption[];
   readonly state: CardState;
   readonly createdAt: number;
+}
+
+/** One place a choice card offers: what Claw is told was picked, and what the card showed for it. */
+export interface ConfirmCardOption {
+  readonly id: string;
+  readonly label: string;
+  readonly detail: string;
 }
 
 /** A choice the assistant put to the person: what was asked, the options, and (once sent) what was picked. */
@@ -113,7 +125,13 @@ export interface AssistantButtonRepository {
   /** Null once it is older than ASSISTANT_MESSAGE_KEEP_SECONDS. */
   getActionCard(cardId: string): ActionCard | null;
   moveActionCard(cardId: string, state: CardState, options?: MoveOptions): boolean;
-  addConfirmCard(userId: string, confirmationId: string, kind: string, label?: string): string;
+  addConfirmCard(
+    userId: string,
+    confirmationId: string,
+    kind: string,
+    label?: string,
+    options?: readonly ConfirmCardOption[],
+  ): string;
   /** Null once it is older than CONFIRM_CARD_KEEP_SECONDS. */
   getConfirmCard(cardId: string): ConfirmCard | null;
   moveConfirmCard(cardId: string, state: CardState, options?: MoveOptions): boolean;

@@ -70,10 +70,16 @@ export class HttpAssistant implements ClawAssistantPort {
     return dataOf(await this.http.json({ method: "GET", path: `/v1/assistant/brief?${query}`, key }), "the brief");
   }
 
-  async decideConfirmation(token: ClawCredential, confirmationId: string, decision: string): Promise<JsonObject> {
+  async decideConfirmation(
+    token: ClawCredential,
+    confirmationId: string,
+    decision: string,
+    choice?: string,
+  ): Promise<JsonObject> {
     requireToken(token, "an answer to a held write");
     const path = `/v1/assistant/confirmations/${segment(confirmationId)}/decision`;
-    const out = objectOf(await this.http.json({ method: "POST", path, key: token, body: { decision } }), "a decision");
+    const body = choice === undefined ? { decision } : { decision, choice };
+    const out = objectOf(await this.http.json({ method: "POST", path, key: token, body }), "a decision");
     return dataOrSelf(out);
   }
 

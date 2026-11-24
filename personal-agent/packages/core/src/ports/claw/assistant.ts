@@ -46,8 +46,16 @@ export interface ClawAssistantPort {
   send(key: ClawCredential, sessionId: string, text: string, options?: AssistantMessageOptions): Promise<string | null>;
   /** The caller's brief, put together now: `{date, lang, sections, needs_you, text}`. */
   brief(key: ClawCredential, lang: string, timezone: string): Promise<JsonObject>;
-  /** The person's answer to a held write the assistant put to them (`allow` or `deny`); exchanged token only. */
-  decideConfirmation(token: ClawCredential, confirmationId: string, decision: string): Promise<JsonObject>;
+  /**
+   * The person's answer to a held write the assistant put to them (`allow` or `deny`); exchanged token only. `choice`: on a choice
+   * card's `allow`, the id of the place picked (sent only when given).
+   */
+  decideConfirmation(
+    token: ClawCredential,
+    confirmationId: string,
+    decision: string,
+    choice?: string,
+  ): Promise<JsonObject>;
   /** Reviews as `actingAs`, each a work item. ReviewsRefused: none started. ClawError(404): a Claw without the route. */
   startReviews(token: ClawCredential, request: StartReviews): Promise<ReviewStart[]>;
   /** Makes the key owner's watcher of `scope` observe it. */

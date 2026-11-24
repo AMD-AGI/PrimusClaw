@@ -37,6 +37,10 @@ export interface RemoteAskRequest {
   readonly agent: string;
   /** Which work item asks ("#seq title"; "" none). */
   readonly about: string;
+  /** The name the person gave the seat the task was handed to (absent: none); the card's title names it. */
+  readonly seat?: string;
+  /** The one reminder of a request the agent keeps waiting on (`ask.parked`): the card says it still waits, until when. */
+  readonly parked?: boolean;
   readonly expiresAt: number;
   readonly zone: string;
   readonly lang: string;

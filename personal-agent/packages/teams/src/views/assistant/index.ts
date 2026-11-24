@@ -35,6 +35,7 @@ import {
   type WorkDoneModel,
   type WorkItem,
   type WorkNoteModel,
+  seatDispatchText,
 } from "@primusclaw/personal-agent";
 
 import { clip } from "../../cards/cjk.js";
@@ -254,6 +255,7 @@ function confirmWrite(model: ConfirmWriteModel): TeamsMessage {
   const t = assistantCardText.in(model.lang === "zh" ? "zh" : "en");
   const button = (title: string, op: string) =>
     execute(title, `primusclaw.assistant_confirm_${op}`, { primusclaw: "assistant_confirm", op, card: model.cardId });
+  if (model.options?.length) return confirmChoice(model);
   return message(
     [header(t.confirmTitle, { tone: "warning", emoji: "needs_you" }), text(model.text)],
     buttons([
@@ -261,6 +263,29 @@ function confirmWrite(model: ConfirmWriteModel): TeamsMessage {
       button(model.kind === "github_merge" ? t.denyMerge : t.deny, "deny"),
     ]),
   );
+}
+
+/**
+ * A seat dispatch that offers several places: the words, then a button for each place (its folder under it, as text only), and
+ * Cancel. A button carries the card's id and the place's index: what Claw is told was picked is read from the card's record. The
+ * person may also just name the place in the chat.
+ */
+function confirmChoice(model: ConfirmWriteModel): TeamsMessage {
+  const t = seatDispatchText.in(model.lang === "zh" ? "zh" : "en");
+  const press = (title: string, op: string, pick?: number) =>
+    execute(title, `primusclaw.assistant_confirm_${op}`, {
+      primusclaw: "assistant_confirm",
+      op,
+      card: model.cardId,
+      ...(pick === undefined ? {} : { pick: String(pick) }),
+    });
+  const body: CardElement[] = [header(t.choiceTitle, { tone: "warning", emoji: "needs_you" })];
+  if (model.text) body.push(text(model.text));
+  (model.options ?? []).forEach((option, i) => {
+    body.push({ type: "ActionSet", actions: [press(option.label, "allow", i)], spacing: "Small" });
+    if (option.detail) body.push(note(markdownPlain(option.detail), { spacing: "None" }));
+  });
+  return message(body, buttons([press(t.cancel, "deny")], ""));
 }
 
 /**
