@@ -501,3 +501,58 @@ it("the chat going on while the answer goes out sends the whole answer below it,
   );
   assert.deepEqual(bus.texts, ["Part one", "Part two"]);
 });
+
+it("the chat going on while the last part goes out sends the whole answer below it; a final that is the whole answer stays", async () => {
+  const clock = new Timeline();
+  const bus = new Bus(clock);
+  const status = turnStatusMessage(bus, { clock, log: new RecordingLogger(), streamReplyTo: "act" });
+  const publish = bus.publish;
+  bus.publish = (sent) => {
+    if (textOf(sent.message) === "Part two") status.movedOn("BELOW"); // (the person writes while the last part goes out)
+    return publish(sent);
+  };
+  status.begin();
+  await clock.advanceTo(clock.start + 2);
+  await clock.pump(status.finish(["Part one", "Part two"]));
+  assert.deepEqual(bus.texts, ["Part two", "Part one", "Part two"]);
+
+  const held: { status?: StatusMessage<Step> } = {};
+  const refuse = (op: { op: string }): undefined => {
+    if (op.op === "finish") held.status?.movedOn("BELOW");
+    return undefined;
+  };
+  const whole = new Bus(clock, { stream: { refuse } });
+  const one = turnStatusMessage(whole, { clock, log: new RecordingLogger(), streamReplyTo: "act" });
+  held.status = one;
+  one.begin();
+  await clock.advanceTo(clock.start + clock.elapsed + 2);
+  await clock.pump(one.finish(["The whole answer"]));
+  assert.deepEqual(
+    whole.streamOps.filter((o) => o.op === "finish").map((o) => o.text),
+    ["The whole answer"],
+  );
+  assert.deepEqual(whole.texts, []);
+});
+
+it("a refused stream closed with the answer's first part sends the whole answer when the chat goes on meanwhile", async () => {
+  const clock = new Timeline();
+  const held: { status?: StatusMessage<Step> } = {};
+  const refuse = (op: { op: string }): number | undefined => {
+    if (op.op === "inform") return 500; // (the stream is refused: the progress message takes over)
+    if (op.op === "finish") held.status?.movedOn("BELOW");
+    return undefined;
+  };
+  const bus = new Bus(clock, { stream: { refuse } });
+  const status = turnStatusMessage(bus, { clock, log: new RecordingLogger(), streamReplyTo: "act" });
+  held.status = status;
+  status.begin();
+  status.progress(RUNNING);
+  await clock.advanceTo(clock.start + 4);
+  await clock.pump(status.finish(["Part one", "Part two"]));
+  assert.deepEqual(
+    bus.streamOps.filter((o) => o.op === "finish").map((o) => o.text),
+    ["Part one"],
+  );
+  const answer = bus.texts.filter((t) => t.startsWith("Part"));
+  assert.deepEqual(answer, ["Part one", "Part two"]);
+});

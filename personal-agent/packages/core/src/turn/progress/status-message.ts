@@ -491,9 +491,8 @@ export class StatusMessage<S> {
       return;
     }
     const messageId = await this.messageId(); // the progress message is on screen before the answer, so it stays above it
-    let rest: readonly OutMessage[] = messages;
-    if (this.live && this.live.closable && !this.streamOver) rest = await this.closeRefusedStream(this.live, messages);
-    for (const message of rest) await this.surface.send(message);
+    if (this.live && this.live.closable && !this.streamOver) await this.closeRefusedStream(this.live, messages);
+    else for (const message of messages) await this.surface.send(message);
     if (messageId) await this.retire(messageId);
   }
 
@@ -514,12 +513,9 @@ export class StatusMessage<S> {
 
   /**
    * The stream opened and the chat later refused an update of it, so the progress message took over: the stream is still
-   * closed, with the first part of the answer when the chat takes that. Returns what is left to send as messages.
+   * closed, with the first part of the answer when the chat takes that, and what is left of the answer is sent as messages.
    */
-  private async closeRefusedStream(
-    live: StreamHandle,
-    messages: readonly OutMessage[],
-  ): Promise<readonly OutMessage[]> {
+  private async closeRefusedStream(live: StreamHandle, messages: readonly OutMessage[]): Promise<void> {
     let final: OutMessage;
     let rest: readonly OutMessage[];
     const [first, ...others] = messages;
@@ -529,11 +525,13 @@ export class StatusMessage<S> {
     else if (first) [final, rest] = [first, others];
     else [final, rest] = [plainMessage(turnText.in(this.lang).doneShort), []];
     const closed = await live.final(final);
-    if (closed.ok) return rest;
-    this.log.warn("the refused stream could not be closed either; the chat closes it at its limit", {
-      reason: closed.error.reason,
-    });
-    return messages;
+    if (!closed.ok) {
+      this.log.warn("the refused stream could not be closed either; the chat closes it at its limit", {
+        reason: closed.error.reason,
+      });
+      rest = messages;
+    }
+    await this.sendAfterBubble(closed.ok && final === first, rest, messages);
   }
 
   /**
@@ -559,14 +557,25 @@ export class StatusMessage<S> {
       });
       rest = messages;
     }
+    await this.sendAfterBubble(closed.ok, rest, messages);
+  }
+
+  /**
+   * Send `rest`, what follows the stream's final. When that final showed part of the answer above (`shown`) and the chat goes on
+   * below the bubble while the rest goes out (`movedOn`: the person wrote meanwhile), the whole answer is sent again below that, so
+   * it is never read from its middle. A final that is the whole answer (nothing follows it) stays as it is.
+   */
+  private async sendAfterBubble(
+    shown: boolean,
+    rest: readonly OutMessage[],
+    messages: readonly OutMessage[],
+  ): Promise<void> {
+    const wentOn = (): boolean => shown && rest.length > 0 && this.wentOn !== "";
     for (const message of rest) {
-      if (closed.ok && this.wentOn) {
-        // (the chat went on below the bubble while the answer went out: the whole answer again below that, never its middle)
-        for (const whole of messages) await this.surface.send(whole);
-        return;
-      }
+      if (wentOn()) break;
       await this.surface.send(message);
     }
+    if (wentOn()) for (const message of messages) await this.surface.send(message);
   }
 
   /** Wait until FINAL_SETTLE_SECONDS have passed since the last progress edit left. */
