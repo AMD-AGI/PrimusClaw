@@ -13,8 +13,9 @@
  * alias or a machine name is no seat (`seat_not_found`); whether a seat needs a card is the real `whyCard`; the agent kinds that take
  * tasks, the queue's length and the roster's matching of a machine, agent and folder are the real ones. What reads the database is
  * stood in for by the fixture: a turn a report started dispatches nothing (`not_from_user`); a turn that has read what a machine or
- * an agent wrote may only put a card to the user (`read_untrusted`); a seat that is not free queues the errand (at most
- * `SEAT_QUEUE_MAX` waiting).
+ * an agent wrote (devenv_list, work_recall of any item) may only put a card to the user (`read_untrusted`); a seat that is not free
+ * queues the errand (at most `SEAT_QUEUE_MAX` waiting). work_send to a seat's task goes through the real checks on the task
+ * (`errandNotStarted`, `errandRunning`, `errandClosed`) and its seat (`seatRefusal`, `whyCard`), in `errandWorkSend`'s order.
  */
 import * as prompts from "../../src/assistant/prompts.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
@@ -22,7 +23,12 @@ import { createAssistantMcpServer } from "../../src/assistant/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import * as seats from "../../src/assistant/seats.js";
-import { parseTarget, whyCard, type Target } from "../../src/assistant/seat-dispatch.js";
+import { errandText } from "../../src/assistant/remote-items.js";
+import {
+  errandClosed, errandNotStarted, errandRunning, parseTarget, seatRefusal, whyCard, type Target,
+} from "../../src/assistant/seat-dispatch.js";
+import type { ToolRefused } from "../../src/assistant/tools.js";
+import { REMOTE_AGENT_LIMITS } from "@claw/protocol";
 import { messagesLlm, promptFor, userTurn, type Block, type Llm, type Message, type ModelResponse, type ToolSchema } from "./assistant-router-eval-lib.js";
 import {
   CHANNEL_ACTIONS, ERRAND_SEAT, INJECT_EN, INJECT_ZH, ITEM, MACHINES, MANIFEST, NOW, SEAT, SEATS, seatOf,
@@ -117,11 +123,33 @@ const itemOf = (ref: unknown) => {
   return MANIFEST.find((i) => i.itemId === r || `#${i.seq}` === r || String(i.seq) === r);
 };
 
-/** The fields of a seat the real `whyCard` reads, from the fixture's seat. */
+/**
+ * The fields of a seat the real `whyCard` and `seatRefusal` read, from the fixture's seat (an agent kind seats do not take is
+ * `unsupported: "agent_kind"`, as `seatsLive` marks it).
+ */
 const liveOf = (s: FixtureSeat): seats.SeatLive => ({
   seat: { seat_id: s.seat_id, role_state: s.role_state, confirm_each: s.confirm_each, dispatch_mode: s.dispatch_mode },
   unattended: s.unattended,
+  ...(seats.SEAT_DISPATCH_AGENT_KINDS.has(s.kind) ? {} : { unsupported: "agent_kind" }),
 } as unknown as seats.SeatLive);
+
+/**
+ * The parameters of a fixture errand the real `work_send` checks read: still waiting (its card, or its seat's queue: the item list's
+ * `waiting`), and running (an open prompt in its session) when it is in progress with a session.
+ */
+export function errandParamsOf(item: (typeof MANIFEST)[number]): { queued?: string; open_cmd_seqs: number[] } {
+  const e = item.remote?.errand as { waiting?: string } | undefined;
+  return {
+    ...(e?.waiting ? { queued: e.waiting } : {}),
+    open_cmd_seqs: item.boardState !== "done" && item.remote?.session ? [item.seq] : [],
+  };
+}
+
+/** The seqs waiting in hl-ci's queue with `hlciQueue` set: #33 first (the item list's), then seqs that are no item of the list. */
+export const hlciQueueOf = (n: number): number[] => Array.from({ length: n }, (_, i) => (i === 0 ? 33 : 35 + i));
+
+/** A refusal of the real code, answered as the tools answer it. */
+const refused = (e: ToolRefused, refuse: (c: string, m: string, x?: Record<string, unknown>) => Out): Out => refuse(e.code, e.message, e.data);
 
 /** The tools, answered as the real ones answer in the fixture's world, for one case. */
 export class DispatchStub {
@@ -131,7 +159,7 @@ export class DispatchStub {
   private readonly queues = new Map<string, number[]>();
   constructor(private readonly c: Pick<DispatchCase, "wake" | "inject" | "hlciQueue" | "lang">) {
     for (const s of SEATS) {
-      const q = s.seat_id === SEAT.hlci && c.hlciQueue !== undefined ? Array.from({ length: c.hlciQueue }, (_, i) => 33 + i) : [...s.queue];
+      const q = s.seat_id === SEAT.hlci && c.hlciQueue !== undefined ? hlciQueueOf(c.hlciQueue) : [...s.queue];
       this.queues.set(s.seat_id, q);
     }
   }
@@ -168,10 +196,16 @@ export class DispatchStub {
           ...(asked ? { where: list.length ? "only the seats where the user said (machine, agent, folder)" : "no seat of the user's is where they said (machine, agent, folder)" } : {}) });
       }
       case "seat_set": {
-        if (this.c.wake) return refuse("not_from_user", "only the user's own message can change a seat: a report cannot");
+        // `seatSet` asks `attendedTurn` first: a report's turn is not the user's, and one that has read a machine's words no longer acts.
+        if (this.c.wake) return refuse("not_attended", "this turn does not answer a message the user sent signed in (it is a report), so it cannot act for them");
+        if (this.untrusted) return refuse("read_untrusted", "this turn has read what a machine or an agent wrote, so it no longer acts for the user on its own");
         const asked = str("seat").toLowerCase();
         const s = SEATS.find((x) => x.seat_id.toLowerCase() === asked || (x.alias ?? "").toLowerCase() === asked);
-        if (!s) return refuse("no_seat", "no seat of the user's is named that", { choices: SEATS.map((x) => x.alias ?? x.seat_id) });
+        if (!s) {
+          // The refusal lists the seats as their machines name them: the turn has read those (`resolveSeat`'s `read`).
+          this.untrusted = true;
+          return refuse("no_seat", "no seat of the user's matches that: ask which one they mean", { choices: SEATS.map((x) => x.alias ?? x.seat_id) });
+        }
         if (typeof input.confirm_each === "boolean") {
           return ok({ ok: true, seat_id: s.seat_id, alias: s.alias, confirm_each: input.confirm_each,
             note: input.confirm_each ? "every dispatch to this seat now shows a card first" : "back to: the first dispatch shows a card, then it goes directly" });
@@ -185,20 +219,8 @@ export class DispatchStub {
         return this.devenvSend(input, refuse, ok);
       case "work_create":
         return this.workCreate(input, refuse, ok);
-      case "work_send": {
-        if (!str("text")) return refuse("invalid_arguments", "work_send needs text");
-        const item = itemOf(input.item_id);
-        if (!item) return refuse("item_not_found", "no such item");
-        const seatId = ERRAND_SEAT[item.itemId];
-        if (!seatId) return ok({ ok: true, item_id: item.itemId, seq: item.seq, status: "in_progress" });
-        if (this.c.wake) return refuse("not_from_user", "only the user's own message can send an instruction to a seat: a report cannot");
-        const s = seatOf(seatId)!;
-        const gate = this.gate(s);
-        if (gate) return ok({ ...this.card("seat_dispatch", { seat_id: s.seat_id }), item_id: item.itemId, seq: item.seq, seat_id: s.seat_id, alias: s.alias, dispatch: "card", why_card: gate });
-        const queued = item.itemId === ITEM.e33;
-        return ok({ ok: true, item_id: item.itemId, seq: item.seq, seat_id: s.seat_id, alias: s.alias, status: "in_progress",
-          dispatch: queued ? "queued" : "sent", ...(item.boardState === "done" ? { reopened: true } : {}) });
-      }
+      case "work_send":
+        return this.workSend(input, refuse, ok);
       case "work_stop": {
         const item = itemOf(input.item_id);
         if (!item) return refuse("item_not_found", "no such item");
@@ -209,7 +231,8 @@ export class DispatchStub {
         const item = itemOf(input.item_id);
         if (!item) return refuse("item_not_found", "no such item");
         const remote = Boolean(ERRAND_SEAT[item.itemId]);
-        if (remote) this.untrusted = true;
+        // `workRecall` marks the turn before it reads any item: a sandbox worker's words are a worker's words too.
+        this.untrusted = true;
         const tail = item.itemId === ITEM.e35
           ? `Published @primusclaw/connector 0.3.1 to npm; the release notes are in CHANGELOG.md.${this.c.inject === "recall" ? ` ${this.c.lang === "zh" ? INJECT_ZH : INJECT_EN}` : ""}`
           : remote ? "Running the tests… 214 passed so far." : "";
@@ -254,11 +277,8 @@ export class DispatchStub {
     if (this.c.wake) return refuse("not_from_user", "only the user's own message can hand a task to their machine: a report or a wake cannot");
     for (const id of target.seats) {
       const s = seatOf(id);
-      if (!s) return refuse("seat_not_found", "no seat of the user's has that seat_id: use the seat_id from seat_roster (an alias or a machine name is not a target)");
-      if (s.role_state === "retired") return refuse("seat_retired", "the user said not to send work to that seat");
-      if (!seats.SEAT_DISPATCH_AGENT_KINDS.has(s.kind)) {
-        return refuse("seat_unsupported", "tasks can only be handed to Claude Code for now; that seat's agent is another one");
-      }
+      const no = seatRefusal(s && liveOf(s), id);
+      if (no) return refused(no, refuse);
     }
     const seq = ++this.seq;
     const itemId = `kwi_01KAH0NEW00000000000000${seq}`;
@@ -280,7 +300,12 @@ export class DispatchStub {
       return ok({ ...this.card("seat_dispatch", { seat_id: s.seat_id }), ...base, dispatch: "card", why_card: why,
         ...(why === "first_dispatch" ? { note_card: "once pressed, later errands to this seat go without a card; saying 'always ask first' turns that back" } : {}) });
     }
-    // `dispatchErrand`: behind others in the queue it waits there; else as the seat is now.
+    return this.dispatchErrand(s, seq, fresh, base, full, ok);
+  }
+
+  /** `dispatchErrand`: behind others in the queue it waits there; else as the seat is now. */
+  private dispatchErrand(s: FixtureSeat, seq: number, fresh: boolean, base: Record<string, unknown>, full: () => Out, ok: (r: unknown) => Out): Out {
+    const queue = this.queues.get(s.seat_id)!;
     const waitWhy = s.state === "offline" ? "machine_offline" : s.state === "in_terminal" ? "in_terminal" : "seat_busy";
     const reason = queue.length > 0 ? waitWhy
       : s.state === "offline" ? "machine_offline" : s.state === "working" || s.state === "waiting_for_you" ? "seat_busy"
@@ -291,6 +316,43 @@ export class DispatchStub {
     queue.push(seq);
     return ok({ ok: true, ...base, dispatch: "queued", queued_reason: reason, position: ahead.length + 1, ahead,
       note: reason === "machine_offline" ? "the machine is offline: it is sent when it comes back, within 24 hours" : "it is sent when the seat is free" });
+  }
+
+  /**
+   * work_send as `tools.ts` `workSend` and the real `errandWorkSend` answer it, in their order, with the fixture's items and seats in
+   * place of the database. The checks on the task itself (`errandNotStarted`, `errandRunning`, `errandClosed`) and on its seat
+   * (`seatRefusal`, `whyCard`) are the real functions.
+   */
+  private workSend(input: Record<string, unknown>, refuse: (c: string, m: string, x?: Record<string, unknown>) => Out, ok: (r: unknown) => Out): Out {
+    const text = typeof input.text === "string" ? input.text.trim() : "";
+    if (!text) return refuse("invalid_arguments", "work_send needs text");
+    const item = itemOf(input.item_id);
+    if (!item) return refuse("item_not_found", "no such item");
+    const seatId = ERRAND_SEAT[item.itemId];
+    if (!seatId) return ok({ ok: true, item_id: item.itemId, seq: item.seq, status: "in_progress" });
+    const p = errandParamsOf(item);
+    const notStarted = errandNotStarted(p as Parameters<typeof errandNotStarted>[0]);
+    if (notStarted) return refused(notStarted, refuse);
+    if (this.c.wake) return refuse("not_from_user", "only the user's own message can send more to their machine: a report or a wake cannot");
+    if (Buffer.byteLength(errandText(99_999_999, text, this.c.lang)) > REMOTE_AGENT_LIMITS.maxPromptBytes) {
+      return refuse("brief_too_long", `the instruction is too long to send to a machine (at most ${REMOTE_AGENT_LIMITS.maxPromptBytes} bytes)`);
+    }
+    const s = seatOf(seatId);
+    const no = seatRefusal(s && liveOf(s), seatId);
+    if (no) return refused(no, refuse);
+    const running = errandRunning({ board_state: item.boardState }, p);
+    if (!running) {
+      const closed = errandClosed({ board_state: item.boardState, closed_at: item.closedAt ?? null }, NOW.getTime());
+      if (closed) return refused(closed, refuse);
+    }
+    const base = { item_id: item.itemId, seq: item.seq };
+    const why = this.gate(s!);
+    if (why) return ok({ ...this.card("seat_dispatch", { seat_id: s!.seat_id }), ...base, dispatch: "card", why_card: why });
+    const sent = { ok: true, ...base, dispatch: "sent", note: "Sent: the seat's agent is on it; you will hear when it finishes or needs the user." };
+    if (running) return ok(sent);
+    // Ended: opened again and sent as a new task to the same seat (or put back as it ended when its queue is full).
+    const full = () => refuse("seat_queue_full", `${SEAT_QUEUE_MAX} tasks already wait for that seat: offer to wait, the sandbox, or another seat`);
+    return this.dispatchErrand(s!, item.seq, input.new_session === true, base, full, ok);
   }
 
   private devenvList(activity: boolean): Record<string, unknown> {
