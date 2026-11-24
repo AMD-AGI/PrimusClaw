@@ -694,9 +694,18 @@ describe("seat dispatch", { skip }, () => {
     const s = await seat(cid, "/home/u/rel");
     seats.seatDispatchSettings.on = false;
     assert.equal((await refusal(create(await userTurn(alice, "发布"), `seat:${s.seatId}`))).code, "not_enabled");
-    assert.match(prompts.renderRouterSeatsSection(false), /Seats are only shown for now/);
-    assert.doesNotMatch(prompts.renderRouterSeatsSection(false), /Dispatching work/);
-    assert.match(prompts.renderRouterSeatsSection(true), /Dispatching work \(seats\)/);
-    assert.doesNotMatch(prompts.renderRouterSeatsSection(true), /only shown/);
+    assert.match(prompts.renderRouterSeatsSection(), /Seats are only shown for now/);
+    assert.doesNotMatch(prompts.renderRouterSeatsSection(), /Dispatching work/);
+    // With dispatch the "only shown" rule is left out; the dispatch section is its own (role-profile.ts appends both).
+    assert.doesNotMatch(prompts.renderRouterSeatsSection({ dispatch: true }), /only shown/);
+    assert.doesNotMatch(prompts.renderRouterSeatsSection({ dispatch: true }), /Dispatching work/);
+    const d = prompts.renderRouterDispatchSection();
+    // It comes before the development environments section's devenv_send rule, follows a seat's task with work_send, and an offline
+    // seat's task waits for its machine (contract §3.6) rather than being refused.
+    assert.match(d, /come before the development environments section/);
+    assert.match(d, /followed with work_send, never devenv_send/);
+    assert.match(d, /offline: a task for it waits in its queue until its machine is back/);
+    assert.doesNotMatch(d, /offline\/unsupported cannot take work/);
+    assert.match(prompts.renderRouterDevenvSection({ actions: true, send: true }), /"task handed to seat" is not one of these: another instruction for it is work_send/);
   });
 });

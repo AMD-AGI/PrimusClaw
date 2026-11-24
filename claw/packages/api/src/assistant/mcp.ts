@@ -712,9 +712,10 @@ export function createAssistantMcpServer(
         mcp.tool(
           "seat_roster",
           "The user's seats (工位): each folder an agent works in on their machines, with only what Claw computed or the user confirmed: "
-          + "its alias, the role the user confirmed (what it handles), whether its machine is online, its state, and its latest item. "
-          + "Nothing in it was written by a machine or an agent, so reading it does not stop you from acting afterwards. Use it to "
-          + "answer which seat handles what, or what a seat the user named is for.",
+          + "its alias, the role the user confirmed (what it handles), its machine and folder (cwd), whether its machine is online, its "
+          + "state, and its latest item. Nothing in it is words a machine or an agent wrote (a machine or folder name that is not plain "
+          + "host or path characters is not listed), so reading it does not stop you from acting afterwards. Use it to answer which seat "
+          + "handles what, or to find the seat the user named by its alias, role, machine or folder.",
           {},
           () => answer(claims, "seat_roster", () => seatRoster(claims)),
         );

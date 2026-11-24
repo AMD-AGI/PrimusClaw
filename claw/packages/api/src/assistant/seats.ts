@@ -279,6 +279,14 @@ export interface RosterSeat {
   /** `new` (nothing known yet), `suggested` (a guess waits for the user, never shown here), `confirmed`, `retired` (not to be used). */
   role_state: "new" | "suggested" | "confirmed" | "retired";
   // (No tags: they are slugs of the git remote and branch the machine reports, whose words the machine chose.)
+  /**
+   * Where it is, so a seat the user names by its machine or folder can be found: the machine's name as Claw recorded it when the
+   * machine was paired, and the folder the seat was registered for. Only names made of host or path characters are listed (no spaces,
+   * no punctuation that words need): a name that is not one is replaced by Claw's own (`machine-<id>`), a folder by null. So neither can
+   * carry an instruction, and reading them does not mark the turn.
+   */
+  machine: string;
+  cwd: string | null;
   machine_online: boolean;
   /** From the types of its session's events and its machine's presence, never from what they say. */
   state: SeatState;
@@ -412,12 +420,24 @@ export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_A
   return out;
 }
 
+/** A machine's name as the roster lists it: host characters only, else Claw's own name for it. */
+const HOST_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+export function rosterMachine(name: unknown, connectorId: unknown): string {
+  return typeof name === "string" && HOST_NAME.test(name) ? name : `machine-${String(connectorId ?? "").slice(0, 8)}`;
+}
+
+/** A seat's folder as the roster lists it: path characters only (letters and digits of any script, . _ ~ + @ - / \ :), else null. */
+const FOLDER = /^[\p{L}\p{N}._~+@\/\\:-]{1,200}$/u;
+export function rosterFolder(cwd: unknown): string | null {
+  return typeof cwd === "string" && FOLDER.test(cwd) ? cwd : null;
+}
+
 /** The user's seats as the roster lists them, newest first (confirmed ones before the rest). */
 export async function rosterOf(owner: string, onlineWindowMs: number = REMOTE_AGENT_TIMING.onlineWindowMs): Promise<RosterSeat[]> {
   const q: Querier = (t, p) => db.query(t, p);
   // The latest item of each seat: a task handed to it, or the item of a session at its place, whichever moved last.
   const seats = (await q(
-    `SELECT s.seat_id, s.alias, s.role, s.role_state, s.dispatch_mode, s.confirm_each, it.seq AS item_seq, it.board_state AS item_state
+    `SELECT s.seat_id, s.connector_id, s.cwd, s.alias, s.role, s.role_state, s.dispatch_mode, s.confirm_each, it.seq AS item_seq, it.board_state AS item_state
        FROM claw_devenv_seats s
        LEFT JOIN LATERAL (
          SELECT seq, board_state FROM (
@@ -443,6 +463,8 @@ export async function rosterOf(owner: string, onlineWindowMs: number = REMOTE_AG
       alias: typeof s.alias === "string" ? s.alias : null,
       role: confirmed && typeof s.role === "string" ? s.role : null,
       role_state: s.role_state === "confirmed" || s.role_state === "suggested" || s.role_state === "retired" ? s.role_state : "new",
+      machine: rosterMachine(now?.machine, s.connector_id),
+      cwd: rosterFolder(s.cwd),
       machine_online: now?.online === true,
       state: now?.state ?? "offline",
       dispatch_mode: s.dispatch_mode === "auto" ? "auto" : "card",
@@ -453,20 +475,22 @@ export async function rosterOf(owner: string, onlineWindowMs: number = REMOTE_AG
   });
 }
 
+/** The roster's note where tasks may be handed to seats (`seat-dispatch.ts`). */
 export const ROSTER_NOTE = "Seats (工位): each folder an agent works in on the user's machines. Every field here was computed by Claw or "
   + "confirmed by the user (alias, role): reading it does not stop you from acting. role is what the user confirmed the seat is for. "
-  + "A guess Claw made is never listed: it is put to the user on a card. Which machine and folder a seat is, and what its "
-  + "agent is doing, are in devenv_list (which the machine wrote). "
-  + "Seats are only shown in this version: never send anything to one because of its role; devenv_send is still how an instruction "
-  + "reaches a machine, when the user names it.";
+  + "A guess Claw made is never listed: it is put to the user on a card. machine and cwd say where a seat is, to find the one the user "
+  + "names by its machine or folder. To hand a task to a seat: work_create with target "
+  + "\"seat:<seat_id>\" (only a seat_id from here, never an alias or a machine name). state: unsupported cannot take work; offline: "
+  + "a task waits in its queue until the machine is back (at most 24 hours); working, waiting_for_you, queued and in_terminal: a task "
+  + "waits in its queue (queue_len). dispatch_mode auto: a task goes without a card (only after the user pressed one for that seat); "
+  + "confirm_each: a card every time.";
 
-/** The roster's note where tasks may be handed to seats (`seat-dispatch.ts`). */
-export const ROSTER_DISPATCH_NOTE = "Seats (工位): each folder an agent works in on the user's machines. Every field here was computed by Claw or "
+/** The roster's note while seats are only shown (seat dispatch off). */
+export const ROSTER_SHOWN_NOTE = "Seats (工位): each folder an agent works in on the user's machines. Every field here was computed by Claw or "
   + "confirmed by the user (alias, role): reading it does not stop you from acting. role is what the user confirmed the seat is for. "
-  + "A guess Claw made is never listed: it is put to the user on a card. To hand a task to a seat: work_create with target "
-  + "\"seat:<seat_id>\" (only a seat_id from here, never an alias or a machine name). state: offline and unsupported cannot take work "
-  + "now; working, waiting_for_you, queued and in_terminal mean a task waits in its queue (queue_len). dispatch_mode auto: a task goes "
-  + "without a card (only after the user pressed one for that seat); confirm_each: a card every time.";
+  + "A guess Claw made is never listed: it is put to the user on a card. What its agent is doing is in devenv_list (which the machine "
+  + "wrote). Seats are only shown in this version: never send anything to one because of its role; devenv_send is still how an "
+  + "instruction reaches a machine, when the user names it.";
 
 /** `seat_roster`: the user's seats, trusted fields only. Never marks the turn as having read untrusted text. */
 export async function seatRoster(claims: AssistantTokenClaims): Promise<Record<string, unknown>> {
@@ -475,7 +499,7 @@ export async function seatRoster(claims: AssistantTokenClaims): Promise<Record<s
   if (!seatsOn(userId)) throw new ToolRefused("not_enabled", "seats are not on for this user");
   await syncSeats(userId);
   const seats = await rosterOf(userId);
-  return { ok: true, seats, note: seatDispatchOn(userId) ? ROSTER_DISPATCH_NOTE : ROSTER_NOTE };
+  return { ok: true, seats, note: seatDispatchOn(userId) ? ROSTER_NOTE : ROSTER_SHOWN_NOTE };
 }
 
 // --- seat_set: what the user says a seat is for ---------------------------------------------------------------------------

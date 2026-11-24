@@ -32,7 +32,7 @@ import {
   ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_SKILLS_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, ROUTER_DISCIPLINE_PROMPT_VERSION, WORKER_DISCIPLINE_PROMPT_VERSION, renderModelChoice,
   renderObserverSystem, renderReviewState, renderRouterItems, renderRouterPrompt, renderWorkerSystem, withTurnState,
   ROUTER_DEVENV_PROMPT_VERSION, ROUTER_DISPATCH_PROMPT_VERSION, ROUTER_SEATS_PROMPT_VERSION, renderAttachedState, renderRouterDevenvSection,
-  renderRouterSeatsSection,
+  renderRouterDispatchSection, renderRouterSeatsSection,
   type AskedOfOtherLine, type ManifestItem,
 } from "./prompts.js";
 import { allowedModels, modelChoiceOn, platformModel, readModelPrefs } from "./model-choice.js";
@@ -435,7 +435,11 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS, send: true }));
     // Seats (`seats.ts`), for the users who have them: what each folder on their machines is for, as they confirmed it.
     // With seat dispatch (`seat-dispatch.ts`), its rules take the place of "only shown".
-    if (devenv && seatsOn(role.userId)) withSystemAppend(task, renderRouterSeatsSection(seatDispatchOn(role.userId)));
+    if (devenv && seatsOn(role.userId)) {
+      const dispatch = seatDispatchOn(role.userId);
+      withSystemAppend(task, renderRouterSeatsSection({ dispatch }));
+      if (dispatch) withSystemAppend(task, renderRouterDispatchSection());
+    }
     // Who it is (by the name its client calls it, with claw_self_status) and how to count what a lookup returned: the same on every
     // turn, so it stays cached.
     const self = selfStatusOn();
