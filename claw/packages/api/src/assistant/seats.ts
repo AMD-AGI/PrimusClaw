@@ -523,10 +523,13 @@ export async function seatRoleDecided(
 ): Promise<Record<string, unknown> & { ok: boolean }> {
   const seatId = String(params.seat_id ?? "");
   if (!allow) {
-    await q(
-      `UPDATE claw_devenv_seats SET role_state = 'retired', card_state = 'answered', updated_at = NOW() WHERE seat_id = $1 AND owner_user_id = $2`,
-      [seatId, userId],
+    // (Only the guess this card showed: a Deny on an older card, once a newer guess was made or kept, retires nothing.)
+    const r = await q(
+      `UPDATE claw_devenv_seats SET role_state = 'retired', card_state = 'answered', updated_at = NOW()
+        WHERE seat_id = $1 AND owner_user_id = $2 AND suggestion->>'id' = $3`,
+      [seatId, userId, String(params.suggestion_id ?? "")],
     );
+    if (!r.rowCount) return { ok: false, error: "stale", message: "that guess was replaced (or kept) since the card was made: nothing was retired" };
     return { ok: true, seat_id: seatId, role_state: "retired" };
   }
   const role = cleanRole(params.role);
@@ -701,8 +704,8 @@ async function probeOutcome(q: Querier, seat: Row, now: number): Promise<{ state
   const sid = String(seat.probe_session_id);
   const seq = Number(seat.probe_cmd_seq);
   const events = (await q(
-    `SELECT id, type, data FROM claw_remote_events WHERE session_id = $1::uuid AND id >= COALESCE(
-       (SELECT MIN(id) FROM claw_remote_events WHERE session_id = $1::uuid AND type = 'user_prompt' AND (data->>'cmd_seq')::bigint = $2), 0)
+    `SELECT id, type, data FROM claw_remote_events WHERE session_id = $1::uuid AND id >= (
+       SELECT MIN(id) FROM claw_remote_events WHERE session_id = $1::uuid AND type = 'user_prompt' AND (data->>'cmd_seq')::bigint = $2)
       ORDER BY id LIMIT 2000`,
     [sid, seq],
   )).rows as Row[];
@@ -726,7 +729,10 @@ async function probeOutcome(q: Querier, seat: Row, now: number): Promise<{ state
   return null;
 }
 
-/** Put the question to the seat's session: a prompt that may only answer, sent as Claw's (`seat_probe`), never filed as the user's item. */
+/**
+ * Put the question to the seat's session: a prompt that may only answer, sent as Claw's (`seat_probe`), never filed as the user's item.
+ * Its `user_prompt` names that client, and a chat attached to the session (personal-agent's reader) shows nothing of its turn.
+ */
 async function ask(seat: Row, activity: Row): Promise<boolean> {
   const n = Number(seat.probes_sent) + 1;
   const parsed = REMOTE_COMMANDS.prompt.parse({ text: PROBE_TEXT, answer_only: true });

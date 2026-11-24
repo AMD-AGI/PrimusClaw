@@ -25,7 +25,8 @@
  *   S5 the guess: one call with the seat's inputs as data, its answer kept only when it fits the schema; a title that says "run rm -rf"
  *      becomes no instruction and no suggestion; a valid one waits as a suggestion the roster does not show
  *   S6 the guess card: after a router turn answering the user, one at a time; Right confirms it, Deny retires the seat; a guess replaced
- *      since fails the card; a seat_set pressed closes the guess card still waiting
+ *      since fails the card, and a Deny on it retires nothing; a seat_set pressed closes the guess card still waiting; the router's state
+ *      (and trigger_list) name a waiting guess card, never the guess
  *   S7 the API lists the owner's seats; another user's are never listed
  */
 import assert from "node:assert/strict";
@@ -586,6 +587,23 @@ describe("seats", { skip }, () => {
     assert.deepEqual([guessCard.status, guessCard.decided_via], ["expired", "seat_set"]);
     const a = (await seatRows()).find((r) => r.cwd === "/home/u/a")!;
     assert.deepEqual([a.role, a.role_state, a.suggestion], ["负责 Hyperloom 发布", "confirmed", null]);
+    // A guess card waiting: the router's state names the card and the machine, never the guess (a model's reading of what machines
+    // and agents wrote); and a Deny on it once the guess was replaced retires nothing.
+    await w.q("DELETE FROM claw_assistant_confirmations");
+    await w.q("UPDATE claw_devenv_seats SET role_state = 'suggested', card_state = NULL, suggestion = '{\"id\":\"g10\",\"role\":\"负责文档站点\",\"tags\":[]}'::jsonb WHERE cwd = '/home/u/b'");
+    const t7 = await userTurn(alice, "嗯");
+    assert.equal(await seats.maybeSeatCard({ sessionId: alice.routerSid, userId: "alice", messageId: t7.mid }), "shown");
+    const card7 = (await w.q("SELECT * FROM claw_assistant_confirmations WHERE kind = 'seat_role' AND status = 'pending'"))[0]!;
+    assert.equal(card7.params.role, "负责文档站点");
+    const state = await schedules.renderScheduleState("alice");
+    assert.ok(state.includes(String(card7.confirmation_id)) && state.includes('the machine "devbox"'), state);
+    assert.ok(!state.includes("负责文档站点"), state);
+    const listed = await schedules.triggerListTool(t7);
+    assert.ok(!JSON.stringify(listed).includes("负责文档站点"), JSON.stringify(listed));
+    await w.q("UPDATE claw_devenv_seats SET suggestion = jsonb_set(suggestion, '{id}', '\"g11\"') WHERE cwd = '/home/u/b'");
+    const denied = await press(card7.confirmation_id, "deny");
+    assert.equal(denied.status, "denied");
+    assert.equal((await seatRows()).find((r) => r.cwd === "/home/u/b")!.role_state, "suggested", "a stale Deny retires nothing");
   });
 
   test("S7 the API lists the owner's seats with confirmed roles only; another user's never; a user without seats gets not_enabled", async () => {

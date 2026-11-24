@@ -652,7 +652,9 @@ export function describeCard(kind: string, params: Record<string, unknown> | nul
     case "skill_save":
       return `save the personal skill ${JSON.stringify(oneLine(p.name, 64))} the assistant drafted (no scheduled task): ${JSON.stringify(oneLine(p.description, 120))}`;
     case "seat_role":
-      return `confirm Claw's guess of what a seat on the machine ${JSON.stringify(oneLine(p.machine, 60))} handles (Deny: do not send it work): ${JSON.stringify(oneLine(p.role, 120))}`;
+      // (Never the guess itself: it is a model's reading of what machines and agents wrote, and this line goes into every router
+      // turn's state while the card waits. The user reads the guess on the card.)
+      return `confirm Claw's guess of what a seat on the machine ${JSON.stringify(oneLine(p.machine, 60))} handles (the guess is shown on the card only; Deny: do not send it work)`;
     case "seat_set":
       return `keep what the user said of a seat on the machine ${JSON.stringify(oneLine(p.machine, 60))}: ${[p.alias ? `name ${JSON.stringify(oneLine(p.alias, 16))}` : "", p.role ? `handles ${JSON.stringify(oneLine(p.role, 120))}` : ""].filter(Boolean).join(", ")}`;
     case "devenv_hide": {

@@ -22,6 +22,8 @@ export class RemoteTurnState {
   closed: string | null = null;
   note: string | null = null;
   private toolSinceText = true;
+  /** Claw's number of the prompt Claw put to the session for itself whose turn is being read now (none of it is shown), else null. */
+  private hidden: number | null = null;
 
   constructor(
     private readonly errors: PublicErrors,
@@ -37,6 +39,8 @@ export class RemoteTurnState {
     if (event.id) this.remember(event.id);
     const step = decode(event, this.errors);
     if (step.replay) return step;
+    const own = this.ownTurn(step);
+    if (own !== undefined) return own;
     // (the end of another prompt's turn, one queued in front of this one: not this turn's, and nothing to show)
     if (this.othersEnd(step)) return NOTHING;
     if (step.chunk?.kind === "message") {
@@ -49,6 +53,34 @@ export class RemoteTurnState {
     // (the connector refused this turn's own prompt: no turn_end follows that)
     if (this.refusedOwn(step)) this.end("error", step.rejected?.reason ?? null);
     return step;
+  }
+
+  /** A turn Claw put to the session for itself is being read: no reader shows it (its text, steps, mode switches). */
+  get hiding(): boolean {
+    return this.hidden !== null;
+  }
+
+  /**
+   * A turn Claw put to the session for itself (a seat's question, `CLAW_OWN_CLIENTS`): its prompt starts it, and everything until its
+   * end is nothing to any reader. Its end (`turn_end` naming it, or naming none; an error; the connector refusing it) ends it; the
+   * session closing, or its connector restarting, ends it and is read. Undefined when the event is read as usual.
+   */
+  private ownTurn(step: RemoteStep): RemoteStep | undefined {
+    if (step.hiddenTurn !== null) {
+      this.hidden = step.hiddenTurn;
+      return NOTHING;
+    }
+    if (this.hidden === null) return undefined;
+    if (step.closed !== null || step.recovered !== null) {
+      this.hidden = null; // (the session ended, or its connector restarted and the turn with it: read as usual)
+      return undefined;
+    }
+    if (step.finished && step.endsSeq !== null && step.endsSeq !== this.hidden) {
+      this.hidden = null; // (a turn end that names another prompt: that turn's, read as usual)
+      return undefined;
+    }
+    if (step.finished || (step.rejected?.type === "prompt" && step.rejected.cmdSeq === this.hidden)) this.hidden = null;
+    return NOTHING;
   }
 
   /** A turn end that names another prompt than this turn's. */

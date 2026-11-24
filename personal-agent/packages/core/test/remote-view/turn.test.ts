@@ -100,3 +100,51 @@ test("a credential in the answer is masked", () => {
   const secret = "sk-EXAMPLE-abcdef0123456789abcdef0123456789";
   assert.ok(!answerParts(`token: ${secret}`)[0]?.includes(secret));
 });
+
+test("a turn Claw put to the session for itself is nothing to the reader, and what follows its end is read", () => {
+  const state = new RemoteTurnState(PLAIN_ERRORS, () => 8);
+  const steps = [
+    frame("user_prompt", { text: "What do you handle?", cmd_seq: 7, client: "seat_probe", by: "claw" }, "1"),
+    acp("agent_message_chunk", "2", { content: { text: "I am responsible for the billing service." } }),
+    acp("tool_call", "3", { toolCallId: "t", title: "Read" }),
+    frame("mode_update", { currentMode: "plan" }, "4"),
+    frame("turn_end", { stopReason: "end_turn", cmd_seq: 7 }, "5"),
+  ].map((event) => state.feed(event));
+  assert.ok(steps.every((step) => step.chunk === null && step.tool === null && step.mode === null && !step.finished));
+  assert.deepEqual(state.segments, []);
+  assert.equal(state.ended, false);
+  assert.equal(state.hiding, false);
+  // the person's own prompt that comes next is read as usual
+  state.feed(frame("user_prompt", { text: "fix it", cmd_seq: 8, client: "personal-agent", by: "claw" }, "6"));
+  state.feed(acp("agent_message_chunk", "7", { content: { text: "Fixed." } }));
+  state.feed(frame("turn_end", { stopReason: "end_turn", cmd_seq: 8 }, "8"));
+  assert.equal(state.answer, "Fixed.");
+  assert.equal(state.ended, true);
+});
+
+test("a turn Claw put for itself ends at its refusal, at the session's end, and at another prompt's turn end", () => {
+  const refused = turn();
+  refused.feed(frame("user_prompt", { cmd_seq: 3, client: "seat_probe" }, "1"));
+  refused.feed(frame("command_rejected", { type: "prompt", cmd_seq: 3, reason: "busy" }, "2"));
+  assert.equal(refused.hiding, false);
+  refused.feed(acp("agent_message_chunk", "3", { content: { text: "on its own" } }));
+  assert.equal(refused.answer, "on its own");
+
+  const closed = turn();
+  closed.feed(frame("user_prompt", { cmd_seq: 3, client: "seat_probe" }, "1"));
+  const step = closed.feed(frame("session_closed", { reason: "stopped" }, "2"));
+  assert.equal(step.closed, "stopped");
+  assert.equal(closed.hiding, false);
+
+  const other = turn();
+  other.feed(frame("user_prompt", { cmd_seq: 3, client: "seat_probe" }, "1"));
+  const end = other.feed(frame("turn_end", { stopReason: "end_turn", cmd_seq: 4 }, "2"));
+  assert.equal(end.finished, true);
+  assert.equal(other.hiding, false);
+
+  // a prompt of any other client is no such turn
+  const mine = turn();
+  mine.feed(frame("user_prompt", { cmd_seq: 3, client: "assistant" }, "1"));
+  mine.feed(acp("agent_message_chunk", "2", { content: { text: "Shown." } }));
+  assert.equal(mine.answer, "Shown.");
+});

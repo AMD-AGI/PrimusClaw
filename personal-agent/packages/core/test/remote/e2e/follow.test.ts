@@ -87,6 +87,29 @@ test("what the agent writes after its turn reaches the chat without a message fr
     assert.deepEqual(prompts(w), ["do the thing"]);
   }));
 
+test("the answer to a question Claw put to the session for itself never reaches the chat", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    const before = w.said().length;
+    // Claw asks the idle session what it handles (a seat's question): its prompt, the agent's answer, the turn's end
+    await w.server.emit(sid, "user_prompt", {
+      text: "What do you handle?",
+      cmd_seq: 41,
+      client: "seat_probe",
+      by: "claw",
+    });
+    await w.server.say(sid, "I am responsible for the billing service.");
+    await w.server.emit(sid, "turn_end", { stopReason: "end_turn", cmd_seq: 41 });
+    await settle();
+    assert.equal(w.said().length, before, w.said().slice(before).join(" | "));
+    // what the agent says on its own afterwards still reaches the chat
+    await w.server.say(sid, "Heads up: the deploy finished.");
+    await settle();
+    const told = onItsOwn(w);
+    assert.equal(told.length, 1, w.said().slice(before).join(" | "));
+    assert.ok(told[0]?.includes("the deploy finished") && !told[0].includes("billing"), told[0] ?? "");
+  }));
+
 test("it is a new message and the chat is not asked anything", () =>
   remoteWorld(async (w) => {
     const { sid } = await attachedClaude(w);
@@ -347,6 +370,32 @@ test("a worker that starts follows the chats that are attached and says what it 
   }));
 
 // --- more of the same: restarts, errors, holding, the unlink race --------------------------------------------------------------
+
+test("a worker that restarts in the middle of a question Claw put to the session for itself says none of its answer", () =>
+  remoteWorld(async (w) => {
+    const { sid } = await attachedClaude(w);
+    const before = w.said().length;
+    const asked = await w.server.emit(sid, "user_prompt", {
+      text: "What do you handle?",
+      cmd_seq: 41,
+      client: "seat_probe",
+    });
+    await w.server.say(sid, "I am responsible ");
+    await settle();
+    w.remote.shutdown(); // the worker goes down in the middle of the answer...
+    await sleep(100);
+    // the read position it wrote never passes the question while its turn is open
+    assert.ok(Number(w.test.store.remoteState.attachedRemote(AAD)?.cursor || 0) < asked);
+    await w.server.say(sid, "for the billing service.");
+    await w.server.emit(sid, "turn_end", { stopReason: "end_turn", cmd_seq: 41 });
+    w.remote.resume(); // ...and comes back
+    await settle();
+    assert.equal(w.said().length, before, w.said().slice(before).join(" | "));
+    await w.server.say(sid, "Heads up: the deploy finished.");
+    await settle();
+    assert.equal(onItsOwn(w).length, 1);
+    assert.ok(!onItsOwn(w)[0]?.includes("billing"));
+  }));
 
 test("text that was read but not yet said when the worker stops is said once by the next one", () =>
   remoteWorld(async (w) => {
