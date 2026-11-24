@@ -103,13 +103,14 @@ func validateTemplateLayers(templates []runtimev1alpha1.GrantTemplate) error {
 }
 
 // validateTemplateMounts rejects a grant template whose volumes are anything
-// but read-only host directories mounted at their own path. A grant template
-// comes from an application platform, which lets a template reach a host
-// path only through a mount it has checked against the workspace (an absolute,
-// clean path under a directory the workspace mounts for sandboxes): the
-// sandbox workload mounts each hostPath volume read-only at the same path and
-// has no field for another mount path, so any other shape would not be what
-// it says.
+// but emptyDir volumes and read-only host directories mounted at their own
+// path. A grant template comes from an application platform, which lets a
+// template reach a host path only through a mount it has checked against the
+// workspace (an absolute, clean path under a directory the workspace mounts
+// for sandboxes): the sandbox workload mounts each hostPath volume read-only
+// at the same path and has no field for another mount path, so any other
+// shape would not be what it says. Other volume sources are refused, as the
+// template API refuses them to a caller who is not an administrator.
 //
 // A read-only mount nested inside a read-write workspace mount (workspace
 // /shared, template /shared/team/cache) relies on the nested mount being
@@ -135,24 +136,32 @@ func validateTemplateMounts(templates []runtimev1alpha1.GrantTemplate) error {
 
 // checkTemplateMounts holds one template to validateTemplateMounts.
 func checkTemplateMounts(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate) error {
-	paths := map[string]string{}
+	hostPaths := map[string]string{}
+	names := map[string]bool{}
 	for _, vol := range tmpl.Volumes {
-		if vol.HostPath == nil || vol.VolumeSource != (corev1.VolumeSource{HostPath: vol.HostPath}) {
-			return fmt.Errorf("volume %q is not a hostPath volume", vol.Name)
-		}
-		if err := checkMountPath(vol.HostPath.Path); err != nil {
-			return fmt.Errorf("volume %q: %w", vol.Name, err)
-		}
-		if _, dup := paths[vol.Name]; dup {
+		if names[vol.Name] {
 			return fmt.Errorf("volume %q is defined twice", vol.Name)
 		}
-		paths[vol.Name] = vol.HostPath.Path
+		names[vol.Name] = true
+		switch {
+		case vol.EmptyDir != nil && vol.VolumeSource == (corev1.VolumeSource{EmptyDir: vol.EmptyDir}):
+		case vol.HostPath != nil && vol.VolumeSource == (corev1.VolumeSource{HostPath: vol.HostPath}):
+			if err := checkMountPath(vol.HostPath.Path); err != nil {
+				return fmt.Errorf("volume %q: %w", vol.Name, err)
+			}
+			hostPaths[vol.Name] = vol.HostPath.Path
+		default:
+			return fmt.Errorf("volume %q is neither an emptyDir nor a hostPath volume", vol.Name)
+		}
 	}
 	mounted := map[string]bool{}
 	for _, m := range tmpl.VolumeMounts {
-		hostPath, ok := paths[m.Name]
-		if !ok {
+		if !names[m.Name] {
 			return fmt.Errorf("volume mount %q names no volume of the template", m.Name)
+		}
+		hostPath, ok := hostPaths[m.Name]
+		if !ok {
+			continue
 		}
 		if mounted[m.Name] {
 			return fmt.Errorf("volume %q is mounted twice", m.Name)
@@ -165,9 +174,23 @@ func checkTemplateMounts(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate) e
 			return fmt.Errorf("volume %q must be mounted read-only", m.Name)
 		}
 	}
-	for name := range paths {
+	for name := range hostPaths {
 		if !mounted[name] {
 			return fmt.Errorf("volume %q is not mounted", name)
+		}
+	}
+	// A sidecar mounts a volume with Kubernetes' own default, read-write: a
+	// host directory is the main container's alone.
+	for _, c := range tmpl.Sidecars {
+		for _, m := range c.VolumeMounts {
+			if _, ok := hostPaths[m.Name]; ok {
+				return fmt.Errorf("sidecar %q mounts host directory volume %q", c.Name, m.Name)
+			}
+		}
+		for _, d := range c.VolumeDevices {
+			if _, ok := hostPaths[d.Name]; ok {
+				return fmt.Errorf("sidecar %q uses host directory volume %q as a device", c.Name, d.Name)
+			}
 		}
 	}
 	return nil

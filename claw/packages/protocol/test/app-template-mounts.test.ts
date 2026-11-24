@@ -81,12 +81,38 @@ test("mountPath other than the hostPath, an unknown key, a duplicate, too many m
   assert.deepEqual(paths({ host_mounts: ["/shared"] }), ["sandbox_templates[0].host_mounts[0]"]);
 });
 
-test("Agent Sandbox's own volumes and volumeMounts are refused, flat or nested: host paths come only through host_mounts", () => {
-  assert.deepEqual(paths({ volumes: [{ name: "v", hostPath: { path: "/" } }] }), ["sandbox_templates[0].volumes"]);
-  assert.deepEqual(paths({ volumeMounts: [{ name: "v", mountPath: "/host" }] }), ["sandbox_templates[0].volumeMounts"]);
-  assert.deepEqual(paths({ template: { fromImage: "x", volumes: [], volumeMounts: [] } }), [
-    "sandbox_templates[0].template.volumes", "sandbox_templates[0].template.volumeMounts",
+test("a template's own hostPath or other non-emptyDir volume is refused, flat or nested: host paths come only through host_mounts", () => {
+  assert.deepEqual(paths({ volumes: [{ name: "v", hostPath: { path: "/" } }] }), ["sandbox_templates[0].volumes[0]"]);
+  assert.deepEqual(paths({ volumes: [{ name: "v", emptyDir: {}, hostPath: { path: "/" } }] }), ["sandbox_templates[0].volumes[0]"]);
+  assert.deepEqual(paths({ volumes: [{ name: "v", nfs: { server: "nfs.example.invalid", path: "/" } }] }), ["sandbox_templates[0].volumes[0]"]);
+  assert.deepEqual(paths({ volumes: { name: "v" } }), ["sandbox_templates[0].volumes"]);
+  assert.deepEqual(paths({ template: { fromImage: "x", volumes: [{ name: "v", persistentVolumeClaim: { claimName: "c" } }] } }), [
+    "sandbox_templates[0].template.volumes[0]",
   ]);
+});
+
+test("Agent Sandbox's keys must be spelt exactly: its decoder matches them case-insensitively", () => {
+  assert.deepEqual(paths({ Volumes: [{ name: "v", hostPath: { path: "/" } }], VolumeMounts: [{ name: "v", mountPath: "/host" }] }), [
+    "sandbox_templates[0].Volumes", "sandbox_templates[0].VolumeMounts",
+  ]);
+  assert.deepEqual(paths({ VOLUMEMOUNTS: [] }), ["sandbox_templates[0].VOLUMEMOUNTS"]);
+  assert.deepEqual(paths({ Template: { fromImage: "x" } }), ["sandbox_templates[0].Template"]);
+  assert.deepEqual(paths({ template: { fromImage: "x", volumes: [], Volumes: [] } }), ["sandbox_templates[0].template.Volumes"]);
+});
+
+test("a template's own emptyDir volumes and their mounts are kept, and may not take a host mount's volume name", () => {
+  const scratch = { volumes: [{ name: "scratch", emptyDir: {} }], volumeMounts: [{ name: "scratch", mountPath: "/scratch", readOnly: false }] };
+  assert.deepEqual(issuesOf(scratch), []);
+  assert.deepEqual(issuesOf({ ...scratch, host_mounts: [{ hostPath: CACHE, readOnly: true }] }), []);
+  assert.deepEqual(paths({ volumes: [{ name: "template-mount-0", emptyDir: {} }] }), ["sandbox_templates[0].volumes[0].name"]);
+  assert.deepEqual(paths({ volumeMounts: [{ name: "template-mount-0", mountPath: "/w", readOnly: false }], host_mounts: [{ hostPath: CACHE, readOnly: true }] }), [
+    "sandbox_templates[0].volumeMounts[0].name",
+  ]);
+  const [t] = appGrantTemplates(manifest({ ...scratch, host_mounts: [{ hostPath: CACHE, readOnly: true }] }), { image: "i", sandboxWorkspace: "ws" });
+  assert.deepEqual((t!.volumes as Array<{ name: string }>).map((v) => v.name), ["scratch", "template-mount-0"]);
+  assert.deepEqual((t!.volumeMounts as Array<{ name: string }>).map((v) => v.name), ["scratch", "template-mount-0"]);
+  const [plain] = appGrantTemplates(manifest(scratch), { image: "i", sandboxWorkspace: "ws" });
+  assert.deepEqual(plain!.volumes, scratch.volumes, "a template without host_mounts keeps its volumes unchanged");
 });
 
 test("the grant carries each mount as a hostPath volume and a read-only mount at the same path, and drops mounts", () => {

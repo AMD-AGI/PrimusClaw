@@ -60,11 +60,13 @@ func TestTemplateMountsRefused(t *testing.T) {
 		"root":            `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/"}}],"volumeMounts":[{"name":"v","mountPath":"/"}]}`,
 		"relative":        `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"shared"}}],"volumeMounts":[{"name":"v","mountPath":"shared"}]}`,
 		"colon":           `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/a:b"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/a:b"}]}`,
-		"not hostPath":    `{` + img + `,"volumes":[{"name":"v","emptyDir":{}}],"volumeMounts":[{"name":"v","mountPath":"/scratch"}]}`,
+		"nfs":             `{` + img + `,"volumes":[{"name":"v","nfs":{"server":"nfs.example.invalid","path":"/"}}],"volumeMounts":[{"name":"v","mountPath":"/n"}]}`,
+		"case variant":    `{` + img + `,"Volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"VolumeMounts":[{"name":"v","mountPath":"/shared/c","readOnly":false}]}`,
 		"two sources":     `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"},"emptyDir":{}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"}]}`,
 		"unmounted":       `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}]}`,
 		"unknown volume":  `{` + img + `,"volumeMounts":[{"name":"v","mountPath":"/shared/c"}]}`,
 		"mounted twice":   `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"},{"name":"v","mountPath":"/shared/c"}]}`,
+		"sidecar mount":   `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"}],"sidecars":[{"name":"s","image":"i","volumeMounts":[{"name":"v","mountPath":"/w"}]}]}`,
 		"duplicate names": `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}},{"name":"v","hostPath":{"path":"/shared/d"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"}]}`,
 	}
 	for name, spec := range cases {
@@ -72,10 +74,12 @@ func TestTemplateMountsRefused(t *testing.T) {
 			t.Errorf("%s: accepted", name)
 		}
 	}
-	// An omitted readOnly is read-only (the template's default), and a template
-	// without volumes, or without an image, is not this check's.
+	// An omitted readOnly is read-only (the template's default), an emptyDir
+	// is the template's own to mount as it likes, and a template without
+	// volumes, or without an image, is not this check's.
 	ok := []string{
 		`{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"}]}`,
+		`{` + img + `,"volumes":[{"name":"s","emptyDir":{}}],"volumeMounts":[{"name":"s","mountPath":"/scratch","readOnly":false}],"sidecars":[{"name":"c","image":"i","volumeMounts":[{"name":"s","mountPath":"/scratch"}]}]}`,
 		`{` + img + `}`,
 		``,
 	}
