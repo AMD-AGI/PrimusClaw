@@ -42,6 +42,10 @@ func TestCheckSpecKeysRefusesFoldedDuplicates(t *testing.T) {
 			t.Errorf("%s: err=%v", name, err)
 		}
 	}
+	// Keys the decoder keeps apart are not refused: dotless ı is not i.
+	if err := CheckSpecKeys(`{"labels":{"\u0131d":"a","Id":"b"}}`); err != nil {
+		t.Errorf("dotless i: %v", err)
+	}
 	ok := []string{
 		``,
 		mountSpec,

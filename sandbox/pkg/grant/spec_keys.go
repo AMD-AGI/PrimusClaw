@@ -80,8 +80,9 @@ func scanValue(dec *json.Decoder, at string) error {
 }
 
 // foldKey folds a key the way encoding/json folds field names when it matches
-// them: ASCII letters to upper case, any other rune to upper(lower(r)), which
-// maps ſ (U+017F) to S and K (U+212A) to K.
+// them (its foldName): ASCII letters to upper case, any other rune to the
+// smallest rune of its simple fold set, which maps ſ (U+017F) to S and K
+// (U+212A) to K.
 func foldKey(key string) []byte {
 	out := make([]byte, 0, len(key))
 	for i := 0; i < len(key); {
@@ -94,10 +95,21 @@ func foldKey(key string) []byte {
 			continue
 		}
 		r, n := utf8.DecodeRuneInString(key[i:])
-		out = utf8.AppendRune(out, unicode.ToUpper(unicode.ToLower(r)))
+		out = utf8.AppendRune(out, foldRune(r))
 		i += n
 	}
 	return out
+}
+
+// foldRune is the smallest rune of r's simple fold set.
+func foldRune(r rune) rune {
+	for {
+		r2 := unicode.SimpleFold(r)
+		if r2 <= r {
+			return r2
+		}
+		r = r2
+	}
 }
 
 // validateSpecKeys holds every template's spec to CheckSpecKeys.
