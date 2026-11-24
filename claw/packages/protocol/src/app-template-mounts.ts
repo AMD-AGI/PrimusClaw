@@ -36,7 +36,7 @@
  *    its `subPath`; one with `enableUserDir` declares only the directories
  *    under it other than `users` (the per-user directories).
  *
- * A template's own Agent Sandbox `volumes` may only be `emptyDir` ones, and
+ * A template's own Agent Sandbox `volumes` may not be hostPath ones, and
  * Agent Sandbox's keys must be spelt exactly (its JSON decoder matches them
  * case-insensitively): `host_mounts` is the only way a plugin template reaches
  * a host path, so the checks above cannot be stepped around.
@@ -66,7 +66,7 @@ export interface AppTemplateMount {
   readOnly: true;
 }
 
-/** Agent Sandbox's own volume keys of a template; its `volumes` may only be `emptyDir` ones. */
+/** Agent Sandbox's own volume keys of a template; its `volumes` may not be hostPath ones. */
 export const TEMPLATE_RAW_VOLUME_KEYS = ["volumes", "volumeMounts"] as const;
 
 /** The name prefix of the volumes `host_mounts` renders, which a template's own volumes may not take. */
@@ -170,10 +170,10 @@ export function templateMountIssues(template: Record<string, unknown>, at: strin
 }
 
 /**
- * Agent Sandbox's own volume keys of one template object: spelt exactly, its
- * `volumes` only `emptyDir` ones (`{ name, emptyDir }`), and no volume or mount
- * named like those `host_mounts` renders. A host directory is reached only
- * through `host_mounts`.
+ * Agent Sandbox's own volume keys of one template object: spelt exactly, no
+ * hostPath among its `volumes` (in any spelling), and no volume or mount named
+ * like those `host_mounts` renders. A host directory is reached only through
+ * `host_mounts`.
  */
 function rawVolumeIssues(obj: Record<string, unknown>, at: string, bad: (path: string, reason: string) => void): void {
   for (const key of Object.keys(obj)) {
@@ -184,9 +184,10 @@ function rawVolumeIssues(obj: Record<string, unknown>, at: string, bad: (path: s
   if (Object.hasOwn(obj, "volumes")) {
     if (!Array.isArray(obj.volumes)) bad(`${at}.volumes`, "must be an array");
     else obj.volumes.forEach((v, i) => {
-      const keys = isObj(v) ? Object.keys(v).sort().join(",") : "";
-      if (!isObj(v) || keys !== "emptyDir,name" || !isObj(v.emptyDir) || typeof v.name !== "string") {
-        bad(`${at}.volumes[${i}]`, "a template's own volumes may only be { name, emptyDir }; a host directory goes in host_mounts");
+      if (!isObj(v)) {
+        bad(`${at}.volumes[${i}]`, "must be an object");
+      } else if (Object.keys(v).some((k) => k.toLowerCase() === "hostpath")) {
+        bad(`${at}.volumes[${i}]`, "a template's own volumes may not be hostPath volumes; a host directory goes in host_mounts");
       } else if (reserved(v.name)) {
         bad(`${at}.volumes[${i}].name`, `must not start with ${TEMPLATE_MOUNT_VOLUME_PREFIX}`);
       }
@@ -220,7 +221,7 @@ export function renderTemplateMounts(template: Record<string, unknown>): Record<
   if (mounts.length === 0) return rest;
   const volumes = mounts.map((m, i) => ({ name: `${TEMPLATE_MOUNT_VOLUME_PREFIX}${i}`, hostPath: { path: m.hostPath, type: "Directory" } }));
   const volumeMounts = mounts.map((m, i) => ({ name: `${TEMPLATE_MOUNT_VOLUME_PREFIX}${i}`, mountPath: m.hostPath, readOnly: true }));
-  // Added to the template's own (emptyDir) volumes and mounts, never in place of them.
+  // Added to the template's own volumes and mounts, never in place of them.
   const merged = (target: Record<string, unknown>): Record<string, unknown> => ({
     ...target,
     volumes: [...(Array.isArray(target.volumes) ? target.volumes : []), ...volumes],

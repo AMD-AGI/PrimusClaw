@@ -684,8 +684,9 @@ Checked when the manifest is registered and on every app run:
   `/etc`, `/lib*`, `/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/tmp`, `/usr`,
   `/var/lib`, `/var/run`, `/var/tmp`; so not `/var` either).
 - A template's own Agent Sandbox `volumes` (flat or in a nested `template`)
-  may only be `{ "name", "emptyDir" }` entries, and neither they nor its
-  `volumeMounts` may use a name starting with `template-mount-`; `volumes`,
+  may not be `hostPath` volumes (other sources pass through as before), and
+  neither they nor its `volumeMounts` may use a name starting with
+  `template-mount-`; `volumes`,
   `volumeMounts` and `template` must be spelt exactly (Agent Sandbox matches
   field names case-insensitively). `host_mounts` is the only way a template
   reaches a host path.
@@ -705,9 +706,9 @@ already give its sandboxes. `host_mounts` cannot be changed by run-time
 The grant hands each mount to Agent Sandbox as a `hostPath` volume
 (`template-mount-<i>`, type `Directory`) and a `readOnly: true` volume mount at
 the same path, after the template's own `volumes` and `volumeMounts`. Agent
-Sandbox refuses a grant template with any other volume source, a hostPath
-volume mounted anywhere but read-only at its own path, or a sidecar that
-mounts a hostPath volume.
+Sandbox refuses to issue or extend a grant whose template has a hostPath
+volume that is not a clean absolute path, is mounted anywhere but read-only at
+its own path, or is mounted by a sidecar.
 
 **A read-only directory inside a read-write one.** When the workspace mounts
 `/shared` read-write and a template mounts `/shared/team/cache` read-only, the

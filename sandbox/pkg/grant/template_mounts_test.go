@@ -4,8 +4,10 @@
 package grant
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 )
@@ -60,9 +62,8 @@ func TestTemplateMountsRefused(t *testing.T) {
 		"root":            `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/"}}],"volumeMounts":[{"name":"v","mountPath":"/"}]}`,
 		"relative":        `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"shared"}}],"volumeMounts":[{"name":"v","mountPath":"shared"}]}`,
 		"colon":           `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/a:b"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/a:b"}]}`,
-		"nfs":             `{` + img + `,"volumes":[{"name":"v","nfs":{"server":"nfs.example.invalid","path":"/"}}],"volumeMounts":[{"name":"v","mountPath":"/n"}]}`,
-		"case variant":    `{` + img + `,"Volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"VolumeMounts":[{"name":"v","mountPath":"/shared/c","readOnly":false}]}`,
 		"two sources":     `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"},"emptyDir":{}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"}]}`,
+		"case variant":    `{` + img + `,"Volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"VolumeMounts":[{"name":"v","mountPath":"/shared/c","readOnly":false}]}`,
 		"unmounted":       `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}]}`,
 		"unknown volume":  `{` + img + `,"volumeMounts":[{"name":"v","mountPath":"/shared/c"}]}`,
 		"mounted twice":   `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"},{"name":"v","mountPath":"/shared/c"}]}`,
@@ -74,12 +75,13 @@ func TestTemplateMountsRefused(t *testing.T) {
 			t.Errorf("%s: accepted", name)
 		}
 	}
-	// An omitted readOnly is read-only (the template's default), an emptyDir
-	// is the template's own to mount as it likes, and a template without
-	// volumes, or without an image, is not this check's.
+	// An omitted readOnly is read-only (the template's default), a volume of
+	// another source is not this check's, and neither is a template without
+	// volumes or without an image.
 	ok := []string{
 		`{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"}]}`,
 		`{` + img + `,"volumes":[{"name":"s","emptyDir":{}}],"volumeMounts":[{"name":"s","mountPath":"/scratch","readOnly":false}],"sidecars":[{"name":"c","image":"i","volumeMounts":[{"name":"s","mountPath":"/scratch"}]}]}`,
+		`{` + img + `,"volumes":[{"name":"c","configMap":{"name":"cfg"}}],"volumeMounts":[{"name":"c","mountPath":"/config"}]}`,
 		`{` + img + `}`,
 		``,
 	}
@@ -87,5 +89,30 @@ func TestTemplateMountsRefused(t *testing.T) {
 		if err := validateTemplateMounts(grantTemplate(spec)); err != nil {
 			t.Errorf("%q: %v", spec, err)
 		}
+	}
+}
+
+// A grant stored with a writable host directory (before its templates'
+// volumes were checked) is not extended.
+func TestExtendRefusesAStoredWritableHostMount(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	svc, priv, _, _ := testService(t, now)
+	req := sampleRequest(now.Add(time.Hour))
+	req.Attestation = signGrant(t, priv, req)
+	if _, _, err := svc.Issue(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	g, err := svc.get(context.Background(), req.GrantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Spec.Templates[0].Spec = `{"fromImage":"example@sha256:` + strings.Repeat("0", 64) + `",` +
+		`"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c","readOnly":false}]}`
+	if err := svc.client.Update(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.Extend(context.Background(), req.GrantID, ExtendRequest{ExpiresAt: now.Add(2 * time.Hour), Attestation: req.Attestation})
+	if !IsReason(err, "invalid_grant") || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("err=%v", err)
 	}
 }

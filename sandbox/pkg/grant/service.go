@@ -313,6 +313,11 @@ func (s *Service) Extend(ctx context.Context, grantID string, req ExtendRequest)
 	if !req.ExpiresAt.After(g.Spec.ExpiresAt.Time) {
 		return GrantView{}, opErr(http.StatusBadRequest, "invalid_grant", "expiresAt must move later")
 	}
+	// A grant stored before its templates' volumes were checked is not kept
+	// alive past its expiry with a mount Issue would now refuse.
+	if err := validateTemplateMounts(g.Spec.Templates); err != nil {
+		return GrantView{}, err
+	}
 	issue := issueFrom(g, req.ExpiresAt, req.Attestation)
 	if s.attest == nil {
 		return GrantView{}, opErr(http.StatusServiceUnavailable, "attestation_unavailable", "JWKS is not configured")

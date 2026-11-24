@@ -102,15 +102,14 @@ func validateTemplateLayers(templates []runtimev1alpha1.GrantTemplate) error {
 	return nil
 }
 
-// validateTemplateMounts rejects a grant template whose volumes are anything
-// but emptyDir volumes and read-only host directories mounted at their own
-// path. A grant template comes from an application platform, which lets a
-// template reach a host path only through a mount it has checked against the
-// workspace (an absolute, clean path under a directory the workspace mounts
-// for sandboxes): the sandbox workload mounts each hostPath volume read-only
-// at the same path and has no field for another mount path, so any other
-// shape would not be what it says. Other volume sources are refused, as the
-// template API refuses them to a caller who is not an administrator.
+// validateTemplateMounts rejects a grant template whose hostPath volumes are
+// anything but read-only host directories mounted at their own path. A grant
+// template comes from an application platform, which lets a template reach a
+// host path only through a mount it has checked against the workspace (an
+// absolute, clean path under a directory the workspace mounts for
+// sandboxes): the sandbox workload mounts each hostPath volume read-only at
+// the same path and has no field for another mount path, so any other shape
+// would not be what it says. Volumes of other sources are not this check's.
 //
 // A read-only mount nested inside a read-write workspace mount (workspace
 // /shared, template /shared/team/cache) relies on the nested mount being
@@ -143,16 +142,16 @@ func checkTemplateMounts(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate) e
 			return fmt.Errorf("volume %q is defined twice", vol.Name)
 		}
 		names[vol.Name] = true
-		switch {
-		case vol.EmptyDir != nil && vol.VolumeSource == (corev1.VolumeSource{EmptyDir: vol.EmptyDir}):
-		case vol.HostPath != nil && vol.VolumeSource == (corev1.VolumeSource{HostPath: vol.HostPath}):
-			if err := checkMountPath(vol.HostPath.Path); err != nil {
-				return fmt.Errorf("volume %q: %w", vol.Name, err)
-			}
-			hostPaths[vol.Name] = vol.HostPath.Path
-		default:
-			return fmt.Errorf("volume %q is neither an emptyDir nor a hostPath volume", vol.Name)
+		if vol.HostPath == nil {
+			continue
 		}
+		if vol.VolumeSource != (corev1.VolumeSource{HostPath: vol.HostPath}) {
+			return fmt.Errorf("volume %q sets a hostPath and another source", vol.Name)
+		}
+		if err := checkMountPath(vol.HostPath.Path); err != nil {
+			return fmt.Errorf("volume %q: %w", vol.Name, err)
+		}
+		hostPaths[vol.Name] = vol.HostPath.Path
 	}
 	mounted := map[string]bool{}
 	for _, m := range tmpl.VolumeMounts {

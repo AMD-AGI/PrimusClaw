@@ -81,14 +81,16 @@ test("mountPath other than the hostPath, an unknown key, a duplicate, too many m
   assert.deepEqual(paths({ host_mounts: ["/shared"] }), ["sandbox_templates[0].host_mounts[0]"]);
 });
 
-test("a template's own hostPath or other non-emptyDir volume is refused, flat or nested: host paths come only through host_mounts", () => {
+test("a template's own hostPath volume is refused in any spelling, flat or nested: host paths come only through host_mounts", () => {
   assert.deepEqual(paths({ volumes: [{ name: "v", hostPath: { path: "/" } }] }), ["sandbox_templates[0].volumes[0]"]);
-  assert.deepEqual(paths({ volumes: [{ name: "v", emptyDir: {}, hostPath: { path: "/" } }] }), ["sandbox_templates[0].volumes[0]"]);
-  assert.deepEqual(paths({ volumes: [{ name: "v", nfs: { server: "nfs.example.invalid", path: "/" } }] }), ["sandbox_templates[0].volumes[0]"]);
+  assert.deepEqual(paths({ volumes: [{ name: "v", emptyDir: {}, HostPath: { path: "/" } }] }), ["sandbox_templates[0].volumes[0]"]);
   assert.deepEqual(paths({ volumes: { name: "v" } }), ["sandbox_templates[0].volumes"]);
-  assert.deepEqual(paths({ template: { fromImage: "x", volumes: [{ name: "v", persistentVolumeClaim: { claimName: "c" } }] } }), [
+  assert.deepEqual(paths({ volumes: ["v"] }), ["sandbox_templates[0].volumes[0]"]);
+  assert.deepEqual(paths({ template: { fromImage: "x", volumes: [{ name: "v", hostpath: { path: "/etc" } }] } }), [
     "sandbox_templates[0].template.volumes[0]",
   ]);
+  assert.deepEqual(issuesOf({ volumes: [{ name: "c", configMap: { name: "cfg" } }], volumeMounts: [{ name: "c", mountPath: "/config" }] }), [],
+    "a volume of another source passes through as before");
 });
 
 test("Agent Sandbox's keys must be spelt exactly: its decoder matches them case-insensitively", () => {
@@ -100,7 +102,7 @@ test("Agent Sandbox's keys must be spelt exactly: its decoder matches them case-
   assert.deepEqual(paths({ template: { fromImage: "x", volumes: [], Volumes: [] } }), ["sandbox_templates[0].template.Volumes"]);
 });
 
-test("a template's own emptyDir volumes and their mounts are kept, and may not take a host mount's volume name", () => {
+test("a template's own volumes and their mounts are kept, and may not take a host mount's volume name", () => {
   const scratch = { volumes: [{ name: "scratch", emptyDir: {} }], volumeMounts: [{ name: "scratch", mountPath: "/scratch", readOnly: false }] };
   assert.deepEqual(issuesOf(scratch), []);
   assert.deepEqual(issuesOf({ ...scratch, host_mounts: [{ hostPath: CACHE, readOnly: true }] }), []);

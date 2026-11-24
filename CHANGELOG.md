@@ -119,9 +119,9 @@ release version, and its `appVersion` stays `latest`.
   Sandbox template at the same path. Only `readOnly: true` is accepted, the path must be absolute and normalised and stay
   clear of system directories, and an app run is refused (`403 sandbox_template_mount_not_granted`) unless the path lies
   under a directory the template's workspace already mounts for sandboxes, read from SaFE as the caller. A template's
-  own Agent Sandbox `volumes` may now only be `emptyDir` ones, and the Agent Sandbox grant service refuses a grant
-  template with any other volume source, a hostPath volume mounted anywhere but read-only at its own path, or a sidecar
-  that mounts a hostPath volume.
+  own Agent Sandbox `volumes` may no longer be hostPath ones, and the Agent Sandbox grant service refuses to issue or
+  extend a grant whose template has a hostPath volume mounted anywhere but read-only at its own path, or mounted by a
+  sidecar.
 - Claw: the assistant knows what it can and cannot do. Its router turn has a new read tool, `claw_capabilities`, that
   answers a list generated from what that turn really has: the tools registered on its assistant server, each by how
   it takes effect (`acts_at_once`, `asks_first`, `reads`), the deployment's switches (pull request and job watching,

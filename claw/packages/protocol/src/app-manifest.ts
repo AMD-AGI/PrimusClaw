@@ -143,8 +143,8 @@ export interface AppSandboxTemplateDataPlane {
  * are owned by the Agent Sandbox design, not by Claw: Claw reads `name`
  * (roles refer to it), `per_gpu_count` and `host_mounts`, and hands every other
  * field through unvalidated and unchanged (Agent Sandbox stores them whole as
- * the template's `spec`). Agent Sandbox's own `volumes` may only be
- * `emptyDir` ones: a template reaches a host path only through `host_mounts`.
+ * the template's `spec`). Agent Sandbox's own `volumes` may not be hostPath
+ * ones: a template reaches a host path only through `host_mounts`.
  */
 export interface AppSandboxTemplate {
   name: string;
