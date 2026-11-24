@@ -7,6 +7,7 @@
  */
 
 import AdmZip from "adm-zip";
+import { validateAppManifest } from "@claw/protocol";
 import {
   DeleteObjectCommand,
   GetObjectCommand,
@@ -23,6 +24,7 @@ import { getS3Client, S3_LIST_PAGE_KEYS } from "../infra/s3-client.js";
 import { storedOverridable } from "./plugin-overrides.js";
 import {
   AccessDeniedError,
+  AppManifestInvalidError,
   BadGatewayError,
   BadRequestError,
   ConflictError,
@@ -634,6 +636,26 @@ export async function createToolNewVersion(
   throw new ToolDuplicateError("tool with same name and version already exists");
 }
 
+/**
+ * Refuse a plugin `resource` whose app (`resource.app`) carries a manifest that
+ * fails {@link validateAppManifest}, so such a manifest is never stored: an app
+ * run would refuse it anyway (422 app_manifest_invalid), only later and on
+ * every submitter's request. These are the checks that need nothing but the
+ * manifest, the template host mounts and keys among them. Whether a mount lies
+ * under a directory the sandbox's workspace grants stays an app-run check,
+ * because the workspace is only known then.
+ */
+export function assertStorableAppManifest(resource: unknown): void {
+  if (!isPlainRecord(resource) || !Object.hasOwn(resource, "app")) return;
+  const app = resource.app;
+  const issues = validateAppManifest(isPlainRecord(app) ? app.manifest : undefined);
+  if (issues.length > 0) throw new AppManifestInvalidError(issues.slice(0, 20));
+}
+
+function isPlainRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
 async function upsertPluginOnce(
   payload: JsonObject,
   actingUserId: string,
@@ -673,6 +695,7 @@ export async function upsertPlugin(
 ): Promise<[JsonObject, string]> {
   const name = requireNonBlankName(payload.name);
   const ver = requireNonBlankVersion(payload.version);
+  assertStorableAppManifest(payload.resource);
   let last: unknown;
   for (let attempt = 0; attempt < UPSERT_CONCURRENCY_RETRIES; attempt++) {
     try {
@@ -728,6 +751,7 @@ export async function createPluginNewVersion(
     status: src.status ?? "active",
   };
   if (overrides) Object.assign(payload, overrides);
+  assertStorableAppManifest(payload.resource);
   // A new version of a temporary plugin is temporary until the same instant,
   // unless the request names its own expiry (or null for none).
   const inheritExpiresAt = src.expires_at ? new Date(src.expires_at as string | Date) : null;

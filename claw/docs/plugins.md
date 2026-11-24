@@ -670,7 +670,17 @@ read it:
 | `mountPath` | no | When given, must equal `hostPath`: the sandbox workload mounts a host path at its own path and has no field for another one. |
 | `readOnly` | yes | Must be `true`. |
 
-Checked when the manifest is registered and on every app run:
+Checked when the manifest is registered and on every app run. Registration
+here is every plugin write that carries `resource`: `POST /v1/plugins`,
+`POST /v1/plugins/upsert`, `PUT`/`PATCH /v1/plugins/:id` and
+`POST /v1/plugins/:id/new-version` (a new version that keeps its source's
+`resource` is checked too). A write whose `resource.app.manifest` fails any
+static check of the manifest, these among them, is refused with
+`422 app_manifest_invalid` and the `issues` (each a `path` and a `reason`, at
+most 20), the body an app run of that manifest would get, and nothing is
+written. A write without `resource`, or whose `resource` has no `app`, is not
+checked.
+
 
 - At most 8 mounts per template, no path twice, no other key.
 - `readOnly: true` only. The workspace already mounts its storage into every
@@ -698,7 +708,11 @@ Checked when the manifest is registered and on every app run:
   checked against W2 and run in W1. `host_mounts` is the only way a template
   reaches a host path.
 
-Checked when an app run is created, as the caller: every `hostPath` must lie
+Checked only when an app run is created, as the caller, because the workspace
+a sandbox runs in (and so the directories it grants) is known only then, and a
+plugin registered today may run in a workspace whose volumes change later: a
+mount outside every workspace directory is therefore stored at registration
+and refused at the run. Every `hostPath` must lie
 under a directory the template's workspace (the template's `workspace`, else the
 run's `sandbox_workspace`) already mounts for sandboxes, read from the
 workspace's `volumes`. A `hostpath` volume declares its `hostPath` joined with
