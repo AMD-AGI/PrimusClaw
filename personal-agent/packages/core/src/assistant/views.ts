@@ -88,6 +88,8 @@ export interface ConfirmWriteModel {
   readonly cardId: string;
   /** Claw's word for letting it through ("" for "Confirm"). */
   readonly allowLabel: string;
+  /** What is held (`github_merge`, `trigger_create`, ...): a merge's other button says "Don't merge". Absent: "Don't". */
+  readonly kind?: string;
   readonly lang: string;
 }
 

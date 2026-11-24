@@ -92,8 +92,19 @@ test("a 403 in another workspace says sandbox workspace, not CPU", async () => {
   assertReadable(err.message);
 });
 
-test("every other refusal keeps the error it had", async () => {
-  for (const status of [400, 401, 404, 500, 503]) {
+test("any other 4xx is the platform refusing the request: terminal, sandbox_rejected, with what it said", async () => {
+  for (const status of [400, 401, 404, 409, 422]) {
+    answer(status, "body");
+    const err = await new SafeWorkloadProvider().create(params("global-cpu")).then(() => null, (e: unknown) => e);
+    assert.ok(err instanceof SandboxProvisionTerminalError, `HTTP ${status}`);
+    assert.equal(err.reason, "sandbox_rejected", `HTTP ${status}`);
+    assert.equal(err.message, `The platform refused to create the sandbox (HTTP ${status}): body`);
+    globalThis.fetch = realFetch!;
+  }
+});
+
+test("a 5xx, or a 4xx that means later, keeps the retryable error it had", async () => {
+  for (const status of [408, 425, 429, 500, 503]) {
     answer(status, "body");
     const err = await new SafeWorkloadProvider().create(params("global-cpu")).then(() => null, (e: unknown) => e);
     assert.ok(!(err instanceof SandboxProvisionTerminalError), `HTTP ${status}`);

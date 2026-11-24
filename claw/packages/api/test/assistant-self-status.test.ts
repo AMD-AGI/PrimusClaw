@@ -60,7 +60,7 @@ test("S1 the router is told who it is, by the name its client gives or by none, 
 test("S6 a greeting or a question about the assistant is answered short, with the channel's help command for the full list", () => {
   // router-self-v3 (nightly 2026-11-13: "who are you" 480 characters against 400, "hello" 265 against 200, a sign-off that listed
   // the cards waiting): each kind of social turn has its budget, every one under the shortest the eval allows for that kind.
-  assert.equal(ROUTER_SELF_PROMPT_VERSION, "router-self-v4");
+  assert.equal(ROUTER_SELF_PROMPT_VERSION, "router-self-v5");
   assert.ok(SOCIAL_REPLY_CHARS <= 100 && SELF_INTRO_CHARS <= 300 && CAPABILITIES_CHARS <= 450);
   for (const self of [true, false]) {
     const teams = renderRouterSelfSection(self, undefined, "Helper");

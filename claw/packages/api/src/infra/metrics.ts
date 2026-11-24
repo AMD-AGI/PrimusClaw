@@ -75,6 +75,9 @@ function isQueueWaitOutcome(outcome: QueueExitOutcome): outcome is QueueWaitOutc
 
 export type EverHeld = "true" | "false";
 
+/** Why the event consumer set an event aside (events/poison.ts). */
+export type EventQuarantineReason = "unparseable" | "unstorable" | "bounded";
+
 export const registry = new Registry();
 registry.setDefaultLabels({ service: "claw-api" });
 collectDefaultMetrics({ register: registry });
@@ -101,6 +104,61 @@ const eventPersistedTotal = new Counter({
   name: "claw_api_event_persisted_total",
   help: "Events persisted by the durable event consumer.",
   labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+// A run's result carried characters Postgres refuses (U+0000, a lone
+// surrogate) and they were replaced so the result could land.
+const agentDoneSanitizedTotal = new Counter({
+  name: "claw_api_agent_done_sanitized_total",
+  help: "agent_done callbacks whose text had unstorable characters replaced with U+FFFD before the write.",
+  registers: [registry],
+});
+// A result the database still refused for its values, answered 422 so the
+// sender stops resending it. Rising means a field the sanitiser does not cover.
+const agentDoneRefusedTotal = new Counter({
+  name: "claw_api_agent_done_refused_total",
+  help: "agent_done callbacks refused with 422 because the database rejected their values, by SQLSTATE.",
+  labelNames: ["sqlstate"] as const,
+  registers: [registry],
+});
+
+// The event consumer's own health (events/poison.ts). Consecutive failures is this replica's run of deliveries answered
+// with a retry since it last stored an event or set one aside; an outage or a poison event shows here first. Quarantined is an event set aside with a
+// durable copy in claw_event_quarantine, by why: `unparseable` (not a JSON object) or `unstorable` (the database refused
+// its value after sanitising), or `bounded` (a completion the database refused for its depth, run with a depth-bounded
+// copy; the record keeps the original). Sanitised counts the events newly stored with characters Postgres cannot hold (NUL, a
+// lone surrogate) replaced by U+FFFD; a delivery that fails, is dropped, or finds its row already stored is not counted.
+const eventConsumerConsecutiveFailures = new Gauge({
+  name: "claw_api_event_consumer_consecutive_failures",
+  help: "Event deliveries this replica answered with a retry since it last stored or set aside an event.",
+  registers: [registry],
+});
+const eventQuarantinedTotal = new Counter({
+  name: "claw_api_event_quarantined_total",
+  help: "Events the event consumer set aside in claw_event_quarantine, by reason.",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+const eventSanitisedTotal = new Counter({
+  name: "claw_api_event_sanitised_total",
+  help: "Events stored with NUL or lone-surrogate characters replaced by U+FFFD.",
+  registers: [registry],
+});
+// The durable consumer's backlog as the server reports it, read every 30 s by each replica (the same numbers on
+// every replica). Oldest pending age is how long the oldest event not yet acknowledged has waited: the stall signal.
+const eventConsumerAckPending = new Gauge({
+  name: "claw_api_event_consumer_ack_pending",
+  help: "Events delivered to the api-consumer durable and not yet acknowledged.",
+  registers: [registry],
+});
+const eventConsumerPending = new Gauge({
+  name: "claw_api_event_consumer_pending",
+  help: "Events on the event stream not yet delivered to the api-consumer durable.",
+  registers: [registry],
+});
+const eventConsumerOldestPendingAge = new Gauge({
+  name: "claw_api_event_consumer_oldest_pending_age_seconds",
+  help: "Age of the oldest event the api-consumer durable has not acknowledged; 0 when none is pending.",
   registers: [registry],
 });
 
@@ -346,6 +404,136 @@ const identityClientEnabled = new Gauge({
   registers: [registry],
 });
 
+// ─── Outbound notifications (notifications/outbox.ts) ─────────────────
+// What became of each delivery attempt. `failed` is a row that will be tried again; the `dropped_*` and `quarantined`
+// outcomes are the ones it will not.
+export const NOTIFICATION_DELIVERY_OUTCOMES = [
+  "delivered", "failed", "quarantined", "dropped_gone", "dropped_expired", "dropped_subscription_gone",
+] as const;
+export type NotificationDeliveryOutcome = (typeof NOTIFICATION_DELIVERY_OUTCOMES)[number];
+export const NOTIFICATION_QUARANTINE_REASONS = ["isolated_failures"] as const;
+export type NotificationQuarantineReason = (typeof NOTIFICATION_QUARANTINE_REASONS)[number];
+const notificationDeliveryTotal = new Counter({
+  name: "claw_notification_delivery_total",
+  help: "Outbound notification delivery attempts, by outcome.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+// The one to alert on: an event a person was owed and did not get, set aside because the receiver works and kept refusing it
+// (400, 413, 415, 422) for an hour while it took everything else (`isolated_failures`).
+const notificationQuarantinedTotal = new Counter({
+  name: "claw_notification_quarantined_total",
+  help: "Outbound notifications quarantined instead of retried, by reason.",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+// Every series is exported at 0 from the start. prom-client exports a labelled series only once it has a value, so without
+// this a pod's first quarantine would appear to Prometheus already at 1, increase() over it would read 0, and the alert on
+// it (ClawNotificationQuarantined) would stay silent for exactly the case it exists for.
+for (const reason of NOTIFICATION_QUARANTINE_REASONS) notificationQuarantinedTotal.inc({ reason }, 0);
+for (const outcome of NOTIFICATION_DELIVERY_OUTCOMES) notificationDeliveryTotal.inc({ outcome }, 0);
+const notificationReadFailedTotal = new Counter({
+  name: "claw_notification_outbox_read_failed_total",
+  help: "Scrapes whose read of the notification outbox failed; the outbox gauges then keep their last value.",
+  registers: [registry],
+});
+
+export interface NotificationOutboxHealth {
+  oldestPendingAgeSeconds: number;
+  pending: number;
+}
+let notificationOutboxReader: (() => Promise<NotificationOutboxHealth>) | null = null;
+let notificationOutboxRead: { at: number; reading: Promise<NotificationOutboxHealth | null> } | null = null;
+/** One read of the table per scrape, shared by the gauges below (each collects on its own). */
+function readNotificationOutbox(): Promise<NotificationOutboxHealth | null> {
+  const reader = notificationOutboxReader;
+  if (!reader) return Promise.resolve(null);
+  const now = Date.now();
+  if (notificationOutboxRead && now - notificationOutboxRead.at < 1000) return notificationOutboxRead.reading;
+  const reading = reader().catch(() => {
+    notificationReadFailedTotal.inc();
+    return null;
+  });
+  notificationOutboxRead = { at: now, reading };
+  return reading;
+}
+// The stall gauge: how long the oldest notification still to be delivered has waited. A receiver that is down, a delivery
+// loop that stopped, a row retried without end -- each shows here, whatever the loop itself believes.
+const notificationOldestPendingAge = new Gauge({
+  name: "claw_notification_outbox_oldest_pending_age_seconds",
+  help: "Age of the oldest outbound notification not yet delivered, dropped or quarantined (0 when none).",
+  registers: [registry],
+  async collect() {
+    const r = await readNotificationOutbox();
+    if (r) this.set(r.oldestPendingAgeSeconds);
+  },
+});
+const notificationPending = new Gauge({
+  name: "claw_notification_outbox_pending",
+  help: "Outbound notifications not yet delivered, dropped or quarantined.",
+  registers: [registry],
+  async collect() {
+    const r = await readNotificationOutbox();
+    if (r) this.set(r.pending);
+  },
+});
+// (registered by construction; nothing else refers to them. The failing subscriptions are the delivery-health sample's
+// `claw_notification_subscriptions_failing` and `claw_notification_subscription_failures_max`, below.)
+void [notificationOldestPendingAge, notificationPending];
+
+// A2A push notifications (`routes/a2a-push.ts`). Each webhook gets its notifications in order, the oldest undelivered
+// one first and alone, so one that keeps failing holds the rest back until it is set aside (quarantined) after a bounded
+// number of attempts. The two gauges are read from the outbox on the worker's reconcile pass and are the same on every
+// replica: the most attempts any webhook's current head has used, and how long the oldest undelivered notification has
+// waited. A rising age with flat deliveries is a stalled webhook.
+const a2aPushDeliveryTotal = new Counter({
+  name: "claw_a2a_push_delivery_total",
+  help: "A2A push notification delivery attempts, by outcome.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+const a2aPushQuarantinedTotal = new Counter({
+  name: "claw_a2a_push_quarantined_total",
+  help: "A2A push notifications set aside after failing every allowed attempt, so the ones behind them could be sent.",
+  registers: [registry],
+});
+const a2aPushHeadConsecutiveFailures = new Gauge({
+  name: "claw_a2a_push_head_consecutive_failures",
+  help: "The most delivery attempts any webhook's oldest undelivered notification has used.",
+  registers: [registry],
+});
+const a2aPushOldestPendingAgeSeconds = new Gauge({
+  name: "claw_a2a_push_oldest_pending_age_seconds",
+  help: "Age of the oldest A2A push notification that is neither delivered nor set aside; 0 when none waits.",
+  registers: [registry],
+});
+
+export type A2aPushDeliveryOutcome = "delivered" | "retried" | "dropped" | "quarantined";
+
+// The per-session message queue (`claw_pending_messages`). The two gauges are
+// read from the table on every sweeper tick, by every replica, so they describe
+// the queue rather than this process: alert on max() across replicas.
+const pendingDrainFailuresTotal = new Counter({
+  name: "claw_api_pending_drain_failures_total",
+  help: "Attempts to send on a queued message that failed and left it queued.",
+  registers: [registry],
+});
+const pendingQuarantinedTotal = new Counter({
+  name: "claw_api_pending_quarantined_total",
+  help: "Queued messages moved out of their session's queue after repeated failures to send them.",
+  registers: [registry],
+});
+const pendingConsecutiveFailures = new Gauge({
+  name: "claw_api_pending_messages_consecutive_failures",
+  help: "Most consecutive failed attempts to send any one message still queued; 0 when every queued message is flowing.",
+  registers: [registry],
+});
+const pendingOldestAgeSeconds = new Gauge({
+  name: "claw_api_pending_messages_oldest_age_seconds",
+  help: "Age of the oldest message still queued behind a session; 0 when nothing is queued.",
+  registers: [registry],
+});
+
 // A marker ahead of the clock is pod skew, not a negative wait, so it clamps
 // to zero rather than entering the first bucket as a measurement nobody took.
 function sojournSeconds(markerIso: string | null | undefined): number | null {
@@ -354,6 +542,166 @@ function sojournSeconds(markerIso: string | null | undefined): number | null {
   if (Number.isNaN(started)) return null;
   return Math.max(0, (Date.now() - started) / 1000);
 }
+
+// ---------------------------------------------------------------------------
+// Delivery health: whether what is on its way to a person is getting through (a connector's events once refused for
+// hours with nobody told). One naming for every queue, so one alert rule covers them all
+// (claw/deploy/charts/claw/alerts/delivery.rules.yaml).
+//
+// The backlog gauges are read from the database on a scrape (`setDeliverySampler`, `remote-agents/delivery-health.ts`),
+// so every replica reports the same deployment-wide numbers; the rules take max() over replicas. `connector_id` is a
+// label only on the per-connector gauges, and only for a connector that is behind or failing right now (at most
+// DELIVERY_SAMPLE_MAX_CONNECTORS of them): a healthy fleet exports none of those series.
+// ---------------------------------------------------------------------------
+
+/** The queues the delivery gauges name. */
+export const DELIVERY_QUEUES = ["remote_events", "notification_outbox"] as const;
+export type DeliveryQueue = (typeof DELIVERY_QUEUES)[number];
+export const DELIVERY_SAMPLE_MAX_CONNECTORS = 50;
+
+export interface DeliverySample {
+  backlog: Array<{ queue: DeliveryQueue; oldestAgeSeconds: number; size: number }>;
+  /** Connectors behind or failing now, the worst first. */
+  connectors: Array<{ connectorId: string; backlogAgeSeconds: number; postFailures: number; apiFailures: number }>;
+  /** Connectors the delivery-health sweep holds as stalled. */
+  stalled: number;
+  /** Notification subscriptions failing now, and the most consecutive failures of any (null without notifications). */
+  subscriptions: { failing: number; failuresMax: number } | null;
+}
+
+let deliverySampler: (() => Promise<DeliverySample | null>) | null = null;
+let deliverySampled: { at: number; value: Promise<DeliverySample | null> } | null = null;
+/** One read per scrape: every gauge below shares it, and a second scrape within this long reuses it. */
+const DELIVERY_SAMPLE_TTL_MS = 5_000;
+
+async function deliverySample(): Promise<DeliverySample | null> {
+  if (!deliverySampler) return null;
+  if (!deliverySampled || Date.now() - deliverySampled.at > DELIVERY_SAMPLE_TTL_MS) {
+    const sampler = deliverySampler;
+    // A read that fails reports nothing (the gauges go absent, which `absent()`-free rules read as no data), never a stale zero.
+    deliverySampled = { at: Date.now(), value: sampler().catch(() => null) };
+  }
+  return deliverySampled.value;
+}
+
+const deliveryBacklogOldestAge = new Gauge({
+  name: "claw_delivery_backlog_oldest_age_seconds",
+  help: "How long the oldest item still waiting to be delivered has waited, by queue.",
+  labelNames: ["queue"] as const,
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    for (const b of s?.backlog ?? []) this.set({ queue: b.queue }, b.oldestAgeSeconds);
+  },
+});
+const deliveryBacklogSize = new Gauge({
+  name: "claw_delivery_backlog_size",
+  help: "Items still waiting to be delivered, by queue.",
+  labelNames: ["queue"] as const,
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    for (const b of s?.backlog ?? []) this.set({ queue: b.queue }, b.size);
+  },
+});
+const remoteConnectorBacklogAge = new Gauge({
+  name: "claw_remote_connector_backlog_age_seconds",
+  help: "How long the oldest event a connector has not got through has waited, for connectors behind or failing now.",
+  labelNames: ["connector_id"] as const,
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    for (const c of s?.connectors ?? []) this.set({ connector_id: c.connectorId }, c.backlogAgeSeconds);
+  },
+});
+const remoteConnectorPostFailures = new Gauge({
+  name: "claw_remote_connector_post_failures",
+  help: "Consecutive failed event posts of a connector, as the connector reports them and as the API answered them, for connectors failing now.",
+  labelNames: ["connector_id", "side"] as const,
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    for (const c of s?.connectors ?? []) {
+      this.set({ connector_id: c.connectorId, side: "connector" }, c.postFailures);
+      this.set({ connector_id: c.connectorId, side: "api" }, c.apiFailures);
+    }
+  },
+});
+const remoteDeliveryStalled = new Gauge({
+  name: "claw_remote_delivery_stalled",
+  help: "Connectors whose events have not got through for longer than the notice threshold, as the delivery-health sweep holds them.",
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    if (s) this.set(s.stalled);
+  },
+});
+const notificationSubscriptionsFailing = new Gauge({
+  name: "claw_notification_subscriptions_failing",
+  help: "Enabled notification subscriptions whose receiver is failing now.",
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    if (s?.subscriptions) this.set(s.subscriptions.failing);
+  },
+});
+const notificationSubscriptionFailuresMax = new Gauge({
+  name: "claw_notification_subscription_failures_max",
+  help: "The most consecutive failed deliveries of any enabled notification subscription.",
+  registers: [registry],
+  async collect() {
+    const s = await deliverySample();
+    this.reset();
+    if (s?.subscriptions) this.set(s.subscriptions.failuresMax);
+  },
+});
+
+// Every batch a connector posted to `POST /v1/remote-agents/connectors/:cid/events`, by how the API answered it: stored
+// (`ok`), refused as malformed (`client_error`), or failed (`server_error`, a 5xx the connector retries).
+export type RemoteEventsPostOutcome = "ok" | "client_error" | "server_error";
+const remoteEventsPostTotal = new Counter({
+  name: "claw_remote_events_post_total",
+  help: "Event batches posted by connectors, by how the API answered them.",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
+// A delivery of the durable event consumer (`api-consumer`) that JetStream had delivered before (a nak or an ack timeout),
+// and how long the longest-redelivered message still being retried has been (`events/redelivery.ts`).
+const eventRedeliveredTotal = new Counter({
+  name: "claw_api_event_redelivered_total",
+  help: "Event consumer deliveries that were redeliveries of a message delivered before.",
+  registers: [registry],
+});
+let redeliveryOldestAge: () => number = () => 0;
+const eventRedeliveryOldestAge = new Gauge({
+  name: "claw_api_event_redelivery_oldest_age_seconds",
+  help: "How long the event consumer has been redelivering the message it has retried longest without acknowledging it; 0 when none.",
+  registers: [registry],
+  collect() {
+    this.set(redeliveryOldestAge());
+  },
+});
+
+// What the delivery-health sweep told a person about their replies (`remote-agents/delivery-health.ts`): that they are
+// delayed, or that they get through again; `told`, or `no_assistant` (nobody to say it through), or `failed` (retried).
+export type DeliveryNoticeKind = "delayed" | "recovered";
+export type DeliveryNoticeOutcome = "told" | "no_assistant" | "failed";
+const deliveryStallNoticesTotal = new Counter({
+  name: "claw_delivery_stall_notices_total",
+  help: "Notices to a person that their replies are delayed or get through again, by kind and outcome.",
+  labelNames: ["kind", "outcome"] as const,
+  registers: [registry],
+});
+// Referenced so a gauge read only by its collect() is not reported unused.
+void [deliveryBacklogOldestAge, deliveryBacklogSize, remoteConnectorBacklogAge, remoteConnectorPostFailures, remoteDeliveryStalled,
+  notificationSubscriptionsFailing, notificationSubscriptionFailuresMax, eventRedeliveryOldestAge];
 
 export const metrics = {
   /** Handed to the identity client at construction; see @claw/utils identity/. */
@@ -372,6 +720,12 @@ export const metrics = {
   setIdentityClientEnabled(enabled: boolean): void {
     identityClientEnabled.set(enabled ? 1 : 0);
   },
+  onAgentDoneSanitized(): void {
+    agentDoneSanitizedTotal.inc();
+  },
+  onAgentDoneRefused(sqlstate: string): void {
+    agentDoneRefusedTotal.inc({ sqlstate });
+  },
   onSessionCreated(outcome: "ok" | "error"): void {
     sessionCreatedTotal.inc({ outcome });
   },
@@ -383,6 +737,20 @@ export const metrics = {
   },
   onEventPersisted(outcome: "ok" | "error"): void {
     eventPersistedTotal.inc({ outcome });
+  },
+  setEventConsumerConsecutiveFailures(n: number): void {
+    eventConsumerConsecutiveFailures.set(n);
+  },
+  onEventQuarantined(reason: EventQuarantineReason): void {
+    eventQuarantinedTotal.inc({ reason });
+  },
+  onEventSanitised(): void {
+    eventSanitisedTotal.inc();
+  },
+  setEventConsumerBacklog(b: { ackPending: number; pending: number; oldestPendingAgeSeconds: number }): void {
+    eventConsumerAckPending.set(b.ackPending);
+    eventConsumerPending.set(b.pending);
+    eventConsumerOldestPendingAge.set(b.oldestPendingAgeSeconds);
   },
 
   onAdmissionDecision(origin: AdmissionOrigin, decision: AdmissionDecisionLabel): void {
@@ -407,6 +775,24 @@ export const metrics = {
   },
   onRunDispatchHeld(cause: DispatchHeldCause): void {
     runDispatchHeldTotal.inc({ cause });
+  },
+
+  /** Where the delivery gauges read their numbers from; null stops reading (a test, or a process going down). */
+  setDeliverySampler(sampler: (() => Promise<DeliverySample | null>) | null): void {
+    deliverySampler = sampler;
+    deliverySampled = null;
+  },
+  onRemoteEventsPost(outcome: RemoteEventsPostOutcome): void {
+    remoteEventsPostTotal.inc({ outcome });
+  },
+  onEventRedelivered(): void {
+    eventRedeliveredTotal.inc();
+  },
+  setRedeliveryOldestAge(read: () => number): void {
+    redeliveryOldestAge = read;
+  },
+  onDeliveryStallNotice(kind: DeliveryNoticeKind, outcome: DeliveryNoticeOutcome): void {
+    deliveryStallNoticesTotal.inc({ kind, outcome });
   },
 
   onRunClaim(mode: ClaimMode, outcome: ClaimOutcome): void {
@@ -466,6 +852,14 @@ export const metrics = {
   onAssistantRouterUnsaid(outcome: RouterUnsaidOutcome): void {
     assistantRouterUnsaidTotal.inc({ outcome });
   },
+  onA2aPushDelivery(outcome: A2aPushDeliveryOutcome): void {
+    a2aPushDeliveryTotal.inc({ outcome });
+    if (outcome === "quarantined") a2aPushQuarantinedTotal.inc();
+  },
+  setA2aPushBacklog(headConsecutiveFailures: number, oldestPendingAgeSeconds: number): void {
+    a2aPushHeadConsecutiveFailures.set(headConsecutiveFailures);
+    a2aPushOldestPendingAgeSeconds.set(oldestPendingAgeSeconds);
+  },
   onUserSkillListed(role: "router", chars: number, truncated: boolean): void {
     userSkillListedChars.observe({ role }, chars);
     if (truncated) userSkillTruncatedTotal.inc({ role });
@@ -473,7 +867,29 @@ export const metrics = {
   onUserSkillRead(role: "router", outcome: "ok" | "not_found" | "not_here"): void {
     userSkillReadTotal.inc({ role, outcome });
   },
+  onNotificationDelivery(outcome: NotificationDeliveryOutcome): void {
+    notificationDeliveryTotal.inc({ outcome });
+  },
+  onNotificationQuarantined(reason: NotificationQuarantineReason): void {
+    notificationQuarantinedTotal.inc({ reason });
+    notificationDeliveryTotal.inc({ outcome: "quarantined" });
+  },
+  /** Set by a process that has the outbox tables; until then the outbox gauges read 0. */
+  setNotificationOutboxReader(reader: (() => Promise<NotificationOutboxHealth>) | null): void {
+    notificationOutboxReader = reader;
+    notificationOutboxRead = null;
+  },
   onUserSkillSave(op: "create" | "update" | "draft" | "delete" | "disable" | "enable" | "undo", outcome: string): void {
     userSkillSaveTotal.inc({ op, outcome });
+  },
+  onPendingDrainFailure(): void {
+    pendingDrainFailuresTotal.inc();
+  },
+  onPendingQuarantined(): void {
+    pendingQuarantinedTotal.inc();
+  },
+  setPendingQueueState(consecutiveFailures: number, oldestAgeSeconds: number): void {
+    pendingConsecutiveFailures.set(Math.max(0, consecutiveFailures));
+    pendingOldestAgeSeconds.set(Math.max(0, oldestAgeSeconds));
   },
 };

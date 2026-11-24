@@ -67,6 +67,11 @@ export function withdraws(agent: Agent | null | undefined): boolean {
   return says(agent, "withdraw");
 }
 
+/** The connector saves the files a prompt carries on its machine and names them in the prompt (`prompt_files`). */
+export function takesFiles(agent: Agent | null | undefined): boolean {
+  return says(agent, "prompt_files");
+}
+
 /** The connector can open a conversation that is open in a terminal read-only (`watch_live`). */
 export function watchesLive(agent: Agent): boolean {
   return says(agent, "watch_live");

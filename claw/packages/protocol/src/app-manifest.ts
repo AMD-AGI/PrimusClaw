@@ -48,6 +48,18 @@ export const APP_MANIFEST_DEFAULTS = {
   stop_grace_sec: 900,
 } as const;
 
+/**
+ * Hard ceiling on the SIGTERM grace, whatever the manifest asks for: the wait
+ * keeps the run's lock and its sandbox, so an application cannot name an hour
+ * count of its own.
+ */
+export const APP_MAX_STOP_GRACE_SEC = 3600;
+
+/** The SIGTERM grace a run of `manifest` is given when it is stopped (the manifest's, bounded). */
+export function appStopGraceSec(manifest: Pick<AppManifestV1, "stop_grace_sec">): number {
+  return Math.min(manifest.stop_grace_sec ?? APP_MANIFEST_DEFAULTS.stop_grace_sec, APP_MAX_STOP_GRACE_SEC);
+}
+
 export interface AppContainer {
   /** The default image; `resources.image` in the request wins. Optional. */
   image?: string;

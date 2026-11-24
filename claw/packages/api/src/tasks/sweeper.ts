@@ -28,6 +28,7 @@ import { backfillPlatformFacts, drainPendingPlatformFacts } from "./platform-bac
 import { publishEvent } from "../events/store.js";
 import pino from "pino";
 import {
+  APP_MAX_STOP_GRACE_SEC,
   appendAttemptRecord, bankQueuedMs, endAttemptRecord, interruptSubject,
   noteAttemptRenewal, openAttemptRecord,
   BG_VERDICT_TTL_MS,
@@ -67,6 +68,7 @@ import {
   parseDispatchCompensationRecord, SWEEPABLE_RUN_STATUSES, UNSUPPORTED_RECEIPT_SQL,
 } from "./chat-run.js";
 import { sweepAssistant } from "../assistant/sweep.js";
+import { observePendingQueue, pruneQuarantinedMessages, retryQuarantineNotices } from "./pending-quarantine.js";
 
 const logger = pino({ name: "task-sweeper" });
 
@@ -103,7 +105,8 @@ const WAITING_ITEM_SANDBOX_RELEASE_SEC = envInt(
 
 /**
  * The work item `sessionId` is the worker of (one at most: the column is
- * unique), when it waits for a person or is over, nothing is queued for the
+ * unique), when it waits for a person, only watches a pull request after its
+ * result was delivered, or is over, nothing is queued for the
  * session, and the session's last run -- or the item's last change, whichever
  * is later -- is at least WAITING_ITEM_SANDBOX_RELEASE_SEC ago. Null otherwise,
  * and null on a failed read: keeping the sandbox one more tick is what the
@@ -117,7 +120,7 @@ export async function waitingItemPastRelease(
   if (!sessionId || !CLAW_ASSISTANT_ENABLED) return null;
   try {
     const r = await db.query(
-      `SELECT w.item_id, w.board_state,
+      `SELECT w.item_id, w.board_state, w.params ? 'watching_pr' AS watching,
               EXTRACT(EPOCH FROM NOW() - GREATEST(
                 w.updated_at,
                 (SELECT MAX(COALESCE(t.completed_at, t.started_at, t.created_at)) FROM claw_tasks t WHERE t.session_id = $1)
@@ -128,9 +131,10 @@ export async function waitingItemPastRelease(
       [sessionId],
     );
     const row = r.rows[0] as
-      | { item_id: string; board_state: string; quiet_sec: number | string | null; queued: boolean }
+      | { item_id: string; board_state: string; watching: boolean; quiet_sec: number | string | null; queued: boolean }
       | undefined;
-    if (!row || (row.board_state !== "needs_you" && row.board_state !== "done") || row.queued) return null;
+    // A delivered result's item that only watches its pull request (`watching_pr`) waits for GitHub as one in needs_you waits for a person.
+    if (!row || (row.board_state !== "needs_you" && row.board_state !== "done" && !row.watching) || row.queued) return null;
     const quietSec = Number(row.quiet_sec);
     if (row.quiet_sec === null || !Number.isFinite(quietSec) || quietSec < releaseSec) return null;
     return { itemId: row.item_id, boardState: row.board_state, quietSec: Math.round(quietSec) };
@@ -372,6 +376,28 @@ let timer: NodeJS.Timeout | null = null;
 let takeoverTimer: NodeJS.Timeout | null = null;
 
 /**
+ * An app run (`mode = 'app'`) past its deadline by the backstop's grace (`$3`) but
+ * not yet by its application's stop grace on top, which `reapStaleTasks` leaves
+ * alone.
+ *
+ * An app run's deadline is the moment the Brain stops it (`pastDeadline`, and the
+ * deadline the dispatch carries): the Brain then sends SIGTERM and waits up to the
+ * manifest's `stop_grace_sec` (bounded at `$5`, APP_MAX_STOP_GRACE_SEC) for the
+ * application to write its own result, holding the run's lease throughout. Closing
+ * the task inside that wait would end the run before the Brain's own deadline
+ * handling does, as `run_budget_exhausted` instead of the `deadline` it is. The
+ * grace is the one recorded at admission (`metadata.app_stop_grace_sec`); a run
+ * admitted before it was recorded waits the ceiling. A row in the window that the
+ * never-claimed arm would take waits at most the same.
+ */
+const APP_IN_STOP_GRACE_SQL = `(mode = 'app'
+         AND deadline_at IS NOT NULL
+         AND deadline_at < NOW() - ($3::int * INTERVAL '1 second')
+         AND deadline_at >= NOW() - (($3::int + CASE WHEN metadata->>'app_stop_grace_sec' ~ '^[0-9]{1,9}$'
+                                                  THEN LEAST((metadata->>'app_stop_grace_sec')::int, $5::int)
+                                                  ELSE $5::int END) * INTERVAL '1 second'))`;
+
+/**
  * Backstop for runs that outlived their budget and did not stop themselves.
  *
  * This used to be the only enforcement there was, and it enforced nothing: the
@@ -446,12 +472,14 @@ export async function reapStaleTasks(): Promise<number> {
             AND started_at < NOW() - ($1::int * INTERVAL '1 second')
             -- a2a rows are closed by their own protocol, not by this backstop.
             AND origin IS DISTINCT FROM 'a2a')
-       )`,
+       )
+       AND NOT ${APP_IN_STOP_GRACE_SQL}`,
       params: [
         BRAIN_TASK_TIMEOUT_SEC,
         `no agent_done after ${BRAIN_TASK_TIMEOUT_SEC}s`,
         RUN_BUDGET_BACKSTOP_GRACE_SEC,
         RUN_ROWS_SWEEPABLE,
+        APP_MAX_STOP_GRACE_SEC,
       ],
     },
   );
@@ -1261,7 +1289,9 @@ const APP_RUN_DRIVEN_STATES = "('provisioning','starting','running','restarting'
  * stops every live sandbox carrying the run's `CLAW_APP_RUN_ID`, a queued one included.
  *
  * `last_exit` says why (`row_terminal`); the restart history it held is not a finish's, and only
- * `recovery` (shared storage was already read once) is kept. Not a task with `app_finish_prior`:
+ * `recovery` (shared storage was already read once) and `platform_losses` (the run's count of
+ * sandboxes the platform took away, shown as `app.platform_losses` and inside `app.restarts` for
+ * as long as the run is shown) are kept. Not a task with `app_finish_prior`:
  * that is a finish-only dispatch, whose rows the passes above own.
  */
 export async function finishAbandonedAppRuns(): Promise<number> {
@@ -1283,7 +1313,9 @@ export async function finishAbandonedAppRuns(): Promise<number> {
         SET state = 'finishing',
             last_exit = jsonb_build_object('at', to_jsonb(NOW()), 'cause', 'row_terminal', 'final', false)
                         || CASE WHEN r.last_exit->'recovery' = 'true'::jsonb
-                                THEN '{"recovery": true}'::jsonb ELSE '{}'::jsonb END,
+                                THEN '{"recovery": true}'::jsonb ELSE '{}'::jsonb END
+                        || CASE WHEN jsonb_typeof(r.last_exit->'platform_losses') = 'number'
+                                THEN jsonb_build_object('platform_losses', r.last_exit->'platform_losses') ELSE '{}'::jsonb END,
             updated_at = NOW()
        FROM prior p
       WHERE r.task_id = p.task_id
@@ -3312,6 +3344,12 @@ export async function sweeperTick(): Promise<void> {
   // Before the orphan drain: a save whose finish no replica released it for is released and drained here.
   await runContained("sweeper.finished_workspace_saves_failed", () => releaseFinishedWorkspaceSaves(drainOldestPendingMessage));
   await runContained("sweeper.orphaned_pending_drain_failed", drainOrphanedPendingMessages);
+  // After the orphan drain, which is where a message that keeps failing is
+  // quarantined: a notice its quarantine could not publish is retried here, and
+  // the gauges then read the queue as the drains above left it.
+  await runContained("sweeper.quarantine_notices_failed", retryQuarantineNotices);
+  await runContained("sweeper.quarantine_prune_failed", pruneQuarantinedMessages);
+  await runContained("sweeper.pending_queue_observe_failed", observePendingQueue);
   // After the orphan drain, so a queued report is already on its way; before the session reapers, which close runs this reads.
   await runContained("sweeper.assistant_failed", sweepAssistant);
   await runContained("sweeper.orphaned_fat_runs_failed", reapOrphanedFatRuns);

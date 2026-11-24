@@ -22,6 +22,8 @@
  * is the run's own to report.
  */
 
+import type { AppRunStatus } from "../tasks/app-run-status.js";
+
 /** Where a run is. `terminal` means it will not move again. */
 export type RunPhase = "pending" | "running" | "terminal";
 
@@ -94,8 +96,14 @@ export interface RunView {
   };
   placement: {
     node: string;
+    /** The run's sandbox workload; for an app run, its app sandbox (the current one, or the last). */
     workload_id: string;
   };
+  /**
+   * For an app run (`mode: "app"`): its sandbox's state and, once ended, how it
+   * ended (tasks/app-run-status.ts). Null for every other run.
+   */
+  app: AppRunStatus | null;
 }
 
 /**

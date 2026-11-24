@@ -34,13 +34,14 @@
  */
 import { randomUUID } from "node:crypto";
 import pino from "pino";
+import { storableJsonText } from "@claw/utils";
 import {
   REMOTE_AGENT_LIMITS, REMOTE_COMMANDS, REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED,
-  REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_ASKS, type TerminalAsks,
+  REMOTE_EVENT_TERMINAL_TURN_END, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_ASKS, type TerminalAsks,
 } from "@claw/protocol";
 import { CLAW_ASSISTANT_ENABLED, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
-import { approvalsEnabled, DELIVERY_UNCONFIRMED, findSession, issueCommand, onlineSql, wakeConnector } from "../remote-agents/store.js";
+import { approvalsEnabled, DELIVERY_UNCONFIRMED, findSession, issueCommand, onlineSql, terminalMuted, wakeConnector } from "../remote-agents/store.js";
 import { newWorkItemId } from "../tasks/ids.js";
 import type { AssistantRemoteAsk, AssistantRemoteNotice } from "../notifications/assistant-events.js";
 import { personWritesChinese, recordSystemNotice } from "./outbound.js";
@@ -53,7 +54,7 @@ export const REMOTE_EVENT_COMMAND_REJECTED = "command_rejected";
 /** The events that move a remote item. */
 const MOVING = [
   REMOTE_EVENT_TURN_END, REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED,
-  REMOTE_EVENT_COMMAND_REJECTED,
+  REMOTE_EVENT_COMMAND_REJECTED, REMOTE_EVENT_TERMINAL_TURN_END,
 ];
 /**
  * Why a connector refuses a prompt before it is queued (`connector/src/session.ts` `enqueuePrompt`): that prompt never gets a
@@ -81,6 +82,13 @@ const EVENTS_PER_PASS = 100;
  * wait (once a minute), so a session that asks for everything does not fill the chat.
  */
 export const TERMINAL_ASKS_PER_MINUTE = 5;
+/**
+ * How long after telling the user that a terminal's turn ended the next end of that conversation is said again: one that works on its
+ * own (background tasks waking it, a loop) is not said every turn. The item still records every end.
+ */
+export const TERMINAL_END_GAP_MS = 5 * 60_000;
+/** How much of what the agent last said an end's message carries. */
+const END_SAID_MAX = 400;
 const MINUTE_MS = 60_000;
 /** The newest message chunks of a turn its answer is read from. */
 const ANSWER_CHUNKS = 400;
@@ -139,6 +147,10 @@ export interface RemoteParams {
   summarized_at?: number;
   /** A terminal's item: the requests put to the user as cards and not yet ended, so their end elsewhere is said (`resolved`). */
   carded?: string[];
+  /** A terminal's item: when (ms) the user was last told that one of its turns ended ({@link TERMINAL_END_GAP_MS}). */
+  end_told_at?: number;
+  /** A terminal's item: the conversation's own name, as its connector lists it (`capabilities.resumable` title), when it has one. */
+  name?: string;
   /** Prompts (`cmd_seq`) Claw ended as `delivery_unconfirmed`: an end of the machine's own for one of them still ends the item. */
   unconfirmed?: number[];
   /** What each of those asked (`asked` when it was ended), by `cmd_seq`: said with its answer should that come once the item moved on. */
@@ -295,7 +307,7 @@ export async function noteRemoteCancel(owner: string, sessionId: string, mark: n
     const before = Math.min(1, last ? last.n : Math.max(0, Number(item.params?.open_turns) || 0));
     cancels.push({ after: mark, before, n: 0, seqs: openSeqs ? [...openSeqs] : [] });
     await q("UPDATE claw_work_items SET params = params || $2::jsonb, updated_at = NOW() WHERE item_id = $1",
-      [item.item_id, JSON.stringify({ cancels })]);
+      [item.item_id, storableJsonText({ cancels })]);
   });
 }
 
@@ -350,7 +362,7 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
       await q(
         `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, last_report_kind, worker_session_id, kind, params)
          VALUES ($1, $2, $3, $4, 'in_progress', 'progress', $5, 'remote', $6::jsonb)`,
-        [itemId, p.owner, seq, title, worker, JSON.stringify(params)],
+        [itemId, p.owner, seq, title, worker, storableJsonText(params)],
       );
       await q(
         `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
@@ -392,7 +404,7 @@ async function notePrompt(p: NotePrompt): Promise<{ itemId: string; seq: number 
               pending_question = CASE WHEN board_state = 'needs_you' THEN pending_question ELSE NULL END,
               generation = generation + 1, params = params || $3::jsonb, updated_at = NOW()
         WHERE item_id = $1`,
-      [open.item_id, title, JSON.stringify(patch)],
+      [open.item_id, title, storableJsonText(patch)],
     );
     await q(
       `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
@@ -595,7 +607,7 @@ export async function noteRemoteEvents(owner: string, sessionIds: readonly strin
 }
 
 /**
- * A terminal-hook session's item, made when its first request comes (a session that never asks has none): filed under the session as
+ * A terminal-hook session's item, made when its first request or its first told end comes (a session that never does has none): filed under the session as
  * every remote item is, origin `terminal`, titled with the machine, the agent and the conversation. Null for any other session, or
  * when the owner has no assistant to file it under.
  */
@@ -610,7 +622,8 @@ async function terminalItem(q: Querier, owner: string, sessionId: string): Promi
   )).rows[0];
   if (!s) return false;
   const asks = (await q(
-    `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND type = $2 LIMIT 1`, [sessionId, REMOTE_EVENT_PERMISSION_REQUEST],
+    `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND type = ANY($2::text[]) LIMIT 1`,
+    [sessionId, [REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_TERMINAL_TURN_END]],
   )).rows.length > 0;
   if (!asks) return false;
   const assistant = (await q("SELECT session_id FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [owner])).rows[0];
@@ -630,7 +643,7 @@ async function terminalItem(q: Querier, owner: string, sessionId: string): Promi
   await q(
     `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, last_report_kind, worker_session_id, kind, params)
      VALUES ($1, $2, $3, $4, 'in_progress', 'progress', $5, 'remote', $6::jsonb) ON CONFLICT (worker_session_id) DO NOTHING`,
-    [itemId, owner, seq, remoteTitle(machine, remoteAgentName(params), asked, lang), remoteWorkerSessionId(sessionId), JSON.stringify(params)],
+    [itemId, owner, seq, remoteTitle(machine, remoteAgentName(params), asked, lang), remoteWorkerSessionId(sessionId), storableJsonText(params)],
   );
   await q(`INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
            SELECT $1, 'created', 'remote', 0, NULL WHERE EXISTS (SELECT 1 FROM claw_work_items WHERE item_id = $1)`, [itemId]);
@@ -691,6 +704,25 @@ const HOW_ZH: HowWords = {
   },
 };
 
+/**
+ * What a terminal's turn that ended while nobody was at it says, in the user's language: where (the machine, the tool, the
+ * conversation's name or title and its folder), finished or failed (with why), what the agent last said, and how to stop hearing
+ * of this one conversation (`/approvals mute #<item>`). The agent's words are quoted text, never instructions.
+ */
+export function terminalEndNotice(
+  p: Pick<RemoteParams, "machine" | "agent_id" | "tool" | "lang" | "title" | "cwd" | "name">, seq: number, failed: boolean, error: string, said: string,
+): string {
+  const agent = remoteAgentName(p);
+  const zh = p.lang === "zh";
+  const where = [flat(p.name, 80) || flat(p.title, 80), cwdTail(String(p.cwd ?? ""))].filter(Boolean).join(zh ? "，" : ", ");
+  const head = zh
+    ? `#${seq} ${p.machine} 上终端里的 ${agent}${where ? `（${where}）` : ""}${failed ? `出错停下了（${error}）` : "做完了"}，之后终端那边一直没人操作。`
+    : `#${seq} ${agent} in a terminal on ${p.machine}${where ? ` (${where})` : ""} ${failed ? `stopped with an error (${error})` : "finished"}; nobody has typed in that terminal since.`;
+  const quote = said ? (zh ? `\n它最后说：\n${said}` : `\nIts last words:\n${said}`) : "";
+  const mute = zh ? `\n（不想再收到这个会话的推送：/approvals mute #${seq}）` : `\n(To stop hearing from this conversation: /approvals mute #${seq})`;
+  return `${head}${quote}${mute}`;
+}
+
 /** Said instead of each request once more of one conversation's wait than are put one by one in a minute. */
 export function terminalBusyNotice(p: Pick<RemoteParams, "machine" | "agent_id" | "tool" | "lang" | "title" | "cwd">, waiting: number): string {
   const agent = remoteAgentName(p);
@@ -741,7 +773,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       await q(
         `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary, question, result)
          SELECT item_id, $2, 'remote', generation, $3, $4, $5::jsonb FROM claw_work_items WHERE item_id = $1`,
-        [item.item_id, ev.kind, ev.summary, ev.question ?? null, ev.result === undefined ? null : JSON.stringify(ev.result)],
+        [item.item_id, ev.kind, ev.summary, ev.question ?? null, ev.result === undefined ? null : storableJsonText(ev.result)],
       );
     };
     // The item ends with this turn's end: answered, with the end of the agent's answer.
@@ -806,7 +838,21 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
           ]);
         }
       }
-      const said = await applyTerminal(events, p, board, write, await approvalsEnabled(owner, q));
+      // The owner's switch for every push of their terminals, and their mute of this one conversation.
+      const where = (await q(
+        `SELECT s.connector_id::text AS connector_id, s.ref,
+                (SELECT r.value->>'title' FROM claw_remote_agents a
+                   CROSS JOIN LATERAL jsonb_array_elements(
+                     CASE WHEN jsonb_typeof(a.capabilities->'resumable') = 'array' THEN a.capabilities->'resumable' ELSE '[]'::jsonb END) r(value)
+                  WHERE a.connector_id = s.connector_id AND jsonb_typeof(r.value) = 'object' AND r.value->>'ref' = s.ref
+                  LIMIT 1) AS name
+           FROM claw_remote_sessions s WHERE s.session_id = $1`,
+        [sessionId],
+      )).rows[0] as { connector_id: string; ref: string | null; name: string | null } | undefined;
+      const muted = !!where?.ref && await terminalMuted(owner, where.connector_id, where.ref, q);
+      const name = flat(where?.name, 80);
+      if (name) p.name = name;
+      const said = await applyTerminal(events, p, board, write, !muted && await approvalsEnabled(owner, q), item.seq);
       // A message filed under the item is the one that told the user of its current wait (one per `attention_seq`): the last request
       // said in this pass. The others (an earlier request of the same pass, a card marked resolved) are said without it.
       const filed = said.map((n) => !n.resolved).lastIndexOf(true);
@@ -815,13 +861,13 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         notices.push({
           userId: owner, routerSid: item.router_sid, itemId: i === filed ? item.item_id : undefined, key: `remote:${item.item_id}:${n.key}`, text: n.text,
           remote: {
-            kind: n.resolved ? "resolved" : "needs_you", session_id: sessionId, machine: p.machine, agent: p.agent_id,
+            kind: n.resolved ? "resolved" : n.end ?? "needs_you", session_id: sessionId, machine: p.machine, agent: p.agent_id,
             ...(tool ? { tool } : {}),
             ...(n.ask ? { ask: n.ask } : {}), ...(n.resolved ? { resolved: n.resolved } : {}),
           },
         });
       }
-      await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, JSON.stringify(p)]);
+      await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, storableJsonText(p)]);
       return notices;
     }
     for (const e of events) {
@@ -857,7 +903,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
           await q(
             `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary, result)
              SELECT item_id, 'answer', 'remote', generation, $2, $3::jsonb FROM claw_work_items WHERE item_id = $1`,
-            [item.item_id, [said, tailOf(whole, ANSWER_EVENT_MAX)].filter(Boolean).join(" ") || null, JSON.stringify({ stop_reason: stop || null, remote_event_id: e.id, cmd_seq: seq })],
+            [item.item_id, [said, tailOf(whole, ANSWER_EVENT_MAX)].filter(Boolean).join(" ") || null, storableJsonText({ stop_reason: stop || null, remote_event_id: e.id, cmd_seq: seq })],
           );
           // (one notice per time the item needs the user: this is another)
           if (p.origin === "assistant") await q("UPDATE claw_work_items SET attention_seq = attention_seq + 1, updated_at = NOW() WHERE item_id = $1", [item.item_id]);
@@ -998,7 +1044,7 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
         if (unfinished) tell(`closed:${e.id}`, "closed", remoteNotice("closed", p, item.seq, ""));
       }
     }
-    await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, JSON.stringify(p)]);
+    await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, storableJsonText(p)]);
     return notices;
   });
 }
@@ -1013,6 +1059,8 @@ interface TerminalSaid {
   resolved?: { action_id: string; by: string };
   /** The request it is about, so a request answered in the same pass is never put to the user. */
   actionId?: string;
+  /** A turn's end told: finished, or ended in an error. */
+  end?: "done" | "error";
 }
 
 /** Who ended a request when the person did not answer it on the phone: their terminal, or nobody (it stopped waiting). */
@@ -1030,7 +1078,7 @@ const CARDED_KEPT = 50;
  * (the caller writes it).
  */
 async function applyTerminal(
-  events: MovingEvent[], p: RemoteParams, board: string, write: ItemWrite, enabled: boolean, now: number = Date.now(),
+  events: MovingEvent[], p: RemoteParams, board: string, write: ItemWrite, enabled: boolean, seq: number, now: number = Date.now(),
 ): Promise<TerminalSaid[]> {
   const zh = p.lang === "zh";
   const said: TerminalSaid[] = [];
@@ -1099,6 +1147,27 @@ async function applyTerminal(
         `board_state = 'done', outcome = 'answered', last_report_kind = 'answer', summary = $2, pending_question = NULL, closed_at = NOW()`,
         [summary], { kind: "answer", summary, result: { by: by || null, remote_event_id: e.id } },
       );
+    } else if (e.type === REMOTE_EVENT_TERMINAL_TURN_END) {
+      // A turn ended while nobody was at that terminal (its connector waited a minute without input to say so). The item is done
+      // with it, and the user is told once (at most every TERMINAL_END_GAP_MS for one conversation), unless pushes are off or muted.
+      const failed = e.data.outcome === "error";
+      const error = failed ? flat(e.data.error, 40) || "unknown" : "";
+      const message = typeof e.data.message === "string" ? e.data.message : "";
+      const summary = [
+        failed ? (zh ? `出错停下了（${error}）` : `stopped with an error (${error})`) : (zh ? "已完成" : "finished"),
+        tailOf(message, 80),
+      ].filter(Boolean).join(" ");
+      board = "done";
+      p.waiting = [];
+      await write(
+        `board_state = 'done', outcome = 'answered', last_report_kind = 'answer', summary = $2, pending_question = NULL,
+         closed_at = NOW(), attention_seq = attention_seq + 1`,
+        [summary], { kind: "answer", summary, result: { outcome: failed ? "error" : "done", error: error || null, remote_event_id: e.id } },
+      );
+      if (!enabled) continue;
+      if (Number(p.end_told_at) > now - TERMINAL_END_GAP_MS) continue;
+      p.end_told_at = now;
+      said.push({ key: `end:${e.id}`, text: terminalEndNotice(p, seq, failed, error, tailLines(message, END_SAID_MAX)), end: failed ? "error" : "done" });
     } else if (e.type === REMOTE_EVENT_SESSION_CLOSED) {
       const unanswered = p.waiting.length > 0;
       for (const a of p.waiting) ended(a, "session_end");

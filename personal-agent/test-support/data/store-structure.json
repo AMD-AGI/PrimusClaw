@@ -261,6 +261,12 @@
    },
    {
     "type": "table",
+    "name": "review_onboarding",
+    "tbl_name": "review_onboarding",
+    "sql": "CREATE TABLE review_onboarding (\n  onboarding_id TEXT PRIMARY KEY, actor_aad TEXT NOT NULL, requester_aad TEXT NOT NULL, pulls TEXT NOT NULL,\n  request_json TEXT NOT NULL, told_rank INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,\n  UNIQUE (actor_aad, requester_aad, pulls))"
+   },
+   {
+    "type": "table",
     "name": "session_history",
     "tbl_name": "session_history",
     "sql": "CREATE TABLE session_history (\n  aad_id TEXT NOT NULL, session_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', repo TEXT NOT NULL DEFAULT '',\n  branch TEXT NOT NULL DEFAULT '', last_at REAL NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (aad_id, session_id))"
@@ -2768,6 +2774,90 @@
     ],
     "indexes": []
    },
+   "review_onboarding": {
+    "columns": [
+     {
+      "cid": 0,
+      "name": "onboarding_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "dflt_value": null,
+      "pk": 1
+     },
+     {
+      "cid": 1,
+      "name": "actor_aad",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 2,
+      "name": "requester_aad",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 3,
+      "name": "pulls",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 4,
+      "name": "request_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 5,
+      "name": "told_rank",
+      "type": "INTEGER",
+      "notnull": 1,
+      "dflt_value": "0",
+      "pk": 0
+     },
+     {
+      "cid": 6,
+      "name": "done",
+      "type": "INTEGER",
+      "notnull": 1,
+      "dflt_value": "0",
+      "pk": 0
+     },
+     {
+      "cid": 7,
+      "name": "created_at",
+      "type": "REAL",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     }
+    ],
+    "indexes": [
+     {
+      "seq": 0,
+      "name": "sqlite_autoindex_review_onboarding_2",
+      "unique": 1,
+      "origin": "u",
+      "partial": 0
+     },
+     {
+      "seq": 1,
+      "name": "sqlite_autoindex_review_onboarding_1",
+      "unique": 1,
+      "origin": "pk",
+      "partial": 0
+     }
+    ]
+   },
    "session_history": {
     "columns": [
      {
@@ -3390,6 +3480,12 @@
     "name": "review_notices",
     "tbl_name": "review_notices",
     "sql": "CREATE TABLE review_notices (session_id TEXT, actor_aad TEXT, requester_aad TEXT, pull TEXT, delivered INTEGER,\n    reason TEXT, at REAL)"
+   },
+   {
+    "type": "table",
+    "name": "review_onboarding",
+    "tbl_name": "review_onboarding",
+    "sql": "CREATE TABLE review_onboarding (\n  onboarding_id TEXT PRIMARY KEY, actor_aad TEXT NOT NULL, requester_aad TEXT NOT NULL, pulls TEXT NOT NULL,\n  request_json TEXT NOT NULL, told_rank INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,\n  UNIQUE (actor_aad, requester_aad, pulls))"
    },
    {
     "type": "table",
@@ -5899,6 +5995,90 @@
      }
     ],
     "indexes": []
+   },
+   "review_onboarding": {
+    "columns": [
+     {
+      "cid": 0,
+      "name": "onboarding_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "dflt_value": null,
+      "pk": 1
+     },
+     {
+      "cid": 1,
+      "name": "actor_aad",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 2,
+      "name": "requester_aad",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 3,
+      "name": "pulls",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 4,
+      "name": "request_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 5,
+      "name": "told_rank",
+      "type": "INTEGER",
+      "notnull": 1,
+      "dflt_value": "0",
+      "pk": 0
+     },
+     {
+      "cid": 6,
+      "name": "done",
+      "type": "INTEGER",
+      "notnull": 1,
+      "dflt_value": "0",
+      "pk": 0
+     },
+     {
+      "cid": 7,
+      "name": "created_at",
+      "type": "REAL",
+      "notnull": 1,
+      "dflt_value": null,
+      "pk": 0
+     }
+    ],
+    "indexes": [
+     {
+      "seq": 0,
+      "name": "sqlite_autoindex_review_onboarding_2",
+      "unique": 1,
+      "origin": "u",
+      "partial": 0
+     },
+     {
+      "seq": 1,
+      "name": "sqlite_autoindex_review_onboarding_1",
+      "unique": 1,
+      "origin": "pk",
+      "partial": 0
+     }
+    ]
    },
    "session_history": {
     "columns": [

@@ -474,6 +474,63 @@ test("the reply to a prompt typed at the shared terminal says so in the chats la
     );
   }));
 
+/**
+ * A connector that typed the message into the terminal but did not see it in the transcript in time (`terminal_input_unconfirmed`),
+ * as a connector before 0.1.22 ended a pasted message of several lines: the prompt as Claude Code recorded it, in a
+ * `<pasted_content>` block, then the end of the turn; the session's answer comes after that end.
+ */
+class Unconfirmed extends Typing {
+  protected override async handle(srv: FakeRemote, cmd: FakeCommand): Promise<void> {
+    if (cmd.type !== "prompt") return super.handle(srv, cmd);
+    const sid = cmd.session_id;
+    const sent = cmd.body["text"];
+    const text = (typeof sent === "string" ? sent : "").replaceAll("\r\n", "\n");
+    await srv.emit(
+      sid,
+      "user_message_chunk",
+      chunk("user_message_chunk", `\n\n<pasted_content id="9a55">\n${text}\n</pasted_content id="9a55">\n`),
+    );
+    await srv.emit(sid, "turn_end", { stopReason: "error", error: "terminal_input_unconfirmed" });
+  }
+}
+
+for (const [lang, version] of [
+  ["en", "0.1.21"],
+  ["zh", "0.2.2"],
+] as const) {
+  test(`a message the terminal took without the connector seeing it in time is never said as not sent and its answer still comes: ${lang} ${version}`, () =>
+    remoteWorld(
+      async (w) => {
+        w.setLang(AAD, lang);
+        w.server.addConnector(ALICE, "dev-pod", ATTACH_AGENT, { caps: typingCaps(w), version });
+        w.server.onCommand = new Unconfirmed().hook;
+        await press(w, await agentsCard(w), lang === "zh" ? "连上（终端照常用）" : CONNECT);
+        await w.idle();
+        const sid = w.test.store.remoteState.attachedRemote(AAD)?.sessionId ?? "";
+        await w.say("summarise the three issues\r\n\r\none line each");
+        const lead = lang === "zh" ? "还没确认终端收到" : "Not confirmed by the terminal yet";
+        await w.until(() => w.said().some((t) => t.includes(lead)));
+        const note = w.said().find((t) => t.includes(lead)) ?? "";
+        assert.ok(!/did not complete|not sent|may not have gone in|没有完成|没发出去|没有发进去/u.test(note), note);
+        assert.ok(
+          note.includes(lang === "zh" ? "之后的回复仍会发到这里" : "Whatever the session answers still shows here"),
+          note,
+        );
+        // (an upgrade is offered only to a connector from before the fix)
+        assert.equal(note.includes("npm install -g @primusclaw/connector@latest"), version === "0.1.21", note);
+        // The prompt the terminal took is shown as it was typed, never as Claude Code's paste block.
+        assert.ok(!w.said().some((t) => t.includes("pasted_content")), w.said().join(" | "));
+        await w.server.emit(
+          sid,
+          "agent_message_chunk",
+          chunk("agent_message_chunk", "The three issues, one line each."),
+        );
+        await w.until(() => w.said().some((t) => t.includes("The three issues, one line each.")), 5_000);
+      },
+      { timings: { quietMs: 60_000, toolQuietMs: 60_000, gapMs: 0, maxAgeMs: 120_000, reconnectMs: 50 } },
+    ));
+}
+
 test("the sessions card says a conversation it types into takes messages in the persons language", () =>
   remoteWorld(async (w) => {
     w.setLang(AAD, "zh");

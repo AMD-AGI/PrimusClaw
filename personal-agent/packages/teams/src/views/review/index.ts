@@ -49,8 +49,8 @@ const MODE_WHAT: Readonly<Record<string, readonly [string, string]>> = {
     "Approved and merged when nothing needs fixing and every check passes; a change the reviewing model judges high risk (security, credentials, CI/release, permissions, data migrations, ...) or one the repository asks to confirm waits for your own click on a card.",
   ],
   fully_auto: [
-    "审完没有问题、检查全部通过时直接批准并合入，不再请你确认；只有仓库自己要求确认的变更（.github/claw-review.yml 的 confirm_merge: always 等）仍会先问你。",
-    "Approved and merged when nothing needs fixing and every check passes, without asking you; only a change the repository itself requires a person for (confirm_merge: always in its review config, and the like) still waits for your click.",
+    "审完没有问题、检查全部通过时直接批准并合入，不再请你确认，你在聊天里让我审并合入的 PR 也一样；仓库自身要求的检查仍然生效：CI 没过或还有没解决的评审讨论不会合入，仓库自己要求确认的变更（.github/claw-review.yml 的 confirm_merge: always 等）仍会先问你。",
+    "Approved and merged when nothing needs fixing and every check passes, without asking you, a pull request you ask me in the chat to review and merge included; the repository's own requirements still apply: nothing merges with CI failing or review threads open, and a change the repository itself requires a person for (confirm_merge: always in its review config, and the like) still waits for your click.",
   ],
 };
 const MODE_BUTTON: Readonly<Record<string, string>> = { high_risk_confirm: "高风险再问我", fully_auto: "全自动合入" };

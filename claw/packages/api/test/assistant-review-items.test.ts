@@ -36,8 +36,9 @@
  *   FW2 merged or closed on GitHub ends an item whatever it held; a review only is followed without the requester's merge
  *   FW3 which items are followed, and how often: one look per item per interval, none while its turn runs, before it ran, or once done/stopped;
  *       a turn that ended without writing anything is followed too
- *   FW4 the whole way, through the route and the review service: handed over to merge, bob approves and his merge is held for the risk,
- *       the sweep merges with alice's own account, the item ends merged and bob's late allow makes nothing
+ *   FW4 the whole way, through the route and the review service: handed over to merge, bob approves and his merge is held for the risk;
+ *       the sweep leaves it bob's (it reads with bob's account, merges nothing, asks alice nothing), and bob's allow merges it with his
+ *       account (2026-11-20: the reviewer's account merges whenever it can; `assistant-review-merge-actor.test.ts` has the rest)
  *   RS1 the owner's own review that ends without an approval tells them why and what is next: the checks that held it (and it waits for
  *       CI), or its findings; a review asked of someone else is told by the chat that started it
  *   RS2 held back only by CI: the sweep reads CI with the pull request, runs the review once more in its session when the head is green,
@@ -58,6 +59,10 @@
  *   AW2 the wait ends when the pull request gets new commits: the review is run once more on them in its session (the same words, no
  *       wake for the reviewer); a second wait whose head moves again cannot be run a third time and goes to the reviewer
  *   AW3 a wait nobody ends within a day goes to the reviewer; a restart carries neither the wait's mark nor its end over
+ *   RS7 the owner's own review the assistant started under fully_auto that approves is told how it ended, once, through the outbox, by
+ *       the server: merged with the merge commit and the pull request; in the merge queue; approved with nothing merged and why. A merge
+ *       GitHub refused needs the owner (the wake tells them) and gets no second notice; a merge or approval the owner confirmed is answered
+ *       where they confirmed it and is not told again; one without an approval is still told why (N55, 2026-11-18: Primus-SaFE#891, #885)
  *   BU1 the whole way, with the review service: the sweep's own follow-ups of a review open for hours make more GitHub requests than the
  *       session's budget, and the review's re-run in the same session still reads the pull request (2026-11-15, PrimusClaw#846)
  *   BU2 a review whose session used up its GitHub requests before it posted anything did not review: the item ends, whoever asked is told
@@ -1681,7 +1686,7 @@ describe("assistant review items", { skip }, () => {
     }
   });
 
-  test("FW4 handed over to merge: bob's approval lands, his merge is held, and alice's own account merges it with no confirmation from bob", () => withEnv({
+  test("FW4 handed over to merge: bob's approval lands, his merge is held, and it stays his: the sweep neither merges it nor uses alice's account", () => withEnv({
     ...ROOMY, CLAW_REVIEW_FOR_OTHERS_MAX_ACTIVE: "20", CLAW_REVIEW_FOR_OTHERS_PER_REQUESTER_MAX_ACTIVE: "20", CLAW_ASSISTANT_MAX_ACTIVE_ITEMS: "20",
   }, async () => {
     const { GithubReview } = await import("../src/github-review/service.js");
@@ -1689,7 +1694,7 @@ describe("assistant review items", { skip }, () => {
     const { setReviewMode } = await import("../src/github-review/store.js");
     const { mergeNeedsConfirmationOf, reviewOnlyOf } = await import("../src/github-review/review-target.js");
     const { FakeGithub, HEAD } = await import("./support/fake-github.js");
-    const { credential, reviewedHead, REQUESTER_TOKEN, SECRET, PR: DEMO } = await import("./support/review-env.js");
+    const { credential, reviewedHead, REQUESTER_TOKEN, SECRET, TOKEN, PR: DEMO } = await import("./support/review-env.js");
     const pg = w.h.app.db.db;
     const db = { query: async (text: string, params?: unknown[]) => { const r = await pg.query(text, params as never); return { rows: r.rows, rowCount: r.rowCount }; } };
     const q = ((text: string, params?: unknown[]) => w.q(text, params as never)) as never;
@@ -1705,10 +1710,14 @@ describe("assistant review items", { skip }, () => {
       reviewOnly: reviewOnlyOf(cfg), mergeNeedsConfirmation: mergeNeedsConfirmationOf(cfg),
     };
     const gh = new FakeGithub();
+    const resolved: string[] = [];
     const service = new GithubReview({
       settings: () => readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MCP_SECRET: SECRET, CLAW_GITHUB_WRITES_ENABLED: "true" }, true),
       db, fetchImpl: gh.fetch, sleep: async () => {}, recordPosted: true, sessionStopped: ri.reviewSessionStopped,
-      resolveCredential: async (req) => (req.userId === "bob" ? credential() : credential({ token: REQUESTER_TOKEN, providerLogin: "alice" })),
+      resolveCredential: async (req) => {
+        resolved.push(req.userId);
+        return req.userId === "bob" ? credential() : credential({ token: REQUESTER_TOKEN, providerLogin: "alice" });
+      },
     });
     // bob's review: it approves the head (judged low), then its merge is judged high and held for bob, as his setting says.
     await reviewedHead({ sql: (text: string, params?: unknown[]) => w.q(text, params as never), actor }, { pr: DEMO });
@@ -1723,21 +1732,25 @@ describe("assistant review items", { skip }, () => {
     gh.calls.length = 0;
     ri.reviewItemPorts.followPullRequest = (f) => service.followPullRequest(f);
     try {
-      assert.equal(await ri.followReviewItems(), 1);
+      assert.equal(await ri.followReviewItems(), 0);
+      assert.equal(await ri.followReviewItems(Date.now() + 2 * ri.REVIEW_FOLLOW_MS), 0);
     } finally {
       ri.reviewItemPorts.followPullRequest = null;
     }
-    const merges = gh.calls.filter((c) => c.method === "PUT");
+    assert.ok(gh.calls.length > 0, "the sweep looked at the pull request");
+    assert.ok(gh.calls.every((c) => c.authorization !== `Bearer ${REQUESTER_TOKEN}`), "nothing read or written with alice's account");
+    assert.ok(!resolved.includes("alice"), "alice's credential was never fetched");
+    assert.equal(gh.calls.filter((c) => c.method === "PUT").length, 0, "nothing merged while bob has not answered");
+    const during = await w.item(item.item_id);
+    assert.deepEqual([during.board_state, during.summary], ["needs_you", "the merge of AMD-AGI/demo#7 is held"], "bob's to answer");
+    const [c] = await w.q("SELECT confirmation_id, status, actor_user_id, kind FROM claw_github_confirmations WHERE session_id = $1", [item.worker_session_id]);
+    assert.deepEqual([c.status, c.actor_user_id, c.kind], ["pending", "bob", "merge"], "bob's to answer, and nothing was asked of alice");
+    // bob allows it: his account merges it.
+    const allowed = await service.decide("bob", c.confirmation_id, "allow");
+    assert.equal(allowed.body.status, "merged", JSON.stringify(allowed.body));
+    const merges = gh.calls.filter((x) => x.method === "PUT");
     assert.equal(merges.length, 1);
-    assert.equal(merges[0]!.authorization, `Bearer ${REQUESTER_TOKEN}`, "merged with alice's own account");
-    const after = await w.item(item.item_id);
-    assert.deepEqual([after.board_state, after.outcome, after.summary], ["done", "accepted", "AMD-AGI/demo#7 was merged by the requester's account after the approval"]);
-    assert.equal(after.params.requester_view.merged, true);
-    const [c] = await w.q("SELECT confirmation_id, status, decided_by FROM claw_github_confirmations WHERE session_id = $1", [item.worker_session_id]);
-    assert.deepEqual([c.status, c.decided_by], ["merged", "alice"]);
-    const late = await service.decide("bob", c.confirmation_id, "allow");
-    assert.deepEqual([late.body.status, late.body.reason], ["refused", "not_pending"]);
-    assert.equal(gh.calls.filter((x) => x.method === "PUT").length, 1, "bob's late allow merged nothing");
+    assert.equal(merges[0]!.authorization, `Bearer ${TOKEN}`, "merged with bob's own account");
   }));
 
   test("G2 nothing the server queues reaches an acting session without the person's proof: work_send into a review is refused", async () => {
@@ -1842,6 +1855,157 @@ describe("assistant review items", { skip }, () => {
     assert.equal((await w.item(askedItem.item_id)).board_state, "done", "it does not wait for CI either");
     assert.deepEqual([(await toldTo("alice")).length, (await toldTo("bob")).length], [3, 0]);
   });
+
+  test("RS7 an approval the owner's own fully_auto review made in its run is told once: merged, queued, approved only, refused, confirmed (N55)", () => withEnv(ROOMY, async () => {
+    const { GithubReview } = await import("../src/github-review/service.js");
+    const { readGithubReviewSettings } = await import("../src/github-review/settings.js");
+    const { setReviewMode } = await import("../src/github-review/store.js");
+    const { mergeRulesOf } = await import("../src/github-review/review-target.js");
+    const { FakeGithub, HEAD } = await import("./support/fake-github.js");
+    const { credential, reviewedHead, PR: DEMO } = await import("./support/review-env.js");
+    const pg = w.h.app.db.db;
+    const db = { query: async (text: string, params?: unknown[]) => { const r = await pg.query(text, params as never); return { rows: r.rows, rowCount: r.rowCount }; } };
+    const alice = await w.user("alice");
+    await w.q("DELETE FROM claw_notification_outbox");
+    await w.subscribe("alice");
+    const user = { userId: "alice", userName: "Name alice", platformKey: "pk-alice", virtualKey: "vk-alice", roles: ["default"] };
+    const url = "https://github.com/AMD-AGI/demo/pull/7";
+    /** The say rows the outbox holds for alice, oldest first: what reaches her channels. */
+    const outbox = async (): Promise<string[]> => (await w.q(
+      "SELECT payload FROM claw_notification_outbox WHERE payload->>'type' = 'assistant.say' ORDER BY created_at, id",
+    )).map((r: { payload: Record<string, any> }) => String(r.payload.text ?? r.payload.data?.text ?? ""));
+    /**
+     * One review of demo#7 as the router's review_start starts it for alice under her mode (the session's own merge rules), its turn run
+     * with the real review tools against a fake GitHub, and the turn's end synced as the dispatcher's turn end does.
+     */
+    async function assistantReview(
+      mode: "fully_auto" | "high_risk_confirm", act: (s: InstanceType<typeof GithubReview>, actor: any, gh: InstanceType<typeof FakeGithub>) => Promise<void>,
+      gh = new FakeGithub(), viaRoute = false,
+    ) {
+      await setReviewMode(db, "alice", mode);
+      const request = ri.parseReviewRequest({ prs: [{ owner: "AMD-AGI", repo: "demo", number: 7 }], review_only: false });
+      const [started] = await ri.startReviews(user, "identity_token", viaRoute ? request : { ...request, mergeNeedsConfirmation: mode !== "fully_auto" });
+      const sessionId = started!.session_id;
+      const cfg = (await w.q("SELECT config FROM claw_sessions WHERE session_id = $1", [sessionId]))[0].config;
+      const actor = { sessionId, requesterUserId: "alice", actorUserId: "alice", requesterLabel: "Name alice", ...mergeRulesOf(cfg) };
+      const service = new GithubReview({
+        settings: () => readGithubReviewSettings({ CLAW_GITHUB_REVIEW_MCP_SECRET: "t".repeat(40), CLAW_GITHUB_WRITES_ENABLED: "true", ...ROOMY }, true),
+        db, fetchImpl: gh.fetch, sleep: async () => {}, recordPosted: true, sessionStopped: ri.reviewSessionStopped,
+        resolveCredential: async () => credential(),
+      });
+      await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [sessionId]);
+      const run = await w.openRun(sessionId);
+      await reviewedHead({ sql: (text: string, params?: unknown[]) => w.q(text, params as never), actor }, { pr: DEMO });
+      await act(service, actor, gh);
+      await w.closeRun(run.taskId, "completed");
+      await ri.syncReviewItemOfSession(sessionId);
+      await reviewResultsSettled();
+      return { itemId: started!.item_id, seq: started!.seq, sessionId, service, actor, gh };
+    }
+    const approve = (s: InstanceType<typeof GithubReview>, actor: any, gh: InstanceType<typeof FakeGithub>, event = "APPROVE") => s.submitReview(actor, {
+      pr: DEMO, head_sha: HEAD, event, body: event === "APPROVE" ? "No blocking findings." : "One question in the review.", risk_judgement: { level: "low", reason: "an ordinary change" },
+      coverage: gh.files.map((f) => ({ path: f.filename, status: "reviewed" })),
+    });
+    const merge = (s: InstanceType<typeof GithubReview>, actor: any) => s.mergePr(actor, { pr: DEMO, head_sha: HEAD, risk_judgement: { level: "low", reason: "an ordinary change" } });
+
+    // Merged in its run (Primus-SaFE#885 as it happened): the item is done, and alice is told it was merged, with the merge commit and the link.
+    const merged = await assistantReview("fully_auto", async (s, actor, gh) => {
+      assert.equal((await approve(s, actor, gh)).body.status, "submitted");
+      const o = await merge(s, actor);
+      assert.equal(o.body.status, "merged", o.text);
+    });
+    let item = await w.item(merged.itemId);
+    assert.deepEqual([item.board_state, item.outcome, item.summary], ["done", "accepted", "AMD-AGI/demo#7 was merged"]);
+    let told = await toldTo("alice");
+    assert.equal(told.length, 1, told.join("\n---\n"));
+    assert.equal(told[0], ["**AMD-AGI/demo#7 is merged**", "", `- The review passed; it was approved and merged as commit \`${"m".repeat(7)}\`.`, `- The pull request: ${url}`].join("\n"));
+    assert.deepEqual(await outbox(), [told[0]], "the say reaches the outbox once");
+    // Once: the sweep, the turn end again and the follow-up find nothing more to say.
+    await ri.sweepReviewItems();
+    await ri.syncReviewItemOfSession(merged.sessionId);
+    await reviewResultsSettled();
+    assert.equal((await toldTo("alice")).length, 1, "told once");
+    assert.equal((await outbox()).length, 1);
+    assert.equal((await w.pending(alice.routerSid)).length, 0, "a done item wakes nobody");
+    const { tellReviewResult } = await import("../src/assistant/review-result.js");
+    assert.equal(await tellReviewResult(merged.itemId, "merged"), false, "the same item is never told twice, whatever asks");
+    assert.equal((await toldTo("alice")).length, 1);
+
+    // Put in the merge queue in its run.
+    const queuedGh = new FakeGithub();
+    queuedGh.graphql.isMergeQueueEnabled = true;
+    const queued = await assistantReview("fully_auto", async (s, actor, gh) => {
+      assert.equal((await approve(s, actor, gh)).body.status, "submitted");
+      const o = await merge(s, actor);
+      assert.equal(o.body.status, "queued", o.text);
+    }, queuedGh);
+    assert.equal((await w.item(queued.itemId)).summary, "AMD-AGI/demo#7 is in the merge queue");
+    told = await toldTo("alice");
+    assert.equal(told.length, 2);
+    assert.match(told[1]!, /^\*\*AMD-AGI\/demo#7 is approved and in the merge queue\*\*\n/);
+    assert.match(told[1]!, /GitHub merges it from the merge queue/);
+    assert.equal((await outbox()).length, 2);
+
+    // Approved, and the turn ended without a merge call: approved but not merged, and why.
+    const approvedOnly = await assistantReview("fully_auto", async (s, actor, gh) => {
+      assert.equal((await approve(s, actor, gh)).body.status, "submitted");
+    });
+    assert.deepEqual([(await w.item(approvedOnly.itemId)).board_state], ["done"]);
+    told = await toldTo("alice");
+    assert.equal(told.length, 3);
+    assert.match(told[2]!, /^\*\*AMD-AGI\/demo#7 is approved but not merged\*\*\n/);
+    assert.match(told[2]!, /Why: the review approved it but made no merge call\./);
+    assert.match(told[2]!, new RegExp(`review again #${approvedOnly.seq}`));
+    assert.match(told[2]!, /pull\/7#pullrequestreview-\d+/);
+
+    // Held for her confirmation (high_risk_confirm) and merged on her allow: answered in the chat she allowed it in, not told again here.
+    const before = (await toldTo("alice")).length;
+    const confirmed = await assistantReview("high_risk_confirm", async (s, actor, gh) => {
+      assert.equal((await approve(s, actor, gh)).body.status, "submitted");
+      assert.equal((await merge(s, actor)).body.status, "confirmation_required");
+    });
+    assert.equal((await w.item(confirmed.itemId)).board_state, "needs_you");
+    const [held] = await w.q("SELECT confirmation_id FROM claw_github_confirmations WHERE session_id = $1 AND status = 'pending'", [confirmed.sessionId]);
+    assert.equal((await confirmed.service.decide("alice", held.confirmation_id, "allow")).body.status, "merged");
+    await ri.syncReviewItemOfSession(confirmed.sessionId);
+    await reviewResultsSettled();
+    assert.deepEqual([(await w.item(confirmed.itemId)).board_state, (await w.item(confirmed.itemId)).summary], ["done", "AMD-AGI/demo#7 was merged"]);
+    const afterConfirm = (await toldTo("alice")).slice(before);
+    assert.equal(afterConfirm.filter((t) => /is merged|approved/.test(t)).length, 0, afterConfirm.join("\n---\n"));
+
+    // Without an approval, it is still told why (the notice before this change).
+    const comment = await assistantReview("fully_auto", async (s, actor, gh) => {
+      assert.equal((await approve(s, actor, gh, "COMMENT")).body.status, "submitted");
+    });
+    assert.equal((await w.item(comment.itemId)).board_state, "done");
+    assert.match((await toldTo("alice")).at(-1)!, /^\*\*AMD-AGI\/demo#7 is reviewed and not approved\*\*/);
+    // A review the person's own chat started over the route (not the assistant): that chat follows its turn and says how it ended.
+    const routed = (await toldTo("alice")).length;
+    const viaRoute = await assistantReview("fully_auto", async (s, actor, gh) => {
+      assert.equal((await approve(s, actor, gh)).body.status, "submitted");
+      assert.equal((await merge(s, actor)).body.status, "merged");
+    }, new FakeGithub(), true);
+    assert.equal((await w.item(viaRoute.itemId)).summary, "AMD-AGI/demo#7 was merged");
+    assert.equal((await toldTo("alice")).length, routed, "not told by the server");
+
+    const says = (await toldTo("alice")).length;
+    await w.q("DELETE FROM claw_pending_messages WHERE session_id = $1", [alice.routerSid]);
+    // GitHub refused the merge after the approval: the owner's to look at, told by the wake (the router's say), never a second notice.
+    const refusedGh = new FakeGithub();
+    refusedGh.mergeStatus = 405;
+    const refused = await assistantReview("fully_auto", async (s, actor, gh) => {
+      { const a = await approve(s, actor, gh); assert.equal(a.body.status, "submitted", a.text); }
+      const o = await merge(s, actor);
+      assert.equal(o.body.reason, "not_mergeable", o.text);
+    }, refusedGh);
+    item = await w.item(refused.itemId);
+    assert.deepEqual([item.board_state, item.summary], ["needs_you", "the merge of AMD-AGI/demo#7 was refused: not_mergeable"]);
+    const wakes = await w.pending(alice.routerSid);
+    assert.equal(wakes.length, 1, "the assistant is woken to tell her");
+    assert.match(wakes[0].content, /the merge of AMD-AGI\/demo#7 was refused: not_mergeable/);
+    assert.equal((await toldTo("alice")).length, says, "no server notice besides the wake");
+
+  }));
 
   test("RS2 a review held back only by CI is run once more when CI on its head is green, and its approval goes to the merge card", async () => {
     const alice = await w.user("alice");

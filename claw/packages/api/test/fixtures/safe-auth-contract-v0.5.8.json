@@ -1,0 +1,861 @@
+{
+  "//": "Recorded from the claw-v0.5.8 tree by test/support/safe-auth-contract.ts (CLAW_SAFE_CONTRACT_RECORD); do not edit by hand.",
+  "platformKey": {
+    "cases": {
+      "bearer ak- key, user with email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "apiKey": "ak-evalbot"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-3c9e1f0a",
+            "userName": "eval-bot",
+            "email": "eval-bot@example.invalid",
+            "roles": [
+              "default"
+            ],
+            "platformKey": "ak-platform-evalbot",
+            "virtualKey": "vk-virtual-evalbot"
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-3c9e1f0a",
+            "roles": [
+              "default"
+            ],
+            "name": "eval-bot",
+            "email": "eval-bot@example.invalid",
+            "sandbox": {
+              "available": true,
+              "defaultWorkspaceId": "ws-sandbox",
+              "gpuProduct": "MI300X"
+            },
+            "workspaces": [
+              {
+                "id": "ws-train",
+                "name": "Train",
+                "scopes": [
+                  "Train",
+                  "Infer"
+                ],
+                "admin": false,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": false
+              },
+              {
+                "id": "ws-sandbox",
+                "name": "Sandbox",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": false,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": true
+              }
+            ]
+          }
+        }
+      },
+      "x-api-key ak- key, user with email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "apiKey": "ak-ssouser"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-sso-1d2e",
+            "userName": "sso.user",
+            "email": "sso.user@example.invalid",
+            "roles": [
+              "default",
+              "system-admin"
+            ],
+            "platformKey": "ak-platform-ssouser",
+            "virtualKey": "vk-virtual-ssouser"
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-sso-1d2e",
+            "roles": [
+              "default",
+              "system-admin"
+            ],
+            "name": "sso.user",
+            "email": "sso.user@example.invalid",
+            "sandbox": {
+              "available": true,
+              "defaultWorkspaceId": "ws-sandbox",
+              "gpuProduct": "MI300X"
+            },
+            "workspaces": [
+              {
+                "id": "ws-sandbox",
+                "name": "Sandbox",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": true,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": true
+              },
+              {
+                "id": "ws-cpu",
+                "name": "CPU",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": false,
+                "clusterId": "c-cpu",
+                "isDefault": false
+              }
+            ]
+          }
+        }
+      },
+      "download-URL ak- key, user with email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "apiKey": "ak-evalbot-download"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-3c9e1f0a",
+            "userName": "eval-bot",
+            "email": "eval-bot@example.invalid",
+            "roles": [
+              "default"
+            ],
+            "platformKey": "ak-platform-evalbot",
+            "virtualKey": "vk-virtual-evalbot"
+          }
+        },
+        "me": {
+          "status": 0,
+          "body": null
+        }
+      },
+      "default session cookie, user with email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "cookie": "Token=tok-evalbot; userType=default"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-3c9e1f0a",
+            "userName": "eval-bot",
+            "email": "eval-bot@example.invalid",
+            "roles": [
+              "default"
+            ],
+            "platformKey": "ak-platform-evalbot",
+            "virtualKey": "vk-virtual-evalbot"
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-3c9e1f0a",
+            "roles": [
+              "default"
+            ],
+            "name": "eval-bot",
+            "email": "eval-bot@example.invalid",
+            "sandbox": {
+              "available": true,
+              "defaultWorkspaceId": "ws-sandbox",
+              "gpuProduct": "MI300X"
+            },
+            "workspaces": [
+              {
+                "id": "ws-train",
+                "name": "Train",
+                "scopes": [
+                  "Train",
+                  "Infer"
+                ],
+                "admin": false,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": false
+              },
+              {
+                "id": "ws-sandbox",
+                "name": "Sandbox",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": false,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": true
+              }
+            ]
+          }
+        }
+      },
+      "sso session cookie": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "cookie": "Token=sso-ssouser; userType=sso"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-sso-1d2e",
+            "userName": "sso.user",
+            "email": "sso.user@example.invalid",
+            "roles": [
+              "default",
+              "system-admin"
+            ],
+            "platformKey": "ak-platform-ssouser",
+            "virtualKey": "vk-virtual-ssouser"
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-sso-1d2e",
+            "roles": [
+              "default",
+              "system-admin"
+            ],
+            "name": "sso.user",
+            "email": "sso.user@example.invalid",
+            "sandbox": {
+              "available": true,
+              "defaultWorkspaceId": "ws-sandbox",
+              "gpuProduct": "MI300X"
+            },
+            "workspaces": [
+              {
+                "id": "ws-sandbox",
+                "name": "Sandbox",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": true,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": true
+              },
+              {
+                "id": "ws-cpu",
+                "name": "CPU",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": false,
+                "clusterId": "c-cpu",
+                "isDefault": false
+              }
+            ]
+          }
+        }
+      },
+      "bearer ak- key, user without email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "apiKey": "ak-noemail"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-noemail-77",
+            "userName": "no-email",
+            "roles": [],
+            "platformKey": "ak-platform-noemail",
+            "virtualKey": ""
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-noemail-77",
+            "roles": [],
+            "name": "no-email",
+            "sandbox": {
+              "available": false
+            },
+            "workspaces": []
+          }
+        }
+      },
+      "default session cookie, user without email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "cookie": "Token=tok-noemail; userType=default"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-noemail-77",
+            "userName": "no-email",
+            "roles": [],
+            "platformKey": "ak-platform-noemail",
+            "virtualKey": ""
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-noemail-77",
+            "roles": [],
+            "name": "no-email",
+            "sandbox": {
+              "available": false
+            },
+            "workspaces": []
+          }
+        }
+      }
+    },
+    "client": {
+      "verifyApiKey": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "apiKey": "ak-evalbot"
+          }
+        ],
+        "user": {
+          "userId": "u-3c9e1f0a",
+          "userName": "eval-bot",
+          "email": "eval-bot@example.invalid",
+          "roles": [
+            "default"
+          ],
+          "platformKey": "ak-platform-evalbot",
+          "virtualKey": "vk-virtual-evalbot"
+        }
+      },
+      "verifyCookie default": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "cookie": "Token=tok-evalbot; userType=default"
+          }
+        ],
+        "user": {
+          "userId": "u-3c9e1f0a",
+          "userName": "eval-bot",
+          "email": "eval-bot@example.invalid",
+          "roles": [
+            "default"
+          ],
+          "platformKey": "ak-platform-evalbot",
+          "virtualKey": "vk-virtual-evalbot"
+        }
+      },
+      "verifyCookie sso": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "cookie": "Token=sso-ssouser; userType=sso"
+          }
+        ],
+        "user": {
+          "userId": "u-sso-1d2e",
+          "userName": "sso.user",
+          "email": "sso.user@example.invalid",
+          "roles": [
+            "default",
+            "system-admin"
+          ],
+          "platformKey": "ak-platform-ssouser",
+          "virtualKey": "vk-virtual-ssouser"
+        }
+      },
+      "verifyAccessToken": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "authorization": "Bearer idt-evalbot"
+          }
+        ],
+        "user": {
+          "userId": "u-3c9e1f0a",
+          "userName": "eval-bot",
+          "email": "eval-bot@example.invalid",
+          "roles": [
+            "default"
+          ],
+          "platformKey": "ak-platform-evalbot",
+          "virtualKey": "vk-virtual-evalbot"
+        }
+      }
+    }
+  },
+  "virtualKey": {
+    "cases": {
+      "bearer ak- key, user with email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "apiKey": "ak-evalbot"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-3c9e1f0a",
+            "userName": "eval-bot",
+            "email": "eval-bot@example.invalid",
+            "roles": [
+              "default"
+            ],
+            "platformKey": "ak-platform-evalbot",
+            "virtualKey": "vk-virtual-evalbot"
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-3c9e1f0a",
+            "roles": [
+              "default"
+            ],
+            "name": "eval-bot",
+            "email": "eval-bot@example.invalid",
+            "sandbox": {
+              "available": true,
+              "defaultWorkspaceId": "ws-sandbox",
+              "gpuProduct": "MI300X"
+            },
+            "workspaces": [
+              {
+                "id": "ws-train",
+                "name": "Train",
+                "scopes": [
+                  "Train",
+                  "Infer"
+                ],
+                "admin": false,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": false
+              },
+              {
+                "id": "ws-sandbox",
+                "name": "Sandbox",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": false,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": true
+              }
+            ]
+          }
+        }
+      },
+      "x-api-key ak- key, user with email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "apiKey": "ak-ssouser"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-sso-1d2e",
+            "userName": "sso.user",
+            "email": "sso.user@example.invalid",
+            "roles": [
+              "default",
+              "system-admin"
+            ],
+            "platformKey": "ak-platform-ssouser",
+            "virtualKey": "vk-virtual-ssouser"
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-sso-1d2e",
+            "roles": [
+              "default",
+              "system-admin"
+            ],
+            "name": "sso.user",
+            "email": "sso.user@example.invalid",
+            "sandbox": {
+              "available": true,
+              "defaultWorkspaceId": "ws-sandbox",
+              "gpuProduct": "MI300X"
+            },
+            "workspaces": [
+              {
+                "id": "ws-sandbox",
+                "name": "Sandbox",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": true,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": true
+              },
+              {
+                "id": "ws-cpu",
+                "name": "CPU",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": false,
+                "clusterId": "c-cpu",
+                "isDefault": false
+              }
+            ]
+          }
+        }
+      },
+      "download-URL ak- key, user with email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "apiKey": "ak-evalbot-download"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-3c9e1f0a",
+            "userName": "eval-bot",
+            "email": "eval-bot@example.invalid",
+            "roles": [
+              "default"
+            ],
+            "platformKey": "ak-platform-evalbot",
+            "virtualKey": "vk-virtual-evalbot"
+          }
+        },
+        "me": {
+          "status": 0,
+          "body": null
+        }
+      },
+      "default session cookie, user with email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "cookie": "Token=tok-evalbot; userType=default"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-3c9e1f0a",
+            "userName": "eval-bot",
+            "email": "eval-bot@example.invalid",
+            "roles": [
+              "default"
+            ],
+            "platformKey": "ak-platform-evalbot",
+            "virtualKey": "vk-virtual-evalbot"
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-3c9e1f0a",
+            "roles": [
+              "default"
+            ],
+            "name": "eval-bot",
+            "email": "eval-bot@example.invalid",
+            "sandbox": {
+              "available": true,
+              "defaultWorkspaceId": "ws-sandbox",
+              "gpuProduct": "MI300X"
+            },
+            "workspaces": [
+              {
+                "id": "ws-train",
+                "name": "Train",
+                "scopes": [
+                  "Train",
+                  "Infer"
+                ],
+                "admin": false,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": false
+              },
+              {
+                "id": "ws-sandbox",
+                "name": "Sandbox",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": false,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": true
+              }
+            ]
+          }
+        }
+      },
+      "sso session cookie": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "cookie": "Token=sso-ssouser; userType=sso"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-sso-1d2e",
+            "userName": "sso.user",
+            "email": "sso.user@example.invalid",
+            "roles": [
+              "default",
+              "system-admin"
+            ],
+            "platformKey": "ak-platform-ssouser",
+            "virtualKey": "vk-virtual-ssouser"
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-sso-1d2e",
+            "roles": [
+              "default",
+              "system-admin"
+            ],
+            "name": "sso.user",
+            "email": "sso.user@example.invalid",
+            "sandbox": {
+              "available": true,
+              "defaultWorkspaceId": "ws-sandbox",
+              "gpuProduct": "MI300X"
+            },
+            "workspaces": [
+              {
+                "id": "ws-sandbox",
+                "name": "Sandbox",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": true,
+                "gpuProduct": "MI300X",
+                "flavorId": "f-mi300",
+                "clusterId": "c-main",
+                "isDefault": true
+              },
+              {
+                "id": "ws-cpu",
+                "name": "CPU",
+                "scopes": [
+                  "Sandbox"
+                ],
+                "admin": false,
+                "clusterId": "c-cpu",
+                "isDefault": false
+              }
+            ]
+          }
+        }
+      },
+      "bearer ak- key, user without email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "apiKey": "ak-noemail"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-noemail-77",
+            "userName": "no-email",
+            "roles": [],
+            "platformKey": "ak-platform-noemail",
+            "virtualKey": ""
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-noemail-77",
+            "roles": [],
+            "name": "no-email",
+            "sandbox": {
+              "available": false
+            },
+            "workspaces": []
+          }
+        }
+      },
+      "default session cookie, user without email": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "cookie": "Token=tok-noemail; userType=default"
+          }
+        ],
+        "user": {
+          "status": 200,
+          "body": {
+            "userId": "u-noemail-77",
+            "userName": "no-email",
+            "roles": [],
+            "platformKey": "ak-platform-noemail",
+            "virtualKey": ""
+          }
+        },
+        "me": {
+          "status": 200,
+          "body": {
+            "userId": "u-noemail-77",
+            "roles": [],
+            "name": "no-email",
+            "sandbox": {
+              "available": false
+            },
+            "workspaces": []
+          }
+        }
+      }
+    },
+    "client": {
+      "verifyApiKey": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "apiKey": "ak-evalbot"
+          }
+        ],
+        "user": {
+          "userId": "u-3c9e1f0a",
+          "userName": "eval-bot",
+          "email": "eval-bot@example.invalid",
+          "roles": [
+            "default"
+          ],
+          "platformKey": "ak-platform-evalbot",
+          "virtualKey": "vk-virtual-evalbot"
+        }
+      },
+      "verifyCookie default": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "cookie": "Token=tok-evalbot; userType=default"
+          }
+        ],
+        "user": {
+          "userId": "u-3c9e1f0a",
+          "userName": "eval-bot",
+          "email": "eval-bot@example.invalid",
+          "roles": [
+            "default"
+          ],
+          "platformKey": "ak-platform-evalbot",
+          "virtualKey": "vk-virtual-evalbot"
+        }
+      },
+      "verifyCookie sso": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "cookie": "Token=sso-ssouser; userType=sso"
+          }
+        ],
+        "user": {
+          "userId": "u-sso-1d2e",
+          "userName": "sso.user",
+          "email": "sso.user@example.invalid",
+          "roles": [
+            "default",
+            "system-admin"
+          ],
+          "platformKey": "ak-platform-ssouser",
+          "virtualKey": "vk-virtual-ssouser"
+        }
+      },
+      "verifyAccessToken": {
+        "verifyRequests": [
+          {
+            "includePlatformKey": true,
+            "includeVirtualKey": true,
+            "authorization": "Bearer idt-evalbot"
+          }
+        ],
+        "user": {
+          "userId": "u-3c9e1f0a",
+          "userName": "eval-bot",
+          "email": "eval-bot@example.invalid",
+          "roles": [
+            "default"
+          ],
+          "platformKey": "ak-platform-evalbot",
+          "virtualKey": "vk-virtual-evalbot"
+        }
+      }
+    }
+  }
+}

@@ -78,6 +78,11 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
     columns: ["event_id", "session_id", "event", "data", "created_at"],
   },
   {
+    // Absent, an event the consumer sets aside cannot be recorded, and it is retried instead of set aside.
+    table: "claw_event_quarantine",
+    columns: ["event_id", "session_id", "subject", "stream_seq", "event_type", "reason", "deliveries", "payload"],
+  },
+  {
     table: "claw_tasks",
     columns: [
       "task_id", "session_id", "status", "dag_root_task_id", "dag_node_id",
@@ -147,6 +152,25 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "dedupe_key",
       // Named by every queue insert and read back by the drain, like `topology`.
       "tools_allowlist",
+      // Absent, a message that can never be sent cannot be counted, so it is
+      // never quarantined and holds every later message on its session behind
+      // it for good (tasks/pending-quarantine.ts).
+      "drain_failures", "drain_first_failed_at", "drain_last_error",
+    ],
+  },
+  {
+    table: "claw_pending_messages_quarantine",
+    // Absent, the move that isolates such a message fails, and it stays at the
+    // head of its session's queue.
+    columns: [
+      "id", "session_id", "user_id", "message_id", "content", "attempts", "last_error",
+      "notified_at", "notice_attempts", "notice_claimed_at",
+      // Absent, a notice retried after a partial publish repeats what was
+      // already sent.
+      "notice_events", "failure_reason",
+      // Absent, a notice cannot tell an attempt that may have stored an event
+      // from one NATS refused, and is given up on during a long NATS outage.
+      "notice_started_at", "notice_unsure_since",
     ],
   },
   {
@@ -160,6 +184,7 @@ export const REQUIRED_SCHEMA: SchemaRequirement[] = [
       "task_id", "session_id", "plugin_id", "manifest", "idempotency_key", "state",
       "mcp_token_enc", "grant_id", "grant_keys_enc", "grant_limits", "grant_templates",
       "grant_expires_at", "grant_revoked_at", "created_by", "request_hash",
+      "sandbox_state", "sandbox_since",
     ],
   },
   {

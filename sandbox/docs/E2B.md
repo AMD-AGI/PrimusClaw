@@ -63,6 +63,45 @@ Sealed rules:
 
 A template that is not sealed allows commands and file access in the sandbox.
 
+### GPU template size
+
+A template with GPU counts (an owner policy template, or a Claw grant template with `perGpuCount`, `per_gpu_count` in the app manifest) is registered once per count. The count comes only from that list. CPU, memory, pod storage and `/dev/shm` come from the template spec when it sets them, so a sandbox can ask for what it needs instead of a whole node's share per card and leave room on the node for CPU sandboxes:
+
+```json
+{
+  "fromImage": "<image>@sha256:<digest>",
+  "resources": {
+    "requests": { "cpu": "16", "memory": "448Gi" },
+    "limits": { "ephemeral-storage": "400Gi" }
+  },
+  "gpu": { "sharedMemory": "128Gi" }
+}
+```
+
+`resources` is the Kubernetes container `resources` (in the `{"template": {...}}` form it sits inside `template`); `gpu` sits at the top of the spec in both forms. Each of `cpu`, `memory` and `ephemeral-storage` is resolved on its own:
+
+| The spec sets           | Request             | Limit               |
+| ----------------------- | ------------------- | ------------------- |
+| `requests` and `limits` | as given            | as given            |
+| `requests` only         | as given            | the request         |
+| `limits` only           | the limit           | as given            |
+| neither                 | per card x GPUs     | per card x GPUs     |
+
+Per card is 24 CPU, 224Gi memory and 187.5Gi pod storage. `/dev/shm` is `gpu.sharedMemory` when set, else 125Gi per card, lowered to the memory limit when that is smaller (shared memory counts against the container's memory). A spec without `resources` or `gpu` gets exactly the per-card size, as before. The values apply to every GPU count of the template, so give each shape its own template, for example:
+
+| Template      | GPUs | CPU | Memory |
+| ------------- | ---- | --- | ------ |
+| DS TP2        | 2    | 16  | 448Gi  |
+| GLM TP4       | 4    | 24  | 1200Gi |
+| MiniMax TP4   | 4    | 24  | 1400Gi |
+| Kimi TP8      | 8    | 32  | 1792Gi |
+
+A SaFE Workload takes one CPU and one memory value per sandbox: it is sent the limit.
+
+The grant (or the owner policy write) is refused with `400` (`invalid_grant`, or `invalid_owner_policy`) and nothing is registered when a value is zero, negative or not a quantity, a request exceeds its limit, `gpu.sharedMemory` exceeds the memory limit, `resources` on a GPU template names anything other than `cpu`, `memory` and `ephemeral-storage` (the GPU count is not set there), `gpu` sets a key other than `sharedMemory`, `count`, `product` and `resourceName`, or a template without GPU counts sets `gpu.sharedMemory`. A template without GPU counts keeps its `resources` as written; its `cpu`, `memory` and `ephemeral-storage` are checked the same way.
+
+`gpu.count`, `gpu.product` and `gpu.resourceName` (the CodeInterpreter `gpu` fields) are accepted and ignored, as before: the card count is `perGpuCount` and the resource is `amd.com/gpu`. A policy stored with them keeps applying.
+
 ### User templates
 
 A user creates a template for a workspace with `POST /v1/templates` and the `workspace` field (see [API.md](API.md)). Its template id is the template name. A name cannot start with `e2b-`. All user templates share the control-plane namespace, so a name is unique across users and workspaces: a name already taken returns 409. User templates are used with SaFE API keys; a grant key runs only the templates of its role.

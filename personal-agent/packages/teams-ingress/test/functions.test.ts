@@ -20,7 +20,8 @@ import * as entry from "@primusclaw/personal-agent-teams-ingress";
 import { consoleSink, contextSink, type Registrar, register } from "../src/functions.js";
 import { type LogRecord } from "../src/log.js";
 import { start } from "../src/app.js";
-import { defined, FULL_ENV, load, MESSAGE, PACKAGE } from "./helpers.js";
+import { createIngress } from "../src/ingress.js";
+import { defined, FULL_ENV, load, MESSAGE, PACKAGE, RecordingBus } from "./helpers.js";
 
 type Calls = [string, unknown[]][];
 
@@ -71,6 +72,7 @@ test("records outside an invocation go to the console, at their level", (t) => {
 interface Handlers {
   messages?: (request: HttpRequest, context: InvocationContext) => Promise<HttpResponseInit>;
   outbound?: (message: unknown, context: InvocationContext) => Promise<void>;
+  probe?: { schedule: string; handler: (timer: unknown, context: InvocationContext) => Promise<void> };
 }
 
 function registered(ingress: Parameters<typeof register>[1]): Handlers {
@@ -81,6 +83,9 @@ function registered(ingress: Parameters<typeof register>[1]): Handlers {
     },
     serviceBusQueue: (_name, options) => {
       handlers.outbound = options.handler;
+    },
+    timer: (_name, options) => {
+      handlers.probe = options;
     },
   };
   register(recorder, ingress);
@@ -147,10 +152,28 @@ test("start registers the messaging endpoint, and the outbound trigger when its 
   const recorder: Registrar = {
     http: (name) => names.push(name),
     serviceBusQueue: (name) => names.push(name),
+    timer: (name) => names.push(name),
   };
   start(recorder, { PRIMUSCLAW_BOT_APP_ID: "claw-app" });
   start(recorder, { PRIMUSCLAW_BOT_APP_ID: "claw-app", PRIMUSCLAW_OUTBOUND_SERVICEBUS__fullyQualifiedNamespace: "x" });
-  assert.deepEqual(names, ["messages", "messages", "outbound"]);
+  start(recorder, { PRIMUSCLAW_BOT_APP_ID: "claw-app", PRIMUSCLAW_PROBE_SCHEDULE: " " });
+  start(recorder, { PRIMUSCLAW_BOT_APP_ID: "claw-app", PRIMUSCLAW_PROBE_SCHEDULE: "0 */5 * * * *" });
+  assert.deepEqual(names, ["messages", "messages", "outbound", "messages", "messages", "probe"]);
+  // (a registrar from before the probe, without timers: the endpoint still registers, and the start says no probe is sent)
+  const older: string[] = [];
+  const records: string[] = [];
+  const ingress = createIngress({
+    env: { PRIMUSCLAW_BOT_APP_ID: "claw-app", PRIMUSCLAW_PROBE_SCHEDULE: "0 */5 * * * *" },
+    fetch: () => Promise.reject(new Error("no network")),
+    log: (record) => records.push(`${record.level} ${record.message}`),
+    serviceBus: new RecordingBus(),
+    spawn: () => undefined,
+  });
+  register({ http: (name) => older.push(name), serviceBusQueue: (name) => older.push(name) }, ingress);
+  assert.deepEqual(older, ["messages"]);
+  assert.ok(
+    records.some((r) => r.startsWith("warning PRIMUSCLAW_PROBE_SCHEDULE is set but the registrar has no timers")),
+  );
 });
 
 test("the deployable entry registers the functions when it is loaded", () => {

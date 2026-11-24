@@ -8,7 +8,8 @@ import { Session, type SessionEnv } from "./session.js";
 import os from "node:os";
 import { withHint } from "./hints.js";
 import { resolveCwd } from "./roots.js";
-import { REMOTE_COMMAND_TYPES, isRemoteCommandType } from "./protocol.js";
+import { REMOTE_COMMAND_TYPES, isRemoteCommandType, parsePromptFiles } from "./protocol.js";
+import { dropSessionFiles, savePromptFiles, sweepPromptFiles, withSavedFiles, withUnsavedFiles } from "./prompt-files.js";
 import { sha256, errMessage, verdictOf, type MayRun } from "./util.js";
 
 export interface Command {
@@ -45,7 +46,10 @@ export class SessionManager {
   /** The sessions that carry a terminal's approvals (approvals.ts): their commands go there, never to an agent. */
   approvals: { owns(sid: string): boolean; decide(actionId: string, optionId: string, by: string | null): boolean; close(sid: string): void } | null = null;
 
-  constructor(private readonly env: SessionEnv) {}
+  constructor(private readonly env: SessionEnv) {
+    // (files of sessions that ended while this connector was not running, past their keep time)
+    if (env.uploadDir) sweepPromptFiles(env.uploadDir, Date.now());
+  }
 
   private agent(id: unknown): AgentConfig | undefined {
     return typeof id === "string" ? this.env.config.agents.find((a) => a.id === id) : undefined;
@@ -143,6 +147,7 @@ export class SessionManager {
     if (!(s instanceof Session)) {
       // Closing needs no disk: the record is closed and the phone told, whatever the folder's state.
       if (type === "close") {
+        if (this.env.uploadDir) dropSessionFiles(this.env.uploadDir, sid);
         this.env.store.patch(sid, { status: "closed" });
         this.env.audit.record("session_closed", { session_id: sid, reason: "closed" });
         this.env.emit(sid, "session_closed", { reason: "closed" });
@@ -157,7 +162,7 @@ export class SessionManager {
     switch (type) {
       case "prompt":
         if (typeof cmd.text !== "string" || cmd.text === "") { s.rejectCommand("prompt", cmdId, "text_required", cmdSeqOf(cmd)); return false; }
-        s.enqueuePrompt(cmd.text, cmdId, handled, cmdSeqOf(cmd), mayRun);
+        s.enqueuePrompt(this.withFiles(cmd.text, cmd), cmdId, handled, cmdSeqOf(cmd), mayRun);
         return true;
       case "cancel":
         await s.cancel();
@@ -173,7 +178,7 @@ export class SessionManager {
         await s.resume(cmdId);
         return false;
       case "close":
-        await s.close("closed");
+        await s.close("closed"); // (its files go with it: Session.close)
         return false;
       case "decision":
         if (typeof cmd.action_id !== "string" || typeof cmd.option_id !== "string") s.rejectCommand("decision", cmdId, "action_and_option_required");
@@ -181,6 +186,34 @@ export class SessionManager {
         return false;
     }
     return false;
+  }
+
+  /**
+   * A prompt's text with the files it carries saved on this machine and named by their paths (prompt-files.ts). The words
+   * always go: files that cannot be taken or saved are said to be missing in the text the agent reads.
+   */
+  private withFiles(text: string, cmd: Command): string {
+    if (cmd.files === undefined) return text;
+    const parsed = parsePromptFiles(cmd.files);
+    const count = Array.isArray(cmd.files) ? cmd.files.length : 0;
+    if (!parsed.ok || !this.env.uploadDir) {
+      const why = parsed.ok ? "this connector does not take files" : parsed.error;
+      this.env.audit.record("prompt_files_refused", { session_id: cmd.session_id, cmd_id: cmd.cmd_id, count, reason: why });
+      return count ? withUnsavedFiles(text, count, why) : text;
+    }
+    if (parsed.value.length === 0) return text;
+    try {
+      sweepPromptFiles(this.env.uploadDir, Date.now());
+      const saved = savePromptFiles(this.env.uploadDir, cmd.session_id, cmd.cmd_id, parsed.value);
+      this.env.audit.record("prompt_files_saved", {
+        session_id: cmd.session_id, cmd_id: cmd.cmd_id, count: saved.length, bytes: saved.reduce((n, f) => n + f.size, 0),
+      });
+      return withSavedFiles(text, saved);
+    } catch (e) {
+      this.env.log.warn("the files of a prompt were not saved", { session: cmd.session_id, error: errMessage(e) });
+      this.env.audit.record("prompt_files_refused", { session_id: cmd.session_id, cmd_id: cmd.cmd_id, count, reason: "not_saved" });
+      return withUnsavedFiles(text, count, errMessage(e).slice(0, 200));
+    }
   }
 
   private async sessionNew(cmd: Command): Promise<void> {
@@ -248,6 +281,18 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Whether a session of this connector follows that conversation now (taken over, typed into or watched read-only from the
+   * phone), for any agent: the chat it is attached to shows what the conversation does.
+   */
+  followsRef(ref: string): boolean {
+    const want = ref.toLowerCase();
+    for (const s of this.sessions.values()) if (!s.closed && s.acpId?.toLowerCase() === want) return true;
+    // An attach still looking the conversation up follows it too: its chat is about to show what the conversation does.
+    for (const claim of this.attaching) if (claim.endsWith(`:${want}`)) return true;
+    return false;
+  }
+
   /** The ids of the existing sessions this connector holds open, by agent. */
   attachedRefs(agentId: string): Set<string> {
     const out = new Set<string>();
@@ -295,6 +340,11 @@ export class SessionManager {
   /** After the command stream reconnects: cards still waiting are shown again. */
   resendPending(): void {
     for (const s of this.sessions.values()) s.resendPending();
+  }
+
+  /** No command is being carried out and no session has a turn, a queued prompt or message, or a card waiting. */
+  idleNow(): boolean {
+    return this.chains.size === 0 && this.attaching.size === 0 && [...this.sessions.values()].every((s) => !s.busy);
   }
 
   get pendingPermissions(): number {

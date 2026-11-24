@@ -52,7 +52,11 @@ export const pauseFile = (d: Dirs) => path.join(d.state, "paused");
 export const stopRequestFile = (d: Dirs) => path.join(d.state, "stop-requested.json");
 export const auditFile = (d: Dirs) => path.join(d.state, "audit.jsonl");
 export const outboxDir = (d: Dirs) => path.join(d.state, "outbox");
+/** Events Claw would not take, set aside unsent (session, number, type and why: never the content). One JSON line each. */
+export const quarantineFile = (d: Dirs) => path.join(d.state, "quarantine.jsonl");
 export const logDir = (d: Dirs) => path.join(d.state, "logs");
+/** The files prompts carried, saved where the agents can open them (prompt-files.ts). */
+export const uploadsDir = (d: Dirs) => path.join(d.state, "uploads");
 export const disconnectsFile = (d: Dirs) => path.join(d.state, "disconnects.jsonl");
 export const needsLoginFile = (d: Dirs) => path.join(d.state, "needs-login.json");
 export const supervisorPidFile = (d: Dirs) => path.join(d.state, "supervisor.pid");
@@ -63,3 +67,8 @@ export const serviceFile = (d: Dirs) => path.join(d.state, "service.json");
 export const doctorFile = (d: Dirs) => path.join(d.state, "doctor.json");
 /** Touched by every `service ensure` (what keepalive.sh runs), so `doctor` can tell whether anything calls it. */
 export const keepaliveStampFile = (d: Dirs) => path.join(d.state, "keepalive-last");
+/**
+ * What the connector's own upgrades left behind (auto-upgrade.ts): the last outcome, a version that failed here and is not
+ * tried again, when to try again after a refusal, and the setup the next run still has to do.
+ */
+export const autoUpgradeFile = (d: Dirs) => path.join(d.state, "auto-upgrade.json");

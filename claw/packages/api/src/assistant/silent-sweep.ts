@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * An item needs the user and nobody has said so, or an item's answer (`answer`, which closes it) was never said.
+ * An item needs the user and nobody has said so, or an item's answer (`answer`, which closes it), or a result delivered without the
+ * user's Accept (`applyWorkerReport`), was never said.
  *
  * The assistant is a model: it can be slow, fail, or answer a report without saying anything, and the say it
  * did make can fail to reach anyone. A result nobody hears about is the one outcome the assistant exists to
@@ -36,7 +37,7 @@ import pino from "pino";
 import { CLAW_ASSISTANT_SILENT_SWEEP_SEC, CLAW_NOTIFICATIONS_ENABLED } from "../config.js";
 import { db } from "../infra/db.js";
 import {
-  ANSWERED_UNSAID_SQL, recordNeedsYouFallback, resendUnreachedSays, reshowFallback, SAY_EVENT_TYPE_SQL, UNREACHED_SAY_SQL,
+  ANSWERED_UNSAID_SQL, DELIVERED_UNSAID_SQL, recordNeedsYouFallback, resendUnreachedSays, reshowFallback, SAY_EVENT_TYPE_SQL, UNREACHED_SAY_SQL,
 } from "./outbound.js";
 
 const logger = pino({ name: "assistant-silent-sweep" });
@@ -81,7 +82,7 @@ export async function tellSilentItems(
            WHERE f.item_id = w.item_id AND f.item_attention_seq = w.attention_seq AND f.fallback)`;
   const items = (await db.query(
     `SELECT w.item_id, w.user_id, ${fallbackStored} AS fallback_stored, ${unshownFallback(notifications)} AS unshown FROM claw_work_items w
-      WHERE (w.board_state = 'needs_you' OR (${ANSWERED_UNSAID}))
+      WHERE (w.board_state = 'needs_you' OR (${ANSWERED_UNSAID}) OR (${DELIVERED_UNSAID_SQL}))
         -- A remote item tells the user itself, and only of what the assistant sent (\`remote-items.ts\`): what they typed into an
         -- attached chat they watched, and is not to be said again.
         AND w.kind <> 'remote'

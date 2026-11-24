@@ -99,23 +99,143 @@ export const SANDBOX_UNAVAILABLE_REASONS: ReadonlySet<string> = new Set([
   // Nor this one: the deployment does not let a sandbox run in that workspace,
   // and a second try names the same workspace.
   "sandbox_workspace_not_allowed",
+  // Nor this: the platform refused the create request itself (an admission
+  // webhook, a validation error), and a second try sends the same request.
+  "sandbox_rejected",
 ]);
 
 /**
- * The endings among SANDBOX_UNAVAILABLE_REASONS that say the platform had no
- * capacity for the sandbox within the wait the run was given: no node took its
- * pod, the wait for capacity ran out, or it never became ready once scheduled.
- * A run that asked for a sandbox and ended on one of these did not do the work
- * it needed the sandbox for, and is recorded as failed for it even when its
- * agent went on to answer (see TaskRunner.provisionFailure). A refused account or
- * workspace is not among them: that is the account's standing, and a turn that
- * carries on without a sandbox there is the designed behaviour, not a failure.
+ * The platform refused the request to create the sandbox workload: a 4xx answer
+ * to the create, such as an admission webhook's denial ("timeout 64800 exceeds
+ * the qos limit of 10800 seconds for scope Sandbox"). Nothing was created, and
+ * the same request is refused again, so the run is failed for it with the
+ * platform's own words (see `sandboxRejectedText`).
  */
-export const SANDBOX_CAPACITY_FAILURE_REASONS: ReadonlySet<string> = new Set([
-  "sandbox_unschedulable",
-  "sandbox_start_timeout",
-  "sandbox_pending_timeout",
+export const SANDBOX_REJECTED = "sandbox_rejected";
+
+/**
+ * Provisioning endings that do NOT fail a run that goes on without a sandbox:
+ * an account or workspace the platform refuses (that is the account's standing,
+ * and a turn that carries on without a sandbox there is the designed behaviour)
+ * and a wait the run itself cancelled (the run ends as cancelled, not failed).
+ * Every other provisioning ending, and a create that failed
+ * (`sandbox_create_failed`), fails it: see TaskRunner.provisionFailure.
+ */
+const NOT_A_RUN_FAILURE: ReadonlySet<string> = new Set([
+  "sandbox_workspace_forbidden",
+  "sandbox_workspace_not_allowed",
+  "sandbox_wait_interrupted",
 ]);
+
+/** The longest platform text carried into a failure message. */
+const PLATFORM_TEXT_LIMIT = 600;
+
+/** One line of the platform's text: control characters and runs of space folded, cut at `limit`. */
+export function oneLineText(raw: unknown, limit: number): string {
+  const text = String(raw ?? "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+/**
+ * What the platform said in a refused create's body: SaFE's `errorMessage` when
+ * the body is its JSON error shape, else the body itself. One line, cut to a
+ * bound.
+ *
+ * `mask` is applied to the text as the platform wrote it, BEFORE it is folded
+ * onto one line and cut: a credential the platform echoed back only matches the
+ * value that was sent while it is whole and keeps its own line breaks. Folded
+ * first, a multi-line value (a PEM key) no longer matches and goes out in clear;
+ * cut first, a value that straddles the cut leaves its prefix in clear. Nothing
+ * downstream can catch either, since every later mask also matches whole values.
+ */
+export function platformErrorText(body: string, mask: (text: string) => string): string {
+  let said: unknown = body;
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object") {
+      said = parsed.errorMessage ?? parsed.message ?? parsed.error ?? body;
+    }
+  } catch { /* not JSON: the body is the text */ }
+  const text = typeof said === "string" ? said : JSON.stringify(said) ?? "";
+  return oneLineText(mask(text), PLATFORM_TEXT_LIMIT);
+}
+
+/**
+ * The timeout a run asked for and the one Claw sent, when the platform's refusal
+ * is about it. Claw adds SHUTDOWN_BUFFER_SECONDS to a requested timeout (the
+ * room to stop the run cleanly at its deadline), so a request under the
+ * platform's ceiling can be refused once padded; without both numbers the
+ * caller reads a refusal of a number it never sent.
+ *
+ * `ceiling` is the limit the platform named ("qos limit of N seconds"), when it
+ * named one. Empty when the refusal is not about the timeout.
+ */
+export function timeoutRefusalNote(
+  platformText: string,
+  timeout: { requestedSec?: number; sentSec: number; bufferSec: number },
+): string {
+  if (!/\btimeout\b/i.test(platformText)) return "";
+  const limit = /limit of (\d+) seconds/i.exec(platformText);
+  const ceiling = limit ? Number(limit[1]) : null;
+  const above = ceiling !== null && timeout.sentSec > ceiling ? `, above the platform's limit of ${ceiling}s` : "";
+  if (timeout.requestedSec === undefined) {
+    return `The run named no timeout; Claw sent timeout=${timeout.sentSec}s (the deployment's default)${above}.`;
+  }
+  const padded = timeout.requestedSec + timeout.bufferSec;
+  const how = padded === timeout.sentSec
+    ? `Claw adds ${timeout.bufferSec}s to stop the run cleanly and sent timeout=${timeout.sentSec}s`
+    : `Claw sent timeout=${timeout.sentSec}s (${timeout.requestedSec}s + ${timeout.bufferSec}s, capped by the deployment)`;
+  const within = ceiling !== null && timeout.requestedSec + timeout.bufferSec > ceiling && timeout.requestedSec <= ceiling
+    ? ` A timeout of at most ${Math.max(0, ceiling - timeout.bufferSec)}s fits.`
+    : "";
+  return `The run asked for timeout=${timeout.requestedSec}s; ${how}${above}.${within}`;
+}
+
+/**
+ * The failure message for a create the platform refused: the HTTP status, the
+ * platform's own words, and, when the refusal is about the timeout, the numbers
+ * asked for and sent (`timeoutRefusalNote`).
+ */
+export function sandboxRejectedText(
+  status: number,
+  platformText: string,
+  timeout: { requestedSec?: number; sentSec: number; bufferSec: number },
+): string {
+  const note = timeoutRefusalNote(platformText, timeout);
+  return `The platform refused to create the sandbox (HTTP ${status}): ${platformText || "no reason given"}`
+    + (note ? ` ${note}` : "");
+}
+
+/**
+ * Why a run that asked for a sandbox and never had one failed, from the error
+ * its last open ended with: the provisioning code and its message, or null when
+ * the ending is not a failure of the run (NOT_A_RUN_FAILURE) or says nothing
+ * about the sandbox at all. `classify` maps an untyped error's text to a code
+ * (the reaper's `classifySandboxFailure`), so a create that failed with a 5xx
+ * reads as `sandbox_create_failed`.
+ */
+export function sandboxOpenFailureOf(
+  err: unknown,
+  classify: (message: string) => string | null,
+): { reason: string; message: string } | null {
+  const terminal = provisionTerminalOf(err);
+  if (terminal) {
+    if (NOT_A_RUN_FAILURE.has(terminal.reason)) return null;
+    return { reason: terminal.reason, message: String(terminal.message ?? "") };
+  }
+  let current: unknown = err;
+  for (let depth = 0; current && depth < 4; depth++) {
+    const message = current instanceof Error ? current.message : String(current);
+    const reason = classify(message);
+    if (reason) return { reason, message };
+    current = (current as { cause?: unknown }).cause;
+  }
+  return null;
+}
 
 /**
  * The platform refused to create the sandbox workload because the caller's
@@ -192,6 +312,24 @@ export function classifyWorkloadTerminalReason(info: Record<string, unknown>): s
     return "sandbox_envd_exited";
   }
   return "sandbox_workload_terminal";
+}
+
+/**
+ * What the platform said about a workload that reached a terminal phase: the
+ * terminal condition's message (AdminFailed / AdminStopped), the source
+ * {@link classifyWorkloadTerminalReason} reads, falling back to the top-level
+ * message only when there is no terminal condition. One line, bounded; empty
+ * when it said nothing.
+ */
+export function workloadTerminalText(info: Record<string, unknown>): string {
+  const conds = Array.isArray(info.conditions) ? (info.conditions as Array<Record<string, unknown> | null>) : [];
+  const terminal = conds.find((c) => {
+    const t = String(c?.type ?? "").toLowerCase();
+    return t === "adminfailed" || t === "adminstopped";
+  });
+  if (!terminal) return oneLineText(info.message, PLATFORM_TEXT_LIMIT);
+  const parts = [terminal.type, terminal.reason, terminal.message].map((v) => String(v ?? "").trim()).filter(Boolean);
+  return oneLineText(parts.join(": "), PLATFORM_TEXT_LIMIT);
 }
 
 /**

@@ -12,7 +12,7 @@
 import { randomUUID } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { parseEventBatch, parseHeartbeat } from "../../../claw/packages/protocol/src/remote-agents.js";
+import { compareConnectorVersions, parseEventBatch, parseHeartbeat } from "../../../claw/packages/protocol/src/remote-agents.js";
 
 export interface StoredEvent { session_id: string; seq: number; type: string; ts: number; data: any }
 
@@ -43,6 +43,22 @@ export class FakeClaw {
   outageRefusals = 0;
   /** Refuse (name in `rejected`, as the real server does) every event of this type. */
   rejectType: string | null = null;
+  /**
+   * Answer a post 500 when any event in it holds a NUL or an unpaired surrogate, the way Claw's API did before it made such text
+   * storable: PostgreSQL's jsonb refused the whole INSERT (the body is the one that API sent, measured).
+   */
+  refuseUnstorable = false;
+  /** Answer a post 500 when any event in it matches, whatever is done to its text: an event Claw can never take. */
+  refuseEvent: ((e: { session_id: string; seq: number; type: string; data: any }) => boolean) | null = null;
+  /** Answer every post 500, an empty one too: Claw's database is down. */
+  failAllPosts = false;
+  /**
+   * Answer a post that holds events 500 when this says so, with the body a deadlock gives (SQLSTATE 40P01, nothing about the events):
+   * a Claw that fails now and then, whatever the post carries. An empty post is always taken.
+   */
+  flaky: (() => boolean) | null = null;
+  /** Every post's events (session, seq, type), in order, and its answer's status. */
+  readonly posts: Array<{ status: number; events: Array<{ session_id: string; seq: number; type: string }> }> = [];
   /** Store the next N event posts but close the socket before answering (a lost acknowledgement). */
   loseAcks = 0;
   readonly commands: Array<{ seq: number; payload: Record<string, unknown> }> = [];
@@ -65,6 +81,11 @@ export class FakeClaw {
   readonly revocations: Array<{ method: string; id: string; auth: string | undefined }> = [];
   cursor = 0;
   nextSeq = 1;
+  /**
+   * The connector versions this Claw takes, as CLAW_REMOTE_AGENTS_{MIN,RECOMMENDED}_CONNECTOR_VERSION set them: a heartbeat from an
+   * older version than `recommended` is answered with `connector_version`, as the real server does. Null: never.
+   */
+  connectorVersions: { minimum: string; recommended: string } | null = null;
   /** Sessions closed on Claw's side (the person closed one, or removed the machine): their commands are no longer live. */
   readonly closedSessions = new Set<string>();
   /** What `POST .../commands/:cmd_id/confirm` answers for a command, instead of judging it. */
@@ -281,10 +302,29 @@ export class FakeClaw {
         this.heartbeats.push(body);
         if (hb.value.cmdCursor !== null) { this.cursor = Math.max(this.cursor, hb.value.cmdCursor); }
         this.wake();
-        return this.json(res, 200, { ok: true, data: { server_time: new Date().toISOString(), online_window_ms: 90000 } });
+        const pol = this.connectorVersions;
+        // A recommended version that does not compare (not a version at all) is sent too: a connector must refuse it itself.
+        const old = pol && typeof hb.value.version === "string" && (compareConnectorVersions(hb.value.version, pol.recommended) ?? -1) < 0;
+        return this.json(res, 200, { ok: true, data: {
+          server_time: new Date().toISOString(), online_window_ms: 90000,
+          ...(old ? { connector_version: {
+            version_status: (compareConnectorVersions(hb.value.version!, pol.minimum) ?? 0) < 0 ? "unsupported" : "outdated",
+            upgrade_command: "npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install",
+            minimum_version: pol.minimum, recommended_version: pol.recommended,
+          } } : {}),
+        } });
       }
       case "events": {
-        if (this.failPosts > 0) { this.failPosts--; return this.json(res, 503, { ok: false, error: "unavailable" }); }
+        const sent = Array.isArray((body as any)?.events) ? (body as any).events as any[] : [];
+        const post = { status: 200, events: sent.map((e) => ({ session_id: e?.session_id, seq: e?.seq, type: e?.type })) };
+        this.posts.push(post);
+        const answer = (status: number, b: unknown) => { post.status = status; return this.json(res, status, b); };
+        if (this.failPosts > 0) { this.failPosts--; return answer(503, { ok: false, error: "unavailable" }); }
+        const internal = (message: string, code: string) => answer(500, { statusCode: 500, code, error: "Internal Server Error", message });
+        if (this.failAllPosts) return internal("Connection terminated unexpectedly", "ECONNRESET");
+        if (this.flaky && sent.length > 0 && this.flaky()) return internal("deadlock detected", "40P01");
+        if (this.refuseUnstorable && sent.some((e) => holdsUnstorable(e?.data))) return internal("unsupported Unicode escape sequence", "22P05");
+        if (this.refuseEvent && sent.some((e) => this.refuseEvent!(e))) return internal("refused for the test", "22023");
         const batch = parseEventBatch(body);
         if (!batch.ok) return this.json(res, 400, { ok: false, error: batch.error });
         const acked: Record<string, number> = {};
@@ -299,7 +339,7 @@ export class FakeClaw {
         }
         this.wake();
         if (this.loseAcks > 0) { this.loseAcks--; req.socket.destroy(); return; }
-        return this.json(res, 200, { ok: true, data: { batch_id: batch.value.batchId, acked, rejected: refused } });
+        return answer(200, { ok: true, data: { batch_id: batch.value.batchId, acked, rejected: refused } });
       }
       case "commands": {
         this.streamHeaders.push(req.headers);
@@ -341,4 +381,13 @@ export class FakeClaw {
     }
     return this.json(res, 404, { ok: false, error: "not_found" });
   }
+}
+
+/** Whether a parsed JSON value holds, in a key or a string, a character PostgreSQL's jsonb refuses (a NUL, an unpaired surrogate). */
+function holdsUnstorable(v: unknown): boolean {
+  const bad = (t: string) => /\u0000|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(t);
+  if (typeof v === "string") return bad(v);
+  if (Array.isArray(v)) return v.some(holdsUnstorable);
+  if (v && typeof v === "object") return Object.entries(v).some(([k, x]) => bad(k) || holdsUnstorable(x));
+  return false;
 }

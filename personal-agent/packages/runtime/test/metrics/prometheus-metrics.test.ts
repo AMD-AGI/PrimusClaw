@@ -16,6 +16,7 @@ import {
   ALERTED,
   CONTENT_TYPE,
   HELP,
+  HELP_CURRENT_ONLY,
   LEGACY_METRIC_PREFIX,
   METRIC_PREFIX,
   PrometheusMetrics,
@@ -219,7 +220,12 @@ describe("files and inbound counted", () => {
         return base !== name && own(HELP, base)?.[0] === "histogram" ? base : name;
       }),
     );
-    assert.deepEqual([...names].sort(), Object.keys(HELP).sort());
+    assert.deepEqual([...names].sort(), [...Object.keys(HELP), ...Object.keys(HELP_CURRENT_ONLY)].sort());
+    for (const [name, [kind]] of Object.entries(HELP_CURRENT_ONLY)) {
+      assert.ok(name.startsWith(METRIC_PREFIX), name);
+      assert.ok(text.includes(`# TYPE ${name} ${kind}\n`) && text.includes(`# HELP ${name} `), name);
+      assert.ok(!text.includes(LEGACY_METRIC_PREFIX + name.slice(METRIC_PREFIX.length)), name);
+    }
     for (const [name, [kind]] of Object.entries(HELP)) {
       assert.ok(name.startsWith(METRIC_PREFIX), name);
       const legacy = LEGACY_METRIC_PREFIX + name.slice(METRIC_PREFIX.length);
@@ -228,6 +234,41 @@ describe("files and inbound counted", () => {
       }
     }
     assert.equal(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8");
+  });
+});
+
+describe("the delivery probe and the inbound receivers", () => {
+  it("keeps the delivery probe's outcomes and its last times, and counts re-armed receivers", async () => {
+    const { clock, metrics } = world();
+    const at = (name: string, labels: Readonly<Record<string, string>> = {}): number | undefined =>
+      samples(metrics.render()).get(key(name, labels));
+    assert.deepEqual(
+      [
+        at("personal_agent_probe_total", { outcome: "answered" }),
+        at("personal_agent_probe_total", { outcome: "unanswered" }),
+        at("personal_agent_probe_last_answered_seconds"),
+        at("personal_agent_inbound_rearmed_total"),
+      ],
+      [0, 0, 0, 0],
+      "every series exists before its first probe",
+    );
+    await clock.advance(5000);
+    metrics.probed(420.7, 2300);
+    metrics.inboundRearmed();
+    const answeredAt = Math.trunc(clock.epochMs() / 1000);
+    await clock.advance(300_000);
+    metrics.probed(900, null); // (unanswered: the reply time stays the last answered one's)
+    assert.deepEqual(
+      [
+        at("personal_agent_probe_total", { outcome: "answered" }),
+        at("personal_agent_probe_total", { outcome: "unanswered" }),
+        at("personal_agent_probe_feedback_ms"),
+        at("personal_agent_probe_reply_ms"),
+        at("personal_agent_probe_last_answered_seconds"),
+        at("personal_agent_inbound_rearmed_total"),
+      ],
+      [1, 1, 900, 2300, answeredAt, 1],
+    );
   });
 });
 
@@ -242,10 +283,11 @@ describe("the names of an earlier release, for one more release", () => {
     m.filesDropped("assistant", 2);
     m.eventDelivered("assistant.say", 0.3, 4.2);
     const found = samples(m.render());
-    const current = [...found].filter(([k]) => k.startsWith(METRIC_PREFIX));
+    const currentOnly = (k: string): boolean => Object.hasOwn(HELP_CURRENT_ONLY, k.split("|")[0] ?? "");
+    const current = [...found].filter(([k]) => k.startsWith(METRIC_PREFIX) && !currentOnly(k));
     const legacy = [...found].filter(([k]) => k.startsWith(LEGACY_METRIC_PREFIX));
     assert.ok(current.length > 0);
-    assert.equal(current.length + legacy.length, found.size);
+    assert.equal(current.length + legacy.length, found.size - [...found.keys()].filter(currentOnly).length);
     assert.deepEqual(
       legacy.map(([k, v]) => [k.slice(LEGACY_METRIC_PREFIX.length), v]),
       current.map(([k, v]) => [k.slice(METRIC_PREFIX.length), v]),
@@ -282,6 +324,9 @@ describe("the text the Python worker wrote", () => {
     m.eventDelivered("weird", 0.5, -2.0);
     m.eventDelivered("approval.requested", 65.0, 0.0004);
     const python = readFileSync(new URL("data/python-render.txt", import.meta.url), "utf8");
-    assert.equal(m.render(), python.replaceAll(LEGACY_METRIC_PREFIX, METRIC_PREFIX) + python);
+    const rendered = m.render();
+    const earlier = python.replaceAll(LEGACY_METRIC_PREFIX, METRIC_PREFIX) + python;
+    assert.equal(rendered.slice(0, earlier.length), earlier);
+    assert.match(rendered.slice(earlier.length), /^# HELP personal_agent_probe_total /);
   });
 });

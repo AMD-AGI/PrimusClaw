@@ -89,12 +89,15 @@ export function eventForwardingSeams(
  * `claimCount` is the epoch the caller holds the run at; every write to the row quotes it.
  * `publish` is where the application's events go; the seams bound at boot win over the forwarding ones.
  */
-export function createAppRunner(runId: string, platformKey: string, claimCount: number, publish?: AppEventPublisher): AppRunner {
+export function createAppRunner(
+  runId: string, platformKey: string, claimCount: number, publish?: AppEventPublisher, nodeLabels?: Record<string, string>,
+): AppRunner {
   const store = httpAppRunStore({ claimCount });
   const sandbox = realAppSandbox(store);
   return new AppRunner(runId, platformKey, {
     store, sandbox, claimCount, grant: boundGrant, seams: { ...eventForwardingSeams(store, sandbox, publish), ...boundSeams },
     sessionDeleted: sessionWasDeleted,
+    ...(nodeLabels ? { nodeLabels } : {}),
   });
 }
 

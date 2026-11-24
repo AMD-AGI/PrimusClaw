@@ -16,6 +16,9 @@ import {
   knownReasons,
 } from "../../src/remote/connector/reasons.js";
 import { setupFrom } from "../../src/remote/connector/setup.js";
+import { decode, unwrapPasted } from "../../src/remote/events.js";
+import { remoteLeads } from "../../src/locales/remote-leads.js";
+import { WORLD_ERRORS } from "../../../../test-support/remote-world.js";
 
 // The closed set, from connector/src: every `SessionRefusal("...")`, `refuse("...")`, `rejectCommand(..., "...")`, `close("...")` /
 // `killAll("...")`, the cwd verdicts of roots.ts, attach.ts's reasons, and the `error` a failed turn_end carries. A code the
@@ -267,5 +270,56 @@ test("a withdrawn message says where it is and how to send it", () => {
   assert.ok(
     en.includes("not sent") && en.includes("input box") && en.includes("Enter") && en.includes("again from the phone"),
     en,
+  );
+});
+
+test("a message the terminal did not confirm is never said as not sent and only a connector before 0.1.22 is told to upgrade", () => {
+  for (const lang of ["zh", "en"] as const) {
+    for (const [version, upgrade] of [
+      ["0.1.21", true],
+      ["0.1.4", true],
+      ["0.1.22", false],
+      ["0.2.2", false],
+      [null, false],
+    ] as const) {
+      const text = describe("terminal_input_unconfirmed", lang, version);
+      assert.equal(text.includes(UPGRADE_LINE), upgrade, `${String(version)} ${lang}: ${text}`);
+      assert.ok(!/not sent|did not go|may not have gone in|没有发进去|没发出去/u.test(text), text);
+      assert.ok(text.includes(lang === "zh" ? "之后的回复仍会发到这里" : "still shows here"), text);
+    }
+  }
+  assert.equal(
+    ended(remoteLeads.inputUnconfirmed, "terminal_input_unconfirmed", "en").split(": ")[0],
+    "Not confirmed by the terminal yet",
+  );
+});
+
+test("a prompt typed at the terminal is shown as typed, not as the block Claude Code records a paste in", () => {
+  const step = decode(
+    {
+      name: "user_message_chunk",
+      id: "1",
+      data: {
+        data: {
+          update: {
+            sessionUpdate: "user_message_chunk",
+            content: {
+              type: "text",
+              text: '\n\n<pasted_content id="9a55">\nline one\n\nline two\n</pasted_content id="9a55">\n',
+            },
+          },
+        },
+      },
+    },
+    WORLD_ERRORS,
+  );
+  assert.equal(step.typed, "line one\n\nline two");
+  assert.equal(
+    unwrapPasted('look\n\n<pasted_content id="2a">\na\nb\n</pasted_content id="2a">\n\nand fix it'),
+    "look\na\nb\nand fix it",
+  );
+  assert.equal(
+    unwrapPasted('<pasted_content id="1">\nx\n</pasted_content id="2">'),
+    '<pasted_content id="1">\nx\n</pasted_content id="2">',
   );
 });

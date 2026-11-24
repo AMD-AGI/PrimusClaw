@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-export { sleep } from "./async.js";
+export { sleep, setLongTimeout, MAX_TIMER_DELAY_MS, type LongTimeout } from "./async.js";
 export { constantTimeEquals } from "./security/constant-time.js";
 export {
   redactSecrets, redactLogSecrets, safePreview, scanForSecretLeak, looksLikeCredentialValue,
@@ -9,6 +9,7 @@ export {
   type RedactResult, type ScanHit,
 } from "./security/redact-secrets.js";
 export { redactStoredText, redactStoredValue } from "./security/stored-secrets.js";
+export { storableText, storableJson, storableJsonText, UNSTORABLE_REPLACEMENT } from "./security/storable.js";
 export { isSensitiveKey } from "./security/sensitive-keys.js";
 export { coerceToolInput, isPlainObject } from "./tool-input.js";
 export {

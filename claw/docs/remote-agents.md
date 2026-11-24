@@ -37,7 +37,7 @@ session), or an access token from the identity provider (see
 | Route | Purpose |
 |---|---|
 | `POST /v1/remote-agents/connectors` | Register `{name, version?}`; returns `connector_id`. At most 5 per user. |
-| `POST .../connectors/:cid/heartbeat` | Every 30 s: `{version?, agents:[{agent_id, kind, name, capabilities?}], cmd_cursor?}`. Replaces the advertised agent list; `cmd_cursor` lets the server forget commands up to it. |
+| `POST .../connectors/:cid/heartbeat` | Every 30 s: `{version?, agents:[{agent_id, kind, name, capabilities?}], cmd_cursor?, outbox?}`. Replaces the advertised agent list; `cmd_cursor` lets the server forget commands up to it; `outbox` reports the connector's unacknowledged events (see "Replies that do not get through" below). |
 | `GET .../connectors/:cid/commands` | The command stream; each `id:` is the connector's `cmd_seq`. On every connect the server sends every command it still holds, in order. It holds a command until a heartbeat's `cmd_cursor` covers it, so a `Last-Event-ID` (or `?after=`) is validated but never skips one: the id of the last frame a client received does not prove it acted on it. A connector skips what it already did, by `cmd_seq` or `cmd_id`. |
 | `POST .../connectors/:cid/events` | `{batch_id, events:[{session_id, seq, type, ts, data}]}`. Answers `{acked:{session_id: highest stored seq}, rejected:[{index, session_id, seq, reason}]}`. |
 | `POST .../connectors/:cid/commands/:cmd_id/confirm` | Before a connector carries out a command it received late, it asks whether it may. Body (optional): `{received_late?, why?, session_id?}`; `received_late` (default `true`) says the command was already past the live TTL when it reached the connector; `session_id` is the command's session. Answers `{cmd_id, status}`, where `status` is `live` (run it), `session_closed`, `cancelled` (a prompt, and a `cancel` or `close` of its session was queued after it), `expired` (it reached the connector past the live TTL: never one received in time that then waited on the machine) or `gone` (Claw no longer holds it). Closing a session deletes its acting commands, so for one of those the answer is `session_closed` when `session_id` names a closed session of this connector's, and `gone` otherwise. Only `live` may run. A revoked connector gets `401 revoked`, as on every connector-side route. An answer about a command Claw holds is audited (`command.confirmed`, `command.refused_late`); one about an id it does not hold is not. See "A command received late" below. |
@@ -58,7 +58,10 @@ Events are stored once per `(session_id, seq)`; a repeat is ignored and a gap is
 allowed. A malformed event is refused alone and named in `rejected`, so one bad
 event cannot block the good ones behind it; retrying a rejected event cannot help.
 One event's `data` is at most 64 KB, and a request body at most the API's 4 MiB
-limit. Credentials in `data` are masked before storage.
+limit. Credentials in `data` are masked before storage, and a character
+PostgreSQL cannot store (U+0000, an unpaired surrogate) is replaced by U+FFFD, in
+keys and values. An event the database still refuses for its content is refused
+alone, as `unstorable`, and the rest of its batch is stored.
 
 Special event types: `permissionRequest` (`data.actionId`, `data.options[].optionId`),
 `permission_resolved` (`data.actionId`, `data.optionId`, `data.by`), and
@@ -175,7 +178,7 @@ every 15 minutes and when `doctor` signals the connector. `scope` is `agent` (ab
 connector; a client shows it once per machine). `severity` is `fail` (sessions will not work until it is fixed) or `warn`.
 `detail` and `fix` are English lines for a client that does not know the `code`; `fix` is a command or edit for the machine.
 The codes: `node_too_old`, `agent_cli_missing`, `agent_not_signed_in`, `root_missing`, `root_not_writable`, `proxy_mismatch`,
-`proxy_invalid`, `no_service`, `linger_off`, `keepalive_not_scheduled` (and from `doctor` alone: `claw_unreachable`, `claw_tls_untrusted`, `service_path_missing`, `config_invalid`, `not_signed_in`, `needs_login`). An empty `problems` means the checks passed; an absent
+`proxy_invalid`, `no_service`, `linger_off`, `keepalive_not_scheduled`, `connector_upgrade_blocked` and `connector_upgrade_failed` (below) (and from `doctor` alone: `claw_unreachable`, `claw_tls_untrusted`, `service_path_missing`, `config_invalid`, `not_signed_in`, `needs_login`). An empty `problems` means the checks passed; an absent
 `health` means unknown (an older connector, or the first check not done yet). `devenv_list` relays the problems to the assistant.
 
 ## Connector access tokens
@@ -326,6 +329,32 @@ above). A newer stream for the same
 connector replaces the older, which receives `event: superseded` and ends. When a
 connector is revoked its stream receives `event: revoked` and ends, and every
 connector-side route answers `401 revoked`.
+
+**Replies that do not get through.** Every heartbeat carries the connector's account of its
+event outbox, `outbox: {pending, oldest_age_ms, failures, failing_ms, last_error, sessions}`:
+how many events wait to be acknowledged, how long the oldest has waited, how many posts in a
+row failed and for how long, how the last one failed (`http_<status>`, `network` or
+`error`), and up to 20 sessions with events waiting (`{session_id, pending, oldest_age_ms}`,
+the longest waiting first). The server also counts, per connector, the event batches it
+answered with a 5xx. Both go to `claw_remote_delivery_health`, written after the answer
+(never holding up the heartbeat or the batch), at most four writes at a time per replica. A
+malformed report is ignored; it never fails the heartbeat, and a connector that sends none is
+judged on the server's count alone.
+
+Every 15 s one API replica (an advisory lock picks it) holds each connector as delivering or
+stalled. Stalled: the connector's fresh report says its posts have failed for 2 minutes
+while events wait, or the server has answered its posts with a 5xx for 2 minutes and still
+does. When the assistant is on, the owner is told once, through their assistant, that the
+replies from the sessions on that machine are delayed and being retried (with how many wait
+and for how long, when the connector reported it), and told once more when a batch from it
+is stored again, or its fresh report says nothing waits any more, and nothing has failed on
+either side since (a clean report with events still waiting is not enough: a connector
+restarted mid-stall reports no failure while its backlog still waits). A notice counts as
+told only once the assistant has it; until then a later sweep tries again, and its key keeps
+it from being said twice. A connector that goes offline while stalled is told nothing more
+here; presence, below, reports that it went. The same rows feed the `claw_delivery_*` and
+`claw_remote_connector_*` metrics, which the chart's alert rules read
+(`prometheusRule.enabled`, `claw/deploy/charts/claw/alerts/delivery.rules.yaml`).
 
 **Presence over time.** Every 15 s one API replica (an advisory lock picks it) compares
 each connector with the presence it last recorded and writes every change it sees to
@@ -479,6 +508,28 @@ recommended version the connector list, `devenv_list` and the heartbeat's answer
 `npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install`
 (`stop` exits 0 when nothing runs, so a failed install stops the chain). Sessions already open
 are not touched.
+
+**Upgrading itself.** A connector with auto-upgrade (from the first release after 0.2.3; the upgrade to it is done by hand)
+reads `connector_version.recommended_version` and `minimum_version` from the heartbeat's answer and, when it runs under a
+supervisor (`run --supervised`) and its owner did not turn it off (`auto_upgrade = false` in `agents.toml`,
+`claw-connector auto-upgrade off`, `CLAW_CONNECTOR_AUTO_UPGRADE=0`), upgrades itself to exactly that version: never down,
+never to a prerelease or a new major version, and below 1.0.0 to a new minor version only when the server's minimum is in
+the connector's own minor line or below it. It does so only while its command stream is open, no turn runs, nothing is queued and no approval waits
+(for a minute; otherwise it looks again 15 minutes later), and never while `agents.toml` cannot be read. It downloads the
+version first, while still connected, with the npm beside the node that runs it, into a directory beside the package in the
+prefix it was installed under, then moves it in and keeps the old package directory; the new version must report its version
+and connect (a trial run: one identify and heartbeat) within 60 seconds, else after three tries the old version is put back
+and that version is not tried again until a newer one is recommended. After that the new version is on probation until one
+of its real runs has stayed connected without a break for a minute: three runs of it that end with a failure first (or do
+not connect within 60 seconds) put the old version back and pin the new one as failed the same way. Each run counts itself
+as its first step, so this holds under systemd and launchd as well as under the script supervisor. Every agent's `capabilities.auto_upgrade` says where it stands:
+`{enabled, state, target?, last?: {from, to, outcome, at}, failed_version?, reason?, command?}`, `state` one of `current`,
+`waiting_idle`, `upgrading`, `unreadable` (`agents.toml` or its own state could not be read; it does not upgrade), `blocked` (it cannot here: no npm, a prefix this user may not write, a registry that does not
+answer; nothing was changed), `failed`, `off`, `unsupervised`, `unmanaged` (not a global npm install) or `manual` (a step it
+does not take by itself); `command` is the command that upgrades that machine by hand, with its own npm, prefix and
+program. While it is `blocked` or `failed` the machine's health has `connector_upgrade_blocked` or
+`connector_upgrade_failed`. `devenv_list` gives each machine its `auto_upgrade` and uses the machine's own `command` as
+its `upgrade_command`.
 
 What a person runs to connect a machine is given by the server, never written by a client
 or a model: `GET /v1/remote-agents/setup`, and `connect_a_machine` in `devenv_list` (no

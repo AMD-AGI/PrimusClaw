@@ -29,6 +29,8 @@ interface Received {
   protocol: string;
   cbs: Record<string, unknown>[];
   messages: { address: string; message: Rhea.Message }[];
+  /** The client closed its AMQP connection itself (a close frame), rather than only dropping the socket. */
+  closed?: boolean;
 }
 
 /** A broker that answers every claims request with 202 and keeps every message sent to a queue. */
@@ -49,6 +51,9 @@ function broker(container: Rhea.Container, received: Received): void {
       return;
     }
     received.messages.push({ address, message });
+  });
+  container.on("connection_close", () => {
+    received.closed = true;
   });
   container.on("disconnected", () => undefined); // the client closing its socket, which ends every case
   container.on("error", () => undefined);
@@ -114,6 +119,8 @@ test("the Service Bus client sends over AMQP on Node's built-in WebSocket, the b
   assert.equal(message.group_id, "19:abc@thread.v2"); // the session id
   assert.equal(message.message_id, "a1");
   assert.equal(message.application_properties, undefined);
+  // QueueClient.close() closes the SDK client's connection (what the ingress calls on a client it throws away).
+  assert.equal(received.closed, true, "the client's connection was not closed");
 });
 
 test("an identity-based client is built for the system-assigned and for a user-assigned identity", async () => {

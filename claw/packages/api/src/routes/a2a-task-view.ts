@@ -278,6 +278,9 @@ function failureMessage(run: RunRecord, events: RunEvent[]): Message | undefined
     contextId: run.contextId,
     role: Role.AGENT,
     parts: [{ text: text.slice(0, 2000) }],
+    // The stable code beside the text, so a caller can tell a refused sandbox
+    // (`sandbox_rejected`) from a crash without parsing prose.
+    ...(str(run.failureReason) ? { metadata: { failure_reason: str(run.failureReason) } } : {}),
   };
 }
 

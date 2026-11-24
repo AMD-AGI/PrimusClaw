@@ -53,13 +53,30 @@ export function reviewOnlyOf(config: unknown): boolean {
 
 /**
  * `config.merge_needs_confirmation` of a session: written by the server, never by a caller, on the session of a review the assistant's
- * router started or restarted (`review_start`, `review_restart`). Natural language never approves a merge, and the router's `merge=true`
- * is read from a sentence, so such a session merges nothing, and approves nothing GitHub's auto-merge or merge queue would merge, until the acting user
- * has confirmed that very write: the tools hold it (`confirmation_required`) whatever its risk and the acting user's review mode, and it is
- * made only from the card's button or the exact command `批准 #<ref>` / `approve #<ref>` (C2). Absent or `false` is no such session;
- * any other stored value reads as one: the caller refuses more, never less.
+ * router started or restarted (`review_start`, `review_restart`) for a person whose review mode was not `fully_auto` when it did. The
+ * router's `merge=true` is read from a sentence, so such a session merges nothing, and approves nothing GitHub's auto-merge or merge queue
+ * would merge, until the acting user has confirmed that very write: the tools hold it (`confirmation_required`) whatever its risk, and it
+ * is made only from the card's button or the exact command `批准 #<ref>` / `approve #<ref>` (C2). A person who chose `fully_auto` gets
+ * no such hold: their sentence is enough (2026-11-18), and their review merges as one they started themselves would. Absent or `false`
+ * is no such session; any other stored value reads as one: the caller refuses more, never less.
  */
 export function mergeNeedsConfirmationOf(config: unknown): boolean {
   const value = config !== null && typeof config === "object" ? (config as Record<string, unknown>).merge_needs_confirmation : undefined;
   return value !== undefined && value !== null && value !== false;
+}
+
+/**
+ * `config.started_by_assistant` of a session: written by the server on the session of every review the assistant's router started or
+ * restarted, whatever it resolved for `merge_needs_confirmation`. Such a session merges without the acting user's confirmation only while
+ * their review mode is `fully_auto`: one who has left it since the review started is asked, as `merge_needs_confirmation` would ask
+ * them. Absent or `false` is no such session; any other stored value reads as one: the caller refuses more, never less.
+ */
+export function startedByAssistantOf(config: unknown): boolean {
+  const value = config !== null && typeof config === "object" ? (config as Record<string, unknown>).started_by_assistant : undefined;
+  return value !== undefined && value !== null && value !== false;
+}
+
+/** What a review session's stored config says about how it may merge: what its review tools are built with (`mcp.ts`). */
+export function mergeRulesOf(config: unknown): { reviewOnly: boolean; mergeNeedsConfirmation: boolean; startedByAssistant: boolean } {
+  return { reviewOnly: reviewOnlyOf(config), mergeNeedsConfirmation: mergeNeedsConfirmationOf(config), startedByAssistant: startedByAssistantOf(config) };
 }

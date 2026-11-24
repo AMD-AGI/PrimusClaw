@@ -129,3 +129,7 @@ CREATE TABLE IF NOT EXISTS group_language (
   conversation_id TEXT PRIMARY KEY, lang TEXT NOT NULL, updated_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS bound_users (
   aad_id TEXT PRIMARY KEY, claw_user_id TEXT NOT NULL, token_hash TEXT NOT NULL, updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS review_onboarding (
+  onboarding_id TEXT PRIMARY KEY, actor_aad TEXT NOT NULL, requester_aad TEXT NOT NULL, pulls TEXT NOT NULL,
+  request_json TEXT NOT NULL, told_rank INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
+  UNIQUE (actor_aad, requester_aad, pulls));

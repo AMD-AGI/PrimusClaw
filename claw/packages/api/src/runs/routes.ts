@@ -43,6 +43,7 @@ import { getUser } from "../auth/middleware.js";
 import { isAdmin } from "../auth/models.js";
 import { db } from "../infra/db.js";
 import { phaseOf, terminalFacts, type RunView } from "./platform-terminal.js";
+import { readAppRunStatuses, type AppRunStatus } from "../tasks/app-run-status.js";
 
 const logger = pino({ name: "runs-routes" });
 
@@ -109,6 +110,8 @@ const ID_FILTERS: readonly IdFilter[] = [
 interface RunRow {
   task_id: string;
   session_id: string;
+  /** `app` for a hosted application's run, whose sandbox is on its `claw_app_runs` row. */
+  mode?: string | null;
   status: string;
   failure_reason: string | null;
   error_message?: string | null;
@@ -126,7 +129,7 @@ interface RunRow {
 }
 
 const SELECT_COLUMNS = `
-  task_id, session_id, status, failure_reason, error_message, sandbox_workload_id,
+  task_id, session_id, mode, status, failure_reason, error_message, sandbox_workload_id,
   platform_exit_code, platform_node, platform_message, platform_container_reason,
   created_at, started_at, completed_at, deadline_at
 `;
@@ -146,8 +149,8 @@ function failureMessageOf(row: RunRow): string {
   return message && message !== (row.failure_reason ?? "").trim() ? message : "";
 }
 
-/** One row as the contract renders it. */
-export function toRunView(row: RunRow): RunView {
+/** One row as the contract renders it; `app` is the run's app status when it is an app run. */
+export function toRunView(row: RunRow, app: AppRunStatus | null = null): RunView {
   const terminal = terminalFacts({
     status: row.status,
     failure_reason: row.failure_reason,
@@ -171,9 +174,18 @@ export function toRunView(row: RunRow): RunView {
     },
     placement: {
       node: row.platform_node ?? "",
-      workload_id: row.sandbox_workload_id ?? "",
+      // An app run's sandbox is not the task row's: the row is told the run is
+      // running before its sandbox exists, and the sandbox is replaced on a restart.
+      workload_id: row.sandbox_workload_id || app?.sandbox.workload_id || "",
     },
+    app,
   };
+}
+
+/** Every row rendered, the app runs among them with their app status. */
+async function toRunViews(rows: RunRow[]): Promise<RunView[]> {
+  const statuses = await readAppRunStatuses(rows.filter((row) => row.mode === "app").map((row) => row.task_id));
+  return rows.map((row) => toRunView(row, row.mode === "app" ? statuses.get(row.task_id) ?? null : null));
 }
 
 /** Ids from `?ids=a,b,c`, de-duplicated. Not bounded here -- see the caller. */
@@ -366,7 +378,7 @@ async function readNamedRuns(q: RunsQuery, s: Scope, reply: FastifyReply): Promi
   // "not ours" from "not finished". `requested` counts the ids named, so for
   // `?session_ids=` it is a count of sessions and `runs` may be longer --
   // each run carries its `session_id` for the caller to group on.
-  return { runs: rows.map(toRunView), requested: ids.length };
+  return { runs: await toRunViews(rows), requested: ids.length };
 }
 
 /** Walk terminal runs newest-first, one keyset page at a time. */
@@ -438,7 +450,7 @@ async function listTerminalRuns(q: RunsQuery, s: Scope, reply: FastifyReply): Pr
   const hasMore = fetched.length > limit;
   const page = hasMore ? fetched.slice(0, limit) : fetched;
   return {
-    runs: page.map(toRunView),
+    runs: await toRunViews(page),
     limit,
     has_more: hasMore,
     next_cursor: hasMore ? encodeCursor(page.at(-1)!) : null,
@@ -461,7 +473,7 @@ export async function registerRunRoutes(app: FastifyInstance): Promise<void> {
     if ((r.rowCount ?? 0) === 0) {
       return reply.status(404).send({ ok: false, error: "run_not_found" });
     }
-    return toRunView(r.rows[0] as RunRow);
+    return (await toRunViews([r.rows[0] as RunRow]))[0];
   });
 
   app.get("/v1/runs", async (req, reply) => {

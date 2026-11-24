@@ -66,6 +66,7 @@ Object.assign(process.env, {
   AUTH_INTERNAL_TOKEN: "internal-token-for-tests",
 });
 delete process.env.CLAW_DEPLOY_MODE;
+process.env.CLAW_AUTH_PROVIDER = "safe";
 
 type Mod<T> = T extends Promise<infer U> ? U : never;
 let h: Mod<ReturnType<typeof import("./scenario-harness.js").startHarness>>;

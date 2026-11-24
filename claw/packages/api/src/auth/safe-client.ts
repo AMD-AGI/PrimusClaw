@@ -191,6 +191,9 @@ export class SafeClient {
     return h;
   }
 
+  // Both keys are asked for whatever LLM_KEY_SOURCE says. `includeVirtualKey` is also what makes SaFE fill in the
+  // account's email from the user record: an `ak-` key and a default session cookie carry none of their own, so
+  // without it the caller has no email (GET /v1/me, everything keyed by it), and no virtual key to carry along.
   private body(): Record<string, unknown> {
     return { includePlatformKey: true, includeVirtualKey: true };
   }

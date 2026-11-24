@@ -200,6 +200,7 @@ spec:
         - name: NODE_EXTRA_CA_CERTS
           value: {{ include "primus-claw.mountPath" (list . "api" "extra-ca") }}/ca.crt
         {{- end }}
+        {{- include "primus-claw.authProviderEnv" . | nindent 8 }}
         {{- with (include "primus-claw.identityEnv" .) }}
         {{- . | nindent 8 }}
         {{- end }}

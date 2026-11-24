@@ -8,7 +8,8 @@
  *
  *   OB1  a replayed group conversation: every message gets a record of what the assistant would do, and nothing else
  *        happens anywhere (no item, no event, no say, no outbox row, no message to a worker, no session but the watcher)
- *   OB2  every tool the router is offered is offered to the watcher, and each one, called with valid arguments, only records
+ *   OB2  every tool the router is offered is offered to the watcher (but claw_capabilities, a person's question about the assistant), and
+ *        each one, called with valid arguments, only records
  *   OB3  a scope starts in observe; auto is taken only from a person's sign-in (or a listed service's), observe from any request of theirs
  *   OB4  what a channel hands over is checked: the scope, the content, a replayed message, a backlog, another person's record
  *   OB5  a watcher's turn is cut like a router's, without the owner's items, and skips skill selection
@@ -192,7 +193,10 @@ describe("assistant observe", { skip }, () => {
     try {
       const offered = (await watcher.listTools()).tools;
       const names = offered.map((t) => t.name).sort();
-      assert.deepEqual(names, [...routerTools.map((t) => t.name), "pass"].sort(), "the watcher is offered the router's tools and pass");
+      // claw_capabilities is the router's alone: it answers a person's question about the assistant, which a watcher is never asked.
+      assert.ok(routerTools.some((t) => t.name === "claw_capabilities"));
+      assert.deepEqual(names, [...routerTools.map((t) => t.name).filter((n) => n !== "claw_capabilities"), "pass"].sort(),
+        "the watcher is offered the router's tools and pass");
       for (const tool of offered) {
         const args = argumentsFor(tool.inputSchema as JsonSchema, mine.itemId);
         const answered = await call(watcher, tool.name, args);

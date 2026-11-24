@@ -501,10 +501,15 @@ become spaces), so nothing in a message can act as a key or end the paste. Its t
 transcript records the end of the turn that took it in (a queued message: the turn whose `queued_command` it is, or its own turn
 after the `dequeue`), when the turn is stopped there (`cancelled`), or once Claude Code has said it is idle for 5 seconds; a message
 that neither appears in the transcript nor is queued there (`queue-operation` enqueue) within 20 seconds ends as
-`terminal_input_unconfirmed`, and one Claude Code queued whose queue went back into the box (`popAll`, to be edited there) as
+`terminal_input_unconfirmed`. Its prompt is told by its words once both are read alike (Claude Code's `<pasted_content>` blocks
+unwrapped, line breaks and every run of white space as one, one Unicode form); when none matches in those 20 seconds but the
+terminal recorded a prompt after the message's Enter (and did not queue the message), that prompt is taken as the message's and its
+turn ends as any other, with `input_unconfirmed: true` on its `turn_end`. One Claude Code queued whose queue went back into the box (`popAll`, to be edited there) as
 `terminal_input_withdrawn`. A
 `cancel` presses Esc in the terminal only for a turn the phone's message started itself (submitted straight at a prompt, not
-through Claude Code's queue), which stops it there. While the message is still being put in, waiting on a question, or
+through Claude Code's queue), which stops it there; Claude Code puts a prompt whose turn Esc stopped before any answer back into its box, and the connector
+takes it out again before the next message goes in; a message whose Enters did not submit it is taken out when it is refused. Either
+only while the box holds exactly that text and no question shows; anything else in the box is waited for. While the message is still being put in, waiting on a question, or
 held in Claude Code's queue or taken into a turn the person started, no key is sent: the phone stops following it (the question
 stays the person's to answer; a message Claude Code already queued is still Claude Code's to run, and text already in the box stays
 there). A mode change is refused (`terminal_session`): the terminal keeps
@@ -577,8 +582,8 @@ Claude Code not installed and no `--config-dir`, it refuses and says so, since t
 The card names the tool that asked and the machine, as in "Claude Code in a terminal on dev-pod (fix CI, work/claw) is waiting
 for you" (or Codex, or Cursor, for their hooks below).
 
-This adds a `PermissionRequest` hook, plus `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop` (all run in the
-background) and `SessionEnd`, to the Claude config directory's user-level `settings.json`, merged the same way as the session
+This adds a `PermissionRequest` hook, plus `PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `StopFailure` (all
+run in the background) and `SessionEnd`, to the Claude config directory's user-level `settings.json`, merged the same way as the session
 hooks above (marked `--managed-by claw-connector`, nothing else in the file is touched). They run `approval-hook.js` from this
 installation, which talks to the running connector over a socket in its state directory (`approvals.sock`, 0600, in a
 directory only you can enter).
@@ -616,6 +621,27 @@ directory only you can enter).
   leave every question to the terminal.
 - A card nobody answers is withdrawn after an hour; the terminal still has the question. The audit log records each request,
   answer and withdrawal (`approval_requested`, `permission_resolved`, `approval_withdrawn`), never what was typed.
+
+### When a turn ends while you are away
+
+The same hooks also tell you when a turn ends in a terminal you walked away from: Claude Code's `Stop` (it finished) and
+`StopFailure` (it stopped on an API error: a rate limit, a billing or sign-in problem, an unknown model), and Codex's `Stop`
+(installed with `hooks install --agent codex`; Codex asks you to trust the new hook once). At the end of a turn the hook names
+the terminal the session runs in, and the connector waits: if nobody types in that terminal for a minute after the turn
+ended (its last-input time, as `w` reads it), the chat gets one message naming the machine, the tool, the conversation and
+its folder, with the end of what the agent last said, or the error. Nothing is said:
+
+- when someone typed in that terminal, sent a new prompt or ended the conversation within that minute;
+- while a chat follows the conversation (taken over, typed into or watched from the phone): it shows the end itself;
+- for a `Stop` that leaves background tasks running (Claude Code wakes the conversation again when they finish);
+- when the hook cannot name the terminal (nobody can tell whether a person is at it), and for `claude -p`, `codex exec` and
+  the sessions this connector runs;
+- more than once every five minutes for one conversation (the work item still records every end).
+
+`/approvals off` turns these off with the questions. To stop hearing from one conversation, send the command its message
+ends with, `/approvals mute #<item>` (`/approvals unmute #<item>` brings it back): its questions, waits and ends then stay in
+its terminal, and Claw refuses to open a card session for it (`session_muted`). The audit log records each end told or not
+(`turn_end_sent`, `turn_end_not_sent` with the reason), never the agent's words.
 
 ### The same for Codex
 
@@ -697,6 +723,7 @@ never approve one. So for Cursor the phone goes first and the terminal second:
 | `service install\|uninstall\|status [--supervisor systemd\|launchd\|script] [--env NAME ...]` | Keep `run` up (see [Keeping it running](#keeping-it-running)). `install` stops a `run` started by hand so the service takes over, and starts an installed service again (a script supervisor too) so an edited `agents.toml` or environment takes effect; `status` also lists the last five disconnects and why. |
 | `status [--json]` | Running or not, paused, signed in, agents, adapter processes, the last disconnect and its reason (`last down:`), a `problem:` line when a new sign-in is needed, and a `warning:` line for each agent whose sessions will be refused because Claude's own settings default to `bypassPermissions` (see [Running without per-step approval](#running-without-per-step-approval)). |
 | `doctor [--agent ID] [--json]` | Check this machine and print one fix per problem (see step 5 of the quick start), then each agent's adapter (step 2); exit 1 when something stops sessions. The report is kept in `doctor.json`; a running connector is signalled to check again and sends what it finds to Claw (each agent's `capabilities.health`). |
+| `auto-upgrade on\|off\|status [--json]` | Whether the connector upgrades itself to the version Claw recommends (on by default; see [Upgrades](#upgrades)). `on`/`off` set `auto_upgrade` in `agents.toml`; `status` shows the setting, where the package is installed, whether this user may write there, the last upgrade and the command that does it by hand. |
 | `pause` / `resume` | Stop every agent within a second and stay offline, or undo that. |
 | `stop` | Stop the running connector and every agent it started. |
 | `logout` | Stop, revoke this machine's connector at Claw (with a key, `DELETE /v1/remote-agents/connectors/:cid`; with a device sign-in, the connector-side `POST .../connectors/:cid/revoke`), ask the identity service to revoke the sign-in, and delete it from this machine. The next sign-in registers a new connector. When Claw cannot be reached or refuses (a Claw from before the connector-side route refuses a device sign-in), the sign-in is still deleted, but `logout` says the connector was not revoked, prints the `curl` that revokes it with a Claw API key of yours, keeps its id (so a later sign-in reuses it), and exits 1. |
@@ -712,9 +739,9 @@ the connector sees it within a heartbeat, stops every agent and exits without re
 `~/.config/claw-connector/` (or `$XDG_CONFIG_HOME/claw-connector/`, or `$CLAW_CONNECTOR_CONFIG_DIR`): `agents.toml`, `credentials.json`
 (0600; a file other users can read is refused), and `service-env.json` (0600, the agents' sign-in variables `service install` kept). `~/.local/state/claw-connector/` (or `$XDG_STATE_HOME/claw-connector/`): `connector.json` (the connector's identity and the
 commands handled), `connector-id.json` (the identity alone, written once and flushed to the disk: a `connector.json` damaged
-by a crash falls back to it instead of registering the machine as a new connector), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `audit.jsonl` (spawn, directory
+by a crash falls back to it instead of registering the machine as a new connector), `sessions.json`, `outbox/` (events not yet acknowledged by Claw), `quarantine.jsonl` (events Claw would not take, set aside unsent so the ones behind them could go: one line each with the session, number, type and why, never the content), `audit.jsonl` (spawn, directory
 decisions, every command received, every permission request and answer, every automatic approval, mode changes),
-`logs/`, `children.json`, `connector.pid`, `disconnects.jsonl`, `needs-login.json` (only after a run that needs a new sign-in), `doctor.json`
+`logs/`, `children.json`, `connector.pid`, `disconnects.jsonl`, `auto-upgrade.json` (the last upgrade, a version that failed here, when to try again, a new version still on probation), `needs-login.json` (only after a run that needs a new sign-in), `doctor.json`
 (the last `doctor` report), `approval-hooks-offer.json` (the answer to the one-time offer of the approval hooks), and with the script supervisor `supervisor.pid`, `keepalive.sh`, `keepalive-last` (when it last ran) and `run.log`. `CLAW_CONNECTOR_HOME=/some/dir` keeps all of it under one directory.
 
 ## Keeping it running
@@ -766,6 +793,67 @@ restart, `superseded` by another run, `token_expired`; reconnected at once), `st
 dated by its last heartbeat), and `connector_limit_reached` (Claw already holds the most connectors one person may have: remove a
 machine you no longer use, in the chat with `/agents` or with `claw-connector logout` on it; the run stays up and tries again every 10
 minutes instead of being restarted every 5 seconds). `status` shows the latest, `service status` the last five.
+
+## Upgrades
+
+A connector that runs as a service upgrades itself to the version Claw recommends. Claw says which one in its answer to
+every heartbeat of an older connector; the connector then:
+
+- takes exactly that version, never `latest`, never an older one, never a prerelease or a new major version. Below 1.0.0 a
+  new minor version is taken only when Claw's minimum version is in this connector's minor line or below it (Claw then
+  works with both);
+- waits until nothing is going on: connected to Claw, no turn running, nothing queued for an agent or a terminal, no
+  approval waiting, not paused, for a minute. While something is, it looks again 15 minutes later. If `agents.toml` is
+  there but cannot be read or parsed at that moment, it does not upgrade;
+- checks first, while still connected, that it can: a global npm install (`<prefix>/lib/node_modules/@primusclaw/connector`),
+  the `npm` beside the `node` that runs it, a prefix this user may write, and a registry that has that version. If any of
+  these fails nothing is changed, the reason is logged once, and the chat shows the machine's problem
+  (`connector_upgrade_blocked`) with the command that does it by hand on that machine, for example
+  `sudo /usr/bin/npm install -g --prefix /usr @primusclaw/connector@0.2.5 && /usr/bin/claw-connector stop && /usr/bin/claw-connector service install`;
+- downloads the new version while still connected, with the same node and npm and that prefix's global npmrc, into a
+  directory of its own beside the package (`.connector-stage-<version>-<pid>`, an npm prefix:
+  `npm install -g --prefix <that directory> @primusclaw/connector@<version>`; npm checks the package's integrity against the
+  registry), and checks that the new program says that version. Nothing the running connector uses is touched yet, so a
+  connector killed during the download (a service manager that gave up waiting) still has its old version in place; the
+  next upgrade removes what the killed one left;
+- once it is still idle, stops, moves the package directory aside (`.connector-backup-<old version>` next to it) and moves
+  the new one in, by renames in one directory;
+- starts the new version once as a trial: it must connect to Claw within 60 seconds. Three failed trials put the old
+  version back, pin the new one as failed here (not tried again until Claw recommends a newer one), and show
+  `connector_upgrade_failed` in the chat;
+- ends with exit code 79, which every supervisor restarts: systemd and launchd start the new version; the script supervisor
+  first starts itself again on the new code.
+
+The new version is then on probation until one of its runs has been connected to Claw without a break for a minute (a
+dropped command stream starts the minute again, and must open again within 60 seconds of the drop, or the run ends with a
+failure that counts). Every run of it counts itself as the first thing it does, before it reads
+its configuration or signs in, so a run that fails at any later step of its start has been counted; a run that does not
+connect within 60 seconds ends with a failure. The script supervisor also counts each failed exit it sees. The run after
+the third puts the old version back, pins the new one as failed and exits 79 (so systemd and launchd, which restart every
+failed run, start the old one); the script supervisor does the same when it sees the third failure. A version that cannot
+run any of its code at all fails its trial runs and is never moved in. When its runs cannot be counted (the state
+directory cannot be written), the new version is not run: the old one is put back. Stopping the connector on purpose
+(`claw-connector stop`) does not count.
+
+The two renames of the swap follow each other directly. A connector killed between them (for example a `SIGKILL` at that
+moment) has no package directory: under the script supervisor the old version is put back at the next exit it sees; under
+systemd or launchd, run the command the chat shows for the machine, or rename `.connector-backup-<old version>` back to
+`connector` in the same directory.
+
+The first run of the new version brings the hooks it finds installed (the Claude Code session and approval hooks, the
+Codex approval hook) up to date. It never adds hooks you did not install; when the session hooks are missing it says so
+once in the log, with `claw-connector hooks install`.
+
+Only a supervised run upgrades itself (`claw-connector run` in a terminal does not: nothing would start it again). Turn it
+off with `claw-connector auto-upgrade off` (`auto_upgrade = false` at the top of `agents.toml`) or
+`CLAW_CONNECTOR_AUTO_UPGRADE=0` in the service's environment (`service install` carries it over), which wins over
+`agents.toml`. Turning it off takes effect at the next check, and also while a download is under way: the connector reads
+the setting again once the download is done and once more just before the swap, so a version downloaded meanwhile is
+discarded and never moved in. `claw-connector auto-upgrade status` shows where things stand.
+
+Connectors before this feature cannot upgrade themselves: upgrade them once by hand, with the command the chat shows for
+the machine or `npm install -g @primusclaw/connector@latest && claw-connector stop && claw-connector service install`
+(add `--prefix <dir>` when you installed it under one). From then on they follow Claw's recommended version.
 
 ## Restarts and crashes
 

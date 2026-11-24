@@ -31,8 +31,10 @@ import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
 import {
   APP_GPU_RESOURCE,
+  APP_MAX_RUNTIME_SEC,
   APP_SANDBOX_ROLES,
   appGrantTemplates,
+  appStopGraceSec,
   isGpuResourceKey,
   resolveAppResources,
   validateAppManifest,
@@ -485,6 +487,29 @@ export async function checkAppRunRequest(
   return { pluginId, manifest, input, resolved, plan, ...(overrides ? { overrides } : {}) };
 }
 
+/** A positive whole number of seconds a run's deadline can be armed for, or undefined. */
+const runtimeSec = (v: unknown): number | undefined =>
+  typeof v === "number" && Number.isInteger(v) && v > 0 && v <= APP_MAX_RUNTIME_SEC ? v : undefined;
+
+/**
+ * The run's time limit in seconds: the smaller of the manifest's
+ * `limits.max_runtime_sec` and the request's `resources.grant.max_runtime_sec`
+ * (as the grant takes it); undefined when neither sets one. Counted from the run's
+ * creation, by the Brain (`pastDeadline`) and by the task's `deadline_at`; recorded on
+ * the task as `metadata.app_max_runtime_sec`, which the Brain reads with the run.
+ *
+ * The platform's own cap on a grant is not part of it: it bounds the grant's keys,
+ * not how long the run may go on.
+ */
+export function appRunMaxRuntimeSec(manifest: AppManifestV1, resources: unknown): number | undefined {
+  const fromManifest = runtimeSec(manifest.limits?.max_runtime_sec);
+  const grant = isPlainObject(resources) && isPlainObject(resources.grant) ? resources.grant : undefined;
+  const requested = runtimeSec(grant?.max_runtime_sec);
+  if (fromManifest === undefined) return requested;
+  if (requested === undefined) return fromManifest;
+  return Math.min(fromManifest, requested);
+}
+
 /**
  * The whole admission. Returns the answer to give; never throws for a refusal.
  * A fault that is not a refusal propagates.
@@ -498,6 +523,7 @@ export async function admitAppRun(
   const { pluginId, manifest, input, resolved, plan, overrides } = checked;
   const taskId = newTaskId();
   const grantId = newGrantId();
+  const maxRuntimeSec = appRunMaxRuntimeSec(manifest, req.body.resources);
   const grantRun: AppGrantRun = { grantId, taskId, sessionId: req.sessionId, userId: req.user.userId, pluginId };
 
   // A caller with no platform key is refused the same way inside the transaction;
@@ -588,8 +614,9 @@ export async function admitAppRun(
       await client.query(
         `INSERT INTO claw_app_runs (
            task_id, session_id, plugin_id, manifest, idempotency_key, state, mcp_token_enc,
-           grant_id, grant_keys_enc, grant_limits, grant_expires_at, created_by, request_hash, grant_templates
-         ) VALUES ($1, $2, $3, $4::jsonb, $5, 'provisioning', $6, $7, $8, $9::jsonb, $10, $11, $12, $13::jsonb)`,
+           grant_id, grant_keys_enc, grant_limits, grant_expires_at, created_by, request_hash, grant_templates,
+           sandbox_state, sandbox_since
+         ) VALUES ($1, $2, $3, $4::jsonb, $5, 'provisioning', $6, $7, $8, $9::jsonb, $10, $11, $12, $13::jsonb, 'pending', NOW())`,
         [
           taskId, req.sessionId, pluginId, JSON.stringify(manifest), req.idemKey,
           sealAppRunSecret(newMcpToken(), taskId, "mcp_token"),
@@ -602,7 +629,26 @@ export async function admitAppRun(
           issued?.templates ? JSON.stringify(issued.templates) : null,
         ],
       );
-      logger.info({ sessionId: req.sessionId, taskId, pluginId }, "app_run.created");
+      // The task's deadline is the run's own: its time limit counted from the run's
+      // creation, the moment the Brain stops it at (`pastDeadline`, which reads the
+      // limit as `app_max_runtime_sec`), rather than the generic budget a task gets
+      // when it starts. Set here, before anything can claim the task, so the claim's
+      // stamp keeps it. A run with no limit keeps that budget. `app_stop_grace_sec` is
+      // how long the Brain then gives the application to stop, which the deadline
+      // backstop waits out before it closes the task. The manifest is stored as it is.
+      await client.query(
+        `UPDATE claw_tasks t
+            SET deadline_at = CASE WHEN $2::int IS NULL THEN t.deadline_at
+                                   ELSE r.created_at + ($2::int * INTERVAL '1 second') END,
+                metadata = COALESCE(t.metadata, '{}'::jsonb)
+                           || jsonb_build_object('app_stop_grace_sec', $3::int)
+                           || CASE WHEN $2::int IS NULL THEN '{}'::jsonb
+                                   ELSE jsonb_build_object('app_max_runtime_sec', $2::int) END
+           FROM claw_app_runs r
+          WHERE t.task_id = $1 AND r.task_id = t.task_id`,
+        [taskId, maxRuntimeSec ?? null, appStopGraceSec(manifest)],
+      );
+      logger.info({ sessionId: req.sessionId, taskId, pluginId, maxRuntimeSec }, "app_run.created");
       // Keys only: a value can be anything the plugin let the caller set.
       if (overrides) {
         logger.info(

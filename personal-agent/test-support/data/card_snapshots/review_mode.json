@@ -94,7 +94,7 @@
      {
       "items": [
        {
-        "text": "全自动合入，无需人工确认",
+        "text": "全自动合入（仓库自身要求的检查仍然生效）",
         "type": "TextBlock",
         "weight": "Bolder",
         "wrap": true
@@ -102,7 +102,7 @@
        {
         "isSubtle": true,
         "spacing": "Small",
-        "text": "审完没有问题、检查全部通过时直接批准并合入，不再请你确认；只有仓库自己要求确认的变更（.github/claw-review.yml 的 confirm_merge: always 等）仍会先问你。",
+        "text": "审完没有问题、检查全部通过时直接批准并合入，不再请你确认，你在聊天里让我审并合入的 PR 也一样；仓库自身要求的检查仍然生效：CI 没过或还有没解决的评审讨论不会合入，仓库自己要求确认的变更（.github/claw-review.yml 的 confirm_merge: always 等）仍会先问你。",
         "type": "TextBlock",
         "wrap": true
        }
@@ -151,7 +151,7 @@
        },
        {
         "size": "Small",
-        "text": "**Fully automatic merge, nobody is asked to confirm**: Approved and merged when nothing needs fixing and every check passes, without asking you; only a change the repository itself requires a person for (confirm_merge: always in its review config, and the like) still waits for your click.",
+        "text": "**Fully automatic merge (the repository's own requirements still apply)**: Approved and merged when nothing needs fixing and every check passes, without asking you, a pull request you ask me in the chat to review and merge included; the repository's own requirements still apply: nothing merges with CI failing or review threads open, and a change the repository itself requires a person for (confirm_merge: always in its review config, and the like) still waits for your click.",
         "type": "TextBlock",
         "wrap": true
        },

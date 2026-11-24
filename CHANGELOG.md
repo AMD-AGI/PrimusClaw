@@ -16,8 +16,8 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 | Release | Tag | Current version |
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
-| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.2.3 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.10.3 |
+| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.0 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.12.0 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
 The Teams app package (its manifest `version`) is not covered by these rules.
@@ -111,8 +111,209 @@ release version, and its `appVersion` stays `latest`.
 
 ## [Unreleased]
 
+### Added
+
+- Claw: the assistant knows what it can and cannot do. Its router turn has a new read tool, `claw_capabilities`, that
+  answers a list generated from what that turn really has: the tools registered on its assistant server, each by how
+  it takes effect (`acts_at_once`, `asks_first`, `reads`), the deployment's switches (pull request and job watching,
+  triggers, memory, reviews, development environments, personal skills, files and images), its lookups, the user's
+  review mode (`fully_auto` or `high_risk_confirm`) and its limits as data that is on or off (no email, calendar,
+  document stores or voice; the chat apps it is in), each lifted where the deployment provides it. The router is told
+  to call it first for any question about its abilities, limits or how it compares with other assistants and to
+  answer only from it (`router-self-v5`, `router-read-v18`); "every change goes through a work item that asks first"
+  is no longer said, since its own tools act by themselves. `GET /v1/assistant/capabilities` serves the same list to
+  the signed-in user. Asked what it could not do, it used to answer from guesswork and name limits it does not have.
+  An entry is on only where it works: web search and page reading as the Brain running the turn has each of them
+  (the Brain names them to the assistant's server in `x-claw-web-tools`; the API's own list, which no Brain serves,
+  claims neither, and where that leaves nothing else to look up lists `look_up` as not known, `on: null`, rather than
+  off), reviews and the review mode only where a review can be started from the assistant (reviews and
+  review items on) and the user has bound a GitHub account (a review as them acts with it), pull request watching and
+  GitHub comments only where the user has a GitHub token as those tools resolve it (a `GH_TOKEN` in their settings, or
+  their `/github bind` binding where bindings count), and memory only where the user's own setting has it and the
+  conversation keeps it. An entry that is off says so (and, for GitHub, what to connect), and the tools that would
+  refuse because of it are listed under `off_here` rather than as acting.
+- Claw: the super-agent evaluation grades an answer about the assistant against that list. A case with
+  `self_knowledge` reads the identity's list before it is sent; an answer that states a limit the list contradicts,
+  or claims an ability it lists as off, is flagged and is no pass without a judge, which is given the list as the
+  truth and the flagged words and decides; an entry the list does not know (`on: null`) is graded neither way; a case
+  whose list was not read never passes. Nine such cases are in
+  `sa-eval-cases/catalog/self-knowledge.jsonl`, and four in the router evaluation (`self-01`..`self-04`).
+
+- Claw, connector, personal agent: a turn of a Claude Code or Codex conversation open in one of your terminals that ends
+  while nobody is at that terminal is said in your 1:1 chat: finished, with the end of what the agent last said, or
+  stopped with an error (Claude Code's `StopFailure` reason). The connector's approval hooks now also run on
+  `StopFailure` (Claude Code) and `Stop` (Codex); the connector posts `terminal_turn_end` only once that terminal has had
+  no input for a minute after the turn ended, never while a chat follows the conversation, and not for a `Stop` that
+  leaves background tasks running. Claw files it under the conversation's work item and says at most one end per
+  conversation every five minutes. `/approvals off` turns these off with the questions; `/approvals mute #<item>` (and
+  `unmute`) does it for one conversation (`PUT /v1/remote-agents/approvals/mutes`): its open card session is closed,
+  and its questions, waits and ends stay in the terminal. See `connector/README.md`, "When a turn ends while you are
+  away".
+
+- Claw: an app run's `app` block also says what the run is doing while it is alive: `app.restarts`, how many times the
+  application was started again, and `app.last_exit`, `{ returncode, at, cause }` of the last time the application
+  stopped (`null` until then), moved on every exit. A crash-looping application used to read only `status: running`
+  with nothing else until its run ended. `cause` is a closed list (`exited`, `start_failed`, `sandbox_lost`,
+  `restarts_exhausted`, `deadline`, `cancelled`, `task_closed`); no free text is carried. See `claw/docs/run-api.md`,
+  "App runs".
+- Claw: `app.restarts` is split by kind. `app.crash_restarts` counts the restarts for the application's own failure (an
+  exit without `final`, a launch that kept failing, its container failing), the ones `restart.max_restarts` bounds;
+  `app.platform_losses` counts the sandboxes the platform took away (node lost, no node to run on) that were replaced.
+  `app.restarts` is now their total, so a reader of it keeps working; before, it carried only the first and a platform
+  loss was in no count. Both are on `GET /v1/tasks/:id` (`item.app`) and `GET /v1/runs` (`app`), and keep their value
+  once the run has ended (the Brain now carries the platform-loss count onto the run's final `last_exit`). See
+  `claw/docs/run-api.md`, "App runs".
+- Claw: a plugin can let an app run change its manifest's sandbox templates. `overridable.sandbox_templates` declares,
+  per template name, which of `fromImage` (a string rule with an `enum` or a `pattern`), `per_gpu_count` (an integer
+  `enum` or range) and `resources` (a `max` Kubernetes quantity for each of `cpu`, `memory`, `ephemeralStorage` and
+  `sharedMemory`) a launch may set; `overrides.sandbox_templates` on `POST /v1/sessions/:id/tasks` (`mode: "app"`) names
+  the values, for example `{ "runner": { "fromImage": "...", "per_gpu_count": 4, "resources": { "requests": { "cpu":
+  "24", "memory": "1400Gi" } } } }`. The values are checked against the declaration and applied to a copy of the
+  manifest (the card count becomes `[n]`; `fromImage` and `resources` land where Agent Sandbox reads them; each given
+  request or limit replaces that entry; `sharedMemory` becomes `gpu.sharedMemory`), which must still validate: a request
+  above its limit, a shared memory above the memory the template will get (its memory limit, else its request, else
+  the per-card default of 224Gi times its fewest cards), or two templates of one role with the same card count is
+  refused. Quantities are compared exactly, as Kubernetes rounds them, not as floating-point numbers. A refusal is `400 plugin_overrides_invalid` naming each field, and nothing is created. The run stores and
+  grants the effective templates, records the values in `metadata.plugin_overrides`, logs only the keys, and binds them
+  to the `Idempotency-Key`. One generic plugin can so serve several model sizes instead of one plugin per size. A plugin
+  that declares nothing launches exactly as before. Agent Sandbox applies a template's `resources` and
+  `gpu.sharedMemory` from the release that reads them. See `claw/docs/plugins.md` section 4.
+- Claw: an app run (`mode: "app"`) carries an `app` block on `GET /v1/tasks/{id}` (`item.app`) and on every form of
+  `GET /v1/runs` (`app`, `null` for other runs). `app.sandbox` says where the run's sandbox is -- `state` (`pending`
+  while it is being created, queued or starting, `running` once the platform reports it Running, `ended`),
+  `workload_id` and `since` -- where until now the task read `running` from the moment a worker accepted it, however
+  long its sandbox stayed queued or pulled its image. `app.outcome`, once the run has ended, says how as stable fields:
+  `cause` (a closed list: `exited`, `restarts_exhausted`, `start_failed`, `deadline`, `cancelled`, `task_closed`,
+  `no_exit_record`, `sandbox_rejected`, `sandbox_create_failed`, `sandbox_unschedulable`, `sandbox_start_timeout`,
+  `sandbox_failed`), `returncode`, `final` and `error` (the application's `exit.json` `error`, or the platform's reason
+  for a `sandbox_*` cause; masked, one line, at most 300 characters), so a caller no longer matches on the prose of
+  `failure_reason`, which is unchanged. `placement.workload_id` on `GET /v1/runs` now names an app run's sandbox; it was
+  always empty. To tell a run that never got a sandbox from one whose application failed, the run's row now records why
+  it has no sandbox (the provisioning code and the platform's words, scrubbed) while it waits, until one is Running.
+  A wait for a sandbox cut short by the run's own cancel or deadline is never counted as a sandbox the platform failed
+  to give, so such a run ends as `cancelled` or `deadline`. See `claw/docs/run-api.md`, "App runs".
+- Claw: metrics for the API's event consumer: `claw_api_event_consumer_consecutive_failures` (deliveries this replica
+  retried since it last stored or set aside an event), `claw_api_event_quarantined_total{reason}` (`unparseable`,
+  `unstorable`, `bounded`), `claw_api_event_sanitised_total` (events stored with a character replaced), and, read from the server every 30 seconds,
+  `claw_api_event_consumer_ack_pending`, `claw_api_event_consumer_pending` and
+  `claw_api_event_consumer_oldest_pending_age_seconds` (how long the oldest event not yet acknowledged has waited; 0 when
+  none is).
+
+- Connector: a connector that runs as a service upgrades itself to the version Claw recommends (on by default; off with
+  `claw-connector auto-upgrade off`, `auto_upgrade = false` in `agents.toml`, or `CLAW_CONNECTOR_AUTO_UPGRADE=0`). It
+  takes exactly the recommended version (never `latest`, never down, never a prerelease or a new major version; below
+  1.0.0 a new minor version only when Claw's minimum is in its own minor line), only when no turn runs and nothing is
+  queued or waiting for an approval, with the npm beside its own node into the prefix it was installed under; never while it is
+  disconnected from Claw or while `agents.toml` cannot be read. The new version is downloaded beside the live one while the
+  connector still runs and is moved in only then, so a connector killed during the download keeps its old version. The old
+  package directory is kept; a new version that does not connect within 60 seconds in three trial runs is rolled back and
+  not tried again until a newer one is recommended, and so is one whose first three real runs fail (or do not connect
+  within 60 seconds, or do not reconnect within 60 seconds after a drop) before one of them has stayed connected without a
+  break for a minute. Turning auto-upgrade off while a download is under way still stops the swap. Each real run of the new
+  version counts itself as its first step, so this holds under systemd and launchd as well as under the script
+  supervisor; a version that cannot even start its code is caught by the trial runs before it is moved in. A new version
+  whose runs cannot be counted (its state file cannot be written) is not run: the old one comes back. Where it cannot upgrade (no npm, a prefix it may not write, a
+  registry that does not answer) it changes nothing and the chat shows the machine's problem with the command that does
+  it by hand. The first run of a new version brings installed hooks up to date and never adds hooks that were not
+  installed. Each agent's `capabilities.auto_upgrade` reports the state and the last outcome, and `devenv_list` uses the
+  machine's own command as its `upgrade_command`. Connectors before this one cannot upgrade themselves: upgrade them once
+  by hand. See "Upgrades" in `connector/README.md`.
+
+- Claw: stall detection for the queues that carry replies to a person. The connector reports its event outbox with
+  every heartbeat (`outbox`: events waiting, the oldest's age, failed posts in a row and since when, the last error, and
+  up to 20 sessions with events waiting); the API counts, per connector, the event batches it answers with a 5xx. When a
+  connector's posts have failed for 2 minutes, its owner is told once in chat that the replies from the sessions on that
+  machine are delayed and being retried, and once more when they get through again. New metrics:
+  `claw_delivery_backlog_oldest_age_seconds` and `claw_delivery_backlog_size` (by `queue`: `remote_events`,
+  `notification_outbox`), `claw_remote_connector_backlog_age_seconds` and `claw_remote_connector_post_failures` (by
+  `connector_id`, only for connectors behind or failing now), `claw_remote_delivery_stalled`,
+  `claw_remote_events_post_total`, `claw_api_event_redelivered_total`, `claw_api_event_redelivery_oldest_age_seconds`,
+  `claw_notification_subscriptions_failing`, `claw_notification_subscription_failures_max` and
+  `claw_delivery_stall_notices_total`. The chart ships alert rules for them as a PrometheusRule
+  (`prometheusRule.enabled`, off by default; thresholds around ten minutes) and a "Claw — Delivery" Grafana dashboard
+  (with `grafanaDashboard.enabled`). The rules are evaluated by promtool against synthetic stalls in CI. A connector
+  from before this reports nothing and is judged on the API's count alone. See "Replies that do not get through" in
+  `claw/docs/remote-agents.md`.
+
+- Claw: `POST /v1/sessions` accepts an optional `placement.nodeLabels`, a map of node label key to value that every
+  sandbox of the session requires. It is sent to SaFE as the workload's `customerLabels` (a required node affinity), kept
+  with the session, and applied to every sandbox the session creates, a rebuilt or reclaimed one, a queued message's
+  and a task's, DAG node's or application run's included, so a rebuilt sandbox lands where the first was allowed to. A
+  multi-node turn's GPU cluster (RayJob or InferaDeployment) carries the same `customerLabels` on every pod.
+  Keys must be Kubernetes label keys, values single label values with no whitespace, at most 8 entries, and the keys the
+  platform reads itself (`kubernetes.io/hostname`, `specified-nodes`, `excluded-nodes`, the workspace labels) are
+  refused, all with `400`. Without the field the session and the workload request are unchanged. A sandbox or cluster
+  that already exists is reused or adopted only when it was created with the same placement, and is otherwise rebuilt.
+  Roll out Brain before the API. See "Placing a session's sandboxes on labelled nodes" in
+  `claw/docs/sandbox-session-lifecycle.md`.
+
+- Claw: metrics and alerts for outbound notifications. `claw_notification_outbox_oldest_pending_age_seconds`
+  and `claw_notification_outbox_pending` are read from the outbox table at each scrape, so they show a
+  stall even when the delivery loop itself has stopped; `claw_notification_delivery_total{outcome}` and
+  `claw_notification_quarantined_total{reason}` count what became of each attempt, every series exported at 0 from
+  start-up so a pod's first quarantine is an increase Prometheus sees. `claw/deploy/promql/notification-outbox.rules.yaml`
+  is a Prometheus rule group with two alerts, `ClawNotificationOutboxStalled` (a notification has waited more than 15
+  minutes, for 5 minutes) and `ClawNotificationQuarantined`, tested with `promtool` in CI.
+
 ### Changed
 
+- Agent Sandbox: a GPU template's CPU, memory, pod storage and `/dev/shm` now come from the template when it sets them,
+  instead of always 24 CPU, 224Gi memory, 187.5Gi storage and 125Gi shared memory per card. A sandbox can ask for what
+  it needs (for example 16 CPU and 448Gi for two cards, or 32 CPU and 1792Gi for eight) and leave the rest of the node
+  to CPU sandboxes. Before, `resources` on a grant or owner policy template with GPU counts was silently overwritten.
+  Each of `cpu`, `memory` and `ephemeral-storage` in `resources.requests`/`resources.limits` is resolved on its own: a
+  value given only as a request is also the limit, one given only as a limit is also the request, and one given in
+  neither keeps the per-card size times the card count. `/dev/shm` is the spec's `gpu.sharedMemory`, else 125Gi per card
+  lowered to the memory limit when that is smaller. The card count still comes only from `perGpuCount`. A template with
+  no `resources` or `gpu` is sized exactly as before. A value that is zero, negative or not a quantity, a request above
+  its limit, a shared memory above the memory limit, any other resource name on a GPU template, or a `gpu` key other than
+  `sharedMemory` (`count`, `product` and `resourceName` are still accepted and ignored, so a stored policy with them keeps
+  applying), is refused with `400` (`invalid_grant` or `invalid_owner_policy`) naming the field, and nothing is
+  registered. A template without GPU counts keeps its `resources` as written, and its `cpu`, `memory` and
+  `ephemeral-storage` are now checked the same way. Claw already passes a manifest template's fields through unchanged, so an app manifest's
+  `sandbox_templates` entries can set these now. See `sandbox/docs/E2B.md` (GPU template size). Deploy the sandbox control
+  plane (`agent-sandbox-controlplane`); Claw is unchanged. Templates registered before the release keep their size until
+  their grant is issued again.
+- Claw: an app task's `deadline_at` is the run's own time limit, the smaller of the manifest's
+  `limits.max_runtime_sec` and the request's `resources.grant.max_runtime_sec`, counted from the run's creation: the
+  moment the Brain stops it. It used to be the generic task budget (72 hours) from the task's start, which said
+  nothing about when the run would end. An app run with neither limit keeps that budget, and other tasks are
+  unchanged. A run whose request asked for less than its manifest's limit is now stopped at the request's (the Brain
+  used to stop it at the manifest's only). The deadline backstop now gives an app run its application's
+  `stop_grace_sec` (at most an hour) past the deadline before it closes the task, so it no longer closes a run the
+  Brain is still stopping as `run_budget_exhausted`.
+  The request's `resources.grant.max_runtime_sec`, the manifest's `limits.max_runtime_sec` and
+  `APP_SANDBOX_CAPS.max_runtime_sec` must now be a whole number of seconds from 1 to 2147483 (about 24.8 days): a
+  fraction or 0, which the grant issuer already refused, or a longer limit, is refused at admission with
+  `400 app_resources_invalid` (an `APP_SANDBOX_CAPS` outside it stops the API at start-up). Limits in use today are at
+  most 259200 seconds.
+- Claw API: a review asked of someone else ("review and merge", R asking X) is now merged with the reviewer's account
+  whenever the reviewer can merge it, and the requester's own account is used only when the reviewer cannot, and only on
+  the requester's yes. Under X's `fully_auto` the merge is made at once; under `high_risk_confirm` a held merge waits for
+  X's own confirmation, and the review items' sweep no longer merges it with R's account because it is held (it reads the
+  pull request with X's account only and asks R nothing). When X approved and X's merge of the current head was refused
+  because X's account may not merge there (`no_merge_permission`, or the new refusal `merge_not_permitted`: GitHub
+  refused the merge with a 403, 405 or 422, or a merge-queue refusal, in its words for a permission, such as a protected
+  branch that restricts who may push; a 403 in other words, or one with Retry-After or a rate limit, is not one, since a
+  retry may get past it), the sweep asks R once per head, with the same
+  gates as before (R wrote the pull request and may push, X's approval of the head is on GitHub, CI green, no open thread,
+  merge state `CLEAN`, strictly: unlike X's own merge, `UNSTABLE` is not read as open even when only checks the base
+  branch does not require failed, and a branch with a merge queue no longer lifts this gate, so R is not asked and R's
+  account queues nothing while the state is `UNSTABLE` or `BLOCKED`): a `claw_github_confirmations` row of the new kind `requester_merge` whose acting user is R, sent to
+  R's own assistant conversation as an `assistant.say` carrying `confirm_write` (kind `github_merge`): "X 已批准 …，但 X
+  没有合入权限；要用你自己的账号合入吗？" with 合入 and 不合 (or `批准 #<ref>` / `拒绝 #<ref>`). R's yes, through the
+  same decision routes as any held write, reads every gate again and the head must be the one R was asked about; then R's
+  account merges (or queues) it, audited as `gh_pr_merge_as_requester`, and a held merge of X's for that head closes as
+  merged by R. R's no leaves it unmerged and ends the item; R is not asked again for that head. The item stays in
+  progress while R's answer is awaited, and X is not asked about R's question. The sweep always reads the pull request
+  with X's account first, and uses R's account only once that read shows X's merge of the current head was refused, so a
+  push after X's refusal is read with X's account only and R's credential is not fetched. Review items opened before this change
+  follow the new rule after the deploy: a merge held for X waits for X, and R is asked only as above.
+- Personal agent: the receipt for "请 X 帮我 review 并合入" says plainly who merges: "X 批准后，用 X 的账号合入", with
+  "（X 需要确认，TA 确认之前不会合入）" when X's merge waits for X, and "X 没有合入权限时，会先问你要不要用你自己的账号合入。"
+  when Claw may ask the asker; the old "（X 那边被拦下的合入，会用你自己的 GitHub 账号合，前提是 PR 是你提的）" is gone. A
+  card for a held merge (the reviewer's, or the asker's question) now has 合入 and 不合 ("Merge" and "Don't merge")
+  instead of "不要".
 - Personal agent: a result Claw delivered without an Accept (`delivered_version` on the message's item, from a Claw with
   `CLAW_ASSISTANT_AUTO_DELIVER` on) is shown as a result card instead of the "Accept vN" card: "v2 delivered" ("v2 已交付"),
   or "v1 delivered; still watching PR owner/repo#7" ("v1 已交付，继续盯 PR owner/repo#7") while the item follows its pull
@@ -120,31 +321,213 @@ release version, and its `appVersion` stays `latest`.
   system's own notice of such a result is its words alone. An Accept pressed on a card drawn before the result was
   delivered says it was delivered and there is nothing to accept; an item that still waits for an Accept gets its card and
   buttons as before. The retry refusal at the limit of running tasks no longer suggests accepting one.
-
 - Connector: on a paired machine whose configuration is on the container's own file system, the note on where to keep
   it no longer names the personal agent's bot: it says to "ask the assistant in your chat for a new pairing command".
   The bot's earlier default name collides with third-party products, and each deployment now names its bot itself.
   The connector's README and test fixtures name the personal agent and the chat instead (#837, #838).
-
+- Personal agent: the worker's `inbound message` line for a Teams activity also says when the client sent the message:
+  `client_ts` (the activity's `localTimestamp`, the client's own clock with its zone offset), `server_ts` (the activity's
+  `timestamp`, or in a 1:1 chat the time its message id encodes), `client_lag_raw_ms` (the second less the first, as
+  measured) and `client_lag_ms` (the same lag, only when it lies between 0 and 24 hours; otherwise the two clocks disagree
+  and only the raw value is logged), and `client_msg_id` when the client put its own message id in `channelData`. A
+  message that reaches the bot late can now be told apart: a large `client_lag_ms` means the client held it, a small one
+  that it was sent late. Only values of a timestamp's or an id's shape are logged; never the text or who sent it
+  (#872).
 ### Fixed
 
-- Sandboxes: a sandbox that waits for capacity which can come is no longer given up on after 5 minutes. When the platform
-  has admitted a sandbox and the autoscaler is not adding a node for it yet for a reason that ends on its own (every account
-  it buys nodes as is at the scheduler's per-user limit, a node is still being given back, the pool is at its limit and
-  releases an idle node, a purchase in backoff; or the pod is held at a scheduling gate), the wait is a wait for capacity,
-  like a node being added: it runs on `SANDBOX_PENDING_TIMEOUT_SECONDS` (3 hours) and is never cut short by
-  `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS`, which used to end every GPU run that had to queue in a burst pool with
-  `sandbox_unschedulable`. The user is told what the sandbox waits for, with the autoscaler's reason. A refusal that no
-  wait settles (no pool serves the workspace, the pod fits no node of a pool, more nodes at once than a pool may hold)
-  still ends at the 5-minute limit. A request that names its own `timeout` waits for capacity at most that timeout less
-  the new `SANDBOX_MIN_RUN_SECONDS` (default 1 hour; chart value `secret.sandboxMinRunSeconds`), because SaFE counts a
-  sandbox's lifetime from admission and a wait after it is spent out of the run's own time: a 25200-second request waits
-  up to 3 hours and keeps at least 4 hours to run.
-- Runs: a run whose sandbox the platform had no capacity for is recorded as failed. Its turn still ends with the agent's
-  answer, but `GET /v1/runs` used to report it as `exited` with no exit code and an empty `failure_reason`, so a caller
-  could not tell it from a run that finished. It is now `failed` with the provisioning code (`sandbox_unschedulable`,
-  `sandbox_pending_timeout` or `sandbox_start_timeout`), and the terminal block has a new `failure_message` field with the platform's reason (`""` when the run recorded nothing beyond
-  its code). Task and DAG runs report the same through their callback.
+- Claw: a run whose deadline was more than about 24.8 days away was stopped at once. The Brain stops a run at its
+  `deadline_at` with a timer, and Node fires a timer longer than 2^31 - 1 ms after 1 ms; an app run's deadline can be
+  its own time limit, which a request or manifest could set that far out. The timer now waits in steps no longer than
+  that, so any deadline fires when it comes, and admission refuses a time limit above 2147483 seconds (see Changed).
+- Claw: an A2A push notification that its webhook keeps refusing no longer holds back every later notification for that
+  webhook for up to an hour. After eight failed attempts (about twenty minutes) it is set aside: its outbox row is
+  closed, a copy is kept in the new `claw_a2a_push_dead_letters` table for 14 days, the log line
+  `a2a_push.quarantined` names it without its content, and the next notification is sent, still in order. A
+  notification is no longer dropped just because it is an hour old, so a receiver that comes back after a longer outage
+  gets what it was owed. A notification whose text holds a NUL character or a lone UTF-16 surrogate, which PostgreSQL's
+  `jsonb` refuses, is stored with U+FFFD in their place instead of failing the write and losing the notification. New
+  metrics: `claw_a2a_push_delivery_total{outcome}`, `claw_a2a_push_quarantined_total`,
+  `claw_a2a_push_head_consecutive_failures` and `claw_a2a_push_oldest_pending_age_seconds`. A notification is set
+  aside even when its dead-letter copy cannot be written (it is then closed as `quarantined_unrecorded:<status>`,
+  and its config is kept so the row, the only copy left, is not deleted with it). Each
+  delivery attempt, config read and name lookup included, now ends within 45 seconds, inside the 120-second claim lease,
+  so a lookup that hangs can no longer let another replica send the next notification before a late copy of this one.
+  Only an attempt that reached the receiver (a request started, or its name looked up and not found) counts toward
+  the eight, so a slow or failing database cannot set aside a notification whose receiver is healthy; one that goes an
+  hour and at least three passes without any attempt reaching its receiver (a name lookup that hangs every time) is
+  set aside as `unsent:<status>` (a gap of more than 50 seconds between such passes, as when no worker ran, starts the
+  hour again), and one written before the upgrade is sent at least once more before it can be set aside. See "Push
+  notifications" in `claw/docs/a2a.md`.
+- Claw: a run whose sandbox the platform did not create or schedule now ends failed, with a stable `failure_reason` and
+  the platform's own words as its message, on `GET /v1/runs`, the run row, the session's events (a `sandboxStatus`
+  event with `status: failed`), the A2A task status (the message carries `metadata.failure_reason`) and the `run.failed`
+  notification (its summary is `<code>: <message>`). Until now a create that SaFE refused (for example its admission
+  webhook's QoS ceiling: "timeout 64800 exceeds the qos limit of 10800 seconds for scope Sandbox") was treated as a
+  retryable error, and the run ended `class: exited` with no exit code and an empty `failure_reason`; so did a workload
+  that failed before it was ready, and a create that failed with a 5xx. The codes: `sandbox_rejected` (SaFE answered the
+  create with a 4xx other than 403, 408, 425 or 429: the same request is not sent again within the run),
+  `sandbox_create_failed` (a 5xx, a 408, 425 or 429, or no answer; retried, and the run fails with it once no retry is
+  left before the run's deadline or its delivery limit, a run claimed through `/v1/runs` counting its claims, so it no
+  longer ends `max_retries_exceeded` instead), the workload's terminal code (for example `sandbox_workload_terminal`,
+  with the `AdminFailed` condition's reason and message), `sandbox_unschedulable` and `sandbox_pending_timeout`. When a
+  refusal is about the timeout, the message also says the timeout the run asked for and the one Claw sent (Claw adds
+  3600 s to stop the run cleanly) and, when only that hour is over the platform's limit, the largest timeout that fits.
+  A run that is refused the workspace (403) still carries on without a sandbox and is not failed for it. After
+  `sandbox_pending_timeout`, a deadline, `GET /v1/runs` keeps `class: killed` with `kill_reason: deadline`, as before. The
+  platform's text is bounded, kept on one line and masked like every other value the run sends; every value the
+  sandbox's env was sent is masked in it too, and in the log of the refusal, since a platform may echo the request back.
+  It is masked before it is cut or folded onto one line, and in each spelling the answer may carry a value in (as sent,
+  JSON-escaped as JavaScript and as Go write it, folded, a line at a time), so neither a credential that runs across the
+  cut, nor a multi-line one (a PEM key), nor a signed URL whose `&` the platform wrote as `\u0026` is left partly or
+  wholly in clear.
+- Claw: `redactSecrets` masks the exact values it is given before its patterns run. A pattern that matched part of such
+  a value (a hex token inside a JSON value, a URL's `user:pass@`) used to leave the rest of it, such as a password beside
+  the token or the URL's host and database, unmasked.
+- Claw API: a queued message that can never be sent no longer holds every later message on its session behind it. A
+  message sent while the session is busy waits in that session's queue, and a drain sends only the oldest one; a
+  message whose dispatch failed every time (for example, one larger than NATS's `max_payload`) was retried on every
+  completion and every sweeper tick with no limit, and nothing after it was sent while the session read idle. Each
+  failed attempt is now counted on the queued row, and a message that has failed `PENDING_DRAIN_MAX_FAILURES` times
+  (default 5) over at least `PENDING_DRAIN_FAILURE_WINDOW_SEC` (default 600) is moved to the new
+  `claw_pending_messages_quarantine` table, with its text, sender and last error, and the next message is sent at once.
+  A failed attempt that only says NATS could not be reached (a `503`, a lost connection, or a timeout while NATS answers
+  nobody) is not counted, so a NATS outage of any length quarantines nothing: the queue waits and is sent in order once
+  NATS is back. A timeout while NATS answers everything else is the message's own and is counted, so a message whose
+  publish always times out is quarantined too. The session
+  is told once, in the turn the message would have been, that it was not sent and can be sent again; a notice that
+  cannot be published then is retried by the sweeper. An attempt NATS refused stored nothing, so it does not use up
+  the notice's attempts and the notice is retried until NATS is back; no attempt is made while NATS answers nobody,
+  and one that failed because NATS went away under it is not charged either; only once an attempt may have stored an event
+  without its acknowledgement is the notice retried for at most 30 minutes from that attempt, and given up on (logged
+  as `pending.quarantine_notice_abandoned`) after that. Each event of the notice is published under a stable id, and the
+  event stream's duplicate window is widened at start-up from the server's default of two minutes to one hour, so a
+  retry after a publish whose acknowledgement was lost does not show the user the notice twice. A message whose run may
+  still be delivered is never moved. A queued message whose sealed credentials are too short to be sealed, or open to
+  something that is not the credentials written, is quarantined at once (`credentials_unreadable`); one whose
+  credentials fail to authenticate under this replica's key, which a replica with a stale key sees while the others
+  open them, is retried like any other failure and quarantined only once it has had its attempts. Until now any such
+  failure refused and deleted the message on the first replica that could not open it. Quarantined messages are kept for `PENDING_QUARANTINE_RETENTION_DAYS` (default 30) and are deleted with their
+  session. The log line (`pending.drain_quarantined`) names the message and the error, never the text. New metrics:
+  `claw_api_pending_drain_failures_total`, `claw_api_pending_quarantined_total`,
+  `claw_api_pending_messages_consecutive_failures` (the longest failing streak of any queued message) and
+  `claw_api_pending_messages_oldest_age_seconds`. A publish the NATS client refuses as `MAX_PAYLOAD_EXCEEDED` is now
+  treated as certainly not sent, so the run row it opened is closed instead of left waiting for a delivery that never
+  happened. The API migrates the table and columns at start-up and refuses to start without them.
+- Claw API: a message whose text or request carries a NUL character or a lone UTF-16 surrogate is now queued with
+  U+FFFD in its place. PostgreSQL stores neither (TEXT refuses the NUL byte; `jsonb` refuses the `\u0000` escape and a
+  lone surrogate escape), so such a message used to be refused with a server error when the session was busy.
+- Personal agent: a review asked of a colleague who cannot be acted as yet no longer stops at the first step they finish.
+  Reviewing for someone else takes three steps of theirs (connecting their Primus account at the identity service,
+  `/github bind`, `/github auto-merge on`, and `/link` when their own key is missing too), and confirming the identity
+  card looked like being done. Now the request is kept (new store table `review_onboarding`, kept a week): the reviewer's
+  first message lists every step with the current one marked, in English and Chinese, and each step they finish is
+  answered once with the next one (a button runs `/github bind`, another turns the authorization on or declines it). The
+  identity service tells the worker nothing when someone confirms there, so the reviewer's state is read again on any
+  message of theirs and every minute. The asker is told which step is missing ("还差第 N 步「…」"), and once every step is
+  done hears "<name> 已完成授权，可以开始代审了" where they asked, with a button that starts the same request again (same
+  pull requests, same merge flag, the same handoff within a day, the same model) through every check, the model's
+  included, so nothing starts without the reviewer's authorization on and nothing runs on a model nobody chose. A
+  reviewer who declines, or turns the authorization off while asked, is not asked again for those requests, and each
+  asker is told once; a later new request of them sends the steps once more. The reviewer's first message stays at most once a day. A step that could not be said (the
+  reviewer's chat not reachable yet, or a send whose text failed) is said on the next read rather than counted as said;
+  once its text went, a button that failed after it does not send the step again. The asker's "ready" and "declined"
+  messages are marked sent only once they went out, and one that failed is sent by the next minute's read. A GitHub notice
+  that already went to the reviewer earlier the same day for something else no longer keeps the step they are at from
+  being sent. Asked again for the same pull requests, a button sent for the earlier request no longer starts the new one.
+- Claw: in the SaFE deployment mode with `LLM_KEY_SOURCE=platformKey`, a caller signed in with an `ak-` key (in
+  `Authorization: Bearer`, `x-api-key` or a download URL) or a default session cookie has their email again:
+  `GET /v1/me` answers it and the request's user carries it, as in 0.5.8. Since 0.5.9 the API no longer asked SaFE's
+  verification for the virtual key in that mode, and that request is what makes SaFE fill in the account's email from
+  the user record, so every such caller came back with no email and no virtual key (an SSO session cookie kept its
+  email, not the virtual key). Both keys are asked for in every mode again. A new contract test drives every credential
+  SaFE verifies through the auth middleware and `GET /v1/me` against a fake SaFE that answers the way SaFE's apiserver
+  does, and compares the verify request, the request's user and the `/v1/me` document, field for field, with values
+  recorded from the 0.5.8 code.
+- Claw: one event the database cannot store no longer stalls the API's event consumer. A NUL character or a lone
+  UTF-16 surrogate in an event (a tool's output, a model's text) is now replaced with U+FFFD where the event is parsed,
+  before anything is written, so the event is stored and a completion carrying one still runs (its turn is written and
+  its run is closed) instead of being skipped. The two clean-ups that existed did nothing: they ran over JSON text, where
+  both characters are escapes. An event the database still refuses for its value (SQLSTATE 22P05, 22021, 22P02 or
+  54001) is set aside on its first delivery instead of being retried for ever: a copy of it, sanitised and with
+  credential-shaped content masked as a stored event is, goes to the new `claw_event_quarantine` table (deleted with its
+  session), a log line `event-consumer.quarantined` without its content says so, and it is acknowledged. An event that
+  is not JSON is kept there too rather than dropped unrecorded. Nothing else is set aside, however often or however long
+  it has failed: the backlog an outage of the database or the tombstone bucket leaves, and a completion waiting on its
+  session's lock or on its run notification, are retried until they succeed, as before. A completion is never set aside.
+  One the database refuses for its nesting (54001, past about 13,000 levels with the default `max_stack_depth`) is
+  stored and run with a copy cut off at 1,000 levels (each deeper object replaced with `"[nested too deep to store]"`;
+  at 100, then 10, when a server with a smaller `max_stack_depth` refuses that copy too), so its turn is written and its
+  run closed on its first delivery; the original is kept in `claw_event_quarantine` with reason `bounded`, counted and
+  logged once however often it is redelivered.
+  Making an event storable, and masking the stored copy (`redactStoredValue`), no longer recurse: an event nested deeper
+  than the call stack (a few thousand levels, which `JSON.parse` and the database both take) is stored and, as a
+  completion, processed, where it used to be retried for ever. A `__proto__` key in an event stays a key of the stored
+  copy instead of being dropped.
+- Claw: an event a connector posts whose text holds a NUL (terminal output carries them) or half of a surrogate pair is
+  now stored, with each such character replaced by U+FFFD, in keys and values alike. Until now PostgreSQL's `jsonb`
+  refused the whole batch (`unsupported Unicode escape sequence`) and the API answered `500`; the connector posted the same
+  batch again for ever and every later event of that machine, of every session, waited behind it: prompts reached the
+  agents and no answer was ever shown. The same holds for what else a connector or a person sends on this path (an
+  agent's `capabilities` in a heartbeat, a prompt, the audit trail of a permission request) and for what the API stores
+  through `redactStoredValue` and `redactStoredText` (session events, an assistant's inbound messages). An event the
+  database still refuses for its value is now refused alone, as `unstorable` in the answer's `rejected` with its `index`
+  and `seq`, and the rest of its batch is stored; deployed connectors already drop such an event and go on.
+- Connector: one event Claw cannot take no longer holds up the events behind it. A batch Claw answers `500` three times
+  in a row (or a `4xx` that is not about the credential, the route or the rate, once) is posted in halves, always the
+  earliest events first so that no session's event goes before an earlier one of it, down to the event that fails it.
+  That event is posted again with its NULs and unpaired surrogates replaced by U+FFFD; when Claw still refuses it alone,
+  twice in a row, saying it is the event's fault (a `4xx`, or a `500` whose SQLSTATE in `code` is class 22 or 54, as
+  `22P05` was), while it takes an empty post each time, it is set aside: removed from the outbox, written to
+  `quarantine.jsonl` in the state directory and logged once, by session, number and type, never its content. An outage
+  (no answer, `502`, `503`, `504`, `429`, or a `500` to an empty post too) never sets an event aside, and neither does a
+  `500` that names nothing about the event (a deadlock, a lost database connection): a Claw that fails now and then
+  would otherwise narrow the search onto an event that was fine, a turn's end as likely as any, and drop it. Events are also made storable where
+  they are made, so a NUL an agent prints never reaches Claw.
+- Claw notifications: a notification whose text holds a character PostgreSQL cannot store (U+0000, or half of a
+  surrogate pair, as a run's raw output or a cut-off emoji can) is now recorded with U+FFFD in its place, however deeply
+  it is nested (a terminal's request carries its input whole). Until now the write failed, and with it whatever recorded
+  the event: a run's end, an approval request or the assistant's message was never announced, and a caller that retried
+  failed the same way every time. The outbox uses the replacement the rest of the server stores events with
+  (`storableJson` and `storableText` in `@claw/utils`).
+- Claw notifications: one notification the receiver refuses for good no longer retries for a day. A row the receiver
+  refuses at least five times for its body (`400`, `413`, `415` or `422`), each time after it has taken another of the
+  subscription's notifications, and for at least an hour since its first refusal, with no other failure in between (a
+  5xx, a `401` or a timeout starts the count and the hour again, as does a previous status that is not a refusal
+  however it was written, so a failure recorded by a replica still on the previous version also counts), is
+  quarantined: it is no longer sent,
+  it is kept in `claw_notification_outbox` with `quarantined_at` set as the record of what was not delivered, and the
+  `notification.quarantined` log line names the event, the receiver's answer and the reason, never what the
+  notification says. No single answer quarantines a row, a `422` included, and no other 4xx counts: a `401`
+  (the personal agent's `bad_signature` from a backend still on the old secret, or `stale_timestamp` to a Claw replica
+  whose clock is off), a `403` or a `404` depends on who sent the request or where it landed, not on the event. The
+  quarantining answer does not count against the subscription. A 5xx, a timeout or a connection error never
+  quarantines a row: the personal agent answers 503 for a notification it will take on a later
+  try (a run's end while that chat's turn is still answering), so such a row keeps the 24-hour retry window, as does
+  every row of a receiver that is down or refuses everything (a wrong secret). The rows one delivery round claims for a
+  subscription are now sent in the order they were recorded; before, the order the database handed them back in could
+  send a later one first. This is not an order across rounds or replicas: a receiver that needs one reads
+  `occurred_at`.
+- Assistant reviews: when a review the assistant started for the person's own account approves the pull request in its
+  own run, the person is now told how it ended, once, in their language. Until now a review under the `fully_auto` mode
+  that approved and merged closed its item silently: the person got only the generic "Run completed" notice and had to
+  ask whether the pull request was merged. The server now sends one `assistant.say` when such an item closes: merged,
+  with the short merge commit and the pull request's link; approved and put in the merge queue; or approved with nothing
+  merged, and why (no merge was made, or writes are off; a review only says it approved). A merge GitHub refused after
+  the approval still needs the person, and they are told of it as before, by the assistant; a merge or approval the
+  person confirmed is answered where they confirmed it and is not told twice; a review that did not approve is still
+  told why. The review tools now keep the commit a merge made on its audit row (`claw_github_audit.merge_sha`).
+- Assistant reviews: a merge (or an approval) that a review the assistant started for the person's own account holds for
+  them now reaches their chat as a card with a button. Until now the assistant told them to press the card's button or
+  reply `批准 #<ref>`, and no card was ever sent: only a review a chat started itself (one asked of someone else) put
+  one to the reviewer, so a person whose review mode is `high_risk_confirm` could answer only by typing the command. When
+  such a review's item comes to need its owner, each held write of its session that asks them goes out once as an
+  `assistant.say` carrying `confirm_write` (kind `github_merge` or `github_review`, with its ref and the button's label,
+  in the person's language); a new held write, such as the merge of a new head, gets its own card. The button calls
+  `POST /v1/assistant/confirmations/:id/decision`, which now makes that decision exactly as
+  `POST /v1/github-review/confirmations/:id/decision` does, for the person it asks only and with how they signed in;
+  the route is registered whenever review items are on. The personal agent draws the two kinds as the other held-write
+  cards, says how the answer ended (merged, queued, approval posted, not merged, new commits, expired, or why it was
+  refused), and gives the card back when Claw could not try it just now.
 - Connector: a message for a conversation typed into its terminal no longer gives up after 10 minutes as
   `terminal_state_unknown` while a question of Claude Code's own (a permission prompt, such as a dangerous `rm` asked by a
   background agent) is on that terminal's screen. When Claude Code's registry row for the process cannot be read, the
@@ -195,6 +578,110 @@ release version, and its `appVersion` stays `latest`.
 - Personal agent: a turn that is cancelled (the chat detaches from or switches away from a running session, the machine
   is disconnected, or the turn breaks off) no longer leaves its progress message in the chat as stale progress: it is
   deleted, or edited down to one "Interrupted." line where the chat cannot delete it.
+- Connector: a message typed into a terminal whose prompt Claude Code records in words that do not match what was pasted is
+  no longer ended as `terminal_input_unconfirmed` while the terminal answers it. The prompt is compared once both are read
+  alike (paste blocks unwrapped, CRLF and every run of white space as one, one Unicode form, no invisible characters); and
+  when no prompt matches within the 20-second wait but the terminal recorded one after the message's Enter (and Claude Code
+  did not queue the message), that prompt is taken as the message's (until a matching one comes), so its turn and its reply
+  are followed and the turn ends as usual, with `input_unconfirmed: true` on its `turn_end`. A message with no prompt at
+  all after its Enter in that wait still ends as `terminal_input_unconfirmed`, and what the terminal does next is still
+  passed on.
+- Connector: a message the phone stopped before the session answered no longer blocks every later message. Claude Code puts
+  a prompt back into its input box when Esc stops its turn before any answer (measured on Claude Code 2.1.327), and a message
+  refused because its Enter did not submit it stays there too; the connector read that text as someone typing and held every
+  later message as `terminal_typing` for 10 minutes before refusing it. Now it takes such a message out again, only while the box holds exactly that
+  text and no question shows: right after the stop (the next message waits for that), and at the refusal itself. Text
+  anyone else typed or pasted into the box, the same words included, is waited for as before.
+- Personal agent: `terminal_input_unconfirmed` is no longer said as a turn that did not complete or a message that may not
+  have been sent. It says the terminal has not confirmed the message yet, that whatever the session answers still shows in
+  the chat, and to look at the terminal before sending it again; a connector before 0.1.22, which did not recognise a
+  pasted message of several lines, is also told to upgrade. A prompt a connector passes on in Claude Code's
+  `<pasted_content>` block is shown as the text that was pasted.
+
+- Claw: a task's result that contains U+0000 (a script printing a C string, a model echoing a binary file) or an unpaired
+  UTF-16 surrogate is stored, with those characters replaced by U+FFFD and everything else kept. Until now Postgres
+  refused the whole `agent_done` write, the API answered 500, and Brain resent the same result on every delivery of the
+  task's message until the poison guard failed the run, many minutes later, as `max_retries_exceeded`. A result the
+  database still refuses for its values (SQLSTATE 22021, 22P05, 22P02 or 22003, for example a count out of range) is
+  now answered 422 with `error: unstorable_result`, and Brain reports the run as failed with `failure_reason: result_unstorable` on the same delivery
+  instead of retrying it; any other 422 is retried as before. If even that report is refused, Brain keeps the result in its checkpoint bucket under
+  `task-quarantine.<task_id>`, logs the task id and status without the content, and settles the message so the tasks
+  behind it keep flowing; the API's sweeper fails the row. New metrics: `claw_api_agent_done_sanitized_total`,
+  `claw_api_agent_done_refused_total{sqlstate}`, `claw_brain_agent_done_failures_total{status}`,
+  `claw_brain_agent_done_consecutive_failures`, `claw_brain_agent_done_oldest_pending_seconds` and
+  `claw_brain_agent_done_quarantined_total{reason}`.
+
+## [0.5.8] - 2026-11-18
+
+Image `docker.io/primussafe/claw:202611181714` (commit f227c209), released as `docker.io/rocm/primusclaw:claw-0.5.8`. A patch
+release: sandboxes wait for capacity that can come and a run without a sandbox is recorded as failed; under `fully_auto` a
+review the assistant starts merges once it approves; results can be delivered without an Accept, behind a setting that is
+off by default. Schema: one index, `idx_work_items_watching_pr` on `claw_work_items`, created by the API at start. New
+settings, both optional with defaults: `SANDBOX_MIN_RUN_SECONDS` (Brain, default 3600) and `CLAW_ASSISTANT_AUTO_DELIVER`
+(API, default off). Connector requirements unchanged from 0.3.1 (minimum 0.1.3, recommended 0.1.4).
+
+### Added
+
+- Assistant: `CLAW_ASSISTANT_AUTO_DELIVER` (default off) delivers a worker's ready result without asking for an Accept. The
+  item closes as accepted by policy (an `accepted` event with source `policy`, `accepted_version` set to the delivered
+  version, `params.delivered`), the way a review item closes when it posts its review, and frees its slot at once. The router
+  is told there is nothing to accept and that a reply changes the result; the item's message carries the new
+  `delivered_version` instead of an Accept (`can_accept` is false), and the silent sweep says a delivered result nobody said,
+  as it says an answer. A result that names, in `result.refs`, a pull request the item watches keeps the item open watching it
+  (`params.watching_pr`, also on the message as `watching_pr`): it holds no slot and needs nothing, a comment, a review or
+  failed CI there still sends it back to its worker and the next ready result is delivered as the next version, a worker that
+  only answers the news (`waiting` with no question) goes back to watching, and the merge or close of the last pull request
+  it watches, the end of every watch of it, or 7 days with nothing new on it close the item as delivered. Stopping the item, a Retry, and any run
+  that starts on it end the watching (and a stop or Retry the delivered mark), so a watch never closes an item that is
+  worked on again. A watching item's sandbox gives up its
+  background work as one that waits for a person does. Off, a ready result waits for the user's Accept as before (#873).
+
+- Assistant: `work_send` reopens an item whose result was delivered by policy in the last 7 days, so a reply asking for a
+  change produces the next version of the same item. An item the user stopped, one they accepted themselves and one delivered
+  longer ago stay closed (`item_closed`) (#873).
+
+### Changed
+
+- Assistant reviews: a review the assistant's router starts or restarts with `merge=true` ("review and merge it for me")
+  for a person whose review mode is `fully_auto` now merges once the review approves, without asking them. Until now
+  every such review held its merge for the person's confirmation (the card's button or `批准 #<ref>` / `approve #<ref>`)
+  whatever their mode, on the reasoning that the router reads `merge=true` from a sentence and natural language never
+  approves a merge. A person who chose `fully_auto` has already said that nobody needs to confirm their merges, and asked
+  for a confirmation on exactly the reviews they asked for in their own words; under that mode their sentence is now
+  enough. Everything else that holds a merge still holds it: what the repository itself requires (its branch rules and
+  required checks, `confirm_merge` in `.github/claw-review.yml`), failed CI, open review threads, and an earlier approval
+  or merge of the same commit that waits for the person or that they refused. Under
+  `high_risk_confirm` (the default) nothing changes: the merge waits for the person's own confirmation, at any risk.
+  The mode is read when the review starts and stored on its item and session (`merge_needs_confirmation`, now only for
+  a mode other than `fully_auto`); the router's restart reads it again. Every review the router started is marked
+  (`config.started_by_assistant`), and one started under `fully_auto` asks for the merge after all once the person has
+  left `fully_auto`. The router's answers say how each review merges from that review's own `merge_needs_confirmation`
+  (in `review_start` and `review_restart`, and on each review in its item list), never from the mode alone; it no longer
+  says it cannot change the review mode: `review_mode_set` sets `high_risk_confirm`, and `fully_auto` is still turned on
+  only by the person, in their settings. The personal agent's review-mode card names `fully_auto`
+  "全自动合入（仓库自身要求的检查仍然生效）" / "Fully automatic merge (the repository's own requirements still apply)" and
+  says it covers reviews asked for in the chat (#874).
+
+### Fixed
+
+- Sandboxes: a sandbox that waits for capacity which can come is no longer given up on after 5 minutes. When the platform
+  has admitted a sandbox and the autoscaler is not adding a node for it yet for a reason that ends on its own (every account
+  it buys nodes as is at the scheduler's per-user limit, a node is still being given back, the pool is at its limit and
+  releases an idle node, a purchase in backoff; or the pod is held at a scheduling gate), the wait is a wait for capacity,
+  like a node being added: it runs on `SANDBOX_PENDING_TIMEOUT_SECONDS` (3 hours) and is never cut short by
+  `SANDBOX_UNSCHEDULABLE_TIMEOUT_SECONDS`, which used to end every GPU run that had to queue in a burst pool with
+  `sandbox_unschedulable`. The user is told what the sandbox waits for, with the autoscaler's reason. A refusal that no
+  wait settles (no pool serves the workspace, the pod fits no node of a pool, more nodes at once than a pool may hold)
+  still ends at the 5-minute limit. A request that names its own `timeout` waits for capacity at most that timeout less
+  the new `SANDBOX_MIN_RUN_SECONDS` (default 1 hour; chart value `secret.sandboxMinRunSeconds`), because SaFE counts a
+  sandbox's lifetime from admission and a wait after it is spent out of the run's own time: a 25200-second request waits
+  up to 3 hours and keeps at least 4 hours to run (#863).
+
+- Runs: a run whose sandbox the platform had no capacity for is recorded as failed. Its turn still ends with the agent's
+  answer, but `GET /v1/runs` used to report it as `exited` with no exit code and an empty `failure_reason`, so a caller
+  could not tell it from a run that finished. It is now `failed` with the provisioning code (`sandbox_unschedulable`,
+  `sandbox_pending_timeout` or `sandbox_start_timeout`), and the terminal block has a new `failure_message` field with the platform's reason (`""` when the run recorded nothing beyond
+  its code). Task and DAG runs report the same through their callback (#863).
 
 ## [0.5.7] - 2026-11-17
 
@@ -1498,7 +1985,7 @@ The first tagged Claw release, a baseline for what was deployed on that day; eve
   good the stamped rows of sessions deleted more than that many days ago. `SESSION_RETENTION_BATCH` (default 500) bounds
   each pass; `SESSION_RETENTION_DRY_RUN=true` only logs the counts (`session_retention.dry_run`). Archiving now records
   `claw_sessions.archived_at` (a new nullable column; a session archived before it existed counts from `updated_at`).
-- A review asked of someone else (`POST /v1/assistant/reviews` with `acting_as` naming another person) is that person's: their item, their session sealed with their own keys (brought as `x-acting-as-token` and `x-acting-as-api-key`), their quota; their delegation switch is asked at creation and before every queued turn; the session runs with a fixed review profile and, on SaFE, a sandbox in `SANDBOX_CPU_NAMESPACE` created with `useWorkspaceStorage: false`; the requester sees four facts only. `POST /v1/sessions` refuses `requested_by`, `sandbox_profile`, `requester_note` and `acting_as` naming anyone but the caller (a deployment with `CLAW_ASSISTANT_REVIEW_ITEMS` off has no way to ask a review of someone else). New settings `CLAW_REVIEW_FOR_OTHERS_*`. The assistant's `review_start` refuses a review by someone else (`acting_as_credentials_required`; the user is sent to the review agent named by `CLAW_GITHUB_REVIEW_AGENT_NAME`); the requester's assistant lists the reviews they asked of others read-only (four facts), and `work_recall` / `work_stop` act on them with only those facts in the answer. A review the assistant's router starts or restarts merges nothing by itself, whatever its `merge` says: its session (`config.merge_needs_confirmation`, kept by every restart) holds its merge, and an approval GitHub's auto-merge or merge queue would turn into one, for the acting user's confirmation whatever the risk and review mode, made only from the card's button or `批准 #<ref>` / `approve #<ref>`; while auto-merge is on or the pull request is in the merge queue, such a session (and a review-only one) resolves no thread (`gh_thread_resolve` answers `auto_merge_on`).
+- A review asked of someone else (`POST /v1/assistant/reviews` with `acting_as` naming another person) is that person's: their item, their session sealed with their own keys (brought as `x-acting-as-token` and `x-acting-as-api-key`), their quota; their delegation switch is asked at creation and before every queued turn; the session runs with a fixed review profile and, on SaFE, a sandbox in `SANDBOX_CPU_NAMESPACE` created with `useWorkspaceStorage: false`; the requester sees four facts only. `POST /v1/sessions` refuses `requested_by`, `sandbox_profile`, `requester_note` and `acting_as` naming anyone but the caller (a deployment with `CLAW_ASSISTANT_REVIEW_ITEMS` off has no way to ask a review of someone else). New settings `CLAW_REVIEW_FOR_OTHERS_*`. The assistant's `review_start` refuses a review by someone else (`acting_as_credentials_required`; the user is sent to the review agent named by `CLAW_GITHUB_REVIEW_AGENT_NAME`); the requester's assistant lists the reviews they asked of others read-only (four facts), and `work_recall` / `work_stop` act on them with only those facts in the answer. A review the assistant's router starts or restarts merges nothing by itself, whatever its `merge` says: its session (`config.merge_needs_confirmation`, kept by every restart) holds its merge, and an approval GitHub's auto-merge or merge queue would turn into one, for the acting user's confirmation whatever the risk and review mode, made only from the card's button or `批准 #<ref>` / `approve #<ref>`; while auto-merge is on or the pull request is in the merge queue, such a session (and a review-only one) resolves no thread (`gh_thread_resolve` answers `auto_merge_on`). (Later changed: such a review for a person whose review mode is `fully_auto` merges once it approves, since that person has already said nobody needs to confirm their merges; see the assistant reviews entry under Unreleased.)
 - The user's long-term memory in the assistant, behind `CLAW_ASSISTANT_MEMORY_TOOLS` (`on` | `off`, default off; needs
   `CLAW_ASSISTANT_ENABLED` and `CLAW_MEMORY_ENABLED`, and the user's own opt-in). A router turn is shown the one-line
   index and offered `memory_recall`, `memory_save`, `memory_update`, `memory_forget` and `memory_undo`; each write acts only

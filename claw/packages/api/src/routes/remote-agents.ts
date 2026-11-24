@@ -26,7 +26,7 @@ import {
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_PROTOCOL_VERSION, REMOTE_AGENT_TIMING, REMOTE_COMMANDS,
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
   REMOTE_HIDDEN_INCLUDE, parseHiddenRequest, parseRemoteId, parseSessionNew, sseFrame, type RemoteCommandType,
-  REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS, parseApprovalsSetting, parseTerminalSessionOpen,
+  REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS, parseApprovalsSetting, parseTerminalMute, parseTerminalSessionOpen,
 } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED, CLAW_REMOTE_AGENTS_RETENTION_DAYS } from "../config.js";
 import { getUser } from "../auth/middleware.js";
@@ -45,6 +45,8 @@ import * as store from "../remote-agents/store.js";
 import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
 import { startTerminalWaitSweep, TERMINAL_WAIT_NOTICE_MS } from "../remote-agents/terminal-waits.js";
+import { DELIVERY_SWEEP_MS, deliveryWritesIdle, noteEventsPost, recordOutboxReport, startDeliveryHealthSweep } from "../remote-agents/delivery-health.js";
+import { metrics } from "../infra/metrics.js";
 import { closeCardsOfConnector } from "../assistant/devenv-tools.js";
 import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
@@ -79,6 +81,10 @@ export interface RemoteAgentOptions {
   offlineNoticeMs?: number;
   /** How long a conversation open in a terminal waits for its person before they are told. */
   terminalWaitNoticeMs?: number;
+  /** How often this replica sweeps delivery health (`remote-agents/delivery-health.ts`); zero or less runs no sweep. */
+  deliverySweepMs?: number;
+  /** How long a connector's events must have failed before its owner is told their replies are delayed. */
+  deliveryStallNoticeMs?: number;
   /** Pairing a machine with a one-time code (`remote-agents/pairing-routes.ts`). */
   pairing?: PairingRouteOptions;
   /**
@@ -251,6 +257,13 @@ async function serveSse(
 export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: RemoteAgentOptions = {}): Promise<void> {
   if (!CLAW_REMOTE_AGENTS_ENABLED) return;
   const waker = opts.waker ?? new Waker();
+  // The delivery-health writes the routes below leave running (`remote-agents/delivery-health.ts`) get a few seconds to land on
+  // shutdown, before the pool closes; they are advice, so a shutdown never waits longer for them.
+  app.addHook("onClose", async () => {
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([deliveryWritesIdle(), new Promise<void>((resolve) => { timer = setTimeout(resolve, 5_000); timer.unref(); })]);
+    clearTimeout(timer);
+  });
   // Every loop below is started through `startBackgroundLoops`, so CLAW_API_BACKGROUND=off starts none of them.
   const loops: BackgroundLoop<RemoteAgentBackgroundLoopName>[] = [];
   loops.push({
@@ -322,6 +335,17 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     when: presenceSweepMs > 0,
     start: () => {
       const stop = startTerminalWaitSweep({ onlineWindowMs, noticeAfterMs: opts.terminalWaitNoticeMs ?? TERMINAL_WAIT_NOTICE_MS, sweepMs: presenceSweepMs });
+      app.addHook("onClose", async () => stop());
+    },
+  });
+  // Whether each connector's events get through, and telling its owner once when they have not for two minutes (and once when
+  // they do again): `remote-agents/delivery-health.ts`. A lock makes each sweep one replica's.
+  const deliverySweepMs = opts.deliverySweepMs ?? DELIVERY_SWEEP_MS;
+  loops.push({
+    name: "remote_agents.delivery_health_sweep",
+    when: deliverySweepMs > 0,
+    start: () => {
+      const stop = startDeliveryHealthSweep({ sweepMs: deliverySweepMs, stallAfterMs: opts.deliveryStallNoticeMs });
       app.addHook("onClose", async () => stop());
     },
   });
@@ -477,6 +501,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const hb = parseHeartbeat(req.body);
     if (!hb.ok) return fail(reply, 400, hb.error);
     const undelivered = await store.recordHeartbeat(connector.connector_id, owner, hb.value);
+    // What its outbox holds (`remote-agents/delivery-health.ts`): advice, written off the request path, never a reason to fail or
+    // hold up the heartbeat that carries it.
+    recordOutboxReport(String(connector.connector_id), owner, hb.value.outbox);
     await sayUndelivered(undelivered, (sid) => waker.wake(`s:${sid}`));
     // Below the recommended version the answer says so, with the command that upgrades it; a connector may print it.
     const verdict = versionVerdict(hb.value.version ?? (connector.version as string | null));
@@ -492,10 +519,28 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const connector = await ownConnector(req, reply, owner);
     if (!connector) return;
     const batch = parseEventBatch(req.body);
-    if (!batch.ok) return fail(reply, 400, batch.error);
+    if (!batch.ok) {
+      metrics.onRemoteEventsPost("client_error");
+      return fail(reply, 400, batch.error);
+    }
     // Second line of defence behind the connector's own scrub of what leaves the machine.
     const events = batch.value.events.map((e) => ({ ...e, data: redactPublicJson(e.data) as Record<string, unknown> }));
-    const result = await store.ingestEvents(connector as { connector_id: string; owner_user_id: string }, events, getAuthMethod(req));
+    const cid = String(connector.connector_id);
+    let result: Awaited<ReturnType<typeof store.ingestEvents>>;
+    try {
+      result = await store.ingestEvents(connector as { connector_id: string; owner_user_id: string }, events, getAuthMethod(req));
+    } catch (err) {
+      // Answered with a 5xx, which the connector retries: counted per connector (`delivery-health.ts`), so a batch that fails
+      // every time is seen as the stall it is, by its owner and by the alert rules, instead of only in a log line per retry.
+      metrics.onRemoteEventsPost("server_error");
+      const code = typeof (err as { code?: unknown })?.code === "string" ? `pg_${(err as { code: string }).code}` : "error";
+      // Written off the request path: the answer never waits on its own observation.
+      noteEventsPost(cid, owner, { ok: false, error: code });
+      throw err;
+    }
+    metrics.onRemoteEventsPost("ok");
+    // A batch that carried something got through; an empty one (no event to move) is no evidence either way.
+    if (batch.value.events.length || batch.value.rejected.length) noteEventsPost(cid, owner, { ok: true });
     for (const sid of result.touched) waker.wake(`s:${sid}`);
     // The assistant's view of the work (`assistant/remote-items.ts`): after the events are stored, and never a reason to refuse them.
     // Every session the batch was for, not only those that gained an event: a retry of a batch whose events were stored but not
@@ -503,6 +548,10 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const posted = [...new Set([...result.touched, ...Object.keys(result.acked)])];
     if (posted.length) await noteRemoteEvents(owner, posted);
     const rejected = [...batch.value.rejected, ...result.rejected].sort((a, b) => a.index - b.index);
+    // Refused because the database could not hold it (`store.insertEvents`): the rest of the batch was stored. Named by number only.
+    for (const r of result.rejected) {
+      if (r.reason === "unstorable") logger.warn({ owner, connectorId: connector.connector_id, sessionId: r.session_id, seq: r.seq }, "remote_agents.event_unstorable");
+    }
     return reply.send({ ok: true, data: { batch_id: batch.value.batchId, acked: result.acked, rejected } });
   });
 
@@ -518,6 +567,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (out.status !== "opened") {
       if (out.status === "gone") return fail(reply, 401, "revoked");
       if (out.status === "approvals_off") return fail(reply, 409, "approvals_off");
+      if (out.status === "session_muted") return fail(reply, 409, "session_muted");
       if (out.status === "agent_not_found") return fail(reply, 404, "agent_not_found");
       return fail(reply, 429, "rate_limited");
     }
@@ -539,6 +589,17 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!body.ok) return fail(reply, 400, body.error);
     await store.setApprovalsEnabled(owner, body.value.enabled, clientLabel(req));
     return reply.send({ ok: true, data: { enabled: body.value.enabled } });
+  });
+
+  // One conversation open in a terminal, named by its work item (`#<seq>`): its pushes muted or back on (`store.setTerminalMute`).
+  app.put("/v1/remote-agents/approvals/mutes", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    const body = parseTerminalMute(req.body);
+    if (!body.ok) return fail(reply, 400, body.error);
+    const out = await store.setTerminalMute(owner, body.value.item, body.value.muted, clientLabel(req));
+    if (out.status !== "ok") return out.status === "not_found" ? fail(reply, 404, "item_not_found") : fail(reply, 409, "not_a_terminal_item");
+    return reply.send({ ok: true, data: { item: out.seq, muted: out.muted, machine: out.machine, title: out.title } });
   });
 
   app.get<{ Params: { cid: string }; Querystring: { after?: string } }>(
@@ -753,6 +814,9 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     // (a withdraw sent right after a prompt takes that prompt back) and the item counts them in that order.
     const ordered = type === "prompt" || type === "cancel" || type === "withdraw";
     const out = ordered ? await inRemoteSessionOrder(sessionId, send) : await send();
+    // `files`: how many files the prompt carries on to the machine, so a client can tell a Claw that took them from one
+    // that knows no `files` field (and dropped them unread).
+    const files = type === "prompt" ? { files: ((parsed.value as { files?: unknown[] }).files ?? []).length } : {};
     if (out.status === "rate_limited") return fail(reply, 429, "rate_limited");
     if (out.status === "gone") return notFound(reply);
     if (out.status === "terminal_hook_session") return fail(reply, 409, "terminal_hook_session");
@@ -760,11 +824,15 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       const same = out.row.type === type && out.row.session_id === sessionId
         && (type !== "decision" || out.row.payload?.option_id === (parsed.value as { option_id: string }).option_id);
       if (!same) return fail(reply, 409, type === "decision" ? "already_decided" : "idempotency_key_reused");
-      return reply.send({ ok: true, data: { cmd_id: cmdId, duplicate: true } });
+      // (a repeat says the files too, as many as the original carried, not this request: a client that lost the first answer
+      // still learns whether they were taken, and a repeat that adds files is not told they went)
+      const kept = out.row.payload?.files;
+      const original = type === "prompt" ? { files: Array.isArray(kept) ? kept.length : 0 } : {};
+      return reply.send({ ok: true, data: { cmd_id: cmdId, duplicate: true, ...original } });
     }
     waker.wake(`c:${session.connector_id}`);
     return reply.status(202).send({
-      ok: true, data: { cmd_id: cmdId, cmd_seq: Number(out.row.cmd_seq), connector_online: !!connector.online },
+      ok: true, data: { cmd_id: cmdId, cmd_seq: Number(out.row.cmd_seq), connector_online: !!connector.online, ...files },
     });
   }
 

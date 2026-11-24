@@ -7,7 +7,7 @@ import cookie from "@fastify/cookie";
 import multipart from "@fastify/multipart";
 import {
   API_PORT, APP_ENV, SAFE_API_URL, DATABASE_URL, resolveCorsOrigin,
-  AUTH_INTERNAL_TOKEN, NATS_URL,
+  AUTH_INTERNAL_TOKEN, NATS_URL, isIdentityAuthProvider, LLM_KEY_SOURCE,
   CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY, CLAW_NOTIFICATIONS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY, CLAW_SKILL_AUTO_EVOLUTION_ENABLED, CLAW_USER_SKILLS_ENABLED, SESSION_AUTO_ARCHIVE_DAYS,
   SESSION_PURGE_DAYS, SESSION_RETENTION_BATCH, SESSION_RETENTION_DAYS, SESSION_RETENTION_DRY_RUN,
   SESSION_RETENTION_HOLD_BUDGET_SEC, SESSION_RETENTION_LOCK_RETRY_MIN,
@@ -22,6 +22,7 @@ import { initNats, nc as natsConnection } from "./infra/nats.js";
 import { initUserEnvCrypto } from "./crypto/user-env.js";
 import { authLogPath, authMiddleware } from "./auth/middleware.js";
 import { startIdentityClient } from "./auth/identity.js";
+import { identityAuthMissingSettings, identityKeySourceProblem } from "./startup/identity-auth.js";
 import { registerSessionRoutes } from "./routes/sessions.js";
 import { registerSessionDeliveryRoutes } from "./routes/session-deliveries.js";
 import { registerAnswerFeedbackRoutes } from "./routes/answer-feedback.js";
@@ -45,7 +46,9 @@ import { registerTriggerMcpRoutes } from "./triggers/mcp.js";
 import { assertTriggerToolsConfig } from "./triggers/token.js";
 import { registerNotificationSubscriptionRoutes } from "./routes/notification-subscriptions.js";
 import { registerRemoteAgentRoutes } from "./routes/remote-agents.js";
-import { deliverNotificationsOnRequest, startNotificationWorker, stopNotificationDelivery } from "./notifications/outbox.js";
+import {
+  deliverNotificationsOnRequest, registerNotificationMetrics, startNotificationWorker, stopNotificationDelivery,
+} from "./notifications/outbox.js";
 import { registerAssistantDeliveryHook } from "./assistant/outbound.js";
 import { registerHoldDeliveryHook } from "./assistant/holds.js";
 import { a2aPushEnabled } from "./routes/a2a-flags.js";
@@ -85,7 +88,8 @@ import { startPluginExpirySweeper } from "./marketplace/plugin-expiry.js";
 import { archiveIdleSessions } from "./sessions/archive.js";
 import { DEFAULT_RETENTION_RUN, runSessionRetentionOnce } from "./sessions/retention.js";
 import { cleanupOrphanSkillFiles, cleanupOldPatterns, cleanupExpiredSkillDrafts, cleanupOldSkillChanges } from "./marketplace/skill-service.js";
-import { registry as metricsRegistry } from "./infra/metrics.js";
+import { metrics, registry as metricsRegistry } from "./infra/metrics.js";
+import { sampleDeliveryHealth } from "./remote-agents/delivery-health.js";
 import { assertRolloutConfigAtStartup } from "./startup/rollout-config.js";
 import { apiBackgroundLoops, logBackgroundOff, startBackgroundLoops } from "./startup/background.js";
 import pino from "pino";
@@ -158,6 +162,28 @@ function assertNoSharedIdentityBypass(): void {
 }
 
 /**
+ * Refuse identity auth without LLM_KEY_SOURCE=platformKey: IdentityVerifier leaves
+ * virtualKey empty, so virtualKey mode would silently fall back to the deployment key.
+ */
+function assertIdentityUsesPlatformKey(): void {
+  const problem = identityKeySourceProblem(isIdentityAuthProvider(), LLM_KEY_SOURCE);
+  if (problem === null) return;
+  logger.error({ LLM_KEY_SOURCE }, "startup.identity_requires_platform_key");
+  throw new Error(problem);
+}
+
+/**
+ * Refuse identity auth outside dev mode without the identity client and a usable identity URL:
+ * without them every request is answered 500.
+ */
+function assertIdentityAuthConfig(): void {
+  const missing = identityAuthMissingSettings(isIdentityAuthProvider(), APP_ENV, process.env);
+  if (missing.length === 0) return;
+  logger.error({ missing }, "startup.identity_auth_refused");
+  throw new Error(`CLAW_AUTH_PROVIDER=identity cannot authenticate without: ${missing.join(", ")}`);
+}
+
+/**
  * Refuse to serve when the timings that decide a run is dead disagree.
  *
  * Fatal rather than a warning, for the same reason an incomplete schema is: the
@@ -221,6 +247,8 @@ async function main() {
     logBackgroundOff(logger);
   }
   assertNoSharedIdentityBypass();
+  assertIdentityUsesPlatformKey();
+  assertIdentityAuthConfig();
   assertRunLeaseTiming();
   assertAssistantTokenKey(CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_TOKEN_KEY);
   assertTriggerToolsConfig(CLAW_TRIGGER_TOOLS_ENABLED, CLAW_TRIGGERS_ENABLED, CLAW_TRIGGER_TOOLS_TOKEN_KEY);
@@ -349,6 +377,9 @@ async function main() {
     return { status: "ok", service: "api-v2" };
   });
 
+  // The delivery gauges (`claw_delivery_backlog_*`, the stalled connectors, the failing subscriptions) read the database on a
+  // scrape: `remote-agents/delivery-health.ts`. Every replica reads the same numbers; the alert rules take max().
+  metrics.setDeliverySampler(() => sampleDeliveryHealth());
   // Prometheus scrape endpoint (text/plain Prom exposition).
   app.get("/metrics", async (_req, reply) => {
     reply.type(metricsRegistry.contentType);
@@ -416,6 +447,8 @@ async function main() {
   // Scheduled triggers: nothing is registered unless the deployment turns them on.
   if (CLAW_TRIGGERS_ENABLED) await registerTriggerRoutes(app);
 
+  // The outbox gauges read the table, so every replica that has it reports them, whether or not it delivers.
+  if (CLAW_NOTIFICATIONS_ENABLED) registerNotificationMetrics();
   // The assistant's messages go out through the same outbox, so both switches have to be on. Hooks, not loops: they run
   // when this process delivers, which with CLAW_API_BACKGROUND=off it does not.
   if (CLAW_NOTIFICATIONS_ENABLED && CLAW_ASSISTANT_ENABLED) registerAssistantDeliveryHook();

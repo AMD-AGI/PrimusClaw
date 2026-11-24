@@ -8,6 +8,7 @@ import type { DispatchInput } from "../src/sessions/dispatch.js";
 import type { Harness } from "./scenario-harness.js";
 
 process.env.CLAW_DEPLOY_MODE = "safe";
+process.env.CLAW_AUTH_PROVIDER = "safe";
 process.env.LLM_KEY_SOURCE = "virtualKey";
 
 const { db } = await import("../src/infra/db.js");

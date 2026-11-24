@@ -40,6 +40,64 @@ test("a prompt's audit record carries a hash and a length, never the text", () =
   assert.equal(audit.sha256, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
 });
 
+test("a prompt may carry files: safe names, media types and base64 bytes, within the limits", () => {
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64");
+  const ok = REMOTE_COMMANDS.prompt.parse({
+    text: "look",
+    files: [
+      { name: "image-1.png", media_type: "image/png", data: png },
+      { name: "report v2.pdf", media_type: "application/pdf", data: "JVBERi0=" },
+    ],
+  });
+  assert.deepEqual(ok, {
+    ok: true,
+    value: {
+      text: "look",
+      files: [
+        { name: "image-1.png", media_type: "image/png", data: png },
+        { name: "report v2.pdf", media_type: "application/pdf", data: "JVBERi0=" },
+      ],
+    },
+  });
+  // no files, or an empty list: the prompt is as it always was
+  assert.deepEqual(REMOTE_COMMANDS.prompt.parse({ text: "x", files: [] }), { ok: true, value: { text: "x" } });
+  const file = { name: "a.txt", media_type: "text/plain", data: "eA==" };
+  const big = "A".repeat(Math.ceil((REMOTE_AGENT_LIMITS.maxPromptFileBytes + 3) / 3) * 4);
+  const bad: Array<[string, unknown, string]> = [
+    ["not a list", { a: 1 }, "invalid_files"],
+    ["too many", Array.from({ length: REMOTE_AGENT_LIMITS.maxPromptFiles + 1 }, (_, i) => ({ ...file, name: `f${i}` })), "invalid_files"],
+    ["a path", [{ ...file, name: "../etc/passwd" }], "invalid_file_name"],
+    ["a dot file", [{ ...file, name: ".bashrc" }], "invalid_file_name"],
+    ["the parent", [{ ...file, name: ".." }], "invalid_file_name"],
+    ["a directory", [{ ...file, name: "a/b.txt" }], "invalid_file_name"],
+    ["a line break", [{ ...file, name: "a\nb.txt" }], "invalid_file_name"],
+    ["two of one name", [file, file], "invalid_file_name"],
+    ["two names that differ only in case", [file, { ...file, name: file.name.toUpperCase() }], "invalid_file_name"],
+    ["no type", [{ ...file, media_type: "" }], "invalid_file_media_type"],
+    ["not base64", [{ ...file, data: "eA=?" }], "invalid_file_data"],
+    ["empty", [{ ...file, data: "" }], "invalid_file_data"],
+    ["over the bytes", [{ ...file, data: big }], "files_too_large"],
+  ];
+  for (const [label, files, error] of bad) {
+    assert.deepEqual(REMOTE_COMMANDS.prompt.parse({ text: "x", files }), { ok: false, error }, label);
+  }
+});
+
+test("a prompt's audit record names its files by name, type, size and hash, never their bytes", () => {
+  const spec = REMOTE_COMMANDS.prompt;
+  const parsed = spec.parse({ text: "hi", files: [{ name: "a.txt", media_type: "text/plain", data: "aGVsbG8=" }] });
+  assert.ok(parsed.ok);
+  assert.deepEqual(spec.audit(parsed.value).files, [
+    {
+      name: "a.txt",
+      media_type: "text/plain",
+      size: 5,
+      sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+    },
+  ]);
+  assert.ok(!JSON.stringify(spec.audit(parsed.value)).includes("aGVsbG8="));
+});
+
 test("command parsers", () => {
   const table: Array<[string, Record<string, unknown>, boolean, unknown?]> = [
     ["prompt", { text: "hi" }, true, { text: "hi" }],

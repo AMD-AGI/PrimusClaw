@@ -234,4 +234,38 @@ describe("an app run closed before it reached finishing is finished by the sweep
     assert.equal(exit.cause, "row_terminal");
     assert.equal(exit.recovery, true, "the reader sandbox is not made a second time");
   });
+
+  test("the platform losses counted so far are carried into the finish, and the run still shows them once ended", async () => {
+    await seed({
+      status: "cancelled", runState: "running",
+      lastExit: { at: "2026-11-06T10:00:00Z", cause: "sandbox_lost", final: false, returncode: null, platform_losses: 2 },
+    });
+    await sql("UPDATE claw_app_runs SET restarts = 3 WHERE task_id = 'app-1'");
+    await sql("UPDATE claw_tasks SET completed_at = NOW()");
+    await aged(grace + 5);
+    assert.equal(await sweeper.finishAbandonedAppRuns(), 1);
+    const exit = (await run()).last_exit;
+    assert.deepEqual(Object.keys(exit).sort(), ["at", "cause", "final", "platform_losses"]);
+    assert.equal(exit.cause, "row_terminal");
+    assert.equal(exit.platform_losses, 2, "the count is not reset by the sweeper's rewrite");
+
+    const { appRunStatusOf } = await import("../src/tasks/app-run-status.js");
+    const row = (await sql(`SELECT task_id, state, restarts, last_exit, sandbox_workload_id, sandbox_state, sandbox_since
+                              FROM claw_app_runs WHERE task_id = 'app-1'`))[0];
+    const shown = appRunStatusOf(row);
+    assert.deepEqual(
+      { restarts: shown.restarts, crash_restarts: shown.crash_restarts, platform_losses: shown.platform_losses },
+      { restarts: 5, crash_restarts: 3, platform_losses: 2 },
+    );
+  });
+
+  for (const bad of [null, "2", true, { n: 2 }]) {
+    test(`a platform_losses that is not a number (${JSON.stringify(bad)}) is not carried`, async () => {
+      await seed({ status: "cancelled", runState: "running", lastExit: { at: "2026-11-06T10:00:00Z", cause: "exit", final: false, platform_losses: bad } });
+      await sql("UPDATE claw_tasks SET completed_at = NOW()");
+      await aged(grace + 5);
+      assert.equal(await sweeper.finishAbandonedAppRuns(), 1);
+      assert.deepEqual(Object.keys((await run()).last_exit).sort(), ["at", "cause", "final"]);
+    });
+  }
 });

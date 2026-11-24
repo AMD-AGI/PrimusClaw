@@ -8,8 +8,9 @@
  */
 import assert from "node:assert/strict";
 
-import type { InboundMessage, InboundQuote, UserRef } from "@primusclaw/personal-agent";
+import type { InboundFile, InboundForward, InboundMessage, InboundQuote, UserRef } from "@primusclaw/personal-agent";
 
+import { forwardBlock } from "../../../src/inbound-text/forward-block.js";
 import { quoteBlock, withQuote } from "../../../src/inbound-text/quote-block.js";
 import type { RouterLimits } from "../../../src/routing/deps.js";
 import type { AssistantChat } from "../../../src/routing/features.js";
@@ -27,7 +28,16 @@ export interface Routed {
   readonly rw: RemoteWorld;
   readonly r: World;
   /** One message through the router, then until the remote agents are quiet. */
-  say(text: string, options?: { user?: UserRef; group?: boolean; quotes?: readonly InboundQuote[] }): Promise<void>;
+  say(
+    text: string,
+    options?: {
+      user?: UserRef;
+      group?: boolean;
+      quotes?: readonly InboundQuote[];
+      forwards?: readonly InboundForward[];
+      files?: readonly InboundFile[];
+    },
+  ): Promise<void>;
   /** The sender's chat as the remote agents key it. */
   attachedSession(user?: UserRef): string | null;
 }
@@ -42,7 +52,11 @@ export function routed<T>(
       surface: rw.surface,
       testStore: rw.test,
       remoteChat: rw.remote,
-      messageText: { quoteBlock: (m, group) => quoteBlock(m.quotes, { group }), withQuote },
+      messageText: {
+        quoteBlock: (m, group) =>
+          [forwardBlock(m.forwards ?? [], { group }), quoteBlock(m.quotes, { group })].filter(Boolean).join("\n\n"),
+        withQuote,
+      },
       handlers: { clicks: [rw.remote.clickHandler] }, // (as the worker registers the remote agents' buttons)
       ...(options.assistant ? { assistant: options.assistant } : {}),
       ...(options.limits ? { limits: options.limits } : {}),
@@ -50,7 +64,12 @@ export function routed<T>(
     for (const [userId, key] of Object.entries(KEY_OF)) link(r, userId, key);
     const say: Routed["say"] = async (text, o = {}) => {
       const base = message(text, { ...(o.user ? { user: o.user } : {}), ...(o.group ? { kind: "group" } : {}) });
-      const m: InboundMessage = o.quotes ? { ...base, quotes: o.quotes } : base;
+      const m: InboundMessage = {
+        ...base,
+        ...(o.quotes ? { quotes: o.quotes } : {}),
+        ...(o.forwards ? { forwards: o.forwards } : {}),
+        ...(o.files ? { files: o.files } : {}),
+      };
       await r.router.handle(m);
       await rw.idle();
     };

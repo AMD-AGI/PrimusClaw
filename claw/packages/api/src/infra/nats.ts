@@ -133,6 +133,22 @@ const SYSTEM_ENV_TTL_MS = 0;
  */
 export const EVENT_STREAM_RETENTION_MS = 24 * 3600 * 1000;
 
+/**
+ * The shortest duplicate window the event stream is allowed to have.
+ *
+ * Almost every event is published without a deduplication id, and an event
+ * without one is never tracked, so this costs nothing for them. The ones that
+ * carry an id are the notices of a quarantined queued message
+ * (tasks/pending-quarantine.ts), which are retried for minutes: a publish that
+ * reached the stream and lost its acknowledgement is published again under the
+ * same id, and only a window that still remembers the first copy drops the
+ * second. NATS's default window is two minutes, shorter than that retry span,
+ * so the notice retry stops well inside this window
+ * (`QUARANTINE_NOTICE_RETRY_HORIZON_SEC`), never after it. Like the retention
+ * it is a lower bound: `ensureStream` widens a narrower window and keeps a wider one.
+ */
+export const EVENT_STREAM_DUPLICATE_WINDOW_MS = 60 * 60 * 1000;
+
 /** What the event stream keeps, and whether the server said so. */
 export interface EventStreamRetention {
   /** Milliseconds, or `null` when the stream never expires. */
@@ -235,9 +251,10 @@ export function tombstoneTtlMs(
  * already has: whatever the first copy is going to do it is going to do, and
  * anything the caller tore down on the way out is torn down under it.
  *
- * Only two answers are certain, and both come from the server having answered.
+ * Only three answers are certain. Two come from the server having answered:
  * `503` is nobody answering at all, so nothing was stored; an `api_error` is
- * the server declining, and it says why. Everything else -- timeouts, a
+ * the server declining, and it says why. The third is the client refusing a
+ * payload over the server's `max_payload` before sending it. Everything else -- timeouts, a
  * connection that went away mid-request -- is unknown, and is reported as
  * unknown rather than guessed, because the two guesses are not symmetric: one
  * leaves a spare row behind, the other loses the message.
@@ -274,7 +291,74 @@ export async function taskDeliverySettlement(): Promise<
 
 export function publishCertainlyFailed(err: unknown): boolean {
   const e = err as { code?: string; api_error?: unknown } | null;
-  return e?.code === "503" || e?.api_error !== undefined;
+  // A third certain answer, and the only one that comes from this side: the
+  // client checks the size against the server's `max_payload` before it writes
+  // a byte, and refuses with MAX_PAYLOAD_EXCEEDED, so nothing went out. Read as
+  // unknown it left the run open on every attempt, so a queued message too large
+  // to send was never settled and never counted towards its quarantine.
+  return e?.code === "503" || e?.code === "MAX_PAYLOAD_EXCEEDED" || e?.api_error !== undefined;
+}
+
+/**
+ * The NATS client's codes for a request that found nobody to answer it: no
+ * stream responding on the subject (`503`), no reply in time, or no connection
+ * to send it on.
+ */
+const NATS_UNREACHABLE_CODES = new Set([
+  "503", "TIMEOUT", "CONNECTION_REFUSED", "CONNECTION_CLOSED", "CONNECTION_TIMEOUT", "DISCONNECT",
+  "CONNECTION_DRAINING",
+]);
+
+/**
+ * Whether a failure says NATS could not be reached, and nothing about what was
+ * being sent.
+ *
+ * Every queued message on a cluster fails the same way while NATS is away, and
+ * passes again when it is back, so such a failure is no evidence that a
+ * message is the one that cannot be sent (tasks/pending-quarantine.ts). Only
+ * errors from the NATS client itself: a database or application error that
+ * happens to carry one of these codes says nothing about NATS.
+ *
+ * This is not the same question as `publishCertainlyFailed`: a timeout means
+ * NATS did not answer, and says nothing about whether the message was stored.
+ *
+ * Nor is a `TIMEOUT` by itself proof that NATS is away: a request can time out
+ * on a server that answers everything else. A caller that counts failures
+ * against what it sent asks `natsStreamsAnswer` before it lets one go uncounted.
+ */
+export function natsUnreachable(err: unknown): boolean {
+  const e = err as { name?: unknown; code?: unknown } | null | undefined;
+  return e?.name === "NatsError" && typeof e.code === "string" && NATS_UNREACHABLE_CODES.has(e.code);
+}
+
+/** How long `natsStreamsAnswer` waits for each stream before it reads NATS as away. */
+const STREAMS_PROBE_TIMEOUT_MS = 3_000;
+
+/**
+ * Whether both streams the API publishes to answer right now: the connection is
+ * open and JetStream returns each stream's info in time.
+ *
+ * What tells a `TIMEOUT` that says NATS is away from one that says something
+ * about the request that timed out. A publish while the server is down or the
+ * client is reconnecting times out like any other, and so does this probe; a
+ * publish that times out while the probe is answered is the request's own.
+ */
+export async function natsStreamsAnswer(timeoutMs = STREAMS_PROBE_TIMEOUT_MS): Promise<boolean> {
+  if (!nc || !jsm || nc.isClosed()) return false;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      Promise.all([jsm.streams.info(TASK_STREAM), jsm.streams.info(EVENT_STREAM)]),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("streams probe timed out")), timeoutMs);
+      }),
+    ]);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -315,7 +399,7 @@ export async function initNats(): Promise<void> {
 
   await ensureStream(
     jsm, EVENT_STREAM, ["events.>"], EVENT_STREAM_RETENTION_MS * 1_000_000,
-    0, EVENT_STREAM_REPLICAS,
+    EVENT_STREAM_DUPLICATE_WINDOW_MS * 1_000_000, EVENT_STREAM_REPLICAS,
   );
   // Read back here, ahead of the bucket that is sized from it, because no later
   // start corrects a bucket sized from the constant instead. What would be wrong

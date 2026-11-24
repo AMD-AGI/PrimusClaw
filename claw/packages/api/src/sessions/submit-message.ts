@@ -48,6 +48,7 @@ import { workspaceSaveHeldSql } from "./save-hold.js";
 import { drainOldestPendingMessage } from "../events/consumer.js";
 import { DRAIN_UNDER_WAY_SQL } from "./drain-claim.js";
 import { dispatchTaskToBrain, newChatMessageId } from "./dispatch.js";
+import { storableJson, storableText } from "@claw/utils";
 
 // The name the route logged these records under before they moved, so a filter an
 // operator already has keeps matching them.
@@ -198,26 +199,32 @@ export async function insertPendingMessage(
   q: StatementRunner,
   row: PendingMessageRow,
 ): Promise<{ id: number | null; deduplicated: boolean }> {
+  // Every value is made storable here, at the one statement that writes the
+  // queue: a NUL or a lone surrogate anywhere in the request fails the whole
+  // insert (see @claw/utils storable.ts), so a message carrying one would be
+  // refused outright rather than queued. U+FFFD in its place is what the user
+  // sees of that character, and nothing else in the request changes.
+  const optional = <T>(value: T): T => (typeof value === "string" ? storableText(value) : value) as T;
   const params: unknown[] = [
     row.sessionId,
-    row.content,
-    row.userId,
+    storableText(row.content),
+    storableText(row.userId),
     row.pluginId ?? null,
     JSON.stringify(row.toolIds.length ? row.toolIds : []),
-    row.workspaceId ?? null,
-    row.secrets.platform,
-    row.secrets.llm,
-    row.secrets.blob,
-    row.image ?? null,
-    row.resource ? JSON.stringify(row.resource) : null,
+    optional(row.workspaceId ?? null),
+    optional(row.secrets.platform),
+    optional(row.secrets.llm),
+    optional(row.secrets.blob),
+    optional(row.image ?? null),
+    row.resource ? JSON.stringify(storableJson(row.resource)) : null,
     row.timeout ?? null,
-    JSON.stringify(row.secrets.userEnv),
-    JSON.stringify(row.sessionEnv),
-    row.topology ? JSON.stringify(row.topology) : null,
-    row.toolsAllowlist?.length ? JSON.stringify(row.toolsAllowlist) : null,
+    JSON.stringify(storableJson(row.secrets.userEnv)),
+    JSON.stringify(storableJson(row.sessionEnv)),
+    row.topology ? JSON.stringify(storableJson(row.topology)) : null,
+    row.toolsAllowlist?.length ? JSON.stringify(storableJson(row.toolsAllowlist)) : null,
   ];
   const keyed = row.dedupeKey !== undefined;
-  if (keyed) params.push(row.dedupeKey);
+  if (keyed) params.push(optional(row.dedupeKey));
   const inserted = await q.query(
     "INSERT INTO claw_pending_messages (session_id, content, user_id, plugin_id, tool_ids, workspace_id, platform_key, llm_api_key, credentials_blob, image, resources, timeout, user_env, session_env, topology, tools_allowlist"
     + (keyed ? ", dedupe_key" : "")

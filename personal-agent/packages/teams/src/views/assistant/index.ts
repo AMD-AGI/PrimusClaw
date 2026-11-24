@@ -256,7 +256,10 @@ function confirmWrite(model: ConfirmWriteModel): TeamsMessage {
     execute(title, `primusclaw.assistant_confirm_${op}`, { primusclaw: "assistant_confirm", op, card: model.cardId });
   return message(
     [header(t.confirmTitle, { tone: "warning", emoji: "needs_you" }), text(model.text)],
-    buttons([button(model.allowLabel || t.confirm, "allow"), button(t.deny, "deny")]),
+    buttons([
+      button(model.allowLabel || t.confirm, "allow"),
+      button(model.kind === "github_merge" ? t.denyMerge : t.deny, "deny"),
+    ]),
   );
 }
 

@@ -44,25 +44,32 @@ test("the reviewer hears that only a review was asked of them", async () => {
   assert.ok(!bob.includes("合入前会先请你确认"));
 });
 
-test("a reviewer without github who cannot be reached is asked for where the request was made", async () => {
+test("a reviewer without github who cannot be reached is asked for where the request was made, by the step left", async () => {
   const world = reviewWorld();
   world.identity.know("aad-b", "u-bob", null);
   (world.surface as unknown as { reachable: Set<string> }).reachable = new Set(["aad-a"]);
   await ask(world, `请 {Bob} 帮我 review 合入 ${PR}`);
   const said = saidIn(world.surface, CONV);
   assert.ok(
-    said.includes("Bob 还没有绑定 GitHub，我没能私信 Bob；请 Bob 在 1:1 里给我发 `/github bind`，之后你再 @ 我一次。"),
+    said.includes(
+      "Bob 还不能被我代审：还差第 2 步「发 `/github bind` 连接 GitHub」（共 3 步：1. 连接 Primus 账号；2. 发 `/github bind` 连接 GitHub；3. 发 `/github auto-merge on` 开启代审授权），所以没有开始 review。我没能私信 Bob；请 Bob 在 1:1 里给我发任意一条消息，我会告诉 TA 剩下的步骤，全部完成后我会在这个群里告诉你。",
+    ),
     said,
   );
   assert.equal(world.started.length, 0);
 });
 
-test("in a 1:1 chat a reviewer without github is asked for with send it again", async () => {
+test("in a 1:1 chat the asker hears which step the reviewer has left and that the news comes back here", async () => {
   const world = reviewWorld();
   world.identity.know("aad-b", "u-bob", null);
   await ask(world, `请 Bob 帮我 review 合入 ${PR}`, "personal");
   const said = saidIn(world.surface, "personal:aad-a");
-  assert.ok(said.includes("Bob 还没有绑定 GitHub，我已私信 TA 说明绑定方式；绑定后请再发一次。"), said);
+  assert.ok(
+    said.includes(
+      "还差第 2 步「发 `/github bind` 连接 GitHub」（共 3 步：1. 连接 Primus 账号；2. 发 `/github bind` 连接 GitHub；3. 发 `/github auto-merge on` 开启代审授权），所以没有开始 review。我已私信 TA 这几步；TA 每完成一步我会提示下一步，全部完成后我会在这里告诉你，点一下就能按原请求重新发起。",
+    ),
+    said,
+  );
   const bob = saidIn(world.surface, "personal:aad-b");
   assert.ok(bob.includes("Alice asked me to review and merge") && !bob.includes("in a group chat"), bob);
 });

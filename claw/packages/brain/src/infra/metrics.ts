@@ -608,6 +608,64 @@ const watchdogLastTickAgeSeconds = new Gauge({
   registers: [registry],
 });
 
+// ─── agent_done delivery health ───────────────────────────────────────
+// A result that cannot be delivered holds its task's JetStream message (and on
+// a claimed doorbell, its row) until it lands or is given up on, so these three
+// say whether results are flowing: every failed attempt by HTTP status (or
+// "network"), how many attempts in a row have failed on this pod with no
+// success between them, and how long the oldest undelivered result has been
+// waiting. A result the API refused outright is quarantined and counted.
+const agentDoneFailuresTotal = new Counter({
+  name: "claw_brain_agent_done_failures_total",
+  help: "agent_done callback attempts that did not succeed, by HTTP status or \"network\".",
+  labelNames: ["status"] as const,
+  registers: [registry],
+});
+let agentDoneConsecutive = 0;
+new Gauge({
+  name: "claw_brain_agent_done_consecutive_failures",
+  help: "agent_done callback attempts that have failed in a row on this pod since the last one that succeeded.",
+  registers: [registry],
+  collect() { this.set(agentDoneConsecutive); },
+});
+const agentDoneQuarantinedTotal = new Counter({
+  name: "claw_brain_agent_done_quarantined_total",
+  help: "Task results the API refused to store, set aside with a durable record instead of being redelivered, by reason.",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+/**
+ * Results this pod is trying to deliver, by task, since when.
+ *
+ * `seenMs` lets an entry be forgotten once nothing has tried it for a while: a
+ * nak hands the message to whichever replica pulls it next, so the pod that
+ * last failed it may never hear how it ended.
+ */
+const agentDonePending = new Map<string, { sinceMs: number; seenMs: number }>();
+export const AGENT_DONE_PENDING_FORGET_MS = 10 * 60_000;
+new Gauge({
+  name: "claw_brain_agent_done_oldest_pending_seconds",
+  help: "Age of the oldest task result this pod has tried and not yet delivered or quarantined; 0 when none.",
+  registers: [registry],
+  collect() { this.set(oldestAgentDonePendingSeconds()); },
+});
+
+export function oldestAgentDonePendingSeconds(now = Date.now()): number {
+  let oldest = now;
+  for (const [taskId, entry] of agentDonePending) {
+    if (now - entry.seenMs > AGENT_DONE_PENDING_FORGET_MS) {
+      agentDonePending.delete(taskId);
+      continue;
+    }
+    oldest = Math.min(oldest, entry.sinceMs);
+  }
+  return Math.max(0, (now - oldest) / 1000);
+}
+
+export function agentDoneConsecutiveFailures(): number {
+  return agentDoneConsecutive;
+}
+
 // The brain's own poison guard firing, one delivery before NATS would have
 // dropped the task. Split by reason because the two demand opposite responses:
 // "max_retries_exceeded" is a task that keeps failing and wants a root cause,
@@ -1176,6 +1234,28 @@ export const metrics = {
   },
   onResumeNoticeFiltered(): void {
     resumeNoticeFilteredTotal.inc();
+  },
+  /** An attempt at delivering `taskId`'s result is starting; `sinceMs` is when the result was first stored. */
+  onAgentDonePending(taskId: string | undefined, sinceMs?: number, now = Date.now()): void {
+    if (!taskId) return;
+    const prior = agentDonePending.get(taskId);
+    const since = Math.min(prior?.sinceMs ?? now, sinceMs ?? now);
+    agentDonePending.set(taskId, { sinceMs: since, seenMs: now });
+  },
+  onAgentDoneFailedAttempt(status: string): void {
+    agentDoneFailuresTotal.inc({ status });
+    agentDoneConsecutive++;
+  },
+  onAgentDoneDelivered(taskId: string | undefined): void {
+    agentDoneConsecutive = 0;
+    if (taskId) agentDonePending.delete(taskId);
+  },
+  /** Given up on without a delivery (refused, then quarantined): no longer pending, and not a success. */
+  onAgentDoneSettled(taskId: string | undefined): void {
+    if (taskId) agentDonePending.delete(taskId);
+  },
+  onAgentDoneQuarantined(reason: "refused"): void {
+    agentDoneQuarantinedTotal.inc({ reason });
   },
   onTaskPoisonDiscarded(reason: TerminalRefusalReason): void {
     taskPoisonDiscardedTotal.inc({ reason });

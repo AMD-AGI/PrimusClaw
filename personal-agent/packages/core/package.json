@@ -1,6 +1,6 @@
 {
   "name": "@primusclaw/personal-agent",
-  "version": "0.10.3",
+  "version": "0.12.0",
   "description": "The personal agent's channel-neutral core: domain logic, ports and plugin interfaces.",
   "license": "MIT",
   "repository": {

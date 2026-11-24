@@ -184,6 +184,14 @@
           "default": false,
           "type": "boolean"
         },
+        "authProvider": {
+          "description": "Who verifies callers in the SaFE deployment mode (CLAW_AUTH_PROVIDER): safe or identity. identity needs identity.enabled, identity.endpoints.introspection, and secret.llmKeySource=platformKey. A caller's platform roles, admin roles included, are the introspection answer's roles; access-token callers get no SaFE-exchanged LLM/sandbox keys.",
+          "default": "safe",
+          "enum": [
+            "identity",
+            "safe"
+          ]
+        },
         "cache": {
           "type": "object",
           "additionalProperties": true,
@@ -240,7 +248,10 @@
               "type": "array",
               "uniqueItems": true,
               "items": {
-                "enum": ["system-admin", "system-admin-readonly"]
+                "enum": [
+                  "system-admin",
+                  "system-admin-readonly"
+                ]
               }
             }
           }

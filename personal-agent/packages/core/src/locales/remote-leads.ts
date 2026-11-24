@@ -11,6 +11,8 @@ export const remoteLeads = {
   sessionEnded: ["会话已结束", "The session ended"],
   couldNotStart: ["会话没能启动", "The session could not start"],
   turnIncomplete: ["这一轮没有完成", "The turn did not complete"],
+  /** (a message the terminal may have taken: never said as a turn that did not complete) */
+  inputUnconfirmed: ["还没确认终端收到", "Not confirmed by the terminal yet"],
   modeNotSwitched: ["模式没有切换", "The mode was not switched"],
   notSwitchedTo: (mode: string): Pair => [`没有切到 \`${mode}\``, `The agent did not switch to \`${mode}\``],
 } as const satisfies Readonly<Record<string, Pair | ((mode: string) => Pair)>>;

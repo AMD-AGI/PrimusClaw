@@ -39,7 +39,7 @@ import { isSessionDeletedLocally } from "../infra/deleted-sessions.js";
 import { buildOutstandingStartHint, classifyResumeOutcome } from "./resume-outcome.js";
 import {
   sleep, redactSecrets, isSensitiveKey, looksLikeCredentialValue, isCredentialFreeLocator,
-  decodeAeadKey,
+  decodeAeadKey, setLongTimeout,
 } from "@claw/utils";
 import {
   BRAIN_ID, BRAIN_VERSION, CHECKPOINT_TTL_MS,
@@ -49,7 +49,7 @@ import {
   S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET, S3_REGION, S3_API_ENDPOINT,
   BRAIN_WORKSPACE_SNAPSHOT_ENABLED,
   RETRY_PENDING_KEEPALIVE_GRACE_SEC,
-  TASK_MAX_DELIVER, BRAIN_LAZY_SANDBOX, BRAIN_SANDBOX_PRESTART,
+  TASK_MAX_DELIVER, TASK_POISON_DELIVERY_COUNT, BRAIN_LAZY_SANDBOX, BRAIN_SANDBOX_PRESTART,
   RUN_LEASE_HEARTBEAT_MS, RUN_LEASE_TTL_MS,
   LOCK_REFRESH_INTERVAL_MS,
   SANDBOX_HANDS_RESTART_ENABLED,
@@ -72,9 +72,10 @@ import { checkHandsHealth } from "../sandbox/hands-health.js";
 import { restartHandsInSandbox } from "../sandbox/hands-restart.js";
 import { resolveSandboxAction } from "../sandbox/params.js";
 import {
-  SANDBOX_CAPACITY_FAILURE_REASONS, SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf,
-  sandboxUnavailableOf,
+  SANDBOX_WORKSPACE_FORBIDDEN, SANDBOX_WORKSPACE_NOT_ALLOWED, provisionTerminalOf, sandboxOpenFailureOf,
+  sandboxUnavailableOf, oneLineText,
 } from "../sandbox/errors.js";
+import { placementNodeLabels } from "../sandbox/create-sandbox.js";
 import { runScript, type ScriptProgress } from "./script-runner.js";
 import { createAppRunner } from "../apps/app-runner-wiring.js";
 import { AppRunFailedError, type AppRunOutcome } from "../apps/app-runner.js";
@@ -84,7 +85,7 @@ class FinishOnlyHandOver extends Error {
   constructor(why: string) { super(why); this.name = "FinishOnlyHandOver"; }
 }
 import {
-  AgentDoneDeliveryError, postAgentDone, postAppFinishDone, postAppFinishHandOver, postRunLease, postTaskRunning, sandboxForLease,
+  AgentDoneDeliveryError, AgentDoneRejectedError, postAgentDone, postAppFinishDone, postAppFinishHandOver, postRunLease, postTaskRunning, sandboxForLease,
   type LeaseRenewal, type RunAttemptToken,
 } from "./callback.js";
 import { taskSubject, type RunTimeReport, RUN_FAILURE_MESSAGE_FIELD, RUN_FAILURE_REASON_FIELD, WORKSPACE_SAVE_EVENT, WORKSPACE_SAVE_ID_FIELD, WORKSPACE_SAVE_PENDING, WORKSPACE_SAVE_PENDING_FIELD, type WorkspaceSaveFinishedEvent, type WorkspaceSaveOutcome } from "@claw/protocol";
@@ -238,6 +239,66 @@ function pendingCallbackKey(taskId: string): string {
   return `task-result.${taskId}`;
 }
 
+/** Where a result the API refused is set aside (see {@link quarantineAgentDone}). */
+export function quarantinedResultKey(taskId: string): string {
+  return `task-quarantine.${taskId}`;
+}
+
+/** What the outbox holds: the result, its final report, and when it was first stored. */
+type PendingResult = ExecuteResult & { run_time?: RunTimeReport; outbox_since_ms?: number };
+
+/**
+ * Set aside a result the API refused to store, and the failure sent in its place.
+ *
+ * Reached only after `postAgentDone` has had its 422 twice: the result, then a
+ * failure carrying none of it. Neither will be accepted on a resend, so a nak
+ * would only re-run the delivery until the poison guard ends it a couple of
+ * dozen deliveries later -- holding the run's message, or its claimed row, for
+ * all of that time. The result is kept instead, in the same bucket as the
+ * outbox it came from, under a key nothing replays, and the caller settles the
+ * delivery as it would a delivered one. If that write fails, the result stays
+ * in the outbox and the delivery is naked, as for any undelivered result. The row is left to the API's sweeper,
+ * which fails a run that never reports.
+ *
+ * The log line says which task and why, and never what the result contained.
+ */
+async function quarantineAgentDone(
+  kvCkpt: KV,
+  request: ExecuteRequest,
+  pending: PendingResult,
+  err: AgentDoneRejectedError,
+): Promise<void> {
+  const taskId = request.task_id ?? "";
+  const record = {
+    task_id: taskId,
+    session_id: request.session_id,
+    reason: "refused",
+    http_status: err.status,
+    sqlstate: err.sqlstate,
+    quarantined_at: new Date().toISOString(),
+    result: pending,
+  };
+  const encoded = sc.encode(JSON.stringify(record));
+  try {
+    await kvCkpt.put(quarantinedResultKey(taskId), encoded);
+  } catch (e) {
+    // Without the record, settling would delete the only copy of the result
+    // (the caller clears the outbox next). Fail the way an undelivered result
+    // does instead: the caller naks, the outbox stays, and the poison guard
+    // still bounds the redeliveries.
+    logger.error({ err: (e as Error).message, taskId }, "task.agent_done_quarantine_write_failed");
+    throw new AgentDoneDeliveryError(`quarantine write failed after ${err.message}`);
+  }
+  metrics.onAgentDoneQuarantined("refused");
+  logger.error(
+    {
+      taskId, sessionId: request.session_id, httpStatus: err.status, sqlstate: err.sqlstate,
+      resultBytes: encoded.length,
+    },
+    "task.agent_done_quarantined",
+  );
+}
+
 /**
  * Persist the terminal result before delivery. If Brain dies after execution
  * but before the callback is acknowledged, redelivery replays this result
@@ -254,9 +315,17 @@ async function deliverAgentDone(
     return;
   }
   const key = pendingCallbackKey(request.task_id);
-  const pending = runTime ? { ...result, run_time: runTime } : result;
+  const sinceMs = Date.now();
+  const pending: PendingResult = { ...result, ...(runTime ? { run_time: runTime } : {}), outbox_since_ms: sinceMs };
   await kvCkpt.put(key, sc.encode(JSON.stringify(pending)));
-  await fx().postAgentDone(request, result, runTime);
+  try {
+    await fx().postAgentDone(request, result, runTime, sinceMs);
+  } catch (err) {
+    // Returning settles the delivery: every caller acks and clears the outbox
+    // next, which is what a refused result needs, since resending it cannot help.
+    if (!(err instanceof AgentDoneRejectedError)) throw err;
+    await quarantineAgentDone(kvCkpt, request, pending, err);
+  }
 }
 
 async function ackAndClearCallback(msg: JsMsg, kvCkpt: KV, request: ExecuteRequest): Promise<void> {
@@ -666,8 +735,8 @@ const REAL_SIDE_EFFECTS: TaskRunnerSideEffects = {
   postRunLease,
   settleRunAttempt: settleClaimedRun,
   runScript,
-  createAppRunner: (runId, platformKey, claimCount) =>
-    createAppRunner(runId, platformKey, claimCount, (sessionId, event, opts) => getDeps().emitter.emit(sessionId, event, opts)),
+  createAppRunner: (runId, platformKey, claimCount, _publish, nodeLabels) =>
+    createAppRunner(runId, platformKey, claimCount, (sessionId, event, opts) => getDeps().emitter.emit(sessionId, event, opts), nodeLabels),
   republishTask: async (subject, data) => {
     await getDeps().emitter.nc.jetstream().publish(subject, data);
   },
@@ -1067,9 +1136,9 @@ async function replayPendingCallback(
   // fresh execution, exactly as when the key was never written.
   if (entry.operation === "DEL" || entry.operation === "PURGE" || entry.value.length === 0) return false;
 
-  let stored: ExecuteResult & { run_time?: RunTimeReport };
+  let stored: PendingResult;
   try {
-    stored = JSON.parse(sc.decode(entry.value)) as ExecuteResult & { run_time?: RunTimeReport };
+    stored = JSON.parse(sc.decode(entry.value)) as PendingResult;
   } catch (err) {
     // deliverAgentDone writes only JSON, so this entry holds no result that can
     // be replayed, and retrying cannot make it parse. Drop it and run this
@@ -1083,10 +1152,15 @@ async function replayPendingCallback(
   }
 
   try {
-    const { run_time: runTime, ...result } = stored;
-    await fx().postAgentDone(request, result, runTime);
+    const { run_time: runTime, outbox_since_ms: sinceMs, ...result } = stored;
+    try {
+      await fx().postAgentDone(request, result, runTime, typeof sinceMs === "number" ? sinceMs : undefined);
+      logger.info({ taskId: request.task_id }, "task.agent_done_replayed");
+    } catch (err) {
+      if (!(err instanceof AgentDoneRejectedError)) throw err;
+      await quarantineAgentDone(kvCkpt, request, stored, err);
+    }
     await ackAndClearCallback(msg, kvCkpt, request);
-    logger.info({ taskId: request.task_id }, "task.agent_done_replayed");
   } catch (err) {
     logger.error({ err, taskId: request.task_id }, "task.agent_done_replay_failed");
     msg.nak(5_000);
@@ -1580,6 +1654,14 @@ class TaskRunner {
    * the next message of the session tries afresh.
    */
   private sandboxUnavailable: unknown = null;
+  /**
+   * What the last failed open of this run's sandbox ended with, until an open
+   * succeeds. A failure the next tool may retry past (a create the platform
+   * answered 5xx, a workload that failed before it was ready) is not latched in
+   * `sandboxUnavailable`, but a run that asked and never got a sandbox did not do
+   * the work it needed one for either; see `provisionFailure`.
+   */
+  private lastOpenFailure: unknown = null;
   private resumeMetricsRecorded = false;
   // Set by the first successful reap, which a terminal path may do early to
   // keep a still-writing process out of its snapshot; the release on the way
@@ -2924,7 +3006,11 @@ class TaskRunner {
     // cached and how a rebuild is not undone: `recreateHands` replaces
     // `this.hands` without coming through here, so a retained promise would keep
     // handing out the sandbox the rebuild has already destroyed.
-    this.handsAttach = this.openSandbox(prestart).catch(async (err: unknown) => {
+    this.handsAttach = this.openSandbox(prestart).then((hands) => {
+      this.lastOpenFailure = null;
+      return hands;
+    }, async (err: unknown) => {
+      this.lastOpenFailure = err;
       await this.settleUnavailableOpen(err);
       throw err;
     }).finally(() => {
@@ -2947,23 +3033,31 @@ class TaskRunner {
 
   /**
    * Why this run ended without the sandbox it asked for, when it did: a tool asked
-   * for one, the platform had no capacity for it (SANDBOX_CAPACITY_FAILURE_REASONS:
-   * no node took the pod, the wait for capacity ran out, it never became ready)
-   * and none was opened after. The model was told and wrote its answer
-   * without one, so the turn ends as usual; but none of the work that needed the
-   * sandbox ran, and the run is recorded as failed for that reason, with the
-   * platform's account of it, so a caller reading the run sees why rather than a
-   * clean ending with no exit code.
+   * for one and the platform did not provide it -- it refused the create
+   * (`sandbox_rejected`, e.g. an admission webhook's QoS ceiling), the create
+   * failed (`sandbox_create_failed`), the workload failed before it was ready
+   * (AdminFailed), no node took the pod, or the wait for capacity ran out -- and
+   * none was opened after. The model was told and wrote its answer without one,
+   * so the turn ends as usual; but none of the work that needed the sandbox ran,
+   * and the run is recorded as failed for that reason, with the platform's
+   * account of it, so a caller reading the run sees why
+   * rather than a clean ending with no exit code.
    *
    * A prestarted open that failed with nothing asking for it is not this: the run
    * never needed the sandbox. Nor is an account the platform refuses a sandbox to:
-   * such a run carries on without one by design.
+   * such a run carries on without one by design (see `sandboxOpenFailureOf`).
    */
   private provisionFailure(): { reason: string; message: string } | null {
-    if (!this.sandboxClaimed || this.hands || !this.sandboxUnavailable) return null;
-    const terminal = sandboxUnavailableOf(this.sandboxUnavailable);
-    if (!terminal || !SANDBOX_CAPACITY_FAILURE_REASONS.has(terminal.reason)) return null;
-    return { reason: terminal.reason, message: String(terminal.message ?? "").slice(0, 2000) };
+    if (!this.sandboxClaimed || this.hands) return null;
+    const err = this.sandboxUnavailable ?? this.lastOpenFailure;
+    if (!err) return null;
+    const failure = sandboxOpenFailureOf(err, classifySandboxFailure);
+    if (!failure) return null;
+    // One line and bounded here, whichever path built it: a failed create's message
+    // carries the platform's body as it came, newlines and all. The run's secrets
+    // are masked on the way out, as for every event (`onEvent`) and callback
+    // (`redactEgressPayload`) this run sends.
+    return { reason: failure.reason, message: oneLineText(failure.message, 2000) };
   }
 
   /**
@@ -3773,6 +3867,13 @@ class TaskRunner {
         "task.ended_without_sandbox",
       );
       result = { ...result, abortReason: "error", failureReason: provisionFailure.reason, failureMessage: provisionFailure.message };
+      // In the session's events too, where a client following the session reads
+      // why the sandbox it was shown starting never came (the completion itself
+      // is not forwarded to clients).
+      await this.onEvent({
+        type: "sandboxStatus", status: "failed", reason: provisionFailure.reason, message: provisionFailure.message,
+        message_id: this.messageId,
+      }).catch(() => { /* a status event must not fail the run */ });
     }
     const completion: Record<string, unknown> = {
       type: "exec_complete",
@@ -4620,6 +4721,10 @@ class TaskRunner {
     // A SandboxProvisionTerminalError carries an authoritative machine reason
     // (e.g. sandbox_workload_terminal); else fall back to the message-regex classifier.
     const sandboxReason = provisionTerminalOf(err)?.reason ?? classifySandboxFailure(rawMsg);
+    // The platform's account of a sandbox that could not be provided, carried
+    // beside the code to the run row, the A2A task and the notification, so a
+    // caller can tell a refusal from a crash. Masked on the way out, as below.
+    const sandboxFailureMessage = sandboxReason ? rawMsg.slice(0, 2000) : undefined;
     if (sandboxReason) {
       await this.onEvent({
         type: "sandboxStatus",
@@ -4694,6 +4799,7 @@ class TaskRunner {
       final_text: finalText,
       failed: true,
       failure_reason: taskFailure.reason,
+      ...(sandboxFailureMessage ? { failure_message: sandboxFailureMessage } : {}),
       turns: partialTurns,
       elapsed_ms: elapsedMsAtFailure,
       token_usage: partialTokenUsage,
@@ -4728,6 +4834,7 @@ class TaskRunner {
           elapsedMs: elapsedMsAtFailure,
           abortReason: "error",
           failureReason: sandboxReason || rawMsg.slice(0, 500),
+          ...(sandboxFailureMessage ? { failureMessage: sandboxFailureMessage } : {}),
           ...(err instanceof AppRunFailedError && err.captures ? { captures: err.captures } : {}),
         }),
         runtimeSecrets(this.request, this.platformKey),
@@ -4823,9 +4930,11 @@ class TaskRunner {
       fire();
       return () => {};
     }
-    const timer = setTimeout(fire, delay);
-    timer.unref();
-    return () => clearTimeout(timer);
+    // Not a bare setTimeout: an app run's deadline is its own time limit, which
+    // can be weeks away, and Node fires a timer longer than about 24.8 days after
+    // 1 ms -- the run would be stopped as soon as it started.
+    const timer = setLongTimeout(fire, delay, { unref: true });
+    return () => timer.clear();
   }
 
   /**
@@ -5306,7 +5415,8 @@ class TaskRunner {
       await fx().createAppRunner(runId, this.platformKey, epoch).finishNow("cancelled");
       throw new AppRunFailedError("a hosted application is not run for a session that acts as a user");
     }
-    const runner = fx().createAppRunner(runId, this.platformKey, epoch);
+    // The session's placement, checked before anything is created: the run's sandbox keeps it.
+    const runner = fx().createAppRunner(runId, this.platformKey, epoch, undefined, placementNodeLabels(this.request));
     // A finish-only dispatch is not a run starting: the task is already over as far as the
     // user is concerned, so nothing says "running" and nothing reports a terminal state.
     if (!finishOnly) {
@@ -5439,12 +5549,18 @@ class TaskRunner {
     }
 
     if (this.abortCtrl.signal.reason === DEADLINE_EXCEEDED_ABORT_REASON) {
+      // A deadline that fell while the sandbox's create was failing ends the run
+      // for that: the run reached it because the platform never gave it a
+      // sandbox, and that is what a caller needs to read, not a spent budget.
+      const sandboxCause = this.sandboxCreateFailureOf(err);
       await this.settleTerminal(
         () => this.handleFatalError(
-          new Error(
-            `run_budget_exhausted: the run reached its deadline of ${this.request.deadline_at} `
-            + `after ${this.reportedCkpt?.turns_completed ?? 0} turns`,
-          ),
+          sandboxCause
+            ? new Error(`${sandboxCause} (retried until the run reached its deadline of ${this.request.deadline_at})`)
+            : new Error(
+              `run_budget_exhausted: the run reached its deadline of ${this.request.deadline_at} `
+              + `after ${this.reportedCkpt?.turns_completed ?? 0} turns`,
+            ),
         ),
         "task.deadline_agent_done_delivery_exhausted",
       );
@@ -5484,6 +5600,20 @@ class TaskRunner {
       return;
     }
     if (isRetryable(err)) {
+      // A create the platform keeps failing (a 5xx, a 429) is retried by
+      // redelivery. When no retry is left -- the next would come after the
+      // run's deadline, or be the delivery the poison guard resolves -- the run
+      // is failed here, as `sandbox_create_failed` with the platform's words;
+      // left to either of those, it ends with a reason that says nothing about
+      // the sandbox.
+      const lastRetry = this.sandboxCreateRetriesSpent(err);
+      if (lastRetry) {
+        await this.settleTerminal(
+          () => this.handleFatalError(new Error(lastRetry)),
+          "task.sandbox_create_retries_spent_agent_done_delivery_exhausted",
+        );
+        return;
+      }
       await this.handleRetryableError(err);
       return;
     }
@@ -5491,6 +5621,35 @@ class TaskRunner {
       () => this.handleFatalError(err),
       "task.failed_agent_done_delivery_exhausted",
     );
+  }
+
+  /** The failed create's message (`sandbox_create_failed`) behind `err`, or null when `err` is not one. */
+  private sandboxCreateFailureOf(err: unknown): string | null {
+    const failure = sandboxOpenFailureOf(err, classifySandboxFailure);
+    return failure?.reason === "sandbox_create_failed" ? failure.message : null;
+  }
+
+  /**
+   * The message to fail the run with when `err` is a failed sandbox create and
+   * this attempt was its last chance: the redelivery it would nak into lands
+   * after the run's deadline, or is the one the poison guard resolves
+   * (`TASK_POISON_DELIVERY_COUNT`). The guard counts both kinds of attempt: a
+   * JetStream delivery by `deliveryCount`, and a claimed run by its
+   * `claim_count`, which the API's claim fails as `max_retries_exceeded` once it
+   * reaches the same threshold. Null while a retry is still worth making.
+   */
+  private sandboxCreateRetriesSpent(err: unknown): string | null {
+    const message = this.sandboxCreateFailureOf(err);
+    if (!message) return null;
+    const attempt = this.claimed ? this.attempt.claimCount : this.msg.info.deliveryCount;
+    const deadlineMs = this.request.deadline_at ? Date.parse(this.request.deadline_at) : NaN;
+    if (Number.isFinite(deadlineMs) && Date.now() + retryableNakMs(attempt) >= deadlineMs) {
+      return `${message} (no retry left before the run's deadline of ${this.request.deadline_at})`;
+    }
+    if (attempt >= TASK_POISON_DELIVERY_COUNT - 1) {
+      return `${message} (failed on ${attempt} attempts)`;
+    }
+    return null;
   }
 
   private async finishRun(

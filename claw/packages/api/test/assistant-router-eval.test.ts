@@ -13,7 +13,7 @@
  *   R1  the set has at least 60 cases, unique ids, and at least 12 of each of the plan's five kinds
  *   R2  every decision the Router can make is labelled somewhere: create, send, stop, nothing, and a mix
  *   R3  every item a label names exists, and is open where the label sends to it or stops it
- *   R4  the Router is offered exactly the assistant's six tools, and sees the fixture's items in its prompt
+ *   R4  the Router is offered exactly the assistant's seven tools, and sees the fixture's items in its prompt
  *   R5  the stand-in refuses what the real tools refuse: a long say, a send to a closed item, an unknown item, a name that is not one
  *   R5b the stand-in names an item as the real tools do: by id or by number, in every tool and in say
  *   R6  the loop follows the model's calls to the end, and a refused call changes nothing
@@ -22,6 +22,8 @@
  *   R8f a turn that ends in plain text and no say is delivered as a say, as the completion handler does, for a turn that answers the user
  *   R8e the model is sent the user's words with the reply-language line the API adds, and for a report, the language of the user's earlier words
  *   R8h the verdict is "passed" only for the whole set: a subset that scores well shows its score and does not pass
+ *   R8s a question about the assistant itself: the turn is given the rule and claw_capabilities, the tool answers the list generated from
+ *       the tools offered, and the answer is held to it: read first and nothing it contradicts, or the case fails
  *   R9  against a real model the Router's dispatch decisions are at least 95% right, with items named as the real tools
  *       name them (EVAL_STRICT_IDS=0 scores the decisions apart from that); skips without a model
  */
@@ -35,6 +37,7 @@ import test from "node:test";
 
 import { createAssistantMcpServer } from "../src/assistant/mcp.js";
 import { renderRouterSystem, SAY_MAX_CHARS } from "../src/assistant/prompts.js";
+import { deploymentFeatures } from "../src/assistant/capabilities.js";
 import { ASSISTANT_TOOLS_PATTERN } from "../src/assistant/role-profile.js";
 import {
   CASES, FIXTURE, itemIdOf, NOTHING, type EvalCase,
@@ -108,9 +111,9 @@ test("R3 every item a label names exists, and is open where the label sends to i
   assert.ok(FIXTURE.some((i) => i.boardState === "done") && FIXTURE.some((i) => i.boardState === "needs_you") && FIXTURE.some((i) => i.boardState === "in_progress"));
 });
 
-test("R4 the Router is offered exactly the assistant's six tools, and sees the fixture's items in its prompt", async () => {
+test("R4 the Router is offered exactly the assistant's seven tools, and sees the fixture's items in its prompt", async () => {
   const tools = await routerTools();
-  assert.deepEqual(tools.map((t) => t.name), ["deliver_text", "say", "work_create", "work_recall", "work_send", "work_stop"].map((n) => `${P}${n}`));
+  assert.deepEqual(tools.map((t) => t.name), ["claw_capabilities", "deliver_text", "say", "work_create", "work_recall", "work_send", "work_stop"].map((n) => `${P}${n}`));
   assert.ok(ASSISTANT_TOOLS_PATTERN.startsWith(P));
   for (const t of tools) assert.ok(t.description.length > 0 && (t.input_schema as { type?: string }).type === "object", t.name);
   // The worker's tool is not the router's.
@@ -168,7 +171,7 @@ test("R6 the loop follows the model's calls to the end, and a repeated title is 
   const results = script.sent[1]?.messages.at(-1)?.content as Array<{ tool_use_id: string }>;
   assert.deepEqual(results.map((r) => r.tool_use_id), ["a1", "a2"]);
   // Every call is made with the system prompt of the fixture, and the tools.
-  assert.ok(script.sent.every((s) => s.system.includes("Work items") && s.tools.length === 6));
+  assert.ok(script.sent.every((s) => s.system.includes("Work items") && s.tools.length === 7));
   const score = scoreCase(byId("new-01"), trace);
   assert.ok(score.dispatchOk && score.turnOk);
 });
@@ -392,7 +395,7 @@ test("R8b the model call is the Messages request, retries only what may pass, an
     assert.equal(seen[0]?.headers["x-api-key"], "k-secret");
     assert.equal(seen[0]?.body.model, "m-1");
     assert.deepEqual(seen[0]?.body.system, [{ type: "text", text: "SYS" }]);
-    assert.equal(seen[0]?.body.tools.length, 6);
+    assert.equal(seen[0]?.body.tools.length, 7);
     assert.ok(!JSON.stringify(seen[0]?.body).includes("k-secret"));
 
     answers.push(new Response("bad request", { status: 400 }));
@@ -509,6 +512,80 @@ const liveKey = process.env.EVAL_KEY ?? (process.env.EVAL_KEY_FILE ? "file" : ""
 const liveSkip = process.env.EVAL_BASE_URL && process.env.EVAL_MODEL && liveKey
   ? false
   : "needs EVAL_BASE_URL, EVAL_MODEL and EVAL_KEY or EVAL_KEY_FILE: a real model";
+
+/** The last tool result the model was sent, parsed. */
+function lastResult(messages: Parameters<Llm>[0]["messages"]): Record<string, any> {
+  const blocks = messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])) as Array<{ type: string; content?: unknown }>;
+  const last = blocks.filter((b) => b.type === "tool_result").at(-1);
+  return JSON.parse(String(last?.content ?? "{}"));
+}
+
+test("R8s a question about the assistant is answered from claw_capabilities, called first, and held to the list it answered", async () => {
+  const tools = await routerTools();
+  const c = byId("self-01");
+  assert.equal(c.selfKnowledge, true);
+  // A model that does what the rule says: reads the list, then answers from it alone (what it has on, what it lacks).
+  const sent: Array<Parameters<Llm>[0]> = [];
+  let step = 0;
+  const reads: Llm = async (req) => {
+    sent.push(req);
+    step += 1;
+    if (step === 1) return reply(use("claw_capabilities", {}));
+    if (step > 2) return reply();
+    const list = lastResult(req.messages);
+    const has = (list.abilities as Array<{ id: string; on: boolean; what: string }>).filter((x) => x.on);
+    const lacks = (list.limits as Array<{ id: string; on: boolean; what: string }>).filter((x) => !x.on);
+    return reply(use("say", { text: [...has.slice(0, 3).map((x) => x.what), ...lacks.map((x) => x.what)].join("\n").slice(0, SAY_MAX_CHARS) }));
+  };
+  // An English question, answered in the list's own (English) words.
+  const trace = await runCase(byId("self-03"), { llm: reads, tools });
+  // The turn was given the rule and the tool.
+  assert.match(sent[0]!.system, /call claw_capabilities first, before you say anything, and answer from what it returns alone/);
+  assert.ok(sent[0]!.tools.some((t) => t.name === `${P}claw_capabilities`));
+  // The tool answered the list generated from the tools this turn is offered; the say is made of its entries.
+  const answered = trace.calls.find((x) => x.tool === "claw_capabilities")!.result as Record<string, any>;
+  assert.equal(answered.ok, true);
+  assert.equal(answered.version, "capabilities-v4");
+  assert.deepEqual(answered.reads.includes("work_recall") && answered.acts_at_once.includes("work_create"), true);
+  assert.equal(answered.abilities.find((x: { id: string }) => x.id === "see_images").on, true, "images are shown to every router turn");
+  const said = String(trace.calls.find((x) => x.tool === "say")!.input.text);
+  assert.match(said, /Images sent with a message are shown to you \(up to 4 per message\)/);
+  assert.match(said, /No email: you cannot read or send the user's mail\./);
+  const good = scoreCase(byId("self-03"), trace);
+  assert.equal(good.selfOk, true, String(good.contradictions));
+  assert.equal(good.turnOk, true);
+
+  // The 2026-11-23 answer: no tool, four false limits. It fails on both counts.
+  const guessed = await runCase(c, { llm: scripted([
+    reply(use("say", { text: "我目前的不足：我没有后台监控能力，只有在你发消息的时候才会工作；我看不到你发的图片；所有写操作都需要开 worker 并经过你的确认；我无法检查 worker 的结论对不对。" })),
+    reply(),
+  ]).llm, tools });
+  const bad = scoreCase(c, guessed);
+  assert.equal(bad.selfOk, false);
+  assert.equal(bad.turnOk, false);
+  assert.equal(bad.contradictions?.[0], "claw_capabilities was not called before the answer");
+  // In this deployment (no pull request watching, no jobs, no triggers) "no background watching" is true; the other three are not.
+  assert.deepEqual(bad.contradictions?.slice(1).map((x) => x.split(":")[0]).sort(), ["denies acting directly", "denies check_work", "denies see_images"]);
+  // Read first, and still a false limit: it fails on what it said.
+  const readThenWrong = await runCase(c, { llm: scripted([
+    reply(use("claw_capabilities", {})), reply(use("say", { text: "我能做很多事，但我看不到你发的图片。" })), reply(),
+  ]).llm, tools });
+  assert.deepEqual(scoreCase(c, readThenWrong).contradictions?.map((x) => x.split(":")[0]), ["denies see_images"]);
+  // Read after the answer: the answer did not come from it.
+  const lateRead = await runCase(c, { llm: scripted([
+    reply(use("say", { text: "我可以看图片。" })), reply(use("claw_capabilities", {})), reply(),
+  ]).llm, tools });
+  assert.equal(scoreCase(c, lateRead).selfOk, false);
+  // With pull request watching on, "no background watching" is a contradiction too: the list decides, not the words.
+  const watching = await runCase(c, { llm: scripted([
+    reply(use("claw_capabilities", {})), reply(use("say", { text: "我没有后台监控能力。" })), reply(),
+  ]).llm, tools: [...tools, { name: `${P}work_subscribe`, description: "watch", input_schema: { type: "object" } }],
+  capabilities: { features: { ...deploymentFeatures(), github_events: true } } });
+  assert.deepEqual(scoreCase(c, watching).contradictions?.map((x) => x.split(":")[0]), ["denies background"]);
+  // A case that is not about the assistant is not held to the list, and is not given the section.
+  const plain = byId("chat-01");
+  assert.equal(scoreCase(plain, guessed).selfOk, true);
+});
 
 test("R9 against a real model the Router's dispatch decisions are at least 95% right", { skip: liveSkip, timeout: 3_600_000 }, async () => {
   const key = () => process.env.EVAL_KEY?.trim() || readFileSync(process.env.EVAL_KEY_FILE as string, "utf8").trim();

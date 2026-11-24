@@ -104,6 +104,7 @@ describe("the platform-role requirement through the authentication hook", () => 
     });
     delete process.env.CLAW_INSECURE_DEV_AUTH;
     delete process.env.CLAW_DEPLOY_MODE;
+    process.env.CLAW_AUTH_PROVIDER = "safe";
     ({ startIdentityClient } = await import("../src/auth/identity.js"));
     ({ getCachedUserLlmKey } = await import("../src/llm/client.js"));
     const { authMiddleware, getUser } = await import("../src/auth/middleware.js");

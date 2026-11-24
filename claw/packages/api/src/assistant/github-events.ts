@@ -46,7 +46,7 @@ import { TOOL_NAME_PREFIX } from "./prompts.js";
 import { ingestReport } from "./reports.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, ToolRefused } from "./tools.js";
-import { canAccept, reopenWorkItem, resolveWorkItem, type WorkReport } from "./work-items.js";
+import { canAccept, closeWatchedItem, reopenWorkItem, resolveWorkItem, type WorkReport } from "./work-items.js";
 
 const logger = pino({ name: "assistant-github-events" });
 
@@ -63,6 +63,11 @@ const markersIn = (text: string): string[] => [...text.matchAll(/<!-- claw-reply
 /** An answer names its own event and no other: a marker in what the model wrote (quoted from a stranger, say) would make another event look answered. */
 const withoutMarkers = (text: string): string => text.split(REPLY_MARKER_PREFIX).join("<!-- quoted-claw-reply:");
 
+/**
+ * A delivered result's item that watches its pull request (`watching_pr`) closes, as delivered, after this many days with nothing new on
+ * it, or as soon as it watches nothing any more (`closeEndedWatches`).
+ */
+export const WATCH_IDLE_DAYS = 7;
 /** The subscription starts this much before it was made: the two clocks may disagree, and a comment just before is the reason to subscribe. */
 const SINCE_MARGIN_SEC = 120;
 /** At most this many deliveries to one item in `WAKE_WINDOW` (Comma's limit); the rest wait in the table, they are not dropped. */
@@ -942,12 +947,15 @@ export function formatGithubEvents(events: readonly PendingEvent[]): string {
  * item's events are dropped with the reason and its subscriptions end; an item past its wake limit keeps them for later. Returns the
  * session to start, if any.
  */
-export async function deliverItemEvents(itemId: string): Promise<"delivered" | "dropped" | "limited" | "held" | "nothing" | "not_queued"> {
+export async function deliverItemEvents(itemId: string): Promise<"delivered" | "dropped" | "limited" | "held" | "closed" | "nothing" | "not_queued"> {
   const out = await inTransaction(async (query) => {
     const q = { query };
     const item = (await query(
-      "SELECT item_id, user_id, kind, board_state, last_report_kind, worker_session_id FROM claw_work_items WHERE item_id = $1 FOR UPDATE", [itemId],
-    )).rows[0] as { item_id: string; user_id: string; kind: string; board_state: string; last_report_kind: string | null; worker_session_id: string } | undefined;
+      `SELECT item_id, user_id, kind, board_state, last_report_kind, worker_session_id, params ? 'watching_pr' AS watching
+         FROM claw_work_items WHERE item_id = $1 FOR UPDATE`, [itemId],
+    )).rows[0] as {
+      item_id: string; user_id: string; kind: string; board_state: string; last_report_kind: string | null; worker_session_id: string; watching: boolean;
+    } | undefined;
     const pending = (await query(
       `SELECT e.event_id, e.kind, e.author, e.url, e.body, e.path, e.line, s.owner, s.repo, s.number, s.reply_allowed
          FROM claw_work_item_github_events e JOIN claw_work_item_subscriptions s ON s.id = e.sub_id
@@ -979,14 +987,47 @@ export async function deliverItemEvents(itemId: string): Promise<"delivered" | "
     // The pull request closing (merged, most often by the user) is no reason to take back a result the user has not judged yet: it is
     // kept, and reaches the worker with the next news or once the user sends the item back. Accepted, the item ends and it is dropped.
     // Asked of everything waiting, not of this batch: closings older than a comment fill a batch by themselves.
-    if (canAccept(item) && !(await query(
+    const onlyClosing = async (): Promise<boolean> => !(await query(
       `SELECT 1 FROM claw_work_item_github_events
         WHERE item_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL AND kind <> 'pr_closed' LIMIT 1`,
       [itemId],
-    )).rowCount) return { status: "held" as const };
-    // A result waiting for the user is no longer the one to accept once there is news on the pull request. An item in progress is left
-    // alone: its running turn keeps its generation, and the next turn reads these.
-    if (item.board_state === "needs_you") {
+    )).rowCount;
+    if (canAccept(item) && await onlyClosing()) return { status: "held" as const };
+    // A delivered result that only watches its pull request (`watching_pr`): the pull request closing, merged most often, is the end of
+    // it. Once the last of its watches has ended so, the item closes as delivered, nothing reaches the worker, and its watches end with
+    // it. While another pull request of it is still watched, the item keeps watching that one, and the closing is only recorded.
+    if (item.watching && await onlyClosing()) {
+      const left = (await query(
+        "SELECT owner, repo, number FROM claw_work_item_subscriptions WHERE item_id = $1 AND state = 'active' ORDER BY id", [itemId],
+      )).rows as Array<{ owner: string; repo: string; number: number }>;
+      if (left.length) {
+        await query(
+          `UPDATE claw_work_item_github_events SET dropped_at = NOW(), drop_reason = 'still_watching'
+            WHERE item_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
+          [itemId],
+        );
+        await query(
+          "UPDATE claw_work_items SET params = params || jsonb_build_object('watching_pr', $2::jsonb) WHERE item_id = $1",
+          [itemId, JSON.stringify(left.map((s) => prName(s)))],
+        );
+        return { status: "dropped" as const };
+      }
+      await closeWatchedItem(q, itemId, [...new Set(pending.map((e) => `${prName(e)}: ${e.body ?? "closed"}`))].join("; "));
+      await query(
+        `UPDATE claw_work_item_github_events SET dropped_at = NOW(), drop_reason = 'item_closed'
+          WHERE item_id = $1 AND delivered_at IS NULL AND dropped_at IS NULL`,
+        [itemId],
+      );
+      await query(
+        "UPDATE claw_work_item_subscriptions SET state = 'ended', end_reason = 'item_closed', ended_at = NOW() WHERE item_id = $1 AND state = 'active'",
+        [itemId],
+      );
+      return { status: "closed" as const };
+    }
+    // A result waiting for the user is no longer the one to accept once there is news on the pull request, and a delivered one that
+    // watches it is worked on again: a comment or failed CI there makes the next version. An item in progress is left alone: its running
+    // turn keeps its generation, and the next turn reads these.
+    if (item.board_state === "needs_you" || item.watching) {
       await reopenWorkItem(q, {
         userId: item.user_id, itemId, source: "github",
         text: `GitHub: ${pending.length} new event${pending.length === 1 ? "" : "s"} on ${[...new Set(pending.map(prName))].join(", ")}`,
@@ -1097,6 +1138,51 @@ export function refsBackfillIdle(): Promise<void> {
   return backfilling ?? Promise.resolve();
 }
 
+/**
+ * Delivered results' items that watch their pull request (`watching_pr`) and should not any more: every watch of theirs ended (the
+ * user stopped it, or it ended without a closing event left to deliver), or nothing changed on them for `WATCH_IDLE_DAYS`. Each closes
+ * as delivered. One with news still to deliver is left to `deliverItemEvents`. Returns how many closed.
+ */
+export async function closeEndedWatches(idleDays: number = WATCH_IDLE_DAYS): Promise<number> {
+  // Over `claw_work_items w`, $1 the idle days.
+  const ended = `w.params ? 'watching_pr' AND w.board_state <> 'done'
+        AND (NOT EXISTS (SELECT 1 FROM claw_work_item_subscriptions s WHERE s.item_id = w.item_id AND s.state = 'active')
+             OR w.updated_at < NOW() - make_interval(days => $1::int))
+        AND NOT EXISTS (SELECT 1 FROM claw_work_item_github_events e WHERE e.item_id = w.item_id AND e.delivered_at IS NULL AND e.dropped_at IS NULL)`;
+  const due = (await db.query(
+    `SELECT w.item_id FROM claw_work_items w WHERE ${ended} ORDER BY w.updated_at LIMIT 100`, [idleDays],
+  )).rows as Array<{ item_id: string }>;
+  let closed = 0;
+  for (const { item_id } of due) {
+    try {
+      const done = await inTransaction(async (query) => {
+        // Asked again under the item's lock: news stored, or a reopen, since the read above keeps it open.
+        const still = (await query(
+          `SELECT EXISTS (SELECT 1 FROM claw_work_item_subscriptions s WHERE s.item_id = w.item_id AND s.state = 'active') AS watching
+             FROM claw_work_items w WHERE w.item_id = $2 AND ${ended} FOR UPDATE OF w`,
+          [idleDays, item_id],
+        )).rows[0] as { watching: boolean } | undefined;
+        if (!still) return false;
+        const ok = await closeWatchedItem(
+          { query }, item_id, still.watching ? `nothing new on its pull request for ${idleDays} days` : "it no longer watches a pull request",
+        );
+        if (ok) {
+          await query(
+            "UPDATE claw_work_item_subscriptions SET state = 'ended', end_reason = 'item_closed', ended_at = NOW() WHERE item_id = $1 AND state = 'active'",
+            [item_id],
+          );
+        }
+        return ok;
+      });
+      if (done) closed += 1;
+    } catch (err) {
+      logger.warn({ err, itemId: item_id }, "assistant.github_watch_close_failed");
+    }
+  }
+  if (closed) logger.info({ closed }, "assistant.github_watches_closed");
+  return closed;
+}
+
 export async function pollDueSubscriptions(intervalSec: number = CLAW_ASSISTANT_GITHUB_POLL_SEC): Promise<{ polled: number; stored: number; delivered: number }> {
   // Beside the pass, not before it: its reads of ended watches (up to 20, each up to GitHub's timeout) never hold back the polling and
   // delivery of active ones. One at a time per process.
@@ -1131,6 +1217,7 @@ export async function pollDueSubscriptions(intervalSec: number = CLAW_ASSISTANT_
     }
   }
   const delivered = await deliverPendingEvents();
+  await closeEndedWatches().catch((err: unknown) => logger.warn({ err }, "assistant.github_watch_close_failed"));
   // Comments held back that the owner has not been told about: this poll's, and those of a poll whose question could not be asked
   // then (a result was waiting for the user). After delivering: news delivered with it would otherwise send the item straight back to
   // work, and the question with it.

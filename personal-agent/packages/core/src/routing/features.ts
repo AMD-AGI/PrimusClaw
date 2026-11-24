@@ -6,7 +6,7 @@ import type { JsonObject } from "../json.js";
 import type { KeyOwner } from "../plugins/identity-lookup.js";
 import type { Lang } from "../locales/lang.js";
 import type { GroupContextKept } from "../locales/transparency.js";
-import type { Conversation, InboundFile, InboundMessage, OutMessage, UserRef } from "../ports/surface.js";
+import type { Conversation, FetchedFile, InboundFile, InboundMessage, OutMessage, UserRef } from "../ports/surface.js";
 
 /**
  * What the router asks of the features it hands messages to. Each is implemented by the feature's own module (the
@@ -104,6 +104,8 @@ export interface RemotePrompt {
   readonly prompt: string;
   readonly conversation: Conversation;
   readonly provider: CredentialProvider;
+  /** Files the session's machine saves and names in the prompt (only where it `takesFiles`). */
+  readonly files?: readonly FetchedFile[];
 }
 
 export interface RemoteAgentCommand {
@@ -121,6 +123,11 @@ export interface RemoteAgentCommand {
 export interface RemoteChat {
   readonly enabled: boolean;
   attached(chatKey: string): boolean;
+  /**
+   * The machine of the chat's session saves the files a prompt carries and names them in it (its agent says `prompt_files`);
+   * absent or false: a session gets text only.
+   */
+  takesFiles?(chatKey: string, credential: string): Promise<boolean>;
   /** The chat is the agent's window itself (direct chat). */
   direct(chatKey: string): boolean;
   windowMode(chatKey: string): "card" | "chat";

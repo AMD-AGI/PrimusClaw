@@ -25,6 +25,11 @@ import { renderRouterSystem, SAY_MAX_CHARS, WORK_EVENT_PREFIX, type ManifestItem
 import { answerToDeliver } from "../../src/assistant/router-turn-end.js";
 import { ASSISTANT_MCP_SERVER } from "../../src/assistant/role-profile.js";
 import {
+  CAPABILITIES_RULE, capabilityList, channelsOf, deploymentFeatures, type Capabilities, type CapabilityInputs,
+} from "../../src/assistant/capabilities.js";
+import { renderRouterSelfSection, selfStatusOn } from "../../src/assistant/self-status.js";
+import { contradictedClaims } from "./self-knowledge.js";
+import {
   FIXTURE, itemIdOf, NOTHING, type EvalCase, type Effects, type FixtureItem, type HistoryTurn,
 } from "./assistant-router-eval-cases.js";
 
@@ -239,7 +244,7 @@ class StubBackend {
   readonly items: FixtureItem[];
   private nextSeq: number;
   private readonly created = new Map<string, number>();
-  constructor(items: FixtureItem[], private readonly lenient: boolean) {
+  constructor(items: FixtureItem[], private readonly lenient: boolean, private readonly capabilities: Capabilities) {
     this.items = items;
     this.nextSeq = Math.max(...items.map((i) => i.seq)) + 1;
   }
@@ -315,6 +320,9 @@ class StubBackend {
         }
         return { ...this.refuse("invalid_arguments", "detail is summary, reports, worker_tail or live"), ref };
       }
+      case "claw_capabilities":
+        // The list the real tool generates (`capabilities.ts`), from the tools this turn is offered.
+        return this.ok({ ok: true, rule: CAPABILITIES_RULE, ...this.capabilities });
       default:
         return this.refuse("unknown_tool", `no tool named ${short}`);
     }
@@ -335,6 +343,8 @@ export interface Trace {
   delivered?: string;
   inputTokens: number;
   outputTokens: number;
+  /** What claw_capabilities answers in this run: the truth a `selfKnowledge` case's answer is held to. */
+  capabilities?: Capabilities;
   /** The model could not be reached: the case has no answer, which is not a pass. */
   error?: string;
 }
@@ -348,6 +358,28 @@ export interface RunOptions {
    * else is refused. False reads anything that looks like a number as that item.
    */
   strictIds?: boolean;
+  /**
+   * What claw_capabilities is generated from, beside the tools offered (`tools`): by default this process's deployment features, no
+   * GitHub and no plugin systems, the default review mode and the channels with a surface of their own.
+   */
+  capabilities?: Partial<Omit<CapabilityInputs, "tools">>;
+}
+
+/** The capability list the stand-in answers claw_capabilities with: generated from the offered tools, as the real tool is. */
+export function capabilitiesFor(tools: readonly ToolSchema[], over: Partial<Omit<CapabilityInputs, "tools">> = {}): Capabilities {
+  const prefix = `mcp__${ASSISTANT_MCP_SERVER}__`;
+  return capabilityList({
+    tools: tools.map((t) => t.name).filter((n) => n.startsWith(prefix)).map((n) => n.slice(prefix.length)),
+    features: over.features ?? deploymentFeatures(),
+    // Brain's web tools as the stand-in offers them, as a Brain names the ones it has.
+    lookups: over.lookups ?? {
+      web: { search: tools.some((t) => t.name === "web_search"), fetch: tools.some((t) => t.name === "web_fetch") }, github: false, systems: [],
+    },
+    reviewMode: over.reviewMode ?? "high_risk_confirm", userMemory: over.userMemory ?? { enabled: true, here: true },
+    // A user who has connected GitHub, both ways, unless the case says otherwise.
+    githubAccount: over.githubAccount ?? { token: "yes", bound: "yes" },
+    channels: over.channels ?? channelsOf(),
+  });
 }
 
 /**
@@ -365,10 +397,12 @@ export async function runCase(c: EvalCase, opts: RunOptions): Promise<Trace> {
 async function runLoop(c: EvalCase, opts: RunOptions): Promise<Trace> {
   const maxTurns = opts.maxTurns ?? CLAW_ASSISTANT_ROUTER_MAX_TURNS;
   const items = fixtureFor(c);
-  const system = renderRouterSystem(manifestOf(items));
-  const backend = new StubBackend(items, opts.strictIds !== true);
+  // A question about the assistant itself is answered under the section every router turn has about itself (`role-profile.ts`).
+  const system = `${renderRouterSystem(manifestOf(items))}${c.selfKnowledge ? `\n\n${renderRouterSelfSection(selfStatusOn())}` : ""}`;
+  const capabilities = capabilitiesFor(opts.tools, opts.capabilities);
+  const backend = new StubBackend(items, opts.strictIds !== true, capabilities);
   const messages: Message[] = [...historyMessages(c.history), { role: "user", content: userTurn(await promptFor(c)) }];
-  const trace: Trace = { calls: [], turns: 0, exhausted: false, stray: "", inputTokens: 0, outputTokens: 0 };
+  const trace: Trace = { calls: [], turns: 0, exhausted: false, stray: "", inputTokens: 0, outputTokens: 0, capabilities };
   const prefix = `mcp__${ASSISTANT_MCP_SERVER}__`;
 
   for (let turn = 1; turn <= maxTurns; turn++) {
@@ -482,6 +516,13 @@ export interface Score {
   langOk: boolean;
   /** No reply says what the case's `sayNot` forbids. */
   contentOk: boolean;
+  /**
+   * A `selfKnowledge` case: claw_capabilities was called before the first reply, and no reply states a limit the list it answered
+   * contradicts, nor claims an ability it lists as off (`self-knowledge.ts`). True for every other case.
+   */
+  selfOk: boolean;
+  /** What the list contradicts, for a `selfKnowledge` case that failed on it. */
+  contradictions?: string[];
   /** The user was told by the turn's end (plain text, no say) and not by a say. */
   rescued: boolean;
   /** dispatch, speech, item, language and content all right. */
@@ -518,9 +559,11 @@ export function scoreCase(c: EvalCase, t: Trace): Score {
   const texts = [...says.map((x) => String(x.input.text ?? "")), ...delivered];
   const langOk = !c.lang || texts.every((s) => (c.lang === "zh" ? CJK.test(s) : !CJK.test(s)));
   const contentOk = !c.sayNot || texts.every((s) => !c.sayNot!.test(s));
+  const self = selfKnowledgeOf(c, t, texts);
   return {
     id: c.id, kind: c.kind, dispatchOk, spokeOk, sayItemOk, langOk, contentOk, rescued: delivered.length > 0,
-    turnOk: dispatchOk && spokeOk && sayItemOk && langOk && contentOk,
+    selfOk: self.ok, ...(self.contradictions.length ? { contradictions: self.contradictions } : {}),
+    turnOk: dispatchOk && spokeOk && sayItemOk && langOk && contentOk && self.ok,
     actual, attempted, spoke: says.length + delivered.length,
     inexactRefs: t.calls.filter((x) => x.ref && !x.ref.exact).length,
     refusals: t.calls.filter((x) => x.refused).map((x) => `${x.tool}:${(x.result as { error?: string }).error}`),
@@ -528,6 +571,21 @@ export function scoreCase(c: EvalCase, t: Trace): Score {
     saidBesideRefusal: says.filter((x) => beside(t, x).some((w) => w.refused)).length,
     ...(t.error ? { error: t.error } : {}),
   };
+}
+
+/**
+ * A `selfKnowledge` case's check: the list was read (claw_capabilities called, and not after the first say), and nothing said
+ * contradicts it. A turn that never read the list fails, whatever it said: its answer came from guesswork.
+ */
+function selfKnowledgeOf(c: EvalCase, t: Trace, texts: readonly string[]): { ok: boolean; contradictions: string[] } {
+  if (!c.selfKnowledge) return { ok: true, contradictions: [] };
+  const read = t.calls.findIndex((x) => x.tool === "claw_capabilities" && !x.refused);
+  const firstSay = t.calls.findIndex((x) => x.tool === "say" && !x.refused);
+  const contradictions = t.capabilities
+    ? texts.flatMap((s) => contradictedClaims(s, t.capabilities!).map((x) => `${x.detector}: "${x.words}" (${x.why})`))
+    : ["no capability list in the trace"];
+  const readFirst = read >= 0 && (firstSay < 0 || read < firstSay);
+  return { ok: !t.error && readFirst && contradictions.length === 0, contradictions: readFirst ? contradictions : ["claw_capabilities was not called before the answer", ...contradictions] };
 }
 
 export interface Summary {

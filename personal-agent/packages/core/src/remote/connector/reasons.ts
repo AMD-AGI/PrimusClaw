@@ -35,6 +35,15 @@ export const STATUS: Pair = both((lang) => connectorReasonHints.in(lang).status)
 /** Codes an older connector hits on a root machine with `approval = "never"`: an upgrade fixes them (see `FIXED_IN`). */
 export const OLD_CONNECTOR: ReadonlySet<string> = new Set(["mode_unavailable", "mode_not_enforced"]);
 
+/**
+ * Codes a connector before a release hits far more often than one after it, with the release that fixed that: an older connector is
+ * told to upgrade after the code's own sentence. Before 0.1.22 a connector did not recognise a pasted message (Claude Code records a
+ * paste of several lines as a `<pasted_content>` block), so nearly every long message it typed into a terminal ended unconfirmed.
+ */
+export const FIXED_LATER: Readonly<Record<string, readonly [number, number, number]>> = {
+  terminal_input_unconfirmed: [0, 1, 22],
+};
+
 // Codes that end on a new-session hint / a retry hint, after their sentence.
 const THEN_NEW: ReadonlySet<string> = new Set([
   "adapter_gone",
@@ -86,6 +95,13 @@ function hintAfter(code: string, lang: Lang, version: unknown): { sep: string; h
     if (parsed === null || older(parsed, FIXED_IN))
       return { sep: "\n\n", hint: `${hints.upgrade({ command: UPGRADE_COMMAND })}\n\n${hints.sandbox}\n\n` };
     return { sep: " ", hint: hints.status }; // (a fixed connector refused anyway: not the root case)
+  }
+  const fixedIn = own<readonly [number, number, number]>(FIXED_LATER, code);
+  if (fixedIn) {
+    const parsed = parseVersion(version);
+    if (parsed !== null && older(parsed, fixedIn))
+      return { sep: "\n\n", hint: hints.upgrade({ command: UPGRADE_COMMAND }) };
+    return null;
   }
   if (THEN_NEW.has(code)) return { sep: " ", hint: hints.newSession };
   if (THEN_RETRY.has(code)) return { sep: " ", hint: hints.retry };

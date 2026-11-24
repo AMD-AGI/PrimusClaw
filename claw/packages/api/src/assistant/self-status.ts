@@ -20,6 +20,7 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_ASSISTANT_SELF_STATUS, CLAW_BUILD } from "
 import { inTransaction, type Querier } from "../infra/db.js";
 import { CHAT_SURFACES, chatSurface } from "./chat-surface.js";
 import { quotedName } from "./assistant-name.js";
+import { CAPABILITIES_TOOL } from "./capabilities.js";
 
 export function selfStatusOn(): boolean {
   return CLAW_ASSISTANT_ENABLED && CLAW_ASSISTANT_SELF_STATUS;
@@ -33,9 +34,12 @@ export function selfStatusOn(): boolean {
  * it has one (nightly 2026-11-11..13: 9 of the 24 chitchat replies with a length check ran past it, "who are you" at 457-571 characters
  * against 400, a sign-off listing the cards that wait). router-self-v4: v3 with the model question answered by the model the turn's
  * state names as the assistant's own (`own-model.ts`), not by the models work items and reviews run on (2026-11-14: "你用的什么模型"
- * answered "I cannot see which model I run on", with the item defaults).
+ * answered "I cannot see which model I run on", with the item defaults). router-self-v5: v4 with every question about what the assistant
+ * can or cannot do, its limits or how it compares with other assistants answered from claw_capabilities, called first, and never with a
+ * limit that list contradicts (2026-11-23: asked what it could not do, it said it had no background watching, could not see images, needed
+ * a worker and a confirmation for every write and could not check a worker's conclusions, all four false, without calling a tool).
  */
-export const ROUTER_SELF_PROMPT_VERSION = "router-self-v4";
+export const ROUTER_SELF_PROMPT_VERSION = "router-self-v5";
 
 /** About how long a greeting, a thanks or a sign-off is answered (router-self-v3). */
 export const SOCIAL_REPLY_CHARS = 100;
@@ -85,6 +89,7 @@ export function renderRouterSelfSection(
     `Who you are (who are you, 你是谁): under about ${SELF_INTRO_CHARS} characters, in one to three sentences: you are ${you}, the user's personal assistant, who keeps track of what they ask, looks things up and hands real work to workers; at most one line of examples after it. Which model you run on (你用的什么模型, which model are you): the one the turn's state names as yours, alone, in a line or two; the models work items and reviews run on are not yours.`,
     `What you can do, how to use you, or help (what can you do, 你能做什么, help, give an example of a prompt): under about ${CAPABILITIES_CHARS} characters: at most four short examples of what they can ask, one per line.${fullList}`,
     "Never answer these with every tool, system or capability you have. Anything else the same message asks is answered as usual, at its own length.",
+    `What you can or cannot do, your limits, or how you compare with other assistants (你能做什么, 你不能做什么, 你能看图吗, 你会盯 PR 吗, 你和 ChatGPT 比怎么样, can you see images, do you watch my PRs, what can't you do): call ${CAPABILITIES_TOOL} first, before you say anything, and answer from what it returns alone, never from what you remember or guess about yourself. An ability it lists with on true is one you have: never say you cannot do it, need a worker for it or must ask first when it says otherwise. One it lists with on false, and a limit with on false, is one you do not have: say so plainly, and never claim it. Your examples of what they can ask come from the abilities that are on. A comparison names what the list says you have and lack, never a product you have not been told about.`,
     "",
     "Counting what a lookup returned",
     "When a result gives a count (total_count, totalCount, in_result) or counts by a field (by, by_repo), answer how many from those numbers. A result that says it is cut (complete false, shown less than the count, not_shown, or a note that it was cut) holds only some of the items: never count its items as the answer, and never call a number uncertain because a list was cut when the counts are given. A count of one kind across every page (running workloads, open pull requests in one repository) is the total the tool answers when called with that filter. To name items that were not shown, call the tool again narrowed (a pool, a repository, a status) or with its paging.",

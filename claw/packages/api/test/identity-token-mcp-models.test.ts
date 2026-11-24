@@ -88,7 +88,7 @@ describe("the models tool and an identity token", () => {
       if (req.method === "GET" && path === "/playground/models") return sendJson(res, 200, { data: { items: [] } });
       return sendJson(res, 404, { message: "no such route" });
     });
-    Object.assign(process.env, { SAFE_API_URL: safe.url, AUTH_INTERNAL_TOKEN: INTERNAL });
+    Object.assign(process.env, { SAFE_API_URL: safe.url, CLAW_AUTH_PROVIDER: "safe", AUTH_INTERNAL_TOKEN: INTERNAL });
     delete process.env.CLAW_DEPLOY_MODE;
     ({ startIdentityClient } = await import("../src/auth/identity.js"));
     const { authMiddleware } = await import("../src/auth/middleware.js");

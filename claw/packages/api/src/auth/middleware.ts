@@ -10,11 +10,13 @@ import {
   SafeUpstreamHttpError,
 } from "./safe-client.js";
 import type { UserInfo } from "./models.js";
-import { SAFE_API_URL, APP_ENV, MEMORY_LLM_BASE_URL, isKubernetesMode } from "../config.js";
+import { SAFE_API_URL, APP_ENV, MEMORY_LLM_BASE_URL, isKubernetesMode, isIdentityAuthProvider } from "../config.js";
+import { identityClient } from "./identity.js";
+import { IdentityAccountRefusedError, IdentityVerifier, PlatformKeyMissingError, identityApiBase } from "./identity-verifier.js";
 import { cacheUserLlmKey } from "../llm/client.js";
 import { resolveUserLlmKey, usePlatformKeyForLlm } from "../llm/key-source.js";
 import { ByokInvalidKeyError, ByokRateLimitError, ByokUpstreamUnavailableError, verifyByokKey } from "./byok.js";
-import { constantTimeEquals } from "@claw/utils";
+import { constantTimeEquals, readIdentityConfig } from "@claw/utils";
 import { verifyConnectorToken } from "./connector-token.js";
 import { verifyConnectorGrant } from "./connector-grant.js";
 import { verifyIdentityAccessToken } from "./identity-token.js";
@@ -27,14 +29,28 @@ import pino from "pino";
 const logger = pino({ name: "auth" });
 
 let _client: SafeClient | null = null;
+let _identityVerifier: IdentityVerifier | null = null;
 
-function getClient(): SafeClient | null {
+/** The verifier of the configured auth provider, or null when that provider is not configured. */
+function getClient(): CredentialVerifier | null {
+  if (isIdentityAuthProvider()) {
+    if (_identityVerifier) return _identityVerifier;
+    const identity = identityClient();
+    const apiUrl = identityApiBase(process.env.IDENTITY_INTROSPECTION_URL);
+    if (!identity || !apiUrl) return null;
+    _identityVerifier = new IdentityVerifier(identity, {
+      apiUrl,
+      client: { clientId: process.env.IDENTITY_CLIENT_ID ?? "", clientSecret: process.env.IDENTITY_CLIENT_SECRET ?? "" },
+      timeoutMs: readIdentityConfig(process.env).settings?.requestTimeoutMs,
+    });
+    return _identityVerifier;
+  }
   if (!_client && SAFE_API_URL) _client = new SafeClient(SAFE_API_URL);
   return _client;
 }
 
-/** The SaFE client the credential paths verify with, for a route that verifies a second person's key (`verifyActingAsCredentials`). */
-export function credentialVerifier(): SafeClient | null {
+/** The client the credential paths verify with, for a route that verifies a second person's key (`verifyActingAsCredentials`). */
+export function credentialVerifier(): CredentialVerifier | null {
   return getClient();
 }
 
@@ -213,7 +229,35 @@ export function authLogPath(url: string): string {
 }
 
 /** The SaFE calls the credential paths need. Narrowed so tests can pass a stub. */
-export type CredentialVerifier = Pick<SafeClient, "verifyCookie" | "verifyApiKey"> & Partial<Pick<SafeClient, "verifyAccessToken">>;
+export type CredentialVerifier = {
+  verifyCookie(token: string, userType?: string): Promise<UserInfo>;
+  verifyApiKey(apiKey: string): Promise<UserInfo>;
+  /** Names the provider in failure messages and logs; absent means SaFE. */
+  authProvider?: AuthProviderInfo;
+} & Partial<Pick<SafeClient, "verifyAccessToken">>;
+
+/** How failure messages and logs name an auth provider. */
+export type AuthProviderInfo = {
+  name: string;
+  settings: string;
+  logFields: Record<string, unknown>;
+};
+
+const SAFE_AUTH_PROVIDER: AuthProviderInfo = {
+  name: "SaFE",
+  settings: "SAFE_API_URL, AUTH_INTERNAL_TOKEN",
+  logFields: { safeApiUrl: SAFE_API_URL },
+};
+
+/** The provider `client` names in failure messages and logs. */
+function providerOf(client: CredentialVerifier): AuthProviderInfo {
+  return client.authProvider ?? SAFE_AUTH_PROVIDER;
+}
+
+/** `s` with its first letter upper-cased, for a provider name that starts a sentence. */
+function capitalized(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
 
 /** An error response a credential path asks {@link authMiddleware} to send. */
 type AuthErrorSpec = {
@@ -249,10 +293,17 @@ function verificationFailureSpec(
   e: unknown,
   unreachableMessage: string,
   invalidLegacyError: string,
+  provider: AuthProviderInfo,
 ): AuthErrorSpec {
   // One reading for every credential SaFE is asked about (delegated-keys.ts): SaFE that cannot be reached, that
   // answers 5xx, or that answers 2xx with something that is not an answer has not judged the credential. A 401 for
   // that tells a person (and a connector, which stops for good after a run of them) that a good key is invalid.
+  if (e instanceof PlatformKeyMissingError) {
+    return { status: 403, legacyError: "platform_key_missing", anthropicType: "permission_error", message: e.message };
+  }
+  if (e instanceof IdentityAccountRefusedError) {
+    return { status: 403, legacyError: "account_refused", anthropicType: "permission_error", message: e.message };
+  }
   const failure = safeFailureOf(e);
   if (failure.status === "unavailable") {
     return {
@@ -261,7 +312,7 @@ function verificationFailureSpec(
       anthropicType: "api_error",
       // SaFE's own error text stays in the log (verificationFailureLogFields), not in the answer.
       message: e instanceof AuthUpstreamUnreachableError ? unreachableMessage
-        : "SaFE could not verify the credential now (it answered with an error); this is not an invalid-credential response.",
+        : `${capitalized(provider.name)} could not verify the credential now (it answered with an error); this is not an invalid-credential response.`,
     };
   }
   if (failure.status === "misconfigured") {
@@ -281,21 +332,26 @@ function verificationFailureSpec(
 }
 
 /** Upstream details worth logging when SaFE rejects or cannot be reached. */
-function verificationFailureLogFields(e: unknown): Record<string, unknown> {
+function verificationFailureLogFields(e: unknown, provider: AuthProviderInfo): Record<string, unknown> {
   const up = e instanceof SafeUpstreamHttpError ? e : null;
   return {
     errMessage: e instanceof Error ? e.message : String(e),
     errStack: e instanceof Error ? e.stack?.split("\n").slice(0, 4).join(" | ") : "",
-    safeApiUrl: SAFE_API_URL,
+    ...provider.logFields,
     upstreamStatus: up?.status ?? null,
     upstreamRequestId: up?.requestId ?? null,
     upstreamBody: up?.bodySnippet ?? null,
   };
 }
 
-const UNREACHABLE_FOR_API_KEY =
-  "cannot reach SaFE to verify the API key (check SAFE_API_URL, AUTH_INTERNAL_TOKEN, and network). " +
-  "This is not an invalid-key response from SaFE.";
+/** The 503 message for a credential the configured auth provider cannot be reached to verify. */
+function unreachableText(credential: string, provider: AuthProviderInfo): string {
+  return `cannot reach ${provider.name} to verify the ${credential} (check ${provider.settings}, and network).`;
+}
+
+/** The 503 message for an API key the provider cannot be reached to verify. */
+const unreachableForApiKey = (provider: AuthProviderInfo): string =>
+  `${unreachableText("API key", provider)} This is not an invalid-key response from ${provider.name}.`;
 
 /**
  * Path 1: SaFE session cookie.
@@ -323,14 +379,15 @@ export async function verifySessionCookie(
       path: pathname,
       userType: userTypeCookie || "(empty)",
       tokenLen: tokenCookie.length,
-      ...verificationFailureLogFields(e),
+      ...verificationFailureLogFields(e, providerOf(client)),
     }, "auth.cookie.rejected");
     return {
       status: "rejected",
       error: verificationFailureSpec(
         e,
-        "cannot reach SaFE to verify the session cookie (check SAFE_API_URL, AUTH_INTERNAL_TOKEN, and network).",
+        unreachableText("session cookie", providerOf(client)),
         "invalid_cookie",
+        providerOf(client),
       ),
     };
   }
@@ -398,11 +455,11 @@ export async function verifyBearerApiKey(
     logger.warn({
       path: pathname,
       tokenLen: token.length,
-      ...verificationFailureLogFields(e),
+      ...verificationFailureLogFields(e, providerOf(client)),
     }, "auth.apikey.rejected");
     return {
       status: "rejected",
-      error: verificationFailureSpec(e, UNREACHABLE_FOR_API_KEY, "invalid_api_key"),
+      error: verificationFailureSpec(e, unreachableForApiKey(providerOf(client)), "invalid_api_key", providerOf(client)),
     };
   }
 }
@@ -432,11 +489,11 @@ export async function verifyXApiKeyHeader(
   } catch (e: unknown) {
     logger.warn({
       path: pathname,
-      ...verificationFailureLogFields(e),
+      ...verificationFailureLogFields(e, providerOf(client)),
     }, "auth.x_api_key.rejected");
     return {
       status: "rejected",
-      error: verificationFailureSpec(e, UNREACHABLE_FOR_API_KEY, "invalid_api_key"),
+      error: verificationFailureSpec(e, unreachableForApiKey(providerOf(client)), "invalid_api_key", providerOf(client)),
     };
   }
 }
@@ -650,7 +707,9 @@ export async function authMiddleware(req: FastifyRequest, reply: FastifyReply): 
   const client = getClient();
   if (!client) {
     return sendAuthError(req, reply, 500, "authentication_misconfigured", "api_error",
-      "SAFE_API_URL is not configured; cannot authenticate") as any;
+      isIdentityAuthProvider()
+        ? "CLAW_AUTH_PROVIDER=identity needs the identity client (IDENTITY_CLIENT_ENABLED) and IDENTITY_INTROSPECTION_URL; cannot authenticate"
+        : "SAFE_API_URL is not configured; cannot authenticate") as any;
   }
 
   for (const verifyCredential of CREDENTIAL_PATHS) {

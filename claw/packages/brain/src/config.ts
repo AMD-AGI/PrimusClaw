@@ -147,8 +147,9 @@ function resolveLlmApiStyle(): LlmApiStyle {
 export const LLM_API_STYLE: LlmApiStyle = resolveLlmApiStyle();
 
 // --- LLM key source ---
-// "virtualKey" preserves the existing behavior. "platformKey" is proxy mode:
-// Engines and kubernetes sandbox env use platform_key as the LLM API key.
+// "virtualKey" (default) is the caller's own gateway key. "platformKey" is proxy
+// mode: SaFE's /api/v1/llm-proxy puts the user's LiteLLM virtual key on the request.
+// CLAW_AUTH_PROVIDER=identity requires platformKey (IdentityVerifier leaves virtualKey empty).
 export type LlmKeySource = "virtualKey" | "platformKey";
 export const LLM_KEY_SOURCE: LlmKeySource =
   env("LLM_KEY_SOURCE", "virtualKey") === "platformKey" ? "platformKey" : "virtualKey";
@@ -1778,6 +1779,16 @@ export const WEB_SEARCH_DOMAIN_DENYLIST = env("WEB_SEARCH_DOMAIN_DENYLIST", "");
 
 // --- Web Fetch ---
 export const WEB_FETCH_ENABLED = envBool("WEB_FETCH_ENABLED", false);
+
+/**
+ * Brain's built-in web tools on this deployment, each on its own: web_search with a search provider, web_fetch with WEB_FETCH_ENABLED.
+ * The tools a turn is offered (`tools/router.ts`) and the ones Brain names to Claw's assistant server (`clients/mcp.ts`, so that what
+ * the assistant says it can look up is what it has) are both this list.
+ */
+export function builtinWebTools(provider: string = WEB_SEARCH_PROVIDER, fetch: boolean = WEB_FETCH_ENABLED): string[] {
+  return [...(provider !== "disabled" ? ["web_search"] : []), ...(fetch ? ["web_fetch"] : [])];
+}
+export const BUILTIN_WEB_TOOLS: readonly string[] = builtinWebTools();
 export const WEB_FETCH_MAX_BYTES = envInt("WEB_FETCH_MAX_BYTES", 10 * 1024 * 1024);
 export const WEB_FETCH_MAX_OUTPUT_CHARS = envInt("WEB_FETCH_MAX_OUTPUT_CHARS", 50_000);
 export const WEB_FETCH_DOMAIN_DENYLIST = env("WEB_FETCH_DOMAIN_DENYLIST", "");

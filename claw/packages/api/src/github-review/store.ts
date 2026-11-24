@@ -114,6 +114,9 @@ export const GITHUB_REVIEW_SCHEMA_SQL = [
   // Whether the call was held to its session's request budget (see {@link sessionRequestCount}): false for the calls the server makes on
   // its own or on a person's answer (`skipBudget`), null on rows written before the column existed.
   `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS budgeted BOOLEAN`,
+  // The commit a merge made (`gh_pr_merge` answered merged), as GitHub gave it; null for every other call. The owner of a review that
+  // merged in its own run is told it (assistant/review-result.ts).
+  `ALTER TABLE claw_github_audit ADD COLUMN IF NOT EXISTS merge_sha TEXT`,
 ];
 
 export async function ensureGithubReviewSchema(client: pg.PoolClient): Promise<void> {
@@ -222,6 +225,8 @@ export interface AuditFinish {
   posted?: PostedReview | null;
   /** GitHub's merge state a merge was refused on (`merge_state_not_clean`), else unset. */
   mergeState?: string | null;
+  /** The commit a merge made, when the call merged. */
+  mergeSha?: string | null;
 }
 
 /** One inline finding of a posted review: where it is, the thread GitHub opened for it (null when that could not be read) and its first words. */
@@ -245,13 +250,14 @@ export async function auditFinish(db: Queryable, id: number, f: AuditFinish): Pr
             github_requests = $5, github_request_ids = $6::jsonb, github_status = $7,
             risk_reasons = $8::jsonb, confirmation_id = $9, dry_run = $10, write = $11,
             result = $12, detail = $13, review_path = $14, review_path_reason = $15, review_mode = COALESCE($16, review_mode),
-            posted = COALESCE($17::jsonb, posted), merge_state = COALESCE($18, merge_state)
+            posted = COALESCE($17::jsonb, posted), merge_state = COALESCE($18, merge_state), merge_sha = COALESCE($19, merge_sha)
       WHERE id = $1`,
     [
       id, f.repo ?? null, f.pr ?? null, f.headSha ?? null, f.githubRequests, JSON.stringify(f.githubRequestIds.slice(-20)),
       f.githubStatus ?? null, JSON.stringify(f.riskReasons ?? []), f.confirmationId ?? null, f.dryRun, f.write,
       f.result, (f.detail ?? "").slice(0, 500), f.reviewPath ?? null, f.reviewPathReason ?? null, f.reviewMode ?? null,
       f.posted ? JSON.stringify(f.posted) : null, f.mergeState ? String(f.mergeState).slice(0, 40) : null,
+      f.mergeSha ? String(f.mergeSha).slice(0, 64) : null,
     ],
   );
 }
@@ -365,8 +371,15 @@ export type ReviewEvent = "COMMENT" | "REQUEST_CHANGES" | "APPROVE";
 export interface ReviewComment { path: string; line: number; side: "RIGHT" | "LEFT"; body: string }
 /** A review held for the acting user, as it will be posted (its footer is added when it is). */
 export interface HeldReview { event: ReviewEvent; body: string; comments: ReviewComment[] }
-/** What a confirmation holds: a merge (approve if needed, then merge), or a review. */
-export type ConfirmationKind = "merge" | "review";
+/**
+ * What a confirmation holds: a merge (approve if needed, then merge), or a review, held for the acting user; or `requester_merge`, the
+ * question put to the person who asked for a review of someone else when the reviewer approved and cannot merge (`REQUESTER_MERGE`): their
+ * own account merges only on their yes. It is never one of the acting user's held writes.
+ */
+export type ConfirmationKind = "merge" | "review" | "requester_merge";
+
+/** The kind of the question put to the requester (`ConfirmationKind`). */
+export const REQUESTER_MERGE = "requester_merge";
 
 /** A digest of what a review says, its text and inline comments: the marker a posted review carries, and part of the key of a held one. */
 export function reviewDigest(text: string, comments: ReviewComment[]): string {
@@ -417,7 +430,7 @@ function toConfirmation(row: Record<string, unknown>): Confirmation {
     author: String(row.author ?? ""),
     reasons: Array.isArray(row.reasons) ? (row.reasons as string[]) : [],
     checks: (row.checks && typeof row.checks === "object" ? row.checks : {}) as Record<string, unknown>,
-    kind: row.kind === "review" ? "review" : "merge",
+    kind: row.kind === "review" ? "review" : row.kind === REQUESTER_MERGE ? REQUESTER_MERGE : "merge",
     review: readHeldReview(row.review),
     status: row.status as ConfirmationStatus,
     createdAt: iso(row.created_at),
@@ -487,7 +500,7 @@ export async function heldOrDeniedOn(db: Queryable, actorUserId: string, repo: s
   const r = await db.query(
     `SELECT CASE WHEN status = 'pending' AND expires_at <= NOW() THEN 'expired' ELSE status END AS state
        FROM claw_github_confirmations
-      WHERE actor_user_id = $1 AND lower(repo) = lower($2) AND pr = $3 AND head_sha = $4
+      WHERE actor_user_id = $1 AND lower(repo) = lower($2) AND pr = $3 AND head_sha = $4 AND kind <> '${REQUESTER_MERGE}'
         AND status IN ('pending', 'merging', 'denied', 'expired')`,
     [actorUserId, repo, pr, headSha],
   );
@@ -606,12 +619,15 @@ export async function finishConfirmation(
  * in one statement, as a click takes one (`claimConfirmation`): a click after this finds them no longer pending. Null, with nothing taken,
  * when one of the session's held writes is being decided right now: the acting user's answer goes first.
  */
-export async function claimHeldMerges(db: Queryable, sessionId: string, headSha: string, requesterUserId: string): Promise<string[] | null> {
+export async function claimHeldMerges(
+  db: Queryable, sessionId: string, headSha: string, requesterUserId: string, deciding: string[] = [],
+): Promise<string[] | null> {
   const busy = async (except: string[]): Promise<boolean> => (await db.query(
     "SELECT 1 FROM claw_github_confirmations WHERE session_id = $1 AND status = 'merging' AND NOT (confirmation_id::text = ANY($2::text[])) LIMIT 1",
     [sessionId, except],
   )).rows.length > 0;
-  if (await busy([])) return null;
+  // (`deciding`: the requester's own answer being carried out, which is what is merging this)
+  if (await busy(deciding)) return null;
   const taken = (await db.query(
     `UPDATE claw_github_confirmations
         SET status = 'merging', decided_at = NOW(), decided_by = $3, decided_via = '{"kind":"requester"}'::jsonb
@@ -620,11 +636,45 @@ export async function claimHeldMerges(db: Queryable, sessionId: string, headSha:
     [sessionId, headSha, requesterUserId],
   )).rows.map((r) => String((r as { confirmation_id: string }).confirmation_id));
   // A click that claimed one between the look and the update: theirs goes first, and what was taken here is given back.
-  if (await busy(taken)) {
+  if (await busy([...deciding, ...taken])) {
     for (const id of taken) await reopenConfirmation(db, id);
     return null;
   }
   return taken;
+}
+
+/**
+ * Codes of a reviewer's merge refused because their account may not merge here: no write permission on the repository
+ * (`no_merge_permission`), or GitHub refused the merge itself for a permission reason (`merge_not_permitted`). Only these let the
+ * requester be asked whether their own account merges instead (`GithubReview.followPullRequest`).
+ */
+export const REVIEWER_CANNOT_MERGE: readonly string[] = ["no_merge_permission", "merge_not_permitted"];
+
+/**
+ * The code of the latest merge this session tried with the reviewer's account (`gh_pr_merge`, the review's own call or a held merge
+ * they confirmed) of `headSha` (any head when null), when it was refused because they may not merge (`REVIEWER_CANNOT_MERGE`); null
+ * otherwise, and null when a later merge of theirs of that head was not refused for that.
+ */
+export async function reviewerMergeRefusal(db: Queryable, sessionId: string, actorUserId: string, headSha: string | null): Promise<string | null> {
+  const r = await db.query(
+    `SELECT result, detail FROM claw_github_audit
+      WHERE session_id = $1 AND actor_user_id = $2 AND tool = 'gh_pr_merge' AND result <> 'started'
+        AND ($3::text IS NULL OR lower(head_sha) = lower($3))
+      ORDER BY at DESC, id DESC LIMIT 1`,
+    [sessionId, actorUserId, headSha],
+  );
+  const row = r.rows[0] as { result?: string; detail?: string } | undefined;
+  return row?.result === "refused" && REVIEWER_CANNOT_MERGE.includes(String(row.detail)) ? String(row.detail) : null;
+}
+
+/** The question put to the requester on this head (`REQUESTER_MERGE`), the latest whatever its state, or null when none was. */
+export async function requesterMergeOn(db: Queryable, sessionId: string, headSha: string): Promise<Confirmation | null> {
+  const r = await db.query(
+    `SELECT * FROM claw_github_confirmations WHERE session_id = $1 AND kind = '${REQUESTER_MERGE}' AND head_sha = $2
+      ORDER BY created_at DESC LIMIT 1`,
+    [sessionId, headSha],
+  );
+  return r.rows[0] ? toConfirmation(r.rows[0] as Record<string, unknown>) : null;
 }
 
 /** The GitHub ids of the approvals this session posted of this head, newest first, from its own audit rows (`posted`). */

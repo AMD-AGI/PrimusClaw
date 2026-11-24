@@ -38,6 +38,10 @@ import { VERSION } from "./version.js";
 import { redactDeep } from "./redact.js";
 import { probeAgents, probeLines, type ProbeFn } from "./probe.js";
 import { rootProblems } from "./roots.js";
+import {
+  AUTO_UPGRADE_ENV, AutoUpgrader, EXIT_UPGRADED, TRIAL_ENV, TRIAL_OK_LINE, autoUpgradeSetting, installLayout, manualCommand, performUpgrade,
+  probationForget, probationPassed, probationStart, readUpgradeState, watchProbation, unwritable, upgradeTiming, writeConfigSetting, writeUpgradeState,
+} from "./auto-upgrade.js";
 
 export interface Ctx {
   dirs: Dirs;
@@ -97,7 +101,8 @@ export interface Ctx {
  * `terminated`: a supervised run ended by a signal that did not come from `stop` (a bare `kill`, the OOM killer's
  * SIGTERM, a container runtime). It is not a stop on purpose, so every supervisor restarts it.
  */
-export const EXIT = { ok: 0, failure: 1, usage: 2, terminated: 75, needsPerson: 78, revoked: 78 } as const;
+/** `upgraded`: a supervised run that upgraded the package; its supervisor starts the new version (auto-upgrade.ts). */
+export const EXIT = { ok: 0, failure: 1, usage: 2, terminated: 75, needsPerson: 78, revoked: 78, upgraded: EXIT_UPGRADED } as const;
 
 /**
  * One subcommand: how it is called (`usage`, after "claw-connector"), what it does (`about`, wrapped at the width the
@@ -168,6 +173,14 @@ revoked, sign-in refused, or no usable config; starting it again will not help`,
       // launchd cannot be told "never restart on 78"; it does not restart a clean exit. The reason was printed.
       return code === EXIT.needsPerson && ctx.env.CLAW_CONNECTOR_SUPERVISOR === "launchd" ? EXIT.ok : code;
     },
+  },
+  "auto-upgrade": {
+    usage: "auto-upgrade on|off|status [--json]",
+    about: `whether this connector upgrades itself to the version Claw recommends (on by default): only when
+no session is working, only to that exact version, never across a major version, keeping the old
+version to go back to if the new one does not connect. Sets auto_upgrade in agents.toml;
+CLAW_CONNECTOR_AUTO_UPGRADE=0 in the service's environment turns it off whatever agents.toml says`,
+    run: (rest, ctx) => cmdAutoUpgrade(rest, ctx),
   },
   service: {
     usage: "service install|uninstall|status [--supervisor systemd|launchd|script] [--env NAME ...]",
@@ -691,6 +704,20 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   // these units or by a unit written by hand earlier for the old revoked code 3 (it now restarts on 78, and each
   // restart ends here without contacting Claw).
   const { values: runFlags } = parseArgs({ args, strict: true, options: { supervised: { type: "boolean" } } });
+  // A trial run of a version this connector just installed (auto-upgrade.ts): it connects once and exits, beside the run that
+  // installed it, which is stopped and waits for it (so the pid file is that run's, not this one's).
+  const trial = (ctx.env[TRIAL_ENV] ?? "").trim() !== "";
+  const log = stderrLogger();
+  // A version this connector just upgraded itself to is on probation until one of its runs stays connected for a while; the
+  // run that would be one too many puts the old version back instead, and ends so that its supervisor starts that one.
+  // Counted first, before anything of this run that could fail: under systemd or launchd nothing else counts a run that
+  // fails (the run itself is restarted every few seconds), so a run that fails at any later step still counts.
+  const timing = upgradeTiming(ctx.env);
+  const probation = trial ? "none" : probationStart(ctx.dirs, VERSION, process.pid, timing.trialAttempts, log);
+  if (probation === "rolled_back") {
+    ctx.err(`${new Date().toISOString()} ${VERSION} did not stay connected in ${timing.trialAttempts} runs; the version before it is back; exit ${EXIT.upgraded}, so the supervisor starts it`);
+    return EXIT.upgraded;
+  }
   {
     const nl = needsLogin(ctx.dirs);
     if (nl) {
@@ -710,14 +737,26 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   }
   if (cfg.agents.length === 0) { ctx.err("agents.toml defines no agents; add an [[agents]] table"); return EXIT.needsPerson; }
   if (!creds) { ctx.err("not signed in: run  claw-connector login"); return EXIT.needsPerson; }
-  const running = runningPid(ctx);
+  const running = trial ? null : runningPid(ctx);
   if (running !== null) { ctx.err(`already running (pid ${running}); use "claw-connector stop" first`); return EXIT.failure; }
   const server = serverUrl(ctx, undefined, cfg, creds)!;
   const tokens = providerFor(creds, (c) => saveCredentials(credentialsFile(ctx.dirs), c), { fetch: ctx.fetch });
   const client = new ClawClient({ server, tokens, fetch: ctx.fetch });
-  const log = stderrLogger();
   const audit = fileAudit(auditFile(ctx.dirs));
-  const connector = new Connector({ config: cfg, dirs: ctx.dirs, client, server, audit, log, version: VERSION, timing: ctx.timing, health: runHealth(ctx, cfg) });
+  const cli = ctx.cli ?? ctx.service?.cli ?? fileURLToPath(import.meta.url);
+  const node = ctx.node ?? process.execPath;
+  const upgrade = trial ? undefined : new AutoUpgrader({ dirs: ctx.dirs, env: ctx.env, version: VERSION, supervised: runFlags.supervised === true, cli, node, log });
+  if (!trial) postUpgradeSetup(ctx);
+  const connector = new Connector({
+    config: cfg, dirs: ctx.dirs, client, server, audit, log, version: VERSION, timing: ctx.timing, health: trial ? undefined : runHealth(ctx, cfg), upgrade, trial,
+  });
+  if (trial) {
+    ctx.onConnector?.(connector);
+    const result = await connector.run().catch((e: unknown) => { ctx.err(`trial run: ${errMessage(e)}`); return "failed" as const; });
+    if (result !== "trial_ok") { ctx.err(`trial run of ${VERSION}: ${result}`); return EXIT.failure; }
+    ctx.out(`${TRIAL_OK_LINE} ${VERSION}`);
+    return EXIT.ok;
+  }
   // In the background: the connection to Claw does not wait for a download; a session that needs one does.
   if (ctx.installAdapters) for (const { pkg, env } of pinnedOf(cfg.agents, ctx.env)) void adapterStore()?.install(pkg, env, (l) => ctx.out(`adapters: ${l}`));
   ctx.onConnector?.(connector);
@@ -727,8 +766,20 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
   for (const a of cfg.agents) if (a.readOnlyModes.includes(a.askMode)) ctx.out(`note: ${a.id}: its sessions start read-only (${a.askMode} mode changes no file); to let phone sessions write code, set approval = "never" on it in agents.toml`);
   // A root that is missing or stalled is reported, not fatal: a network mount may come back, and its sessions with it.
   void rootProblems(cfg.agents).then((ps) => { for (const p of ps) ctx.out(`warning: ${p}`); }, () => undefined);
+  // On probation: connected within `trialMs`, and then connected without a break for `probationMs`, proves this version (a
+  // stream that drops starts the time again); not connected in time, or not again within that time after a drop, ends the run
+  // with a failure, which counts against it.
+  const watch = probation === "watch" ? watchProbation(connector, timing, {
+    passed: () => probationPassed(ctx.dirs, VERSION, log),
+    late: () => {
+      log.error("this new connector version did not connect, or reconnect after a drop, in time; ending the run (it counts against the version)", { version: VERSION, within_ms: timing.trialMs });
+      connector.stop();
+    },
+  }) : null;
   try {
-    const result = await connector.run();
+    const result = await connector.run().finally(() => watch?.dispose());
+    if (result !== "upgrade") upgrade?.dispose();
+    if (watch?.late) { ctx.err(`${new Date().toISOString()} ${VERSION} did not connect (or reconnect after a drop) within ${Math.round(timing.trialMs / 1000)} s; exit ${EXIT.failure}`); return EXIT.failure; }
     // A machine paired from the chat has no login to run again: a new pairing code is what connects it.
     const again = reconnectAdvice(credentialsFile(ctx.dirs));
     if (result === "revoked") {
@@ -741,10 +792,13 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
       ctx.err(`Claw keeps refusing this sign-in (${connector.authFailure}): every agent was stopped. ${again}`);
       return EXIT.needsPerson;
     }
+    if (result === "upgrade") return await upgradeNow(ctx, connector, upgrade!, cli, node, log);
     if (runFlags.supervised && !takeStopRequest(ctx)) {
       ctx.err(`${new Date().toISOString()} stopped by a signal that did not come from "claw-connector stop"; exit ${EXIT.terminated}, so the supervisor starts it again`);
       return EXIT.terminated;
     }
+    // Stopped on purpose: not a failure of the version on probation.
+    if (probation === "watch") probationForget(ctx.dirs, VERSION, process.pid);
     return EXIT.ok;
   } catch (e) {
     // Refused at start (a deleted key, a sign-in the identity service ended): retrying cannot help.
@@ -756,6 +810,107 @@ async function cmdRun(args: string[], ctx: Ctx): Promise<number> {
     if (e instanceof HttpError || e instanceof TransportError) { ctx.err(`error: ${e.message}`); return EXIT.failure; }
     throw e;
   }
+}
+
+// --- upgrading itself (auto-upgrade.ts) ----------------------------------------------------
+
+/**
+ * The run ended to upgrade (`Connector.upgradeTarget`): install that version, prove it connects, and end with EXIT.upgraded so
+ * the supervisor starts it; or, when that cannot be done, end with EXIT.terminated so the supervisor starts this version again.
+ * `claw-connector stop` still finds this process meanwhile (the pid file is written again) and ends the upgrade where it is.
+ */
+async function upgradeNow(ctx: Ctx, connector: Connector, upgrade: AutoUpgrader, cli: string, node: string, log: ReturnType<typeof stderrLogger>): Promise<number> {
+  const to = connector.upgradeTarget!;
+  const staged = upgrade.stagedVersion;
+  const layout = await installLayout(cli, node, ctx.env);
+  if ("unmanaged" in layout || !staged || staged.version !== to) {
+    upgrade.dispose();
+    ctx.err(`cannot upgrade: ${"unmanaged" in layout ? layout.unmanaged : `${to} is not downloaded`}`);
+    return EXIT.terminated;
+  }
+  const pidf = pidFile(ctx.dirs);
+  const mine = JSON.stringify({ pid: process.pid, start: processStart(process.pid) ?? "" });
+  fs.writeFileSync(pidf, mine, { mode: 0o600 });
+  try {
+    const r = await performUpgrade({ layout, from: VERSION, to, staged, dirs: ctx.dirs, env: ctx.env, log, timing: upgradeTiming(ctx.env), signal: connector.stopSignal });
+    if (r.outcome === "upgraded") { ctx.err(`${new Date().toISOString()} upgraded ${VERSION} -> ${to}; exit ${EXIT.upgraded}, so the supervisor starts ${to}`); return EXIT.upgraded; }
+    if (r.outcome === "stopped") return takeStopRequest(ctx) ? EXIT.ok : EXIT.terminated;
+    if (r.outcome === "off") { ctx.err(`${new Date().toISOString()} not upgrading to ${to}: ${r.detail}; the supervisor starts ${VERSION} again`); return EXIT.terminated; }
+    ctx.err(`${new Date().toISOString()} the upgrade to ${to} ${r.outcome === "rolled_back" ? "was rolled back" : "did not happen"} (${r.detail}); the supervisor starts ${VERSION} again`);
+    return EXIT.terminated;
+  } finally {
+    try { if (fs.readFileSync(pidf, "utf8") === mine) fs.rmSync(pidf, { force: true }); } catch { /* gone */ }
+  }
+}
+
+/**
+ * The first run of a version the connector upgraded itself to: the setup a new version may need, done once. Hooks of this
+ * connector that are installed are rewritten as this version writes them (an entry from an older version, or one event missing);
+ * hooks that are not installed are never added, only mentioned, with the command that adds them.
+ */
+export function postUpgradeSetup(ctx: Ctx): void {
+  const st = readUpgradeState(ctx.dirs);
+  if (st.setup_pending !== VERSION) return;
+  for (const dir of claudeDirs(ctx, undefined)) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      if (present(hooksStatus, dir)) {
+        if (installOne(ctx, dir).changed) ctx.out(`auto-upgrade: brought the Claude Code session hooks in ${settingsFile(dir)} up to date`);
+      } else {
+        ctx.out(`auto-upgrade: note: the Claude Code session hooks are not in ${settingsFile(dir)}, so a message sent from the chat to a Claude Code session open in a terminal cannot tell when that terminal has finished with it (terminal_state_unknown). To add them: claw-connector hooks install`);
+      }
+      if (present(approvalHooksStatus, dir) && installApprovalsOne(ctx, dir).changed) ctx.out(`auto-upgrade: brought the approval hooks in ${settingsFile(dir)} up to date`);
+    } catch (e) { ctx.err(`auto-upgrade: the hooks in ${dir}: ${errMessage(e)}`); }
+  }
+  for (const dir of codexDirs(ctx, undefined)) {
+    try {
+      if (codexApprovalHooksStatus(dir).events.length > 0
+        && installCodexApprovalHooks(dir, ctx.node ?? process.execPath, approvalScript(ctx), approvalSocketFile(ctx.dirs.state)).changed) {
+        ctx.out(`auto-upgrade: brought the Codex approval hook in ${codexHooksFile(dir)} up to date`);
+      }
+    } catch (e) { ctx.err(`auto-upgrade: the Codex hook in ${dir}: ${errMessage(e)}`); }
+  }
+  const { setup_pending: _done, ...rest } = st;
+  writeUpgradeState(ctx.dirs, rest);
+}
+
+/** `auto-upgrade on|off|status`. */
+async function cmdAutoUpgrade(args: string[], ctx: Ctx): Promise<number> {
+  const { values, positionals } = parseArgs({ args, strict: true, allowPositionals: true, options: { json: { type: "boolean" } } });
+  const sub = positionals[0] ?? "status";
+  if (!["on", "off", "status"].includes(sub) || positionals.length > 1) { ctx.err(commandHelp("auto-upgrade")); return EXIT.usage; }
+  if (sub !== "status") {
+    const file = writeConfigSetting(ctx.dirs, sub === "on");
+    ctx.out(`auto-upgrade is ${sub} (auto_upgrade = ${sub === "on"} in ${file}); a running connector applies it at its next check`);
+    const s = autoUpgradeSetting(ctx.dirs, ctx.env);
+    if (s.source === "env" && s.enabled !== (sub === "on")) ctx.out(`note: ${AUTO_UPGRADE_ENV} is set in this shell, and where it is set it wins (here: ${s.enabled ? "on" : "off"})`);
+    return EXIT.ok;
+  }
+  const setting = autoUpgradeSetting(ctx.dirs, ctx.env);
+  const layout = await installLayout(ctx.cli ?? ctx.service?.cli ?? fileURLToPath(import.meta.url), ctx.node ?? process.execPath, ctx.env);
+  const st = readUpgradeState(ctx.dirs);
+  const no = "unmanaged" in layout ? null : await unwritable(layout);
+  const status = {
+    version: VERSION, enabled: setting.enabled, source: setting.source,
+    install: "unmanaged" in layout ? { managed: false, why: layout.unmanaged }
+      : { managed: true, prefix: layout.prefix, package_dir: layout.pkgDir, npm: layout.npm?.join(" ") ?? null, writable: no === null, ...(no ? { not_writable: no.dir } : {}) },
+    last: st.last ?? null, failed: st.failed ?? null, next_try_at: st.next_try_at ?? null, probation: st.probation ? { version: st.probation.version, from: st.probation.from, runs: st.probation.runs.length } : null,
+    by_hand: st.command ?? (st.last ? manualCommand("unmanaged" in layout ? null : layout, st.last.to) : null),
+  };
+  if (values.json) { ctx.out(JSON.stringify(status, null, 2)); return EXIT.ok; }
+  ctx.out(`auto-upgrade: ${setting.enabled ? "on" : "off"} (${setting.source === "env" ? AUTO_UPGRADE_ENV : setting.source === "config" ? `auto_upgrade in ${configFile(ctx.dirs)}` : setting.source === "unreadable" ? `off while it cannot be read: ${setting.detail}` : "the default"})`);
+  ctx.out(`version:      ${VERSION}`);
+  if ("unmanaged" in layout) ctx.out(`install:      cannot upgrade itself: ${layout.unmanaged}`);
+  else {
+    ctx.out(`install:      ${layout.pkgDir} (prefix ${layout.prefix})`);
+    ctx.out(`npm:          ${layout.npm ? layout.npm.join(" ") : "none found beside node or on PATH"}`);
+    ctx.out(`writable:     ${no ? `no: ${no.dir} (${no.code})` : "yes"}`);
+  }
+  if (st.last) ctx.out(`last:         ${st.last.at} ${st.last.from} -> ${st.last.to}: ${st.last.outcome}${st.last.detail ? ` (${st.last.detail})` : ""}`);
+  if (st.probation) ctx.out(`probation:    ${st.probation.version} (${st.probation.runs.length} run(s) so far); ${st.probation.from} goes back if it does not stay connected`);
+  if (st.failed) ctx.out(`failed here:  ${st.failed.version} (${st.failed.reason}); not tried again until a newer version is recommended`);
+  if (status.by_hand && st.last?.outcome !== "upgraded") ctx.out(`by hand:      ${status.by_hand}`);
+  return EXIT.ok;
 }
 
 // --- doctor -------------------------------------------------------------------------------

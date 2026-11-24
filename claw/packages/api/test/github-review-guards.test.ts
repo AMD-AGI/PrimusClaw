@@ -636,16 +636,18 @@ describe("Q a base branch with a merge queue", () => {
     assert.equal(e.gh.count(/\/merge$/), 0);
   });
 
-  test("Q10b an HTTP refusal of the queue request (a missing permission, a request GitHub will not process) is enqueue_refused with GitHub's message; a rate limit is not, and a 5xx is not", async () => {
+  test("Q10b an HTTP refusal of the queue request is enqueue_refused with GitHub's message, a missing permission merge_not_permitted (the account may not merge here); a rate limit is not, and a 5xx is not", async () => {
     const answering = (status: number, message: string, headers: Record<string, string> = {}) => async (input: URL | string | Request, init: RequestInit = {}): Promise<Response> => {
       const real = e.gh.fetch;
       if (String(init.body ?? "").includes("enqueuePullRequest")) { await real(input, init); return new Response(JSON.stringify({ message }), { status, headers: { "content-type": "application/json", ...headers } }); }
       return real(input, init);
     };
     const cases: Array<[number, string, Record<string, string>, string]> = [
-      [403, "Resource not accessible by personal access token", {}, "enqueue_refused"],
+      [403, "Resource not accessible by personal access token", {}, "merge_not_permitted"],
       [422, "Validation Failed", {}, "enqueue_refused"],
       [403, "You have exceeded a secondary rate limit", { "retry-after": "30" }, "github_rate_limited"],
+      [403, "You have triggered an abuse detection mechanism. Please wait a few minutes before you try again.", { "retry-after": "60" }, "enqueue_refused"],
+      [403, "Forbidden", {}, "enqueue_refused"],
       [503, "Service Unavailable", {}, "github_error"],
     ];
     for (const [status, message, headers, code] of cases) {
@@ -658,7 +660,7 @@ describe("Q a base branch with a merge queue", () => {
         const o = await merge();
         assert.equal(o.isError, true, `${status}: ${o.text}`);
         assert.equal(reason(o), code, `${status} ${message}: ${o.text}`);
-        if (code === "enqueue_refused") assert.match(String(o.body.message), new RegExp(message), `${status}`);
+        if (code === "enqueue_refused" || code === "merge_not_permitted") assert.match(String(o.body.message), new RegExp(message), `${status}`);
         assert.notEqual(o.body.status, "queued", String(status));
         assert.equal(e.gh.count(/\/merge$/), 0, String(status));
       } finally {

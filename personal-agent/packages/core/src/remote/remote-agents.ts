@@ -15,6 +15,7 @@ import type { JsonObject } from "../json.js";
 import type { Lang } from "../locales/lang.js";
 import type { ClickHandler, ClickRoute } from "../ports/routing.js";
 import type { Conversation, InboundMessage, UserRef } from "../ports/surface.js";
+import { takesFiles } from "./agents.js";
 import { neutral } from "./inert.js";
 import { remoteText } from "../locales/remote.js";
 import { remoteAgentText } from "../locales/remote-agents.js";
@@ -67,6 +68,7 @@ export class RemoteAgents implements RemoteChat {
   private readonly machine: MachineClicks;
   private readonly permissions: Permissions;
   private readonly prompts: Prompts;
+  private readonly ops: SessionOps;
   private readonly runner: TurnRunner;
 
   private readonly ctx: RemoteContext;
@@ -97,6 +99,7 @@ export class RemoteAgents implements RemoteChat {
     const watches = new Watches(ctx, this.state, this.board, this.follow, ended);
     const sessionStarts = new SessionStarts(ctx, this.state, lists, this.follow);
     const ops = new SessionOps(ctx, this.state, this.board, lists, this.follow, this.runner, show);
+    this.ops = ops;
     const parts: CommandParts = {
       ctx,
       state: this.state,
@@ -245,7 +248,13 @@ export class RemoteAgents implements RemoteChat {
       messageId: request.message.id,
       source: "",
       quotesWindow: this.quotesWindow(request.chat.id, request.message),
+      ...(request.files?.length ? { files: request.files } : {}),
     });
+  }
+
+  async takesFiles(chatKey: string, credential: string): Promise<boolean> {
+    const state = this.enabled ? this.state.attached(chatKey) : null;
+    return state !== null && takesFiles(await this.ops.agentOf(credential, state));
   }
 
   /** `only`: a Stop card's turn; the press stops nothing once that turn is not the one running (see Prompts.stop). */

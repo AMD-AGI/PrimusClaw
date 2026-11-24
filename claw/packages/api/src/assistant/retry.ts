@@ -66,6 +66,8 @@ export async function retryWorkItem(userId: string, itemId: string): Promise<Ret
       `WITH upd AS (
          UPDATE claw_work_items
             SET board_state = 'in_progress', last_report_kind = 'progress', pending_question = NULL, outcome = NULL,
+                -- Worked on again: not delivered, not only watching (an item stopped before its stop cleared them included).
+                params = params - 'watching_pr' - 'delivered',
                 closed_at = NULL, generation = generation + 1, updated_at = NOW()
           WHERE item_id = $1 AND user_id = $2
       RETURNING ${ITEM_COLUMNS}, generation

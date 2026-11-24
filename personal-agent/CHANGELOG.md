@@ -15,6 +15,200 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## Unreleased
+
+### Fixed
+
+- A message that forwards messages and whose words answer a question card waiting in the chat no longer loses what it
+  forwards. The words answered the card, and the forwarded messages, which no other message carried, never reached Claw.
+  They now go to Claw with the answer, before its words, as they go with a new message; the card still shows only the
+  words. This holds in a group and in a 1:1 chat; a forward with no words still goes on as a new message.
+
+## 0.12.0
+
+A minor release, because core's exported API changes incompatibly: `ClawPort`'s `remoteAgents` (`ClawRemoteAgentsPort`)
+gains a required member, `muteTerminal`, so code that implements `ClawPort` itself must add it (the packaged Claw client
+does) (#907). No plugin port (core's `src/plugins/`) changed, and the store is unchanged: nothing to do for a deployment
+of the published packages. Forwarded messages reach the assistant and a chat attached to a session, with their authors,
+times and images (#908), files sent to an attached chat reach the session's machine (#909, merged with #908), a
+terminal conversation can be muted on its own (#907), and the worker drains its inbound queue on shutdown, re-opens a
+hung connection and answers an end-to-end delivery probe (#906).
+
+**Claw and connector:** `/approvals mute` and `unmute` need claw-v0.5.12 or later; with an older Claw the worker answers
+that it has no such item. The messages about a terminal turn that ended while nobody was there are sent by Claw,
+claw-v0.5.12 and later, to a connector of 0.3.1 or later. Files sent to an attached session need claw-v0.5.12 and a
+connector of 0.3.1 or later on that machine: with an older connector a file that is not text is named back as before,
+with an upgrade hint, and with an older Claw the person is told that the words went and the files did not.
+
+**Breaking for custom ClawPort implementations:** In `@primusclaw/personal-agent`, `ClawRemoteAgentsPort` (the
+`remoteAgents` member of the exported `ClawPort`) gains the required `muteTerminal(key, item, muted)`, answering the
+exported `TerminalMute` (`item`, `muted`, `machine`, `title`) for `PUT /v1/remote-agents/approvals/mutes`. The runtime's
+Claw client implements it, so a deployment of the published packages has nothing to do; a `ClawPort` of one's own must
+add it (#907).
+
+### Added
+
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: a message the person forwards to the bot (Teams'
+  Forward, one or several at once, with or without words of their own) reaches the 1:1 assistant and a chat attached to
+  a session. Until now only the person's own words went and the forward was dropped. Each forwarded message is read
+  from the Forward blockquote of the message's HTML or from Graph's `forwardedMessageReference` attachment (one message
+  said in both is one message) and keeps its author, time and text. The model is told, before the quotes and the
+  person's words, that these were written by others and are material, not instructions, with each message quoted line by
+  line (its own budget: 20 messages, 24000 characters; masked in a group like a quote). An image in a forwarded message
+  that Teams stores becomes a file of the message, named `[image-<n>]` where it stood; one Teams does not store says it
+  was not passed on. Only the shape of a forward is logged (count, sources, images), never its text.
+  `InboundMessage.forwards` (optional) carries them for a surface of one's own (#908).
+- `@primusclaw/personal-agent`: a chat attached to a session sends text files (logs, code, data, Markdown) inline after
+  the words, fenced, 40 KiB in all, within Claw's 64 KiB prompt (forwarded and quoted text is cut before the person's
+  words are) (#908). When the session's connector says `prompt_files`, every other file (an image, a PDF) is sent to the
+  session as a file, at most 10 and 2 MiB in all, and the connector saves it on the machine and names its path in the
+  prompt; files sent with no words go with the line "The person sent the files below with no words." Two files never
+  share a name (Teams' safe name turns `报告.pdf` and `图表.pdf` both into `_.pdf`; the later one gets its place as a
+  prefix). Until now every file sent to an attached chat was dropped ("only your words were sent") (#909).
+- `@primusclaw/personal-agent`: `/approvals mute #<item>` and `/approvals unmute #<item>` mute one conversation open in a
+  terminal, named by the work item its messages start with: what it asks, waits for or finishes stays in its terminal
+  (zh and en). The messages Claw sends when a terminal's turn ends while nobody is there ("finished", or "stopped with
+  an error", with the end of what the agent last said) arrive through the proactive push path, so quiet hours, pause and
+  held messages apply to them (#907).
+- The delivery probe. With `PRIMUSCLAW_PROBE_SCHEDULE` set on the ingress (for example `0 */5 * * * *`), the ingress
+  queues a `primusclaw.probe` on the inbound queue (session `primusclaw-probe`); the worker answers it through the
+  outbound queue, the relay posts nothing to Teams and sends an ack back, and the worker records the times. It covers
+  every hop after the Bot Framework token check, not Teams or Claw. New metrics, under the `personal_agent_` names only:
+  `personal_agent_probe_total{outcome}`, `personal_agent_probe_feedback_ms`, `personal_agent_probe_reply_ms`,
+  `personal_agent_probe_last_answered_seconds` and `personal_agent_inbound_rearmed_total`; the `clawy_*` half of
+  `/metrics` is unchanged. Unset, the ingress registers no timer. `MetricsPort` gains the optional `probed` and
+  `inboundRearmed`, and the ingress's `Registrar` the optional `timer` (a registrar without it logs that the probe is
+  off), so neither breaks a port of one's own. Deploy the worker and the ingress of this release, then set the schedule
+  ([configuration](docs/configuration.md), "The Teams ingress") (#906).
+
+### Fixed
+
+- `@primusclaw/personal-agent-teams`: a message sent while the worker was being replaced could be lost. On `SIGTERM` the
+  consumer only set a flag, so the pod was usually killed at its 30 s grace while waiting on Service Bus with sessions
+  locked, and a message handed over in the last instant had nobody to settle it. Shutdown now drains: the waits for a
+  session or a message end at once, a message being handled is finished and settled, one that arrives after the signal
+  is abandoned (the next worker gets it at once), and every session is closed so its lock is released. A cutover delays
+  messages and no longer strands them; give the pod the default 30 s grace or more (#906).
+- `@primusclaw/personal-agent-teams`: a receiver whose Service Bus connection died unnoticed waited forever and its
+  conversations stalled. Every broker call now has a deadline (accept 120 s, receive the idle wait plus 40 s, settle
+  and close 60 s); past it the connection is re-opened once, and the old one is closed only after every message taken
+  on it is settled, so no message being handled goes to a second receiver (#906).
+- `@primusclaw/personal-agent-teams`: a session held for longer than its lock's 5-minute renewal could lose the lock
+  while a message was handled, and the broker handed the message to another receiver (a duplicate). A receiver now holds
+  one session for at most 4 minutes of messages, then closes it and takes the next (#906).
+
+## 0.11.0
+
+A minor release, because core's exported API changes incompatibly: `StorePort` gains required members for a review that
+waits for its reviewer's steps (see the note below), so a store of one's own must add them (#893). No plugin port (core's
+`src/plugins/`) changed. The runtime's SQLite store gains one table (`review_onboarding`), created at start; nothing to do
+for a deployment of the published packages. It walks a reviewer with steps left through each and lets the asker start
+the same request again (#893), says who merges a review asked of someone else (#894), and gets the Teams ingress's
+messages through again after its Service Bus connection dies (#896).
+
+**Claw:** the question to the asker whether to merge with their own account when the reviewer cannot merge is asked by
+Claw, claw-v0.5.11 and later (#894); with an older Claw it is not asked.
+
+**Breaking for custom StorePort implementations:** In `@primusclaw/personal-agent`, the core's exported `StorePort`
+gains required members on its GitHub repository for a review that waits for its reviewer's steps (`ReviewOnboarding`:
+`saveReviewOnboarding`, `getReviewOnboarding`, `openReviewOnboardings`, `onboardingReviewers`, `claimOnboardingStep`,
+`releaseOnboardingStep`, `finishReviewOnboarding`, `dropReviewOnboarding`, `declineReviewOnboarding`,
+`declinedReviewOnboardings`, `claimDeclinedOnboarding`, `releaseDeclinedOnboarding`), and
+`REVIEW_ONBOARDING_KEEP_SECONDS` (a week). The runtime's SQLite store implements them, so a deployment of the published
+packages has nothing to do; a store of one's own must add them (#893).
+
+### Added
+
+- `deploy/teams-ingress-alerts.yaml`: Grafana alert rules over the ingress's Application Insights, more than 2 requests to
+  `messages` answered `499` or above in 5 minutes, and any failed enqueue, with the data source they need
+  ([quick start](docs/quickstart.md#4-the-ingress), "Alerts") (#896).
+
+### Changed
+
+- `@primusclaw/personal-agent`: the receipt for "请 X 帮我 review 并合入" says plainly who merges: "X 批准后，用 X 的账号合入", with
+  "（X 需要确认，TA 确认之前不会合入）" when X's merge waits for X, and "X 没有合入权限时，会先问你要不要用你自己的账号合入。"
+  when Claw may ask the asker; the old "（X 那边被拦下的合入，会用你自己的 GitHub 账号合，前提是 PR 是你提的）" is gone. A
+  card for a held merge (the reviewer's, or the asker's question) now has 合入 and 不合 ("Merge" and "Don't merge")
+  instead of "不要" (#894).
+- `@primusclaw/personal-agent-teams-ingress`: `QueueClient` (what a `ServiceBusFactory` returns) has a `close()`, which
+  the ingress calls on a client it throws away. A factory of one's own must add it (#896).
+
+### Fixed
+
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-runtime`: a review asked of a colleague who cannot be acted as yet no longer stops at the first step they finish.
+  Reviewing for someone else takes three steps of theirs (connecting their Primus account at the identity service,
+  `/github bind`, `/github auto-merge on`, and `/link` when their own key is missing too), and confirming the identity
+  card looked like being done. Now the request is kept (new store table `review_onboarding`, kept a week): the reviewer's
+  first message lists every step with the current one marked, in English and Chinese, and each step they finish is
+  answered once with the next one (a button runs `/github bind`, another turns the authorization on or declines it). The
+  identity service tells the worker nothing when someone confirms there, so the reviewer's state is read again on any
+  message of theirs and every minute. The asker is told which step is missing ("还差第 N 步「…」"), and once every step is
+  done hears "<name> 已完成授权，可以开始代审了" where they asked, with a button that starts the same request again (same
+  pull requests, same merge flag, the same handoff within a day, the same model) through every check, the model's
+  included, so nothing starts without the reviewer's authorization on and nothing runs on a model nobody chose. A
+  reviewer who declines, or turns the authorization off while asked, is not asked again for those requests, and each
+  asker is told once; a later new request of them sends the steps once more. The reviewer's first message stays at most once a day. A step that could not be said (the
+  reviewer's chat not reachable yet, or a send whose text failed) is said on the next read rather than counted as said;
+  once its text went, a button that failed after it does not send the step again. The asker's "ready" and "declined"
+  messages are marked sent only once they went out, and one that failed is sent by the next minute's read. A GitHub notice
+  that already went to the reviewer earlier the same day for something else no longer keeps the step they are at from
+  being sent. Asked again for the same pull requests, a button sent for the earlier request no longer starts the new one (#893).
+- The Teams ingress gets messages through again after the Service Bus connection under its kept client dies. Until now a
+  failed send was retried on a new sender of the same client; when the client's connection was stuck closing, every
+  sender opened on it waited the whole 20 s deadline, so every message on that instance was lost (answered `500`, or
+  `499` once the Bot Framework stopped waiting) until the Function app was restarted. A failed send now throws away the
+  whole client when the failure is about the connection (any failure but a Service Bus error about the message or the
+  queue, such as `MessageSizeExceeded`), each attempt ends after 4 s, and a send has up to three attempts within a 12 s
+  deadline counted from the request's arrival (so a slow token check on a cold instance, and the wait for the start-up
+  prefetch, come out of it), inside the 15 s the Bot Framework waits, so a message that still cannot be queued is a
+  `500` that Teams retries. The token check itself races the same deadline: on a cold instance its OpenID metadata and
+  signing-key fetches may take up to 15 s and 30 s, and a request held past the Bot Framework's wait lost its message as
+  a `499`; it is now a `500` at the deadline (Teams retries it, and the keys fetched meanwhile are cached). The queue
+  message id stays the activity id, which the worker dedupes on (#896).
+- A card action (`adaptiveCard/action`) the ingress cannot queue is answered `500`, which the Bot Framework retries, like
+  any other activity. Until now it was answered `200` with a "temporarily unavailable" card, which ended the invoke: the
+  click never reached the worker and was not retried. `UNAVAILABLE_CARD` stays exported but the ingress no longer sends it (#896).
+- The ingress reports its send path: one `inbound_enqueue_failed` record (logger `ingress_health`) per send that fails
+  after its retries, one `inbound_client_reset` per client thrown away and one `inbound_enqueue_recovered` on the first
+  success after failures, each with the instance's running counts (`Ingress.health.counters`). Never the message, the
+  error text or a setting (#896).
+
+## 0.10.4
+
+A patch release: the card for a merge or approval held for its owner, the terminal's own questions said in the chat, streams
+that come back after Teams ends one, and clearer words for a message the terminal has not confirmed yet. No plugin port
+(core's `src/plugins/`) or store change. Drawing the held-merge card needs a Claw that sends it (claw-v0.5.9 and later); the
+terminal question needs `@primusclaw/connector` 0.2.3 or later.
+
+### Added
+
+- The worker's `inbound message` line for a Teams activity also says when the client sent it: `client_ts`, `server_ts`,
+  `client_lag_raw_ms`, `client_lag_ms` (only between 0 and 24 hours) and `client_msg_id` when the client gave one. Only values
+  of a timestamp's or an id's shape are logged; never the text or who sent it (#872).
+
+### Changed
+
+- The review-mode card names `fully_auto` "全自动合入（仓库自身要求的检查仍然生效）" / "Fully automatic merge (the repository's
+  own requirements still apply)" and says it covers reviews asked for in the chat (#874).
+
+### Fixed
+
+- A merge or an approval that a review the assistant started for the person's own account holds for them reaches the chat
+  as the held-write card with its button (`confirm_write`, kinds `github_merge` and `github_review`). The card says how the
+  answer ended (merged, queued, approval posted, not merged or not approved, new commits, expired, or the refusal) and is
+  given back open when Claw answers `retry`. Before, the person was told to press a card that never came (#877).
+- While a message waits for a question on the terminal, the chat says what it asks ("The terminal is waiting for your
+  confirmation: Bash command: rm -rf …", 「终端在等你确认：…」) once per question, and the floating status says "Confirm there"
+  (等你确认). When the connector says Claude Code's registry row for the terminal cannot be read, the chat says once per
+  attach that reopening the conversation with `claude --resume` makes it recognized reliably (#865).
+- When Teams refuses a streamed reply's final message with 403 `ContentStreamNotAllowed` (the person stopped the stream),
+  the conversation streams again from the next turn instead of posting progress messages and deleting them for up to
+  10 minutes. A turn that is cancelled (the chat detaches or switches away, the machine disconnects, the turn breaks off)
+  no longer leaves its progress message behind: it is deleted, or edited down to "Interrupted." (#871).
+- `terminal_input_unconfirmed` is said as a message the terminal has not confirmed yet: whatever the session answers still
+  shows in the chat, and look at the terminal before sending it again (a connector before 0.1.22 is also told to upgrade).
+  A prompt passed on in Claude Code's `<pasted_content>` block is shown as the text that was pasted (#870).
+
 ## 0.10.3
 
 A patch release: a chat attached to a session on a machine shows a long turn's progress while it runs, and a message sent to

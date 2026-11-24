@@ -19,7 +19,7 @@ import type { TokenExchange } from "../plugins/token-exchange.js";
 import { cpLength, pySplit, pyStr, pyStrip } from "../text/py-text.js";
 import { serviceRefusal } from "../claw/service-refusal.js";
 import { CONTEXT_TEXT_MAX } from "./chat.js";
-import { confirmOutcome } from "./confirm-outcome.js";
+import { confirmOutcome, isGithubWrite } from "./confirm-outcome.js";
 import { refusal, unreachable } from "./failures.js";
 import { finish } from "./finish.js";
 import { SKILL_UNDO_KIND } from "../skills/views.js";
@@ -185,6 +185,12 @@ export class AssistantActions {
       await this.notAnswered(click, card, error);
       return;
     }
+    // (a merge or an approval Claw could not try just now still waits: the card comes back, to be pressed again)
+    if (isGithubWrite(card.kind) && pyStr(out["status"]) === "retry") {
+      store.assistantButtons.moveConfirmCard(card.cardId, "open");
+      await this.again(click, card, confirmOutcome(card.kind, out, click.lang()));
+      return;
+    }
     store.assistantButtons.moveConfirmCard(card.cardId, "done");
     await finish(click, confirmOutcome(card.kind, out, click.lang()));
   }
@@ -228,7 +234,7 @@ export class AssistantActions {
 
   /** Nothing was answered: the card comes back with `note`, and pressing it again can help. */
   private async again(click: CardClick, card: ConfirmCard, note: string): Promise<void> {
-    const model = { text: note, cardId: card.cardId, allowLabel: card.label, lang: click.lang() };
+    const model = { text: note, cardId: card.cardId, allowLabel: card.label, kind: card.kind, lang: click.lang() };
     await click.settle(viewMessage({ name: "confirmWrite", model }), { fallback: note });
   }
 }

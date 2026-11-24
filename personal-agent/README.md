@@ -237,7 +237,10 @@ missing, a malformed number, an unknown word in a strict switch) stops it before
 stderr saying why: a secret the secret source (`SECRETS_SOURCE`) cannot load exits with status 2, anything else that
 stops the start (a key file that cannot be read included) with status 1. Some feature switches are lenient and read a typo as off (or, for `REMOTE_PUSH_ENABLED`, as on); the configuration
 reference says which.
-`SIGTERM` or `SIGINT` stops taking new work, finishes what is in hand and exits.
+`SIGTERM` or `SIGINT` stops taking new work, finishes what is in hand and exits. On the inbound queue that is a drain:
+the waits for a session or a message end at once, a message being handled is settled, one that arrives after the signal is
+abandoned (redelivered to the next worker at once), and every session is closed, so a cutover delays messages and
+never strands them behind a lock. Give the pod the default 30 s grace or more.
 
 To answer real people it needs, besides Claw: a Teams bot registration and app package, the ingress in front of the
 inbound queue (the released Function package: [quick start](docs/quickstart.md#4-the-ingress)), and a Service Bus

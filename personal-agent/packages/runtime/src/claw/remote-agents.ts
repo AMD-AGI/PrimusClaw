@@ -21,6 +21,7 @@ import {
   type RemoteSession,
   type RemoteSetup,
   type SseEvent,
+  type TerminalMute,
 } from "@primusclaw/personal-agent";
 import type { z } from "zod";
 import { anyDataOf, dataOf } from "./answers.js";
@@ -57,6 +58,19 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
 
   async setApprovals(key: ClawCredential, enabled: boolean): Promise<boolean> {
     return enabledOf(await this.#call("PUT", "/approvals", key, { enabled }));
+  }
+
+  async muteTerminal(key: ClawCredential, item: number, muted: boolean): Promise<TerminalMute> {
+    const data = anyDataOf(await this.#call("PUT", "/approvals/mutes", key, { item, muted }), "a terminal mute");
+    const d = (data !== null && typeof data === "object" ? data : {}) as Record<string, unknown>;
+    if (typeof d["muted"] !== "boolean" || typeof d["item"] !== "number")
+      throw new ClawAnswerInvalid("a terminal mute has no item or muted");
+    return {
+      item: d["item"],
+      muted: d["muted"],
+      machine: typeof d["machine"] === "string" ? d["machine"] : "",
+      title: typeof d["title"] === "string" ? d["title"] : "",
+    };
   }
 
   async pair(key: ClawCredential): Promise<RemotePairing> {

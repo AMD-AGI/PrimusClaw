@@ -28,6 +28,8 @@ export interface QueueSender {
 /** The part of a ServiceBusClient the ingress uses. */
 export interface QueueClient {
   createSender(queue: string): QueueSender;
+  /** Closes the connection and every sender opened on it. */
+  close(): Promise<void>;
 }
 
 /** How the inbound client is built; src/servicebus.ts has the real one, tests record what is asked. */

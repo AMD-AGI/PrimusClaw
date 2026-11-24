@@ -36,6 +36,7 @@ import {
   type CreateRefusal, type ExpandResult,
 } from "../tasks/dag-expander.js";
 import { getTask, listTasksByDag } from "../tasks/db.js";
+import { readAppRunStatuses } from "../tasks/app-run-status.js";
 import { cancelTask, retryTask } from "../tasks/lifecycle.js";
 import { newBatchId } from "../tasks/ids.js";
 import { canViewPlugin, enrichPluginToolsInline, pluginSandboxImage } from "../marketplace/plugins.js";
@@ -609,7 +610,14 @@ export async function registerTaskReadRoutes(app: FastifyInstance): Promise<void
         req, reply, task.session_id, false, false, false, DELETED_SESSION_TASK_READ_SEC,
       );
       if (!access) return reply;
-      return { ok: true, item: access === "deleted" ? deletedSessionTaskView(task) : publicTaskRow(task) };
+      const item: Record<string, unknown> = access === "deleted" ? deletedSessionTaskView(task) : { ...publicTaskRow(task) };
+      // An app run's sandbox and, once it ended, its outcome as stable fields
+      // (tasks/app-run-status.ts); masked like the rest of the row.
+      if (task.mode === "app") {
+        const status = (await readAppRunStatuses([task.task_id])).get(task.task_id) ?? null;
+        item.app = redactPublicJson(status);
+      }
+      return { ok: true, item };
     },
   );
 

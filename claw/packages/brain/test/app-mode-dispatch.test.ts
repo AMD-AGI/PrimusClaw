@@ -48,7 +48,7 @@ interface FakeRunner {
   /** finishNow fails (the runner gave up after FINISH_NOW_MAX_FAILURES). */
   finishThrows?: boolean;
   /** The platform key and epoch each createAppRunner call got, and how often the row was closed without a runner. */
-  made: Array<{ platformKey: string; epoch: number }>;
+  made: Array<{ platformKey: string; epoch: number; nodeLabels?: Record<string, string> }>;
   closed: string[];
   /** What run() answers. It may also fire the abort first, as a real cancel would. */
   script: (signal: AbortSignal, opts?: { reclaimOnAbort?: () => boolean }) => Promise<AppRunResult>;
@@ -89,10 +89,10 @@ function harness(runner?: FakeRunner, outbox?: { entry: KvEntry | null; deleted:
     releaseTaskLock: (async () => { released++; }) as never,
     flushTranscript: (async () => undefined) as never,
     runScript: (async () => { engineCalls++; throw new Error("script must not run"); }) as never,
-    createAppRunner: ((runId: string, platformKey: string, epoch: number) => {
+    createAppRunner: ((runId: string, platformKey: string, epoch: number, _publish?: unknown, nodeLabels?: Record<string, string>) => {
       created++;
       assert.equal(runId, "t-app");
-      runner?.made.push({ platformKey, epoch });
+      runner?.made.push({ platformKey, epoch, ...(nodeLabels ? { nodeLabels } : {}) });
       return {
         markEnded: async (why: string) => { runner?.closed.push(why); return true; },
         run: async (signal: AbortSignal, opts?: { reclaimOnAbort?: () => boolean }) => { runner!.runs++; return runner!.script(signal, opts); },
@@ -144,6 +144,20 @@ test("A1a the runner is made with the epoch this attempt holds the run at", asyn
   assert.equal(runner.made.length, 1);
   assert.equal(runner.made[0]!.platformKey, "pk");
   assert.equal(typeof runner.made[0]!.epoch, "number");
+});
+
+test("A1p the runner is made with the session's placement, so every sandbox of the run keeps it", async () => {
+  const placed = fakeRunner(async () => ({ kind: "ended", outcome: { success: true, reason: "app finished" } }));
+  const h = harness(placed);
+  const abortCtrl = new AbortController();
+  activeAbort.set("lock.s-app", abortCtrl);
+  const placement = { nodeLabels: { "autopilot.amd.com/preemptible": "false" } };
+  await runHandleTask(h.msg, { ...request("app"), placement } as ExecuteRequest, "s-app", "lock.s-app", "m1", "u1", abortCtrl);
+  assert.deepEqual(placed.made.at(-1)?.nodeLabels, placement.nodeLabels);
+
+  const plain = fakeRunner(async () => ({ kind: "ended", outcome: { success: true, reason: "app finished" } }));
+  await runApp(harness(plain));
+  assert.equal("nodeLabels" in plain.made[0]!, false, "a session with no placement makes a runner with none");
 });
 
 test("A1f no platform key: the row is closed and the task fails", async () => {

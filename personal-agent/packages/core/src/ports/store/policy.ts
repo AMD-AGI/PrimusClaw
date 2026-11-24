@@ -61,6 +61,8 @@ export const HELD_TTL_SECONDS = 7 * DAY;
 export const APPROVAL_TTL_SECONDS = 7 * DAY;
 /** How long a review session is remembered as one that acts as a user. */
 export const ACTING_SESSION_KEEP_SECONDS = 30 * DAY;
+/** How long a review asked of someone who has steps left waits for them to finish (and its retry button works). */
+export const REVIEW_ONBOARDING_KEEP_SECONDS = 7 * DAY;
 /** The repositories /repo remembers per user (and lists). */
 export const RECENT_REPOS = 5;
 /** "My next message is for this repository" is forgotten after this. */

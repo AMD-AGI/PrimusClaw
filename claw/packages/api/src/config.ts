@@ -166,10 +166,22 @@ export function isKubernetesMode(): boolean {
   return CLAW_DEPLOY_MODE === "kubernetes";
 }
 
+// --- Auth provider (SaFE deploy mode) ---
+// "safe" (default): callers are verified by SaFE's /api/v1/auth/verify, which returns the platform key.
+// "identity": callers are verified by the identity service, which also holds each user's platform key.
+export type AuthProvider = "identity" | "safe";
+export const CLAW_AUTH_PROVIDER: AuthProvider =
+  env("CLAW_AUTH_PROVIDER", "safe") === "identity" ? "identity" : "safe";
+/** True when the identity service verifies callers (SaFE deploy mode only). */
+export function isIdentityAuthProvider(): boolean {
+  return !isKubernetesMode() && CLAW_AUTH_PROVIDER === "identity";
+}
+
 // --- LLM key source ---
-// "virtualKey" preserves the existing behavior. "platformKey" is proxy mode:
-// Brain receives platform_key as llm_api_key so LLM calls authenticate via the
-// same per-user SaFE/proxy key used by the platform.
+// LLM_KEY_SOURCE: "virtualKey" (default) sends the caller's own gateway key.
+// "platformKey" sends the user's platform key (SaFE's /api/v1/llm-proxy puts the
+// user's LiteLLM virtual key on the request). CLAW_AUTH_PROVIDER=identity requires
+// platformKey because IdentityVerifier leaves virtualKey empty.
 export type LlmKeySource = "virtualKey" | "platformKey";
 export const LLM_KEY_SOURCE: LlmKeySource =
   env("LLM_KEY_SOURCE", "virtualKey") === "platformKey" ? "platformKey" : "virtualKey";
@@ -605,6 +617,12 @@ export const CLAW_ASSISTANT_ENABLED = envBool("CLAW_ASSISTANT_ENABLED", false);
 export const CLAW_ASSISTANT_ROUTER_MODEL = env("CLAW_ASSISTANT_ROUTER_MODEL");
 // Work items one user may have unfinished (not on the done board) at once.
 export const CLAW_ASSISTANT_MAX_ACTIVE_ITEMS = envInt("CLAW_ASSISTANT_MAX_ACTIVE_ITEMS", 20, { min: 1 });
+// `true` delivers a worker's ready result without asking: the item closes as accepted, by policy, the way a review item closes when
+// it posts its review, and the user changes the result by replying (`work_send` reopens an item delivered in the last
+// DONE_WINDOW_DAYS). An item whose result names a pull request it watches stays open and holds no slot until that pull request is
+// merged or closed (`params.watching_pr`): new comments and failed CI still reach its worker. Off (the default), a ready result
+// waits for the user's Accept, as before.
+export const CLAW_ASSISTANT_AUTO_DELIVER = envBool("CLAW_ASSISTANT_AUTO_DELIVER", false);
 // On-behalf GitHub reviews as work items of the assistant (`POST /v1/assistant/reviews`). Needs
 // CLAW_ASSISTANT_ENABLED and CLAW_GITHUB_REVIEW_ENABLED as well; off, the routes do not exist.
 export const CLAW_ASSISTANT_REVIEW_ITEMS = envBool("CLAW_ASSISTANT_REVIEW_ITEMS", false);
@@ -749,7 +767,8 @@ export const SANDBOX_ROUTER_AUTH_ENABLED = envBool("SANDBOX_ROUTER_AUTH_ENABLED"
  * Platform caps on what an app run's grant may carry, as JSON of the grant
  * shape: `{"max_sandboxes":8,"max_gpus":8,"gpu_hours":500,"max_runtime_sec":172800}`.
  * Each grant item is the smallest of the request, the manifest's limit (where it
- * has one) and its cap; an item with none of them is unbounded. A value that is not that shape stops start-up.
+ * has one) and its cap; an item with none of them is unbounded. A value that is not that shape stops start-up, and so
+ * does a `max_runtime_sec` above `APP_MAX_RUNTIME_SEC` (2147483).
  */
 export const APP_SANDBOX_CAPS = parseAppSandboxCaps(process.env.APP_SANDBOX_CAPS);
 

@@ -91,6 +91,8 @@ export const remoteAgentText = defineCatalog({
       "Use `/agent attach N` with a number from `/agent sessions`, or name the agent: `/agent attach MACHINE/AGENT`.",
     lostTrack:
       "I lost track of your previous task. I am showing how it ends now; send your message again when it has finished.",
+    filesNotTaken:
+      "Your words reached the session, but the files sent with them did not: the server does not pass files on to a session yet.",
     noAnswerableOption:
       "The agent asked for permission but offered no answer I can pass on, so nothing can be approved here. Send /stop to cancel it.",
     notReported: "The agent has not reported in yet. You can send your message anyway, or `/agent detach`.",
@@ -250,6 +252,7 @@ export const remoteAgentText = defineCatalog({
     attachHow:
       "发 `/agent attach N`（N 是 `/agent sessions` 里的编号），或者写出 agent：`/agent attach 机器名/agent`。",
     lostTrack: "我没跟上你上一个任务。现在把它的结果显示出来；它结束后请把你的消息再发一次。",
+    filesNotTaken: "你的文字已经交给会话，但随附的文件没有：服务端还不能把文件转给会话。",
     noAnswerableOption: "agent 请求批准，但没有给出可以转达的选项，所以这里批不了。发 /stop 取消它。",
     notReported: "agent 还没有报到。可以直接发消息，或者发 `/agent detach`。",
     reconnecting: (p) =>

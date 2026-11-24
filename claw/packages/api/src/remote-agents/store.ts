@@ -9,10 +9,11 @@
  * its id: the row is simply not found.
  */
 import { randomUUID } from "node:crypto";
+import { storableJsonText } from "@claw/utils";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import {
-  REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS,
+  REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS,
   REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED, REMOTE_EVENT_USER_PROMPT,
   type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteCommandType, type RemoteTerminalSessionOpen, type RemoteEventRejection, type RemoteHeartbeat, type RemoteHidden,
 } from "@claw/protocol";
@@ -53,7 +54,7 @@ export function writeAudit(q: Querier, e: AuditEntry): Promise<unknown> {
   return q(
     `INSERT INTO claw_remote_audit (owner_user_id, connector_id, agent_id, session_id, action, actor, client, detail)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
-    [e.owner, e.connectorId ?? null, e.agentId ?? null, e.sessionId ?? null, e.action, e.actor, e.client ?? null, JSON.stringify(e.detail ?? {})],
+    [e.owner, e.connectorId ?? null, e.agentId ?? null, e.sessionId ?? null, e.action, e.actor, e.client ?? null, storableJsonText(e.detail ?? {})],
   );
 }
 
@@ -358,7 +359,7 @@ async function revokeIn(
       `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
        SELECT sid, $2, $3, NOW(), $4::jsonb FROM unnest($1::uuid[]) AS sid
        ON CONFLICT (session_id, seq) DO NOTHING`,
-      [closed, REVOKED_CLOSE_SEQ, REMOTE_EVENT_SESSION_CLOSED, JSON.stringify({ reason, by: "claw" })],
+      [closed, REVOKED_CLOSE_SEQ, REMOTE_EVENT_SESSION_CLOSED, storableJsonText({ reason, by: "claw" })],
     );
   }
   await writeAudit(q, {
@@ -392,7 +393,7 @@ export async function recordHeartbeat(connectorId: string, owner: string, hb: Re
          VALUES ($1, $2, $3, $4, $5, $6::jsonb)
          ON CONFLICT (connector_id, agent_id) DO UPDATE
            SET kind = EXCLUDED.kind, name = EXCLUDED.name, capabilities = EXCLUDED.capabilities, updated_at = NOW()`,
-        [connectorId, a.agent_id, owner, a.kind, a.name, JSON.stringify(a.capabilities)],
+        [connectorId, a.agent_id, owner, a.kind, a.name, storableJsonText(a.capabilities)],
       );
     }
     return undelivered;
@@ -519,7 +520,7 @@ export async function expireUndelivered(
       `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
        SELECT session_id, $2, $3, NOW(), $4::jsonb FROM claw_remote_sessions WHERE session_id = $1 AND connector_id = $5
        ON CONFLICT (session_id, seq) DO NOTHING`,
-      [r.session_id, -Number(r.cmd_seq), type, JSON.stringify({ ...data, by: "claw" }), r.connector_id],
+      [r.session_id, -Number(r.cmd_seq), type, storableJsonText({ ...data, by: "claw" }), r.connector_id],
     );
     if (added.rowCount) touched.set(r.session_id!, { owner: r.owner, session_id: r.session_id! });
   };
@@ -749,7 +750,7 @@ export async function enqueueCommand(q: Querier, c: NewCommand): Promise<{ inser
   const row = (await q(
     `INSERT INTO claw_remote_commands (connector_id, cmd_seq, cmd_id, session_id, type, payload)
      VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING cmd_seq, cmd_id, session_id::text AS session_id, type, payload`,
-    [c.connectorId, seq, c.cmdId, c.sessionId, c.type, JSON.stringify(c.payload)],
+    [c.connectorId, seq, c.cmdId, c.sessionId, c.type, storableJsonText(c.payload)],
   )).rows[0];
   return { inserted: true, row };
 }
@@ -886,17 +887,7 @@ export async function ingestEvents(
     const touched = new Set<string>();
     const closed = new Set<string>();
     if (accepted.length) {
-      const inserted = (await q(
-        `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
-         SELECT s, n, t, to_timestamp(ms / 1000.0), d
-           FROM unnest($1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::jsonb[]) AS u(s, n, t, ms, d)
-         ON CONFLICT (session_id, seq) DO NOTHING
-         RETURNING session_id::text AS session_id, seq, type, data`,
-        [
-          accepted.map((e) => e.session_id), accepted.map((e) => e.seq), accepted.map((e) => e.type),
-          accepted.map((e) => e.ts), accepted.map((e) => JSON.stringify(e.data)),
-        ],
-      )).rows;
+      const inserted = await insertEvents(q, accepted, rejected);
       for (const row of inserted) {
         touched.add(row.session_id);
         const d = (row.data ?? {}) as Record<string, any>;
@@ -933,6 +924,61 @@ export async function ingestEvents(
 
 const str = (v: unknown, max = 128): string | null => (typeof v === "string" ? v.slice(0, max) : null);
 
+const INSERT_EVENTS_SQL = `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
+  SELECT s, n, t, to_timestamp(ms / 1000.0), d
+    FROM unnest($1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::jsonb[]) AS u(s, n, t, ms, d)
+  ON CONFLICT (session_id, seq) DO NOTHING
+  RETURNING session_id::text AS session_id, seq, type, data`;
+
+/**
+ * Whether an error is about the value a statement was given (SQLSTATE class 22, data exception: a character, a number or a time
+ * PostgreSQL cannot hold; class 54, a value too deep or too large), not about the database: such an error names one event, and
+ * the next attempt fails the same way. Anything else (a lost connection, a deadlock, a full disk) is the batch's, and retried.
+ */
+export function isUnstorableValueError(err: unknown): boolean {
+  const code = typeof err === "object" && err !== null ? (err as { code?: unknown }).code : undefined;
+  return typeof code === "string" && (code.startsWith("22") || code.startsWith("54"));
+}
+
+/**
+ * Store a batch's accepted events in one statement, with every string made storable (`storableJsonText`: a NUL or an unpaired
+ * surrogate, which `jsonb` refuses, becomes U+FFFD). Should the statement still fail on a value, each event is stored on its own
+ * and one that fails that way is refused (`unstorable`, with its index and seq, added to `rejected`) while the rest are kept: one
+ * event a connector cannot change must not fail the batch it is in, nor every batch after it, which it would otherwise head for
+ * ever. Each attempt runs under a savepoint, so a failed one leaves the transaction usable.
+ */
+async function insertEvents(q: Querier, accepted: ParsedRemoteEvent[], rejected: RemoteEventRejection[]): Promise<Row[]> {
+  const params = (evs: ParsedRemoteEvent[]) => [
+    evs.map((e) => e.session_id), evs.map((e) => e.seq), evs.map((e) => e.type), evs.map((e) => e.ts), evs.map((e) => storableJsonText(e.data)),
+  ];
+  const attempt = async (evs: ParsedRemoteEvent[]): Promise<Row[]> => {
+    await q("SAVEPOINT remote_events");
+    try {
+      const rows = (await q(INSERT_EVENTS_SQL, params(evs))).rows;
+      await q("RELEASE SAVEPOINT remote_events");
+      return rows;
+    } catch (err) {
+      await q("ROLLBACK TO SAVEPOINT remote_events");
+      throw err;
+    }
+  };
+  try {
+    return await attempt(accepted);
+  } catch (err) {
+    if (!isUnstorableValueError(err)) throw err;
+  }
+  const rows: Row[] = [];
+  for (const e of accepted) {
+    try {
+      rows.push(...await attempt([e]));
+    } catch (err) {
+      if (!isUnstorableValueError(err)) throw err;
+      rejected.push({ index: e.index, session_id: e.session_id, seq: e.seq, reason: "unstorable" });
+    }
+  }
+  return rows;
+}
+
 export async function listAudit(owner: string, filter: { sessionId: string | null; connectorId: string | null }, limit: number): Promise<Row[]> {
   return (await direct(
     `SELECT id, ts, connector_id::text AS connector_id, agent_id, session_id::text AS session_id, action, actor, client, detail
@@ -957,7 +1003,11 @@ async function commandIssued(q: Querier, owner: string, connectorId: string, cmd
     [owner, connectorId, cmdId],
   )).rows[0];
   if (!a) return null;
-  return { cmd_seq: null, cmd_id: cmdId, session_id: a.session_id, type: a.detail?.type, payload: { option_id: a.detail?.option_id } };
+  // (a prompt's files as the audit names them: a repeat is answered with how many the original carried)
+  return {
+    cmd_seq: null, cmd_id: cmdId, session_id: a.session_id, type: a.detail?.type,
+    payload: { option_id: a.detail?.option_id, files: a.detail?.files },
+  };
 }
 
 export type IssueOutcome =
@@ -1040,7 +1090,7 @@ async function notePrompt(q: Querier, r: IssueRequest, cmdSeq: number): Promise<
   await q(
     `INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
      VALUES ($1, $2, $3, NOW(), $4::jsonb) ON CONFLICT (session_id, seq) DO NOTHING`,
-    [r.sessionId, userPromptSeq(cmdSeq), REMOTE_EVENT_USER_PROMPT, JSON.stringify(data)],
+    [r.sessionId, userPromptSeq(cmdSeq), REMOTE_EVENT_USER_PROMPT, storableJsonText(data)],
   );
 }
 
@@ -1255,9 +1305,82 @@ export async function setApprovalsEnabled(owner: string, enabled: boolean, clien
   });
 }
 
+/** Whether the owner muted the pushes of one conversation open in a terminal of theirs (`claw_remote_terminal_mutes`). */
+export async function terminalMuted(owner: string, connectorId: string, ref: string, q: Querier = direct): Promise<boolean> {
+  return (await q(
+    "SELECT 1 FROM claw_remote_terminal_mutes WHERE owner_user_id = $1 AND connector_id = $2 AND ref = $3", [owner, connectorId, ref],
+  )).rows.length > 0;
+}
+
+export type TerminalMuteOutcome =
+  | { status: "ok"; muted: boolean; machine: string; title: string; seq: number }
+  | { status: "not_found" | "not_terminal" };
+
+/**
+ * Mute (or unmute) the conversation behind one of the owner's work items (`#<seq>`): an item of a conversation open in a terminal
+ * (origin `terminal`), whose terminal-hook session names the machine and the conversation. Muted, its open terminal-hook session is
+ * closed (the connector gives what waits back to the terminal) and none is opened for it again (`session_muted`): its questions, its
+ * waits and its ends stay in the terminal. Audited.
+ */
+export async function setTerminalMute(owner: string, seq: number, muted: boolean, client: string | null): Promise<TerminalMuteOutcome> {
+  const out = await inTransaction(async (q): Promise<TerminalMuteOutcome & { close?: { session_id: string; connector_id: string; agent_id: string } }> => {
+    const item = (await q(
+      "SELECT kind, params FROM claw_work_items WHERE user_id = $1 AND seq = $2", [owner, seq],
+    )).rows[0] as { kind: string; params: Record<string, unknown> | null } | undefined;
+    if (!item) return { status: "not_found" };
+    const sessionId = String(item.params?.session_id ?? "");
+    if (item.kind !== "remote" || item.params?.origin !== "terminal" || !UUID_SHAPE.test(sessionId)) return { status: "not_terminal" };
+    const s = (await q(
+      `SELECT s.connector_id::text AS connector_id, s.agent_id, s.ref, c.name FROM claw_remote_sessions s
+         JOIN claw_remote_connectors c ON c.connector_id = s.connector_id
+        WHERE s.session_id = $1 AND s.owner_user_id = $2 AND s.origin = $3 AND s.ref IS NOT NULL`,
+      [sessionId, owner, REMOTE_ORIGIN_TERMINAL_HOOK],
+    )).rows[0] as { connector_id: string; agent_id: string; ref: string; name: string } | undefined;
+    if (!s) return { status: "not_terminal" };
+    const title = String(item.params?.title ?? "") || String(item.params?.asked ?? "");
+    if (muted) {
+      await q(
+        `INSERT INTO claw_remote_terminal_mutes (owner_user_id, connector_id, ref, title) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (owner_user_id, connector_id, ref) DO UPDATE SET title = EXCLUDED.title, muted_at = NOW()`,
+        [owner, s.connector_id, s.ref, title.slice(0, 200)],
+      );
+    } else {
+      await q("DELETE FROM claw_remote_terminal_mutes WHERE owner_user_id = $1 AND connector_id = $2 AND ref = $3", [owner, s.connector_id, s.ref]);
+    }
+    await writeAudit(q, {
+      owner, actor: owner, client, connectorId: s.connector_id, agentId: s.agent_id, sessionId,
+      action: "terminal_mute.set", detail: { ref: s.ref, muted },
+    });
+    const open = muted ? (await q(
+      `SELECT session_id::text AS session_id FROM claw_remote_sessions
+        WHERE connector_id = $1 AND ref = $2 AND origin = $3 AND status = 'active'`,
+      [s.connector_id, s.ref, REMOTE_ORIGIN_TERMINAL_HOOK],
+    )).rows[0] : undefined;
+    return {
+      status: "ok", muted, machine: String(s.name ?? ""), title, seq,
+      ...(open ? { close: { session_id: String(open.session_id), connector_id: s.connector_id, agent_id: s.agent_id } } : {}),
+    };
+  });
+  if (out.status !== "ok" || !out.close) return out;
+  // Its open session is closed after the mute is stored, so the next question finds it muted; best effort: a close that does not
+  // get through leaves only cards Claw no longer puts to the owner.
+  const { close, ...told } = out;
+  try {
+    const queued = await issueCommand({
+      owner, client, connectorId: close.connector_id, agentId: close.agent_id, sessionId: close.session_id, type: "close",
+      cmdId: `mute:${close.session_id}`, payload: {}, auditDetail: { reason: "muted" }, closesSession: true,
+      commandsPerMinute: REMOTE_AGENT_LIMITS.commandsPerMinute,
+    });
+    if (queued.status === "queued") wakeConnector(close.connector_id);
+  } catch { /* the mute is stored; the close is best effort */ }
+  return told;
+}
+
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export type TerminalSessionOutcome =
   | { status: "opened"; session_id: string; created: boolean }
-  | { status: "approvals_off" | "agent_not_found" | "rate_limited" | "gone" };
+  | { status: "approvals_off" | "session_muted" | "agent_not_found" | "rate_limited" | "gone" };
 
 /**
  * The session that carries the approvals one conversation open in a terminal asks for: the one this connector already has open for
@@ -1272,6 +1395,7 @@ export async function openTerminalSession(
     // One at a time per connector and conversation: two hooks of one conversation asking at once find one session.
     await lock(q, `terminal:${connectorId}:${o.ref}`);
     if (!await approvalsEnabled(owner, q)) return { status: "approvals_off" };
+    if (await terminalMuted(owner, connectorId, o.ref, q)) return { status: "session_muted" };
     const live = (await q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1 AND owner_user_id = $2", [connectorId, owner])).rows[0];
     if (!live || live.revoked_at) throw new ConnectorGone();
     const agent = (await q("SELECT 1 FROM claw_remote_agents WHERE connector_id = $1 AND agent_id = $2", [connectorId, o.agent_id])).rows[0];

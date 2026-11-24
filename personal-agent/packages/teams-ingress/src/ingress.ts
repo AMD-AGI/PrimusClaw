@@ -37,6 +37,7 @@ import { SECURITY_LOGGER, securityEventRecord, type SecurityEventRecord } from "
 import { Auth, AuthError, authSettings } from "./auth.js";
 import { MsiTokenProvider } from "./bot-msi.js";
 import { type Clock, type Env, type Fetch, SYSTEM_CLOCK } from "./env.js";
+import { InboundHealth, isConnectionFailure } from "./health.js";
 import { coreLogger, type Logger, logger, type LogSink } from "./log.js";
 import {
   ACK_TYPE,
@@ -44,6 +45,9 @@ import {
   connectorUrl,
   type ConnectorResponse,
   dictGet,
+  PROBE_CONVERSATION,
+  PROBE_OPERATION,
+  PROBE_TYPE,
   responseJson,
   withReference,
 } from "./outbound.js";
@@ -63,20 +67,13 @@ import {
 } from "./py.js";
 import { dumps, loads, plain, type PyValue } from "./py-json.js";
 import { boundedId, type QueueClient, type QueueMessage, type QueueSender, type ServiceBusFactory } from "./queue.js";
-import {
-  cardResponse,
-  empty,
-  EMPTY_INVOKE_RESULT,
-  jsonReply,
-  PLACEHOLDER_CARD,
-  type Reply,
-  UNAVAILABLE_CARD,
-} from "./replies.js";
+import { cardResponse, empty, EMPTY_INVOKE_RESULT, jsonReply, PLACEHOLDER_CARD, type Reply } from "./replies.js";
 import {
   INBOUND_IDENTITY_PREFIX,
   namespaceHost,
   OUTBOUND_CONNECTION_SETTING,
   OUTBOUND_IDENTITY_SETTING,
+  PROBE_SCHEDULE_SETTING,
   readSettings,
   type Settings,
 } from "./settings.js";
@@ -89,10 +86,19 @@ const ACK_ONLY_INVOKES: ReadonlySet<string> = new Set(["message/submitAction"]);
 // How long a message waits for the start-up prefetch to finish opening the sender before opening one itself.
 export const PREFETCH_WAIT_SECONDS = 3.0;
 
-// How long a message may take to reach the inbound queue, both attempts and the SDK's retries included, before it is
-// a 500 that Teams retries. Well inside host.json's functionTimeout (30 s), so a stuck send never runs into the host's
-// timeout, which restarts the worker and with it every other request on the instance.
-export const SEND_DEADLINE_SECONDS = 20.0;
+// How long a message may take to reach the inbound queue, counted from the request's arrival (so the token check, whose
+// first run on a cold instance fetches the OpenID metadata and the signing keys, comes out of it), every attempt and the
+// SDK's retries included, before it is a 500 that Teams retries. Inside the 15 s the Bot Framework waits for an answer (a request still running then is
+// dropped by the caller, a 499, and the message is lost rather than retried), and well inside host.json's
+// functionTimeout (30 s), whose expiry restarts the worker and with it every other request on the instance.
+export const SEND_DEADLINE_SECONDS = 12.0;
+
+// How long one attempt may take. A new connection with its managed-identity token takes about a second, so an attempt
+// that has not finished in this time is on a dead connection, and the next attempt gets a new client.
+export const SEND_ATTEMPT_SECONDS = 4.0;
+
+// Attempts per send: the kept sender, then (for a connection failure) a new client, and one more.
+export const SEND_ATTEMPTS = 3;
 
 /** An HTTP request as the handler sees it. */
 export interface Request {
@@ -110,6 +116,8 @@ export interface Deps {
   /** Starts the start-up prefetch in the background; tests record the call instead. */
   spawn?: (name: string, task: () => Promise<void>) => void;
   uuid?: () => string;
+  /** The wall clock, epoch milliseconds (the delivery probe's `sent_at`). */
+  now?: () => number;
 }
 
 /** The loggers one request writes to. */
@@ -163,6 +171,11 @@ function pathOf(activity: JsonObject): { path: "queued" | "deferred" | "sync"; n
 
 const errorName = (error: unknown): string => (error instanceof Error ? error.name : "Error");
 
+/** Anything with a close() that is being thrown away: a sender, or a client. */
+interface Closable {
+  close(): Promise<void>;
+}
+
 /**
  * `work`, or the deadline's reason once `deadline` fires, whichever comes first, so a send that ignores its abort
  * signal still ends at the deadline.
@@ -192,6 +205,7 @@ export class Ingress {
   private readonly serviceBus: ServiceBusFactory;
   private readonly clock: Clock;
   private readonly uuid: () => string;
+  private readonly now: () => number;
 
   private senderClient: QueueClient | null = null;
   /** The inbound-queue sender, opened once per instance and kept. */
@@ -201,6 +215,10 @@ export class Ingress {
   private prefetchReport: string | null = null;
   prefetchWaitSeconds = PREFETCH_WAIT_SECONDS;
   sendDeadlineSeconds = SEND_DEADLINE_SECONDS;
+  sendAttemptSeconds = SEND_ATTEMPT_SECONDS;
+  sendAttempts = SEND_ATTEMPTS;
+  /** The send path's counters, and its structured records. */
+  readonly health: InboundHealth;
 
   constructor(deps: Deps) {
     this.fetchImpl = deps.fetch;
@@ -208,6 +226,8 @@ export class Ingress {
     this.serviceBus = deps.serviceBus;
     this.clock = deps.clock ?? SYSTEM_CLOCK;
     this.uuid = deps.uuid ?? randomUUID;
+    this.now = deps.now ?? Date.now;
+    this.health = new InboundHealth(this.clock);
     this.settings = readSettings(deps.env);
     this.auth = new Auth(authSettings(deps.env, coreLogger(deps.log, "connector_hosts")), deps.fetch, this.clock);
     this.tokens = new MsiTokenProvider(
@@ -273,53 +293,110 @@ export class Ingress {
     return this.serviceBus.fromIdentity(namespace, s.inboundIdentityClientId || null);
   }
 
-  /** Reused across invocations on a warm worker; the SDK handles reconnects. */
+  /** Reused across invocations on a warm worker until a connection failure throws it away (sendInbound). */
   private client(log: Logger): QueueClient {
     this.senderClient ??= this.newClient(log);
     return this.senderClient;
   }
 
-  private async closeQuietly(sender: QueueSender, log: Logger): Promise<void> {
+  private async closeQuietly(what: Closable, log: Logger): Promise<void> {
     try {
-      await sender.close();
+      await what.close();
     } catch (error) {
-      // a sender being thrown away; its close cannot change anything
-      log.debug("closing a discarded inbound sender failed", error);
+      // a sender or client being thrown away; its close cannot change anything
+      log.debug("closing a discarded inbound sender or client failed", error);
     }
   }
 
   /**
-   * Send on the instance's inbound sender, opening it on first use. A failed send discards the sender and tries once
-   * more on a new one, so a kept sender left broken (the service closes idle connections) costs one message a retry
-   * instead of every later message an error. The worker dedupes on the activity id, so a message the broker took
-   * before the error was seen is not handled twice.
+   * After a failed attempt: stop using the sender it was made on, and for a connection failure the whole client, but
+   * only while they are still the instance's (another request may have replaced them already). Not awaited: closing
+   * something whose connection hangs must not hold the request past its deadline. True when the client was reset.
+   */
+  private discard(client: QueueClient, sender: QueueSender, connection: boolean, log: Logger): boolean {
+    if (connection && this.senderClient === client) {
+      // Every sender on the client goes with it: the kept one too, whichever request opened it.
+      this.senderClient = null;
+      this.inbound = null;
+      void this.closeQuietly(client, log);
+      return true;
+    }
+    if (this.inbound === sender) {
+      this.inbound = null;
+      void this.closeQuietly(sender, log);
+    }
+    return false;
+  }
+
+  /**
+   * Send on the instance's inbound sender, opening it (and the client) on first use. Up to `sendAttempts` attempts,
+   * each ended after `sendAttemptSeconds`, all within `sendDeadlineSeconds`. A failed attempt discards the sender and,
+   * when the failure is about the connection (isConnectionFailure), the whole ServiceBusClient: a client whose
+   * connection is stuck closing makes every new sender on it wait as long as the old one did, so only a new client
+   * gets the message through. The message id is the activity id, and the worker dedupes on it, so a message the broker
+   * took before an attempt was given up on is not handled twice.
    *
    * Sends on one instance run concurrently on the shared sender (the SDK's sender takes concurrent sends), so a send
-   * that hangs holds up only its own request: it fails after `sendDeadlineSeconds`, and the request is a 500. Only the
-   * request whose send failed discards the sender, and only while it is still the instance's sender, so a request
-   * never throws away a sender another one has just opened.
+   * that hangs holds up only its own request. Only the request whose send failed discards the sender or client, and
+   * only while it is still the instance's, so a request never throws away one another request has just opened.
+   * `kind` names what is sent in the health records ("activity", or "ack" for a delivery ack). `arrived` is when the
+   * request that sends it arrived (performance.now()): the deadline counts from then, so time the request spent before
+   * the send (the token check) is not given to the send again. Without it the deadline counts from the call.
    */
-  async sendInbound(message: QueueMessage, log: Logger = this.logs.app): Promise<void> {
-    const deadline = AbortSignal.timeout(this.sendDeadlineSeconds * 1000);
-    if (this.inbound === null && this.prefetch !== null && !this.prefetchDone) {
-      // A cold instance: the prefetch is already opening the sender, and a second one would only race it.
-      await Promise.race([this.prefetch, sleep(this.prefetchWaitSeconds * 1000)]);
-    }
-    for (const attempt of [1, 2]) {
-      this.inbound ??= this.client(log).createSender(this.settings.inboundQueue);
-      const sender = this.inbound;
-      try {
-        await beforeDeadline(sender.sendMessages(message, { abortSignal: deadline }), deadline);
-        return;
-      } catch (error) {
-        if (this.inbound === sender) {
-          this.inbound = null;
-          // Not awaited: closing a sender whose connection hangs must not hold this request past its deadline.
-          void this.closeQuietly(sender, log);
+  async sendInbound(
+    message: QueueMessage,
+    log: Logger = this.logs.app,
+    kind = "activity",
+    arrived?: number,
+  ): Promise<void> {
+    const started = this.clock.monotonic();
+    // On the same clock as the timers that enforce it, not this.clock (a test's clock need not move with them).
+    const remaining = this.sendDeadlineSeconds * 1000 - (arrived === undefined ? 0 : performance.now() - arrived);
+    const deadline = AbortSignal.timeout(Math.max(0, Math.ceil(remaining))); // whole milliseconds, or it throws
+    let attempt = 0;
+    try {
+      await this.readyToSend(remaining, deadline);
+      for (;;) {
+        attempt += 1;
+        const client = this.client(log);
+        this.inbound ??= client.createSender(this.settings.inboundQueue);
+        const sender = this.inbound;
+        const signal = AbortSignal.any([deadline, AbortSignal.timeout(this.sendAttemptSeconds * 1000)]);
+        try {
+          await beforeDeadline(sender.sendMessages(message, { abortSignal: signal }), signal);
+          this.health.enqueued(log.sink);
+          return;
+        } catch (error) {
+          this.health.attemptFailed();
+          const reset = this.discard(client, sender, isConnectionFailure(error), log);
+          if (reset) this.health.clientReset(log.sink, error, attempt);
+          if (attempt >= this.sendAttempts || deadline.aborted) throw error;
+          log.warning(`inbound send failed; retrying on a new ${reset ? "client" : "sender"}`, error);
         }
-        if (attempt === 2 || deadline.aborted) throw error;
-        log.warning("inbound send failed; retrying once on a new sender", error);
       }
+    } catch (error) {
+      this.health.enqueueFailed(log.sink, { kind, error, attempts: attempt, started });
+      throw error;
+    }
+  }
+
+  /**
+   * Before the first attempt: throws when the request has no time left for one (`remaining` ms of the deadline), and on
+   * a cold instance waits for the start-up prefetch to open the sender, but not past `deadline`.
+   */
+  private async readyToSend(remaining: number, deadline: AbortSignal): Promise<void> {
+    if (remaining <= 0) {
+      // The request used its whole budget before the send: answer now, while Teams still waits and retries a 500.
+      throw new DOMException("the inbound send deadline passed before the send began", "TimeoutError");
+    }
+    if (this.inbound === null && this.prefetch !== null && !this.prefetchDone) {
+      // A cold instance: the prefetch is already opening the sender, and a second one would only race it. The wait ends
+      // with the deadline too, so a prefetch that hangs cannot hold the request past it.
+      const opened = Promise.race([this.prefetch, sleep(this.prefetchWaitSeconds * 1000)]);
+      await beforeDeadline(opened, deadline).catch(() => undefined);
+    }
+    if (deadline.aborted) {
+      throw new DOMException("the inbound send deadline passed waiting for the start-up prefetch", "TimeoutError");
     }
   }
 
@@ -333,10 +410,11 @@ export class Ingress {
     let sender: QueueSender | null = null;
     let report: string;
     try {
-      sender = this.client(this.logs.app).createSender(this.settings.inboundQueue);
+      const client = this.client(this.logs.app);
+      sender = client.createSender(this.settings.inboundQueue);
       await sender.createMessageBatch(); // opens the connection and the link, which takes the token
-      if (this.inbound === null) {
-        // else a message opened its own meanwhile, and this one is closed below
+      if (this.inbound === null && this.senderClient === client) {
+        // else a message opened its own meanwhile (or threw the client away), and this one is closed below
         this.inbound = sender;
         sender = null;
       }
@@ -372,19 +450,34 @@ export class Ingress {
   async messages(req: Request, sink?: LogSink): Promise<Reply> {
     const logs = sink === undefined ? this.logs : this.logsFor(sink);
     this.logPrefetchOnce(logs.app);
+    const arrived = performance.now();
+    const started = this.clock.monotonic();
     const body = parseBody(req.body);
     const activity = body instanceof Map ? (plain(body) as JsonObject) : null;
 
-    // Authenticate before anything else is decided, so an unauthenticated caller gets a 401 whatever it sent.
-    const refused = await this.authenticate(req, activity, logs.sink);
+    // Authenticate before anything else is decided, so an unauthenticated caller gets a 401 whatever it sent. The token
+    // check races the request's send deadline: on a cold instance it fetches the OpenID metadata and then the signing
+    // keys (up to 15 s and 30 s, src/keys.ts), and a request still running when the Bot Framework stops waiting is
+    // dropped (a 499) and its message lost. At the deadline it is a 500, which says nothing about the token and which
+    // Teams retries; the fetch carries on in the background and its keys are cached for the retry.
+    const deadline = AbortSignal.timeout(Math.max(1, Math.ceil(this.sendDeadlineSeconds * 1000)));
+    let refused: Reply | null;
+    try {
+      refused = await beforeDeadline(this.authenticate(req, activity, logs.sink), deadline);
+    } catch (error) {
+      if (!deadline.aborted || error !== deadline.reason) throw error;
+      this.health.enqueueFailed(logs.sink, { kind: "activity", error, attempts: 0, started });
+      logs.app.error("failed to enqueue activity: the token check did not finish before the send deadline", error);
+      return empty(500);
+    }
     if (refused !== null) return refused;
     if (activity === null || body === null) return empty(400);
 
-    return this.route(req, activity, body, logs.app);
+    return this.route(req, activity, body, logs.app, arrived);
   }
 
   /** An authenticated activity: queue it (or answer a synchronous invoke at once), and the reply Teams gets. */
-  private async route(req: Request, activity: JsonObject, body: PyValue, log: Logger): Promise<Reply> {
+  private async route(req: Request, activity: JsonObject, body: PyValue, log: Logger, arrived: number): Promise<Reply> {
     const correlationId = req.headers.get("x-correlation-id") || this.uuid();
     const { path, name } = pathOf(activity);
     if (path === "sync") {
@@ -393,11 +486,12 @@ export class Ingress {
       return jsonReply(EMPTY_INVOKE_RESULT);
     }
     try {
-      await this.enqueue(activity, body, correlationId, log);
+      await this.enqueue(activity, body, correlationId, log, arrived);
     } catch (error) {
       log.error("failed to enqueue activity", error);
-      if (path === "deferred") return cardResponse(UNAVAILABLE_CARD);
-      // Returning 500 lets Teams retry the message; the worker dedupes on activity.id so a retry cannot double-process.
+      // A 500 lets the Bot Framework retry the activity, a card action included: an unavailable card in a 200 would end
+      // the invoke there and the click would never reach the worker. The worker dedupes on activity.id, so a retry
+      // cannot double-process.
       return empty(500);
     }
     return path === "deferred" ? cardResponse(PLACEHOLDER_CARD) : empty(200);
@@ -435,12 +529,16 @@ export class Ingress {
     return this.auth.validateToken(authorization, kw.appId);
   }
 
-  /** Queue the activity, raw, on its conversation's session. `node` is the parsed document it came from. */
+  /**
+   * Queue the activity, raw, on its conversation's session. `node` is the parsed document it came from; `arrived` is
+   * when its request arrived (sendInbound).
+   */
   async enqueue(
     activity: JsonObject,
     node: PyValue,
     correlationId: string,
     log: Logger = this.logs.app,
+    arrived?: number,
   ): Promise<void> {
     // Ordering is only guaranteed within a session, and a conversation is the unit that needs it. The queue requires
     // sessions.
@@ -457,6 +555,8 @@ export class Ingress {
         messageId: truthy(activityId) ? boundedId(str(activityId)) : this.uuid(),
       },
       log,
+      "activity",
+      arrived,
     );
   }
 
@@ -497,6 +597,10 @@ export class Ingress {
     if (!isObject(reference) || !isObject(activity)) {
       throw new PyValueError("outbound envelope needs reference and activity objects");
     }
+    if (operation === PROBE_OPERATION) {
+      await this.answerProbe(envelope, logs.app);
+      return;
+    }
     const url = this.connectorUrl(reference, operation, get(envelope, "activity_id"));
     const body = withReference(activity, reference);
     if (operation === "update") {
@@ -505,6 +609,55 @@ export class Ingress {
     const resp = await this.post(url, operation, body, logs);
     const ack = get(envelope, "ack");
     if (truthy(ack) && operation !== "update") await this.ackDelivery(str(ack), reference, resp, logs.app);
+  }
+
+  /**
+   * The worker's answer to a delivery probe: nothing goes to Teams (the bot's token is not even fetched), and the ack goes
+   * back on the probe's own session as a posted message's would, with the activity id "probe". An answer that names
+   * another conversation, or carries no ack, is refused (the trigger dead-letters it after its retries).
+   */
+  private async answerProbe(envelope: JsonObject, log: Logger): Promise<void> {
+    const conversation = or(get(or(get(envelope, "reference"), EMPTY) as JsonObject, "conversation"), EMPTY);
+    const ack = get(envelope, "ack");
+    if (!isObject(conversation) || get(conversation, "id") !== PROBE_CONVERSATION || typeof ack !== "string" || !ack) {
+      throw new PyValueError("a probe answer needs the probe conversation and an ack");
+    }
+    await this.sendAck(ack, PROBE_CONVERSATION, PROBE_OPERATION, log);
+  }
+
+  /** The probe's schedule is set, but the app it is registered on has no timers: said at start, and nothing is sent. */
+  noProbeTimer(): void {
+    this.logs.app.warning(
+      `${PROBE_SCHEDULE_SETTING} is set but the registrar has no timers: no delivery probe is sent`,
+    );
+  }
+
+  /**
+   * Put a delivery probe on the inbound queue (the probe timer), under its own session: the worker answers it through the
+   * outbound queue, and the relay's ack of that answer comes back, so the worker can time the whole path (`probe/probe.ts`).
+   * A probe that cannot be queued is an enqueue failure like any other (the health records, and its alert).
+   */
+  async probe(sink?: LogSink): Promise<void> {
+    const logs = sink === undefined ? this.logs : this.logsFor(sink);
+    const id = this.uuid();
+    const document = new Map<string, unknown>([
+      ["type", PROBE_TYPE],
+      ["id", id],
+      ["sent_at", new Date(this.now()).toISOString()],
+      ["conversation", new Map<string, unknown>([["id", PROBE_CONVERSATION]])],
+    ]);
+    await this.sendInbound(
+      {
+        body: Buffer.from(dumps(document), "utf8"),
+        contentType: "application/json",
+        correlationId: id,
+        sessionId: PROBE_CONVERSATION,
+        messageId: id,
+      },
+      logs.app,
+      "probe",
+    );
+    logs.app.info(`delivery probe ${id} queued`);
   }
 
   /** The Connector call itself, and what its answer means: 401, 429 and 5xx throw (the trigger retries), as do refusals. */
@@ -561,23 +714,28 @@ export class Ingress {
       return;
     }
     const conversationId = or(dictGet(or(get(reference, "conversation"), EMPTY), "id"), ack);
+    try {
+      await this.sendAck(ack, str(conversationId), activityIdNode ?? activityId, log);
+    } catch (error) {
+      log.error(`failed to ack delivery ${ack}`, error);
+    }
+  }
+
+  /** A `primusclaw.delivered` for `ack` on the conversation's session of the inbound queue. */
+  private async sendAck(ack: string, conversationId: string, activityId: unknown, log: Logger): Promise<void> {
     const document = new Map<string, unknown>([
       ["type", ACK_TYPE],
       ["ack", ack],
-      ["activity_id", activityIdNode ?? activityId],
+      ["activity_id", activityId],
     ]);
     const message: QueueMessage = {
       body: Buffer.from(dumps(document), "utf8"),
       contentType: "application/json",
       correlationId: ack,
-      sessionId: boundedId(str(conversationId)),
+      sessionId: boundedId(conversationId),
       messageId: this.uuid(),
     };
-    try {
-      await this.sendInbound(message, log);
-    } catch (error) {
-      log.error(`failed to ack delivery ${ack}`, error);
-    }
+    await this.sendInbound(message, log, "ack");
   }
 
   connectorUrl(reference: JsonObject, operation: string, activityId: unknown): string {

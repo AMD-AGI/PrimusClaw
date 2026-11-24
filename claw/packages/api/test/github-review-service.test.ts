@@ -291,6 +291,8 @@ describe("D delegation and permissions", () => {
     assert.equal((await submit({ event: "APPROVE" })).body.status, "submitted");
     const o = await merge();
     assert.equal(o.body.status, "merged", o.text);
+    // The commit the merge made is kept on its audit row: the owner of a review that merged in its run is told it (N55).
+    assert.deepEqual((await e.sql("SELECT tool, merge_sha FROM claw_github_audit WHERE merge_sha IS NOT NULL")).map((r: any) => [r.tool, r.merge_sha]), [["gh_pr_merge", "m".repeat(40)]]);
     assert.equal(e.gh.writes[0]?.body.event, "APPROVE");
     assert.equal(e.gh.calls.every((c) => c.authorization.includes(TOKEN)), true);
     assert.equal(e.gh.calls.some((c) => c.authorization.includes(REQUESTER_TOKEN)), false);
@@ -692,7 +694,7 @@ describe("M the merge gates", () => {
     assert.deepEqual({ ...(await row()) }, { result: "ok", detail: "merged", merge_state: null });
   });
 
-  test("M8d GitHub's 403 for a pull request that changes a CI workflow file, with a token that has no `workflow` scope, is its own refusal: merge it by hand on GitHub, not bind again; any other 403 is still github_error", async () => {
+  test("M8d GitHub's 403 for a pull request that changes a CI workflow file, with a token that has no `workflow` scope, is its own refusal: merge it by hand on GitHub, not bind again; a 403 in GitHub's words for a permission is the account's missing permission (merge_not_permitted)", async () => {
     const workflow = "refusing to allow an OAuth App to create or update workflow `.github/workflows/tests.yml` without `workflow` scope";
     const row = async () => (await e.sql("SELECT result, detail FROM claw_github_audit WHERE tool = 'gh_pr_merge' ORDER BY id DESC LIMIT 1"))[0];
     e.gh.graphql.mergeStateStatus = "CLEAN";
@@ -711,11 +713,37 @@ describe("M the merge gates", () => {
     // A GitHub App says `workflows` permission: the same refusal.
     e.gh.mergeAnswers = [{ status: 403, message: "refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission" }];
     assert.equal(reason(await merge()), "github_workflow_scope_missing");
-    // Another 403 is not this one.
+    // Another 403 is not this one: the account may not merge here, which lets the requester be asked (`followPullRequest`).
     e.gh.mergeAnswers = [{ status: 403, message: "Resource not accessible by integration" }];
     const other = await merge();
-    assert.equal(reason(other), "github_error", other.text);
-    assert.deepEqual({ ...(await row()) }, { result: "refused", detail: "github_error" });
+    assert.equal(reason(other), "merge_not_permitted", other.text);
+    assert.deepEqual({ ...(await row()) }, { result: "refused", detail: "merge_not_permitted" });
+    // A protected branch that restricts who may push answers 405 in these words: the same refusal. A 405 in other words is not.
+    e.gh.mergeAnswers = [{ status: 405, message: "You're not authorized to push to this branch. Visit https://docs.github.com/articles/about-protected-branches/ for more information." }];
+    assert.equal(reason(await merge()), "merge_not_permitted");
+    e.gh.mergeAnswers = [{ status: 405, message: "Required status check \"test\" is expected." }];
+    assert.equal(reason(await merge()), "not_mergeable");
+  });
+
+  test("M8e a 403 counts as the account's missing permission only in GitHub's words for one: a passing 403 (an abuse-detection limit with Retry-After and other words, a bare Forbidden, any 403 with Retry-After) is not merge_not_permitted, since a retry may get past it and it must never let the requester be asked", async () => {
+    const row = async () => (await e.sql("SELECT result, detail FROM claw_github_audit WHERE tool = 'gh_pr_merge' ORDER BY id DESC LIMIT 1"))[0];
+    const passing = [
+      { status: 403, message: "You have triggered an abuse detection mechanism. Please wait a few minutes before you try again.", headers: { "retry-after": "60" } },
+      { status: 403, message: "Forbidden" },
+      { status: 403, message: "Must have admin rights to Repository.", headers: { "retry-after": "30" } },
+    ];
+    for (const answer of passing) {
+      e = await reviewEnv();
+      allowed();
+      e.gh.graphql.mergeStateStatus = "CLEAN";
+      approvedHere();
+      e.gh.mergeAnswers = [answer];
+      const o = await merge();
+      assert.equal(o.isError, true, `${answer.message}: ${o.text}`);
+      assert.notEqual(reason(o), "merge_not_permitted", `${answer.message}: ${o.text}`);
+      assert.equal(puts().length, 1, answer.message);
+      assert.notEqual((await row())?.detail, "merge_not_permitted", answer.message);
+    }
   });
 
   test("M16 GitHub works the merge state out after the approval a person's allow made, not at once: UNKNOWN, and BLOCKED while the review does not count yet, are waited for, a few seconds at most; the merge is made when it settles, and not otherwise", async () => {
