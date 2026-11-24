@@ -29,9 +29,10 @@ import type { AgentConfig, ConnectorConfig } from "./config.js";
 import { claudeSessionMeta } from "./claude-mode.js";
 import { hintFor, withHint } from "./hints.js";
 import {
-  PermissionBook, boundedInput, matchAutoAllow, normalizeOptions, type OfferedOption,
+  PermissionBook, boundedInput, matchAutoAllow, normalizeOptions, type OfferedOption, type ParkPolicy,
 } from "./permissions.js";
 import { dropSessionFiles } from "./prompt-files.js";
+import { PERMISSION_PARK_MAX_MS, REMOTE_EVENT_PERMISSION_PARKED } from "./protocol.js";
 import { redactDeep } from "./redact.js";
 import type { SessionStore } from "./session-store.js";
 import { errMessage, isObject, sleep, truncateBytes, verdictOf, type Logger, type MayRun } from "./util.js";
@@ -43,8 +44,10 @@ export type Emit = (sessionId: string, type: string, data: Record<string, unknow
 export interface SessionTiming {
   /** A session with no activity for this long loses its adapter process (the session itself stays and resumes on demand). */
   idleMs: number;
-  /** A permission request nobody answers is answered `cancelled` after this long. */
+  /** A permission request nobody answers is answered `cancelled` after this long (unless its turn parks it: then it is said parked). */
   permissionTtlMs: number;
+  /** A parked permission request (`prompt.park_permissions`) is answered `cancelled` this long after it was asked; PERMISSION_PARK_MAX_MS when absent. */
+  permissionParkMaxMs?: number;
   /** How long to wait for an adapter to confirm a mode change by notification when it has no other way to be asked. */
   modeConfirmMs: number;
   /** An attach session reads the registry this often while its own agent is starting or running a turn, to see a terminal that opens the conversation meanwhile. */
@@ -210,7 +213,12 @@ export class Session {
    * it again.
    */
   private readonly recording = new Set<Promise<unknown>>();
-  private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun; answerOnly?: boolean }> = [];
+  private queue: Array<{ text: string; cmdId: string | null; cmdSeq: number | null; started: () => void; mayRun?: MayRun; answerOnly?: boolean; park?: boolean }> = [];
+  /**
+   * The prompt whose turn runs on the agent now (`cmd_seq`, carried on its permission requests), and whether it parks them
+   * (`prompt.park_permissions`): a request of such a turn is not cancelled when its timeout passes, it waits on (permissions.ts `ParkPolicy`).
+   */
+  private turnNow: { cmdSeq: number | null; park: boolean } | null = null;
   /** The turn running now only answers (`prompt.answer_only`): every permission its agent asks for is refused here, never put to anyone. */
   private answerOnlyTurn = false;
   /**
@@ -290,9 +298,9 @@ export class Session {
       this.env.audit.record("mode_reverted", { session_id: id, agent_id: agent.id, from: this.targetMode, to: agent.askMode, reason: "no_longer_allowed" });
       this.targetMode = agent.askMode;
     }
-    this.book = new PermissionBook(env.timing.permissionTtlMs, (actionId) => {
-      this.env.audit.record("permission_expired", { session_id: this.id, action_id: actionId });
-      this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "timeout" });
+    this.book = new PermissionBook(env.timing.permissionTtlMs, (actionId, by) => {
+      this.env.audit.record("permission_expired", { session_id: this.id, action_id: actionId, by });
+      this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by });
     });
   }
 
@@ -1273,20 +1281,35 @@ export class Session {
 
   /** Put a question on the phone and wait for the answer, a cancel or the timeout. `shape` turns the answer into what the adapter expects. */
   private askPerson(options: OfferedOption[], info: Record<string, unknown>, shape: (optionId: string | null) => AcpParams, permission = false): Promise<AcpParams> {
+    const turn = this.turnNow;
+    // (`cmd_seq` after the redaction: a number, which no credential scrub ever masks)
+    const cmdSeq = turn?.cmdSeq ?? null;
+    const park: ParkPolicy | null = turn?.park ? { maxMs: this.env.timing.permissionParkMaxMs ?? PERMISSION_PARK_MAX_MS, onPark: (actionId, until) => this.parked(actionId, cmdSeq, until) } : null;
     return new Promise<AcpParams>((resolve) => {
-      const p = this.book.open(options, (actionId) => redactDeep({ actionId, ...info, options, timeout_ms: this.book.ttl }) as Record<string, unknown>, (optionId) => {
+      const p = this.book.open(options, (actionId) => ({ ...(redactDeep({ actionId, ...info, options, timeout_ms: this.book.ttl }) as Record<string, unknown>), cmd_seq: cmdSeq }), (optionId) => {
         if (!this.stopping) {
           this.env.store.removePending(this.id, p.actionId);
           if (this.book.size === 0) this.env.store.markWaiting(this.id, false);
         }
         resolve(shape(optionId));
-      });
+      }, park);
       this.env.store.addPending(this.id, p.actionId);
       this.env.store.markWaiting(this.id, true, permission);
       this.audit("permission_requested", { action_id: p.actionId, tool: info.tool, tool_kind: info.kind, options: options.map((o) => o.optionId) });
       // Shown once the card is on record: a crash after that closes it on the next run (`takePending`).
       this.emit("permissionRequest", p.payload, this.env.store.written());
     });
+  }
+
+  /**
+   * A request of a turn that parks its permissions passed its timeout: it is not cancelled, it waits on until `until`. Said
+   * once, so the phone reminds the person once and keeps the card answerable; a late answer goes through as any other.
+   */
+  private parked(actionId: string, cmdSeq: number | null, until: number): void {
+    this.touch();
+    const parkedUntil = new Date(until).toISOString();
+    this.audit("permission_parked", { action_id: actionId, cmd_seq: cmdSeq, parked_until: parkedUntil });
+    this.emit(REMOTE_EVENT_PERMISSION_PARKED, { actionId, cmd_seq: cmdSeq, parked_until: parkedUntil });
   }
 
   /** A person's answer from the phone. Only an option that was offered is accepted. */
@@ -1303,7 +1326,13 @@ export class Session {
 
   /** After a reconnect: the cards that are still waiting, sent again (same `actionId`, so a client treats them as the same card). */
   resendPending(): void {
-    for (const p of this.book.list()) this.emit("permissionRequest", { ...p.payload, resent: true });
+    for (const p of this.book.list()) {
+      this.emit("permissionRequest", { ...p.payload, resent: true });
+      // (a parked one is said parked again, after its card: a phone that missed the first notice still knows it waits on)
+      if (p.parkedUntil !== undefined) {
+        this.emit(REMOTE_EVENT_PERMISSION_PARKED, { actionId: p.actionId, cmd_seq: p.payload.cmd_seq ?? null, parked_until: new Date(p.parkedUntil).toISOString(), resent: true });
+      }
+    }
   }
 
   /** The Cursor extension requests the adapter blocks on. Never left unanswered. */
@@ -1358,7 +1387,7 @@ export class Session {
    * delivers it again instead of losing it.
    */
   enqueuePrompt(
-    text: string, cmdId: string | null, started: () => void = () => {}, cmdSeq: number | null = null, mayRun?: MayRun, answerOnly = false,
+    text: string, cmdId: string | null, started: () => void = () => {}, cmdSeq: number | null = null, mayRun?: MayRun, answerOnly = false, park = false,
   ): void {
     if (this.closed) { this.rejectCommand("prompt", cmdId, "session_closed", cmdSeq); return started(); }
     if (answerOnly && !this.readOnly && (this.turnRunning || this.queue.length > 0)) {
@@ -1385,7 +1414,7 @@ export class Session {
       return started();
     }
     if (this.queue.length >= MAX_QUEUED_PROMPTS) { this.rejectCommand("prompt", cmdId, "too_many_queued_prompts", cmdSeq); return started(); }
-    this.queue.push({ text, cmdId, cmdSeq, started, mayRun, ...(answerOnly ? { answerOnly: true } : {}) });
+    this.queue.push({ text, cmdId, cmdSeq, started, mayRun, ...(answerOnly ? { answerOnly: true } : {}), ...(park ? { park: true } : {}) });
     // The user's own prompt: a turn that may only answer gives way to it (stopped; the user's runs next, in the session's own mode).
     if (!answerOnly && this.answerOnlySpan) {
       this.answerOnlySpan.userPresent = true;
@@ -1434,7 +1463,7 @@ export class Session {
         if (verdict === "keep") { this.queue.unshift(next); break; }
         if (verdict === "drop") { next.started(); continue; }
         if (this.closed) { this.rejectCommand("prompt", next.cmdId, "session_closed", next.cmdSeq); next.started(); break; }
-        await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq, next.answerOnly === true);
+        await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq, next.answerOnly === true, next.park === true);
       }
     } finally {
       this.turnRunning = false;
@@ -1539,8 +1568,8 @@ export class Session {
   }
 
   /** Every `turn_end` of the turn names its prompt: `cmd_id`, and `cmd_seq` (a number, which no credential scrub ever masks). */
-  private async runTurn(text: string, started: () => void, cmdId: string | null, cmdSeq: number | null, answerOnly = false): Promise<void> {
-    if (!answerOnly) return this.runTurnReady(text, started, cmdId, cmdSeq, false);
+  private async runTurn(text: string, started: () => void, cmdId: string | null, cmdSeq: number | null, answerOnly = false, park = false): Promise<void> {
+    if (!answerOnly) return this.runTurnReady(text, started, cmdId, cmdSeq, false, () => {}, park);
     this.answerOnlySpan = { mode: null, deferred: null, userPresent: false };
     let back: string | null = null;
     try {
@@ -1553,6 +1582,7 @@ export class Session {
   /** The turn, its agent made ready first (and, for one that may only answer, its read-only mode; `entered` gets the mode to go back to). */
   private async runTurnReady(
     text: string, started: () => void, cmdId: string | null, cmdSeq: number | null, answerOnly: boolean, entered: (back: string | null) => void = () => {},
+    park = false,
   ): Promise<void> {
     if (this.agent.attach) {
       const refused = await this.preflight();
@@ -1577,7 +1607,7 @@ export class Session {
       if (reason === "agent_auth_required") return;
       return this.refuse(e);
     }
-    if (!answerOnly) return this.runAdapterTurn(text, started, cmdId, cmdSeq);
+    if (!answerOnly) return this.runAdapterTurn(text, started, cmdId, cmdSeq, park);
     const back = await this.enterAnswerOnly(cmdId, cmdSeq, started);
     if (back === false) return;
     entered(back);
@@ -1587,9 +1617,10 @@ export class Session {
   }
 
   /** The turn itself, its agent running (and, for a turn that may only answer, in a read-only mode). */
-  private async runAdapterTurn(text: string, started: () => void, cmdId: string | null, cmdSeq: number | null): Promise<void> {
+  private async runAdapterTurn(text: string, started: () => void, cmdId: string | null, cmdSeq: number | null, park = false): Promise<void> {
     const a = this.adapter!;
-    this.audit("turn_started", { length: text.length });
+    this.audit("turn_started", { length: text.length, ...(park ? { park_permissions: true } : {}) });
+    this.turnNow = { cmdSeq, park };
     const support = this.agent.attach && this.acpId ? this.env.attach.get(this.agent.id) : undefined;
     const turnFrom = support ? support.transcriptSize(this.acpId!) : null;
     const watch = support ? this.watchTwins(support, this.acpId!) : null;
@@ -1597,7 +1628,7 @@ export class Session {
       const reply = a.requestUnbounded("session/prompt", { sessionId: this.acpId, prompt: [{ type: "text", text }] });
       const now = new Date().toISOString();
       // Recorded before the prompt counts as handled: from here a restart finds this turn instead of losing it.
-      this.env.store.beginTurn({ session_id: this.id, cmd_id: cmdId, cmd_seq: cmdSeq, started_at: now });
+      this.env.store.beginTurn({ session_id: this.id, cmd_id: cmdId, cmd_seq: cmdSeq, started_at: now, ...(park ? { park: true } : {}) });
       this.env.store.patch(this.id, { used_at: now, unused: false });
       void this.tracked(this.handledOnceRecorded(started, now));
       const res = await reply;
@@ -1617,6 +1648,7 @@ export class Session {
     } finally {
       // At once, before the look at who holds the conversation open: the test below it for a terminal that writes
       // next is the size, and it must start from the turn's end, not from a moment later.
+      this.turnNow = null;
       this.markTranscript(turnFrom);
       if (watch) {
         if (this.closed) watch.stop();
