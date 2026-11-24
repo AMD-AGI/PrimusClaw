@@ -111,7 +111,7 @@ export const MANIFEST: ManifestItem[] = [
   { itemId: ITEM.s34, seq: 34, title: "Q4 路线图草稿", boardState: "in_progress", summary: "outline written, 3 of 5 sections drafted",
     lastReportKind: "progress", resultVersion: 0, pendingQuestion: null, createdAt: "2026-11-24T06:00:00.000Z" },
   { itemId: ITEM.e35, seq: 35, title: "发布 connector 0.3.1", boardState: "done", summary: "published 0.3.1 to npm", lastReportKind: "answer",
-    resultVersion: 0, pendingQuestion: null, outcome: "accepted", createdAt: "2026-11-23T10:00:00.000Z", closedAt: "2026-11-23T10:40:00.000Z",
+    resultVersion: 0, pendingQuestion: null, outcome: "answered", createdAt: "2026-11-23T10:00:00.000Z", closedAt: "2026-11-23T10:40:00.000Z",
     remote: { machine: "devbox", agent: "claude", session: "c0ffee12-3456-4789-abcd-ef0123456735", online: true, errand: { seat_id: SEAT.rel, alias: "发布台" } } },
 ];
 
