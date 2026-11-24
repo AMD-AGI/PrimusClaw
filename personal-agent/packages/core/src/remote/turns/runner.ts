@@ -284,7 +284,10 @@ export class TurnRunner {
     else display.progress(step);
     if (step.rowUnreadable) await this.sayRowUnreadable(chatKey, sid, to, display);
     if (saysModes(step)) this.ctx.remoteState.setRemoteModes(chatKey, sid, step);
-    if (step.permission !== null) await this.show(chatKey, sid, step.permission, to);
+    if (step.permission !== null) {
+      display.movedOn?.(); // (its card goes below the turn's stream: the answer must come below it too)
+      await this.show(chatKey, sid, step.permission, to);
+    }
     // answered somewhere else (or it ran out on the machine): the card is dead
     if (step.resolved !== null) this.ctx.permissions.closeRemotePermission(sid, actionIdOf(step.resolved), "decided");
     if (step.recovered !== null && (step.recovered.continuing || !step.recovered.interrupted)) {

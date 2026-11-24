@@ -154,3 +154,43 @@ test("a long answer whose turn the person wrote into comes below the queued mess
     },
     { direct: true, streaming: true },
   ));
+
+test("an answer that goes on after a permission card comes below the card, whole and in order", () =>
+  remoteWorld(
+    async (w) => {
+      neverPastAMinute(w);
+      const { sid, prompts } = await manual(w);
+      await w.send("add a line to the README");
+      await w.until(() => prompts.length === 1);
+      await words(w.server, sid, "I will look first.");
+      await w.until(() =>
+        w.surface.outbox.some((r) => r.op === "stream.emit" && r.text.includes("I will look first.")),
+      );
+      await w.server.emit(sid, "permissionRequest", {
+        actionId: "act-1",
+        tool: "Edit README.md",
+        kind: "edit",
+        input: { path: "README.md" },
+        options: [{ optionId: "allow_once", name: "Allow", kind: "allow_once" }],
+        timeout_ms: 600_000,
+      });
+      await w.until(() =>
+        w.surface.outbox.some((r) => r.op === "send" && JSON.stringify(r.message).includes("README")),
+      );
+      await w.server.emit(sid, "permission_resolved", { actionId: "act-1", optionId: "allow_once", by: "someone" });
+      await words(w.server, sid, PARAS.join("\n\n"));
+      await endOf(w, sid, prompts[0]);
+      await w.idle();
+
+      const read = chat(w.surface.outbox, new Map());
+      const shown = read.join("\n");
+      const card = read.findIndex((line) => line.includes("README") && !line.includes("overview"));
+      const parts = ["First", "Second", "Third"].map((n) =>
+        read.findIndex((l) => l.includes(`${n} part of the overview.`)),
+      );
+      assert.ok(card >= 0 && parts.every((i) => i > card), shown);
+      assert.deepEqual(parts, [parts[0], (parts[0] ?? 0) + 1, (parts[0] ?? 0) + 2], shown);
+      assert.ok(read[(parts[0] ?? 0) + 1]?.includes("(cont. 2/3)"), shown);
+    },
+    { direct: true, streaming: true },
+  ));
