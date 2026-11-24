@@ -121,3 +121,10 @@ test("the commands themselves, other commands, words after it and other words ar
   ])
     assert.ok(!isAgentsSlip(text), text);
 });
+
+test("a slip of /agents is read as /agents in a 1:1 chat, and left as it is in a group", () => {
+  assert.equal(menuCommand("/agnets"), "/agents");
+  assert.equal(menuCommand("／agents"), "/agents");
+  assert.equal(menuCommand("/agnets", true), "/agnets");
+  assert.equal(menuCommand("/urgent"), "/urgent");
+});

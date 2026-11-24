@@ -9,6 +9,7 @@ import { decimalInt, isUpper, pyLower, pySplit, pyStrip, splitOnce, squashSpaces
 import { own } from "../own.js";
 import { CODE_ALPHABET, CODE_LENGTH } from "../ports/store/policy.js";
 import { pyFullmatch } from "../text/py-regex.js";
+import { isAgentsSlip } from "./agent-args.js";
 import { isCommand, type Command } from "./names.js";
 
 /** The command name if `text` is exactly a known command, else null. */
@@ -63,9 +64,11 @@ function looksLikeACode(word: string): boolean {
 
 /**
  * `text` as the command it is when it is exactly a word of the commands menu (case and spacing do not matter), `link CODE` with a
- * code of the console's shape as `/link CODE`, and `text` itself otherwise. `group`: a group chat reads only its own menu's words.
+ * code of the console's shape as `/link CODE`, a slip of `/agents` (`/agnets`, `／agents`) as `/agents` in a 1:1 chat, and
+ * `text` itself otherwise. `group`: a group chat reads only its own menu's words.
  */
 export function menuCommand(text: string, group = false): string {
+  if (!group && isAgentsSlip(text)) return "/agents"; // (the list, read here for every 1:1 chat: never words for the assistant)
   const said = squashSpaces(text);
   const lower = pyLower(said);
   const command = Object.hasOwn(MENU_COMMANDS, lower) ? MENU_COMMANDS[lower] : undefined;

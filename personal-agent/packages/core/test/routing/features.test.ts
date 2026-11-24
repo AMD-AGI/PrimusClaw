@@ -474,52 +474,72 @@ test("test_the_net_leaves_alone_what_it_must", async () => {
   assert.ok(!said(w).some((t) => t.includes("not active any more")));
 });
 
-test("a slip of /agents shows the list: it never starts or attaches a session and never reaches the assistant", async () => {
-  const lists: string[] = [];
-  const commands: string[] = [];
-  const prompts: string[] = [];
-  const w = world({
-    remote: {
-      enabled: true,
-      attached: () => false,
-      agents: (chat) => {
-        lists.push(chat.id);
-        return Promise.resolve();
+for (const understands of [false, true]) {
+  test(`a slip of /agents shows the list: it never starts or attaches a session and never reaches the assistant (assistant understands: ${String(understands)})`, async () => {
+    const lists: string[] = [];
+    const commands: string[] = [];
+    const prompts: string[] = [];
+    const understood: string[] = [];
+    const w = world({
+      assistant: {
+        on: () => understands,
+        understands: () => understands,
+        reachable: () => true,
+        hiddenCommand: () => undefined,
+        board: () => Promise.resolve(),
+        stop: () => Promise.resolve(true),
+        route: (request) => {
+          understood.push(request.prompt);
+          return Promise.resolve(true);
+        },
+        understand: (request) => {
+          understood.push(request.prompt);
+          return Promise.resolve(true);
+        },
       },
-      agent: (command) => {
-        commands.push(command.args);
-        return Promise.resolve();
+      remote: {
+        enabled: true,
+        attached: () => false,
+        agents: (chat) => {
+          lists.push(chat.id);
+          return Promise.resolve();
+        },
+        agent: (command) => {
+          commands.push(command.args);
+          return Promise.resolve();
+        },
+        prompt: (request) => {
+          prompts.push(request.prompt);
+          return Promise.resolve();
+        },
       },
-      prompt: (request) => {
-        prompts.push(request.prompt);
-        return Promise.resolve();
-      },
-    },
+    });
+    link(w, ALICE.id, "ak");
+    const slips = [
+      "/agents",
+      "/Agents",
+      "/agents.",
+      "/agents?",
+      "／agents",
+      "/agnets",
+      "/agens",
+      "/agentss",
+      "/agetns",
+      "/agnet",
+    ];
+    for (const slip of slips) await w.router.handle(message(slip));
+    await w.router.settled();
+    assert.equal(lists.length, slips.length, JSON.stringify({ lists, commands, understood }));
+    assert.deepEqual(commands, []);
+    assert.deepEqual(prompts, []);
+    assert.deepEqual(understood, []);
+    assert.equal(w.turns.calls.length, 0); // (none went on to the assistant as words)
+    // a real subcommand is still one, and words that only look like it stay words
+    await w.router.handle(message("/agents new codex /x"));
+    await w.router.handle(message("/urgent"));
+    await w.router.settled();
+    assert.deepEqual(commands, ["new codex /x"]);
+    assert.equal(lists.length, slips.length);
+    assert.equal(understood.length + w.turns.calls.length, 1, "/urgent goes on as words");
   });
-  link(w, ALICE.id, "ak");
-  const slips = [
-    "/agents",
-    "/Agents",
-    "/agents.",
-    "/agents?",
-    "／agents",
-    "/agnets",
-    "/agens",
-    "/agentss",
-    "/agetns",
-    "/agnet",
-  ];
-  for (const slip of slips) await w.router.handle(message(slip));
-  await w.router.settled();
-  assert.equal(lists.length, slips.length, JSON.stringify({ lists, commands }));
-  assert.deepEqual(commands, []);
-  assert.deepEqual(prompts, []);
-  assert.equal(w.turns.calls.length, 0); // (none went on to the assistant as words)
-  // words that only look like it stay words, and a real subcommand is still one
-  await w.router.handle(message("/agents new codex /x"));
-  await w.router.handle(message("/urgent"));
-  await w.router.handle(message("/agents please"));
-  await w.router.settled();
-  assert.deepEqual(commands, ["new codex /x"]);
-  assert.equal(lists.length, slips.length + 1); // (`/agents please`: words that are no subcommand, the list as before)
-});
+}
