@@ -173,6 +173,15 @@ test("V3 the stand-in keeps the tool layer's rules", () => {
     ["card", "first_dispatch"]);
   assert.equal(r(user().call("work_send", { item_id: "#35", text: "x" })).dispatch, "sent", "ended yesterday: opened again");
   assert.equal(r(user().call("work_send", { item_id: "#34", text: "x" })).status, "in_progress", "a sandbox item");
+  // The same words to the same task twice in one turn go once (errandWorkSend's turn claim): the second is already_sent.
+  const twice = user();
+  assert.equal(r(twice.call("work_send", { item_id: "#31", text: "tag v0.4.0-rc1" })).dispatch, "sent");
+  assert.equal(r(twice.call("work_send", { item_id: "#31", text: " tag  v0.4.0-rc1 " })).dispatch, "already_sent");
+  assert.equal(r(twice.call("work_send", { item_id: "#31", text: "and the README" })).dispatch, "sent");
+  const reopenedTwice = user();
+  assert.equal(r(reopenedTwice.call("work_send", { item_id: "#35", text: "publish 0.3.2" })).dispatch, "sent");
+  assert.equal(r(reopenedTwice.call("work_send", { item_id: "#35", text: "publish 0.3.2" })).dispatch, "already_sent");
+  assert.equal(r(reopenedTwice.call("work_send", { item_id: "#35", text: "also tag it" })).dispatch, "sent", "opened again: running");
   // The same answers as the real checks give for each fixture errand.
   for (const item of MANIFEST.filter((i) => i.remote)) {
     const p = errandParamsOf(item);
@@ -228,6 +237,8 @@ test("V4 scoring passes only the decision a case wants", async () => {
   assert.equal((await run("sandbox-intro-zh", [create("sandbox"), say("已开始（#41）。")])).score.pass, true);
   assert.equal((await run("follow-31-en", [["work_send", { item_id: ITEM.e31, text: "also the README" }], say("Sent to #31.")])).score.pass, true);
   assert.equal((await run("follow-31-en", [create(seat(SEAT.rel)), say("Sent to 发布台 as a new errand.")])).score.pass, false, "a new item, not the follow-up");
+  const doubled = await run("follow-31-en", [["work_send", { item_id: "#31", text: "also the README" }], ["work_send", { item_id: "#31", text: "also the README" }], say("Sent to #31.")]);
+  assert.equal(doubled.score.pass, true, "a repeat the tools answer already_sent is no second effect");
   assert.equal((await run("follow-implicit-zh", [["work_send", { item_id: "#31", text: "tag 用 v0.4.0-rc1" }], say("已转给 #31。")])).score.pass, true);
   assert.equal((await run("confirm-each-zh", [["seat_set", { seat: SEAT.rel, confirm_each: true }], say("好的，以后发给发布台都先出卡片。")])).score.pass, true);
   assert.equal((await run("queue-full-zh", [create(seat(SEAT.hlci)), say("hl-ci 已经排了 3 个，要等、交给沙箱，还是换个工位？")])).score.pass, true);

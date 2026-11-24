@@ -1361,6 +1361,8 @@ export interface ErrandParams extends RemoteParams {
   approved_unattended?: boolean;
   /** An end recorded and not yet reported (`ingestReport` runs after the commit; the sweep retries what it missed). */
   report_due?: { kind: "answer" | "failed"; summary: string; generation: number };
+  /** The instructions `work_send` let through to it in one router turn (`task`), by their words' key (`seat-dispatch.ts`). */
+  turn_sends?: { task: string; keys: string[] };
 }
 
 /** How much of the agent's answer an errand's report carries (its end). */
