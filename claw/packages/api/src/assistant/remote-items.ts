@@ -44,7 +44,7 @@ import { db, inTransaction, type Querier } from "../infra/db.js";
 import { approvalsEnabled, DELIVERY_UNCONFIRMED, findSession, issueCommand, onlineSql, terminalMuted, wakeConnector } from "../remote-agents/store.js";
 import { newWorkItemId } from "../tasks/ids.js";
 import type { AssistantRemoteAsk, AssistantRemoteNotice } from "../notifications/assistant-events.js";
-import { ensureLiveAssistant, personWritesChinese, recordSystemNotice, storeAnswerWhole } from "./outbound.js";
+import { ensureLiveAssistant, itemSession, personWritesChinese, recordSystemNotice, storeAnswerWhole } from "./outbound.js";
 import { applyWorkerReport, clipOneLine, clipWords, graphemes, TITLE_MAX } from "./work-items.js";
 
 const logger = pino({ name: "assistant-remote-items" });
@@ -1461,12 +1461,6 @@ export interface NoteErrandPrompt {
  */
 export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
   const reports = await import("./reports.js");
-  // An end still to be reported here may have to be said by the system (below): a user whose assistant session was deleted gets it
-  // made again first, as `recordNeedsYouFallback` does, so the answer has a session to be said in (none is never swept for later).
-  const due = (await db.query(
-    "SELECT 1 FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' AND params ? 'report_due'", [p.itemId, p.owner],
-  )).rows.length > 0;
-  if (due) await ensureLiveAssistant(p.itemId).catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_assistant_not_made"));
   const woke = await inTransaction(async (q) => {
     const row = (await q(
       "SELECT board_state, outcome, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' FOR UPDATE", [p.itemId, p.owner],
@@ -1477,6 +1471,9 @@ export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
     // As `ingestReport` does it: a long answer stored to be said whole, the router woken, and, when it cannot be, the system says it.
     let wake: { sessionId: string; userId: string } | null = null;
     let whole: { announce: () => Promise<void> } | null = null;
+    // An end the router cannot be woken to say and that nothing here could store (the user's assistant session was deleted: no session
+    // to store it in): said after the commit, in a session made again for it. A seat task is never swept for later, so it is said now.
+    let untold: { kind: "answer" | "failed"; summary: string; generation: number } | null = null;
     const due = row.params.report_due;
     if (due) {
       const applied = await applyWorkerReport({ query: q }, {
@@ -1494,6 +1491,10 @@ export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
         if (queued.status === "queued") wake = { sessionId: queued.sessionId, userId: queued.userId };
         // The router cannot be woken to say it: the system says the answer itself, stored now, while the item still stands answered.
         else if (queued.status === "refused" && !whole) whole = await storeAnswerWhole(q, p.itemId, reports.reportPorts.sayDeps);
+        // (A failure is also said by its own error notice, in the session it was recorded for: said again only when that one is gone.)
+        if (queued.status === "refused" && !whole && !(await itemSession(q, p.itemId))?.sessionId) {
+          untold = { kind: due.kind, summary: String(due.summary), generation: Number(due.generation) };
+        }
       }
       row.board_state = applied.applied ? applied.boardState : row.board_state;
       if (applied.applied && due.kind === "answer") row.outcome = "answered";
@@ -1528,14 +1529,35 @@ export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
        SELECT item_id, 'progress', 'remote', generation, $2 FROM claw_work_items WHERE item_id = $1`,
       [p.itemId, p.machine],
     );
-    return { wake, whole };
+    return { wake, whole, untold };
   });
   if (!woke) return;
   if (woke.whole) await woke.whole.announce().catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_answer_not_announced"));
+  if (woke.untold) await tellUntold(p.owner, p.itemId, woke.untold).catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_end_not_told"));
   if (woke.wake) {
     const { drainSessionIfIdle } = await import("./messages.js");
     await drainSessionIfIdle(woke.wake.sessionId, woke.wake.userId).catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_wake_failed"));
   }
+}
+
+/**
+ * A seat task's end that its router could not be woken to say, and that had no session to be stored in, said by the system in the
+ * user's assistant session (made again when they deleted it, as `recordNeedsYouFallback` does). Once per end (its key).
+ */
+async function tellUntold(owner: string, itemId: string, end: { kind: "answer" | "failed"; summary: string; generation: number }): Promise<void> {
+  await ensureLiveAssistant(itemId);
+  const row = (await db.query(
+    `SELECT w.seq, w.title, w.params->>'lang' AS lang, a.session_id
+       FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id
+      WHERE w.item_id = $1 AND w.user_id = $2`,
+    [itemId, owner],
+  )).rows[0] as { seq: number; title: string; lang: string | null; session_id: string | null } | undefined;
+  if (!row?.session_id) return;
+  const zh = row.lang === "zh";
+  const text = end.kind === "answer"
+    ? (zh ? `#${row.seq} ${row.title}：${end.summary}` : `#${row.seq} "${row.title}": ${end.summary}`)
+    : (zh ? `#${row.seq} ${row.title} 没有完成：${end.summary}` : `#${row.seq} "${row.title}" did not finish: ${end.summary}`);
+  await recordSystemNotice({ userId: owner, sessionId: row.session_id, text, key: `errand-untold:${itemId}:${end.generation}`, itemId });
 }
 
 interface ErrandPass { notices: Notice[]; reports: Array<{ itemId: string; generation: number; kind: "answer" | "failed"; summary: string }> }
