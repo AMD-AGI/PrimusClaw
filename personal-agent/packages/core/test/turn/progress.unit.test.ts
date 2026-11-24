@@ -426,3 +426,57 @@ it("a turn cancelled after its stream was refused closes the stream and retires 
   assert.deepEqual(bus.chat, []);
   assert.deepEqual(bus.streamOps.map((o) => [o.op, o.text]).at(-1), ["finish", "Interrupted."]);
 });
+
+it("words streamed before the chat went on stay in the bubble, which then says the answer is below; the answer comes whole below, once", async () => {
+  const clock = new Timeline();
+  const bus = new Bus(clock);
+  const log = new RecordingLogger();
+  const status = turnStatusMessage(bus, { clock, log, streamReplyTo: "act", streamText: true });
+  status.begin();
+  status.progress({ partial: "Part one begins" });
+  await clock.advanceTo(clock.start + 2);
+  status.movedOn("BELOW");
+  status.progress({ partial: "Part one begins, and goes on" }); // (after the close: not streamed)
+  await clock.advanceTo(clock.start + 4);
+  await clock.pump(status.finish(["Part one begins, and goes on", "Part two"], { ai: true }));
+  const finals = bus.streamOps.filter((o) => o.op === "finish").map((o) => o.text);
+  assert.deepEqual(finals, ["Part one begins\n\nBELOW"]);
+  assert.equal(bus.streamOps.filter((o) => o.op === "emit" && o.at > clock.start + 2).length, 0);
+  assert.deepEqual(bus.texts, ["Part one begins, and goes on", "Part two"]);
+});
+
+it("a turn that ends before the close the chat's going on asked for is closed then, with the answer below and none of it in the bubble", async () => {
+  const { clock, bus, status } = streaming();
+  status.begin();
+  status.movedOn("BELOW"); // (the stream is still opening: its close waits for that, and the turn ends meanwhile)
+  await clock.pump(status.finish(["Part one", "Part two"]));
+  assert.deepEqual(
+    bus.streamOps.filter((o) => o.op === "finish").map((o) => o.text),
+    ["BELOW"],
+  );
+  assert.deepEqual(bus.texts, ["Part one", "Part two"]);
+});
+
+it("the chat going on before the stream opened closes it as soon as it opens; without a stream nothing changes", async () => {
+  const { clock, bus, status } = streaming();
+  status.begin();
+  status.movedOn("BELOW");
+  await clock.advanceTo(clock.start + 2);
+  await clock.pump(status.finish(["Answer"]));
+  assert.deepEqual(
+    bus.streamOps.map((o) => [o.op, o.text]),
+    [
+      ["open", "Thinking…"],
+      ["finish", "BELOW"],
+    ],
+  );
+  assert.deepEqual(bus.texts, ["Answer"]);
+
+  const plain = new Bus(clock);
+  const progress = turnStatusMessage(plain, { clock, log: new RecordingLogger() });
+  progress.begin();
+  progress.movedOn("BELOW");
+  await clock.pump(progress.finish(["Answer"]));
+  assert.equal(plain.streamOps.length, 0);
+  assert.ok(!plain.texts.includes("BELOW"));
+});

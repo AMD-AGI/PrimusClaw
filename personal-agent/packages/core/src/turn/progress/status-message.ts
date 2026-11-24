@@ -117,6 +117,10 @@ export class StatusMessage<S> {
   private hard = false;
   /** The answer is on its way (`finish`): the progress message is the answer's to retire. */
   private finishing = false;
+  /** The chat went on below the stream (`movedOn`): the line its bubble ends with; the answer comes whole below. */
+  private wentOn = "";
+  /** Closing the stream because the chat went on below it, once its words show there (`movedOn`). */
+  private moving: Task<unknown> | undefined;
 
   constructor(surface: TurnSurface, options: StatusOptions<S>) {
     this.surface = surface;
@@ -195,14 +199,23 @@ export class StatusMessage<S> {
     if (this.closed || !live.closable || this.streamOver || this.expiring) return;
     this.expiring = true;
     if (this.stream && this.flusher && !this.flusher.done) await unlessAborted(this.flusher.settled(), signal);
-    this.streamOver = true;
-    const words = this.streamable() || live.streamed; // (the agent's words not yet streamed go into the bubble too)
-    const closed = await live.final(plainMessage(words ? `${words}\n\n${line}` : line));
-    if (!closed.ok) this.log.warn(`the turn's stream could not be closed ${why}; the answer follows as a message`);
+    await this.endStream(live, line, why);
     this.log.info("the turn's stream was closed; the answer follows as a message of its own", {
       why,
       age: Math.round(live.age()),
     });
+  }
+
+  /**
+   * End the stream with `line` after the agent's words in its bubble: the answer, whenever it comes, is a message of its own. The
+   * words not yet streamed go into the bubble too, unless the chat went on below it (`movedOn`): the answer then comes whole below,
+   * and the bubble keeps only what it already shows (the chat will not let that shrink).
+   */
+  private async endStream(live: StreamHandle, line: string, why: string): Promise<void> {
+    this.streamOver = true;
+    const words = this.wentOn ? live.streamed : this.streamable() || live.streamed;
+    const closed = await live.final(plainMessage(words ? `${words}\n\n${line}` : line));
+    if (!closed.ok) this.log.warn(`the turn's stream could not be closed ${why}; the answer follows as a message`);
   }
 
   /**
@@ -239,6 +252,27 @@ export class StatusMessage<S> {
       await this.closeEarly(live, notice, "while the message waits behind another turn", signal);
     });
     return true;
+  }
+
+  /**
+   * The chat went on below the stream while the turn runs (the person wrote again, or something else was said there): the stream's
+   * bubble stays where it opened, above all that. An answer begun in it and continued below would be read from its middle, its first
+   * part out of sight (2026-11-24: "(cont. 2/2)" under a queued message's notice, part 1 above both). So nothing of the agent's goes
+   * into the bubble from now on: while it shows only a status, that floats on until the turn ends; one that shows words already is
+   * closed at once. Either way it ends with `line`, and the whole answer comes as messages of its own, below what was said since.
+   * Nothing when no stream is open or one is already closing. Never fails the turn.
+   */
+  movedOn(line: string): void {
+    const live = this.live;
+    if (this.closed || !live || this.streamOver || this.expiring || this.wentOn) return;
+    this.wentOn = line;
+    this.moving = detach(async (signal) => {
+      if (this.opening && !this.opening.done) await unlessAborted(this.opening.settled(), signal);
+      if (this.flusher && !this.flusher.done) await unlessAborted(this.flusher.settled(), signal); // (an update on its way)
+      if (!live.streamed) return; // (only a status so far: it floats on, and the turn's end closes the stream with `line`)
+      if (!this.expiring) this.expiry?.cancel(); // (its close at the limit is not needed any more)
+      await this.closeEarly(live, line, "because the chat went on below it", signal);
+    });
   }
 
   /** The chat's id of the posted message; undefined when the post failed or its id never came (nothing is edited then). */
@@ -313,6 +347,11 @@ export class StatusMessage<S> {
     return this.stream ? this.policy.streamable(this.stream.streamed) : "";
   }
 
+  /** The agent's words for the bubble now: none once the chat went on below it (its status only; the words come below). */
+  private bubbleWords(): string {
+    return this.wentOn ? "" : this.streamable();
+  }
+
   /** Whether the turn is still shown by its stream (a refusal hands it to the progress message). */
   private streaming(): boolean {
     return this.stream !== undefined;
@@ -356,7 +395,8 @@ export class StatusMessage<S> {
         await sleepSeconds(this.clock, wait, signal);
         continue;
       }
-      const streamed = this.streamable();
+      if (this.wentOn && stream.streamed) return; // (its words show above what was said since: nothing more goes in)
+      const streamed = this.bubbleWords();
       const text = streamed || statusText(this.statusLines());
       if (text === this.lastText || (streamed && streamed === stream.streamed)) return;
       this.lastText = text;
@@ -405,7 +445,7 @@ export class StatusMessage<S> {
   private cancelled(): void {
     const first = !this.hard;
     this.hard = true;
-    for (const task of [this.again, this.expiry, this.choice]) task?.cancel();
+    for (const task of [this.again, this.expiry, this.choice, this.moving]) task?.cancel();
     if (this.live?.closable && !this.streamOver) {
       this.streamOver = true;
       const live = this.live;
@@ -439,7 +479,13 @@ export class StatusMessage<S> {
     await this.quiesce();
     const messages = answerMessages(parts, options);
     if (this.stream && this.stream.open && !this.streamOver) {
-      await this.finishStream(this.stream, messages, parts, options);
+      if (!this.wentOn) {
+        await this.finishStream(this.stream, messages, parts, options);
+        return;
+      }
+      // (the chat went on below the stream and the turn ended before its close did: it is closed now, the answer below)
+      await this.endStream(this.stream, this.wentOn, "because the chat went on below it");
+      for (const message of messages) await this.surface.send(message);
       return;
     }
     const messageId = await this.messageId(); // the progress message is on screen before the answer, so it stays above it
@@ -453,7 +499,13 @@ export class StatusMessage<S> {
   private async quiesce(): Promise<void> {
     this.close();
     if (this.expiry && !this.expiry.done && !this.expiring) this.expiry.cancel();
-    for (const task of [this.opening, this.flusher, this.expiring ? this.expiry : undefined, this.choice]) {
+    for (const task of [
+      this.opening,
+      this.flusher,
+      this.expiring ? this.expiry : undefined,
+      this.choice,
+      this.moving,
+    ]) {
       if (task) await task.settled();
     }
   }
@@ -469,7 +521,9 @@ export class StatusMessage<S> {
     let final: OutMessage;
     let rest: readonly OutMessage[];
     const [first, ...others] = messages;
-    if (live.streamed) [final, rest] = [plainMessage(live.streamed), messages];
+    if (this.wentOn)
+      [final, rest] = [plainMessage(live.streamed ? `${live.streamed}\n\n${this.wentOn}` : this.wentOn), messages];
+    else if (live.streamed) [final, rest] = [plainMessage(live.streamed), messages];
     else if (first) [final, rest] = [first, others];
     else [final, rest] = [plainMessage(turnText.in(this.lang).doneShort), []];
     const closed = await live.final(final);

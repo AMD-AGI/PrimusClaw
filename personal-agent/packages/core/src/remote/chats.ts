@@ -9,6 +9,7 @@
  */
 import type { Follower } from "./follow/follower.js";
 import type { Task } from "./tasks.js";
+import type { TurnDisplay } from "./turns/display.js";
 
 /** Folders typed in a `/agent new MACHINE PATH` kept for the buttons of the card that asks which agent, per chat. */
 export const TYPED_PATHS_KEPT = 20;
@@ -24,6 +25,8 @@ export interface RemoteTurn {
   waitsForTerminal: boolean;
   /** Nothing runs it any more (or nothing ever did): a Stop card's press for it stops nothing. */
   readonly ended: boolean;
+  /** What shows it in the chat, once it has begun: told when the chat goes on below it (`TurnDisplay.movedOn`). */
+  display: TurnDisplay | null;
 }
 
 /**
@@ -51,6 +54,7 @@ export function newTurn(): RemoteTurn {
     task: null,
     stopRequested: false,
     waitsForTerminal: false,
+    display: null,
     get ended() {
       return this.task?.running !== true;
     },
@@ -90,6 +94,11 @@ export class ChatRegistry {
   /** The session each chat was told its terminal's registry row cannot be read for (once per attach). */
   private readonly rowHinted = new Map<string, string>();
   private readonly tickets = new Map<string, TakeoverTicket>();
+
+  /** The chat went on below its running turn's display: that turn's answer must come below what was said since (`movedOn`). */
+  movedOn(chatKey: string): void {
+    this.turns.get(chatKey)?.display?.movedOn?.();
+  }
 
   /** How many messages wait behind the chat's running turn. */
   queuedCount(chatKey: string): number {
