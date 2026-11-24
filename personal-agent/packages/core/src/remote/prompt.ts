@@ -124,6 +124,8 @@ export class Prompts {
     const text = remoteAgentText.in(this.state.lang(p.chatKey));
     const waiting = this.state.chats.queuedCount(p.chatKey);
     if (this.state.chats.queuedMessage(p.chatKey, p.messageId)) return; // (redelivered: it is queued, and was said so)
+    // (the person's message is in the chat below the running turn's stream now: that turn's answer must come below it, whole)
+    this.state.chats.movedOn(p.chatKey);
     if (waiting >= QUEUED_PROMPTS_MAX) return this.say(p.to, text.queueFull({ n: QUEUED_PROMPTS_MAX }));
     const sid = state.sessionId;
     let cmdSeq: number | undefined = undefined; // (Claw's number of it, once the send has answered)
@@ -172,7 +174,7 @@ export class Prompts {
     if (await this.state.watchOver(p.key, state)) {
       // (its end came while the chat could not be told: muted hours)
       this.follow.detach(p.chatKey);
-      return this.say(p.to, terminalClosedLine(lang));
+      return this.say(p.to, terminalClosedLine(lang, this.ctx.settings.botName));
     }
     await this.say(p.to, readOnlyRefused(lang, this.state.offersTakeover(p.chatKey)));
   }
@@ -207,7 +209,10 @@ export class Prompts {
       if (error instanceof ClawError && error.status === 409 && error.code === "session_closed") {
         // A session that has ended takes no prompt, and the chat may not have been told: it leaves the session here.
         this.follow.detach(p.chatKey);
-        await this.say(p.to, `${this.failure(error, p.chatKey)} ${saidIn(lang, "backToPrimusclaw")}`);
+        await this.say(
+          p.to,
+          `${this.failure(error, p.chatKey)} ${remoteAgentText.in(lang).backToBot({ bot: this.ctx.settings.botName })}`,
+        );
         return false;
       }
       if (!(error instanceof ClawError) && !isTransport(error)) throw error;

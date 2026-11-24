@@ -58,7 +58,12 @@ export const remoteAgentText = defineCatalog({
       "PrimusClaw rejected your linked key (it may have expired or been deleted). Send /unlink, then link again.",
     whichSession: "I could not tell which session you mean. Send `/agent sessions`, then `/agent attach N`.",
     whichSessionOrAgent: "I could not tell which session or agent you mean. Send `/agent sessions` to pick one.",
-    backToPrimusclaw: "Your messages go to PrimusClaw again.",
+    backToBot: (p: { bot: string }) => `Your messages go to ${p.bot} again.`,
+    /** A new session that never started: the chat was never said to be in it, so its messages never left the bot. */
+    stillToBot: (p: { bot: string }) => `Your messages still go to ${p.bot}.`,
+    /** A New session tap or `/agent new`, said at once: what starts where; where messages go is said once the agent has started. */
+    starting: (p: { label: string; host: string; folder: string }) =>
+      `Starting ${p.label} on ${p.host}${p.folder ? ` in ${p.folder}` : ""}… I will say here when it is running.`,
     tapInactive: "That button is not active any more.",
     tapInvalid: "That button is no longer valid.",
     cardExpired: "That card has expired. Send the command again, or use /agents.",
@@ -110,13 +115,14 @@ export const remoteAgentText = defineCatalog({
     notAcceptedRef: (p: { ref: string }) => `PrimusClaw did not accept that (ref ${p.ref}).`,
     couldNotTake: (p: { status: number }) => `PrimusClaw could not take that (error ${String(p.status)}).`,
     /** A session that ended while the chat was idle, when its end cannot be described (said in English, as the worker did). */
-    endedWhileIdle: (p: { reason: string }) =>
+    endedWhileIdle: (p: { reason: string; bot: string }) =>
       (p.reason ? `The session ended: ${p.reason}.` : "The session ended.") +
-      " Your messages go to PrimusClaw again. Start a new session with `/agent new AGENT PATH`.",
+      ` Your messages go to ${p.bot} again. Start a new session with \`/agent new AGENT PATH\`.`,
     noMachineYet: "You have no machine connected yet.",
     changedElsewhere: "(Switched: see the status card below)",
     listBelow: "(Updated: see the card below)",
-    endedFollowTail: " Your messages go to PrimusClaw again. Start a new session with `/agent new AGENT PATH`.",
+    endedFollowTail: (p: { bot: string }) =>
+      ` Your messages go to ${p.bot} again. Start a new session with \`/agent new AGENT PATH\`.`,
     endedTail: " Start a new one with `/agent new AGENT PATH`.",
     approvalInPersonal: (p: { who: string }) =>
       `${p.who} is waiting for your approval. I sent the card to our 1:1 chat, so the group does not see what it asks.`,
@@ -160,7 +166,7 @@ export const remoteAgentText = defineCatalog({
     closedNumber: (p: { number: number; where: string }) => `Closed session ${String(p.number)}${p.where}.`,
     closedSession: (p: { where: string }) => `Closed the session${p.where}.`,
     closedIn: (p: { folder: string }) => ` in ${p.folder}`,
-    closedBack: " Your messages go to PrimusClaw again.",
+    closedBack: (p: { bot: string }) => ` Your messages go to ${p.bot} again.`,
     newUsage:
       "Use `/agent new AGENT PATH`, for example `/agent new codex /home/me/repo`, or pick a folder here and tap New session.",
     modeIs: (p: { mode: string }) => `Mode: \`${p.mode}\`. `,
@@ -221,7 +227,9 @@ export const remoteAgentText = defineCatalog({
     keyRejected: "PrimusClaw 拒绝了你关联的 key（可能已过期或被删除）。发 /unlink，然后重新关联。",
     whichSession: "我分不清你说的是哪个会话。发 `/agent sessions`，再发 `/agent attach N`。",
     whichSessionOrAgent: "我分不清你说的是哪个会话或 agent。发 `/agent sessions` 选一个。",
-    backToPrimusclaw: "你的消息会重新发给 PrimusClaw。",
+    backToBot: (p) => `你的消息会重新发给 ${p.bot}。`,
+    stillToBot: (p) => `你的消息仍然发给 ${p.bot}。`,
+    starting: (p) => `正在 ${p.host} 上启动 ${p.label}${p.folder ? `（${p.folder}）` : ""}……启动好了我在这里说。`,
     tapInactive: "这个按钮已经失效了。",
     tapInvalid: "这个按钮已经不能用了。",
     cardExpired: "这张卡片已经过期了。重新发一次命令，或者用 /agents。",
@@ -267,11 +275,11 @@ export const remoteAgentText = defineCatalog({
     couldNotTake: (p) => `PrimusClaw 处理不了这个请求（错误 ${String(p.status)}）。`,
     endedWhileIdle: (p) =>
       (p.reason ? `会话已结束：${p.reason}。` : "会话已结束。") +
-      "你的消息会重新发给 PrimusClaw。用 `/agent new AGENT PATH` 开新会话。",
+      `你的消息会重新发给 ${p.bot}。用 \`/agent new AGENT PATH\` 开新会话。`,
     noMachineYet: "你还没有连接任何机器。",
     changedElsewhere: "（已切换，见下方的新状态卡）",
     listBelow: "（已更新，见下方的新卡片）",
-    endedFollowTail: " 你的消息会重新发给 PrimusClaw。用 `/agent new AGENT PATH` 开新会话。",
+    endedFollowTail: (p) => ` 你的消息会重新发给 ${p.bot}。用 \`/agent new AGENT PATH\` 开新会话。`,
     endedTail: " 用 `/agent new AGENT PATH` 开新会话。",
     approvalInPersonal: (p) => `${p.who} 在等你批准。审批卡发到了你和我的 1:1 聊天里，群里看不到它要做什么。`,
     ranOutRefused: (p) => `${p.tool}：这个请求已经过期，已自动拒绝。还需要的话，让 agent 再执行一次。`,
@@ -313,7 +321,7 @@ export const remoteAgentText = defineCatalog({
     closedNumber: (p) => `已关闭会话 ${String(p.number)}${p.where}。`,
     closedSession: (p) => `已关闭会话${p.where}。`,
     closedIn: (p) => `（${p.folder}）`,
-    closedBack: "你的消息会重新发给 PrimusClaw。",
+    closedBack: (p) => `你的消息会重新发给 ${p.bot}。`,
     // (said in English, as the worker did)
     newUsage:
       "Use `/agent new AGENT PATH`, for example `/agent new codex /home/me/repo`, or pick a folder here and tap New session.",

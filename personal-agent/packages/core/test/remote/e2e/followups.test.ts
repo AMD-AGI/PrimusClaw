@@ -455,7 +455,7 @@ test("a session that ended during a pause is left by the first message that is r
     assert.ok(!w.said().some((t) => t.includes("The session ended"))); // (not told: a pause)
     w.reachable = true;
     await w.say("hello?");
-    assert.ok(w.last().includes("That session has ended") && w.last().includes("PrimusClaw again"), w.last());
+    assert.ok(w.last().includes("That session has ended") && w.last().includes("PrimusClaw Assistant again"), w.last());
     assert.deepEqual(prompts(w), []);
     // not attached to a session that takes no prompt: the next message is not refused too
     assert.equal(w.test.store.remoteState.attachedRemote(AAD), null);

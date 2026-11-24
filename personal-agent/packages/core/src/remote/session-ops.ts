@@ -169,7 +169,7 @@ export class SessionOps {
     const where = folder ? words.closedIn({ folder: neutral(folder, 300) }) : "";
     const text =
       (number ? words.closedNumber({ number, where }) : words.closedSession({ where })) +
-      (mine ? words.closedBack : "");
+      (mine ? words.closedBack({ bot: this.ctx.settings.botName }) : "");
     return { done: true, text };
   }
 }

@@ -138,6 +138,7 @@ export class TurnRunner {
   private async run(request: TurnRequest, turn: RemoteTurn, signal: AbortSignal): Promise<void> {
     const { chatKey, to, state } = request;
     const { display, signer } = this.display(request);
+    turn.display = display;
     display.begin();
     const fold = new RemoteTurnState(this.ctx.errors, request.cmdSeq);
     const cursor = this.ctx.remoteState.getRemote(chatKey)?.cursor ?? ""; // (read again: a catch-up starts where the chat left off)
@@ -277,18 +278,21 @@ export class TurnRunner {
     const sid = request.state.sessionId ?? "";
     noteWaiting(this.state.chats.turns.get(chatKey), step);
     if (step.rejected?.type === "prompt" && step.rejected.cmdSeq !== null) {
-      await this.queuedRefused(chatKey, to, step.rejected.cmdSeq, step.rejected.reason);
+      await this.queuedRefused(chatKey, to, step.rejected.cmdSeq, step.rejected.reason, display);
     }
     if (step.queued !== null) await this.showWait(request, step, display);
     else display.progress(step);
-    if (step.rowUnreadable) await this.sayRowUnreadable(chatKey, sid, to);
+    if (step.rowUnreadable) await this.sayRowUnreadable(chatKey, sid, to, display);
     if (saysModes(step)) this.ctx.remoteState.setRemoteModes(chatKey, sid, step);
-    if (step.permission !== null) await this.show(chatKey, sid, step.permission, to);
+    if (step.permission !== null) {
+      display.movedOn?.(); // (its card goes below the turn's stream: the answer must come below it too)
+      await this.show(chatKey, sid, step.permission, to);
+    }
     // answered somewhere else (or it ran out on the machine): the card is dead
     if (step.resolved !== null) this.ctx.permissions.closeRemotePermission(sid, actionIdOf(step.resolved), "decided");
     if (step.recovered !== null && (step.recovered.continuing || !step.recovered.interrupted)) {
       // (a turn the restart ended says so as its own end, which comes next)
-      await this.sayRecovered(chatKey, to, step.recovered.interrupted, step.recovered.continuing);
+      await this.sayRecovered(chatKey, to, step.recovered.interrupted, step.recovered.continuing, display);
     }
   }
 
@@ -297,7 +301,7 @@ export class TurnRunner {
    * how to take it back (in the terminal when its own queue holds it; else /stop). A message queued behind a turn of this chat was
    * told so when it was sent (`queuedBehind`): not again here.
    */
-  private async tellBusy(request: TurnRequest, step: RemoteStep): Promise<void> {
+  private async tellBusy(request: TurnRequest, step: RemoteStep, display: TurnDisplay): Promise<void> {
     const { chatKey, to } = request;
     // (only a wait the connector ties to this turn's own message: another one was told when it was sent, `queuedBehind`)
     const mine = request.cmdSeq?.();
@@ -318,6 +322,7 @@ export class TurnRunner {
       before === "waiting"
         ? words.terminalBusyNowHeld
         : words.terminalBusy + (step.queuedHeld ? words.terminalBusyHeld : words.terminalBusyWaiting);
+    display.movedOn?.(); // (said below the turn's stream: its answer must come below this too)
     try {
       await to.send(textMessage(text));
     } catch (error) {
@@ -329,11 +334,18 @@ export class TurnRunner {
    * A message waiting behind this turn was refused on the machine before it ran: it waits no more, and the person is told. One whose
    * send has not answered yet has no number to match: the refusal is kept for that send (`Prompts.queueBehind`).
    */
-  private async queuedRefused(chatKey: string, to: Conversation, cmdSeq: number, reason: string): Promise<void> {
+  private async queuedRefused(
+    chatKey: string,
+    to: Conversation,
+    cmdSeq: number,
+    reason: string,
+    display: TurnDisplay,
+  ): Promise<void> {
     if (this.state.chats.takeQueuedSeq(chatKey, cmdSeq) === undefined) {
       this.state.chats.noteRefusal(chatKey, cmdSeq, reason);
       return;
     }
+    display.movedOn?.();
     try {
       await to.send(textMessage(remoteAgentText.in(this.state.lang(chatKey)).queuedRefused({ reason })));
     } catch (error) {
@@ -353,7 +365,7 @@ export class TurnRunner {
     const note = queuedNote(reason, step.dialog, lang);
     display.progress({ ...step, note, waitLine: queuedLine(reason, lang) });
     if (reason === "terminal_dialog" && !display.showsWaits) await this.sayQuestion(display, note, to);
-    if (BUSY_REASONS.has(reason)) await this.tellBusy(request, step);
+    if (BUSY_REASONS.has(reason)) await this.tellBusy(request, step, display);
   }
 
   /**
@@ -365,6 +377,7 @@ export class TurnRunner {
     if (told.has(line)) return;
     told.add(line);
     this.questionsTold.set(display, told);
+    display.movedOn?.();
     try {
       await to.send(textMessage(line));
     } catch (error) {
@@ -373,8 +386,9 @@ export class TurnRunner {
   }
 
   /** Once per attach: the terminal's registry row cannot be read, and a restart of it there makes it known again. */
-  private async sayRowUnreadable(chatKey: string, sid: string, to: Conversation): Promise<void> {
+  private async sayRowUnreadable(chatKey: string, sid: string, to: Conversation, display: TurnDisplay): Promise<void> {
     if (!this.state.chats.firstRowHint(chatKey, sid)) return;
+    display.movedOn?.();
     try {
       await to.send(textMessage(rowUnreadableLine(this.state.lang(chatKey))));
     } catch (error) {
@@ -389,9 +403,11 @@ export class TurnRunner {
     to: Conversation,
     interrupted: boolean,
     continuing: boolean,
+    display: TurnDisplay,
   ): Promise<void> {
     const state = this.ctx.remoteState.getRemote(chatKey);
     if (!state?.sessionId) return;
+    display.movedOn?.();
     try {
       const line = recoveredLine(state.agentLabel, state.host, this.state.lang(chatKey), interrupted, continuing);
       await to.send(textMessage(line));

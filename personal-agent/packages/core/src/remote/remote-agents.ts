@@ -267,6 +267,14 @@ export class RemoteAgents implements RemoteChat {
     return this.chats.turns.get(chatKey);
   }
 
+  goesOn(userId: string, scope: string): (() => void) | undefined {
+    const turns = this.chats.turnsIn(userId, scope);
+    if (turns.length === 0) return undefined;
+    return () => {
+      for (const turn of turns) turn.display?.movedOn?.();
+    };
+  }
+
   /** The chat's session card is its window (`/agent mode card`, not a direct chat): a turn is shown there, with its own Stop. */
   windowed(chatKey: string): boolean {
     const state = this.enabled ? this.state.attached(chatKey) : null;

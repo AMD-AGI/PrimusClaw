@@ -151,8 +151,8 @@ ${p.quoted}`,
       "Open in a terminal: a message from here cannot be typed into it now, so you can watch. To send from here, open the conversation in tmux, and in that one terminal only",
     shareNoteOld:
       "Open in a terminal: this machine's connector cannot type into a terminal yet (it needs 0.1.9 or newer), so you can watch",
-    terminalClosed:
-      "The conversation was closed in the terminal, so the watch is over and your messages go to PrimusClaw again. Switch to it again to carry on with it.",
+    terminalClosed: (p: { bot: string }) =>
+      `The conversation was closed in the terminal, so the watch is over and your messages go to ${p.bot} again. Switch to it again to carry on with it.`,
     switched: (p: { where: string }) => `—— Now: ${p.where} ——`,
     recoveredWhere: (p: { host: string; label: string }) => `${p.label} on ${p.host}`,
     recoveredContinuing: (p: { where: string }) =>
@@ -358,7 +358,7 @@ ${p.quoted}`,
     shareNoteNoTmux:
       "终端里正在用：这里发的消息现在打不进那个终端，只能看。要能发：在 tmux 里打开这个会话，并且只在这一个终端里开着它",
     shareNoteOld: "终端里正在用：这台机器的连接器还不能往终端里输入（需要 0.1.9 或更新），现在只能看",
-    terminalClosed: "终端里的会话已经退出，旁观结束，你的消息回到助理。要接着用它，再切过去就行。",
+    terminalClosed: (p) => `终端里的会话已经退出，旁观结束，你的消息回到 ${p.bot}。要接着用它，再切过去就行。`,
     switched: (p) => `—— 现在是 ${p.where} ——`,
     recoveredWhere: (p) => `${p.host} 上的 ${p.label}`,
     recoveredContinuing: (p) =>

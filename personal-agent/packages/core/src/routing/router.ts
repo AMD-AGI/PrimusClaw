@@ -8,7 +8,7 @@ import { routingText } from "../locales/routing.js";
 import { noRequestScope } from "../ports/request-scope.js";
 import type { InboundEvent, InboundMessage, InboundVote, UserRef } from "../ports/surface.js";
 import type { ReviewSlots } from "./admission.js";
-import { Chat } from "./chat.js";
+import { Chat, postingAfter } from "./chat.js";
 import { CommandTable } from "./command-table.js";
 import { AccountCommands } from "./commands-account.js";
 import { SessionCommands } from "./commands-session.js";
@@ -78,11 +78,11 @@ export class Router {
 
   private async route(event: InboundEvent): Promise<void> {
     const scope = event.conversation.kind === "group" ? event.conversation.id : "";
-    const chat = this.ctx.chatOf(event, scope);
     if (event.type === "vote") {
-      await this.vote(event, chat);
+      await this.vote(event, this.ctx.chatOf(event, scope));
       return;
     }
+    const chat = this.goingOn(event, this.ctx.chatOf(event, scope));
     try {
       await this.dispatch(event, chat);
     } catch (error) {
@@ -90,6 +90,21 @@ export class Router {
       throw error;
     }
     await this.settleOpen(event, chat, routingText.in(chat.lang()).buttonInactive);
+  }
+
+  /**
+   * What happens in the chat now happens below the stream of an attached agent's turn running there, whatever it is (a message
+   * of the person's, a command answered at once, a click whose outcome is said): that turn's answer must come below it, whole,
+   * never begun above it and continued below (`movedOn`). A message is in the chat already; a click, once it posts something.
+   */
+  private goingOn(event: Exclude<InboundEvent, InboundVote>, chat: Chat): Chat {
+    const goesOn = this.ctx.deps.remote.goesOn?.(chat.sender.id, chat.scope);
+    if (goesOn === undefined) return chat;
+    if (event.type === "message") {
+      goesOn();
+      return chat;
+    }
+    return chat.through(postingAfter(chat.conversation, goesOn));
   }
 
   /** The safety net under every card click: a click whose card is still the placeholder ends with a note. */

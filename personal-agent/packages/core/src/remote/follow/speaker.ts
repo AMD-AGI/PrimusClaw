@@ -348,8 +348,8 @@ export class BurstSpeaker {
     if (reference === null) return;
     this.deps.remoteState.detachRemote(this.chatKey);
     const bare = bareReason(reason);
-    let text = remoteAgentText.in("en").endedWhileIdle({ reason: bare });
-    if (bare === TERMINAL_CLOSED) text = terminalClosedLine(this.langOr("en"));
+    let text = remoteAgentText.in("en").endedWhileIdle({ reason: bare, bot: this.deps.botName });
+    if (bare === TERMINAL_CLOSED) text = terminalClosedLine(this.langOr("en"), this.deps.botName);
     else if (this.deps.describeEnd !== undefined) {
       try {
         text = await unlessCutOff(this.deps.describeEnd(bare), this.cutOff);

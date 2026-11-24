@@ -77,6 +77,7 @@ export class StartClicks {
     await this.becomeStatus(
       click,
       state ? await this.p.ops.rowCard(click.chatKey, click.key, state, "", agent, "starting") : null,
+      true,
     );
     const watch = {
       chatKey: click.chatKey,
@@ -177,14 +178,16 @@ export class StartClicks {
    * and the tapped card deleted (a phone does not redraw an edit). Where no new card can be sent, the tapped card becomes the
    * status card in place.
    */
-  async becomeStatus(click: Click, card: Shown | null): Promise<void> {
+  async becomeStatus(click: Click, card: Shown | null, starting = false): Promise<void> {
     const lang = this.c.lang(click);
     const state = this.p.state.attached(click.chatKey);
     if (card === null || state === null) return this.c.home(click, saidIn(lang, "sessionUnavailable"));
     const old = this.p.ctx.remoteState.getRemote(click.chatKey)?.statusCard ?? "";
     if (this.p.state.direct(click.chatKey)) {
-      // the chat is the window: the line that says where messages go now, and the tapped card goes
-      await this.p.board.sayEntered(click.chatKey, click.to, state);
+      // the chat is the window: the line that says where messages go now (for a new session: what starts where, and where
+      // messages go once it has started), and the tapped card goes
+      if (starting) await this.p.board.sayStarting(click.chatKey, click.to, state);
+      else await this.p.board.sayEntered(click.chatKey, click.to, state);
       if (click.tapped) await this.removeTapped(click);
       return;
     }

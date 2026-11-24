@@ -88,8 +88,8 @@ test("a connector that refuses the takeover says why and the chat stays with cla
     await press(w, await agentsCard(w), "Take over");
     assert.equal(
       w.last(),
-      "The session could not start: That conversation is still open in a terminal on that machine. Quit it " +
-        "there first, then take it over. Your messages go to PrimusClaw again.",
+      "The session could not start in `/home/me/work/parser`: That conversation is still open in a terminal on that machine. Quit it " +
+        "there first, then take it over. Your messages go to PrimusClaw Assistant again.",
     );
     assert.equal(w.test.store.remoteState.attachedRemote(AAD), null);
   }));
@@ -348,7 +348,7 @@ test("a connector that could not end the terminal says so and the chat stays wit
       w
         .last()
         .startsWith(
-          "The session could not start: The terminal did not let the conversation go when asked, so it was " +
+          "The session could not start in `/home/me/work/term`: The terminal did not let the conversation go when asked, so it was " +
             "not taken over; it is still there.",
         ),
       w.last(),

@@ -193,7 +193,7 @@ function lines(lang: Lang): string {
   return [
     remoteDomain.switchedLine("cx-main", "devbox-7", lang),
     remoteDomain.backLine(lang),
-    remoteDomain.terminalClosedLine(lang),
+    remoteDomain.terminalClosedLine(lang, "PrimusClaw Assistant"),
     remoteDomain.readOnlyRefused(lang),
     remoteDomain.readOnlyRefused(lang, true),
     remoteDomain.botLine(lang, "PrimusClaw Assistant"),
