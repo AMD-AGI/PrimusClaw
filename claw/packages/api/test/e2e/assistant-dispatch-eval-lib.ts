@@ -410,13 +410,14 @@ function matches(d: Decision, calls: readonly Call[], said: string): boolean {
   return done.length === 0;
 }
 
-/** The seats a case allows anything to reach: those its decisions name, and the seats of the items it sends to. */
+/**
+ * The seats a case allows work to reach: those its dispatch decisions name, and the seats of the items it sends to. A seat named only
+ * in a refusal the case expects (a full queue) or in confirm_each is not one: work sent there is a mis-dispatch.
+ */
 export function allowedSeats(c: DispatchCase): Set<string> {
   const out = new Set<string>();
   for (const d of c.want) {
     if ("seat" in d) out.add(SEAT[d.seat]);
-    if ("refused" in d) out.add(SEAT[d.refused]);
-    if ("confirmEach" in d) out.add(SEAT[d.confirmEach]);
     if ("choice" in d) for (const k of d.choice.may) if (k !== "sandbox") out.add(SEAT[k]);
     if ("send" in d) { const i = MANIFEST.find((m) => m.seq === d.send); if (i && ERRAND_SEAT[i.itemId]) out.add(ERRAND_SEAT[i.itemId]); }
   }
@@ -434,6 +435,8 @@ export function misDispatches(c: DispatchCase, t: Trace): string[] {
     if (call.tool === "work_create") {
       for (const tg of targetsOf(call.input.target)) {
         if ("seat" in tg && !seatOf(tg.seat)) why.push(`named a seat by ${JSON.stringify(tg.seat)}, not its seat_id`);
+        // A bare alias or machine name ("发布台", "devbox"); a bare seat_id without "seat:" is only malformed.
+        if ("bad" in tg && !seatOf(tg.bad)) why.push(`named a seat by ${JSON.stringify(tg.bad)}, not "seat:<seat_id>"`);
       }
     }
     if (call.refused) continue;
