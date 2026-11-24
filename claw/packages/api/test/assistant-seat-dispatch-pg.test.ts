@@ -27,10 +27,18 @@
  *   D20 one more instruction to a finished task, on a seat that asks first: the task is unchanged until the card is pressed; a no, a
  *       lapse and the sweep keep its result; a yes opens it again and sends; a second card pressed after that sends nothing
  *   D21 a finished task opened again whose instruction cannot be sent (its seat's queue full) is put back as it ended
- *   D22 a turn the seat's agent takes by itself after a task ended (a command it put in the background finished): the seat is busy
+ *   D22 the same words sent to a task twice in one router turn (at once, or one after the other) go once: one command to a running
+ *       task, one reopening of a finished one, one card, one place in the queue; the second call answers that they were already sent;
+ *       the next turn sends them again
+ *   D23 a follow-up whose command went but whose noting failed is noted when the call fails, and the call made again sends nothing more;
+ *       one the machine collected before it could be noted is noted all the same
+ *   D24 two different instructions at once to a finished task: it is opened once, and both reach the machine
+ *   D25 calls to one task waiting for each other hold no main-pool connection while they wait (the lock is on the lock pool); a task
+ *       opened again by another call after this one read it is not opened over it (refused, nothing sent, the words free again)
+ *   D26 a turn the seat's agent takes by itself after a task ended (a command it put in the background finished): the seat is busy
  *       while it runs; its end (`agent_initiated`) frees the seat, the queue goes on, and its answer is said once as a late word of
  *       that task (never of the next one); from an older connector, which never ends it, the seat is free once it has been quiet
- *   D23 an instruction queued behind a turn under way, or sent while the agent is on a turn of its own, is the seat's work until its own
+ *   D27 an instruction queued behind a turn under way, or sent while the agent is on a turn of its own, is the seat's work until its own
  *       end names it, however quiet it is: its prompt is on record before the end of the turn it waited behind, and may be further
  *       back than the events a reading takes
  */
@@ -793,7 +801,212 @@ describe("seat dispatch", { skip }, () => {
     assert.equal(back.params.queued, undefined);
   });
 
-  test("D22 a turn the agent takes by itself after a task: busy while it runs, its end frees the seat and is said as a late word of that task", async () => {
+  test("D22 the same words to a task twice in one turn go once, and the second call says they were already sent", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const send = (turn: Claims, id: unknown, text: string) => tools.workSend(turn, { item_id: String(id), text }) as Promise<Recorded>;
+    // Running: two calls at once, then a third after them, in one turn: one command to the machine.
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    const turn = await userTurn(alice, "顺便更新 changelog");
+    const both = await Promise.all([send(turn, out.item_id, "顺便更新 changelog"), send(turn, out.item_id, "顺便更新  changelog ")]);
+    assert.deepEqual(both.map((r) => r.dispatch).sort(), ["already_sent", "sent"], JSON.stringify(both));
+    assert.equal((await send(turn, out.item_id, "顺便更新 changelog")).dispatch, "already_sent");
+    assert.equal((await prompted(cid)).length, 1, "one command reached the machine");
+    assert.equal((await item(out.item_id)).params.open_cmd_seqs.length, 2);
+    // Other words in the same turn, and the same words in the next turn, are sent.
+    assert.equal((await send(turn, out.item_id, "再跑一次测试")).dispatch, "sent");
+    assert.equal((await send(await userTurn(alice, "顺便更新 changelog"), out.item_id, "顺便更新 changelog")).dispatch, "sent");
+    assert.equal((await prompted(cid)).length, 3);
+
+    // Finished: opened again once and sent once.
+    const cid2 = await machine("alice", "devbox2");
+    const s2 = await seat(cid2, "/home/u/docs", { alias: "文档台", role: "负责文档", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid2, s2, "整理文档");
+    const gen = Number(done.generation);
+    const again = await userTurn(alice, "再补一节");
+    const reopened = await Promise.all([send(again, done.item_id, "再补一节"), send(again, done.item_id, "再补一节")]);
+    assert.deepEqual(reopened.map((r) => r.dispatch).sort(), ["already_sent", "sent"], JSON.stringify(reopened));
+    const open = await item(done.item_id);
+    assert.deepEqual([open.board_state, Number(open.generation), open.params.open_cmd_seqs.length], ["in_progress", gen + 1, 1]);
+    // Once it runs again, the same words later in that turn are not a follow-up either.
+    assert.equal((await send(again, done.item_id, "再补一节")).dispatch, "already_sent");
+    assert.equal((await prompted(cid2)).length, 1, "the finished task's machine got one command");
+
+    // A seat that asks first: one card, and pressing it sends once.
+    await collect(cid);
+    await seats.seatSet(await userTurn(alice, "发布台每次都确认"), { seat: s.seatId, confirm_each: true });
+    const carded = await userTurn(alice, "再打个 tag");
+    const cards = await Promise.all([send(carded, out.item_id, "再打个 tag"), send(carded, out.item_id, "再打个 tag")]);
+    assert.deepEqual(cards.map((r) => r.dispatch).sort(), ["already_sent", "card"], JSON.stringify(cards));
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations WHERE kind = 'seat_dispatch' AND status = 'pending'"))[0].n, 1, "one card");
+    const pressed = await press(cards.find((r) => r.dispatch === "card")!.confirmation_id);
+    assert.equal(pressed.result?.dispatch, "sent", JSON.stringify(pressed));
+    assert.equal((await prompted(cid)).length, 1, "one command for the card");
+
+    // Queued (its seat busy): one place in the queue, and the second call is told it was sent, not that the task has not started.
+    const cid3 = await machine("alice", "devbox3");
+    const s3 = await seat(cid3, "/home/u/ops", { alias: "运维台", role: "负责运维", role_state: "confirmed", dispatch_mode: "auto" });
+    const old = await finished(alice, cid3, s3, "清理日志");
+    assert.equal((await create(await userTurn(alice, "扩容"), `seat:${s3.seatId}`, "扩容")).dispatch, "sent");
+    const busy = await userTurn(alice, "再清理一次");
+    const first = await send(busy, old.item_id, "再清理一次");
+    assert.equal(first.dispatch, "queued", JSON.stringify(first));
+    assert.equal((await send(busy, old.item_id, "再清理一次")).dispatch, "already_sent");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_items WHERE params->>'seat_id' = $1 AND params ? 'queued'", [s3.seatId]))[0].n, 1);
+  });
+
+  test("D22 the same words twice at once to a finished task that cannot go: both calls are refused, neither says it was sent", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid, s, "发布 1.2.1");
+    assert.equal((await create(await userTurn(alice, "任务 1"), `seat:${s.seatId}`, "任务 1")).dispatch, "sent");
+    for (let i = 2; i <= 4; i += 1) assert.equal((await create(await userTurn(alice, `任务 ${i}`), `seat:${s.seatId}`, `任务 ${i}`)).dispatch, "queued");
+    const turn = await userTurn(alice, "再打个 tag");
+    const both = await Promise.allSettled([0, 1].map(() => tools.workSend(turn, { item_id: String(done.item_id), text: "再打个 tag" })));
+    assert.deepEqual(both.map((r) => r.status === "rejected" ? (r.reason as { code?: string }).code : (r.value as Recorded).dispatch), ["seat_queue_full", "seat_queue_full"]);
+  });
+
+  test("D24 two different instructions at once to a finished task: it is opened once, and both reach the machine", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/docs", { alias: "文档台", role: "负责文档", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid, s, "整理文档");
+    const gen = Number(done.generation);
+    const turn = await userTurn(alice, "补一节安装，再补一节升级");
+    const both = await Promise.all(["补一节安装", "补一节升级"].map((text) => tools.workSend(turn, { item_id: String(done.item_id), text }) as Promise<Recorded>));
+    assert.deepEqual(both.map((r) => r.dispatch), ["sent", "sent"], JSON.stringify(both));
+    const open = await item(done.item_id);
+    assert.deepEqual([open.board_state, Number(open.generation), open.params.open_cmd_seqs.length], ["in_progress", gen + 1, 2]);
+    const sent = await prompted(cid);
+    assert.equal(sent.length, 2, "two commands reached the machine");
+    const texts = JSON.stringify(sent);
+    for (const text of ["补一节安装", "补一节升级"]) assert.ok(texts.includes(text), `${text} went: ${texts}`);
+  });
+
+  test("D23 a follow-up whose command went but whose noting failed: noted then, and the same call again sends nothing more", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    // The task's noting fails once, after the command's own commit.
+    await w.q("CREATE SEQUENCE IF NOT EXISTS d23_fail");
+    await w.q(`CREATE OR REPLACE FUNCTION d23_fail_once() RETURNS trigger AS $$
+      BEGIN IF NEW.source = 'remote' AND NEW.kind = 'progress' AND nextval('d23_fail') = 1 THEN RAISE EXCEPTION 'd23 injected'; END IF; RETURN NEW; END
+      $$ LANGUAGE plpgsql`);
+    await w.q("CREATE TRIGGER d23_fail BEFORE INSERT ON claw_work_item_events FOR EACH ROW EXECUTE FUNCTION d23_fail_once()");
+    try {
+      const turn = await userTurn(alice, "顺便更新 changelog");
+      await assert.rejects(tools.workSend(turn, { item_id: String(out.item_id), text: "顺便更新 changelog" }), /d23 injected/);
+      const sent = await prompted(cid);
+      assert.equal(sent.length, 1, "its command went");
+      assert.ok((await item(out.item_id)).params.open_cmd_seqs.map(Number).includes(Number(sent[0].cmd_seq)), "and is the task's now");
+      assert.equal(((await tools.workSend(turn, { item_id: String(out.item_id), text: "顺便更新 changelog" })) as Recorded).dispatch, "already_sent");
+      assert.equal((await prompted(cid)).length, 1, "nothing more was sent");
+    } finally {
+      await w.q("DROP TRIGGER IF EXISTS d23_fail ON claw_work_item_events");
+      await w.q("DROP FUNCTION IF EXISTS d23_fail_once()");
+      await w.q("DROP SEQUENCE IF EXISTS d23_fail");
+    }
+  });
+
+  test("D23 a follow-up the machine collected before its noting could be repaired is still noted, by its prompt event", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    // The noting fails twice: once as it is sent, once more as the failed call repairs it.
+    await w.q("CREATE SEQUENCE IF NOT EXISTS d23b_fail");
+    await w.q(`CREATE OR REPLACE FUNCTION d23b_fail_twice() RETURNS trigger AS $$
+      BEGIN IF NEW.source = 'remote' AND NEW.kind = 'progress' AND nextval('d23b_fail') <= 2 THEN RAISE EXCEPTION 'd23b injected'; END IF; RETURN NEW; END
+      $$ LANGUAGE plpgsql`);
+    await w.q("CREATE TRIGGER d23b_fail BEFORE INSERT ON claw_work_item_events FOR EACH ROW EXECUTE FUNCTION d23b_fail_twice()");
+    let seq = 0;
+    try {
+      const turn = await userTurn(alice, "顺便更新 changelog");
+      await assert.rejects(tools.workSend(turn, { item_id: String(out.item_id), text: "顺便更新 changelog" }), /d23b injected/);
+      const sent = await prompted(cid);
+      assert.equal(sent.length, 1, "its command went");
+      seq = Number(sent[0].cmd_seq);
+      assert.ok(!(await item(out.item_id)).params.open_cmd_seqs.map(Number).includes(seq), "and is not noted yet");
+    } finally {
+      await w.q("DROP TRIGGER IF EXISTS d23b_fail ON claw_work_item_events");
+      await w.q("DROP FUNCTION IF EXISTS d23b_fail_twice()");
+      await w.q("DROP SEQUENCE IF EXISTS d23b_fail");
+    }
+    // The machine collects it (the queue forgets it); the repair still finds its number.
+    await collect(cid);
+    assert.equal((await prompted(cid)).length, 0);
+    const cmdId = String((await w.q(
+      "SELECT detail->>'cmd_id' AS id FROM claw_remote_audit WHERE action = 'command.issued' AND detail->>'type' = 'prompt' ORDER BY id DESC LIMIT 1",
+    ))[0].id).replace(/^k:/, "");
+    await dispatch.noteIssuedPrompt("alice", String(out.item_id), cmdId);
+    assert.ok((await item(out.item_id)).params.open_cmd_seqs.map(Number).includes(seq), "noted after the machine collected it");
+  });
+
+  test("D25 calls to one task waiting for each other hold no main-pool connection while they wait", async () => {
+    const { db } = await import("../src/infra/db.js");
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    const turn = await userTurn(alice, "顺便更新 changelog");
+    // Someone holds the task's lock: every call waits for it.
+    const holder = await db.lockPool.connect();
+    const key = `claw-seat-work-send:${String(out.item_id)}`;
+    await holder.query("SELECT pg_advisory_lock(hashtext($1))", [key]);
+    const n = 6;
+    let calls: Array<Promise<Recorded>> = [];
+    try {
+      calls = Array.from({ length: n }, () => tools.workSend(turn, { item_id: String(out.item_id), text: "顺便更新 changelog" }) as Promise<Recorded>);
+      for (const c of calls) c.catch(() => undefined);
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const waiting = (await w.q("SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"))[0].n;
+        if (waiting >= n) break;
+        assert.ok(Date.now() < deadline, `only ${waiting} of ${n} calls reached the lock`);
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(db.pool.totalCount - db.pool.idleCount, 0, "no main-pool connection is held by a call waiting for the lock");
+    } finally {
+      await holder.query("SELECT pg_advisory_unlock(hashtext($1))", [key]);
+      holder.release();
+    }
+    const done = await Promise.all(calls);
+    assert.deepEqual(done.map((r) => r.dispatch).sort(), [...Array(n - 1).fill("already_sent"), "sent"].sort(), JSON.stringify(done));
+    assert.equal((await prompted(cid)).length, 1, "one command reached the machine");
+  });
+
+  test("D25 a finished task opened again by another call after this one read it: refused, nothing sent, and the words go when said again", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/docs", { alias: "文档台", role: "负责文档", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid, s, "整理文档");
+    // Between this call's read and its reopening, the task moves to a new generation (as another call reopening it would).
+    await w.q("CREATE SEQUENCE IF NOT EXISTS d25_gen");
+    await w.q(`CREATE OR REPLACE FUNCTION d25_bump_once() RETURNS trigger AS $$
+      BEGIN IF NEW.params ? 'turn_sends' AND NOT (OLD.params ? 'turn_sends') AND nextval('d25_gen') = 1 THEN NEW.generation := OLD.generation + 1; END IF;
+      RETURN NEW; END $$ LANGUAGE plpgsql`);
+    await w.q("CREATE TRIGGER d25_gen BEFORE UPDATE ON claw_work_items FOR EACH ROW EXECUTE FUNCTION d25_bump_once()");
+    const turn = await userTurn(alice, "补一节安装");
+    try {
+      assert.equal((await refusal(tools.workSend(turn, { item_id: String(done.item_id), text: "补一节安装" }))).code, "item_changed");
+    } finally {
+      await w.q("DROP TRIGGER IF EXISTS d25_gen ON claw_work_items");
+      await w.q("DROP FUNCTION IF EXISTS d25_bump_once()");
+      await w.q("DROP SEQUENCE IF EXISTS d25_gen");
+    }
+    assert.equal((await prompted(cid)).length, 0, "nothing was sent");
+    assert.equal((await item(done.item_id)).board_state, "done", "and it was not opened again");
+    assert.equal(((await tools.workSend(turn, { item_id: String(done.item_id), text: "补一节安装" })) as Recorded).dispatch, "sent");
+  });
+
+  test("D26 a turn the agent takes by itself after a task: busy while it runs, its end frees the seat and is said as a late word of that task", async () => {
     const alice = await w.user("alice");
     await w.subscribe("alice");
     const cid = await machine("alice", "devbox");
@@ -846,7 +1059,7 @@ describe("seat dispatch", { skip }, () => {
     assert.equal((await item(long.item_id)).summary, summary);
   });
 
-  test("D22 an older connector never ends the agent's own turn: once it has been quiet, the seat is free and the sweep sends what waits", async () => {
+  test("D26 an older connector never ends the agent's own turn: once it has been quiet, the seat is free and the sweep sends what waits", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox");
     const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
@@ -868,7 +1081,7 @@ describe("seat dispatch", { skip }, () => {
     assert.equal((await item(long.item_id)).board_state, "done");
   });
 
-  test("D23 a prompt is the seat's work until its own end, though recorded before the end of the turn it waited behind", async () => {
+  test("D27 a prompt is the seat's work until its own end, though recorded before the end of the turn it waited behind", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox");
     const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
