@@ -165,7 +165,6 @@ describe("seat dispatch", { skip }, () => {
   /** The connector collected everything queued (as its heartbeat acknowledges it). */
   const collect = async (cid: string) => store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000_000);
   const item = async (id: unknown) => (await w.q("SELECT * FROM claw_work_items WHERE item_id = $1", [String(id)]))[0];
-  const says = async () => w.q("SELECT text, item_id, payload FROM claw_assistant_says s LEFT JOIN LATERAL (SELECT payload FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text LIMIT 1) o ON TRUE WHERE s.user_id = 'alice' ORDER BY s.created_at");
   const notices = async () => (await w.q(
     `SELECT o.payload FROM claw_notification_outbox o JOIN claw_assistant_says s ON s.say_id::text = o.event_id WHERE s.user_id = 'alice' ORDER BY o.id`,
   )).map((r) => r.payload as Recorded).filter((p) => p.remote);
