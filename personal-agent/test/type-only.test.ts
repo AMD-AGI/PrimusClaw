@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
-import { codeOutsideSrc, missingFromReport, packagesToCheck } from "../scripts/coverage.js";
+import { codeOutsideSrc, inPool, missingFromReport, packagesToCheck } from "../scripts/coverage.js";
 import { isTypeOnly, sourceFiles, symlinksUnder, typeOnlyFiles } from "../scripts/type-only.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -236,4 +236,20 @@ test("a source extension in another case is refused anywhere in a package, node_
     "packages/core/src/deep/x.Ts has a source extension in upper case (use lower case)",
     "packages/core/src/probe.JS has a source extension in upper case (use lower case)",
   ]);
+});
+
+test("the package reports run at most the limit at a time and come back in package order", async () => {
+  let running = 0;
+  let most = 0;
+  const done = await inPool([30, 5, 20, 1, 10], 2, async (ms) => {
+    running += 1;
+    most = Math.max(most, running);
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    running -= 1;
+    return ms * 2;
+  });
+  assert.deepEqual(done, [60, 10, 40, 2, 20]);
+  assert.equal(most, 2);
+  assert.deepEqual(await inPool([], 4, () => Promise.resolve(1)), []);
+  assert.deepEqual(await inPool([1, 2], 0, (n) => Promise.resolve(n)), [1, 2]);
 });

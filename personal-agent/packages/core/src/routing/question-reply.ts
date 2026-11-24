@@ -31,6 +31,11 @@ export const TYPED_ANSWER_MARGIN_SECONDS = 15;
 export interface TypedReply {
   readonly chat: Chat;
   readonly text: string;
+  /**
+   * What the message forwards, as text for the model ("" none), read once there is a question to answer: it goes to Claw with
+   * the answer, since no other message carries it (the card shows only the words).
+   */
+  readonly forward?: () => string;
   /** The Claw credential of the person, read when there is a question to answer. */
   readonly credential: () => Promise<string>;
 }
@@ -53,7 +58,13 @@ export async function answerWaitingQuestion(ctx: RouterContext, reply: TypedRepl
   if (!store.approvals.closeApproval(sessionId, toolUseId, "sending")) return false; // (the card was pressed meanwhile)
   const answers = typedAnswers(questions, reply.text);
   try {
-    await claw.sessions.answer(key, sessionId, toolUseId, Object.fromEntries(answers.answers), answers.skipped);
+    await claw.sessions.answer(
+      key,
+      sessionId,
+      toolUseId,
+      withForward(ctx, answers.answers, reply.forward?.() ?? ""),
+      answers.skipped,
+    );
   } catch (error) {
     if (!isClawOrNetwork(error)) throw error;
     const stale = error instanceof ClawError && [404, 409, 410].includes(error.status);
@@ -78,6 +89,21 @@ export async function answerWaitingQuestion(ctx: RouterContext, reply: TypedRepl
     : answerLang(store.prefs.getPrefs(chat.sender.id).lang, chat.locale, questions[0]?.question, reply.text);
   await settleCard(ctx, chat, pending.cardId, [...answers.answers], lang);
   return true;
+}
+
+/**
+ * The answers as Claw takes them: what the message forwards goes before the first answer's words, as it goes before the words
+ * of a new message (once: the other questions are answered with the same words, and the forward is said already).
+ */
+function withForward(
+  ctx: RouterContext,
+  answers: ReadonlyMap<string, string>,
+  forward: string,
+): Record<string, string> {
+  const entries = [...answers];
+  const [first] = entries;
+  if (first !== undefined && forward) entries[0] = [first[0], ctx.deps.messageText.withQuote(first[1], forward)];
+  return Object.fromEntries(entries);
 }
 
 /** The person's question card waiting in the chat's session, in time, with the questions it asks; undefined when none. */

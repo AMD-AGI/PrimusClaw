@@ -161,6 +161,7 @@ export class GroupRouter {
         messageId: message.id,
         clientPlatform: message.clientPlatform,
         quote: this.withHistory(message, words.quote),
+        forward: () => this.ctx.deps.messageText.quoteBlock({ ...message, quotes: [] }, true),
         sent: words.sent,
         files,
         typed: true,
