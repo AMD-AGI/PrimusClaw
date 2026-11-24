@@ -23,6 +23,10 @@
  *   D11 a task's end wakes the router (no notice of its own); its failure is an error notice too
  *   D12 the prompt asks for parking only from a connector that can park
  *   D13 off: no seat target, and the router's seat section says seats are only shown
+ *   D19 the sandbox picked on a choice card when it cannot start: nothing written for it, the task dropped, no task left in progress
+ *   D20 one more instruction to a finished task, on a seat that asks first: the task is unchanged until the card is pressed; a no, a
+ *       lapse and the sweep keep its result; a yes opens it again and sends; a second card pressed after that sends nothing
+ *   D21 a finished task opened again whose instruction cannot be sent (its seat's queue full) is put back as it ended
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -697,6 +701,90 @@ describe("seat dispatch", { skip }, () => {
     assert.ok(now && now !== alice.routerSid, "the assistant has a session again");
     const said = await w.q("SELECT text FROM claw_assistant_says WHERE user_id = 'alice' AND text LIKE '%机器拒绝了这条指令%'");
     assert.equal(said.length, 1, JSON.stringify(said));
+  });
+
+  test("D19 the sandbox picked when it cannot start: nothing is written for it, the task is dropped, no task is left in progress", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const a = await seat(cid, "/home/u/hl-ci", { alias: "hl-ci", role: "Hyperloom CI", role_state: "confirmed" });
+    const out = await create(await userTurn(alice, "修一下 CI"), [`seat:${a.seatId}`, "sandbox"], "修 CI 沙箱");
+    assert.equal(out.dispatch, "card", JSON.stringify(out));
+    // No key of the user's reached Claw: the worker's first message cannot be queued.
+    await w.q("UPDATE claw_sessions SET config = config - 'platform_key' - 'llm_api_key' - '_server_managed_credentials' WHERE session_id = $1", [alice.routerSid]);
+    const sessionsBefore = (await w.q("SELECT COUNT(*)::int AS n FROM claw_sessions"))[0].n;
+    const pressed = await press(out.confirmation_id, "allow", "sandbox");
+    assert.deepEqual([pressed.status, pressed.result?.error], ["failed", "no_credentials"], JSON.stringify(pressed));
+    const it = await item(out.item_id);
+    assert.deepEqual([it.kind, it.board_state, it.outcome], ["remote", "done", "dropped"], "not left as a task in progress");
+    assert.equal(it.params.brief, "按发布流程发 1.2.1", "its brief is kept");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_sessions"))[0].n, sessionsBefore, "no worker session was made");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_items WHERE board_state <> 'done'"))[0].n, 0, "no item holds a slot");
+  });
+
+  /** A task of the seat's that ran and finished with an answer. */
+  async function finished(alice: { routerSid: string; userId: string }, cid: string, s: { seatId: string; sid: string }, title: string): Promise<Recorded> {
+    const out = await create(await userTurn(alice, title), `seat:${s.seatId}`, title);
+    assert.equal(out.dispatch, "sent", JSON.stringify(out));
+    const seq = Number((await prompted(cid)).at(-1)!.cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [chunk(`${title} 完成了`), ["turn_end", { stopReason: "end_turn", cmd_seq: seq }]]);
+    const it = await item(out.item_id);
+    assert.equal(it.board_state, "done", JSON.stringify(it));
+    return it;
+  }
+  const ended = (it: Recorded) => [it.board_state, it.outcome, it.summary, String(it.closed_at), Number(it.generation), it.params.brief];
+
+  test("D20 one more instruction to a finished task on a seat that asks first: nothing changes until the card is pressed; a no or a lapse keeps its result", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid, s, "发布 1.2.1");
+    const was = ended(done);
+    await seats.seatSet(await userTurn(alice, "发布台每次都确认"), { seat: s.seatId, confirm_each: true });
+    const carded = await tools.workSend(await userTurn(alice, "再打个 tag"), { item_id: String(done.item_id), text: "再打个 tag" }) as Recorded;
+    assert.deepEqual([carded.dispatch, carded.why_card], ["card", "confirm_each"], JSON.stringify(carded));
+    assert.deepEqual(ended(await item(done.item_id)), was, "the card alone changes nothing");
+    // No: the finished task stays as it was, its answer and all.
+    const no = await press(carded.confirmation_id, "deny");
+    assert.equal(no.status, "denied", JSON.stringify(no));
+    assert.deepEqual(ended(await item(done.item_id)), was);
+    assert.notEqual((await item(done.item_id)).outcome, "dropped");
+    // A card left to lapse, and the sweep after it: still as it was.
+    const lapsing = await tools.workSend(await userTurn(alice, "再打个 tag 吧"), { item_id: String(done.item_id), text: "再打个 tag 吧" }) as Recorded;
+    await w.q("UPDATE claw_assistant_confirmations SET expires_at = NOW() - INTERVAL '1 second' WHERE confirmation_id = $1", [lapsing.confirmation_id]);
+    assert.equal((await press(lapsing.confirmation_id)).status, "expired");
+    await dispatch.runErrandSweep("alice");
+    assert.deepEqual(ended(await item(done.item_id)), was);
+    assert.deepEqual(await prompted(cid), [], "nothing more was sent");
+    // Two cards for it: the first pressed opens it again and sends; the second, pressed after, is for a task that changed.
+    const one = await tools.workSend(await userTurn(alice, "打 tag v1"), { item_id: String(done.item_id), text: "打 tag v1" }) as Recorded;
+    const two = await tools.workSend(await userTurn(alice, "打 tag v2"), { item_id: String(done.item_id), text: "打 tag v2" }) as Recorded;
+    const yes = await press(one.confirmation_id);
+    assert.deepEqual([yes.status, yes.result?.dispatch], ["done", "sent"], JSON.stringify(yes));
+    const open = await item(done.item_id);
+    assert.deepEqual([open.board_state, open.outcome, Number(open.generation), open.params.brief, open.params.approved], ["in_progress", null, was[4] as number + 1, "打 tag v1", "card"]);
+    const sent = await prompted(cid);
+    assert.equal(sent.length, 1);
+    assert.match(String(sent[0].payload.text), /打 tag v1$/);
+    const stale = await press(two.confirmation_id);
+    assert.deepEqual([stale.status, stale.result?.error], ["failed", "item_changed"], JSON.stringify(stale));
+    assert.equal((await prompted(cid)).length, 1, "the second card sent nothing");
+  });
+
+  test("D21 a finished task opened again whose instruction cannot be sent is put back as it ended", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid, s, "发布 1.2.1");
+    const was = ended(done);
+    // The seat busy with one task and three waiting: its queue is full.
+    assert.equal((await create(await userTurn(alice, "任务 1"), `seat:${s.seatId}`, "任务 1")).dispatch, "sent");
+    for (let i = 2; i <= 4; i += 1) assert.equal((await create(await userTurn(alice, `任务 ${i}`), `seat:${s.seatId}`, `任务 ${i}`)).dispatch, "queued");
+    const full = await refusal(tools.workSend(await userTurn(alice, "再打个 tag"), { item_id: String(done.item_id), text: "再打个 tag" }));
+    assert.equal(full.code, "seat_queue_full");
+    const back = await item(done.item_id);
+    assert.deepEqual(ended(back).filter((_, i) => i !== 4), was.filter((_, i) => i !== 4), "its end, answer and brief are back");
+    assert.equal(back.params.queued, undefined);
   });
 
   test("D12 the prompt asks for parking only from a connector that can park", async () => {
