@@ -44,7 +44,7 @@ import { db, inTransaction, type Querier } from "../infra/db.js";
 import { approvalsEnabled, DELIVERY_UNCONFIRMED, findSession, issueCommand, onlineSql, terminalMuted, wakeConnector } from "../remote-agents/store.js";
 import { newWorkItemId } from "../tasks/ids.js";
 import type { AssistantRemoteAsk, AssistantRemoteNotice } from "../notifications/assistant-events.js";
-import { personWritesChinese, recordSystemNotice, storeAnswerWhole } from "./outbound.js";
+import { ensureLiveAssistant, personWritesChinese, recordSystemNotice, storeAnswerWhole } from "./outbound.js";
 import { applyWorkerReport, clipOneLine, clipWords, graphemes, TITLE_MAX } from "./work-items.js";
 
 const logger = pino({ name: "assistant-remote-items" });
@@ -1461,6 +1461,12 @@ export interface NoteErrandPrompt {
  */
 export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
   const reports = await import("./reports.js");
+  // An end still to be reported here may have to be said by the system (below): a user whose assistant session was deleted gets it
+  // made again first, as `recordNeedsYouFallback` does, so the answer has a session to be said in (none is never swept for later).
+  const due = (await db.query(
+    "SELECT 1 FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' AND params ? 'report_due'", [p.itemId, p.owner],
+  )).rows.length > 0;
+  if (due) await ensureLiveAssistant(p.itemId).catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_assistant_not_made"));
   const woke = await inTransaction(async (q) => {
     const row = (await q(
       "SELECT board_state, outcome, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' FOR UPDATE", [p.itemId, p.owner],

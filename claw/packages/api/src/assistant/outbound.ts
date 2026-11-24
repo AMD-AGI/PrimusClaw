@@ -1017,7 +1017,7 @@ export async function itemSession(q: Querier, itemId: string): Promise<{ session
  * it made now, as their next visit would (`getOrCreateAssistant`), so the message has a session that is read. Otherwise it would be
  * shown nowhere and, for a user with no channel, never be said.
  */
-async function ensureLiveAssistant(itemId: string): Promise<void> {
+export async function ensureLiveAssistant(itemId: string): Promise<void> {
   const row = (await db.query(
     `SELECT w.user_id, EXISTS (SELECT 1 FROM claw_sessions s WHERE s.session_id = a.session_id AND s.deleted_at IS NULL) AS live
        FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id WHERE w.item_id = $1`,
