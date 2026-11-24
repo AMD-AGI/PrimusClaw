@@ -106,7 +106,12 @@ test("a template's own volumes and their mounts are kept, and may not take a hos
   const scratch = { volumes: [{ name: "scratch", emptyDir: {} }], volumeMounts: [{ name: "scratch", mountPath: "/scratch", readOnly: false }] };
   assert.deepEqual(issuesOf(scratch), []);
   assert.deepEqual(issuesOf({ ...scratch, host_mounts: [{ hostPath: CACHE, readOnly: true }] }), []);
-  assert.deepEqual(paths({ volumes: [{ name: "template-mount-0", emptyDir: {} }] }), ["sandbox_templates[0].volumes[0].name"]);
+  assert.deepEqual(paths({ volumes: [{ name: "template-mount-0", emptyDir: {} }], host_mounts: [{ hostPath: CACHE, readOnly: true }] }), [
+    "sandbox_templates[0].volumes[0].name",
+  ]);
+  assert.deepEqual(paths({ template: { fromImage: "x", volumes: [{ name: "template-mount-a", emptyDir: {} }] }, host_mounts: [{ hostPath: CACHE, readOnly: true }] }), [
+    "sandbox_templates[0].template.volumes[0].name",
+  ]);
   assert.deepEqual(paths({ volumeMounts: [{ name: "template-mount-0", mountPath: "/w", readOnly: false }], host_mounts: [{ hostPath: CACHE, readOnly: true }] }), [
     "sandbox_templates[0].volumeMounts[0].name",
   ]);
@@ -115,6 +120,18 @@ test("a template's own volumes and their mounts are kept, and may not take a hos
   assert.deepEqual((t!.volumeMounts as Array<{ name: string }>).map((v) => v.name), ["scratch", "template-mount-0"]);
   const [plain] = appGrantTemplates(manifest(scratch), { image: "i", sandboxWorkspace: "ws" });
   assert.deepEqual(plain!.volumes, scratch.volumes, "a template without host_mounts keeps its volumes unchanged");
+});
+
+test("a template without host_mounts may name its own volumes template-mount-*, as it could before", () => {
+  const cache = { volumes: [{ name: "template-mount-cache", emptyDir: {} }], volumeMounts: [{ name: "template-mount-cache", mountPath: "/cache", readOnly: false }] };
+  assert.deepEqual(issuesOf(cache), []);
+  assert.deepEqual(issuesOf({ template: { fromImage: "x", ...cache } }), []);
+  const [t] = appGrantTemplates(manifest(cache), { image: "i", sandboxWorkspace: "ws" });
+  assert.deepEqual(t!.volumes, cache.volumes);
+  assert.deepEqual(t!.volumeMounts, cache.volumeMounts);
+  assert.deepEqual(paths({ ...cache, host_mounts: [{ hostPath: CACHE, readOnly: true }] }), [
+    "sandbox_templates[0].volumes[0].name", "sandbox_templates[0].volumeMounts[0].name",
+  ]);
 });
 
 test("the grant carries each mount as a hostPath volume and a read-only mount at the same path, and drops mounts", () => {

@@ -138,8 +138,10 @@ export function templateMountIssues(template: Record<string, unknown>, at: strin
   const issues: AppManifestIssue[] = [];
   const bad = (path: string, reason: string): void => void issues.push({ path, reason });
   const nested = isObj(template.template) ? template.template : undefined;
-  rawVolumeIssues(template, at, bad);
-  if (nested) rawVolumeIssues(nested, `${at}.template`, bad);
+  // The volume names host_mounts renders are reserved only where it renders them.
+  const reserveNames = Object.hasOwn(template, "host_mounts");
+  rawVolumeIssues(template, at, bad, reserveNames);
+  if (nested) rawVolumeIssues(nested, `${at}.template`, bad, reserveNames);
   const mounts = template.host_mounts;
   if (mounts === undefined) return issues;
   if (!Array.isArray(mounts)) {
@@ -180,16 +182,22 @@ export function templateMountIssues(template: Record<string, unknown>, at: strin
 
 /**
  * Agent Sandbox's own volume keys of one template object: spelt exactly, no
- * hostPath among its `volumes` (in any spelling), and no volume or mount named
- * like those `host_mounts` renders. A host directory is reached only through
- * `host_mounts`.
+ * hostPath among its `volumes` (in any spelling), and, when the template
+ * declares `host_mounts` (`reserveNames`), no volume or mount named like those
+ * it renders. A host directory is reached only through `host_mounts`.
  */
-function rawVolumeIssues(obj: Record<string, unknown>, at: string, bad: (path: string, reason: string) => void): void {
+function rawVolumeIssues(
+  obj: Record<string, unknown>,
+  at: string,
+  bad: (path: string, reason: string) => void,
+  reserveNames: boolean,
+): void {
   for (const key of Object.keys(obj)) {
     const exact = EXACT_KEYS.find((k) => k.toLowerCase() === key.toLowerCase());
     if (exact && exact !== key) bad(`${at}.${key}`, `must be spelt ${exact}`);
   }
-  const reserved = (name: unknown): boolean => typeof name === "string" && name.startsWith(TEMPLATE_MOUNT_VOLUME_PREFIX);
+  const reserved = (name: unknown): boolean =>
+    reserveNames && typeof name === "string" && name.startsWith(TEMPLATE_MOUNT_VOLUME_PREFIX);
   if (Object.hasOwn(obj, "volumes")) {
     if (!Array.isArray(obj.volumes)) bad(`${at}.volumes`, "must be an array");
     else obj.volumes.forEach((v, i) => {
