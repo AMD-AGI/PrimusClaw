@@ -558,6 +558,66 @@ describe("seat dispatch", { skip }, () => {
     assert.match(away[0]!.text, /离线超过 1 小时/);
   });
 
+  test("D15 what was let through is checked again as a task leaves the queue; a card says whether its press makes the seat direct", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const first = await create(await userTurn(alice, "发布 1"), `seat:${s.seatId}`, "任务 1");
+    const seq1 = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    const second = await create(await userTurn(alice, "发布 2"), `seat:${s.seatId}`, "任务 2");
+    assert.equal(second.dispatch, "queued");
+    // The user asks for a card each time while it waits: it is not sent when the seat frees, and they are told how to send it.
+    await seats.seatSet(await userTurn(alice, "发布台每次都确认"), { seat: s.seatId, confirm_each: true });
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_seq: seq1 }]]);
+    assert.deepEqual(await prompted(cid), [], "nothing sent");
+    const it = await item(second.item_id);
+    assert.deepEqual([it.board_state, it.last_report_kind, it.params.queued], ["needs_you", "failed", undefined]);
+    assert.match((await notices()).find((n) => n.remote.item_seq === second.seq)!.text, /要先确认/);
+    assert.equal((await item(first.item_id)).board_state, "done");
+    // A card made while the agent ran unattended says nothing of going direct; pressed once it asks again, it sends but makes nothing direct.
+    const cid2 = await machine("alice", "ci-box", [claude({ unattended: true })]);
+    const bot = await seat(cid2, "/home/u/bot", { alias: "bot", role: "跑 CI", role_state: "confirmed" });
+    const card = await create(await userTurn(alice, "让 bot 跑"), `seat:${bot.seatId}`, "跑 CI");
+    await beat("alice", cid2, [claude()]);
+    assert.equal((await press(card.confirmation_id)).status, "done");
+    assert.equal((await prompted(cid2)).length, 1);
+    assert.equal((await w.q("SELECT dispatch_mode FROM claw_devenv_seats WHERE seat_id = $1", [bot.seatId]))[0].dispatch_mode, "card");
+  });
+
+  test("D16 two tasks with one title are two tasks; a cancel that ends nothing is no task's end; an instruction right after an end loses neither answer", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const a = await create(await userTurn(alice, "修测试 A"), `seat:${s.seatId}`, "修测试", "修 A 的测试");
+    const seqA = Number((await prompted(cid))[0].cmd_seq);
+    const b = await create(await userTurn(alice, "修测试 B"), `seat:${s.seatId}`, "修测试", "修 B 的测试");
+    assert.notEqual(a.item_id, b.item_id);
+    assert.equal(b.dispatch, "queued");
+    await collect(cid);
+    // The end a cancel brings when nothing ran names no prompt (cmd_seq: null): no task's.
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "cancelled", cmd_seq: null }]]);
+    assert.deepEqual((await item(a.item_id)).params.open_cmd_seqs, [seqA]);
+    assert.equal((await item(a.item_id)).board_state, "in_progress");
+    // Its end applied but not yet reported, and one more instruction lands then: the first answer is reported, the item opened again.
+    await w.q("UPDATE claw_work_items SET params = params || jsonb_build_object('open_cmd_seqs', '[]'::jsonb, 'report_due', jsonb_build_object('kind', 'answer', 'summary', '第一段回答', 'generation', generation)) WHERE item_id = $1", [a.item_id]);
+    const gen = Number((await item(a.item_id)).generation);
+    const tools = await import("../src/assistant/devenv-tools.js");
+    const sent = await tools.executeSend("alice", {
+      connector_id: cid, machine: "devbox", agent_id: "claude", agent_name: null, session_id: s.sid, resume_ref: null, cwd: "/home/u/rel", label: "x",
+    }, "再补一个用例", "errand-test-followup", "zh", undefined, { errandItemId: String(a.item_id), queueBehind: true });
+    assert.equal(sent.ok, true, JSON.stringify(sent));
+    const after = await item(a.item_id);
+    assert.deepEqual([after.board_state, Number(after.generation), after.params.report_due], ["in_progress", gen + 1, undefined]);
+    assert.ok((await wakes(alice.routerSid)).some((m) => m.includes("第一段回答")), "the first answer reached the router");
+    const seqF = Number((await prompted(cid)).at(-1)!.cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [chunk("第二段回答"), ["turn_end", { stopReason: "end_turn", cmd_seq: seqF }]]);
+    assert.equal((await item(a.item_id)).board_state, "done");
+    assert.ok((await wakes(alice.routerSid)).some((m) => m.includes("第二段回答")), "and the second");
+  });
+
   test("D12 the prompt asks for parking only from a connector that can park", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox", [claude({ permission_park: true })]);

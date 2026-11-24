@@ -122,6 +122,26 @@ function seatRefusal(live: SeatLive | undefined, seatId: string): ToolRefused | 
   return null;
 }
 
+/**
+ * What the user let through still holds when the task goes (it may have waited in the queue): one that went without a card needs the
+ * seat to still take tasks without one (the user may have asked for a card each time since, or its agent turned unattended); one the user
+ * pressed a card for needs its agent to still ask before it acts, unless the card said it would not.
+ */
+function policyRefusal(live: SeatLive, p: Partial<ErrandParams>): ToolRefused | null {
+  const zh = p.lang === "zh";
+  if (p.approved !== "card" && whyCard(live, null)) {
+    return new ToolRefused("needs_card", zh
+      ? "这个工位现在要先确认（每次都确认或刚改过设置），所以没有发出；回复“继续”会出卡片让你确认"
+      : "that seat now asks for a card first, so it was not sent; reply \"continue\" to get a card for it");
+  }
+  if (live.unattended && p.approved_unattended !== true) {
+    return new ToolRefused("seat_unattended", zh
+      ? "这个工位的 agent 现在处于无人值守模式，你确认时并非如此，所以没有发出；回复“继续”重新确认"
+      : "that seat's agent now runs unattended, which was not so when you let it through, so it was not sent; reply \"continue\" to confirm again");
+  }
+  return null;
+}
+
 /** The other seats a full queue's refusal offers (online, free, not retired), as targets. */
 function otherSeats(all: Map<string, SeatLive>, except: string): string[] {
   return [...all.values()].filter((l) => String(l.seat.seat_id) !== except && l.seat.role_state !== "retired" && (l.state === "idle"))
@@ -135,9 +155,12 @@ export function seatCardText(
   // Whole: what the card lets through is exactly what it shows.
   const brief = p.brief;
   if (p.choice) {
+    const auto = p.makesAuto
+      ? (zh ? "\n选了已确认的工位后，以后发给它不再确认；说“每次都确认”可改回。" : "\nOnce you pick a confirmed seat, tasks for it go without asking; say \"always ask first\" to change that.")
+      : "";
     return zh
-      ? `这件事交给谁？\n${brief}\n${p.choice.map((c) => `- ${inertMd(c)}`).join("\n")}\n在下面选一个，或直接告诉我交给哪个。`
-      : `Who should do this?\n${brief}\n${p.choice.map((c) => `- ${inertMd(c)}`).join("\n")}\nPick one below, or just tell me which.`;
+      ? `这件事交给谁？\n${brief}\n${p.choice.map((c) => `- ${inertMd(c)}`).join("\n")}\n在下面选一个，或直接告诉我交给哪个。${auto}`
+      : `Who should do this?\n${brief}\n${p.choice.map((c) => `- ${inertMd(c)}`).join("\n")}\nPick one below, or just tell me which.${auto}`;
   }
   const lines = [
     zh ? `把这件事交给 ${inertMd(p.label)}（${inertMd(p.cwd)}）吗？` : `Hand this to ${inertMd(p.label)} (${inertMd(p.cwd)})?`,
@@ -241,7 +264,7 @@ export async function dispatchErrand(
     }
     const all = await seatsLive(owner, onlineWindowMs);
     const live = all.get(seatId);
-    const refused = seatRefusal(live, seatId);
+    const refused = seatRefusal(live, seatId) ?? policyRefusal(live!, item.params);
     if (refused) return { error: refused.code, message: refused.message, ...(refused.data ? { data: refused.data } : {}) };
     // Only the head of the queue goes; a task behind others waits its turn (where it is, or at the end).
     const queuedHere = live!.queue.findIndex((q) => q.item_id === itemId);
@@ -294,11 +317,23 @@ export async function dispatchErrand(
 
 /** Send one more instruction to a task running in its session (the connector queues it behind the turn under way). */
 async function sendFollowup(owner: string, itemId: string, text: string, onlineWindowMs: number): Promise<DispatchOutcome> {
-  const item = (await db.query(
-    "SELECT item_id, seq, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' AND board_state <> 'done'",
+  const read = async () => (await db.query(
+    "SELECT item_id, seq, board_state, outcome, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote'",
     [itemId, owner],
-  )).rows[0] as { item_id: string; seq: number; params: ErrandParams } | undefined;
-  if (!item) return { error: "item_closed", message: "that task is closed" };
+  )).rows[0] as { item_id: string; seq: number; board_state: string; outcome: string | null; params: ErrandParams } | undefined;
+  const first = await read();
+  if (!first || (first.board_state === "done" && first.outcome !== "answered")) return { error: "item_closed", message: "that task is closed" };
+  // Under the seat's lock, as a stop is: a task stopped meanwhile is sent nothing more.
+  return (await withSeatLock(String(first.params.seat_id), true, async () => {
+    const item = await read();
+    if (!item || (item.board_state === "done" && item.outcome !== "answered")) return { error: "item_closed", message: "that task is closed" };
+    return followupLocked(owner, itemId, item, text, onlineWindowMs);
+  }))!;
+}
+
+async function followupLocked(
+  owner: string, itemId: string, item: { seq: number; params: ErrandParams }, text: string, onlineWindowMs: number,
+): Promise<DispatchOutcome> {
   const p = item.params;
   const live = (await seatsLive(owner, onlineWindowMs, [p.seat_id])).get(p.seat_id);
   const refused = seatRefusal(live, p.seat_id);
@@ -383,7 +418,7 @@ export async function seatWorkCreate(claims: AssistantTokenClaims, args: SeatCre
     connector_id: live ? String(live.seat.connector_id) : "", session_id: "", agent_id: live ? String(live.seat.agent_id) : "",
     machine: live?.machine ?? "", asked: flat(brief, 120), origin: "assistant", lang, open_turns: 0, open_cmd_seqs: [], waiting: [], last_event_id: 0,
     ...(newSession ? { new_session: true as const } : {}), ...(live?.unattended ? { unattended: true as const } : {}),
-    ...(why ? { queued: "card" as const, queued_at: new Date().toISOString() } : {}),
+    ...(why ? { queued: "card" as const, queued_at: new Date().toISOString() } : { approved: "auto" as const }),
     ...(choice ? { choices: [...target.seats, ...(target.sandbox ? [SANDBOX_TARGET] : [])] } : {}),
   };
   const options: AssistantConfirmOption[] | undefined = choice
@@ -402,8 +437,9 @@ export async function seatWorkCreate(claims: AssistantTokenClaims, args: SeatCre
     // The same task for the same place a moment ago is a replayed call: that one.
     const same = (await tx(
       `SELECT item_id, seq FROM claw_work_items WHERE user_id = $1 AND kind = 'remote' AND params->>'errand' = 'true' AND board_state <> 'done'
-          AND title = $2 AND params->>'seat_id' = $3 AND created_at > NOW() - $4::interval`,
-      [userId, title, seatId, DUPLICATE_WINDOW],
+          AND title = $2 AND params->>'seat_id' = $3 AND params->>'brief' = $5 AND COALESCE(params->'choices', 'null'::jsonb) = $6::jsonb
+          AND created_at > NOW() - $4::interval`,
+      [userId, title, seatId, DUPLICATE_WINDOW, brief, JSON.stringify(params.choices ?? null)],
     )).rows[0] as { item_id: string; seq: number } | undefined;
     if (same) return { itemId: same.item_id, seq: Number(same.seq), card: null, duplicate: true };
     const inserted = await insertWorkItem({ query: tx }, {
@@ -414,16 +450,20 @@ export async function seatWorkCreate(claims: AssistantTokenClaims, args: SeatCre
         ? "too many unfinished items: ask the user which to stop or finish first" : "the user has no assistant");
     }
     if (!why) return { itemId, seq: inserted.seq, card: null, duplicate: false };
-    const makesAuto = !!live && live.seat.role_state === "confirmed" && live.seat.confirm_each !== true && !live.unattended;
+    const autoable = (l: SeatLive) => l.seat.role_state === "confirmed" && l.seat.confirm_each !== true && !l.unattended && l.seat.dispatch_mode !== "auto";
+    const makesAuto = !!live && autoable(live);
+    const autoSeats = choice ? target.seats.filter((id) => autoable(all.get(id)!)) : [];
     const cardParams = {
-      item_id: itemId, seat_id: seatId, title, brief, lang, why_card: why, unattended: live?.unattended === true,
+      item_id: itemId, seat_id: seatId, title, brief, lang, why_card: why, unattended: live?.unattended === true, makes_auto: makesAuto,
+      ...(choice ? { auto_seats: autoSeats } : {}),
       ...(choice
         ? { choices: params.choices, options, unattended_seats: target.seats.filter((id) => all.get(id)!.unattended) }
         : { label: seatLabel(live!), cwd: flat(live!.seat.cwd, 300) }),
     };
     const card = await proposeConfirmation(tx, claims, userId, "seat_dispatch", cardParams, {
       text: (ref) => seatCardText({
-        label: live ? seatLabel(live) : "", cwd: live ? flat(live.seat.cwd, 300) : "", brief, why, makesAuto, unattended: live?.unattended === true,
+        label: live ? seatLabel(live) : "", cwd: live ? flat(live.seat.cwd, 300) : "", brief, why, makesAuto: makesAuto || autoSeats.length > 0,
+        unattended: live?.unattended === true,
         ...(choice ? { choice: options!.map((o) => (o.detail ? `${o.label}（${o.detail}）` : o.label)) } : {}),
       }, ref, zh),
       allowLabel: zh ? "发送" : "Send",
@@ -494,8 +534,11 @@ export async function seatDispatchDecided(
     if (!followup) await dropErrand(q, itemId, refused.message);
     return { result: { ok: false, error: refused.code, message: refused.message } };
   }
-  // The first card the user pressed for a confirmed seat: tasks go to it directly from now on.
-  if (live!.seat.role_state === "confirmed" && live!.seat.confirm_each !== true && !live!.unattended && live!.seat.dispatch_mode !== "auto") {
+  // The first card the user pressed for a confirmed seat, which said so: tasks go to it directly from now on (only when that still holds).
+  const saidAuto = Array.isArray(params.choices)
+    ? Array.isArray(params.auto_seats) && (params.auto_seats as unknown[]).includes(seatId)
+    : params.makes_auto === true;
+  if (saidAuto && !followup && live!.seat.role_state === "confirmed" && live!.seat.confirm_each !== true && !live!.unattended && live!.seat.dispatch_mode !== "auto") {
     await q("UPDATE claw_devenv_seats SET dispatch_mode = 'auto', auto_since = NOW(), updated_at = NOW() WHERE seat_id = $1 AND owner_user_id = $2",
       [seatId, userId]);
   }
@@ -505,6 +548,8 @@ export async function seatDispatchDecided(
       [itemId, JSON.stringify({
         seat_id: seatId, alias: typeof live!.seat.alias === "string" ? live!.seat.alias : null, connector_id: String(live!.seat.connector_id),
         agent_id: String(live!.seat.agent_id), machine: live!.machine, ...(live!.unattended ? { unattended: true } : {}),
+        // What the person pressed: this task, with its agent as unattended as the card said.
+        approved: "card", approved_unattended: live!.unattended,
       })],
     );
   }
@@ -636,13 +681,14 @@ async function reopenErrand(q: Querier, itemId: string, text: string, newSession
     `UPDATE claw_work_items
         SET board_state = 'in_progress', outcome = NULL, closed_at = NULL, last_report_kind = 'progress', pending_question = NULL, summary = '',
             generation = generation + 1,
-            params = (params - 'report_due' - 'progress' - 'progress_told_at' - 'progress_told_h' - 'offline_told' - 'new_session' - 'dispatched_at' - 'queued' - 'queued_at')
+            params = (params - 'report_due' - 'progress' - 'progress_told_at' - 'progress_told_h' - 'offline_told' - 'new_session' - 'dispatched_at' - 'queued' - 'queued_at'
+                       - 'approved' - 'approved_unattended')
                      || $2::jsonb,
             updated_at = NOW()
       WHERE item_id = $1`,
     [itemId, JSON.stringify({
       brief: text, open_cmd_seqs: [], open_turns: 0, waiting: [], ...(newSession ? { new_session: true } : {}),
-      ...(card ? { queued: "card", queued_at: new Date().toISOString() } : {}),
+      ...(card ? { queued: "card", queued_at: new Date().toISOString() } : { approved: "auto" }),
     })],
   );
   await q(`INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
@@ -684,7 +730,7 @@ export async function drainSeatsOf(owner: string, _sessionIds: readonly string[]
 }
 
 /** Refusals a queued task never gets past. */
-const PERMANENT = new Set(["seat_not_found", "seat_retired", "seat_unsupported", "item_closed"]);
+const PERMANENT = new Set(["seat_not_found", "seat_retired", "seat_unsupported", "item_closed", "needs_card", "seat_unattended"]);
 
 /** A task that waited in a queue and will not go: it fails, said as such, and the router hears of it. */
 async function failQueued(owner: string, itemId: string, why: string): Promise<void> {

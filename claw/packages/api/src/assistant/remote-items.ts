@@ -1353,6 +1353,12 @@ export interface ErrandParams extends RemoteParams {
   offline_told?: true;
   /** The seat's agent runs in a mode that asks nothing (`unattended`). */
   unattended?: true;
+  /**
+   * How the user let it through: `auto`, without a card (the seat took tasks directly then), or `card`, pressing one for it, which said
+   * whether its agent runs unattended (`approved_unattended`). Checked again when it leaves the queue (`seat-dispatch.ts`).
+   */
+  approved?: "auto" | "card";
+  approved_unattended?: boolean;
   /** An end recorded and not yet reported (`ingestReport` runs after the commit; the sweep retries what it missed). */
   report_due?: { kind: "answer" | "failed"; summary: string; generation: number };
 }
@@ -1426,29 +1432,53 @@ async function errandRunningOn(q: Querier, owner: string, sessionId: string): Pr
 }
 
 /**
- * Whether a session event belongs to a seat task, so the session's own item passes over it: a turn's end or a refusal naming a task's
- * prompt; a permission event naming one, or naming none (a connector 0.3.1 or older) while a task runs there.
+ * Whether a session event that names no prompt is one of a seat task's: only when its connector does not name prompts at all (no
+ * `cmd_seq` key: an older connector) and a task runs there. One that says it names none (`cmd_seq: null`, such as the end a cancel
+ * brings when nothing was running) is never a task's.
+ */
+const unnamedIsErrands = (e: MovingEvent, running: boolean): boolean => running && !Object.hasOwn(e.data, "cmd_seq");
+
+/**
+ * Whether a session event belongs to a seat task, so the session's own item passes over it: a turn's end, a refusal or a permission
+ * event naming a task's prompt, or naming none from a connector that names no prompts while a task runs there.
  */
 function errandOwns(e: MovingEvent, seqs: ReadonlySet<number>, running: boolean): boolean {
   const seq = Number.isSafeInteger(e.data.cmd_seq) ? Number(e.data.cmd_seq) : null;
-  if (e.type === REMOTE_EVENT_TURN_END || e.type === REMOTE_EVENT_COMMAND_REJECTED) return seq !== null && seqs.has(seq);
-  if (e.type === REMOTE_EVENT_PERMISSION_REQUEST || e.type === REMOTE_EVENT_PERMISSION_RESOLVED || e.type === REMOTE_EVENT_PERMISSION_PARKED) {
-    return seq !== null ? seqs.has(seq) : running;
-  }
-  return false;
+  const moving = e.type === REMOTE_EVENT_TURN_END || e.type === REMOTE_EVENT_COMMAND_REJECTED || e.type === REMOTE_EVENT_PERMISSION_REQUEST
+    || e.type === REMOTE_EVENT_PERMISSION_RESOLVED || e.type === REMOTE_EVENT_PERMISSION_PARKED;
+  if (!moving) return false;
+  return seq !== null ? seqs.has(seq) : unnamedIsErrands(e, running);
 }
 
 export interface NoteErrandPrompt {
   owner: string; itemId: string; sessionId: string; connectorId: string; agentId: string; machine: string; cmdSeq: number; since?: number;
 }
 
-/** A seat task's prompt was queued: the item is running in that session, the prompt one of its own. Then its events are caught up. */
+/**
+ * A seat task's prompt was queued: the item is running in that session, the prompt one of its own. One more instruction that reached it
+ * just after its turn ended is a new turn of it: the end still to be reported is reported first, and an item that end closed is opened
+ * again (a new generation), so neither answer is lost. Then its events are caught up.
+ */
 export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
+  const pending = (await db.query("SELECT params->'report_due' AS due FROM claw_work_items WHERE item_id = $1 AND user_id = $2", [p.itemId, p.owner]))
+    .rows[0]?.due as ErrandParams["report_due"] | null | undefined;
+  if (pending) {
+    await reportErrand({ itemId: p.itemId, generation: Number(pending.generation), kind: pending.kind, summary: String(pending.summary) })
+      .catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_report_failed"));
+  }
   await inTransaction(async (q) => {
     const row = (await q(
-      "SELECT params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' FOR UPDATE", [p.itemId, p.owner],
-    )).rows[0] as { params: ErrandParams } | undefined;
+      "SELECT board_state, outcome, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' FOR UPDATE", [p.itemId, p.owner],
+    )).rows[0] as { board_state: string; outcome: string | null; params: ErrandParams } | undefined;
     if (!row) return;
+    if (row.board_state === "done" && row.outcome === "answered") {
+      await q(
+        `UPDATE claw_work_items SET board_state = 'in_progress', outcome = NULL, closed_at = NULL, last_report_kind = 'progress', summary = '',
+                generation = generation + 1, params = params - 'report_due', updated_at = NOW()
+          WHERE item_id = $1`,
+        [p.itemId],
+      );
+    }
     const was = row.params;
     const same = was.session_id === p.sessionId && Array.isArray(was.open_cmd_seqs) && was.open_cmd_seqs.length > 0;
     const since = p.since !== undefined ? Math.max(0, Number(p.since) || 0) : Number((await q(
@@ -1533,7 +1563,7 @@ async function applyErrands(owner: string, sessionId: string): Promise<ErrandPas
         const seq = Number.isSafeInteger(e.data.cmd_seq) ? Number(e.data.cmd_seq) : null;
         const open = p.open_cmd_seqs ?? [];
         const running = open.length > 0;
-        const mine = seq !== null ? open.includes(seq) : running;
+        const mine = seq !== null ? open.includes(seq) : unnamedIsErrands(e, running);
         if (e.type === REMOTE_EVENT_TURN_END) {
           if (!mine) continue;
           p.open_cmd_seqs = seq !== null ? open.filter((c) => c !== seq) : [];
