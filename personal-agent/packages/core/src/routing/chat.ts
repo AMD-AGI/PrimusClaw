@@ -111,6 +111,55 @@ export class Chat {
   send(message: OutMessage): Promise<void> {
     return this.conversation.send(message);
   }
+
+  /** The same chat, said into through `conversation`. */
+  through(conversation: Conversation): Chat {
+    return new Chat(this.store, this.sender, conversation, this.scope, this.locale, this.written);
+  }
+}
+
+/**
+ * `conversation`, with `first` called before anything new is posted in it (a message, an envelope, a stream); an edit of a
+ * message already there is not new.
+ */
+export function postingAfter(conversation: Conversation, first: () => void): Conversation {
+  return {
+    get ref() {
+      return conversation.ref;
+    },
+    get caps() {
+      return conversation.caps;
+    },
+    get replyTo() {
+      return conversation.replyTo;
+    },
+    get edited() {
+      return conversation.edited;
+    },
+    markSettled: (id) => {
+      conversation.markSettled(id);
+    },
+    typing: () => conversation.typing(),
+    send: (message) => {
+      first();
+      return conversation.send(message);
+    },
+    post: (message) => {
+      first();
+      return conversation.post(message);
+    },
+    update: (id, message, options) => conversation.update(id, message, options),
+    delete: (id) => conversation.delete(id),
+    outgoing: (message) => conversation.outgoing(message),
+    deliver: (envelope) => {
+      first();
+      return conversation.deliver(envelope);
+    },
+    openStream: (replyTo, status) => {
+      first();
+      return conversation.openStream(replyTo, status);
+    },
+  };
 }
 
 /**

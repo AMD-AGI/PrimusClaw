@@ -156,6 +156,12 @@ export interface RemoteChat {
   forgetPerson(userId: string): void;
   /** The chat key of a person's binding in a group chat. */
   groupChatKey(userId: string, scope: string): string;
+  /**
+   * Something is said in the chat (a 1:1 chat's `userId`, or the group `scope`) below the stream of an attached agent's turn running
+   * there now: what tells those turns, so their answers come below it (`TurnDisplay.movedOn`); undefined when none runs there.
+   * Bound to the turns running when it is asked: a turn that starts later is never told by it.
+   */
+  goesOn?(userId: string, scope: string): (() => void) | undefined;
 }
 
 /** The person's notification subscription in Claw (Python `subscriptions.Subscriptions`); undefined when notifications are off. */

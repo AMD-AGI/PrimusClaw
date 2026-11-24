@@ -7,8 +7,10 @@
  * conversation open in a terminal, and the one-time tokens of the cards it showed. Keyed by the chat key (`chat-key.ts`). All of it
  * is lost when the process restarts, as it was in the Python worker; what must survive is in the store.
  */
+import { groupConversationOf } from "./chat-key.js";
 import type { Follower } from "./follow/follower.js";
 import type { Task } from "./tasks.js";
+import type { TurnDisplay } from "./turns/display.js";
 
 /** Folders typed in a `/agent new MACHINE PATH` kept for the buttons of the card that asks which agent, per chat. */
 export const TYPED_PATHS_KEPT = 20;
@@ -24,6 +26,8 @@ export interface RemoteTurn {
   waitsForTerminal: boolean;
   /** Nothing runs it any more (or nothing ever did): a Stop card's press for it stops nothing. */
   readonly ended: boolean;
+  /** What shows it in the chat, once it has begun: told when the chat goes on below it (`TurnDisplay.movedOn`). */
+  display: TurnDisplay | null;
 }
 
 /**
@@ -51,6 +55,7 @@ export function newTurn(): RemoteTurn {
     task: null,
     stopRequested: false,
     waitsForTerminal: false,
+    display: null,
     get ended() {
       return this.task?.running !== true;
     },
@@ -90,6 +95,20 @@ export class ChatRegistry {
   /** The session each chat was told its terminal's registry row cannot be read for (once per attach). */
   private readonly rowHinted = new Map<string, string>();
   private readonly tickets = new Map<string, TakeoverTicket>();
+
+  /** The chat went on below its running turn's display: that turn's answer must come below what was said since (`movedOn`). */
+  movedOn(chatKey: string): void {
+    this.turns.get(chatKey)?.display?.movedOn?.();
+  }
+
+  /** The turns running now in a 1:1 chat (`userId`) or, with `scope`, in that group (every binding's there). */
+  turnsIn(userId: string, scope: string): RemoteTurn[] {
+    if (!scope) {
+      const turn = this.turns.get(userId);
+      return turn ? [turn] : [];
+    }
+    return [...this.turns].filter(([chatKey]) => groupConversationOf(chatKey) === scope).map(([, turn]) => turn);
+  }
 
   /** How many messages wait behind the chat's running turn. */
   queuedCount(chatKey: string): number {

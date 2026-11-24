@@ -11,6 +11,8 @@
  * later messages get a short head of their own, and the way on and back goes under the last message.
  */
 import { errorName } from "../../errors.js";
+import { toLang } from "../../locales/lang.js";
+import { turnText } from "../../locales/turn.js";
 import type { Logger } from "../../ports/logger.js";
 import type { Clock } from "../../ports/clock.js";
 import { type OutMessage, richMessage } from "../../ports/surface.js";
@@ -221,6 +223,10 @@ export class ChatTurn implements TurnDisplay {
 
   close(hard = false): void {
     this.status.close(hard);
+  }
+
+  movedOn(): void {
+    this.status.movedOn(turnText.in(toLang(this.options.lang)).answerBelow);
   }
 
   finish(parts: readonly string[], options: FinishWith): Promise<void> {

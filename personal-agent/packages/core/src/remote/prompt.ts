@@ -124,6 +124,8 @@ export class Prompts {
     const text = remoteAgentText.in(this.state.lang(p.chatKey));
     const waiting = this.state.chats.queuedCount(p.chatKey);
     if (this.state.chats.queuedMessage(p.chatKey, p.messageId)) return; // (redelivered: it is queued, and was said so)
+    // (the person's message is in the chat below the running turn's stream now: that turn's answer must come below it, whole)
+    this.state.chats.movedOn(p.chatKey);
     if (waiting >= QUEUED_PROMPTS_MAX) return this.say(p.to, text.queueFull({ n: QUEUED_PROMPTS_MAX }));
     const sid = state.sessionId;
     let cmdSeq: number | undefined = undefined; // (Claw's number of it, once the send has answered)

@@ -26,6 +26,8 @@ export const turnText = defineCatalog({
     stillWorking: "Still working on it; the result will follow as a new message.",
     /** A turn whose stream is closed because a card now waits for the person's choice. */
     awaitingChoice: "Waiting for your choice in the card; I will continue once you pick.",
+    /** A turn whose stream is closed because the chat went on below it: the whole answer comes below. */
+    answerBelow: "The answer follows below, as new messages.",
     interrupted: "Interrupted.",
     /** What a turn the person stopped ends with. */
     stopped: "Stopped.",
@@ -51,6 +53,7 @@ export const turnText = defineCatalog({
     thinking: "思考中…",
     stillWorking: "仍在处理，完成后另发结果。",
     awaitingChoice: "请在卡片里选择，选好后我接着做。",
+    answerBelow: "回答会在下面另发。",
     interrupted: "已中断。",
     stopped: "已停止。",
     doneShort: "完成。",

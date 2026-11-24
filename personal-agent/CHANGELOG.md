@@ -15,6 +15,19 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## Unreleased
+
+### Fixed
+
+- `@primusclaw/personal-agent`: a remote agent's answer in a 1:1 chat that streams is never read from its middle. A stream's
+  message stays where the stream opened, under the person's message it answers; when the person wrote again while the agent
+  worked, sent a command (`/agent sessions`) or pressed a button whose outcome is said (or the chat was told something
+  meanwhile, such as that the message is queued, what the terminal asks or a permission card), the answer's first part ended in that bubble, above all of it, and its "(cont. 2/2)" came at the
+  bottom, under the queued message's notice, so the first part looked lost. Once the chat goes on below the stream, nothing of the agent's goes into
+  the bubble: a status-only bubble floats on until the turn ends, one that already shows words is closed at once, and either
+  way it ends with "The answer follows below, as new messages."; the whole answer then comes below what was said since, every
+  part as a new message, in order. When the chat goes on while the answer is going out, the whole answer is sent again below.
+
 ## 0.13.0
 
 A minor release, because core's exported API changes incompatibly: `groupLangOf` no longer takes the sender's id and
