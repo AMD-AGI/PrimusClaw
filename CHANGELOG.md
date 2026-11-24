@@ -16,7 +16,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 | Release | Tag | Current version |
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
-| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.1 |
+| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.2 |
 | Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.13.0 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
@@ -370,6 +370,13 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: a plugin write (`POST /v1/plugins`, `POST /v1/plugins/upsert`, `PUT`/`PATCH /v1/plugins/:id`,
+  `POST /v1/plugins/:id/new-version`) runs the app manifest's static checks on `resource.app.manifest` and refuses a
+  manifest that fails them with `422 app_manifest_invalid` and its `issues`, writing nothing. A sandbox template with
+  `host_mounts` `readOnly: false`, its own hostPath `volumes`, a system directory such as `/etc` or a `..` segment used
+  to be stored (201) and refused only when an app run was created. Whether a mount lies under a directory the
+  sandbox's workspace grants (`403 sandbox_template_mount_not_granted`) is still checked at app run, where the
+  workspace is known. A write without `resource`, or with no `app` in it, is not checked.
 - Claw: a run whose deadline was more than about 24.8 days away was stopped at once. The Brain stops a run at its
   `deadline_at` with a timer, and Node fires a timer longer than 2^31 - 1 ms after 1 ms; an app run's deadline can be
   its own time limit, which a request or manifest could set that far out. The timer now waits in steps no longer than

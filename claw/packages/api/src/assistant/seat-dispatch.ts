@@ -505,6 +505,9 @@ export async function seatWorkCreate(claims: AssistantTokenClaims, args: SeatCre
  * A `seat_dispatch` card answered (`decideConfirmation`). Allowed: the seat (the one chosen, on a choice card) is checked again and the
  * task sent or queued; a confirmed seat's first press makes it send directly from now on (`auto`), unless the user asked for a card each
  * time or its agent runs unattended. The sandbox chosen: the task becomes a worker's item, under its number. Denied: the task is dropped.
+ * A card for one more instruction (`followup`, to a running task) or for a task that ended (`reopen`) changes nothing until it is
+ * allowed: denied, the task stays as it was; allowed, an ended task is opened again only then, and put back as it ended when nothing
+ * could be sent.
  * What reaches beyond the database (sending, a worker's run) is `after`, run once the decision committed; its outcome is the card's result.
  */
 export async function seatDispatchDecided(
@@ -513,21 +516,35 @@ export async function seatDispatchDecided(
   const params = (row.params ?? {}) as Row;
   const itemId = String(params.item_id ?? "");
   const item = (await q(
-    "SELECT item_id, seq, board_state, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' FOR UPDATE", [itemId, userId],
-  )).rows[0] as { item_id: string; seq: number; board_state: string; params: ErrandParams } | undefined;
-  if (!item || item.board_state === "done") return { result: { ok: false, error: "item_closed", message: "that task was stopped or closed" } };
+    "SELECT item_id, seq, generation, board_state, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' FOR UPDATE",
+    [itemId, userId],
+  )).rows[0] as { item_id: string; seq: number; generation: number; board_state: string; params: ErrandParams } | undefined;
   const followup = typeof params.followup === "string" ? params.followup : null;
+  const reopen = params.reopen && typeof params.reopen === "object" ? params.reopen as { generation?: unknown; new_session?: unknown } : null;
+  if (!item || (item.board_state === "done" && !reopen)) return { result: { ok: false, error: "item_closed", message: "that task was stopped or closed" } };
+  // Only a task the card made (one waiting for it) is dropped by a no; a running or ended task stays as it is.
+  const ownTask = !followup && !reopen;
   if (!allow) {
-    if (!followup) await dropErrand(q, itemId, item.params.lang === "zh" ? "你没有让它交出去" : "the user did not send it");
-    return { result: { ok: true, item_id: itemId, dropped: !followup } };
+    if (ownTask) await dropErrand(q, itemId, item.params.lang === "zh" ? "你没有让它交出去" : "the user did not send it");
+    return { result: { ok: true, item_id: itemId, dropped: ownTask } };
+  }
+  // An ended task's card is for the task as it was shown: one opened again, queued or running since is not reopened a second time.
+  if (reopen && (Number(item.generation) !== Number(reopen.generation) || item.params.queued
+    || (item.board_state !== "done" && Array.isArray(item.params.open_cmd_seqs) && item.params.open_cmd_seqs.length > 0))) {
+    return { result: { ok: false, error: "item_changed", message: "that task changed since the card was shown: nothing was sent; ask the user again" } };
   }
   const seatId = Array.isArray(params.choices) ? String(choice ?? "") : String(params.seat_id ?? "");
   if (seatId === SANDBOX_TARGET) {
     const started = await errandToSandbox(q, userId, item, String(row.session_id));
-    if (!started) return { result: { ok: false, error: "no_credentials", message: "the sandbox cannot be started for this user now" } };
+    if ("error" in started) {
+      // Nothing of it was written; the card is closed, so the task it waited on goes too.
+      const message = "the sandbox cannot be started for this user now";
+      await dropErrand(q, itemId, message);
+      return { result: { ok: false, error: started.error, message } };
+    }
     return {
       result: { ok: true, item_id: itemId, seq: Number(item.seq), to: SANDBOX_TARGET },
-      after: async () => { await drainSessionIfIdle(started, userId).catch(() => undefined); return { ok: true, to: SANDBOX_TARGET }; },
+      after: async () => { await drainSessionIfIdle(started.workerSessionId, userId).catch(() => undefined); return { ok: true, to: SANDBOX_TARGET }; },
     };
   }
   const live = (await seatsLive(userId, undefined, [seatId])).get(seatId);
@@ -539,18 +556,22 @@ export async function seatDispatchDecided(
       ? new ToolRefused("seat_unattended", "that seat's agent now runs unattended, which the card did not say: nothing was sent; ask the user again")
       : null);
   if (refused) {
-    if (!followup) await dropErrand(q, itemId, refused.message);
+    if (ownTask) await dropErrand(q, itemId, refused.message);
     return { result: { ok: false, error: refused.code, message: refused.message } };
   }
   // The first card the user pressed for a confirmed seat, which said so: tasks go to it directly from now on (only when that still holds).
   const saidAuto = Array.isArray(params.choices)
     ? Array.isArray(params.auto_seats) && (params.auto_seats as unknown[]).includes(seatId)
     : params.makes_auto === true;
-  if (saidAuto && !followup && live!.seat.role_state === "confirmed" && live!.seat.confirm_each !== true && !live!.unattended && live!.seat.dispatch_mode !== "auto") {
+  if (saidAuto && ownTask && live!.seat.role_state === "confirmed" && live!.seat.confirm_each !== true && !live!.unattended && live!.seat.dispatch_mode !== "auto") {
     await q("UPDATE claw_devenv_seats SET dispatch_mode = 'auto', auto_since = NOW(), updated_at = NOW() WHERE seat_id = $1 AND owner_user_id = $2",
       [seatId, userId]);
   }
-  if (!followup) {
+  // The ended task opened again now, as the person let it through; how it ended is kept to put it back if nothing can be sent.
+  const prior = reopen
+    ? await reopenErrand(q, itemId, String(params.brief ?? ""), reopen.new_session === true, { by: "card", unattended: live!.unattended })
+    : null;
+  if (ownTask) {
     await q(
       `UPDATE claw_work_items SET params = (params - 'queued' - 'queued_at') || $2::jsonb, updated_at = NOW() WHERE item_id = $1`,
       [itemId, JSON.stringify({
@@ -564,12 +585,20 @@ export async function seatDispatchDecided(
   return {
     result: { ok: true, item_id: itemId, seq: Number(item.seq), seat_id: seatId, alias: live!.seat.alias ?? null },
     after: async () => {
-      const out = followup !== null
-        ? await sendFollowup(userId, itemId, followup, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "card", unattended: live!.unattended })
-        : await dispatchErrand(userId, itemId);
+      const dq: Querier = (t, v) => db.query(t, v);
+      let out: DispatchOutcome | null;
+      try {
+        out = followup !== null
+          ? await sendFollowup(userId, itemId, followup, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "card", unattended: live!.unattended })
+          : await dispatchErrand(userId, itemId);
+      } catch (err) {
+        if (prior) await restoreErrand(dq, itemId, prior).catch(() => undefined);
+        throw err;
+      }
       if (!out) return { ok: false, error: "busy", message: "try again" };
       if ("error" in out) {
-        if (followup === null) await dropErrand((t, v) => db.query(t, v), itemId, out.message);
+        if (prior) await restoreErrand(dq, itemId, prior);
+        else if (ownTask) await dropErrand(dq, itemId, out.message);
         return { ok: false, error: out.error, message: out.message };
       }
       return { ok: true, ...out };
@@ -591,13 +620,18 @@ async function dropErrand(q: Querier, itemId: string, why: string): Promise<void
 
 /**
  * The sandbox chosen on a choice card: the task becomes a worker's item under its own number, with the credentials the user's messages
- * gave their assistant, as `work_create` starts one: its worker session, run once the decision committed.
+ * gave their assistant, as `work_create` starts one: its worker session, run once the decision committed. A first message that cannot be
+ * queued (no key of the user's reached Claw) undoes what was written for it (a savepoint in the decision's transaction), so the item is
+ * never left in progress under a worker that will not start.
  */
-async function errandToSandbox(q: Querier, userId: string, item: { item_id: string; params: ErrandParams }, routerSid: string): Promise<string | null> {
+async function errandToSandbox(
+  q: Querier, userId: string, item: { item_id: string; params: ErrandParams }, routerSid: string,
+): Promise<{ workerSessionId: string } | { error: string }> {
   const router = (await q("SELECT config FROM claw_sessions WHERE session_id = $1", [routerSid])).rows[0] as { config: unknown } | undefined;
   const creds = readTrustedSessionCredentials(router?.config);
   const title = (await q("SELECT title FROM claw_work_items WHERE item_id = $1", [item.item_id])).rows[0]?.title as string;
   const workerSessionId = randomUUID();
+  await q("SAVEPOINT errand_to_sandbox", []);
   await insertSessionRow({ query: q }, {
     sessionId: workerSessionId, name: title, userId, mode: "claw", agentStatus: "idle", systemPrompt: "",
     config: { ...sealedCredentialFields(creds) }, parentSid: null, role: "", model: CLAW_ASSISTANT_WORKER_MODEL || null,
@@ -608,15 +642,21 @@ async function errandToSandbox(q: Querier, userId: string, item: { item_id: stri
     [item.item_id, workerSessionId],
   );
   const queued = await queueServerMessage({ query: q }, { sessionId: workerSessionId, userId, content: String(item.params.brief ?? ""), dedupeKey: `start:${item.item_id}` });
-  return queued.ok ? workerSessionId : null;
+  if (!queued.ok) {
+    await q("ROLLBACK TO SAVEPOINT errand_to_sandbox", []);
+    return { error: queued.error };
+  }
+  await q("RELEASE SAVEPOINT errand_to_sandbox", []);
+  return { workerSessionId };
 }
 
 // --- work_send to a task of a seat --------------------------------------------------------------------------------------------
 
 /**
  * `work_send` to a seat's task: the same say as `work_create` for its seat. Running: one more instruction into its session. Ended
- * (finished within a week, failed, or stopped where it ran): opened again and sent again, as a new task to the same seat. Not sent yet
- * (its card waits, or its queue): nothing is added to what the user was shown.
+ * (finished within a week, failed, or stopped where it ran): opened again and sent again, as a new task to the same seat; put back as it
+ * ended when nothing could be sent. When the seat asks for a card, nothing changes until the card is pressed: an ended task is opened
+ * again only then, and a no leaves it as it ended. Not sent yet (its card waits, or its queue): nothing is added to what the user was shown.
  */
 export async function errandWorkSend(
   claims: AssistantTokenClaims, userId: string, itemId: string, text: string, newSession: boolean,
@@ -660,19 +700,16 @@ export async function errandWorkSend(
     const card = await inTransaction(async (tx) => {
       await assertLiveRun(tx, claims);
       await tx("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [userId]);
-      if (!running) await reopenErrand(tx, itemId, text, newSession, true);
-      const made = await proposeConfirmation(tx, claims, userId, "seat_dispatch", {
+      // The task is left as it is until the card is pressed: an ended one is opened again only then (`seatDispatchDecided`).
+      return proposeConfirmation(tx, claims, userId, "seat_dispatch", {
         item_id: itemId, seat_id: p.seat_id, title: String(item.title ?? ""), brief: text, lang, why_card: why, label: seatLabel(live!),
         unattended: live!.unattended,
-        cwd: flat(live!.seat.cwd, 300), ...(running ? { followup: text } : {}),
+        cwd: flat(live!.seat.cwd, 300),
+        ...(running ? { followup: text } : { reopen: { generation: Number(item.generation), new_session: newSession } }),
       }, {
         text: (ref) => seatCardText({ label: seatLabel(live!), cwd: flat(live!.seat.cwd, 300), brief: text, why, makesAuto: false, unattended: live!.unattended }, ref, zh),
         allowLabel: zh ? "发送" : "Send",
       });
-      if (!running) {
-        await tx("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [itemId, JSON.stringify({ confirmation_id: String(made.row.confirmation_id) })]);
-      }
-      return made;
     });
     if (card.announce) await card.announce();
     return { ok: true, item_id: itemId, seq: Number(item.seq), dispatch: "card", why_card: why, ...proposed(card.row, card.subscribers, "sent", lang) };
@@ -681,13 +718,37 @@ export async function errandWorkSend(
     const out = await sendFollowup(userId, itemId, text, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "auto", unattended: false });
     return { ok: true, item_id: itemId, seq: Number(item.seq), ...dispatchAnswer(out) };
   }
-  await inTransaction(async (tx) => { await reopenErrand(tx, itemId, text, newSession, false); });
-  return { ok: true, item_id: itemId, seq: Number(item.seq), ...dispatchAnswer((await dispatchErrand(userId, itemId))!) };
+  const prior = await inTransaction((tx) => reopenErrand(tx, itemId, text, newSession, { by: "auto" }));
+  let out: DispatchOutcome;
+  try {
+    out = (await dispatchErrand(userId, itemId))!;
+  } catch (err) {
+    await restoreErrand(q, itemId, prior).catch(() => undefined);
+    throw err;
+  }
+  // Refused (its queue full, the seat gone meanwhile): the task is put back as it ended, not left open with nothing sent.
+  if ("error" in out) await restoreErrand(q, itemId, prior);
+  return { ok: true, item_id: itemId, seq: Number(item.seq), ...dispatchAnswer(out) };
 }
 
-/** A seat's task opened again for a new instruction: in progress, a new generation, the instruction its brief; waiting for its card when one is put. */
-async function reopenErrand(q: Querier, itemId: string, text: string, newSession: boolean, card: boolean): Promise<void> {
-  await q(
+/** How a seat's task stood before it was opened again: what `restoreErrand` puts back. */
+interface ErrandBefore {
+  generation: number; board_state: string; outcome: string | null; closed_at: Date | null; last_report_kind: string | null;
+  pending_question: string | null; summary: string; params: Record<string, unknown>;
+}
+
+/**
+ * A seat's task opened again for a new instruction: in progress, a new generation, the instruction its brief, let through as `approved`
+ * says (without a card, or by a card pressed, with its agent as unattended as the card said). Returns how it stood before.
+ */
+async function reopenErrand(
+  q: Querier, itemId: string, text: string, newSession: boolean, approved: { by: "auto" } | { by: "card"; unattended: boolean },
+): Promise<ErrandBefore> {
+  const before = (await q(
+    "SELECT board_state, outcome, closed_at, last_report_kind, pending_question, summary, params FROM claw_work_items WHERE item_id = $1 FOR UPDATE",
+    [itemId],
+  )).rows[0] as Omit<ErrandBefore, "generation">;
+  const reopened = (await q(
     `UPDATE claw_work_items
         SET board_state = 'in_progress', outcome = NULL, closed_at = NULL, last_report_kind = 'progress', pending_question = NULL, summary = '',
             generation = generation + 1,
@@ -695,14 +756,32 @@ async function reopenErrand(q: Querier, itemId: string, text: string, newSession
                        - 'approved' - 'approved_unattended')
                      || $2::jsonb,
             updated_at = NOW()
-      WHERE item_id = $1`,
+      WHERE item_id = $1
+      RETURNING generation`,
     [itemId, JSON.stringify({
       brief: text, open_cmd_seqs: [], open_turns: 0, waiting: [], ...(newSession ? { new_session: true } : {}),
-      ...(card ? { queued: "card", queued_at: new Date().toISOString() } : { approved: "auto" }),
+      ...(approved.by === "card" ? { approved: "card", approved_unattended: approved.unattended } : { approved: "auto" }),
     })],
-  );
+  )).rows[0] as { generation: number };
   await q(`INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary)
            SELECT item_id, 'progress', 'router', generation, $2 FROM claw_work_items WHERE item_id = $1`, [itemId, clipOneLine(text, 200)]);
+  return { ...before, generation: Number(reopened.generation) };
+}
+
+/**
+ * A task opened again whose instruction could not be sent: put back as it stood (its end, result and summary), while nothing of that
+ * instruction went out or waits in a queue. Its generation stays the new one, so a later instruction never reuses the key of this one.
+ */
+async function restoreErrand(q: Querier, itemId: string, before: ErrandBefore): Promise<void> {
+  await q(
+    `UPDATE claw_work_items
+        SET board_state = $3, outcome = $4, closed_at = $5, last_report_kind = $6, pending_question = $7, summary = $8, params = $9::jsonb,
+            updated_at = NOW()
+      WHERE item_id = $1 AND generation = $2 AND NOT (params ? 'queued')
+        AND jsonb_array_length(COALESCE(params->'open_cmd_seqs', '[]'::jsonb)) = 0`,
+    [itemId, before.generation, before.board_state, before.outcome, before.closed_at, before.last_report_kind, before.pending_question,
+      before.summary, JSON.stringify(before.params)],
+  );
 }
 
 // --- the queue going on -------------------------------------------------------------------------------------------------------

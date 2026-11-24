@@ -42,3 +42,18 @@ export class ToolDuplicateError extends ServiceError {}
 export class ToolVersionDuplicateError extends ServiceError {}
 export class PluginDuplicateError extends ServiceError {}
 export class ResourceDuplicateError extends ServiceError {}
+
+/** One problem of an app manifest, with its path (the protocol's `AppManifestIssue`). */
+export interface ManifestIssue {
+  path: string;
+  reason: string;
+}
+
+// A plugin write whose app manifest (`resource.app.manifest`) fails the
+// manifest's static checks. The route answers 422 app_manifest_invalid with
+// the issues, the same refusal an app run of such a plugin gets.
+export class AppManifestInvalidError extends ServiceError {
+  constructor(readonly issues: ManifestIssue[]) {
+    super(`resource.app.manifest is invalid: ${issues.length} issue(s)`);
+  }
+}
