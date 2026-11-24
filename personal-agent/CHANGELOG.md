@@ -19,6 +19,18 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
 
 ### Fixed
 
+- `@primusclaw/personal-agent`: starting a session on a remote agent from a chat that is the agent's own window (the
+  agents card's New session, or `/agent new`) now says "Starting <agent> on <machine> in <folder>…" at once, and that the
+  chat's messages go to the agent (with the unattended warning) only once the agent has started. Before, the switch and
+  the warning were said at the tap, and a start the connector then refused took them back a second later. A start that
+  fails names the folder it was asked for ("could not start in `/path`: that folder does not exist on that machine: pick
+  one that exists there, or create it there first") and says that the messages still go to the bot.
+- `@primusclaw/personal-agent`: a slip of `/agents` (`/agnets`, `/agens`, `/agentss`, `／agents`, `/agents.`) shows the
+  agents card as `/agents` does; it never starts or attaches a session and no longer goes to the assistant as words.
+- `@primusclaw/personal-agent`: the lines that say a chat's messages go back to the bot (a session that could not start,
+  was closed, ended while idle, or was closed in its terminal) use the bot's name in this deployment
+  (`PERSONAL_AGENT_BOT_NAME`), as the rest of the remote-agent lines do, instead of a fixed "PrimusClaw".
+
 - `@primusclaw/personal-agent`: in a group chat with no language set (or set to follow the asker), a message that says no
   language of its own ("help", the bare @mention, `/whoami`, "ok #3") is answered in English. It was answered in the
   sender's own language, the one their 1:1 messages were written in or their Teams client's, so "help" from a member who

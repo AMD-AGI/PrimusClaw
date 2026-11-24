@@ -131,7 +131,6 @@ test("every table sentence and fixed reply has its chinese", () => {
     "approvalAnswered",
     "whichSession",
     "whichSessionOrAgent",
-    "backToPrimusclaw",
   ] as const;
   for (const sentence of new Set([...REFUSALS.values(), ...STATUS_REFUSALS.values(), ...fixed])) {
     assert.ok(CJK.test(saidIn("zh", sentence)), sentence);

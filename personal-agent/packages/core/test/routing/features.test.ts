@@ -473,3 +473,53 @@ test("test_the_net_leaves_alone_what_it_must", async () => {
   assert.deepEqual(w.surface.outbox.filter((r) => r.op === "update").length, 1);
   assert.ok(!said(w).some((t) => t.includes("not active any more")));
 });
+
+test("a slip of /agents shows the list: it never starts or attaches a session and never reaches the assistant", async () => {
+  const lists: string[] = [];
+  const commands: string[] = [];
+  const prompts: string[] = [];
+  const w = world({
+    remote: {
+      enabled: true,
+      attached: () => false,
+      agents: (chat) => {
+        lists.push(chat.id);
+        return Promise.resolve();
+      },
+      agent: (command) => {
+        commands.push(command.args);
+        return Promise.resolve();
+      },
+      prompt: (request) => {
+        prompts.push(request.prompt);
+        return Promise.resolve();
+      },
+    },
+  });
+  link(w, ALICE.id, "ak");
+  const slips = [
+    "/agents",
+    "/Agents",
+    "/agents.",
+    "/agents?",
+    "／agents",
+    "/agnets",
+    "/agens",
+    "/agentss",
+    "/agetns",
+    "/agnet",
+  ];
+  for (const slip of slips) await w.router.handle(message(slip));
+  await w.router.settled();
+  assert.equal(lists.length, slips.length, JSON.stringify({ lists, commands }));
+  assert.deepEqual(commands, []);
+  assert.deepEqual(prompts, []);
+  assert.equal(w.turns.calls.length, 0); // (none went on to the assistant as words)
+  // words that only look like it stay words, and a real subcommand is still one
+  await w.router.handle(message("/agents new codex /x"));
+  await w.router.handle(message("/urgent"));
+  await w.router.handle(message("/agents please"));
+  await w.router.settled();
+  assert.deepEqual(commands, ["new codex /x"]);
+  assert.equal(lists.length, slips.length + 1); // (`/agents please`: words that are no subcommand, the list as before)
+});

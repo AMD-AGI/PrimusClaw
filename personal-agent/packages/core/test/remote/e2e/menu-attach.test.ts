@@ -255,7 +255,7 @@ test("close of the attached session ends the attachment and says so", () =>
     assert.equal(w.server.session(sid).status, "closed");
     assert.equal(w.test.store.remoteState.attachedRemote(AAD), null);
     assert.ok(
-      textsIn(done)[1]?.includes("Closed session 1 in /home/me/repo. Your messages go to PrimusClaw again."),
+      textsIn(done)[1]?.includes("Closed session 1 in /home/me/repo. Your messages go to PrimusClaw Assistant again."),
       textsIn(done).join(" | "),
     );
     // the status card says it, in place

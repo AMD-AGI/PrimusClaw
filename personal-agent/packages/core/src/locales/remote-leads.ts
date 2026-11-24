@@ -10,6 +10,8 @@ type Pair = readonly [zh: string, en: string];
 export const remoteLeads = {
   sessionEnded: ["会话已结束", "The session ended"],
   couldNotStart: ["会话没能启动", "The session could not start"],
+  /** (`folder`: already shown inert, in backticks) */
+  couldNotStartIn: (folder: string): Pair => [`会话没能在 ${folder} 启动`, `The session could not start in ${folder}`],
   turnIncomplete: ["这一轮没有完成", "The turn did not complete"],
   /** (a message the terminal may have taken: never said as a turn that did not complete) */
   inputUnconfirmed: ["还没确认终端收到", "Not confirmed by the terminal yet"],

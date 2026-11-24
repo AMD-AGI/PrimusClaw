@@ -41,7 +41,9 @@ test("a new session refused with mode unavailable says what to do not the code",
     await w.say("/agent new claude /repo");
     const said = w.last();
     assert.ok(
-      said.startsWith("The session could not start: The agent on that machine does not offer the permission mode"),
+      said.startsWith(
+        "The session could not start in `/repo`: The agent on that machine does not offer the permission mode",
+      ),
       said,
     );
     assert.ok(!said.includes("mode_unavailable"));
@@ -49,7 +51,7 @@ test("a new session refused with mode unavailable says what to do not the code",
       said.includes("npm install -g @primusclaw/connector@latest") && said.includes('env = { IS_SANDBOX = "1" }'),
       said,
     );
-    assert.ok(said.endsWith("Your messages go to PrimusClaw again."), said);
+    assert.ok(said.endsWith("Your messages go to PrimusClaw Assistant again."), said);
     assert.equal(w.test.store.remoteState.attachedRemote(AAD), null);
   }));
 
@@ -69,8 +71,8 @@ test("a refusal is said in chinese to a person answered in chinese", () =>
     await w.say("/agent new claude /repo");
     assert.equal(
       w.last(),
-      "会话没能启动：这个目录不在该 agent 允许的 roots 里。换一个 roots 里的目录，或在 agents.toml 的 `roots` 里加上它" +
-        "并重启连接器。 你的消息会重新发给 PrimusClaw。",
+      "会话没能在 `/repo` 启动：这个目录不在该 agent 允许的 roots 里。换一个 roots 里的目录，或在 agents.toml 的 `roots` 里加上它" +
+        "并重启连接器。 你的消息会重新发给 PrimusClaw Assistant。",
     );
   }));
 
@@ -109,7 +111,7 @@ test("a session that ends while idle says why in words", () =>
     const said = w.said().find((t) => t.includes("The session ended")) ?? "";
     assert.ok(said.startsWith("The session ended: The agent program on that machine has exited."), said);
     assert.ok(!said.includes("adapter_gone"));
-    assert.ok(said.includes("Your messages go to PrimusClaw again."), said);
+    assert.ok(said.includes("Your messages go to PrimusClaw Assistant again."), said);
     assert.equal(w.test.store.remoteState.attachedRemote(AAD), null);
   }));
 

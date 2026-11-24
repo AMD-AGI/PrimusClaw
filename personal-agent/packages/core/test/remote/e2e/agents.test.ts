@@ -368,7 +368,7 @@ test("a session that cannot open says why and the chat goes back to claw", () =>
     await w.say("/agent new codex /etc");
     assert.equal(
       w.last(),
-      "The session could not start: cwd is outside the allowed roots. Your messages go to PrimusClaw again.",
+      "The session could not start in `/etc`: cwd is outside the allowed roots. Your messages go to PrimusClaw Assistant again.",
     );
     assert.equal(w.test.store.remoteState.attachedRemote(AAD), null);
   }));

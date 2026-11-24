@@ -37,7 +37,7 @@ export const connectorReasonText = defineCatalog({
       "The agent is not signed in on that machine. Run the agent there once (`claude`, for example) to sign in, then try again.",
     cwd_outside_roots:
       "That directory is outside the roots the agent may work in. Pick one inside them, or add it to `roots` in agents.toml and restart the connector.",
-    cwd_not_found: "That directory does not exist on that machine.",
+    cwd_not_found: "That folder does not exist on that machine: pick one that exists there, or create it there first.",
     cwd_not_directory: "That path is not a directory.",
     cwd_not_absolute: "The directory must be an absolute path (starting with /).",
     invalid_cwd: "That directory name is not valid.",
@@ -151,7 +151,7 @@ export const connectorReasonText = defineCatalog({
     agent_auth_required: "那台机器上的 agent 还没登录。在那台机器上运行一次 agent（例如 `claude`）完成登录，再试。",
     cwd_outside_roots:
       "这个目录不在该 agent 允许的 roots 里。换一个 roots 里的目录，或在 agents.toml 的 `roots` 里加上它并重启连接器。",
-    cwd_not_found: "那台机器上没有这个目录。",
+    cwd_not_found: "那台机器上没有这个目录：选一个那里已有的目录，或者先在那台机器上建好它。",
     cwd_not_directory: "这个路径不是目录。",
     cwd_not_absolute: "目录要写成绝对路径（以 / 开头）。",
     invalid_cwd: "这个目录名无效，换一个目录再试。",

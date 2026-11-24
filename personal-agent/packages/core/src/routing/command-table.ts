@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { agentActionAllowed } from "../capabilities/visibility.js";
-import { parseAgentCommand } from "../commands/agent-args.js";
+import { isAgentsSlip, parseAgentCommand } from "../commands/agent-args.js";
 import { commandArgs, parseCommand, parseTimezone } from "../commands/parse.js";
 import type { CommandRoute } from "../ports/routing.js";
 import type { InboundMessage } from "../ports/surface.js";
@@ -117,7 +117,8 @@ export class CommandTable {
   private async agent(text: string, chat: Chat, key: string, message: InboundMessage | undefined): Promise<boolean> {
     const { remote } = this.ctx.deps;
     const agents = commandArgs(text, "agents");
-    if (agents !== null && parseAgentCommand(agents) === null) {
+    // (a slip of `/agents`, `/agnets` or `／agents`: the list, never a start or an attach, and never words for the assistant)
+    if ((agents !== null && parseAgentCommand(agents) === null) || (remote.enabled && isAgentsSlip(text))) {
       await remote.agents(chat.sender, key, chat.conversation);
       return true;
     }

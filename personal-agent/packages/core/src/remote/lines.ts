@@ -144,8 +144,8 @@ export function readOnlyRefused(lang: Lang, takeover = false): string {
 }
 
 /** The watch is over because the terminal let the conversation go. */
-export function terminalClosedLine(lang: Lang): string {
-  return remoteText.in(lang).terminalClosed;
+export function terminalClosedLine(lang: Lang, bot: string): string {
+  return remoteText.in(lang).terminalClosed({ bot });
 }
 
 /** `dev-pod · 🟠 Claude Code`: which session a chat talks to, in one line. */
