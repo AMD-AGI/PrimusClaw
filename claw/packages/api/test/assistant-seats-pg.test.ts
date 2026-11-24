@@ -382,8 +382,6 @@ describe("seats", { skip }, () => {
     assert.equal(sent[0]!.session_id, sid);
     assert.deepEqual(sent[0]!.payload, { text: seats.probeText("en"), answer_only: true });
     assert.match(String(sent[0]!.payload.text), /^\(Your assistant, read-only: asked once/, "it says who asks and why, for a chat attached to the session");
-    assert.match(seats.probeText("en", "Robo Helper"), /^\(Robo Helper, read-only: asked once to learn what this folder's session is for;/);
-    assert.match(seats.probeText("zh", "小助手"), /^（小助手 只读询问：只问这一次/);
     assert.match(String(sent[0]!.cmd_id), /^seat-probe:seat_/);
     const asked = (await w.q("SELECT data FROM claw_remote_events WHERE session_id = $1 AND type = 'user_prompt'", [sid]))[0]!.data;
     assert.equal(asked.client, seats.PROBE_CLIENT, "marked as Claw's question, not the user's");

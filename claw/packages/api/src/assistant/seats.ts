@@ -37,7 +37,7 @@ import { callMemoryLLM } from "../llm/client.js";
 import { issueCommand, listConnectors, sessionActivity, wakeConnector, workspacesOf, type Row } from "../remote-agents/store.js";
 import { inertMd, readSession } from "./devenv-tools.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
-import { assistantNameOf } from "./assistant-name.js";
+import { briefLanguage } from "./brief.js";
 import { langOf } from "./remote-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
@@ -89,38 +89,24 @@ export const ROSTER_MAX = 40;
 const REFRESH_MIN_MS = 60 * 60_000;
 
 /**
- * The one question a seat's session is ever asked, in the user's language. It opens with a plain line saying who asks (the assistant,
- * by the name the user's client calls it, else "your assistant") and why: a chat attached to that session shows the question and its
- * answer like any other turn.
+ * The one question a seat's session is ever asked, word for word, in the user's language. It opens with a plain line saying who asks
+ * ("your assistant": no name a client sends goes into it) and why: a chat attached to that session shows the question and its answer
+ * like any other turn.
  */
-export const PROBE_QUESTIONS = {
-  en: "Please describe in two or three sentences what you are responsible for in this directory and what you have been working on "
+export const PROBE_TEXTS = {
+  en: "(Your assistant, read-only: asked once to learn what this folder's session is for; nothing will be changed.)\n\n"
+    + "Please describe in two or three sentences what you are responsible for in this directory and what you have been working on "
     + "recently. Only answer; do not run any tool or change anything.",
-  zh: "请用两三句话说明你在这个目录里负责什么、最近在做什么。只回答，不要运行任何工具，也不要改动任何东西。",
+  zh: "（你的助手 只读询问：只问这一次，用来了解这个目录里的会话负责什么；不会改动任何东西。）\n\n"
+    + "请用两三句话说明你在这个目录里负责什么、最近在做什么。只回答，不要运行任何工具，也不要改动任何东西。",
 } as const;
-/** What marks the opening line in each language (also in a transcript's echo of it, which is never the user's words). */
-const PROBE_MARKS = { en: ", read-only: asked once to learn what this folder", zh: " 只读询问：只问这一次" } as const;
-/** The question in `lang`, from the assistant called `name` (a name `assistantNameOf` kept; none: "your assistant"). */
-export function probeText(lang: "zh" | "en", name?: string): string {
-  return lang === "zh"
-    ? `（${name ?? "你的助手"}${PROBE_MARKS.zh}，用来了解这个目录里的会话负责什么；不会改动任何东西。）\n\n${PROBE_QUESTIONS.zh}`
-    : `(${name ?? "Your assistant"}${PROBE_MARKS.en}'s session is for; nothing will be changed.)\n\n${PROBE_QUESTIONS.en}`;
-}
-/** Whether a prompt's start (`flat`, cut to PROMPT_HEAD) is the question, as a transcript echoes it. */
+/** The question in `lang`. */
+export const probeText = (lang: "zh" | "en"): string => PROBE_TEXTS[lang];
+/** Whether a prompt's start (`flat`, cut to PROMPT_HEAD) is the question, as a transcript echoes it (never the user's words). */
 const isProbe = (head: string): boolean => {
   const h = head.replace(/…$/, "");
-  return h.includes("read-only: asked once") || h.includes("只读询问：只问这一次")
-    || Object.values(PROBE_QUESTIONS).some((q) => q.startsWith(h));
+  return Object.values(PROBE_TEXTS).some((t) => flat(t, 4096)!.startsWith(h));
 };
-/** The language and the assistant's name the question is put in: those of the user's latest message (none: English, no name). */
-async function probeVoice(owner: string): Promise<{ lang: "zh" | "en"; name?: string }> {
-  const row = (await db.query(
-    `SELECT content, channel_context->>'assistant_name' AS name FROM claw_assistant_messages WHERE user_id = $1
-      ORDER BY received_at DESC LIMIT 1`, [owner],
-  )).rows[0] as { content: string; name: string | null } | undefined;
-  const name = assistantNameOf(row?.name);
-  return { lang: row && /\p{Script=Han}/u.test(row.content) ? "zh" : "en", ...(name ? { name } : {}) };
-}
 /** The client the question is sent as: what marks it, in the session's events (`user_prompt.client`), as Claw's and not the user's. */
 export const PROBE_CLIENT = "seat_probe";
 /** The command id of a seat's `n`th question. */
@@ -767,8 +753,7 @@ async function probeOutcome(q: Querier, seat: Row, now: number): Promise<{ state
  */
 async function ask(seat: Row, activity: Row): Promise<boolean> {
   const n = Number(seat.probes_sent) + 1;
-  const voice = await probeVoice(String(seat.owner_user_id));
-  const parsed = REMOTE_COMMANDS.prompt.parse({ text: probeText(voice.lang, voice.name), answer_only: true });
+  const parsed = REMOTE_COMMANDS.prompt.parse({ text: probeText(await briefLanguage(String(seat.owner_user_id))), answer_only: true });
   if (!parsed.ok) return false;
   const out = await issueCommand({
     owner: String(seat.owner_user_id), client: PROBE_CLIENT, connectorId: String(seat.connector_id), agentId: String(activity.agent_id),
