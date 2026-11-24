@@ -26,7 +26,7 @@
  */
 import { createHash } from "node:crypto";
 import pino from "pino";
-import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS } from "@claw/protocol";
+import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_EVENT_USER_PROMPT } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
@@ -84,6 +84,13 @@ const TURN_EVENTS = new Set([
 
 interface ActivityEvent { type: string; occurred_at: string; text: string; action_id: string | null; stop: string | null; replay: boolean }
 
+/**
+ * A turn the agent took by itself (no prompt since the last `turn_end`: Claude Code answering a command it put in the background) counts
+ * as under way for at most this long after its last event. A connector from 0.3.3 on ends such a turn with a `turn_end` of its own
+ * (`agent_initiated`); an older one never does, and its session would read as working for good.
+ */
+export const AGENT_TURN_QUIET_MS = 5 * 60_000;
+
 export interface SessionReading {
   state: Exclude<DevenvState, "in_terminal" | "unknown">;
   /** The tool step it is on (working) or last took. */
@@ -101,7 +108,7 @@ export interface SessionReading {
  * A permission asked and not yet resolved means it waits for the user; events after the last `turn_end`, or a prompt its
  * connector has not yet collected, mean a turn is under way; anything else is idle.
  */
-export function readSession(events: ActivityEvent[], queued: number): SessionReading {
+export function readSession(events: ActivityEvent[], queued: number, now: number = Date.now()): SessionReading {
   const pending = new Set<string>();
   let lastEnd = -1;
   let prevEnd = -1;
@@ -113,7 +120,15 @@ export function readSession(events: ActivityEvent[], queued: number): SessionRea
     else if (e.type === "turn_end") { prevEnd = lastEnd; lastEnd = i; lastStop = e.stop; }
   });
   const live = events.slice(lastEnd + 1).filter((e) => !e.replay);
-  const working = queued > 0 || live.some((e) => TURN_EVENTS.has(e.type));
+  const activity = live.filter((e) => TURN_EVENTS.has(e.type));
+  let working = queued > 0 || activity.length > 0;
+  // Nothing was asked since the last end (no prompt of Claw's, `user_prompt`): what came is a turn the agent took by itself, which an
+  // older connector never ends. Once it has been quiet for AGENT_TURN_QUIET_MS (and asks nothing) it is over. Only when that end is in
+  // the window read: without it a prompt may be further back than the window.
+  if (working && queued === 0 && lastEnd >= 0 && pending.size === 0 && !live.some((e) => e.type === REMOTE_EVENT_USER_PROMPT)) {
+    const last = Date.parse(activity[activity.length - 1]!.occurred_at);
+    if (Number.isFinite(last) && now - last > AGENT_TURN_QUIET_MS) working = false;
+  }
   // The turn to describe: the one under way, else the last that ended.
   const turn = working ? live : events.slice(prevEnd + 1, lastEnd + 1).filter((e) => !e.replay);
   const step = [...turn].reverse().find((e) => e.type === "tool_call" && e.text)?.text ?? null;

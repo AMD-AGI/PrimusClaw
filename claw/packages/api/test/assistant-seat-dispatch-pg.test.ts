@@ -27,6 +27,9 @@
  *   D20 one more instruction to a finished task, on a seat that asks first: the task is unchanged until the card is pressed; a no, a
  *       lapse and the sweep keep its result; a yes opens it again and sends; a second card pressed after that sends nothing
  *   D21 a finished task opened again whose instruction cannot be sent (its seat's queue full) is put back as it ended
+ *   D22 a turn the seat's agent takes by itself after a task ended (a command it put in the background finished): the seat is busy
+ *       while it runs; its end (`agent_initiated`) frees the seat, the queue goes on, and its answer is said once as a late word of
+ *       that task (never of the next one); from an older connector, which never ends it, the seat is free once it has been quiet
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -785,6 +788,72 @@ describe("seat dispatch", { skip }, () => {
     const back = await item(done.item_id);
     assert.deepEqual(ended(back).filter((_, i) => i !== 4), was.filter((_, i) => i !== 4), "its end, answer and brief are back");
     assert.equal(back.params.queued, undefined);
+  });
+
+  test("D22 a turn the agent takes by itself after a task: busy while it runs, its end frees the seat and is said as a late word of that task", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const long = await create(await userTurn(alice, "跑 sleep 60"), `seat:${s.seatId}`, "跑 sleep 60");
+    assert.equal(long.dispatch, "sent");
+    const seq = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [chunk("已放到后台运行，完成后会告诉你。"), ["turn_end", { stopReason: "end_turn", cmd_id: "x", cmd_seq: seq }]]);
+    assert.equal((await item(long.item_id)).board_state, "done");
+    // The command finishes and the agent answers it, on its own.
+    await events("alice", cid, s.sid, [
+      ["tool_call_update", { update: { sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed" } }], chunk("long-0357A978"),
+    ]);
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "working");
+    const second = await create(await userTurn(alice, "再跑 echo"), `seat:${s.seatId}`, "跑 echo");
+    assert.deepEqual([second.dispatch, second.queued_reason], ["queued", "seat_busy"]);
+    // Its end (connector 0.3.3 on): the seat is free and the queued task goes; the answer is the long task's, said once.
+    const end: [string, Recorded] = ["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true, ended_by: "result" }];
+    await events("alice", cid, s.sid, [["usage_update", { update: { sessionUpdate: "usage_update", used: 1, size: 2, cost: { amount: 0.01, currency: "USD" } } }], end]);
+    const sent = await item(second.item_id);
+    assert.equal(sent.params.queued, undefined, JSON.stringify(sent.params));
+    assert.equal(sent.params.session_id, s.sid);
+    const late = (await notices()).filter((n) => n.remote.item_seq === long.seq);
+    assert.equal(late.length, 1, JSON.stringify(await notices()));
+    assert.equal(late[0]!.remote.kind, "done");
+    assert.match(late[0]!.text, /long-0357A978/);
+    assert.doesNotMatch(late[0]!.text, /已放到后台/, "only what it said in that turn");
+    const it = await item(long.item_id);
+    assert.deepEqual([it.board_state, it.outcome, it.summary], ["done", "answered", "long-0357A978"]);
+    assert.equal(it.params.agent_turn_seen > 0, true);
+    // The next task's prompt is out; another own turn of the agent's now (its prompt took it over) is still the long task's word.
+    await collect(cid);
+    await events("alice", cid, s.sid, [chunk("又补一句"), ["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true }]]);
+    assert.equal((await notices()).filter((n) => n.remote.item_seq === long.seq).length, 2);
+    assert.equal((await notices()).filter((n) => n.remote.item_seq === second.seq).length, 0);
+    const two = await item(second.item_id);
+    assert.deepEqual([two.board_state, two.params.open_cmd_seqs.length], ["in_progress", 1], "the next task's turn is not ended by it");
+    // Posted again (a retry): nothing said twice.
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    assert.equal((await notices()).filter((n) => n.remote.item_seq === long.seq).length, 2);
+  });
+
+  test("D22 an older connector never ends the agent's own turn: once it has been quiet, the seat is free and the sweep sends what waits", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const long = await create(await userTurn(alice, "跑 sleep 60"), `seat:${s.seatId}`, "跑 sleep 60");
+    const seq = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [chunk("已放到后台"), ["turn_end", { stopReason: "end_turn", cmd_id: "x", cmd_seq: seq }], chunk("long-0357A978")]);
+    const second = await create(await userTurn(alice, "再跑 echo"), `seat:${s.seatId}`, "跑 echo");
+    assert.equal(second.dispatch, "queued");
+    await dispatch.runErrandSweep("alice");
+    assert.equal((await item(second.item_id)).params.queued, "seat_busy", "still fresh: still busy");
+    const { AGENT_TURN_QUIET_MS } = await import("../src/assistant/devenv-tools.js");
+    await w.q("UPDATE claw_remote_events SET occurred_at = NOW() - make_interval(secs => $2::float8) WHERE session_id = $1 AND type <> 'user_prompt'",
+      [s.sid, AGENT_TURN_QUIET_MS / 1000 + 60]);
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "queued");
+    await dispatch.runErrandSweep("alice");
+    const sent = await item(second.item_id);
+    assert.equal(sent.params.queued, undefined, JSON.stringify(sent.params));
+    assert.equal((await item(long.item_id)).board_state, "done");
   });
 
   test("D12 the prompt asks for parking only from a connector that can park", async () => {

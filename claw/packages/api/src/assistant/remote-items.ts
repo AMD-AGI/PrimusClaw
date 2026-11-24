@@ -890,6 +890,8 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
     for (const e of events) {
       p.last_event_id = e.id;
       if (errandOwns(e, errandSeqs, errandRunning)) continue;
+      // The end of a turn the agent took by itself ends no instruction of the item's (`agentInitiated`).
+      if (agentInitiated(e)) continue;
       // A connector that names the prompt a turn's end ends (`cmd_seq`, null for a cancel that found nothing running) is followed by
       // name, while the item knows every prompt open by its number. A turn's end, or a refusal of a prompt that never runs, that names
       // none (an older connector) makes the item count them instead, as it did before names were kept.
@@ -1359,6 +1361,8 @@ export interface ErrandParams extends RemoteParams {
    */
   approved?: "auto" | "card";
   approved_unattended?: boolean;
+  /** The last turn its agent took by itself that was said as a late word of this task, or of another of its session (`applyAgentTurns`). */
+  agent_turn_seen?: number;
   /** An end recorded and not yet reported (`ingestReport` runs after the commit; the sweep retries what it missed). */
   report_due?: { kind: "answer" | "failed"; summary: string; generation: number };
 }
@@ -1410,6 +1414,93 @@ export function errandNotice(kind: ErrandNoticeKind, p: Partial<ErrandParams>, s
     case "asks_waiting":
       return zh ? `还有 ${extra.waiting ?? 0} 个交给工位的事项在等你批准，见事项列表。` : `${extra.waiting ?? 0} more seat tasks are waiting for your approval; see your items.`;
   }
+}
+
+/**
+ * A `turn_end` of a turn the agent took by itself (connector 0.3.3 and later, session.ts `agentTurn`): Claude Code answering a command
+ * it put in the background, once that finished. It names no prompt (`cmd_seq: null`) and ends none.
+ */
+const agentInitiated = (e: MovingEvent): boolean => e.type === REMOTE_EVENT_TURN_END && e.data.agent_initiated === true;
+
+/** How many of a session's turns the agent took by itself one pass reads, and how much of each one's answer a message says. */
+const AGENT_TURNS_PER_PASS = 20;
+const AGENT_TURN_ANSWER_MAX = 1500;
+
+/**
+ * The turns the seat's agent took by itself after a task's turn ended (a command it put in the background finished, and it answered
+ * that): each one's answer is said once, as a late word of the task whose turn ended last before it (the prompt that turn's end names,
+ * `cmd_id` `k:errand:<item>:…`), and kept on that item. A turn with no answer text says nothing. Read from the session's events after
+ * the last one any task of the session took (`agent_turn_seen`).
+ */
+async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice[]> {
+  // Most posts bring none: looked at without a lock first.
+  const any = (await db.query(
+    `SELECT 1 FROM claw_remote_events e
+      WHERE e.session_id = $1::uuid AND e.type = $3 AND e.data->>'agent_initiated' = 'true'
+        AND e.id > (SELECT COALESCE(MAX((w.params->>'agent_turn_seen')::bigint), 0) FROM claw_work_items w
+                     WHERE w.user_id = $2 AND w.kind = 'remote' AND w.params->>'errand' = 'true' AND w.params->>'session_id' = $1::text)
+      LIMIT 1`,
+    [sessionId, owner, REMOTE_EVENT_TURN_END],
+  )).rows.length > 0;
+  if (!any) return [];
+  return inTransaction(async (q) => {
+    const items = (await q(
+      `SELECT w.item_id, w.seq, w.board_state, w.params, a.session_id AS router_sid
+         FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id
+        WHERE w.user_id = $1 AND w.kind = 'remote' AND w.params->>'errand' = 'true' AND w.params->>'session_id' = $2
+          AND w.params ? 'dispatched_at'
+        ORDER BY w.seq FOR UPDATE OF w`,
+      [owner, sessionId],
+    )).rows as Array<{ item_id: string; seq: number; board_state: string; params: ErrandParams; router_sid: string }>;
+    if (!items.length) return [];
+    const seen = Math.max(0, ...items.map((i) => Number(i.params.agent_turn_seen) || 0));
+    const ends = (await q(
+      `SELECT e.id,
+              (SELECT u.data->>'cmd_id' FROM claw_remote_events t
+                 JOIN claw_remote_events u ON u.session_id = t.session_id AND u.type = $4 AND u.data->>'cmd_seq' = t.data->>'cmd_seq'
+                WHERE t.session_id = e.session_id AND t.type = $3 AND t.id < e.id AND jsonb_typeof(t.data->'cmd_seq') = 'number'
+                ORDER BY t.id DESC LIMIT 1) AS cmd_id
+         FROM claw_remote_events e
+        WHERE e.session_id = $1 AND e.id > $2 AND e.type = $3 AND e.data->>'agent_initiated' = 'true' AND COALESCE(e.data->>'replay', '') <> 'true'
+        ORDER BY e.id LIMIT $5`,
+      [sessionId, seen, REMOTE_EVENT_TURN_END, REMOTE_EVENT_USER_PROMPT, AGENT_TURNS_PER_PASS],
+    )).rows as Array<{ id: string; cmd_id: string | null }>;
+    if (!ends.length) return [];
+    const notices: Notice[] = [];
+    // Whose it is: the task the prompt of the last turn that ended before it was sent for; else the task sent there last.
+    const latest = [...items].sort((a, b) => String(a.params.dispatched_at).localeCompare(String(b.params.dispatched_at)) || a.seq - b.seq).at(-1)!;
+    const touched = new Map<string, number>();
+    for (const end of ends) {
+      const id = Number(end.id);
+      const named = /^k:errand:([^:]+):/.exec(String(end.cmd_id ?? ""))?.[1];
+      const item = items.find((i) => i.item_id === named) ?? latest;
+      touched.set(item.item_id, id);
+      const whole = await answerOf(q, sessionId, id);
+      const answer = tailLines(whole, AGENT_TURN_ANSWER_MAX);
+      if (!answer) continue;
+      const p = item.params;
+      const zh = p.lang === "zh";
+      await q(
+        `INSERT INTO claw_work_item_events (item_id, kind, source, generation, summary, result)
+         SELECT item_id, 'answer', 'remote', generation, $2, $3::jsonb FROM claw_work_items WHERE item_id = $1`,
+        [item.item_id, tailOf(whole, ANSWER_EVENT_MAX), storableJsonText({ agent_initiated: true, remote_event_id: id })],
+      );
+      // A task that is over keeps the last thing its agent said of it, so the item list answers "did it finish?".
+      if (item.board_state === "done") {
+        await q("UPDATE claw_work_items SET summary = $2, updated_at = NOW() WHERE item_id = $1", [item.item_id, tailOf(whole, SUMMARY_MAX)]);
+      }
+      const seat = p.seat_id ? { seat_id: p.seat_id, alias: typeof p.alias === "string" ? p.alias : null } : undefined;
+      notices.push({
+        userId: owner, routerSid: item.router_sid, itemId: undefined, key: `remote:${item.item_id}:agent-turn:${id}`,
+        text: zh ? `#${item.seq} ${errandWho(p)} 在后台的工作结束后又回复了：\n${answer}` : `#${item.seq} ${errandWho(p)} followed up once its background work finished:\n${answer}`,
+        remote: { kind: "done", session_id: sessionId, machine: p.machine, agent: p.agent_id, item_seq: Number(item.seq), ...(seat ? { seat } : {}) },
+      });
+    }
+    for (const [itemId, id] of touched) {
+      await q("UPDATE claw_work_items SET params = params || jsonb_build_object('agent_turn_seen', $2::bigint) WHERE item_id = $1", [itemId, id]);
+    }
+    return notices;
+  });
 }
 
 /** The seq numbers of the prompts sent to this session as seat tasks (from their `user_prompt` events): never the session item's. */
@@ -1761,7 +1852,15 @@ async function noteErrandEvents(owner: string, sessionId: string): Promise<boole
     logger.warn({ err, sessionId }, "assistant.errand_update_failed");
     return false;
   }
-  if (!pass) return false;
+  const late = await applyAgentTurns(owner, sessionId).catch((err) => {
+    logger.warn({ err, sessionId }, "assistant.errand_agent_turn_failed");
+    return [] as Notice[];
+  });
+  for (const n of late) {
+    await recordSystemNotice({ userId: n.userId, sessionId: n.routerSid, text: n.text, key: n.key, itemId: n.itemId, remote: n.remote })
+      .catch((err) => logger.warn({ err, key: n.key }, "assistant.errand_notice_failed"));
+  }
+  if (!pass) return late.length > 0;
   for (const n of pass.notices) {
     await recordSystemNotice({ userId: n.userId, sessionId: n.routerSid, text: n.text, key: n.key, itemId: n.itemId, remote: n.remote })
       .catch((err) => logger.warn({ err, itemId: n.itemId }, "assistant.errand_notice_failed"));
