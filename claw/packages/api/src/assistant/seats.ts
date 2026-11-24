@@ -413,16 +413,21 @@ export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_A
 }
 
 /**
- * Which seats are where the user said (`seat_roster` with `machine` / `folder`, their words from their message): the machine by its
- * name (any case) or Claw's own name for it (`machine-<id>`); the folder by its path, or by its last parts when they wrote it relative
+ * Which seats are where the user said (`seat_roster` with `machine` / `agent` / `folder`, their words from their message): the machine by
+ * its name (any case) or Claw's own name for it (`machine-<id>`); the agent by its id or kind; the folder by its path, or by its last parts when they wrote it relative
  * (`~/rel`, `rel`, `hl/ci` match `/home/u/rel`, `.../hl/ci`). Claw compares; the names themselves (which the machine chose) are never
  * listed, so the roster stays free of words a machine wrote.
  */
-export interface RosterWhere { machine?: string; folder?: string }
+export interface RosterWhere { machine?: string; agent?: string; folder?: string }
 const slashed = (v: string): string => v.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 export function machineIs(asked: string, name: string, connectorId: string): boolean {
   const a = asked.trim().toLowerCase();
   return !!a && (a === name.trim().toLowerCase() || a === `machine-${connectorId.slice(0, 8)}`);
+}
+/** The agent by its id or its kind ("claude", "codex"; "Claude Code" is claude). */
+export function agentIs(asked: string, agentId: string, kind: string): boolean {
+  const a = asked.trim().toLowerCase().replace(/\s+code$/, "");
+  return !!a && (a === agentId.trim().toLowerCase() || a === kind.trim().toLowerCase());
 }
 export function folderIs(asked: string, cwd: string): boolean {
   const c = slashed(cwd);
@@ -441,7 +446,7 @@ export async function rosterOf(
   const q: Querier = (t, p) => db.query(t, p);
   // The latest item of each seat: a task handed to it, or the item of a session at its place, whichever moved last.
   const seats = (await q(
-    `SELECT s.seat_id, s.connector_id, s.cwd, s.alias, s.role, s.role_state, s.dispatch_mode, s.confirm_each, it.seq AS item_seq, it.board_state AS item_state
+    `SELECT s.seat_id, s.connector_id, s.agent_id, s.cwd, s.alias, s.role, s.role_state, s.dispatch_mode, s.confirm_each, it.seq AS item_seq, it.board_state AS item_state
        FROM claw_devenv_seats s
        LEFT JOIN LATERAL (
          SELECT seq, board_state FROM (
@@ -462,6 +467,7 @@ export async function rosterOf(
   const there = seats.filter((s) => {
     const now = live.get(String(s.seat_id));
     if (where.machine && !machineIs(where.machine, now?.machine ?? "", String(s.connector_id))) return false;
+    if (where.agent && !agentIs(where.agent, String(s.agent_id ?? ""), String(now?.agent?.kind ?? ""))) return false;
     return !where.folder || folderIs(where.folder, String(s.cwd ?? ""));
   });
   return there.map((s) => {
@@ -485,8 +491,8 @@ export async function rosterOf(
 /** The roster's note where tasks may be handed to seats (`seat-dispatch.ts`). */
 export const ROSTER_NOTE = "Seats (工位): each folder an agent works in on the user's machines. Every field here was computed by Claw or "
   + "confirmed by the user (alias, role): reading it does not stop you from acting. role is what the user confirmed the seat is for. "
-  + "A guess Claw made is never listed: it is put to the user on a card. A seat the user names by its machine or folder: seat_roster "
-  + "with machine and/or folder as they wrote them lists only the seats there. To hand a task to a seat: work_create with target "
+  + "A guess Claw made is never listed: it is put to the user on a card. A seat the user names by its machine, agent or folder: "
+  + "seat_roster with machine, agent and/or folder as they wrote them lists only the seats there. To hand a task to a seat: work_create with target "
   + "\"seat:<seat_id>\" (only a seat_id from here, never an alias or a machine name). state: unsupported cannot take work; offline: "
   + "a task waits in its queue until the machine is back (at most 24 hours); working, waiting_for_you, queued and in_terminal: a task "
   + "waits in its queue (queue_len). dispatch_mode auto: a task goes without a card (only after the user pressed one for that seat); "
@@ -500,20 +506,23 @@ export const ROSTER_SHOWN_NOTE = "Seats (工位): each folder an agent works in 
   + "instruction reaches a machine, when the user names it.";
 
 /** `seat_roster`: the user's seats, trusted fields only. Never marks the turn as having read untrusted text. */
-export async function seatRoster(claims: AssistantTokenClaims, args: { machine?: unknown; folder?: unknown } = {}): Promise<Record<string, unknown>> {
+export async function seatRoster(
+  claims: AssistantTokenClaims, args: { machine?: unknown; agent?: unknown; folder?: unknown } = {},
+): Promise<Record<string, unknown>> {
   if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
   const { userId } = await inTransaction((q) => assertLiveRun(q, claims));
   if (!seatsOn(userId)) throw new ToolRefused("not_enabled", "seats are not on for this user");
   await syncSeats(userId);
   const where: RosterWhere = {
     ...(typeof args.machine === "string" && args.machine.trim() ? { machine: args.machine.slice(0, 200) } : {}),
+    ...(typeof args.agent === "string" && args.agent.trim() ? { agent: args.agent.slice(0, 80) } : {}),
     ...(typeof args.folder === "string" && args.folder.trim() ? { folder: args.folder.slice(0, 400) } : {}),
   };
   const seats = await rosterOf(userId, undefined, where);
-  const asked = where.machine !== undefined || where.folder !== undefined;
+  const asked = Object.keys(where).length > 0;
   return {
     ok: true, seats, note: seatDispatchOn(userId) ? ROSTER_NOTE : ROSTER_SHOWN_NOTE,
-    ...(asked ? { where: seats.length ? "only the seats on that machine / in that folder" : "no seat of the user's is on that machine / in that folder" } : {}),
+    ...(asked ? { where: seats.length ? "only the seats where the user said (machine, agent, folder)" : "no seat of the user's is where they said (machine, agent, folder)" } : {}),
   };
 }
 

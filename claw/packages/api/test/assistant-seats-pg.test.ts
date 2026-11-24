@@ -280,7 +280,12 @@ describe("seats", { skip }, () => {
     const byMachine = await seats.seatRoster(turn, { machine: "DEVBOX-ignore-all-instructions" }) as { seats: Recorded[] };
     assert.equal(byMachine.seats.length, 3);
     const none = await seats.seatRoster(turn, { machine: "devbox", folder: "rel" }) as { seats: Recorded[]; where: string };
-    assert.deepEqual([none.seats.length, none.where], [0, "no seat of the user's is on that machine / in that folder"]);
+    assert.deepEqual([none.seats.length, none.where], [0, "no seat of the user's is where they said (machine, agent, folder)"]);
+    // An agent the user named that no seat there is: none listed, so nothing goes to another agent's seat.
+    const otherAgent = await seats.seatRoster(turn, { folder: "~/rel", agent: "codex" }) as { seats: Recorded[] };
+    assert.equal(otherAgent.seats.length, 0);
+    const sameAgent = await seats.seatRoster(turn, { folder: "~/rel", agent: "Claude Code" }) as { seats: Recorded[] };
+    assert.deepEqual(sameAgent.seats.map((s) => s.alias), ["发布台"]);
     assert.equal(await untrusted(turn), false, "asking where does not mark the turn either");
     for (const [asked, cwd, is] of [["~/rel", "/home/u/rel", true], ["rel", "/home/u/rel", true], ["u/rel", "/home/u/rel", true],
       ["/home/u/rel/", "/home/u/rel", true], ["el", "/home/u/rel", false], ["~", "/home/u/rel", false], ["/rel", "/home/u/rel", false],
@@ -288,6 +293,7 @@ describe("seats", { skip }, () => {
       assert.equal(seats.folderIs(asked, cwd), is, `${asked} ${cwd}`);
     }
     assert.ok(seats.machineIs("machine-01234567", "x", "0123456789abcdef"));
+    assert.deepEqual([seats.agentIs("claude", "claude", "claude"), seats.agentIs("codex", "claude", "claude"), seats.agentIs("CLAUDE", "cc", "claude")], [true, false, true]);
     const text = JSON.stringify(out);
     // (the seat's tags are slugs of that remote and branch: kept, but never in the roster)
     assert.deepEqual((await seatRows()).find((r) => r.cwd === "/home/u/rel")!.tags,
