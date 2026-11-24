@@ -137,6 +137,19 @@ export const REMOTE_EVENT_PERMISSION_REQUEST = "permissionRequest";
 export const REMOTE_EVENT_PERMISSION_RESOLVED = "permission_resolved";
 export const REMOTE_EVENT_SESSION_CLOSED = "session_closed";
 /**
+ * A permission request of a turn sent with `park_permissions` outlived the connector's own wait (`permissionTtlMs`): instead of refusing
+ * it, the connector keeps it open until `parked_until` (at most {@link PERMISSION_PARK_MAX_MS} after it was asked), still answerable and
+ * cancellable as before. Data: `{actionId, cmd_seq, parked_until}` (`cmd_seq`: the prompt of the turn that asked, null when not known).
+ * When the park ends unanswered the connector refuses it and posts `permission_resolved` with `by: "park_expired"`.
+ */
+export const REMOTE_EVENT_PERMISSION_PARKED = "permission_parked";
+/** The longest a connector keeps a parked permission request open (see {@link REMOTE_EVENT_PERMISSION_PARKED}). */
+export const PERMISSION_PARK_MAX_MS = 24 * 3600_000;
+/**
+ * `permissionRequest` and `permission_parked` carry `cmd_seq`: the prompt of the turn that asked (absent from connector 0.3.1 and
+ * older). `permission_resolved.by` is `park_expired` when a parked request's park ended unanswered.
+ */
+/**
  * A turn of a conversation open in a terminal ended while nobody was at that terminal, posted on the conversation's terminal-hook
  * session (`origin` "terminal_hook") by its connector: `{ref, outcome: "done" | "error", error?, message, agent, cwd, ended_at,
  * away_ms}`. `message` is the end of what the agent last said (untrusted text); `error` names why a turn that failed did
@@ -726,13 +739,24 @@ export const REMOTE_COMMANDS: Record<RemoteCommandType, RemoteCommandSpec> = {
       if (typeof text !== "string" || text.trim() === "") return fail("text_required");
       if (new TextEncoder().encode(text).length > REMOTE_AGENT_LIMITS.maxPromptBytes) return fail("prompt_too_large");
       if (body.answer_only !== undefined && body.answer_only !== null && typeof body.answer_only !== "boolean") return fail("invalid_answer_only");
+      if (body.park_permissions !== undefined && body.park_permissions !== null && typeof body.park_permissions !== "boolean") {
+        return fail("invalid_park_permissions");
+      }
       const files = parsePromptFiles(body.files);
       if (!files.ok) return files;
       // `answer_only`: the turn only answers. A connector that knows it (the agent capability `answer_only`) refuses every permission
       // the agent asks for in that turn on the machine, so nothing is changed or run there; one that does not ignores the field and asks as always.
       return {
         ok: true,
-        value: { text, ...(files.value.length ? { files: files.value } : {}), ...(body.answer_only === true ? { answer_only: true } : {}) },
+        // `park_permissions`: a permission request of this turn that nobody answers in the connector's own wait is parked rather than
+        // refused (`permission_parked`). Claw sends it only to an agent with the capability `permission_park`; one that does not know it
+        // ignores the field and refuses at its timeout as always.
+        value: {
+          text,
+          ...(files.value.length ? { files: files.value } : {}),
+          ...(body.answer_only === true ? { answer_only: true } : {}),
+          ...(body.park_permissions === true ? { park_permissions: true } : {}),
+        },
       };
     },
     // (a file's name, type and size and the hash of its bytes; never the bytes)
@@ -750,6 +774,7 @@ export const REMOTE_COMMANDS: Record<RemoteCommandType, RemoteCommandSpec> = {
           }
         : {}),
       ...(p.answer_only === true ? { answer_only: true } : {}),
+      ...(p.park_permissions === true ? { park_permissions: true } : {}),
     }),
   },
   cancel: {

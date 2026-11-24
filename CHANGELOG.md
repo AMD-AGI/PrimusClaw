@@ -113,6 +113,12 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: tasks handed to the user's seats (for users with seats; `CLAW_DEVENV_SEAT_DISPATCH=off` turns it off). `work_create` takes
+  `target: "seat:<seat_id>"`, or 2 to 5 places for a choice card (`confirm_write.options`, decided with `choice`). Each task is its own
+  remote item; a card is required unless the user's own attended message names one confirmed seat they already approved a card for
+  (and did not ask to confirm each time, and its agent asks before it acts). One task runs per seat, up to three queue; a terminal in use
+  is not typed into; the end wakes the router; permission requests are pushed with the item number and seat, parked requests reminded
+  once; a task running over an hour is said hourly with its latest step. Prompt `router-dispatch-v1`. See `claw/docs/remote-agents.md`.
 - Claw: seats (default off; `CLAW_DEVENV_SEATS=on`, or the users in `CLAW_DEVENV_SEATS_USERS`). Each folder an agent works in on a
   user's machines is a seat (`claw_devenv_seats`), made and kept from the sessions and conversations Claw already has. What it is for
   counts only once the user confirmed it on a card: their own words (`seat_set`, in a turn answering their own signed-in message), or

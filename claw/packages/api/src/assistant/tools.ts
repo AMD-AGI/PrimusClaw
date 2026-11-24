@@ -558,14 +558,28 @@ export async function workCreate(
 }
 
 export async function workSend(
-  claims: AssistantTokenClaims, args: { item_id: string; text: string; model?: string },
+  claims: AssistantTokenClaims, args: { item_id: string; text: string; model?: string; new_session?: boolean },
 ): Promise<{
   ok: true; item_id: string; seq: number; status: "in_progress"; model?: string | null; fell_back_from?: string;
   files_attached?: number; files_not_attached?: string[];
-}> {
+} | Record<string, unknown>> {
   requireRole(claims, "router");
   const text = args.text.trim();
   if (!text) throw new ToolRefused("invalid_arguments", "work_send needs text");
+  // A task handed to one of the user's seats: sent to it under the same say as handing it over (`seat-dispatch.ts`).
+  {
+    const owner = await assistantUser(claims.sid);
+    const looked = await resolveWorkItemNow(owner, args.item_id);
+    if (looked.ok) {
+      const errand = (await db.query(
+        "SELECT 1 FROM claw_work_items WHERE item_id = $1 AND kind = 'remote' AND params->>'errand' = 'true'", [looked.item.item_id],
+      )).rowCount;
+      if (errand) {
+        const { errandWorkSend } = await import("./seat-dispatch.js");
+        return errandWorkSend(claims, owner, looked.item.item_id, text, args.new_session === true);
+      }
+    }
+  }
   // A model named with the instruction is the item's from this turn on; none named keeps the one it has.
   const asked = modelChoiceOn() ? modelArg(args.model) : undefined;
   const choice = asked ? await itemModelFor(claims, asked) : null;
@@ -847,7 +861,10 @@ export async function workRecall(
     last_report_kind: item.last_report_kind, summary: item.summary, pending_question: item.pending_question,
     outcome: item.outcome, result_version: item.result_version,
   };
-  if (args.detail === "summary") return { ok: true, item: summary, note: UNTRUSTED_NOTE };
+  // A task handed to a seat: its latest step, as the agent's plan named it (untrusted, like the rest).
+  const step = item.kind === "remote" && (item.params as { errand?: unknown } | null)?.errand === true
+    ? (item.params as { progress?: unknown }).progress : undefined;
+  if (args.detail === "summary") return { ok: true, item: summary, note: UNTRUSTED_NOTE, ...(step ? { progress: step } : {}) };
   await recordRecall(claims.sid, claims.mid, named.item_id);
   if (args.detail === "live") {
     const live = await workerLive((t, p) => db.query(t, p), String(item.worker_session_id));
@@ -859,9 +876,13 @@ export async function workRecall(
     return { ok: true, item: summary, note: UNTRUSTED_NOTE, reports: await recentEvents(named.item_id, RECALL_EVENTS) };
   }
   if (item.kind === "remote") {
-    // What the agent on the user's machine answered last, or is answering now.
-    const sessionId = String((item.params as { session_id?: unknown } | null)?.session_id ?? "");
-    return { ok: true, item: summary, note: UNTRUSTED_NOTE, worker_tail: sessionId ? await remoteAnswerTail(sessionId, WORKER_TAIL_MAX_CHARS) : "" };
+    // What the agent on the user's machine answered last, or is answering now; for a task handed to a seat, its latest step too.
+    const p = (item.params ?? {}) as { session_id?: unknown; errand?: unknown; progress?: unknown };
+    const sessionId = String(p.session_id ?? "");
+    return {
+      ok: true, item: summary, note: UNTRUSTED_NOTE, worker_tail: sessionId ? await remoteAnswerTail(sessionId, WORKER_TAIL_MAX_CHARS) : "",
+      ...(p.errand === true && p.progress ? { progress: p.progress } : {}),
+    };
   }
   const turns = (await db.query(
     `SELECT role, content FROM claw_conversation_turns

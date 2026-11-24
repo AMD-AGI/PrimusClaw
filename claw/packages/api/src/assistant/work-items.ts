@@ -129,7 +129,8 @@ export function reportTransition(report: Pick<WorkReport, "kind" | "question">):
   }
 }
 
-export type ReportSource = "worker" | "turn_end" | "sweep" | "watchdog";
+/** `remote`: a task handed to one of the user's seats ended on its machine (`remote-items.ts`). */
+export type ReportSource = "worker" | "turn_end" | "sweep" | "watchdog" | "remote";
 
 /**
  * Whether a ready result is delivered as it lands instead of waiting for the user's Accept (`CLAW_ASSISTANT_AUTO_DELIVER`): read
@@ -406,6 +407,8 @@ export async function insertWorkItem(
   q: StatementRunner,
   input: {
     userId: string; title: string; workerSessionId: string; repo?: unknown; kind?: ItemKind; params?: Record<string, unknown>;
+    /** The item's id, when the caller made it first (a seat's task names its item in its worker session id). */
+    itemId?: string;
     /** Who asked for this review, when it is not the user's own. */
     requestedBy?: string | null;
     /** Over the limit, queue the item instead of refusing it (a review item: `insertReview`). */
@@ -422,7 +425,7 @@ export async function insertWorkItem(
             COUNT(*) FILTER (WHERE ${RUNNING} AND params ? 'requested_by')::int AS others,
             COUNT(*) FILTER (WHERE ${RUNNING} AND params->>'requested_by' = $2)::int AS requester,
             COUNT(*) FILTER (WHERE ${WAITING})::int AS queued,
-            COUNT(*) FILTER (WHERE ${WAITING} AND (params ? 'requested_by') = ($2::text IS NOT NULL))::int AS queued_alike,
+            COUNT(*) FILTER (WHERE ${WAITING} AND kind <> 'remote' AND (params ? 'requested_by') = ($2::text IS NOT NULL))::int AS queued_alike,
             COALESCE(MAX(seq), 0)::int + 1 AS next
        FROM claw_work_items WHERE user_id = $1`,
     [input.userId, input.requestedBy ?? null],
@@ -441,7 +444,7 @@ export async function insertWorkItem(
   if ((over ?? held) && !queue) return { ok: false, error: (over ?? held)! };
   const queued: QueueReason | null = queue ? (over ?? held ?? (input.requestedBy ? "too_many_requested_reviews" : "too_many_active_items")) : null;
   const params = queued ? { ...(input.params ?? {}), queued: { since: new Date().toISOString(), reason: queued } } : input.params;
-  const itemId = newWorkItemId();
+  const itemId = input.itemId ?? newWorkItemId();
   await q.query(
     `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo, kind, params, router_session_id)
      VALUES ($1, $2, $3, $4, 'in_progress', $5, $6::jsonb, $7, $8::jsonb, $9)`,
@@ -522,6 +525,13 @@ export async function stopWorkItem(input: {
   let refused: StopRefusal | null = null;
   const stopped = await inTransaction(async (query) => {
     await input.guard?.(query);
+    // A task handed to a seat is stopped under its seat's lock (`seat-dispatch.ts`), so it is never sent as it is being stopped: one being
+    // sent is stopped once it was (and its turn cancelled), one not sent yet is never sent.
+    const seat = (await query(
+      "SELECT params->>'seat_id' AS seat_id FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' AND params->>'errand' = 'true'",
+      [input.itemId, input.userId],
+    )).rows[0] as { seat_id: string | null } | undefined;
+    if (seat?.seat_id) await query("SELECT pg_advisory_xact_lock(hashtext($1))", [`claw-seat-dispatch:${seat.seat_id}`]);
     const open = (await query(
       "SELECT kind, params, worker_session_id FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND board_state <> 'done' FOR UPDATE",
       [input.itemId, input.userId],

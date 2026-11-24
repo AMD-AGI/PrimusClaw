@@ -124,6 +124,11 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
       ON claw_devenv_seats(owner_user_id, connector_id, agent_id, cwd, COALESCE(conversation_ref, ''))`,
   );
   await client.query("CREATE INDEX IF NOT EXISTS idx_devenv_seats_owner ON claw_devenv_seats(owner_user_id, last_seen_at DESC)");
+  // Seat dispatch (`assistant/seat-dispatch.ts`): `confirm_each`, the user asked for a card every time; `auto_since`, when the first card
+  // the user pressed for this seat made it send directly (`dispatch_mode = 'auto'`).
+  await client.query(`ALTER TABLE claw_devenv_seats
+    ADD COLUMN IF NOT EXISTS confirm_each BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS auto_since TIMESTAMPTZ`);
   // Every change of presence the sweep saw. No owner index: it is read per connector.
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_remote_connector_transitions (

@@ -31,7 +31,8 @@ import {
   ASSISTANT_MCP_SERVER, confirmationRef, OBSERVER_PROMPT_VERSION, ROUTER_MEMORY_PROMPT_VERSION, ROUTER_MODEL_PROMPT_VERSION, ROUTER_PROMPT_VERSION,
   ROUTER_CITE_PROMPT_VERSION, ROUTER_READ_PROMPT_VERSION, ROUTER_SKILLS_PROMPT_VERSION, ROUTER_REVIEW_PROMPT, TOOL_NAME_PREFIX, ROUTER_REVIEW_PROMPT_VERSION, WORKER_PROMPT_VERSION, WORK_EVENT_PREFIX, ROUTER_DISCIPLINE_PROMPT_VERSION, WORKER_DISCIPLINE_PROMPT_VERSION, renderModelChoice,
   renderObserverSystem, renderReviewState, renderRouterItems, renderRouterPrompt, renderWorkerSystem, withTurnState,
-  ROUTER_DEVENV_PROMPT_VERSION, ROUTER_SEATS_PROMPT_VERSION, renderAttachedState, renderRouterDevenvSection, renderRouterSeatsSection,
+  ROUTER_DEVENV_PROMPT_VERSION, ROUTER_DISPATCH_PROMPT_VERSION, ROUTER_SEATS_PROMPT_VERSION, renderAttachedState, renderRouterDevenvSection,
+  renderRouterDispatchSection, renderRouterSeatsSection,
   type AskedOfOtherLine, type ManifestItem,
 } from "./prompts.js";
 import { allowedModels, modelChoiceOn, platformModel, readModelPrefs } from "./model-choice.js";
@@ -50,7 +51,7 @@ import { jobHttpSources, jobWatchesEnabled } from "./job-watch.js";
 import { renderRouterProactiveSection, ROUTER_PROACTIVE_PROMPT_VERSION } from "./proactive-prompt.js";
 import { renderRouterWritingSection, ROUTER_WRITING_PROMPT_VERSION } from "./writing-prompt.js";
 import { devenvToolsOn } from "./devenv-tools.js";
-import { seatsOn } from "./seats.js";
+import { seatDispatchOn, seatsOn } from "./seats.js";
 import { remoteManifest } from "./remote-items.js";
 import { renderRouterSelfSection, ROUTER_SELF_PROMPT_VERSION, selfStatusOn } from "./self-status.js";
 import { chatSurface } from "./chat-surface.js";
@@ -433,7 +434,12 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
     const devenv = devenvToolsOn();
     if (devenv) withSystemAppend(task, renderRouterDevenvSection({ actions: CLAW_ASSISTANT_TOOLS, send: true }));
     // Seats (`seats.ts`), for the users who have them: what each folder on their machines is for, as they confirmed it.
-    if (devenv && seatsOn(role.userId)) withSystemAppend(task, renderRouterSeatsSection());
+    // With seat dispatch (`seat-dispatch.ts`), its rules take the place of "only shown".
+    if (devenv && seatsOn(role.userId)) {
+      const dispatch = seatDispatchOn(role.userId);
+      withSystemAppend(task, renderRouterSeatsSection({ dispatch }));
+      if (dispatch) withSystemAppend(task, renderRouterDispatchSection());
+    }
     // Who it is (by the name its client calls it, with claw_self_status) and how to count what a lookup returned: the same on every
     // turn, so it stays cached.
     const self = selfStatusOn();
@@ -478,6 +484,7 @@ export async function applySessionRoleToTask(task: Record<string, unknown>, sess
       ...(proactiveSection ? { proactive: ROUTER_PROACTIVE_PROMPT_VERSION } : {}),
       ...(devenv ? { devenv: ROUTER_DEVENV_PROMPT_VERSION } : {}),
       ...(devenv && seatsOn(role.userId) ? { seats: ROUTER_SEATS_PROMPT_VERSION } : {}),
+      ...(devenv && seatDispatchOn(role.userId) ? { dispatch: ROUTER_DISPATCH_PROMPT_VERSION } : {}),
       read: ROUTER_READ_PROMPT_VERSION, write: ROUTER_WRITING_PROMPT_VERSION, github, ...(read ? { readServers: read.servers, pluginId: read.pluginId } : {}),
       ...(cite ? { cite: ROUTER_CITE_PROMPT_VERSION } : {}), self: ROUTER_SELF_PROMPT_VERSION, selfStatus: self,
       ...(discipline ? { discipline: ROUTER_DISCIPLINE_PROMPT_VERSION } : {}),

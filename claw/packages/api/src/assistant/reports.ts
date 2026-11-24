@@ -221,7 +221,7 @@ export async function ingestReport(
     }
     throw err;
   }
-  if (written.outcome.status === "stale") metrics.onWorkItemStaleRejected(source);
+  if (written.outcome.status === "stale" && source !== "remote") metrics.onWorkItemStaleRejected(source);
   const applied = written.outcome.status === "applied";
   // Before the router runs, so the user has the answer and the files first and the router's line follows them.
   if (written.answer) await written.answer.announce();
