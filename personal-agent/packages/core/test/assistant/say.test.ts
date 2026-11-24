@@ -225,6 +225,44 @@ it("a result claw delivered is a card that says so, with no accept, holding shor
   assert.deepEqual(w.body.view.model.item.delivered, { version: 1, watching: ["acme/app#7"] });
 });
 
+it("a later say about a delivered item that puts a choice or offers replies keeps its choice card and replies", () => {
+  const { say } = planner();
+  const delivered = { ...ITEM, board_state: "done", outcome: "accepted", can_accept: false, delivered_version: 2 };
+  // A choice: its options and Send, not the delivered card.
+  const asked = say.messages(ALICE, {
+    type: "assistant.say",
+    text: "Which branch?",
+    item: delivered,
+    choices: { options: ["main", "dev"] },
+  });
+  assert.deepEqual(shape(asked), ["view:choiceCard"]);
+  const choice = asked[0]?.body;
+  assert.ok(choice?.type === "view" && choice.view.name === "choiceCard");
+  assert.deepEqual(choice.view.model.options, ["main", "dev"]);
+  assert.equal(choice.view.model.text, "Which branch?");
+  // Its own replies: the words with the replies under them, not the delivered card.
+  const offered = say.messages(ALICE, {
+    type: "assistant.say",
+    text: "Want it on another branch?",
+    item: delivered,
+    suggested_replies: ["Push to dev", "Leave it"],
+  });
+  assert.deepEqual(shape(offered), ["rich:Want it on another branch?"]);
+  assert.deepEqual(offered[0]?.suggestions, [
+    { title: "Push to dev", value: "Push to dev" },
+    { title: "Leave it", value: "Leave it" },
+  ]);
+  // Both at once: still the choice card.
+  const both = say.messages(ALICE, {
+    type: "assistant.say",
+    text: "Which branch?",
+    item: delivered,
+    choices: { options: ["main", "dev"] },
+    suggested_replies: ["Cancel"],
+  });
+  assert.deepEqual(shape(both), ["view:choiceCard"]);
+});
+
 it("the system's own notice of a delivered result is its words alone", () => {
   const { say } = planner();
   const delivered = { ...ITEM, board_state: "done", outcome: "accepted", can_accept: false, delivered_version: 3 };
