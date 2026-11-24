@@ -142,6 +142,26 @@ test("a permission row is written once and closed by one caller", () => {
   assert.equal(perms.getRemotePermission("s1", "act-1"), null);
 });
 
+test("a parked request waits again until its longer wait ends unless it was answered", () => {
+  const { store } = openTestStore();
+  const perms = store.remotePermissions;
+  const now = store.now();
+  const row = { userId: "aad-a", sessionId: "s1", actionId: "act-1", tool: "Edit", options: [], expiresAt: now + 600 };
+  assert.equal(perms.saveRemotePermission(row), true);
+  assert.equal(perms.closeRemotePermission("s1", "act-1", "expired"), true);
+  assert.equal(perms.keepRemotePermission("s1", "act-1", now + 86_000), true);
+  assert.deepEqual(
+    [perms.getRemotePermission("s1", "act-1")?.state, perms.getRemotePermission("s1", "act-1")?.expiresAt],
+    ["pending", now + 86_000],
+  );
+  for (const answered of ["sending", "decided", "terminal"]) {
+    perms.closeRemotePermission("s1", "act-1", answered, { onlyIfPending: false });
+    assert.equal(perms.keepRemotePermission("s1", "act-1", now + 86_400), false, answered);
+    assert.equal(perms.getRemotePermission("s1", "act-1")?.state, answered);
+  }
+  assert.equal(perms.keepRemotePermission("s1", "act-2", now + 86_400), false, "none to keep");
+});
+
 test("the sessions waiting for a person are those with an open approval card of theirs", () => {
   const { store, clock } = openTestStore();
   const perms = store.remotePermissions;

@@ -31,14 +31,15 @@
 import { randomUUID } from "node:crypto";
 import pino from "pino";
 import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS } from "@claw/protocol";
-import { CLAW_ASSISTANT_ENABLED, CLAW_DEVENV_SEATS, CLAW_DEVENV_SEATS_USERS, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
+import { CLAW_ASSISTANT_ENABLED, CLAW_DEVENV_SEAT_DISPATCH, CLAW_DEVENV_SEATS, CLAW_DEVENV_SEATS_USERS, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { issueCommand, listConnectors, sessionActivity, wakeConnector, workspacesOf, type Row } from "../remote-agents/store.js";
-import { inertMd, readSession } from "./devenv-tools.js";
+import { inertMd, readSession, resumableOf, type Resumable } from "./devenv-tools.js";
+import { versionVerdict } from "../remote-agents/setup.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { briefLanguage } from "./brief.js";
-import { langOf } from "./remote-items.js";
+import { langOf, SEAT_QUEUE_REASONS } from "./remote-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
 import { typedCommand } from "./typed-commands.js";
@@ -58,6 +59,19 @@ export function seatsOn(userId: string | null | undefined, s: SeatsSettings = se
 export function seatsAnywhere(s: SeatsSettings = seatsSettings): boolean {
   return CLAW_REMOTE_AGENTS_ENABLED && CLAW_ASSISTANT_ENABLED && (s.all || s.users.size > 0);
 }
+
+/** Seat dispatch (`seat-dispatch.ts`): who may hand a task to a seat, which is who has seats, unless it is switched off. A test may change it. */
+export const seatDispatchSettings = { on: CLAW_DEVENV_SEAT_DISPATCH };
+export function seatDispatchOn(userId: string | null | undefined, s: SeatsSettings = seatsSettings): boolean {
+  return seatDispatchSettings.on && seatsOn(userId, s);
+}
+export function seatDispatchAnywhere(s: SeatsSettings = seatsSettings): boolean {
+  return seatDispatchSettings.on && seatsAnywhere(s);
+}
+/** The agent kinds a task may be handed to (Claude Code, and its conversations taken over); a set, so another may be added. */
+export const SEAT_DISPATCH_AGENT_KINDS: ReadonlySet<string> = new Set(["claude", "attach"]);
+/** Tasks that may wait in one seat's queue. */
+export const SEAT_QUEUE_MAX = 3;
 
 export const ALIAS_MAX = 16;
 export const ROLE_MAX = 120;
@@ -248,7 +262,12 @@ export async function syncSeats(owner: string, q: Querier = (t, p) => db.query(t
 
 // --- the roster -------------------------------------------------------------------------------------------------------------
 
-export type SeatState = "offline" | "working" | "waiting_for_you" | "idle" | "in_terminal" | "unknown";
+/**
+ * Where a seat stands, first match wins: its machine offline; it cannot take work (connector too old, agent gone or of a kind tasks are
+ * not handed to); its session (or a task of it) waits for the user's approval; it is working; its conversation is open in a terminal
+ * someone is at; tasks wait in its queue; idle.
+ */
+export type SeatState = "offline" | "unsupported" | "waiting_for_you" | "working" | "in_terminal" | "queued" | "idle";
 
 /** One seat as the router reads it: nothing in it was written by a machine or an agent. */
 export interface RosterSeat {
@@ -264,86 +283,261 @@ export interface RosterSeat {
   /** From the types of its session's events and its machine's presence, never from what they say. */
   state: SeatState;
   dispatch_mode: "card" | "auto";
+  /** The user asked for a card every time a task goes to it. */
+  confirm_each: boolean;
+  /** Tasks waiting in its queue. */
+  queue_len: number;
   /** The latest development environment item of this seat: its number and where it stands. */
   last_item: { seq: number; state: string } | null;
 }
 
-/** A seat's state from what Claw reads of it: its machine, its session's events by type, a conversation open in a terminal there. */
-function stateOf(seat: Row, online: boolean, activity: Map<string, Row>, liveHere: Map<string, string>): SeatState {
-  if (!online) return "offline";
-  const s = seat.current_session_id ? activity.get(String(seat.current_session_id)) : undefined;
-  if (s) {
-    if (s.read_only === true) return "in_terminal";
-    return readSession(Array.isArray(s.events) ? s.events : [], Number(s.queued) || 0).state;
+/**
+ * Whether someone is at a conversation of the machine's (one entry of `capabilities.resumable`): it is doing something now, or it was
+ * written within {@link QUIET_MS}. What both the question put to a seat and a task typed into a terminal wait for.
+ */
+export function conversationActive(r: Row, now: number): boolean {
+  if (r.state === "live" && r.activity !== "idle") return true;
+  return typeof r.updated_at === "number" && now - r.updated_at * 1000 < QUIET_MS;
+}
+
+/** A seat as dispatch and the roster read it now: its machine, agent, session, a conversation of its folder open in a terminal, and its tasks. */
+export interface SeatLive {
+  seat: Row;
+  machine: string;
+  online: boolean;
+  connector: Row | undefined;
+  agent: Row | undefined;
+  /** The state before its queue is counted, and with it. */
+  base: Exclude<SeatState, "queued">;
+  state: SeatState;
+  /** Why it cannot take work (`unsupported`): `connector_outdated`, `no_agent`, `agent_kind`. */
+  unsupported?: string;
+  upgrade_command?: string;
+  /** Its current session open through Claw, as `sessionActivity` reads it, when it is active. */
+  session: Row | undefined;
+  /** A conversation of its folder open in a terminal on its machine (any agent's), and whether what is sent may be typed into it. */
+  terminal: (Resumable & { agent_id: string }) | undefined;
+  /** Its agent runs in a mode that asks nothing. */
+  unattended: boolean;
+  /** Its tasks running, and waiting in its queue in order. */
+  running: Array<{ item_id: string; seq: number; waiting: boolean }>;
+  queue: Array<{ item_id: string; seq: number; queued: string; new_session: boolean }>;
+}
+
+/** The latest event of a session that names its mode, as `sessionMode` reads it, for each of these sessions. */
+async function modesOf(q: Querier, sessionIds: string[]): Promise<Map<string, { currentMode?: unknown; unattended?: unknown }>> {
+  const out = new Map<string, { currentMode?: unknown; unattended?: unknown }>();
+  if (!sessionIds.length) return out;
+  const rows = (await q(
+    `SELECT DISTINCT ON (session_id) session_id::text AS session_id, data->'currentMode' AS current_mode, data->'unattended' AS unattended
+       FROM claw_remote_events
+      WHERE session_id = ANY($1::uuid[]) AND type IN ('session_started', 'session_resumed', 'mode_update') AND data ? 'currentMode'
+        AND COALESCE(data->>'replay', '') <> 'true'
+      ORDER BY session_id, id DESC`,
+    [sessionIds],
+  )).rows as Row[];
+  for (const r of rows) out.set(String(r.session_id), { currentMode: r.current_mode, unattended: r.unattended });
+  return out;
+}
+
+/** The user's seats (all, or those named) as they stand now. */
+export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_AGENT_TIMING.onlineWindowMs, only?: readonly string[]): Promise<Map<string, SeatLive>> {
+  const q: Querier = (t, p) => db.query(t, p);
+  const seats = (await q(
+    `SELECT s.*, s.connector_id::text AS connector_id, s.current_session_id::text AS current_session_id FROM claw_devenv_seats s
+      WHERE s.owner_user_id = $1 AND ($2::text[] IS NULL OR s.seat_id = ANY($2::text[]))`,
+    [owner, only ? [...only] : null],
+  )).rows as Row[];
+  const out = new Map<string, SeatLive>();
+  if (!seats.length) return out;
+  const connectors = await listConnectors(owner, onlineWindowMs);
+  const activity = new Map((await sessionActivity(owner, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser)).map((r) => [String(r.session_id), r]));
+  const tasks = (await q(
+    `SELECT item_id, seq, board_state, last_report_kind, params->>'seat_id' AS seat_id, params->>'queued' AS queued,
+            params->>'queued_at' AS queued_at, COALESCE(params->>'new_session', '') = 'true' AS new_session,
+            jsonb_array_length(COALESCE(params->'open_cmd_seqs', '[]'::jsonb)) AS open
+       FROM claw_work_items WHERE user_id = $1 AND kind = 'remote' AND params->>'errand' = 'true' AND board_state <> 'done'
+        AND params->>'seat_id' <> ''
+      ORDER BY params->>'queued_at' NULLS FIRST, seq`,
+    [owner],
+  )).rows as Row[];
+  const sessionIds = seats.map((s) => s.current_session_id).filter((x): x is string => typeof x === "string" && activity.has(x));
+  const modes = await modesOf(q, sessionIds);
+  const now = Date.now();
+  for (const seat of seats) {
+    const connector = connectors.find((c) => String(c.connector_id) === String(seat.connector_id));
+    const online = connector?.online === true;
+    const agents = (Array.isArray(connector?.agents) ? connector!.agents : []) as Row[];
+    const agent = agents.find((a) => String(a.agent_id) === String(seat.agent_id));
+    const caps = agent && isObject(agent.capabilities) ? agent.capabilities : undefined;
+    const session = seat.current_session_id ? activity.get(String(seat.current_session_id)) : undefined;
+    let terminal: SeatLive["terminal"];
+    for (const a of agents) {
+      for (const r of resumableOf(a)) {
+        if (r.state !== "live" || r.cwd !== seat.cwd) continue;
+        if (seat.conversation_ref && r.ref !== seat.conversation_ref) continue;
+        terminal = { ...r, agent_id: String(a.agent_id) };
+      }
+    }
+    const raw = terminal
+      ? ((agents.find((a) => String(a.agent_id) === terminal!.agent_id)?.capabilities?.resumable ?? []) as Row[]).find((r) => isObject(r) && r.ref === terminal!.ref)
+      : undefined;
+    const mine = tasks.filter((t) => String(t.seat_id) === String(seat.seat_id));
+    const running = mine.filter((t) => !t.queued && Number(t.open) > 0).map((t) => ({
+      item_id: String(t.item_id), seq: Number(t.seq), waiting: t.board_state === "needs_you" && t.last_report_kind === "waiting",
+    }));
+    const queue = mine.filter((t) => typeof t.queued === "string" && (SEAT_QUEUE_REASONS as readonly string[]).includes(t.queued))
+      .map((t) => ({ item_id: String(t.item_id), seq: Number(t.seq), queued: String(t.queued), new_session: t.new_session === true }));
+    const mode = session ? modes.get(String(session.session_id)) : undefined;
+    const unattended = caps?.unattended === true || mode?.unattended === true;
+    const version = versionVerdict(connector?.version as string | null | undefined);
+    let unsupported: string | undefined;
+    if (!agent) unsupported = "no_agent";
+    else if (!SEAT_DISPATCH_AGENT_KINDS.has(String(agent.kind))) unsupported = "agent_kind";
+    else if (version.version_status === "unsupported") unsupported = "connector_outdated";
+    const reading = session ? readSession(Array.isArray(session.events) ? session.events : [], Number(session.queued) || 0) : null;
+    let base: SeatLive["base"];
+    if (!online) base = "offline";
+    else if (unsupported) base = "unsupported";
+    else if (reading?.state === "waiting_for_you" || running.some((r) => r.waiting)) base = "waiting_for_you";
+    else if (reading?.state === "working" || running.length) base = "working";
+    else if (session?.read_only === true || (terminal && (!terminal.typed || (raw ? conversationActive(raw, now) : true)))) base = "in_terminal";
+    else base = "idle";
+    out.set(String(seat.seat_id), {
+      seat, machine: machineOf(connector), online, connector, agent, base, state: base === "idle" && queue.length ? "queued" : base,
+      ...(unsupported ? { unsupported } : {}), ...(unsupported === "connector_outdated" && version.upgrade_command ? { upgrade_command: version.upgrade_command } : {}),
+      session, terminal, unattended, running, queue,
+    });
   }
-  const terminal = liveHere.get(placeKey(String(seat.connector_id), String(seat.agent_id), String(seat.cwd)));
-  if (terminal) return "in_terminal";
-  return "idle";
+  return out;
+}
+
+/**
+ * Which seats are where the user said (`seat_roster` with `machine` / `agent` / `folder`, their words from their message): the machine by
+ * its name (any case) or Claw's own name for it (`machine-<id>`); the agent by its id or kind; the folder by its path, or by its last parts when they wrote it relative
+ * (`~/rel`, `rel`, `hl/ci` match `/home/u/rel`, `.../hl/ci`). Claw compares; the names themselves (which the machine chose) are never
+ * listed, so the roster stays free of words a machine wrote.
+ */
+export interface RosterWhere { machine?: string; agent?: string; folder?: string }
+/** A path with no trailing slash; on Windows, whose paths ignore case and take either slash, lower case with forward slashes (a POSIX path keeps both). */
+const slashed = (v: string, windows: boolean): string => {
+  const p = v.trim();
+  return windows ? p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() : p.replace(/\/+$/, "");
+};
+export function machineIs(asked: string, name: string, connectorId: string): boolean {
+  const a = asked.trim().toLowerCase();
+  return !!a && (a === name.trim().toLowerCase() || a === `machine-${connectorId.slice(0, 8)}`);
+}
+/** The agent by its id or its kind ("claude", "codex"; "Claude Code" is claude). */
+export function agentIs(asked: string, agentId: string, kind: string): boolean {
+  const a = asked.trim().toLowerCase().replace(/\s+code$/, "");
+  return !!a && (a === agentId.trim().toLowerCase() || a === kind.trim().toLowerCase());
+}
+export function folderIs(asked: string, cwd: string): boolean {
+  // A Windows folder starts with a drive (C:\ or C:/) or a UNC share (\\host); a backslash elsewhere is a POSIX name character.
+  const windows = /^([A-Za-z]:[\\/]|\\\\)/.test(cwd.trim());
+  const c = slashed(cwd, windows);
+  let a = slashed(asked, windows);
+  if (!a || !c) return false;
+  if (a === c) return true;
+  a = a.replace(/^~\//, "").replace(/^\.\//, "");
+  if (!a || a === "~" || /^([a-z]:)?\//.test(a)) return false;
+  return c.endsWith(`/${a}`);
 }
 
 /** The user's seats as the roster lists them, newest first (confirmed ones before the rest). */
-export async function rosterOf(owner: string, onlineWindowMs: number = REMOTE_AGENT_TIMING.onlineWindowMs): Promise<RosterSeat[]> {
+export async function rosterOf(
+  owner: string, onlineWindowMs: number = REMOTE_AGENT_TIMING.onlineWindowMs, where: RosterWhere = {},
+): Promise<RosterSeat[]> {
   const q: Querier = (t, p) => db.query(t, p);
+  // The latest item of each seat: a task handed to it, or the item of a session at its place, whichever moved last.
   const seats = (await q(
-    `SELECT s.*, s.connector_id::text AS connector_id, s.current_session_id::text AS current_session_id, it.seq AS item_seq, it.board_state AS item_state
+    `SELECT s.seat_id, s.connector_id, s.agent_id, s.cwd, s.alias, s.role, s.role_state, s.dispatch_mode, s.confirm_each, it.seq AS item_seq, it.board_state AS item_state
        FROM claw_devenv_seats s
        LEFT JOIN LATERAL (
-         SELECT w.seq, w.board_state FROM claw_remote_sessions r
-           JOIN claw_work_items w ON w.worker_session_id = 'remote:' || r.session_id::text AND w.user_id = s.owner_user_id
-          WHERE r.owner_user_id = s.owner_user_id AND r.connector_id = s.connector_id AND r.agent_id = s.agent_id AND r.cwd = s.cwd
-          ORDER BY w.updated_at DESC LIMIT 1) it ON TRUE
+         SELECT seq, board_state FROM (
+           (SELECT w.seq, w.board_state, w.updated_at FROM claw_remote_sessions r
+              JOIN claw_work_items w ON w.worker_session_id = 'remote:' || r.session_id::text AND w.user_id = s.owner_user_id
+             WHERE r.owner_user_id = s.owner_user_id AND r.connector_id = s.connector_id AND r.agent_id = s.agent_id AND r.cwd = s.cwd
+             ORDER BY w.updated_at DESC LIMIT 1)
+           UNION ALL
+           (SELECT w.seq, w.board_state, w.updated_at FROM claw_work_items w
+             WHERE w.user_id = s.owner_user_id AND w.kind = 'remote' AND w.params->>'errand' = 'true' AND w.params->>'seat_id' = s.seat_id
+             ORDER BY w.updated_at DESC LIMIT 1)
+         ) x ORDER BY updated_at DESC LIMIT 1) it ON TRUE
       WHERE s.owner_user_id = $1 AND (s.role_state = 'confirmed' OR s.alias IS NOT NULL OR s.last_seen_at > NOW() - make_interval(days => $2::int))
       ORDER BY (s.role_state = 'confirmed') DESC NULLS LAST, s.last_seen_at DESC LIMIT $3`,
     [owner, LISTED_DAYS, ROSTER_MAX],
   )).rows as Row[];
-  const connectors = await listConnectors(owner, onlineWindowMs);
-  const online = new Map(connectors.map((c) => [String(c.connector_id), c.online === true]));
-  const activity = new Map((await sessionActivity(owner, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser)).map((r) => [String(r.session_id), r]));
-  const liveHere = new Map<string, string>();
-  for (const c of connectors) {
-    for (const a of (Array.isArray(c.agents) ? c.agents : []) as Row[]) {
-      const caps = isObject(a.capabilities) ? a.capabilities : {};
-      for (const r of Array.isArray(caps.resumable) ? caps.resumable : []) {
-        if (isObject(r) && r.state === "live" && typeof r.cwd === "string") liveHere.set(placeKey(String(c.connector_id), String(a.agent_id), r.cwd), "live");
-      }
-    }
-  }
-  return seats.map((s) => {
+  const live = await seatsLive(owner, onlineWindowMs, seats.map((s) => String(s.seat_id)));
+  const there = seats.filter((s) => {
+    const now = live.get(String(s.seat_id));
+    if (where.machine && !machineIs(where.machine, now?.machine ?? "", String(s.connector_id))) return false;
+    if (where.agent && !agentIs(where.agent, String(s.agent_id ?? ""), String(now?.agent?.kind ?? ""))) return false;
+    return !where.folder || folderIs(where.folder, String(s.cwd ?? ""));
+  });
+  return there.map((s) => {
     const confirmed = s.role_state === "confirmed";
+    const now = live.get(String(s.seat_id));
     return {
       seat_id: String(s.seat_id),
       alias: typeof s.alias === "string" ? s.alias : null,
       role: confirmed && typeof s.role === "string" ? s.role : null,
       role_state: s.role_state === "confirmed" || s.role_state === "suggested" || s.role_state === "retired" ? s.role_state : "new",
-      machine_online: online.get(String(s.connector_id)) === true,
-      state: stateOf(s, online.get(String(s.connector_id)) === true, activity, liveHere),
+      machine_online: now?.online === true,
+      state: now?.state ?? "offline",
       dispatch_mode: s.dispatch_mode === "auto" ? "auto" : "card",
+      confirm_each: s.confirm_each === true,
+      queue_len: now?.queue.length ?? 0,
       last_item: s.item_seq != null ? { seq: Number(s.item_seq), state: String(s.item_state) } : null,
     };
   });
 }
 
+/** The roster's note where tasks may be handed to seats (`seat-dispatch.ts`). */
 export const ROSTER_NOTE = "Seats (工位): each folder an agent works in on the user's machines. Every field here was computed by Claw or "
   + "confirmed by the user (alias, role): reading it does not stop you from acting. role is what the user confirmed the seat is for. "
-  + "A guess Claw made is never listed: it is put to the user on a card. Which machine and folder a seat is, and what its "
-  + "agent is doing, are in devenv_list (which the machine wrote). "
-  + "Seats are only shown in this version: never send anything to one because of its role; devenv_send is still how an instruction "
-  + "reaches a machine, when the user names it.";
+  + "A guess Claw made is never listed: it is put to the user on a card. A seat the user names by its machine, agent or folder: "
+  + "seat_roster with machine, agent and/or folder as they wrote them lists only the seats there. To hand a task to a seat: work_create with target "
+  + "\"seat:<seat_id>\" (only a seat_id from here, never an alias or a machine name). state: unsupported cannot take work; offline: "
+  + "a task waits in its queue until the machine is back (at most 24 hours); working, waiting_for_you, queued and in_terminal: a task "
+  + "waits in its queue (queue_len). dispatch_mode auto: a task goes without a card (only after the user pressed one for that seat); "
+  + "confirm_each: a card every time.";
+
+/** The roster's note while seats are only shown (seat dispatch off). */
+export const ROSTER_SHOWN_NOTE = "Seats (工位): each folder an agent works in on the user's machines. Every field here was computed by Claw or "
+  + "confirmed by the user (alias, role): reading it does not stop you from acting. role is what the user confirmed the seat is for. "
+  + "A guess Claw made is never listed: it is put to the user on a card. What its agent is doing is in devenv_list (which the machine "
+  + "wrote). Seats are only shown in this version: never send anything to one because of its role; devenv_send is still how an "
+  + "instruction reaches a machine, when the user names it.";
 
 /** `seat_roster`: the user's seats, trusted fields only. Never marks the turn as having read untrusted text. */
-export async function seatRoster(claims: AssistantTokenClaims): Promise<Record<string, unknown>> {
+export async function seatRoster(
+  claims: AssistantTokenClaims, args: { machine?: unknown; agent?: unknown; folder?: unknown } = {},
+): Promise<Record<string, unknown>> {
   if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
   const { userId } = await inTransaction((q) => assertLiveRun(q, claims));
   if (!seatsOn(userId)) throw new ToolRefused("not_enabled", "seats are not on for this user");
   await syncSeats(userId);
-  const seats = await rosterOf(userId);
-  return { ok: true, seats, note: ROSTER_NOTE };
+  const where: RosterWhere = {
+    ...(typeof args.machine === "string" && args.machine.trim() ? { machine: args.machine.slice(0, 200) } : {}),
+    ...(typeof args.agent === "string" && args.agent.trim() ? { agent: args.agent.slice(0, 80) } : {}),
+    ...(typeof args.folder === "string" && args.folder.trim() ? { folder: args.folder.slice(0, 400) } : {}),
+  };
+  const seats = await rosterOf(userId, undefined, where);
+  const asked = Object.keys(where).length > 0;
+  return {
+    ok: true, seats, note: seatDispatchOn(userId) ? ROSTER_NOTE : ROSTER_SHOWN_NOTE,
+    ...(asked ? { where: seats.length ? "only the seats where the user said (machine, agent, folder)" : "no seat of the user's is where they said (machine, agent, folder)" } : {}),
+  };
 }
 
 // --- seat_set: what the user says a seat is for ---------------------------------------------------------------------------
 
 export interface SeatSetArgs {
   seat?: unknown; machine?: unknown; agent?: unknown; cwd?: unknown; session_id?: unknown; alias?: unknown; role?: unknown; refresh?: unknown;
+  /** true: a card every time a task goes to the seat ("每次都确认"), at once; false: back to a card the first time only, then direct. */
+  confirm_each?: unknown;
 }
 
 /** What a role or an alias may never hold: an address, code or a shell command, a line break, or words that address a model. */
@@ -458,7 +652,10 @@ export async function seatSet(
   if (roleAsked !== null && role === null) {
     throw new ToolRefused("invalid_role", `the role is one or two sentences, at most ${ROLE_MAX} characters, with no address, code or command in it`);
   }
-  if (!refresh && alias === null && role === null) throw new ToolRefused("invalid_arguments", "say the seat's alias, its role, or refresh: true");
+  const confirmEach = typeof args.confirm_each === "boolean" && seatDispatchOn(userId) ? args.confirm_each : null;
+  if (!refresh && alias === null && role === null && confirmEach === null) {
+    throw new ToolRefused("invalid_arguments", "say the seat's alias, its role, or refresh: true");
+  }
   await syncSeats(userId, q, onlineWindowMs);
   const found = await resolveSeat(userId, args, onlineWindowMs);
   if ("refused" in found) {
@@ -466,6 +663,24 @@ export async function seatSet(
     throw found.refused;
   }
   const { seat, machine } = found;
+  if (confirmEach !== null) {
+    // Kept at once, with no card: a card every time is only ever more careful, and back to "a card the first time" still needs that
+    // card pressed before anything goes without one (`auto` comes only from a press).
+    await q(
+      `UPDATE claw_devenv_seats SET confirm_each = $3, dispatch_mode = CASE WHEN $3 THEN 'card' ELSE dispatch_mode END,
+              auto_since = CASE WHEN $3 THEN NULL ELSE auto_since END, updated_at = NOW()
+        WHERE seat_id = $1 AND owner_user_id = $2`,
+      [seat.seat_id, userId, confirmEach],
+    );
+    if (!refresh && alias === null && role === null) {
+      return {
+        ok: true, seat_id: seat.seat_id, confirm_each: confirmEach,
+        note: confirmEach
+          ? "Kept: every task for that seat now shows the user a card first. Tell them in one line."
+          : "Kept: the next task for that seat shows a card once; after they press it, tasks go to it directly. Tell them in one line.",
+      };
+    }
+  }
   if (refresh) {
     const r = await q(
       `UPDATE claw_devenv_seats SET probes_allowed = probes_sent + 1, probe_state = NULL, infer_state = 'due', infer_due_at = NOW(),
@@ -681,9 +896,7 @@ export function mayAsk(seat: Row, online: boolean, activity: Row | undefined, co
   );
   if (now - last < QUIET_MS) return false;
   for (const r of conversations) {
-    if (r.cwd !== seat.cwd) continue;
-    if (r.state === "live" && r.activity !== "idle") return false;
-    if (typeof r.updated_at === "number" && now - r.updated_at * 1000 < QUIET_MS) return false;
+    if (r.cwd === seat.cwd && conversationActive(r, now)) return false;
   }
   return true;
 }
@@ -831,6 +1044,15 @@ export async function runSeatSweep(now: number = Date.now(), onlineWindowMs: num
 async function sweepUser(owner: string, now: number, onlineWindowMs: number, result: SeatSweepResult): Promise<void> {
   const q: Querier = (t, p) => db.query(t, p);
   await syncSeats(owner, q, onlineWindowMs);
+  // The tasks handed to the user's seats (`seat-dispatch.ts`): queues going on, ends reported, the hourly line.
+  if (seatDispatchOn(owner)) {
+    try {
+      const { runErrandSweep } = await import("./seat-dispatch.js");
+      await runErrandSweep(owner, now, onlineWindowMs);
+    } catch (err) {
+      logger.warn({ err: (err as Error)?.message, owner }, "assistant.errand_sweep_failed");
+    }
+  }
   // A guess that failed is tried again a day later.
   await q(
     `UPDATE claw_devenv_seats SET infer_state = 'due', infer_due_at = NOW()

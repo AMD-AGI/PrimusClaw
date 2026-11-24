@@ -13,6 +13,8 @@ export const APPROVAL_DEFAULT_SECONDS = 600;
 export const PERMISSION_DEFAULT_SECONDS = 600;
 /** A pushed permission request runs out at most this long from now. */
 const PERMISSION_MAX_SECONDS = 3600;
+/** A parked request (the agent keeps waiting past its first wait, `ask.parked`) runs out at most this long from now: a day. */
+const PERMISSION_PARKED_MAX_SECONDS = 24 * 3600;
 
 const formatters = new Map<string, Intl.DateTimeFormat>();
 
@@ -90,8 +92,12 @@ export function approvalExpiry(event: Readonly<Record<string, unknown>>, now: nu
   return isoSeconds(raw) ?? now + APPROVAL_DEFAULT_SECONDS;
 }
 
-/** When a pushed permission request runs out: its `expires_at`, at most an hour on; else PERMISSION_DEFAULT_SECONDS from now. */
+/**
+ * When a pushed permission request runs out: its `expires_at`, at most an hour on (a day for a parked one); else
+ * PERMISSION_DEFAULT_SECONDS from now.
+ */
 export function remoteAskExpiry(ask: Readonly<Record<string, unknown>>, now: number): number {
   const at = isoSeconds(ask["expires_at"]);
-  return at === undefined ? now + PERMISSION_DEFAULT_SECONDS : Math.min(at, now + PERMISSION_MAX_SECONDS);
+  const max = ask["parked"] === true ? PERMISSION_PARKED_MAX_SECONDS : PERMISSION_MAX_SECONDS;
+  return at === undefined ? now + PERMISSION_DEFAULT_SECONDS : Math.min(at, now + max);
 }

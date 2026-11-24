@@ -650,6 +650,80 @@ describe("permissions", () => {
     assert.deepEqual([r.data.actionId, r.data.by, r.data.outcome], [perm.data.actionId, "timeout", "cancelled"]);
     assert.equal(fileExists(path.join(h.work, "late.txt")), false);
   });
+  test("a permission request names the prompt whose turn asked it (cmd_seq)", async () => {
+    const h = await make();
+    const sid = await h.newSession();
+    const seq = h.prompt(sid, "write named.txt");
+    const perm = await h.permission(sid);
+    assert.equal(perm.data.cmd_seq, seq);
+    h.decide(sid, perm.data.actionId, "allow-once");
+    await h.turnEnd(sid);
+  });
+  test("park_permissions: past the time-to-live the request is not cancelled but said parked once, and a late answer goes through", async () => {
+    const h = await make({ timing: { permissionTtlMs: 200, permissionParkMaxMs: 60_000, idleMs: 150 } });
+    const sid = await h.newSession();
+    const t0 = Date.now();
+    const seq = h.prompt(sid, "write parked.txt", { park_permissions: true });
+    const perm = await h.permission(sid);
+    assert.equal(perm.data.cmd_seq, seq);
+    const parked = await h.claw.until("permission_parked", () => h.claw.eventsOf(sid, "permission_parked")[0]);
+    assert.equal(parked.data.actionId, perm.data.actionId);
+    assert.equal(parked.data.cmd_seq, seq);
+    const until = Date.parse(parked.data.parked_until);
+    assert.ok(until >= t0 + 60_000 && until <= Date.now() + 60_000, `parked until a minute after it was asked (${parked.data.parked_until})`);
+    // Well past the time-to-live and the idle time: still waiting, the adapter kept, nothing answered.
+    await sleep(500);
+    assert.deepEqual(h.claw.eventsOf(sid, "permission_resolved"), []);
+    assert.deepEqual(h.turnEnds(sid), []);
+    assert.equal(h.claw.eventsOf(sid, "permission_parked").length, 1, "said once");
+    assert.ok(!h.audit().some((a) => a.kind === "adapter_recycled"), "a session with a parked request keeps its agent");
+    assert.ok(h.audit().some((a) => a.kind === "permission_parked" && a.action_id === perm.data.actionId));
+    h.decide(sid, perm.data.actionId, "allow-once");
+    const end = await h.turnEnd(sid);
+    assert.deepEqual([end.data.stopReason, end.data.cmd_seq], ["end_turn", seq]);
+    assert.equal(fs.readFileSync(path.join(h.work, "parked.txt"), "utf8"), "hello\n");
+    const r = h.claw.eventsOf(sid, "permission_resolved")[0]!;
+    assert.deepEqual([r.data.actionId, r.data.optionId, r.data.by], [perm.data.actionId, "allow-once", "user-1"]);
+  });
+  test("park_permissions: unanswered to the end of the park, the request is cancelled by park_expired and the turn ends", async () => {
+    const h = await make({ timing: { permissionTtlMs: 150, permissionParkMaxMs: 600 } });
+    const sid = await h.newSession();
+    h.prompt(sid, "write expired.txt", { park_permissions: true });
+    const perm = await h.permission(sid);
+    await h.claw.until("permission_parked", () => h.claw.eventsOf(sid, "permission_parked")[0]);
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.stopReason, "cancelled");
+    const r = h.claw.eventsOf(sid, "permission_resolved")[0]!;
+    assert.deepEqual([r.data.actionId, r.data.by, r.data.outcome], [perm.data.actionId, "park_expired", "cancelled"]);
+    assert.ok(h.audit().some((a) => a.kind === "permission_expired" && a.by === "park_expired"));
+    assert.equal(fileExists(path.join(h.work, "expired.txt")), false);
+  });
+  test("park_permissions: a parked request is cancelled by a cancel as any other", async () => {
+    const h = await make({ timing: { permissionTtlMs: 150, permissionParkMaxMs: 60_000 } });
+    const sid = await h.newSession();
+    h.prompt(sid, "write stopped.txt", { park_permissions: true });
+    const perm = await h.permission(sid);
+    await h.claw.until("permission_parked", () => h.claw.eventsOf(sid, "permission_parked")[0]);
+    h.claw.issue("cancel", sid);
+    const end = await h.turnEnd(sid);
+    assert.equal(end.data.stopReason, "cancelled");
+    const r = h.claw.eventsOf(sid, "permission_resolved")[0]!;
+    assert.deepEqual([r.data.actionId, r.data.by], [perm.data.actionId, "cancel"]);
+    assert.equal(fileExists(path.join(h.work, "stopped.txt")), false);
+  });
+  test("park_permissions applies to its own turn only: the next prompt without it times out as before", async () => {
+    const h = await make({ timing: { permissionTtlMs: 200, permissionParkMaxMs: 60_000 } });
+    const sid = await h.newSession();
+    h.prompt(sid, "say first", { park_permissions: true });
+    await h.turnEnd(sid);
+    const seq = h.prompt(sid, "write plain.txt");
+    const perm = await h.permission(sid);
+    const end = await h.turnEnd(sid, 2);
+    assert.deepEqual([end.data.stopReason, end.data.cmd_seq], ["cancelled", seq]);
+    const r = h.claw.eventsOf(sid, "permission_resolved")[0]!;
+    assert.deepEqual([r.data.actionId, r.data.by], [perm.data.actionId, "timeout"]);
+    assert.deepEqual(h.claw.eventsOf(sid, "permission_parked"), []);
+  });
   test("an owner's auto-allow rule decides on this machine, shows itself, is audited, and never covers anything else", async () => {
     const h = await make({ agentToml: `auto_allow = [{ kind = "edit", path_glob = "docs/**" }]\n` });
     fs.mkdirSync(path.join(h.work, "docs"));
@@ -918,6 +992,31 @@ describe("crash safety", () => {
     assert.equal(fs.readFileSync(path.join(h.work, "continued.txt"), "utf8"), "hello\n");
     await sleep(200);
     assert.equal(h.turnEnds(sid).length, 1);
+  });
+  test("a turn that parks its permissions, cut off by a restart longer than the time-to-live, is carried on and parks again", async () => {
+    const timing = { permissionTtlMs: 300, permissionParkMaxMs: 60_000 };
+    const h = await make({ timing });
+    const sid = await h.newSession();
+    const seq = h.prompt(sid, "write p.txt", { park_permissions: true });
+    const perm = await h.permission(sid);
+    await h.claw.until("permission_parked", () => h.claw.eventsOf(sid, "permission_parked")[0]);
+    const turns = JSON.parse(fs.readFileSync(path.join(h.dirs.state, "sessions.json.turns"), "utf8"));
+    assert.equal(turns[sid].park, true);
+    await h.stop();
+    await sleep(600); // down longer than a card lives, well inside the park
+    h.connect({ timing });
+    h.start();
+    const closed = await h.claw.until("the dead card closed", () => h.claw.eventsOf(sid, "permission_resolved").find((e) => e.data.actionId === perm.data.actionId));
+    assert.equal(closed.data.by, "connector_restart");
+    const back = await h.claw.until("session_recovered", () => h.claw.eventsOf(sid, "session_recovered")[0]);
+    assert.deepEqual([back.data.continuing, back.data.cmd_seq], [true, seq]);
+    const again = await h.permission(sid, 2);
+    assert.equal(again.data.cmd_seq, seq);
+    const parked = await h.claw.until("the new card parked", () => h.claw.eventsOf(sid, "permission_parked").find((e) => e.data.actionId === again.data.actionId));
+    assert.equal(parked.data.cmd_seq, seq);
+    h.decide(sid, again.data.actionId, "allow-once");
+    const end = await h.turnEnd(sid);
+    assert.deepEqual([end.data.stopReason, end.data.cmd_seq], ["end_turn", seq]);
   });
   test("a turn cut off by a crash while the agent was working ends with connector_restarted, naming its prompt; the session says it is back once and answers the next prompt", async () => {
     const h = await make();

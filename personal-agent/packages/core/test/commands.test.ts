@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { parseAgentCommand } from "../src/commands/agent-args.js";
+import { isAgentsSlip, parseAgentCommand } from "../src/commands/agent-args.js";
 import {
   commandArgs,
   menuCommand,
@@ -88,4 +88,43 @@ test("parse_agent_command", () => {
   assert.deepEqual(parseAgentCommand("detach"), { verb: "detach", rest: "" });
   assert.equal(parseAgentCommand(""), null);
   assert.equal(parseAgentCommand("list"), null);
+});
+
+test("one letter off, a full-width slash or a full stop after it is a slip of /agents", () => {
+  for (const text of [
+    "/agnets",
+    "/agens",
+    "/agentss",
+    "/agetns",
+    "/agnet",
+    "/agnts",
+    "/Agents",
+    "／agents",
+    "/agents.",
+    " /agents? ",
+  ])
+    assert.ok(isAgentsSlip(text), text);
+});
+
+test("the commands themselves, other commands, words after it and other words are not a slip of /agents", () => {
+  for (const text of [
+    "/agents",
+    "/agent",
+    "/agents new codex /x",
+    "/urgent",
+    "/help",
+    "/sessions",
+    "agents",
+    "/ag",
+    "/",
+    "",
+  ])
+    assert.ok(!isAgentsSlip(text), text);
+});
+
+test("a slip of /agents is read as /agents in a 1:1 chat, and left as it is in a group", () => {
+  assert.equal(menuCommand("/agnets"), "/agents");
+  assert.equal(menuCommand("／agents"), "/agents");
+  assert.equal(menuCommand("/agnets", true), "/agnets");
+  assert.equal(menuCommand("/urgent"), "/urgent");
 });

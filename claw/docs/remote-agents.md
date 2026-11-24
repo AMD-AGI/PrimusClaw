@@ -707,9 +707,27 @@ the files git keeps (never by running git) and normalized on the machine and aga
 credential, a remote that still looks like it carries one is not reported, at most 32 folders. An older connector's heartbeat has
 none, and is taken as before.
 
-Seats are shown only: nothing is sent to a seat because of its role. They are off unless `CLAW_DEVENV_SEATS=on` (every user of the
-assistant) or the user's Claw id is in `CLAW_DEVENV_SEATS_USERS` (comma-separated), and need `CLAW_REMOTE_AGENTS_ENABLED` and the
-assistant.
+Seats are off unless `CLAW_DEVENV_SEATS=on` (every user of the assistant) or the user's Claw id is in `CLAW_DEVENV_SEATS_USERS`
+(comma-separated), and need `CLAW_REMOTE_AGENTS_ENABLED` and the assistant.
+
+### Handing a task to a seat
+
+For the users who have seats (and while `CLAW_DEVENV_SEAT_DISPATCH` is not `off`), `work_create` takes `target: "seat:<seat_id>"`
+(only a seat id from `seat_roster`; an alias or a machine name is refused as `seat_not_found`), or a list of 2 to 5 places
+(`"sandbox"` may be one) for a choice card. The task is a remote item of its own (`params.errand`, `worker_session_id`
+`errand:<item id>`), sent to the seat's agent as a prompt behind a fixed opening line, and its end is a report the router passes on.
+
+What goes without a card is decided by Claw, not by the prompt: only a turn answering the user's own signed-in message that has read
+nothing a machine or an agent wrote, naming one seat whose role the user confirmed, after the user pressed a card for that seat once
+(`dispatch_mode` becomes `auto`), unless they asked for a card every time (`seat_set confirm_each: true`) or the seat's agent runs
+unattended. A report or a wake hands nothing to a seat. Everything else is a `seat_dispatch` card; a choice card carries `options`
+and its decision names one (`choice`), which Claw checks.
+
+One task runs in a seat at a time; up to three wait in its queue, in order, and go when it is free (after its events, or the sweep).
+A conversation open in a terminal that someone used in the last ten minutes is not typed into. A task waiting for an offline machine
+fails after a day. A connector that can (`permission_park`) keeps a permission request of such a task open past its own wait instead
+of refusing it (`permission_parked`), and the user is reminded once; with an older connector the timeout fails the task. A task
+running for over an hour is said in one line each hour, with its latest plan step.
 
 ## Retention
 

@@ -117,6 +117,7 @@ export class CommandTable {
   private async agent(text: string, chat: Chat, key: string, message: InboundMessage | undefined): Promise<boolean> {
     const { remote } = this.ctx.deps;
     const agents = commandArgs(text, "agents");
+    // (a slip of `/agnets` or `／agents` comes here as `/agents`: `menuCommand`)
     if (agents !== null && parseAgentCommand(agents) === null) {
       await remote.agents(chat.sender, key, chat.conversation);
       return true;

@@ -27,20 +27,88 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   the bubble: a status-only bubble floats on until the turn ends, one that already shows words is closed at once, and either
   way it ends with "The answer follows below, as new messages."; the whole answer then comes below what was said since, every
   part as a new message, in order. When the chat goes on while the answer is going out, the whole answer is sent again below.
+
+## 0.13.0
+
+A minor release, because core's exported API changes incompatibly: `groupLangOf` no longer takes the sender's id and
+locale, and `AskerLanguages` is no longer exported (#897). No plugin port (core's `src/plugins/`) changed, and the store is
+unchanged: nothing to do for a deployment of the published packages. A seat card from Claw (what a folder on the person's
+machine is for) is drawn with its buttons (#910), a result Claw delivered without an Accept is shown as delivered instead
+of with an Accept button (#875), a group message that says no language of its own is answered in English (#897), and a
+forward whose words answer a waiting question card reaches Claw with the answer (#914).
+
+**Claw:** seat cards are sent by claw-v0.5.13 and later with seats turned on (`CLAW_DEVENV_SEATS`); a worker before
+0.13.0 shows such a card's words with no buttons, so it cannot be answered by a press. The delivered card needs a Claw
+that delivers a result without an Accept (claw-v0.5.8 and later, `CLAW_ASSISTANT_AUTO_DELIVER`); with any other Claw
+nothing changes.
+
+**Breaking for code that uses core's exports directly:** In `@primusclaw/personal-agent`, `groupLangOf` takes
+`(store, conversationId, written)` instead of `(store, conversationId, userId, locale, written)`, since a group's
+language no longer reads the sender's own, and `AskerLanguages` (each member's last language in a group) is removed
+(#897). A surface of one's own also has a new view to draw, `workDelivered` (`WorkDeliveredModel`; a registry typed
+over every key of `ViewMap` needs its renderer, as Teams' has) (#875), and two more held-write kinds, `seat_role` and
+`seat_set`, in `ConfirmWriteModel` (#910).
+
+### Added
+
+- `@primusclaw/personal-agent`: a seat card from Claw is drawn as a held write's card with its buttons (held-write kinds
+  `seat_role` and `seat_set`). A seat is one folder an agent works in on one of the person's machines; Claw asks the
+  person to confirm what it guessed the seat is for (Right keeps it, Deny marks the seat as not to be used), or to keep
+  what the person said it is for. What came of a press is said in one line in both languages: what was kept (the seat's
+  alias and role), that the seat is marked as not to be used, that nothing changed, that the card expired or was already
+  answered, that the guess was replaced or the seat is gone, or why it could not be kept. Until now such a card showed
+  only its words, which ask for a press, and no buttons. Needs claw-v0.5.13 or later with seats on (#910).
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: a result Claw delivered without an Accept (an
+  item's `delivered_version` and `watching_pr`, or a board row's `params.delivered` and `params.watching_pr`) is shown
+  as a card that says so, in place of the card with Accept: the item, "v2 delivered" / 「v2 已交付」, or "v1 delivered; still
+  watching PR owner/repo#7" / 「v1 已交付，继续盯 PR owner/repo#7」, the assistant's words when they fit, and "Reply to me to
+  have it changed." / 「要改直接回复我。」, with no buttons. A say that puts a choice or offers replies of its own keeps them,
+  and the system's own notice of the delivery is its words alone. An Accept pressed on a card drawn before the delivery
+  says the result was delivered and there is nothing to accept, and the refusal to retry at the running-task limit no
+  longer says to accept a task. Core adds `WorkItem.delivered` (optional), `Delivered`, `deliveredOf` and the
+  `workDelivered` view. Works with any Claw: without these fields nothing changes (#875).
+
+### Added
+
+- `@primusclaw/personal-agent`, `-runtime`, `-teams`: a task the assistant hands to one of the person's seats (a folder on
+  their machine whose purpose they confirmed). Claw's `seat_dispatch` card is drawn like any held write (Send, Don't);
+  when several places fit, it is a choice card: a button for each place, its folder under it as text, and Cancel. A
+  button carries only the card and the place's index, the place Claw is told was picked (`choice`) is read from the
+  card's record (`assistant_confirm_cards.options_json`, added at start-up), and a press that names no place on the card
+  sends nothing. What came of a press is said in one line: sent as which item, waiting in line behind which items (busy,
+  in use in the terminal, or its machine offline), or why nothing was sent. A request such a task waits on names the
+  seat and the item; its one reminder after the first wait (`ask.parked`) brings the card back, valid until the longer
+  wait ends (at most a day), unless it was answered. The hourly progress line of a long task is said as Claw words it.
+  Needs a Claw that sends `seat_dispatch` cards; with an older Claw nothing changes.
+
+### Fixed
+
+- `@primusclaw/personal-agent`: starting a session on a remote agent from a chat that is the agent's own window (the
+  agents card's New session, or `/agent new`) now says "Starting <agent> on <machine> in <folder>…" at once, and that the
+  chat's messages go to the agent (with the unattended warning) only once the agent has started. Before, the switch and
+  the warning were said at the tap, and a start the connector then refused took them back a second later. A start that
+  fails names the folder it was asked for ("could not start in `/path`: that folder does not exist on that machine: pick
+  one that exists there, or create it there first") and says that the messages still go to the bot.
+- `@primusclaw/personal-agent`: a slip of `/agents` (`/agnets`, `/agens`, `/agentss`, `／agents`, `/agents.`) shows the
+  agents card as `/agents` does; it never starts or attaches a session and no longer goes to the assistant as words.
+- `@primusclaw/personal-agent`: the lines that say a chat's messages go back to the bot (a session that could not start,
+  was closed, ended while idle, or was closed in its terminal) use the bot's name in this deployment
+  (`PERSONAL_AGENT_BOT_NAME`), as the rest of the remote-agent lines do, instead of a fixed "PrimusClaw".
+
 - `@primusclaw/personal-agent`: in a group chat with no language set (or set to follow the asker), a message that says no
   language of its own ("help", the bare @mention, `/whoami`, "ok #3") is answered in English. It was answered in the
   sender's own language, the one their 1:1 messages were written in or their Teams client's, so "help" from a member who
   writes Chinese to the bot got Chinese help in a group of English speakers. Words of their own still pick the language
   ("你能做什么" gets Chinese help), and a group set with `/lang zh|en` keeps its language; such a turn is asked for an English
   answer too (`[Reply language: English]`), even when the sender's last question in the group was in another (a group no
-  longer remembers each member's last language), and its own texts say the same language as the line. An answered question card in a group follows the group, the reply's words or the
-  question, never the sender's own language. A 1:1 chat is unchanged: the approval card a group binding sends to the
+  longer remembers each member's last language), and its own texts say the same language as the line. An answered question card in a group follows the group, the
+  reply's words or the question, never the sender's own language. A 1:1 chat is unchanged: the approval card a group binding sends to the
   binder's 1:1 chat, and what its click and settled card say, stay in that chat's language; only the group's notice that
-  it waits follows the group.
+  it waits follows the group (#897).
 - A message that forwards messages and whose words answer a question card waiting in the chat no longer loses what it
   forwards. The words answered the card, and the forwarded messages, which no other message carried, never reached Claw.
   They now go to Claw with the answer, before its words, as they go with a new message; the card still shows only the
-  words. This holds in a group and in a 1:1 chat; a forward with no words still goes on as a new message.
+  words. This holds in a group and in a 1:1 chat; a forward with no words still goes on as a new message (#914).
 
 ## 0.12.0
 

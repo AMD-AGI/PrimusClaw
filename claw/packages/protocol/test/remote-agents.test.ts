@@ -4,6 +4,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  PERMISSION_PARK_MAX_MS,
+  REMOTE_EVENT_PERMISSION_PARKED,
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES,
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
   parseHiddenRequest, parseRemoteId, parseSessionNew, sseFrame, REMOTE_HIDDEN_INCLUDE, REMOTE_HIDE_LIMITS,
@@ -330,4 +332,13 @@ test("a prompt may ask for an answer only; anything but a boolean there is refus
   assert.deepEqual(REMOTE_COMMANDS.prompt.parse({ text: "hi" }), { ok: true, value: { text: "hi" } });
   assert.deepEqual(REMOTE_COMMANDS.prompt.parse({ text: "hi", answer_only: "yes" }), { ok: false, error: "invalid_answer_only" });
   assert.deepEqual(REMOTE_COMMANDS.prompt.audit({ text: "hi", answer_only: true }).answer_only, true);
+});
+
+test("a prompt may ask that its permission requests park instead of timing out; anything but a boolean there is refused", () => {
+  assert.deepEqual(REMOTE_COMMANDS.prompt.parse({ text: "hi", park_permissions: true }), { ok: true, value: { text: "hi", park_permissions: true } });
+  assert.deepEqual(REMOTE_COMMANDS.prompt.parse({ text: "hi", park_permissions: false }), { ok: true, value: { text: "hi" } });
+  assert.deepEqual(REMOTE_COMMANDS.prompt.parse({ text: "hi", park_permissions: 1 }), { ok: false, error: "invalid_park_permissions" });
+  assert.equal(REMOTE_COMMANDS.prompt.audit({ text: "hi", park_permissions: true }).park_permissions, true);
+  assert.equal(PERMISSION_PARK_MAX_MS, 24 * 3600_000);
+  assert.equal(REMOTE_EVENT_PERMISSION_PARKED, "permission_parked");
 });

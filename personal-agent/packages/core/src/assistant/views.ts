@@ -90,6 +90,12 @@ export interface ConfirmWriteModel {
   readonly allowLabel: string;
   /** What is held (`github_merge`, `trigger_create`, ...): a merge's other button says "Don't merge". Absent: "Don't". */
   readonly kind?: string;
+  /**
+   * A choice card (`seat_dispatch` with several places): a button for each, in this order, and Cancel instead of Allow and Deny.
+   * A button carries the card and the place's index; what Claw is told was picked is read from the card's record. Absent or empty:
+   * Allow and Deny.
+   */
+  readonly options?: readonly { readonly label: string; readonly detail: string }[];
   readonly lang: string;
 }
 

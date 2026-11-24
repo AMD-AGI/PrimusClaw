@@ -350,7 +350,7 @@ test("close ends the attached session and the chat goes back to claw", () =>
     await w.say("/agent close");
     assert.equal(w.server.commandsOf("close")[0]?.session_id, sid);
     assert.equal(w.server.session(sid).status, "closed");
-    assert.equal(w.last(), "Closed the session. Your messages go to PrimusClaw again.");
+    assert.equal(w.last(), "Closed the session. Your messages go to PrimusClaw Assistant again.");
     assert.equal(w.test.store.remoteState.attachedRemote(AAD), null);
   }));
 

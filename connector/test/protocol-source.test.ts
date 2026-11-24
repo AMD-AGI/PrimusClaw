@@ -29,6 +29,14 @@ test("no other file reaches into the protocol package, and none restates its con
   }
 });
 
+test("the park names the connector defines itself agree with the shared module once it carries them", () => {
+  assert.equal(ours.REMOTE_EVENT_PERMISSION_PARKED, "permission_parked");
+  assert.equal(ours.PERMISSION_PARK_MAX_MS, 24 * 3600_000);
+  const shared = theirs as Record<string, unknown>;
+  if ("REMOTE_EVENT_PERMISSION_PARKED" in shared) assert.equal(shared.REMOTE_EVENT_PERMISSION_PARKED, ours.REMOTE_EVENT_PERMISSION_PARKED);
+  if ("PERMISSION_PARK_MAX_MS" in shared) assert.equal(shared.PERMISSION_PARK_MAX_MS, ours.PERMISSION_PARK_MAX_MS);
+});
+
 test("the connector's own timings are the contract's: heartbeat, watchdog, ping relation", async () => {
   const { DEFAULT_TIMING } = await import("../src/connector.js");
   assert.equal(DEFAULT_TIMING.heartbeatMs, theirs.REMOTE_AGENT_TIMING.heartbeatMs);

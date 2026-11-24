@@ -16,6 +16,7 @@ import {
   type CardState,
   type ChoiceCard,
   type ConfirmCard,
+  type ConfirmCardOption,
   type JsonObject,
   type MoveOptions,
   type PlacedCard,
@@ -23,7 +24,17 @@ import {
 
 import { type StoreContext, tokenUrlsafe } from "./context.js";
 import { type Database, type Row, col, flag } from "./database.js";
-import { jsonStrings, parseJson, pyJsonDumps, storedObject } from "./py-json.js";
+import { jsonList, jsonStrings, parseJson, pyJsonDumps, storedObject } from "./py-json.js";
+
+/** A choice card's stored places; an entry that is not one is dropped (a card whose places cannot be read offers none). */
+function confirmOptions(text: string): ConfirmCardOption[] {
+  return jsonList(text || "[]").flatMap((entry) => {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return [];
+    const { id, label, detail } = entry as Record<string, unknown>;
+    if (typeof id !== "string" || !id || typeof label !== "string") return [];
+    return [{ id, label, detail: typeof detail === "string" ? detail : "" }];
+  });
+}
 
 /** Move a card of `table` to `state`; with `onlyFrom`, only from that state. True if this call moved it. */
 function moveCard(db: Database, table: string, cardId: string, state: CardState, options: MoveOptions = {}): boolean {
@@ -188,26 +199,33 @@ export class SqliteAssistantButtonRepository implements AssistantButtonRepositor
     return moveCard(this.ctx.db, "assistant_action_cards", cardId, state, options);
   }
 
-  addConfirmCard(userId: string, confirmationId: string, kind: string, label = ""): string {
+  addConfirmCard(
+    userId: string,
+    confirmationId: string,
+    kind: string,
+    label = "",
+    options: readonly ConfirmCardOption[] = [],
+  ): string {
     const now = this.ctx.now();
     this.ctx.db.run("DELETE FROM assistant_confirm_cards WHERE created_at < ?", now - CONFIRM_CARD_KEEP_SECONDS);
     const cardId = tokenUrlsafe(this.ctx.random, 12);
     this.ctx.db.run(
-      "INSERT INTO assistant_confirm_cards (card_id, aad_id, confirmation_id, kind, label, state, created_at) " +
-        "VALUES (?, ?, ?, ?, ?, 'open', ?)",
+      "INSERT INTO assistant_confirm_cards (card_id, aad_id, confirmation_id, kind, label, state, created_at, options_json) " +
+        "VALUES (?, ?, ?, ?, ?, 'open', ?, ?)",
       cardId,
       userId,
       confirmationId,
       kind,
       label,
       now,
+      JSON.stringify(options.map(({ id, label: shown, detail }) => ({ id, label: shown, detail }))),
     );
     return cardId;
   }
 
   getConfirmCard(cardId: string): ConfirmCard | null {
     const row = this.ctx.db.get(
-      "SELECT card_id, aad_id, confirmation_id, kind, label, state, created_at FROM assistant_confirm_cards " +
+      "SELECT card_id, aad_id, confirmation_id, kind, label, options_json, state, created_at FROM assistant_confirm_cards " +
         "WHERE card_id = ? AND created_at >= ?",
       cardId,
       this.ctx.now() - CONFIRM_CARD_KEEP_SECONDS,
@@ -219,6 +237,7 @@ export class SqliteAssistantButtonRepository implements AssistantButtonRepositor
       confirmationId: col.str(row, "confirmation_id"),
       kind: col.str(row, "kind"),
       label: col.str(row, "label"),
+      options: confirmOptions(col.str(row, "options_json")),
       state: col.str(row, "state"),
       createdAt: col.num(row, "created_at"),
     };

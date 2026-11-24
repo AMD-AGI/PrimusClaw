@@ -273,6 +273,7 @@ test("action and confirm buttons live as long as their message or confirmation, 
     confirmationId: "conf-1",
     kind: "trigger_create",
     label: "Create",
+    options: [],
     state: "open",
     createdAt: store.now(),
   });
@@ -345,4 +346,19 @@ test("an assistant message is known for a day: whose it was, its actions and the
   assert.deepEqual(messages.assistantMessagePeople("m1"), new Set());
   messages.noteAssistantMessage("m3", "aad-b", ["x"]);
   assert.notEqual(messages.assistantMessage("m3"), null);
+});
+
+test("a choice card keeps its places in their order, and a card without them offers none", () => {
+  const { store } = openTestStore();
+  const buttons = store.assistantButtons;
+  const places = [
+    { id: "seat-a1", label: "发布台", detail: "~/rel" },
+    { id: "sandbox", label: "Sandbox", detail: "" },
+  ];
+  const choice = buttons.addConfirmCard("aad-a", "conf-9", "seat_dispatch", "Send", places);
+  assert.deepEqual(buttons.getConfirmCard(choice)?.options, places);
+  assert.deepEqual(
+    buttons.getConfirmCard(buttons.addConfirmCard("aad-a", "conf-1", "seat_dispatch", "Send"))?.options,
+    [],
+  );
 });

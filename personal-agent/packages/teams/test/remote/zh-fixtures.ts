@@ -193,7 +193,7 @@ function lines(lang: Lang): string {
   return [
     remoteDomain.switchedLine("cx-main", "devbox-7", lang),
     remoteDomain.backLine(lang),
-    remoteDomain.terminalClosedLine(lang),
+    remoteDomain.terminalClosedLine(lang, "PrimusClaw Assistant"),
     remoteDomain.readOnlyRefused(lang),
     remoteDomain.readOnlyRefused(lang, true),
     remoteDomain.botLine(lang, "PrimusClaw Assistant"),
@@ -367,6 +367,18 @@ function hiddenCards(lang: Lang): Record<string, unknown> {
   };
 }
 
+/** The request a seat's (or a session's) push asks, as its card is drawn. */
+const ASKING = {
+  ask: ASK,
+  options: remoteDomain.parseOptions(OPTIONS),
+  sessionId: ATTACHED,
+  machine: "devbox-7",
+  agent: "cx-main",
+  about: "#3 修复",
+  expiresAt: NOW,
+  zone: TZ,
+};
+
 function smallCards(lang: Lang): Record<string, Rendered> {
   const cs = connectors();
   const first = cs[0] ?? connector({ connectorId: "x" });
@@ -397,20 +409,9 @@ function smallCards(lang: Lang): Record<string, Rendered> {
     "permission card, no kind": permissionCard(
       remoteView.permissionView({ ...REQUEST, kind: "" }, options.slice(0, 1), ATTACHED, words.theAgent, NOW, TZ, lang),
     ),
-    "remote ask card": remoteAskCard(
-      remoteView.remoteAskView(
-        {
-          ask: ASK,
-          options,
-          sessionId: ATTACHED,
-          machine: "devbox-7",
-          agent: "cx-main",
-          about: "#3 修复",
-          expiresAt: NOW,
-          zone: TZ,
-        },
-        lang,
-      ),
+    "remote ask card": remoteAskCard(remoteView.remoteAskView(ASKING, lang)),
+    "remote ask card, a seat's parked reminder": remoteAskCard(
+      remoteView.remoteAskView({ ...ASKING, about: "#3", seat: "发布台", parked: true }, lang),
     ),
     "disconnect card": disconnectCard(remoteView.disconnectView("devbox-7", "c-on", SETUP, lang)),
     "disconnect card, paired": disconnectCard(remoteView.disconnectView("devbox-7", "c-on", SETUP, lang, true)),
@@ -484,7 +485,7 @@ export function fixtureStrings(): Set<string> {
     else if (value instanceof Set) [...(value as Set<unknown>)].forEach(walk);
     else if (value && typeof value === "object") Object.values(value).forEach(walk);
   };
-  walk([connectors(), sessions(), OPTIONS, REQUEST, ASK, entries(), health(), "m-a", "m-b", "#3 修复"]);
+  walk([connectors(), sessions(), OPTIONS, REQUEST, ASK, entries(), health(), "m-a", "m-b", "#3 修复", "#3", "发布台"]);
   for (const kind of ["claude", "codex", "cursor"]) found.add(remoteDomain.kindLabel(kind).label);
   found.add("Agent");
   found.add(TERMINAL_ASKS);

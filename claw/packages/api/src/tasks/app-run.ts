@@ -35,6 +35,9 @@ import {
   APP_SANDBOX_ROLES,
   appGrantTemplates,
   appStopGraceSec,
+  appTemplateWorkspace,
+  templateMountRefusals,
+  templateMountsOf,
   isGpuResourceKey,
   resolveAppResources,
   validateAppManifest,
@@ -168,8 +171,17 @@ export interface AppRunPorts {
   containerCaps(): AppContainerCaps;
   /** Whether `workspaceId` exists and `caller` may use it. Throws WorkspaceCheckUnavailableError when it cannot tell. */
   workspaceAccess(auth: CallerAuth, workspaceId: string): Promise<WorkspaceVerdict>;
+  /**
+   * The `volumes` of the workspace, read as the caller; asked only for a run
+   * whose sandbox templates declare `host_mounts`. Throws WorkspaceCheckUnavailableError
+   * when it cannot tell.
+   */
+  workspaceVolumes(auth: CallerAuth, workspaceId: string): Promise<WorkspaceVolumes>;
   grant: AppGrantHooks;
 }
+
+/** What {@link AppRunPorts.workspaceVolumes} answers: the volumes, or why the workspace is not readable. */
+export type WorkspaceVolumes = { volumes: unknown[] } | { verdict: Exclude<WorkspaceVerdict, "ok"> };
 
 /**
  * Asks SaFE, as the caller: the workspace is a SaFE object and SaFE is what
@@ -211,11 +223,50 @@ export async function safeWorkspaceAccess(
   throw new WorkspaceCheckUnavailableError(`SaFE answered ${status}`);
 }
 
+/**
+ * The workspace's `volumes` from SaFE's workspace detail, asked as the caller
+ * (as {@link safeWorkspaceAccess} asks). The dev bypass has no credential to
+ * ask with, and a template mount is never admitted without knowing what the
+ * workspace grants, so it cannot tell.
+ */
+export async function safeWorkspaceVolumes(auth: CallerAuth, workspaceId: string): Promise<WorkspaceVolumes> {
+  if (devAuthBypassEnabled()) throw new WorkspaceCheckUnavailableError("the dev auth bypass has no credential to read workspace volumes");
+  if (isKubernetesMode()) throw new WorkspaceCheckUnsupportedError("no SaFE in kubernetes mode");
+  if (!SAFE_API_URL) throw new WorkspaceCheckUnavailableError("SAFE_API_URL is not configured");
+  if (!auth.authorization && !auth.cookie) return { verdict: "forbidden" };
+  const headers: Record<string, string> = {};
+  if (auth.authorization) headers.authorization = auth.authorization;
+  if (auth.cookie) headers.cookie = auth.cookie;
+  let resp: Response;
+  try {
+    resp = await fetch(
+      `${SAFE_API_URL}/api/v1/workspaces/${encodeURIComponent(workspaceId)}`,
+      { method: "GET", headers, signal: AbortSignal.timeout(5000) },
+    );
+  } catch (err) {
+    throw new WorkspaceCheckUnavailableError(err instanceof Error ? err.message : String(err));
+  }
+  if (resp.status === 404 || resp.status === 401 || resp.status === 403) {
+    await resp.body?.cancel().catch(() => {});
+    return { verdict: resp.status === 404 ? "not_found" : "forbidden" };
+  }
+  if (resp.status < 200 || resp.status >= 300) {
+    await resp.body?.cancel().catch(() => {});
+    throw new WorkspaceCheckUnavailableError(`SaFE answered ${resp.status}`);
+  }
+  const body = await resp.json().catch(() => null) as { volumes?: unknown } | null;
+  if (!body || typeof body !== "object") throw new WorkspaceCheckUnavailableError("SaFE answered an unreadable workspace");
+  if (body.volumes === undefined || body.volumes === null) return { volumes: [] };
+  if (!Array.isArray(body.volumes)) throw new WorkspaceCheckUnavailableError("SaFE answered unreadable workspace volumes");
+  return { volumes: body.volumes };
+}
+
 export const appRunPorts: AppRunPorts = {
   enabled: () => APP_RUNS_ENABLED,
   caps: () => APP_SANDBOX_CAPS,
   containerCaps: () => APP_CONTAINER_CAPS,
   workspaceAccess: safeWorkspaceAccess,
+  workspaceVolumes: safeWorkspaceVolumes,
   grant: { issue: async () => undefined },
 };
 
@@ -484,7 +535,51 @@ export async function checkAppRunRequest(
     if (v.value !== "ok") return refuse(403, "workspace_access_denied", { workspace: workspaceId });
   }
 
+  // 5. Host directories a sandbox template mounts must lie under what the
+  // template's workspace already mounts for sandboxes, read as the caller: a
+  // plugin never reaches a host path the workspace does not grant.
+  const mountRefusal = await checkTemplateMounts(req.auth, manifest, resolved, ports);
+  if (mountRefusal) return mountRefusal;
+
   return { pluginId, manifest, input, resolved, plan, ...(overrides ? { overrides } : {}) };
+}
+
+/**
+ * The refusal for a template mount the template's workspace does not grant, or
+ * undefined when every mount is granted (or no template declares one). Each
+ * workspace is read once.
+ */
+async function checkTemplateMounts(
+  auth: CallerAuth,
+  manifest: AppManifestV1,
+  resolved: ResolvedAppResources,
+  ports: AppRunPorts,
+): Promise<AppRunOutcome | undefined> {
+  const withMounts = (manifest.sandbox_templates ?? []).filter((t) => templateMountsOf(t).length > 0);
+  if (withMounts.length === 0) return undefined;
+  const read = new Map<string, WorkspaceVolumes>();
+  const problems: Array<{ field: string; reason: string }> = [];
+  for (const t of withMounts) {
+    const workspace = appTemplateWorkspace(t, resolved);
+    let answer = read.get(workspace);
+    if (!answer) {
+      try {
+        answer = await ports.workspaceVolumes(auth, workspace);
+      } catch (err) {
+        if (err instanceof WorkspaceCheckUnsupportedError) return refuse(501, "workspace_check_unsupported");
+        logger.warn({ workspace, err: err instanceof Error ? err.message : String(err) }, "app_run.workspace_volumes_unavailable");
+        return refuse(503, "workspace_check_unavailable");
+      }
+      read.set(workspace, answer);
+    }
+    if ("verdict" in answer) {
+      if (answer.verdict === "not_found") return refuse(404, "workspace_not_found", { workspace });
+      return refuse(403, "workspace_access_denied", { workspace });
+    }
+    problems.push(...templateMountRefusals(t.name, templateMountsOf(t), workspace, answer.volumes));
+  }
+  if (problems.length > 0) return refuse(403, "sandbox_template_mount_not_granted", { problems });
+  return undefined;
 }
 
 /** A positive whole number of seconds a run's deadline can be armed for, or undefined. */

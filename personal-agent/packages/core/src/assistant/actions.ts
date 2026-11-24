@@ -11,9 +11,10 @@
 import { viewMessage, type CardClick } from "../approvals/click.js";
 import { errorName } from "../errors.js";
 import { assistantActionText } from "../locales/assistant-actions.js";
+import { seatDispatchText } from "../locales/assistant-seats.js";
 import type { ClawAssistantPort } from "../ports/claw/assistant.js";
 import type { Logger } from "../ports/logger.js";
-import type { ActionCard, ConfirmCard } from "../ports/store/assistant.js";
+import type { ActionCard, ConfirmCard, ConfirmCardOption } from "../ports/store/assistant.js";
 import type { StorePort } from "../ports/store/index.js";
 import type { TokenExchange } from "../plugins/token-exchange.js";
 import { cpLength, pySplit, pyStr, pyStrip } from "../text/py-text.js";
@@ -151,27 +152,15 @@ export class AssistantActions {
 
   /**
    * Allow or Deny (`op`) on a write Claw holds until the person answers. The card must be the presser's and not yet used; what it
-   * answers is the recorded confirmation, as the person with their exchanged token. Of two presses exactly one is sent.
+   * answers is the recorded confirmation, as the person with their exchanged token. Of two presses exactly one is sent. On a choice
+   * card (places to pick from) Allow carries the place's index (`pick`): the place Claw is told was picked is read from the record,
+   * and a press that names none of its places sends nothing.
    */
   async confirmClick(click: CardClick): Promise<void> {
     const { store } = this.deps;
-    const data = click.action.data;
-    const card = store.assistantButtons.getConfirmCard(pyStr(data["card"]));
-    const op = data["op"];
-    // (a skill card's Undo record is no held write: its own buttons answer it, `skills/clicks.ts`)
-    if (
-      (op !== "allow" && op !== "deny") ||
-      card === null ||
-      card.userId !== click.sender.id ||
-      card.kind === SKILL_UNDO_KIND
-    ) {
-      await finish(click, t.confirmGone);
-      return;
-    }
-    if (card.state !== "open") {
-      await finish(click, t.confirmUsed);
-      return;
-    }
+    const pressed = await this.pressed(click);
+    if (pressed === undefined) return;
+    const { card, op, picked } = pressed;
     const token = await this.token(click, card);
     if (token === undefined) return;
     if (!store.assistantButtons.moveConfirmCard(card.cardId, "busy", { onlyFrom: "open" })) {
@@ -180,7 +169,7 @@ export class AssistantActions {
     }
     let out: Event;
     try {
-      out = await this.deps.claw.decideConfirmation(token, card.confirmationId, op);
+      out = await this.deps.claw.decideConfirmation(token, card.confirmationId, op, picked?.id);
     } catch (error) {
       await this.notAnswered(click, card, error);
       return;
@@ -192,7 +181,40 @@ export class AssistantActions {
       return;
     }
     store.assistantButtons.moveConfirmCard(card.cardId, "done");
-    await finish(click, confirmOutcome(card.kind, out, click.lang()));
+    await finish(click, confirmOutcome(card.kind, out, click.lang(), picked?.label ?? ""));
+  }
+
+  /**
+   * The held write a press answers, how, and (a choice card's Allow) the place it picked; undefined when the press answers nothing
+   * (the presser was told why): not the presser's card, not a held write, used already, or a place the card does not offer.
+   */
+  private async pressed(
+    click: CardClick,
+  ): Promise<{ card: ConfirmCard; op: "allow" | "deny"; picked: ConfirmCardOption | undefined } | undefined> {
+    const data = click.action.data;
+    const card = this.deps.store.assistantButtons.getConfirmCard(pyStr(data["card"]));
+    const op = data["op"];
+    // (a skill card's Undo record is no held write: its own buttons answer it, `skills/clicks.ts`)
+    if (
+      (op !== "allow" && op !== "deny") ||
+      card === null ||
+      card.userId !== click.sender.id ||
+      card.kind === SKILL_UNDO_KIND
+    ) {
+      await finish(click, t.confirmGone);
+      return undefined;
+    }
+    if (card.state !== "open") {
+      await finish(click, t.confirmUsed);
+      return undefined;
+    }
+    const choosing = op === "allow" && card.options.length > 0;
+    const picked = choosing ? pickedOption(card, data["pick"]) : undefined;
+    if (choosing && picked === undefined) {
+      await finish(click, seatDispatchText.in(click.lang()).notOnCard);
+      return undefined;
+    }
+    return { card, op, picked };
   }
 
   /** The presser's exchanged token; undefined when it cannot be had (the card was answered with why, as it was). */
@@ -234,7 +256,22 @@ export class AssistantActions {
 
   /** Nothing was answered: the card comes back with `note`, and pressing it again can help. */
   private async again(click: CardClick, card: ConfirmCard, note: string): Promise<void> {
-    const model = { text: note, cardId: card.cardId, allowLabel: card.label, kind: card.kind, lang: click.lang() };
+    const options = card.options.map(({ label, detail }) => ({ label, detail }));
+    const model = {
+      text: note,
+      cardId: card.cardId,
+      allowLabel: card.label,
+      kind: card.kind,
+      ...(options.length ? { options } : {}),
+      lang: click.lang(),
+    };
     await click.settle(viewMessage({ name: "confirmWrite", model }), { fallback: note });
   }
+}
+
+/** The place a choice card's press picked: its index on the card (`pick`), as the card's record has it; undefined for none. */
+function pickedOption(card: ConfirmCard, pick: unknown): ConfirmCardOption | undefined {
+  const index =
+    typeof pick === "string" && /^[0-9]{1,2}$/.test(pick) ? Number(pick) : typeof pick === "number" ? pick : NaN;
+  return Number.isSafeInteger(index) && index >= 0 ? card.options[index] : undefined;
 }

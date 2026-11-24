@@ -75,6 +75,6 @@ export class EndedWords {
     const lang = this.state.lang(chatKey);
     const words = remoteAgentText.in(lang);
     const head = await this.said(chatKey, remoteLeads.sessionEnded, key, provider, connectorId, reason);
-    return head + (follow ? words.endedFollowTail : words.endedTail);
+    return head + (follow ? words.endedFollowTail({ bot: this.ctx.settings.botName }) : words.endedTail);
   }
 }

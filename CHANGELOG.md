@@ -17,7 +17,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
 | Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.1 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.12.0 |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.13.0 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
 The Teams app package (its manifest `version`) is not covered by these rules.
@@ -113,6 +113,23 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: tasks handed to the user's seats (for users with seats; `CLAW_DEVENV_SEAT_DISPATCH=off` turns it off). `work_create` takes
+  `target: "seat:<seat_id>"`, or 2 to 5 places for a choice card (`confirm_write.options`, decided with `choice`). Each task is its own
+  remote item; a card is required unless the user's own attended message names one confirmed seat they already approved a card for
+  (and did not ask to confirm each time, and its agent asks before it acts). One task runs per seat, up to three queue; a terminal in use
+  is not typed into; the end wakes the router; permission requests are pushed with the item number and seat, parked requests reminded
+  once; a task running over an hour is said hourly with its latest step. Prompt `router-dispatch-v1`. See `claw/docs/remote-agents.md`.
+- Claw: a sandbox template of an app manifest can mount host directories read-only, `sandbox_templates[].host_mounts:
+  [{ "hostPath": "/shared/team/cache", "readOnly": true }]`, for example a cache the application writes through the
+  workspace's read-write mount and its measurement sandboxes only read. Each mount is a hostPath volume of the Agent
+  Sandbox template at the same path. Only `readOnly: true` is accepted, the path must be absolute and normalised and stay
+  clear of system directories, and an app run is refused (`403 sandbox_template_mount_not_granted`) unless the path lies
+  under a directory the template's workspace already mounts for sandboxes, read from SaFE as the caller. A template's
+  own Agent Sandbox `volumes` may no longer be hostPath ones, every key of a template must be ASCII (Agent Sandbox's
+  JSON decoder folds `ſ` onto `s` and `K` onto `k`), no object of a template may have two keys that differ only in case
+  (the decoder keeps the last), and the Agent Sandbox grant service refuses to issue or extend a grant whose template
+  spec has two such keys, or a hostPath volume at, under or above a system directory, mounted anywhere but read-only at
+  its own path, or mounted by a sidecar.
 - Claw: seats (default off; `CLAW_DEVENV_SEATS=on`, or the users in `CLAW_DEVENV_SEATS_USERS`). Each folder an agent works in on a
   user's machines is a seat (`claw_devenv_seats`), made and kept from the sessions and conversations Claw already has. What it is for
   counts only once the user confirmed it on a card: their own words (`seat_set`, in a turn answering their own signed-in message), or

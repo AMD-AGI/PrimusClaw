@@ -23,6 +23,9 @@ export const remoteText = defineCatalog({
     asksPermission: (p: { who: string }) => `${p.who} asks permission.`,
     asksPermissionKind: (p: { kind: string; who: string }) => `${p.who} asks permission (${p.kind}).`,
     validUntil: (p: { until: string; zone: string }) => `Valid until ${p.until} (${p.zone}). After that it is refused.`,
+    seatNeedsApproval: (p: { seat: string }) => `${p.seat} needs your approval`,
+    stillWaiting: (p: { until: string; zone: string }) =>
+      `Still waiting for your approval, until ${p.until} (${p.zone}) at the latest.`,
     alwaysChanges:
       "An always option changes what this agent may do on your machine from now on, not only for this request.",
     needsApproval: "Needs your approval",
@@ -148,8 +151,8 @@ ${p.quoted}`,
       "Open in a terminal: a message from here cannot be typed into it now, so you can watch. To send from here, open the conversation in tmux, and in that one terminal only",
     shareNoteOld:
       "Open in a terminal: this machine's connector cannot type into a terminal yet (it needs 0.1.9 or newer), so you can watch",
-    terminalClosed:
-      "The conversation was closed in the terminal, so the watch is over and your messages go to PrimusClaw again. Switch to it again to carry on with it.",
+    terminalClosed: (p: { bot: string }) =>
+      `The conversation was closed in the terminal, so the watch is over and your messages go to ${p.bot} again. Switch to it again to carry on with it.`,
     switched: (p: { where: string }) => `—— Now: ${p.where} ——`,
     recoveredWhere: (p: { host: string; label: string }) => `${p.label} on ${p.host}`,
     recoveredContinuing: (p: { where: string }) =>
@@ -234,6 +237,8 @@ It installs the connector, pairs the machine with you and keeps it running. I wi
     asksPermission: (p) => `${p.who} 请求权限。`,
     asksPermissionKind: (p) => `${p.who} 请求权限（${p.kind}）。`,
     validUntil: (p) => `${p.until}（${p.zone}）前有效，过时自动拒绝。`,
+    seatNeedsApproval: (p) => `${p.seat} 需要你批准`,
+    stillWaiting: (p) => `还在等你批准，最晚到 ${p.until}（${p.zone}）。`,
     alwaysChanges: "选“始终允许”会改变这个 agent 以后在你机器上能做的事，不只是这一次。",
     needsApproval: "需要你批准",
     waitsForYou: (p) => `${p.who} 在等你：${p.about}`,
@@ -353,7 +358,7 @@ ${p.quoted}`,
     shareNoteNoTmux:
       "终端里正在用：这里发的消息现在打不进那个终端，只能看。要能发：在 tmux 里打开这个会话，并且只在这一个终端里开着它",
     shareNoteOld: "终端里正在用：这台机器的连接器还不能往终端里输入（需要 0.1.9 或更新），现在只能看",
-    terminalClosed: "终端里的会话已经退出，旁观结束，你的消息回到助理。要接着用它，再切过去就行。",
+    terminalClosed: (p) => `终端里的会话已经退出，旁观结束，你的消息回到 ${p.bot}。要接着用它，再切过去就行。`,
     switched: (p) => `—— 现在是 ${p.where} ——`,
     recoveredWhere: (p) => `${p.host} 上的 ${p.label}`,
     recoveredContinuing: (p) =>

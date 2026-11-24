@@ -65,7 +65,7 @@
     "type": "table",
     "name": "assistant_confirm_cards",
     "tbl_name": "assistant_confirm_cards",
-    "sql": "CREATE TABLE assistant_confirm_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, confirmation_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',\n  state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL)"
+    "sql": "CREATE TABLE assistant_confirm_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, confirmation_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',\n  state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL, options_json TEXT NOT NULL DEFAULT '[]')"
    },
    {
     "type": "table",
@@ -868,6 +868,14 @@
       "type": "REAL",
       "notnull": 1,
       "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 7,
+      "name": "options_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "'[]'",
       "pk": 0
      }
     ],
@@ -3287,7 +3295,7 @@
     "type": "table",
     "name": "assistant_confirm_cards",
     "tbl_name": "assistant_confirm_cards",
-    "sql": "CREATE TABLE assistant_confirm_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, confirmation_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',\n  state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL)"
+    "sql": "CREATE TABLE assistant_confirm_cards (\n  card_id TEXT PRIMARY KEY, aad_id TEXT NOT NULL, confirmation_id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',\n  state TEXT NOT NULL DEFAULT 'open', created_at REAL NOT NULL, options_json TEXT NOT NULL DEFAULT '[]')"
    },
    {
     "type": "table",
@@ -4090,6 +4098,14 @@
       "type": "REAL",
       "notnull": 1,
       "dflt_value": null,
+      "pk": 0
+     },
+     {
+      "cid": 7,
+      "name": "options_json",
+      "type": "TEXT",
+      "notnull": 1,
+      "dflt_value": "'[]'",
       "pk": 0
      }
     ],
