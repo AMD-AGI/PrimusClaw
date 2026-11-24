@@ -27,6 +27,9 @@
  *   D20 one more instruction to a finished task, on a seat that asks first: the task is unchanged until the card is pressed; a no, a
  *       lapse and the sweep keep its result; a yes opens it again and sends; a second card pressed after that sends nothing
  *   D21 a finished task opened again whose instruction cannot be sent (its seat's queue full) is put back as it ended
+ *   D22 the same words sent to a task twice in one router turn (at once, or one after the other) go once: one command to a running
+ *       task, one reopening of a finished one, one card, one place in the queue; the second call answers that they were already sent;
+ *       the next turn sends them again
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -785,6 +788,60 @@ describe("seat dispatch", { skip }, () => {
     const back = await item(done.item_id);
     assert.deepEqual(ended(back).filter((_, i) => i !== 4), was.filter((_, i) => i !== 4), "its end, answer and brief are back");
     assert.equal(back.params.queued, undefined);
+  });
+
+  test("D22 the same words to a task twice in one turn go once, and the second call says they were already sent", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const send = (turn: Claims, id: unknown, text: string) => tools.workSend(turn, { item_id: String(id), text }) as Promise<Recorded>;
+    // Running: two calls at once, then a third after them, in one turn: one command to the machine.
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    const turn = await userTurn(alice, "顺便更新 changelog");
+    const both = await Promise.all([send(turn, out.item_id, "顺便更新 changelog"), send(turn, out.item_id, "顺便更新  changelog ")]);
+    assert.deepEqual(both.map((r) => r.dispatch).sort(), ["already_sent", "sent"], JSON.stringify(both));
+    assert.equal((await send(turn, out.item_id, "顺便更新 changelog")).dispatch, "already_sent");
+    assert.equal((await prompted(cid)).length, 1, "one command reached the machine");
+    assert.equal((await item(out.item_id)).params.open_cmd_seqs.length, 2);
+    // Other words in the same turn, and the same words in the next turn, are sent.
+    assert.equal((await send(turn, out.item_id, "再跑一次测试")).dispatch, "sent");
+    assert.equal((await send(await userTurn(alice, "顺便更新 changelog"), out.item_id, "顺便更新 changelog")).dispatch, "sent");
+    assert.equal((await prompted(cid)).length, 3);
+
+    // Finished: opened again once and sent once.
+    const cid2 = await machine("alice", "devbox2");
+    const s2 = await seat(cid2, "/home/u/docs", { alias: "文档台", role: "负责文档", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid2, s2, "整理文档");
+    const gen = Number(done.generation);
+    const again = await userTurn(alice, "再补一节");
+    const reopened = await Promise.all([send(again, done.item_id, "再补一节"), send(again, done.item_id, "再补一节")]);
+    assert.deepEqual(reopened.map((r) => r.dispatch).sort(), ["already_sent", "sent"], JSON.stringify(reopened));
+    const open = await item(done.item_id);
+    assert.deepEqual([open.board_state, Number(open.generation), open.params.open_cmd_seqs.length], ["in_progress", gen + 1, 1]);
+    assert.equal((await prompted(cid2)).length, 1, "the finished task's machine got one command");
+
+    // A seat that asks first: one card, and pressing it sends once.
+    await collect(cid);
+    await seats.seatSet(await userTurn(alice, "发布台每次都确认"), { seat: s.seatId, confirm_each: true });
+    const carded = await userTurn(alice, "再打个 tag");
+    const cards = await Promise.all([send(carded, out.item_id, "再打个 tag"), send(carded, out.item_id, "再打个 tag")]);
+    assert.deepEqual(cards.map((r) => r.dispatch).sort(), ["already_sent", "card"], JSON.stringify(cards));
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations WHERE kind = 'seat_dispatch' AND status = 'pending'"))[0].n, 1, "one card");
+    const pressed = await press(cards.find((r) => r.dispatch === "card")!.confirmation_id);
+    assert.equal(pressed.result?.dispatch, "sent", JSON.stringify(pressed));
+    assert.equal((await prompted(cid)).length, 1, "one command for the card");
+
+    // Queued (its seat busy): one place in the queue, and the second call is told it was sent, not that the task has not started.
+    const cid3 = await machine("alice", "devbox3");
+    const s3 = await seat(cid3, "/home/u/ops", { alias: "运维台", role: "负责运维", role_state: "confirmed", dispatch_mode: "auto" });
+    const old = await finished(alice, cid3, s3, "清理日志");
+    assert.equal((await create(await userTurn(alice, "扩容"), `seat:${s3.seatId}`, "扩容")).dispatch, "sent");
+    const busy = await userTurn(alice, "再清理一次");
+    const first = await send(busy, old.item_id, "再清理一次");
+    assert.equal(first.dispatch, "queued", JSON.stringify(first));
+    assert.equal((await send(busy, old.item_id, "再清理一次")).dispatch, "already_sent");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_items WHERE params->>'seat_id' = $1 AND params ? 'queued'", [s3.seatId]))[0].n, 1);
   });
 
   test("D12 the prompt asks for parking only from a connector that can park", async () => {

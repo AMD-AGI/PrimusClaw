@@ -19,7 +19,7 @@
  * the last ten minutes, busy, or one that can only be watched) is not typed into; one quiet for ten minutes is. A task waiting for its
  * machine fails after a day.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import pino from "pino";
 import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, type AssistantConfirmOption } from "@claw/protocol";
 import { readTrustedSessionCredentials, sealedCredentialFields } from "../auth/sealed-session-credentials.js";
@@ -652,11 +652,50 @@ async function errandToSandbox(
 
 // --- work_send to a task of a seat --------------------------------------------------------------------------------------------
 
+/** The words of an instruction as one turn's repeat is told by: the same text, spacing aside. */
+function sendKey(text: string): string {
+  return createHash("sha256").update(text.replace(/\s+/g, " ").trim()).digest("hex").slice(0, 32);
+}
+
+/** Whether these words were already let through to the task in this router turn (sent, queued, opened again or put on a card). */
+function sentThisTurn(p: ErrandParams, task: string, key: string): boolean {
+  return p.turn_sends?.task === task && Array.isArray(p.turn_sends.keys) && p.turn_sends.keys.includes(key);
+}
+
+/**
+ * The turn's claim on sending these words to the task, taken once: false when this turn already took it (a replayed or doubled
+ * `work_send`). One statement on the item's row, so two calls at once meet there and only one goes on.
+ */
+async function claimTurnSend(q: Querier, itemId: string, task: string, key: string): Promise<boolean> {
+  return (await q(
+    `UPDATE claw_work_items
+        SET params = params || jsonb_build_object('turn_sends', jsonb_build_object('task', $2::text, 'keys',
+              CASE WHEN params->'turn_sends'->>'task' = $2::text THEN COALESCE(params->'turn_sends'->'keys', '[]'::jsonb) ELSE '[]'::jsonb END
+              || to_jsonb($3::text))),
+            updated_at = NOW()
+      WHERE item_id = $1
+        AND NOT COALESCE(params->'turn_sends'->>'task' = $2::text AND params->'turn_sends'->'keys' ? $3::text, false)
+      RETURNING 1`,
+    [itemId, task, key],
+  )).rows.length > 0;
+}
+
+/** A claim whose instruction went nowhere, given back: the same words may be sent again in this turn. */
+async function releaseTurnSend(q: Querier, itemId: string, task: string, key: string): Promise<void> {
+  await q(
+    `UPDATE claw_work_items SET params = jsonb_set(params, '{turn_sends,keys}', (params->'turn_sends'->'keys') - $3::text)
+      WHERE item_id = $1 AND params->'turn_sends'->>'task' = $2::text`,
+    [itemId, task, key],
+  );
+}
+
 /**
  * `work_send` to a seat's task: the same say as `work_create` for its seat. Running: one more instruction into its session. Ended
  * (finished within a week, failed, or stopped where it ran): opened again and sent again, as a new task to the same seat; put back as it
  * ended when nothing could be sent. When the seat asks for a card, nothing changes until the card is pressed: an ended task is opened
  * again only then, and a no leaves it as it ended. Not sent yet (its card waits, or its queue): nothing is added to what the user was shown.
+ * The same words to the same task twice in one router turn go once (one send, one card, one task opened again): the second call is
+ * answered that they were already sent.
  */
 export async function errandWorkSend(
   claims: AssistantTokenClaims, userId: string, itemId: string, text: string, newSession: boolean,
@@ -667,6 +706,13 @@ export async function errandWorkSend(
     [itemId, userId])).rows[0] as Row | undefined;
   if (!item) throw new ToolRefused("item_not_found", "no such item");
   const p = item.params as ErrandParams;
+  const key = sendKey(text);
+  const already = (): Record<string, unknown> => ({
+    ok: true, item_id: itemId, seq: Number(item.seq), dispatch: "already_sent",
+    note: "Already sent: this turn already sent these words to that task (or put them to the user on a card); nothing was sent again. Do not say it twice.",
+  });
+  // Asked first: the first call may have queued the task, opened it again or put a card up, which would read as another refusal.
+  if (sentThisTurn(p, claims.task_id, key)) return already();
   if (p.queued) {
     throw new ToolRefused("item_not_started", p.queued === "card"
       ? "that task still waits for the user's card: ask them to press it (or say no), then send more"
@@ -700,6 +746,8 @@ export async function errandWorkSend(
     const card = await inTransaction(async (tx) => {
       await assertLiveRun(tx, claims);
       await tx("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [userId]);
+      // One card for the turn's words (given back with the card if it is not made).
+      if (!await claimTurnSend(tx, itemId, claims.task_id, key)) return null;
       // The task is left as it is until the card is pressed: an ended one is opened again only then (`seatDispatchDecided`).
       return proposeConfirmation(tx, claims, userId, "seat_dispatch", {
         item_id: itemId, seat_id: p.seat_id, title: String(item.title ?? ""), brief: text, lang, why_card: why, label: seatLabel(live!),
@@ -711,23 +759,43 @@ export async function errandWorkSend(
         allowLabel: zh ? "发送" : "Send",
       });
     });
+    if (!card) return already();
     if (card.announce) await card.announce();
     return { ok: true, item_id: itemId, seq: Number(item.seq), dispatch: "card", why_card: why, ...proposed(card.row, card.subscribers, "sent", lang) };
   }
+  if (!await claimTurnSend(q, itemId, claims.task_id, key)) return already();
+  const giveBack = () => releaseTurnSend(q, itemId, claims.task_id, key).catch(() => undefined);
   if (running) {
-    const out = await sendFollowup(userId, itemId, text, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "auto", unattended: false });
+    let out: DispatchOutcome;
+    try {
+      out = await sendFollowup(userId, itemId, text, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "auto", unattended: false });
+    } catch (err) {
+      await giveBack();
+      throw err;
+    }
+    if ("error" in out) await giveBack();
     return { ok: true, item_id: itemId, seq: Number(item.seq), ...dispatchAnswer(out) };
   }
-  const prior = await inTransaction((tx) => reopenErrand(tx, itemId, text, newSession, { by: "auto" }));
+  let prior: ErrandBefore;
+  try {
+    prior = await inTransaction((tx) => reopenErrand(tx, itemId, text, newSession, { by: "auto" }));
+  } catch (err) {
+    await giveBack();
+    throw err;
+  }
   let out: DispatchOutcome;
   try {
     out = (await dispatchErrand(userId, itemId))!;
   } catch (err) {
     await restoreErrand(q, itemId, prior).catch(() => undefined);
+    await giveBack();
     throw err;
   }
   // Refused (its queue full, the seat gone meanwhile): the task is put back as it ended, not left open with nothing sent.
-  if ("error" in out) await restoreErrand(q, itemId, prior);
+  if ("error" in out) {
+    await restoreErrand(q, itemId, prior);
+    await giveBack();
+  }
   return { ok: true, item_id: itemId, seq: Number(item.seq), ...dispatchAnswer(out) };
 }
 
