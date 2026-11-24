@@ -237,6 +237,7 @@ export class PersonalText {
       messageId: message.id,
       clientPlatform: message.clientPlatform,
       quote: said.quote,
+      forward: () => this.ctx.deps.messageText.quoteBlock({ ...message, quotes: [] }, false),
       sent: said.sent,
       files: said.files,
       typed: true,
