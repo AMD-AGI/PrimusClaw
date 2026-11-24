@@ -44,7 +44,7 @@ import { db, inTransaction, type Querier } from "../infra/db.js";
 import { approvalsEnabled, DELIVERY_UNCONFIRMED, findSession, issueCommand, onlineSql, terminalMuted, wakeConnector } from "../remote-agents/store.js";
 import { newWorkItemId } from "../tasks/ids.js";
 import type { AssistantRemoteAsk, AssistantRemoteNotice } from "../notifications/assistant-events.js";
-import { personWritesChinese, recordSystemNotice } from "./outbound.js";
+import { personWritesChinese, recordSystemNotice, storeAnswerWhole } from "./outbound.js";
 import { applyWorkerReport, clipOneLine, clipWords, graphemes, TITLE_MAX } from "./work-items.js";
 
 const logger = pino({ name: "assistant-remote-items" });
@@ -1460,6 +1460,7 @@ export interface NoteErrandPrompt {
  * closed is opened again (a new generation), so neither answer is lost.
  */
 export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
+  const reports = await import("./reports.js");
   const woke = await inTransaction(async (q) => {
     const row = (await q(
       "SELECT board_state, outcome, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' FOR UPDATE", [p.itemId, p.owner],
@@ -1467,20 +1468,26 @@ export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
     if (!row) return null;
     // An end recorded and not yet reported is reported here, in this transaction, before the item is opened again for this prompt: its
     // answer reaches the router, and the report made of it elsewhere afterwards finds the item moved on (a new generation) and does nothing.
+    // As `ingestReport` does it: a long answer stored to be said whole, the router woken, and, when it cannot be, the system says it.
     let wake: { sessionId: string; userId: string } | null = null;
+    let whole: { announce: () => Promise<void> } | null = null;
     const due = row.params.report_due;
     if (due) {
       const applied = await applyWorkerReport({ query: q }, {
         itemId: p.itemId, generation: Number(due.generation), workerSessionId: errandWorkerSessionId(p.itemId), source: "remote", runId: null,
         report: { kind: due.kind, summary: String(due.summary) },
       });
+      if (applied.applied) {
+        whole = reports.answerSentWhole(due.kind, String(due.summary)) ? await storeAnswerWhole(q, p.itemId, reports.reportPorts.sayDeps) : null;
+      }
       if (applied.applied && applied.wake) {
-        const { queueRouterWake } = await import("./reports.js");
-        const queued = await queueRouterWake({ query: q }, {
+        const queued = await reports.queueRouterWake({ query: q }, {
           itemId: p.itemId, userId: applied.userId, eventId: applied.eventId, kind: due.kind, version: applied.resultVersion,
-          summary: String(due.summary), question: null,
+          summary: String(due.summary), question: null, sentInFull: whole !== null,
         });
         if (queued.status === "queued") wake = { sessionId: queued.sessionId, userId: queued.userId };
+        // The router cannot be woken to say it: the system says the answer itself, stored now, while the item still stands answered.
+        else if (queued.status === "refused" && !whole) whole = await storeAnswerWhole(q, p.itemId, reports.reportPorts.sayDeps);
       }
       row.board_state = applied.applied ? applied.boardState : row.board_state;
       if (applied.applied && due.kind === "answer") row.outcome = "answered";
@@ -1515,11 +1522,13 @@ export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
        SELECT item_id, 'progress', 'remote', generation, $2 FROM claw_work_items WHERE item_id = $1`,
       [p.itemId, p.machine],
     );
-    return wake;
+    return { wake, whole };
   });
-  if (woke) {
+  if (!woke) return;
+  if (woke.whole) await woke.whole.announce().catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_answer_not_announced"));
+  if (woke.wake) {
     const { drainSessionIfIdle } = await import("./messages.js");
-    await drainSessionIfIdle(woke.sessionId, woke.userId).catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_wake_failed"));
+    await drainSessionIfIdle(woke.wake.sessionId, woke.wake.userId).catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_wake_failed"));
   }
 }
 

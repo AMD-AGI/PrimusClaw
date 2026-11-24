@@ -639,6 +639,25 @@ describe("seat dispatch", { skip }, () => {
     assert.equal((await refusal(tools.workSend(await w.routerTurn(alice), { item_id: String(out.item_id), text: "x" }))).code, "not_from_user");
   });
 
+  test("D18 an end reported as the next instruction lands, with a router that cannot be woken, is still said to the user", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    await w.q("UPDATE claw_work_items SET params = params || jsonb_build_object('open_cmd_seqs', '[]'::jsonb, 'report_due', jsonb_build_object('kind', 'answer', 'summary', '发布完成', 'generation', generation)) WHERE item_id = $1", [out.item_id]);
+    // The router session holds no credentials now (made again after a delete, before the user's next message): its wake is refused.
+    await w.q("UPDATE claw_sessions SET config = '{}'::jsonb WHERE session_id = $1", [alice.routerSid]);
+    const tools = await import("../src/assistant/devenv-tools.js");
+    const sent = await tools.executeSend("alice", {
+      connector_id: cid, machine: "devbox", agent_id: "claude", agent_name: null, session_id: s.sid, resume_ref: null, cwd: "/home/u/rel", label: "x",
+    }, "再补一个", "errand-test-unwoken", "zh", undefined, { errandItemId: String(out.item_id), queueBehind: true });
+    assert.equal(sent.ok, true, JSON.stringify(sent));
+    const said = await w.q("SELECT text FROM claw_assistant_says WHERE user_id = 'alice' AND item_id = $1", [out.item_id]);
+    assert.ok(said.some((r) => String(r.text).includes("发布完成")), JSON.stringify(said));
+    assert.equal((await item(out.item_id)).board_state, "in_progress");
+  });
+
   test("D12 the prompt asks for parking only from a connector that can park", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox", [claude({ permission_park: true })]);
