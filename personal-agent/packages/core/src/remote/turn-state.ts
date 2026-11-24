@@ -7,56 +7,73 @@ import { type RemoteStep, NOTHING, decode } from "./events.js";
 import { SEEN_KEPT, SEGMENT_KEEP_CHARS, SEGMENTS_KEPT } from "./limits.js";
 import { cpSlice, pyStrip } from "../text/py-text.js";
 
+/** How many prompts a reader keeps track of at once (each is dropped at its turn's end, its refusal, or the session's end). */
+const PROMPTS_KEPT = 32;
+
 /**
- * The turns Claw puts to a session for itself (a seat's question, `CLAW_OWN_CLIENTS`): its prompt (`user_prompt`) starts one, and
- * everything until its end is nothing to any reader of the chat. Its end (`turn_end` naming it or naming none, an error, the connector
- * refusing it) ends it; the session closing, its connector restarting with the turn gone, or a turn end naming another prompt end it
- * and are read as usual.
+ * The turns Claw puts to a session for itself (a seat's question, `CLAW_OWN_CLIENTS`). Every prompt Claw queues has its
+ * `user_prompt`, and the agent runs them one after another, so the prompts read and not yet ended are a queue whose first is the
+ * turn running now. While that one is Claw's own, every event is nothing to any reader of the chat: its text, steps and mode
+ * switches. A prompt ends at its `turn_end` (one naming it, or the first one naming none) or its refusal; the session closing, or its
+ * connector restarting with the turn gone, ends the running one, and a `turn_end` naming a prompt this reader never saw while Claw's
+ * own is first means that one never ran (it is refused: an answer-only prompt is, behind another).
  */
 export class OwnTurns {
-  private hidden: number | null = null;
+  private readonly queue: { readonly seq: number; readonly own: boolean; readonly before: string }[] = [];
   private last = ""; // the id of the last event read
-  /** The id of the event read before the start of the hidden turn open now ('' none, or none was read before it). */
-  from = "";
 
+  /** The turn running now is one Claw put to the session for itself. */
   get hiding(): boolean {
-    return this.hidden !== null;
+    return this.queue[0]?.own === true;
   }
 
   /**
-   * The read position a reader may write after reading up to `cursor`: while such a turn is open, the one before its start (`start`:
-   * where the reader started, for a turn that began with the first event it read), so a reader that starts there hides the rest too.
+   * The read position a reader may write after reading up to `cursor`: while such a turn runs, the one before its prompt (`start`:
+   * where the reader started, for a prompt that was the first event it read), so a reader that starts there hides the rest too.
    */
   hold(cursor: string, start: string): string {
-    return this.hidden === null ? cursor : this.from || start;
+    const first = this.queue[0];
+    return first?.own === true ? first.before || start : cursor;
   }
 
-  /** One event (`id`, '' none) and what it decoded to: whether it is part of such a turn (its start and end included). */
+  /** One event (`id`, '' none) and what it decoded to: whether no reader shows it. */
   hides(id: string, step: RemoteStep): boolean {
     const before = this.last;
     if (id) this.last = id;
     if (step.replay) return false;
-    if (step.hiddenTurn !== null) {
-      if (this.hidden === null) this.from = before;
-      this.hidden = step.hiddenTurn;
-      return true;
+    if (step.prompted !== null) {
+      this.queue.push({ ...step.prompted, before });
+      if (this.queue.length > PROMPTS_KEPT) this.queue.shift();
+      return step.prompted.own;
     }
-    const hidden = this.hidden;
-    if (hidden === null) return false;
-    if (OwnTurns.endsOutside(step, hidden)) {
-      this.hidden = null;
+    if (step.closed !== null) {
+      this.queue.length = 0;
       return false;
     }
-    if (step.finished || (step.rejected?.type === "prompt" && step.rejected.cmdSeq === hidden)) this.hidden = null;
-    return true;
+    if (step.recovered !== null && !step.recovered.continuing) {
+      this.queue.shift();
+      return false;
+    }
+    if (step.finished) return this.ended(step.endsSeq);
+    if (step.rejected?.type === "prompt" && step.rejected.cmdSeq !== null)
+      return this.drop(step.rejected.cmdSeq) ?? false;
+    return this.hiding;
   }
 
-  /** The hidden turn is over and this event is not part of it: the session closed, the connector restarted without the turn, or
-   * another prompt's turn ended. */
-  private static endsOutside(step: RemoteStep, hidden: number): boolean {
-    const recoveredWithout = step.recovered !== null && !step.recovered.continuing;
-    const othersEnd = step.finished && step.endsSeq !== null && step.endsSeq !== hidden;
-    return step.closed !== null || recoveredWithout || othersEnd;
+  /** A turn end: the prompt it names, else the one running, is over. Whether it was Claw's own (then it is not shown). */
+  private ended(seq: number | null): boolean {
+    if (seq === null) return this.queue.shift()?.own === true;
+    const own = this.drop(seq);
+    if (own !== undefined) return own;
+    if (this.hiding) this.queue.shift(); // (a turn this reader never saw the prompt of ran first: Claw's own did not run)
+    return false;
+  }
+
+  /** Forget the prompt `seq`: whether it was Claw's own, undefined when it is not one this reader saw. */
+  private drop(seq: number): boolean | undefined {
+    const at = this.queue.findIndex((p) => p.seq === seq);
+    if (at < 0) return undefined;
+    return this.queue.splice(at, 1)[0]?.own;
   }
 }
 

@@ -180,3 +180,29 @@ test("the read position a reader writes stays before a turn Claw put for itself 
   first.feed(frame("user_prompt", { cmd_seq: 3, client: "seat_probe" }, "6"));
   assert.equal(first.holdCursor("6", "4"), "4");
 });
+
+test("a question Claw queued behind the chat's own prompt hides nothing of the chat's turn", () => {
+  const state = new RemoteTurnState(PLAIN_ERRORS, () => 5);
+  state.feed(frame("user_prompt", { text: "fix it", cmd_seq: 5, client: "personal-agent" }, "1"));
+  state.feed(frame("user_prompt", { text: "What do you handle?", cmd_seq: 6, client: "seat_probe" }, "2"));
+  state.feed(frame("command_rejected", { type: "prompt", cmd_seq: 6, reason: "answer_only_busy" }, "3"));
+  state.feed(acp("agent_message_chunk", "4", { content: { text: "Fixed." } }));
+  state.feed(frame("turn_end", { stopReason: "end_turn", cmd_seq: 5 }, "5"));
+  assert.equal(state.answer, "Fixed.");
+  assert.equal(state.ended, true);
+
+  // and one that does run after it is hidden from its start to its end, whatever the order its refusal or end comes in
+  const after = turn();
+  after.feed(frame("user_prompt", { cmd_seq: 5, client: "personal-agent" }, "1"));
+  after.feed(frame("user_prompt", { cmd_seq: 6, client: "seat_probe" }, "2"));
+  after.feed(acp("agent_message_chunk", "3", { content: { text: "Fixed." } }));
+  assert.equal(after.hiding, false);
+  assert.equal(after.holdCursor("3", ""), "3");
+  after.feed(frame("turn_end", { stopReason: "end_turn", cmd_seq: 5 }, "4"));
+  assert.equal(after.hiding, true);
+  assert.equal(after.holdCursor("4", ""), "1");
+  after.feed(acp("agent_message_chunk", "5", { content: { text: "I handle billing." } }));
+  after.feed(frame("turn_end", { stopReason: "end_turn", cmd_seq: 6 }, "6"));
+  assert.equal(after.hiding, false);
+  assert.equal(after.answer, "Fixed.");
+});

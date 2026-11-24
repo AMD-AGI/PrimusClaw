@@ -84,10 +84,10 @@ export interface RemoteStep {
   /** The conversation id the agent runs the session under on the machine. */
   readonly acp: string | null;
   /**
-   * Claw's number of a prompt Claw put to the session for itself ({@link CLAW_OWN_CLIENTS}, read from its `user_prompt`), null for
-   * every other event: no chat shows that prompt's turn.
+   * A prompt Claw queued for the session (its `user_prompt`): Claw's number of it, and whether Claw put it for itself
+   * ({@link CLAW_OWN_CLIENTS}: no chat shows its turn). Null for every other event.
    */
-  readonly hiddenTurn: number | null;
+  readonly prompted: { readonly seq: number; readonly own: boolean } | null;
 }
 
 export const NOTHING: RemoteStep = Object.freeze({
@@ -121,7 +121,7 @@ export const NOTHING: RemoteStep = Object.freeze({
   terminal: null,
   terminalMode: null,
   acp: null,
-  hiddenTurn: null,
+  prompted: null,
 });
 
 /** A step that says only `fields`. */
@@ -385,10 +385,10 @@ function failed(payload: Json, _kind: string, errors: PublicErrors): RemoteStep 
  */
 export const CLAW_OWN_CLIENTS: ReadonlySet<string> = new Set(["seat_probe"]);
 
-/** What was asked (`user_prompt`, written by Claw): only a prompt Claw put for itself matters here, as the turn no chat shows. */
+/** What was asked (`user_prompt`, written by Claw as it queues a prompt): its number, and whether Claw put it for itself. */
 function userPrompt(payload: Json): RemoteStep {
   const seq = seqOf(payload["cmd_seq"]);
-  return CLAW_OWN_CLIENTS.has(str(payload["client"])) && seq !== null ? remoteStep({ hiddenTurn: seq }) : NOTHING;
+  return seq === null ? NOTHING : remoteStep({ prompted: { seq, own: CLAW_OWN_CLIENTS.has(str(payload["client"])) } });
 }
 
 const READERS: Readonly<Record<string, Reader>> = {

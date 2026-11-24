@@ -24,7 +24,7 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   and its end ends it; none of its text, steps or mode switches reach the chat, whether the chat follows the session between
   turns, reads its own turn queued behind it, or attaches while it runs (it is not the session at work then). No reader writes
   the read position past its start while it runs, so a worker that restarts, a stream that is given up, or a chat that attaches
-  in the middle of it hides the rest too. `RemoteStep` (exported from core) has a new field, `hiddenTurn`; code
+  in the middle of it hides the rest too. `RemoteStep` (exported from core) has a new field, `prompted`; code
   that builds one itself, not through `remoteStep`, must set it (null).
 
 - A message that forwards messages and whose words answer a question card waiting in the chat no longer loses what it
