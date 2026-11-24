@@ -108,7 +108,7 @@ export function whyCard(live: SeatLive, attendedRefusal: string | null): string 
 }
 
 /** A refusal for a seat that cannot take a task, or null. */
-function seatRefusal(live: SeatLive | undefined, seatId: string): ToolRefused | null {
+export function seatRefusal(live: SeatLive | undefined, seatId: string): ToolRefused | null {
   if (!live) {
     return new ToolRefused("seat_not_found", "no seat of the user's has that seat_id: use the seat_id from seat_roster (an alias or a machine name is not a target)");
   }
@@ -654,8 +654,27 @@ async function errandToSandbox(
 
 // --- work_send to a task of a seat --------------------------------------------------------------------------------------------
 
+/** `work_send` to a seat's task that has not started yet (its card or its seat's queue still waits): refused, or null. */
+export function errandNotStarted(p: Pick<ErrandParams, "queued">): ToolRefused | null {
+  if (!p.queued) return null;
+  return new ToolRefused("item_not_started", p.queued === "card"
+    ? "that task still waits for the user's card: ask them to press it (or say no), then send more"
+    : "that task still waits in its seat's queue: wait for it to start, or stop it and create a new one");
+}
+
+/** Whether a seat's task is running: one more instruction goes into its session, rather than opening it again. */
+export function errandRunning(item: { board_state?: unknown }, p: Pick<ErrandParams, "open_cmd_seqs">): boolean {
+  return item.board_state !== "done" && Array.isArray(p.open_cmd_seqs) && p.open_cmd_seqs.length > 0;
+}
+
+/** `work_send` to a seat's task that ended more than a week ago: refused (it is not opened again), or null. */
+export function errandClosed(item: { board_state?: unknown; closed_at?: unknown }, now: number = Date.now()): ToolRefused | null {
+  const reopen = item.board_state !== "done" || (new Date(item.closed_at as Date | string).getTime() > now - 7 * 86_400_000);
+  return reopen ? null : new ToolRefused("item_closed", "that task closed more than a week ago: hand a new one to the seat with work_create");
+}
+
 /** The words of an instruction as one turn's repeat is told by: the same text, spacing aside. */
-function sendKey(text: string): string {
+export function sendKey(text: string): string {
   return createHash("sha256").update(text.replace(/\s+/g, " ").trim()).digest("hex").slice(0, 32);
 }
 
@@ -805,11 +824,8 @@ async function errandWorkSendOnce(
   });
   // Asked first: the first call may have queued the task, opened it again or put a card up, which would read as another refusal.
   if (sentThisTurn(p, claims.task_id, key)) return already();
-  if (p.queued) {
-    throw new ToolRefused("item_not_started", p.queued === "card"
-      ? "that task still waits for the user's card: ask them to press it (or say no), then send more"
-      : "that task still waits in its seat's queue: wait for it to start, or stop it and create a new one");
-  }
+  const notStarted = errandNotStarted(p);
+  if (notStarted) throw notStarted;
   const message = await turnMessage(q, claims.sid, claims.mid);
   if (!message) throw new ToolRefused("not_from_user", "only the user's own message can send more to their machine: a report or a wake cannot");
   const lang = langOf(message.content);
@@ -824,11 +840,10 @@ async function errandWorkSendOnce(
   const live = (await seatsLive(userId, undefined, [p.seat_id])).get(p.seat_id);
   const refused = seatRefusal(live, p.seat_id);
   if (refused) throw refused;
-  const running = item.board_state !== "done" && Array.isArray(p.open_cmd_seqs) && p.open_cmd_seqs.length > 0;
+  const running = errandRunning(item, p);
   if (!running) {
-    const reopen = item.board_state !== "done"
-      || (new Date(item.closed_at).getTime() > Date.now() - 7 * 86_400_000);
-    if (!reopen) throw new ToolRefused("item_closed", "that task closed more than a week ago: hand a new one to the seat with work_create");
+    const closed = errandClosed(item);
+    if (closed) throw closed;
   }
   const why = whyCard(live!, attendedRefusal);
   const zh = lang === "zh";
