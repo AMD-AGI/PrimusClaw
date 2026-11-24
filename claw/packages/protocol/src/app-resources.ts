@@ -23,6 +23,7 @@
  * stores and what the app sees through `env_map.grant_limits`.
  */
 import type { AppManifestV1 } from "./app-manifest.js";
+import { foldedValue, renderTemplateMounts } from "./app-template-mounts.js";
 
 /** The GPU resource name a sandbox spec carries. */
 export const APP_GPU_RESOURCE = "amd.com/gpu";
@@ -351,15 +352,37 @@ export function resolveAppResources(
  * The manifest's templates as the grant hands them to Agent Sandbox. A template
  * that sets its own `image` or `workspace` keeps it; one that does not inherits
  * the run's image and `sandbox_workspace` (which defaults to `workspace`).
- * Everything else in a template passes through untouched.
+ * `host_mounts` becomes the template's read-only hostPath volumes
+ * (renderTemplateMounts). Everything else in a template passes through untouched.
  */
 export function appGrantTemplates(
   manifest: AppManifestV1,
   resolved: Pick<ResolvedAppResources, "image" | "sandboxWorkspace">,
 ): Array<Record<string, unknown>> {
-  return (manifest.sandbox_templates ?? []).map((t) => ({
-    ...t,
-    image: t.image ?? resolved.image,
-    workspace: t.workspace ?? resolved.sandboxWorkspace,
+  return (manifest.sandbox_templates ?? []).map((t) => renderTemplateMounts({
+    ...withoutFolded(t, ["image", "workspace"]),
+    image: foldedValue(t, "image") ?? resolved.image,
+    workspace: foldedValue(t, "workspace") ?? resolved.sandboxWorkspace,
   }));
+}
+
+/**
+ * `t` without the keys that Agent Sandbox's decoder matches to `keys`, in any
+ * case: the caller writes each of them once, spelt exactly, so the template
+ * the grant hands over has one key the decoder and every reader agree on.
+ */
+function withoutFolded(t: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> {
+  const folded = new Set(keys.map((k) => k.toLowerCase()));
+  return Object.fromEntries(Object.entries(t).filter(([k]) => !folded.has(k.replace(/[A-Z]/g, (c) => c.toLowerCase()))));
+}
+
+/** The workspace a template's sandboxes run in: its own, else the run's `sandbox_workspace`. */
+export function appTemplateWorkspace(
+  template: Record<string, unknown>,
+  resolved: Pick<ResolvedAppResources, "sandboxWorkspace">,
+): string {
+  // Read as Agent Sandbox's decoder reads it (the last key matching
+  // `workspace` in any case), and as appGrantTemplates writes it.
+  const workspace = foldedValue(template, "workspace") ?? resolved.sandboxWorkspace;
+  return typeof workspace === "string" ? workspace : resolved.sandboxWorkspace;
 }

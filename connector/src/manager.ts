@@ -8,7 +8,7 @@ import { Session, type SessionEnv } from "./session.js";
 import os from "node:os";
 import { withHint } from "./hints.js";
 import { resolveCwd } from "./roots.js";
-import { REMOTE_COMMAND_TYPES, isRemoteCommandType, parsePromptFiles } from "./protocol.js";
+import { PERMISSION_PARK_MAX_MS, REMOTE_COMMAND_TYPES, isRemoteCommandType, parsePromptFiles } from "./protocol.js";
 import { dropSessionFiles, savePromptFiles, sweepPromptFiles, withSavedFiles, withUnsavedFiles } from "./prompt-files.js";
 import { sha256, errMessage, verdictOf, type MayRun } from "./util.js";
 
@@ -162,7 +162,7 @@ export class SessionManager {
     switch (type) {
       case "prompt":
         if (typeof cmd.text !== "string" || cmd.text === "") { s.rejectCommand("prompt", cmdId, "text_required", cmdSeqOf(cmd)); return false; }
-        s.enqueuePrompt(this.withFiles(cmd.text, cmd), cmdId, handled, cmdSeqOf(cmd), mayRun, cmd.answer_only === true);
+        s.enqueuePrompt(this.withFiles(cmd.text, cmd), cmdId, handled, cmdSeqOf(cmd), mayRun, cmd.answer_only === true, cmd.park_permissions === true);
         return true;
       case "cancel":
         await s.cancel();
@@ -375,13 +375,15 @@ export class SessionManager {
       // that asks and read back, and a "will not ask" warning closes it), and only a session last seen in such a mode.
       const asks = agent !== undefined && !agent.allowUnsafeModes && rec?.mode !== null && rec?.mode !== undefined && agent.askingModes.includes(rec.mode);
       const waiting = Boolean(t.waiting_permission);
-      const recent = o.downForMs !== null && o.downForMs <= this.env.timing.permissionTtlMs;
+      // (a turn that parks its permissions waited, and goes on waiting, as long as its park lasts)
+      const waitsFor = t.park === true ? (this.env.timing.permissionParkMaxMs ?? PERMISSION_PARK_MAX_MS) : this.env.timing.permissionTtlMs;
+      const recent = o.downForMs !== null && o.downForMs <= waitsFor;
       if (o.mayContinue && active && asks && waiting && recent) {
         this.env.audit.record("turn_continued", { session_id: sid, cmd_id: t.cmd_id, cmd_seq: t.cmd_seq, down_ms: o.downForMs });
         this.env.emit(sid, "session_recovered", { reason: "connector_restart", interrupted: true, continuing: true, cmd_id: t.cmd_id, cmd_seq: t.cmd_seq });
         // The record stays until the continuation reaches the agent (which records it afresh): a crash before that finds it again.
         // A continuation dropped before it gets there (refused, the session gone) is ended by that refusal; its record goes too.
-        void this.handle({ cmd_id: t.cmd_id ?? `continue-${t.cmd_seq ?? sid}`, type: "prompt", session_id: sid, text: CONTINUE_PROMPT, ...(t.cmd_seq !== null ? { cmd_seq: t.cmd_seq } : {}) }, () => {
+        void this.handle({ cmd_id: t.cmd_id ?? `continue-${t.cmd_seq ?? sid}`, type: "prompt", session_id: sid, text: CONTINUE_PROMPT, ...(t.cmd_seq !== null ? { cmd_seq: t.cmd_seq } : {}), ...(t.park === true ? { park_permissions: true } : {}) }, () => {
           if (this.env.store.turn(sid)?.started_at === t.started_at) this.env.store.endTurn(sid);
         });
       } else {

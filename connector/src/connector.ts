@@ -554,6 +554,9 @@ export class Connector {
         // `answer_only`: a prompt can ask for a turn that only answers: every permission its agent asks for in it is refused here
         // (Session.onPermission). `git_info`: the heartbeat reports each folder's git remote and branch (`workspaces`, git-info.ts).
         answer_only: true, git_info: true,
+        // `permission_park`: a prompt can ask (`park_permissions`) that the permission requests of its turn wait past their timeout
+        // instead of being cancelled: each is said parked (`permission_parked`) and stays answerable up to PERMISSION_PARK_MAX_MS.
+        permission_park: true,
         // `prompt_files`: a prompt's files (`prompt.files`) are saved on this machine and named in the prompt (prompt-files.ts)
         prompt_files: true,
         ...(support ? { watch_live: true, ...(support.typesIntoTerminals() ? { terminal_input: true } : {}) } : {}),

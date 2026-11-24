@@ -195,7 +195,13 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 	if err != nil {
 		return IssueResponse{}, 0, err
 	}
+	if err := validateSpecKeys(stored, "invalid_grant"); err != nil {
+		return IssueResponse{}, 0, err
+	}
 	if err := validateTemplateLayers(stored); err != nil {
+		return IssueResponse{}, 0, err
+	}
+	if err := validateTemplateMounts(stored); err != nil {
 		return IssueResponse{}, 0, err
 	}
 	if err := validateTemplateResources(stored, "invalid_grant"); err != nil {
@@ -309,6 +315,14 @@ func (s *Service) Extend(ctx context.Context, grantID string, req ExtendRequest)
 	}
 	if !req.ExpiresAt.After(g.Spec.ExpiresAt.Time) {
 		return GrantView{}, opErr(http.StatusBadRequest, "invalid_grant", "expiresAt must move later")
+	}
+	// A grant stored before its templates' keys and volumes were checked is
+	// not kept alive past its expiry with a spec Issue would now refuse.
+	if err := validateSpecKeys(g.Spec.Templates, "invalid_grant"); err != nil {
+		return GrantView{}, err
+	}
+	if err := validateTemplateMounts(g.Spec.Templates); err != nil {
+		return GrantView{}, err
 	}
 	issue := issueFrom(g, req.ExpiresAt, req.Attestation)
 	if s.attest == nil {

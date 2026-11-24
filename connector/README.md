@@ -327,8 +327,12 @@ All of these run on your machine and fail closed.
   `run` prints a note, and the sample `agents.toml` says so above the Cursor block.
 - **Permissions.** Each permission request becomes a card with the options **the adapter offered**, passed through with
   their own ids and kinds (`allow_once`, `allow_always`, `reject_once`). An answer must be one of those ids; any other is refused
-  and the request stays open. An unanswered request is answered `cancelled` after 10 minutes, and a cancel,
-  a close or an adapter exit answers every waiting request `cancelled`. Cursor's `cursor/create_plan` and a single
+  and the request stays open. Each card names the prompt whose turn asked it (`cmd_seq`). An unanswered request is answered
+  `cancelled` after 10 minutes, and a cancel, a close or an adapter exit answers every waiting request `cancelled`.
+  A prompt Claw sends with `park_permissions` (only when the agent reports the capability `permission_park`) parks instead:
+  after 10 minutes the request is not cancelled; the connector says so once (`permission_parked`, with `parked_until`) and the
+  card stays answerable until 24 hours after it was asked, then it is answered `cancelled` (`permission_resolved`
+  `by: "park_expired"`). A session waiting on such a request keeps its agent running meanwhile. Cursor's `cursor/create_plan` and a single
   `cursor/ask_question` are shown as cards; a question the phone cannot carry is skipped, visibly, so the agent never waits.
 - **Automatic approval, by rule.** `auto_allow = [{ kind = "edit", path_glob = "docs/**" }]` (at file level or per agent) lets
   a call through without asking when its kind matches and every path it touches is inside the session directory and
@@ -883,7 +887,7 @@ The turn an agent is running is on disk too, from the moment its prompt reaches 
 
 - carries it on when the agent was waiting for a person's permission for a tool call (not a plan or a question card), the agent
   always asks (no `approval = "never"`, no `allow_unsafe_modes`) and its session was in a mode that asks, the connector is not
-  paused, and it was away no longer than a card lives (10 minutes): the agent is told the connector restarted and to go on, so
+  paused, and it was away no longer than a card lives (10 minutes; 24 hours for a turn that parks its permissions): the agent is told the connector restarted and to go on, so
   it asks again and a new card comes; the prompt's own `turn_end` still ends it. It only asks, so nothing runs that nobody
   approved. Nothing is carried on before the run has signed in (a revoked connector carries on nothing);
 - otherwise ends it with `turn_end` `{"stopReason": "error", "error": "connector_restarted"}`, naming its prompt (`cmd_id`,
