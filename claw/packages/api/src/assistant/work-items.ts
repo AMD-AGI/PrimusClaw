@@ -129,7 +129,8 @@ export function reportTransition(report: Pick<WorkReport, "kind" | "question">):
   }
 }
 
-export type ReportSource = "worker" | "turn_end" | "sweep" | "watchdog";
+/** `remote`: a task handed to one of the user's seats ended on its machine (`remote-items.ts`). */
+export type ReportSource = "worker" | "turn_end" | "sweep" | "watchdog" | "remote";
 
 /**
  * Whether a ready result is delivered as it lands instead of waiting for the user's Accept (`CLAW_ASSISTANT_AUTO_DELIVER`): read
@@ -406,6 +407,8 @@ export async function insertWorkItem(
   q: StatementRunner,
   input: {
     userId: string; title: string; workerSessionId: string; repo?: unknown; kind?: ItemKind; params?: Record<string, unknown>;
+    /** The item's id, when the caller made it first (a seat's task names its item in its worker session id). */
+    itemId?: string;
     /** Who asked for this review, when it is not the user's own. */
     requestedBy?: string | null;
     /** Over the limit, queue the item instead of refusing it (a review item: `insertReview`). */
@@ -422,7 +425,7 @@ export async function insertWorkItem(
             COUNT(*) FILTER (WHERE ${RUNNING} AND params ? 'requested_by')::int AS others,
             COUNT(*) FILTER (WHERE ${RUNNING} AND params->>'requested_by' = $2)::int AS requester,
             COUNT(*) FILTER (WHERE ${WAITING})::int AS queued,
-            COUNT(*) FILTER (WHERE ${WAITING} AND (params ? 'requested_by') = ($2::text IS NOT NULL))::int AS queued_alike,
+            COUNT(*) FILTER (WHERE ${WAITING} AND kind <> 'remote' AND (params ? 'requested_by') = ($2::text IS NOT NULL))::int AS queued_alike,
             COALESCE(MAX(seq), 0)::int + 1 AS next
        FROM claw_work_items WHERE user_id = $1`,
     [input.userId, input.requestedBy ?? null],
@@ -441,7 +444,7 @@ export async function insertWorkItem(
   if ((over ?? held) && !queue) return { ok: false, error: (over ?? held)! };
   const queued: QueueReason | null = queue ? (over ?? held ?? (input.requestedBy ? "too_many_requested_reviews" : "too_many_active_items")) : null;
   const params = queued ? { ...(input.params ?? {}), queued: { since: new Date().toISOString(), reason: queued } } : input.params;
-  const itemId = newWorkItemId();
+  const itemId = input.itemId ?? newWorkItemId();
   await q.query(
     `INSERT INTO claw_work_items (item_id, user_id, seq, title, board_state, worker_session_id, repo, kind, params, router_session_id)
      VALUES ($1, $2, $3, $4, 'in_progress', $5, $6::jsonb, $7, $8::jsonb, $9)`,

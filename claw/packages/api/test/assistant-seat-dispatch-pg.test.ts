@@ -1,0 +1,540 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+/**
+ * Handing tasks to seats (`assistant/seat-dispatch.ts`, the errand items of `remote-items.ts`) on a real Postgres with the production
+ * schema. Skipped without DATABASE_URL, and a skip is not a pass.
+ *
+ *   D1  a seat is a target only by its seat_id: an alias or a machine name is no seat; a turn answering no message of the user's hands
+ *       nothing over, not even as a card; a list too long is no target
+ *   D2  what goes without a card: a suggested seat is a card every time; a confirmed one the first time, and directly after that card
+ *       was pressed; "confirm each" puts the card back; a key-sent message, a turn that read a machine's words, and an unattended
+ *       agent are cards (and pressing the unattended one never makes it direct)
+ *   D3  several seats are a choice card with options; a press must name one of them (else 400, nothing sent), a card without options
+ *       takes none, a typed approval does not answer it, and the seat picked is the one sent to
+ *   D4  one task at a time per seat: the rest queue in order with their place, at most three; the next goes when the running one ends;
+ *       a queued task stopped leaves the queue
+ *   D5  a conversation open in a terminal that someone used in the last ten minutes is not typed into; one quiet for ten is
+ *   D6  a task waiting for its machine fails after a day, said once, and the router hears of it
+ *   D7  a task's events and the session's own item never mix
+ *   D8  a permission request is a needs_you notice naming the item and seat; a parked one is said once more, once
+ *   D9  an older connector's approval timeout fails the task, saying how to send it again
+ *   D10 a task running over an hour is said once an hour, with its latest step
+ *   D11 a task's end wakes the router (no notice of its own); its failure is an error notice too
+ *   D12 the prompt asks for parking only from a connector that can park
+ *   D13 off: no seat target, and the router's seat section says seats are only shown
+ */
+import assert from "node:assert/strict";
+import { after, before, beforeEach, describe, test } from "node:test";
+import Fastify, { type FastifyInstance } from "fastify";
+
+import { postgresSkipReason } from "./support/pg-cluster.js";
+import { startWorld, type Claims, type World } from "./support/assistant-world.js";
+
+const skip = postgresSkipReason();
+type Recorded = Record<string, any>;
+
+describe("seat dispatch", { skip }, () => {
+  let w: World;
+  let app: FastifyInstance;
+  let base = "";
+  let store: typeof import("../src/remote-agents/store.js");
+  let seats: typeof import("../src/assistant/seats.js");
+  let dispatch: typeof import("../src/assistant/seat-dispatch.js");
+  let schedules: typeof import("../src/assistant/schedules.js");
+  let tools: typeof import("../src/assistant/tools.js");
+  let inbound: typeof import("../src/assistant/inbound.js");
+  let prompts: typeof import("../src/assistant/prompts.js");
+  let role: typeof import("../src/assistant/role-profile.js");
+  let protocol: typeof import("@claw/protocol");
+
+  before(async () => {
+    w = await startWorld({
+      CLAW_REMOTE_AGENTS_ENABLED: "true", CLAW_ASSISTANT_TOOLS: "on", CLAW_ASSISTANT_ATTENDED_TTL_SEC: "600",
+      CLAW_TRIGGERS_ENABLED: "true", CLAW_TRIGGER_TOOLS_ENABLED: "true", CLAW_TRIGGER_TOOLS_TOKEN_KEY: "trigger-tools-test-key-0123456789abcdef",
+      CLAW_DEVENV_SEATS_USERS: "alice",
+    });
+    store = await import("../src/remote-agents/store.js");
+    seats = await import("../src/assistant/seats.js");
+    dispatch = await import("../src/assistant/seat-dispatch.js");
+    schedules = await import("../src/assistant/schedules.js");
+    tools = await import("../src/assistant/tools.js");
+    inbound = await import("../src/assistant/inbound.js");
+    prompts = await import("../src/assistant/prompts.js");
+    role = await import("../src/assistant/role-profile.js");
+    protocol = await import("@claw/protocol");
+    const { registerRemoteAgentRoutes } = await import("../src/routes/remote-agents.js");
+    app = Fastify();
+    app.addHook("preHandler", async (req) => {
+      const id = req.headers["x-test-user"];
+      if (typeof id !== "string") return;
+      (req as any).user = { userId: id, userName: id, platformKey: "", virtualKey: "", roles: ["default"] };
+      (req as any).authMethod = "identity_token";
+    });
+    await registerRemoteAgentRoutes(app, { pingMs: 150, pollMs: 40, retentionDays: 0, undeliveredSweepMs: 0, presenceSweepMs: 0, deliverySweepMs: 0, seatSweepMs: 0 });
+    const { registerAssistantProactiveRoutes } = await import("../src/routes/assistant-proactive.js");
+    await registerAssistantProactiveRoutes(app, true, true, false, false);
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
+  });
+  after(async () => {
+    await app?.close();
+    await w?.stop();
+  });
+  beforeEach(async () => {
+    seats.seatDispatchSettings.on = true;
+    await w.q(`TRUNCATE claw_devenv_seats, claw_remote_workspaces, claw_remote_events, claw_remote_commands, claw_remote_sessions, claw_remote_agents,
+      claw_remote_connector_transitions, claw_remote_connectors, claw_remote_hidden, claw_remote_audit, claw_work_items, claw_work_item_events, claw_tasks,
+      claw_assistants, claw_sessions, claw_assistant_messages, claw_assistant_says, claw_assistant_confirmations, claw_notification_outbox,
+      claw_notification_subscriptions, claw_pending_messages CASCADE`);
+  });
+
+  async function http(method: string, user: string, path: string, body?: unknown): Promise<{ status: number; body: any }> {
+    const r = await fetch(base + path, {
+      method, headers: { "x-test-user": user, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    return { status: r.status, body: await r.json().catch(() => null) };
+  }
+  const claude = (caps: Recorded = {}): Recorded => ({
+    agent_id: "claude", kind: "claude", name: "Claude Code",
+    capabilities: { roots: ["/home/u"], answer_only: true, ask_mode: "default", read_only_modes: ["plan"], unattended: false, ...caps },
+  });
+  async function machine(owner: string, name: string, agents: Recorded[] = [claude()]): Promise<string> {
+    const row = await store.registerConnector(owner, name, "0.3.2", null, 10);
+    assert.ok(row);
+    await beat(owner, String(row.connector_id), agents);
+    return String(row.connector_id);
+  }
+  async function beat(owner: string, cid: string, agents: Recorded[] = [claude()]): Promise<void> {
+    const hb = protocol.parseHeartbeat({ version: "0.3.2", agents });
+    assert.ok(hb.ok, JSON.stringify(hb));
+    await store.recordHeartbeat(cid, owner, hb.value);
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW(), stream_seen_at = NOW() WHERE connector_id = $1", [cid]);
+  }
+  async function chatSession(owner: string, cid: string, cwd: string): Promise<string> {
+    const r = await http("POST", owner, "/v1/remote-agents/sessions", { connector_id: cid, agent_id: "claude", cwd });
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    await w.q("DELETE FROM claw_remote_commands WHERE session_id = $1", [r.body.data.session_id]);
+    return r.body.data.session_id;
+  }
+  /** A seat of alice's at `cwd` (with a session open there), as the user confirmed it, or as asked. */
+  async function seat(cid: string, cwd: string, set: Recorded = { alias: null, role: "负责发布", role_state: "confirmed" }): Promise<{ seatId: string; sid: string }> {
+    const sid = await chatSession("alice", cid, cwd);
+    await seats.syncSeats("alice");
+    const row = (await w.q("SELECT seat_id FROM claw_devenv_seats WHERE owner_user_id = 'alice' AND cwd = $1", [cwd]))[0];
+    const cols = Object.keys(set);
+    if (cols.length) {
+      await w.q(`UPDATE claw_devenv_seats SET ${cols.map((c, i) => `${c} = $${i + 2}`).join(", ")} WHERE seat_id = $1`, [row.seat_id, ...cols.map((c) => set[c])]);
+    }
+    return { seatId: String(row.seat_id), sid };
+  }
+  const seqs = new Map<string, number>();
+  async function events(owner: string, cid: string, sid: string, list: Array<[string, Recorded]>): Promise<void> {
+    const out = list.map(([type, data]) => {
+      const n = (seqs.get(sid) ?? 0) + 1;
+      seqs.set(sid, n);
+      return { session_id: sid, seq: n, type, ts: Date.now(), data };
+    });
+    const r = await http("POST", owner, `/v1/remote-agents/connectors/${cid}/events`, { batch_id: `b${Math.random()}`, events: out });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+  }
+  const chunk = (text: string): [string, Recorded] => ["agent_message_chunk", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } }];
+  async function userTurn(u: { routerSid: string; userId: string }, content: string, attended = true): Promise<Claims> {
+    const turn = await w.routerTurn(u);
+    await w.q(
+      `INSERT INTO claw_assistant_messages (session_id, message_id, user_id, user_name, content, attended_via, channel_context, received_at)
+       VALUES ($1, $2, $3, 'Alice A', $4, $5::jsonb, $6::jsonb, NOW())`,
+      [u.routerSid, turn.mid, u.userId, content, attended ? JSON.stringify({ kind: "person" }) : null,
+        JSON.stringify(inbound.parseChannelContext({ channel: "teams", channel_message_id: `m-${turn.mid}` }))],
+    );
+    return turn;
+  }
+  const refusal = async (p: Promise<unknown>): Promise<{ code: string; data?: Recorded }> => {
+    try { await p; } catch (err) { return { code: String((err as { code?: string }).code ?? (err as Error).message), data: (err as { data?: Recorded }).data }; }
+    assert.fail("not refused");
+  };
+  const press = (id: unknown, decision: "allow" | "deny" = "allow", choice?: string) =>
+    schedules.decideConfirmation({ userId: "alice", confirmationId: String(id), decision, via: "button", ...(choice !== undefined ? { choice } : {}) });
+  const create = (turn: Claims, target: unknown, title = "发布 1.2.1", brief = "按发布流程发 1.2.1", extra: Recorded = {}) =>
+    dispatch.seatWorkCreate(turn, { title, brief, target, ...extra });
+  /** The prompts queued for the machine, and the newest one's number. */
+  const prompted = async (cid: string) => w.q(
+    "SELECT cmd_seq, session_id::text AS session_id, payload FROM claw_remote_commands WHERE connector_id = $1 AND type = 'prompt' ORDER BY cmd_seq", [cid],
+  );
+  /** The connector collected everything queued (as its heartbeat acknowledges it). */
+  const collect = async (cid: string) => store.pruneCommands((t, p) => w.h.app.db.db.query(t, p), cid, 1_000_000_000);
+  const item = async (id: unknown) => (await w.q("SELECT * FROM claw_work_items WHERE item_id = $1", [String(id)]))[0];
+  const says = async () => w.q("SELECT text, item_id, payload FROM claw_assistant_says s LEFT JOIN LATERAL (SELECT payload FROM claw_notification_outbox o WHERE o.event_id = s.say_id::text LIMIT 1) o ON TRUE WHERE s.user_id = 'alice' ORDER BY s.created_at");
+  const notices = async () => (await w.q(
+    `SELECT o.payload FROM claw_notification_outbox o JOIN claw_assistant_says s ON s.say_id::text = o.event_id WHERE s.user_id = 'alice' ORDER BY o.id`,
+  )).map((r) => r.payload as Recorded).filter((p) => p.remote);
+  const wakes = async (routerSid: string) => (await w.pending(routerSid)).map((m: Recorded) => String(m.content));
+
+  test("D1 only a seat_id is a target; a turn answering no message of the user's hands nothing over; a list too long is none", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const { seatId } = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const turn = await userTurn(alice, "把发布交给发布台");
+    for (const t of ["发布台", "seat:发布台", "devbox", "seat:devbox"]) {
+      assert.equal((await refusal(create(turn, t))).code, "seat_not_found", t);
+    }
+    assert.equal((await refusal(create(turn, ["sandbox", `seat:${seatId}`, "seat:a", "seat:b", "seat:c", "seat:d"]))).code, "invalid_target");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_items"))[0].n, 0, "nothing was made");
+    // A wake (no message of the user's): refused, and no card either.
+    const wake = await w.routerTurn(alice);
+    assert.equal((await refusal(create(wake, `seat:${seatId}`))).code, "not_from_user");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations"))[0].n, 0);
+    assert.deepEqual(await prompted(cid), []);
+  });
+
+  test("D2 a suggested seat is a card every time; a confirmed one the first time, then directly; confirm_each brings the card back", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const sug = await seat(cid, "/home/u/docs", { role_state: "suggested" });
+    for (let i = 0; i < 2; i += 1) {
+      const out = await create(await userTurn(alice, "整理文档"), `seat:${sug.seatId}`, `整理文档 ${i}`);
+      assert.deepEqual([out.dispatch, out.why_card], ["card", "suggested"], JSON.stringify(out));
+    }
+    assert.deepEqual(await prompted(cid), [], "nothing is sent for a card");
+    const rel = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed" });
+    const first = await create(await userTurn(alice, "让发布台发 1.2.1"), `seat:${rel.seatId}`);
+    assert.deepEqual([first.dispatch, first.why_card, first.alias], ["card", "first_dispatch", "发布台"]);
+    assert.equal((await item(first.item_id)).params.queued, "card");
+    const pressed = await press(first.confirmation_id);
+    assert.equal(pressed.status, "done", JSON.stringify(pressed));
+    assert.equal(pressed.result?.dispatch, "sent", JSON.stringify(pressed));
+    const p1 = await prompted(cid);
+    assert.equal(p1.length, 1);
+    assert.equal(p1[0].session_id, rel.sid, "into the seat's own idle session");
+    assert.match(String(p1[0].payload.text), /^（你的助手 代你交代的任务，事项 #\d+。完成时用一段话总结：结果、改了什么、还剩什么。）\n\n按发布流程发 1.2.1$/);
+    const s1 = (await w.q("SELECT dispatch_mode, auto_since FROM claw_devenv_seats WHERE seat_id = $1", [rel.seatId]))[0];
+    assert.equal(s1.dispatch_mode, "auto");
+    assert.ok(s1.auto_since);
+    // Its turn ends: from now on a task goes to it directly.
+    await collect(cid);
+    await events("alice", cid, rel.sid, [chunk("done"), ["turn_end", { stopReason: "end_turn", cmd_seq: Number(p1[0].cmd_seq) }]]);
+    const direct = await create(await userTurn(alice, "让发布台再发 1.2.2"), `seat:${rel.seatId}`, "发布 1.2.2");
+    assert.equal(direct.dispatch, "sent", JSON.stringify(direct));
+    await collect(cid);
+    // A message that came with a key, and a turn that read a machine's words: cards.
+    await events("alice", cid, rel.sid, [["turn_end", { stopReason: "end_turn", cmd_seq: Number((await w.q("SELECT (data->>'cmd_seq')::int AS s FROM claw_remote_events WHERE type = 'user_prompt' ORDER BY id DESC LIMIT 1"))[0].s) }]]);
+    const keyed = await create(await userTurn(alice, "再发一次", false), `seat:${rel.seatId}`, "发布 1.2.3");
+    assert.deepEqual([keyed.dispatch, keyed.why_card], ["card", "not_attended"]);
+    const reader = await userTurn(alice, "看看机器然后发");
+    await inbound.markUntrustedRead((t, p) => w.h.app.db.db.query(t, p), reader.sid, reader.mid);
+    const read = await create(reader, `seat:${rel.seatId}`, "发布 1.2.4");
+    assert.deepEqual([read.dispatch, read.why_card], ["card", "read_untrusted"]);
+    // "每次都确认": a card again, at once, with no card for the setting itself.
+    const set = await seats.seatSet(await userTurn(alice, "发布台每次都确认"), { seat: rel.seatId, confirm_each: true });
+    assert.equal(set.confirm_each, true, JSON.stringify(set));
+    const each = await create(await userTurn(alice, "让发布台发 1.2.5"), `seat:${rel.seatId}`, "发布 1.2.5");
+    assert.deepEqual([each.dispatch, each.why_card], ["card", "confirm_each"]);
+    // An unattended agent: a card, and pressing it never makes the seat direct.
+    const cid2 = await machine("alice", "ci-box", [claude({ unattended: true })]);
+    const bot = await seat(cid2, "/home/u/bot", { alias: "bot", role: "跑 CI", role_state: "confirmed" });
+    const unat = await create(await userTurn(alice, "让 bot 跑一下"), `seat:${bot.seatId}`, "跑 CI");
+    assert.deepEqual([unat.dispatch, unat.why_card], ["card", "first_dispatch"]);
+    assert.equal((await press(unat.confirmation_id)).status, "done");
+    assert.equal((await w.q("SELECT dispatch_mode FROM claw_devenv_seats WHERE seat_id = $1", [bot.seatId]))[0].dispatch_mode, "card");
+    const card = (await w.q("SELECT params FROM claw_assistant_confirmations WHERE confirmation_id = $1", [unat.confirmation_id]))[0];
+    assert.equal(card.params.why_card, "first_dispatch");
+  });
+
+  test("D3 several seats are a choice card: a press must name one of its options, and that seat is the one sent to", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const a = await seat(cid, "/home/u/hl-ci", { alias: "hl-ci", role: "Hyperloom CI", role_state: "confirmed" });
+    const b = await seat(cid, "/home/u/hl-ci2", { alias: "hl-ci2", role: "Hyperloom CI 2", role_state: "confirmed" });
+    const out = await create(await userTurn(alice, "修一下 Hyperloom CI"), [`seat:${a.seatId}`, `seat:${b.seatId}`, "sandbox"], "修 CI");
+    assert.deepEqual([out.dispatch, out.why_card], ["card", "choice"], JSON.stringify(out));
+    assert.deepEqual(out.choices, [a.seatId, b.seatId, "sandbox"]);
+    const say = (await w.q("SELECT o.payload FROM claw_notification_outbox o ORDER BY o.id DESC LIMIT 1"))[0].payload;
+    assert.equal(say.confirm_write.kind, "seat_dispatch");
+    assert.deepEqual(say.confirm_write.options.map((o: Recorded) => [o.id, o.label]), [[a.seatId, "hl-ci"], [b.seatId, "hl-ci2"], ["sandbox", "沙箱"]]);
+    assert.equal(say.confirm_write.options[0].detail, "/home/u/hl-ci");
+    // No choice, a choice it did not offer: 400 at the route, and nothing sent.
+    const id = String(out.confirmation_id);
+    for (const body of [{ decision: "allow" }, { decision: "allow", choice: "seat_nope" }]) {
+      const r = await http("POST", "alice", `/v1/assistant/confirmations/${id}/decision`, body);
+      assert.deepEqual([r.status, r.body.error], [400, "invalid_choice"], JSON.stringify(r.body));
+    }
+    assert.deepEqual(await prompted(cid), []);
+    assert.equal((await w.q("SELECT status FROM claw_assistant_confirmations WHERE confirmation_id = $1", [id]))[0].status, "pending");
+    // A card without options takes no choice.
+    const single = await create(await userTurn(alice, "让 hl-ci 修"), `seat:${a.seatId}`, "修 CI 单");
+    const r1 = await http("POST", "alice", `/v1/assistant/confirmations/${single.confirmation_id}/decision`, { decision: "allow", choice: a.seatId });
+    assert.deepEqual([r1.status, r1.body.error], [400, "invalid_choice"]);
+    // A typed approval does not answer a choice card.
+    const typed = await userTurn(alice, `批准 #${out.ref}`);
+    assert.equal((await refusal(schedules.scheduleConfirmationAnswer(typed, { decision: "allow" }))).code, "choice_card");
+    // The second seat picked: sent there, and the item is that seat's.
+    const r2 = await http("POST", "alice", `/v1/assistant/confirmations/${id}/decision`, { decision: "allow", choice: b.seatId });
+    assert.equal(r2.status, 200, JSON.stringify(r2.body));
+    assert.equal(r2.body.data.status, "done", JSON.stringify(r2.body));
+    const sent = await prompted(cid);
+    assert.deepEqual(sent.map((s) => s.session_id), [b.sid]);
+    const it = await item(out.item_id);
+    assert.deepEqual([it.params.seat_id, it.params.alias, it.params.queued], [b.seatId, "hl-ci2", undefined]);
+    // The sandbox picked on another: the task becomes a worker's item under its own number.
+    const other = await create(await userTurn(alice, "再修一个"), [`seat:${a.seatId}`, "sandbox"], "修 CI 沙箱");
+    const toSandbox = await press(other.confirmation_id, "allow", "sandbox");
+    assert.equal(toSandbox.status, "done", JSON.stringify(toSandbox));
+    const sb = await item(other.item_id);
+    assert.deepEqual([sb.kind, sb.seq], ["task", other.seq]);
+    assert.equal((await w.pending(sb.worker_session_id)).length, 1);
+    // Denied: dropped, nothing sent.
+    const denied = await create(await userTurn(alice, "第三个"), [`seat:${a.seatId}`, `seat:${b.seatId}`], "修 CI 3");
+    assert.equal((await press(denied.confirmation_id, "deny")).status, "denied");
+    assert.deepEqual([(await item(denied.item_id)).board_state, (await item(denied.item_id)).outcome], ["done", "dropped"]);
+  });
+
+  test("D4 one task at a time per seat: the rest queue in order with their place, three at most; the next goes when the running one ends", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const rel = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const first = await create(await userTurn(alice, "发布 1"), `seat:${rel.seatId}`, "任务 1");
+    assert.equal(first.dispatch, "sent");
+    await collect(cid);
+    const queued: Recorded[] = [];
+    for (let i = 2; i <= 4; i += 1) queued.push(await create(await userTurn(alice, `发布 ${i}`), `seat:${rel.seatId}`, `任务 ${i}`));
+    assert.deepEqual(queued.map((q) => [q.dispatch, q.queued_reason, q.position]), [["queued", "seat_busy", 2], ["queued", "seat_busy", 3], ["queued", "seat_busy", 4]]);
+    assert.deepEqual(queued[2]!.ahead, [first.seq, queued[0]!.seq, queued[1]!.seq]);
+    const full = await refusal(create(await userTurn(alice, "发布 5"), `seat:${rel.seatId}`, "任务 5"));
+    assert.equal(full.code, "seat_queue_full");
+    assert.deepEqual(full.data?.choices.slice(0, 2), ["wait", "sandbox"]);
+    const roster = await seats.rosterOf("alice");
+    assert.deepEqual([roster[0]!.state, roster[0]!.queue_len], ["working", 3]);
+    // The second, stopped, leaves the queue; nothing was ever sent for it.
+    await tools.workStop(await userTurn(alice, "第二个不要了"), { item_id: String(queued[0]!.item_id), reason: "not needed" });
+    assert.equal((await item(queued[0]!.item_id)).outcome, "stopped");
+    // The first ends: the third goes, into the same session.
+    const sent1 = Number((await w.q("SELECT (data->>'cmd_seq')::int AS s FROM claw_remote_events WHERE type = 'user_prompt' ORDER BY id DESC LIMIT 1"))[0].s);
+    await events("alice", cid, rel.sid, [chunk("ok"), ["turn_end", { stopReason: "end_turn", cmd_seq: sent1 }]]);
+    assert.equal((await item(first.item_id)).board_state, "done");
+    const next = await item(queued[1]!.item_id);
+    assert.equal(next.params.queued, undefined, JSON.stringify(next.params));
+    assert.equal(next.params.session_id, rel.sid);
+    assert.equal((await item(queued[2]!.item_id)).params.queued, "seat_busy");
+  });
+
+  test("D5 a terminal someone used in the last ten minutes is not typed into; once quiet for ten minutes it is", async () => {
+    const alice = await w.user("alice");
+    const now = Math.floor(Date.now() / 1000);
+    const attach = (updated: number, activity = "idle") => ({
+      agent_id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)",
+      capabilities: { terminal_input: true, watch_live: true, resumable: [{ ref: "11111111-1111-4111-8111-111111111111", title: "rel", cwd: "/home/u/rel", updated_at: updated, state: "live", activity, input: "terminal" }] },
+    });
+    const cid = await machine("alice", "devbox", [claude(), attach(now)]);
+    await seats.syncSeats("alice");
+    const row = (await w.q("SELECT seat_id FROM claw_devenv_seats WHERE agent_id = 'claude' AND cwd = '/home/u/rel'"))[0]
+      ?? (await w.q("SELECT seat_id FROM claw_devenv_seats WHERE cwd = '/home/u/rel'"))[0];
+    await w.q("UPDATE claw_devenv_seats SET alias = '发布台', role = '负责发布', role_state = 'confirmed', dispatch_mode = 'auto' WHERE seat_id = $1", [row.seat_id]);
+    const out = await create(await userTurn(alice, "发布"), `seat:${row.seat_id}`);
+    assert.deepEqual([out.dispatch, out.queued_reason], ["queued", "in_terminal"], JSON.stringify(out));
+    assert.equal((await seats.rosterOf("alice")).find((s) => s.seat_id === row.seat_id)!.state, "in_terminal");
+    // Eleven minutes of quiet: the sweep types it into that terminal's conversation.
+    await beat("alice", cid, [claude(), attach(now - 11 * 60)]);
+    await dispatch.runErrandSweep("alice");
+    const it = await item(out.item_id);
+    assert.equal(it.params.queued, undefined, JSON.stringify(it.params));
+    assert.ok(it.params.session_id);
+    const opened = (await w.q("SELECT payload FROM claw_remote_commands WHERE connector_id = $1 AND type = 'session.new'", [cid]))[0];
+    assert.equal(opened?.payload?.resume_ref, "11111111-1111-4111-8111-111111111111", JSON.stringify(opened));
+  });
+
+  test("D6 a task waiting for its machine fails after a day, said once, and the router hears of it", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "laptop");
+    const s = await seat(cid, "/home/u/notes", { alias: "notes", role: "笔记", role_state: "confirmed", dispatch_mode: "auto" });
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '2 hours', stream_seen_at = NULL WHERE connector_id = $1", [cid]);
+    const out = await create(await userTurn(alice, "让 notes 整理"), `seat:${s.seatId}`, "整理笔记");
+    assert.deepEqual([out.dispatch, out.queued_reason], ["queued", "machine_offline"]);
+    const exp = Date.parse((await item(out.item_id)).params.queue_expires_at);
+    assert.ok(Math.abs(exp - (Date.now() + 24 * 3600_000)) < 60_000);
+    await dispatch.runErrandSweep("alice");
+    assert.equal((await item(out.item_id)).params.queued, "machine_offline", "still waiting within the day");
+    await w.q("UPDATE claw_work_items SET params = params || '{\"queue_expires_at\": \"2020-01-01T00:00:00Z\"}'::jsonb WHERE item_id = $1", [out.item_id]);
+    await dispatch.runErrandSweep("alice");
+    await dispatch.runErrandSweep("alice");
+    const it = await item(out.item_id);
+    assert.deepEqual([it.board_state, it.last_report_kind, it.params.queued], ["needs_you", "failed", undefined]);
+    const told = (await notices()).filter((n) => n.remote.item_seq === out.seq);
+    assert.equal(told.length, 1, JSON.stringify(told));
+    assert.equal(told[0]!.remote.kind, "error");
+    assert.match(told[0]!.text, /机器 24 小时没上线/);
+    assert.ok((await wakes(alice.routerSid)).some((m) => m.includes(`#${out.seq}`)), "the router is woken");
+  });
+
+  test("D7 a task's events and the session's own item never mix", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    assert.equal(out.dispatch, "sent");
+    const errandSeq = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    // The user types into the attached chat: the session's own item.
+    const typed = await http("POST", "alice", `/v1/remote-agents/sessions/${s.sid}/commands`, { type: "prompt", text: "顺便看下日志" });
+    assert.equal(typed.status, 202, JSON.stringify(typed.body));
+    const chatSeq = Number((await prompted(cid))[0].cmd_seq);
+    const own = async () => (await w.q("SELECT * FROM claw_work_items WHERE worker_session_id = $1", [`remote:${s.sid}`]))[0];
+    assert.equal((await own()).board_state, "in_progress");
+    await events("alice", cid, s.sid, [chunk("released"), ["turn_end", { stopReason: "end_turn", cmd_seq: errandSeq }]]);
+    assert.equal((await item(out.item_id)).board_state, "done", "the task ends with its own turn");
+    assert.equal((await own()).board_state, "in_progress", "the session's item is untouched");
+    await events("alice", cid, s.sid, [["permissionRequest", { actionId: "a1", tool: "tail log", options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }], cmd_seq: chatSeq }]]);
+    assert.equal((await own()).board_state, "needs_you");
+    assert.equal((await item(out.item_id)).board_state, "done");
+    await events("alice", cid, s.sid, [["permission_resolved", { actionId: "a1", by: "phone" }], chunk("log ok"), ["turn_end", { stopReason: "end_turn", cmd_seq: chatSeq }]]);
+    assert.equal((await own()).board_state, "done");
+    const errand = await item(out.item_id);
+    assert.equal(errand.outcome, "answered");
+    assert.match(errand.summary, /released/);
+  });
+
+  test("D8 a permission request is a needs_you notice naming the item and seat; a parked one is said once more, once", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox", [claude({ permission_park: true })]);
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    const seq = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    const req = ["permissionRequest", { actionId: "act-1", tool: "git push", kind: "execute", options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }], timeout_ms: 600_000, cmd_seq: seq }] as [string, Recorded];
+    await events("alice", cid, s.sid, [req]);
+    let told = await notices();
+    assert.equal(told.length, 1, JSON.stringify(told));
+    assert.deepEqual([told[0]!.remote.kind, told[0]!.remote.item_seq, told[0]!.remote.seat], ["needs_you", out.seq, { seat_id: s.seatId, alias: "发布台" }]);
+    assert.equal(told[0]!.remote.ask.action_id, "act-1");
+    assert.match(told[0]!.text, new RegExp(`^#${out.seq} 发布台 在等你批准：git push`));
+    assert.equal((await item(out.item_id)).board_state, "needs_you");
+    const until = new Date(Date.now() + 24 * 3600_000).toISOString();
+    await events("alice", cid, s.sid, [["permission_parked", { actionId: "act-1", cmd_seq: seq, parked_until: until }]]);
+    await events("alice", cid, s.sid, [["permission_parked", { actionId: "act-1", cmd_seq: seq, parked_until: until }]]);
+    told = await notices();
+    assert.equal(told.length, 2, JSON.stringify(told.map((t) => t.text)));
+    assert.deepEqual([told[1]!.remote.kind, told[1]!.remote.ask.parked, told[1]!.remote.ask.expires_at], ["needs_you", true, until]);
+    assert.match(told[1]!.text, /还在等你批准/);
+    assert.equal((await item(out.item_id)).board_state, "needs_you", "still waiting for the user");
+    await events("alice", cid, s.sid, [["permission_resolved", { actionId: "act-1", by: "phone" }]]);
+    assert.equal((await item(out.item_id)).board_state, "in_progress");
+    // A park that ends unanswered fails it.
+    await events("alice", cid, s.sid, [["permissionRequest", { ...req[1], actionId: "act-2" }], ["permission_resolved", { actionId: "act-2", by: "park_expired", cmd_seq: seq }]]);
+    const it = await item(out.item_id);
+    assert.deepEqual([it.board_state, it.last_report_kind], ["needs_you", "failed"]);
+  });
+
+  test("D9 an older connector's approval timeout fails the task, saying how to send it again", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    assert.equal((await prompted(cid))[0].payload.park_permissions, undefined, "no parking asked of a connector that cannot");
+    await collect(cid);
+    // (0.3.1 and older: no cmd_seq on a permission request)
+    await events("alice", cid, s.sid, [["permissionRequest", { actionId: "x", tool: "rm build", options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] }],
+      ["permission_resolved", { actionId: "x", by: "timeout" }]]);
+    const it = await item(out.item_id);
+    assert.deepEqual([it.board_state, it.last_report_kind], ["needs_you", "failed"]);
+    const err = (await notices()).find((n) => n.remote.kind === "error");
+    assert.ok(err, "an error notice");
+    assert.match(err!.text, new RegExp(`^#${out.seq} 发布台 没有做完：因审批超时停了。回复“继续”重发`));
+    assert.ok((await wakes(alice.routerSid)).some((m) => m.includes(`#${out.seq}`)));
+    // The turn then ends on the machine (the agent was refused); "继续": sent again into its seat, the same item.
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn" }]]);
+    assert.deepEqual([(await item(out.item_id)).board_state, (await item(out.item_id)).last_report_kind], ["needs_you", "failed"], "a late end changes nothing");
+    const again = await tools.workSend(await userTurn(alice, "继续"), { item_id: String(out.item_id), text: "继续" }) as Recorded;
+    assert.equal(again.dispatch, "sent", JSON.stringify(again));
+    assert.equal((await item(out.item_id)).board_state, "in_progress");
+  });
+
+  test("D10 a task running over an hour is said once an hour, with its latest step", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    const plan = (done: number): [string, Recorded] => ["plan", { update: { sessionUpdate: "plan", entries: [
+      { content: "build", status: done > 0 ? "completed" : "in_progress" }, { content: "tag\u0007 release", status: done > 1 ? "completed" : "pending" }, { content: "publish", status: "pending" },
+    ] } }];
+    await events("alice", cid, s.sid, [plan(1)]);
+    assert.deepEqual((await item(out.item_id)).params.progress.current, "tag release");
+    await dispatch.runErrandSweep("alice");
+    assert.equal((await notices()).filter((n) => n.remote.kind === "progress").length, 0, "nothing within the first hour");
+    await w.q("UPDATE claw_work_items SET params = params || jsonb_build_object('dispatched_at', (NOW() - interval '2 hours 5 minutes')::text) WHERE item_id = $1", [out.item_id]);
+    await dispatch.runErrandSweep("alice");
+    await dispatch.runErrandSweep("alice");
+    let progress = (await notices()).filter((n) => n.remote.kind === "progress");
+    assert.equal(progress.length, 1);
+    assert.equal(progress[0]!.text, `#${out.seq} 发布台 已进行 2 小时：“tag release”（1/3）`);
+    await events("alice", cid, s.sid, [plan(2)]);
+    await w.q("UPDATE claw_work_items SET params = params || jsonb_build_object('dispatched_at', (NOW() - interval '3 hours 1 minute')::text) WHERE item_id = $1", [out.item_id]);
+    await dispatch.runErrandSweep("alice");
+    progress = (await notices()).filter((n) => n.remote.kind === "progress");
+    assert.equal(progress.length, 2);
+    assert.equal(progress[1]!.text, `#${out.seq} 发布台 已进行 3 小时：“publish”（2/3）`);
+    // In the item list, as quoted data.
+    const line = prompts.formatManifestLine((await role.routerManifest("alice")).find((m) => m.itemId === out.item_id)!);
+    assert.match(line, /step: "publish" \(2\/3\)/);
+  });
+
+  test("D11 a task's end wakes the router and says nothing of its own; a failure is an error notice too", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    const seq = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [chunk("发布完成：1.2.1 已打 tag。"), ["turn_end", { stopReason: "end_turn", cmd_seq: seq }]]);
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_seq: seq }]]);
+    const it = await item(out.item_id);
+    assert.deepEqual([it.board_state, it.outcome, it.last_report_kind], ["done", "answered", "answer"]);
+    assert.equal(it.params.report_due, undefined);
+    assert.deepEqual(await notices(), [], "no done notice: the router says it");
+    const woke = await wakes(alice.routerSid);
+    assert.equal(woke.filter((m) => m.includes(`#${out.seq}`)).length, 1, JSON.stringify(woke));
+    assert.match(woke[0]!, /发布完成/);
+    // A failed turn: an error notice, and the router is woken too.
+    const two = await create(await userTurn(alice, "再发"), `seat:${s.seatId}`, "发布 2");
+    const seq2 = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "error", error: "rate_limit", cmd_seq: seq2 }]]);
+    const errs = (await notices()).filter((n) => n.remote.kind === "error");
+    assert.equal(errs.length, 1);
+    assert.equal(errs[0]!.remote.item_seq, two.seq);
+    // Stopped in its terminal: closed as stopped, said by nobody.
+    const three = await create(await userTurn(alice, "第三次"), `seat:${s.seatId}`, "发布 3");
+    const seq3 = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "cancelled", cmd_seq: seq3 }]]);
+    const t3 = await item(three.item_id);
+    assert.deepEqual([t3.board_state, t3.outcome, t3.summary], ["done", "stopped", "在终端里停止"]);
+    assert.equal((await notices()).length, 1);
+  });
+
+  test("D12 the prompt asks for parking only from a connector that can park", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox", [claude({ permission_park: true })]);
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    assert.equal((await prompted(cid))[0].payload.park_permissions, true);
+  });
+
+  test("D13 off: no seat target, and the router's seat section says seats are only shown", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel");
+    seats.seatDispatchSettings.on = false;
+    assert.equal((await refusal(create(await userTurn(alice, "发布"), `seat:${s.seatId}`))).code, "not_enabled");
+    assert.match(prompts.renderRouterSeatsSection(false), /Seats are only shown for now/);
+    assert.doesNotMatch(prompts.renderRouterSeatsSection(false), /Dispatching work/);
+    assert.match(prompts.renderRouterSeatsSection(true), /Dispatching work \(seats\)/);
+    assert.doesNotMatch(prompts.renderRouterSeatsSection(true), /only shown/);
+  });
+});

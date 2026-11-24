@@ -34,7 +34,7 @@ import {
 } from "../remote-agents/store.js";
 import { connectorSetup, outdatedMessage, versionVerdict, type ConnectorVersionVerdict } from "../remote-agents/setup.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
-import { inRemoteSessionOrder, langOf, noteRemotePrompt, remoteEventMark, remoteWorkerSessionId, type RemoteLang } from "./remote-items.js";
+import { ERRAND_CLIENT, inRemoteSessionOrder, langOf, noteErrandPrompt, noteRemotePrompt, remoteEventMark, remoteWorkerSessionId, type RemoteLang } from "./remote-items.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
 import { typedCommand } from "./typed-commands.js";
@@ -319,7 +319,7 @@ function agentRef(c: Row, agent: Row, online: Row[]): { ref: string } | { why_no
 }
 
 /** A conversation the connector offers to take over (`capabilities.resumable`, as `connector/src/attach.ts` reports it). */
-type Resumable = {
+export type Resumable = {
   ref: string; title: string | null; cwd: string | null; updated_at: string | null; state: string;
   terminal_state: DevenvSession["terminal_state"] | null; waiting_for: string | null;
   /** `live`, and its connector types what is sent into that terminal (`input: "terminal"` with `capabilities.terminal_input`). */
@@ -329,7 +329,7 @@ type Resumable = {
 /** The connector's word for what a terminal is doing (`activity`), in the states this tool uses; anything else is nothing. */
 const TERMINAL_STATES: Record<string, NonNullable<DevenvSession["terminal_state"]>> = { working: "working", waiting: "waiting_for_you", idle: "idle" };
 
-function resumableOf(agent: Row): Resumable[] {
+export function resumableOf(agent: Row): Resumable[] {
   const caps = isObject(agent.capabilities) ? agent.capabilities : {};
   const raw = Array.isArray(caps.resumable) ? caps.resumable : [];
   const typing = caps.terminal_input === true && caps.watch_live === true;
@@ -1041,10 +1041,19 @@ export type SendOutcome =
 export async function executeSend(
   userId: string, asked: SendPlan, text: string, cmdId: string, lang: RemoteLang,
   onlineWindowMs: number = REMOTE_AGENT_TIMING.onlineWindowMs,
+  /**
+   * `errandItemId`: a task the assistant handed to one of the user's seats (`seat-dispatch.ts`): the prompt is that item's (its number
+   * joins the item's), never the session's own item. `parkPermissions`: its permission requests park instead of timing out (only to a
+   * connector that says it can, `permission_park`). `queueBehind`: one more instruction of a task running there, which the connector
+   * queues behind the turn under way (a session working is not refused for it).
+   */
+  opts: { errandItemId?: string; parkPermissions?: boolean; queueBehind?: boolean } = {},
 ): Promise<SendOutcome> {
   let plan = asked;
-  const prior = await priorSend(userId, plan, cmdId);
-  if (prior) return prior;
+  if (!opts.errandItemId) {
+    const prior = await priorSend(userId, plan, cmdId);
+    if (prior) return prior;
+  }
   let connector = await findConnector(userId, plan.connector_id, onlineWindowMs);
   const live = !!connector && !connector.revoked_at && !!connector.online;
   // Online by the reconnect grace only (`STREAM_GRACE_SECS`: its stream has just ended), or not at all: the machine may have registered
@@ -1071,7 +1080,7 @@ export async function executeSend(
   if (!plan.session_id && versionVerdict(connector.version).version_status === "unsupported") {
     return { ok: false, error: "connector_outdated", message: outdatedMessage(plan.machine, flat(connector.version, 40)) };
   }
-  const parsed = REMOTE_COMMANDS.prompt.parse({ text });
+  const parsed = REMOTE_COMMANDS.prompt.parse({ text, ...(opts.parkPermissions ? { park_permissions: true } : {}) });
   if (!parsed.ok) return { ok: false, error: parsed.error, message: "the instruction cannot be sent as it is" };
   let sessionId = plan.session_id;
   let fresh = false;
@@ -1081,7 +1090,7 @@ export async function executeSend(
     if (s.read_only === true) return { ok: false, error: "session_read_only", message: "that session is open in a terminal on the machine and can only be watched: nothing was sent" };
     // Read again now: a session that started working since the plan (or the card) is not sent another instruction.
     const [now] = (await sessionActivity(userId, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser)).filter((r) => r.session_id === sessionId);
-    if (now && readSession(Array.isArray(now.events) ? now.events as ActivityEvent[] : [], Number(now.queued) || 0).state !== "idle") {
+    if (!opts.queueBehind && now && readSession(Array.isArray(now.events) ? now.events as ActivityEvent[] : [], Number(now.queued) || 0).state !== "idle") {
       return { ok: false, error: "busy", message: "that session is working on something now: nothing was sent" };
     }
   } else {
@@ -1109,12 +1118,18 @@ export async function executeSend(
   const issued = await inRemoteSessionOrder(target, async () => {
     const since = await remoteEventMark(target);
     const out = await issueCommand({
-      owner: userId, client: "assistant", connectorId: plan.connector_id, agentId: plan.agent_id, sessionId: target, type: "prompt",
+      // (A seat's task is sent as its own client: its `user_prompt` marks the prompt as the task's, never the session item's.)
+      owner: userId, client: opts.errandItemId ? ERRAND_CLIENT : "assistant", connectorId: plan.connector_id, agentId: plan.agent_id, sessionId: target, type: "prompt",
       cmdId: `k:${cmdId}`, payload: parsed.value, auditDetail: REMOTE_COMMANDS.prompt.audit(parsed.value),
       closesSession: false, commandsPerMinute: REMOTE_AGENT_LIMITS.commandsPerMinute,
     });
     // The item the user is told the end of. A repeat (`duplicate`) found the first one's.
-    if (out.status === "queued") {
+    if (out.status === "queued" && opts.errandItemId) {
+      await noteErrandPrompt({
+        owner: userId, itemId: opts.errandItemId, sessionId: target, connectorId: plan.connector_id, agentId: plan.agent_id, machine: plan.machine,
+        since, cmdSeq: Number(out.row.cmd_seq),
+      });
+    } else if (out.status === "queued") {
       await noteRemotePrompt({
         owner: userId, sessionId: target, connectorId: plan.connector_id, agentId: plan.agent_id, text, origin: "assistant", lang, since,
         cmdSeq: Number(out.row.cmd_seq),
@@ -1126,7 +1141,10 @@ export async function executeSend(
   if (issued.status === "gone") return { ok: false, error: "no_machine", message: "that machine is no longer connected" };
   wakeConnector(plan.connector_id);
   const row = (await db.query(
-    "SELECT item_id, seq, title FROM claw_work_items WHERE worker_session_id = $1 AND user_id = $2", [remoteWorkerSessionId(sessionId), userId],
+    opts.errandItemId
+      ? "SELECT item_id, seq, title FROM claw_work_items WHERE item_id = $1 AND user_id = $2"
+      : "SELECT item_id, seq, title FROM claw_work_items WHERE worker_session_id = $1 AND user_id = $2",
+    [opts.errandItemId ?? remoteWorkerSessionId(sessionId), userId],
   )).rows[0] as { item_id: string; seq: number; title: string } | undefined;
   return {
     ok: true, item_id: row?.item_id ?? "", seq: Number(row?.seq ?? 0), title: row?.title ?? "", session_id: sessionId, machine: plan.machine, agent: plan.agent_id,

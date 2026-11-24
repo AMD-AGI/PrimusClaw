@@ -41,6 +41,7 @@ import { GithubClient } from "../github-review/github.js";
 import { briefRangeFor } from "./brief.js";
 import { turnMessage } from "./inbound.js";
 import { recordWriteConfirm, type SayDeps } from "./outbound.js";
+import type { AssistantConfirmOption } from "@claw/protocol";
 import type { AssistantSkillCard } from "../notifications/assistant-events.js";
 import { confirmationRef, toldNote } from "./prompts.js";
 import { toldRefs } from "./told.js";
@@ -70,7 +71,7 @@ export type ScheduleKind = "trigger_create" | "trigger_cancel" | "github_comment
  * Every write a card holds: those above, an instruction for an agent on the user's machine (`devenv-tools.ts`), and a personal skill the
  * assistant drafted on its own (`skill-writes.ts`).
  */
-export type ConfirmKind = ScheduleKind | "devenv_send" | "devenv_hide" | "skill_save" | "seat_role" | "seat_set";
+export type ConfirmKind = ScheduleKind | "devenv_send" | "devenv_hide" | "skill_save" | "seat_role" | "seat_set" | "seat_dispatch";
 /** The longest comment the router puts on a card: the card shows all of it, since the user approves exactly what is posted. */
 export const ROUTER_COMMENT_MAX = 4000;
 
@@ -195,7 +196,11 @@ async function propose(
  */
 export async function proposeConfirmation(
   q: Querier, claims: Pick<AssistantTokenClaims, "sid" | "mid">, userId: string, kind: ConfirmKind, params: Record<string, unknown>,
-  render: { text: (ref: string) => string; allowLabel: string; skillCard?: (confirmationId: string) => AssistantSkillCard },
+  render: {
+    text: (ref: string) => string; allowLabel: string; skillCard?: (confirmationId: string) => AssistantSkillCard;
+    /** A choice card's options (`seat_dispatch` with several places): a button each, the choice checked against `params.choices`. */
+    options?: AssistantConfirmOption[];
+  },
 ): Promise<{ row: Record<string, any>; announce: (() => Promise<void>) | null; subscribers: number }> {
   const pending = Number((await q(
     "SELECT COUNT(*)::int AS n FROM claw_assistant_confirmations WHERE user_id = $1 AND status = 'pending' AND expires_at > NOW()", [userId],
@@ -226,6 +231,7 @@ export async function proposeConfirmation(
     ...(render.skillCard ? { skillCard: render.skillCard(id) } : {}),
     confirm: {
       confirmation_id: id, ref, kind, allow_label: render.allowLabel, expires_at: new Date(row.expires_at).toISOString(),
+      ...(render.options ? { options: render.options } : {}),
     },
   }, schedulePorts.sayDeps);
   return { row, announce: card?.announce ?? null, subscribers: card?.subscribers ?? 0 };
@@ -431,14 +437,25 @@ export async function decideConfirmation(input: {
   /** `button`, `button:<service client>` (their chat pressed it for them) or `command` (their typed answer). */
   userId: string; confirmationId: string; decision: "allow" | "deny"; via: "button" | `button:${string}` | "command"; creds?: DeciderCredentials | null;
   guard?: (q: Querier) => Promise<void>;
+  /** The option picked on a choice card (`options`): required there to allow, refused on any other card. */
+  choice?: string | null;
 }): Promise<DecisionOutcome> {
-  return inTransaction(async (q) => {
+  // What a seat's card lets through reaches past the database (a machine, a worker): done once the decision committed.
+  let after: (() => Promise<Record<string, unknown>>) | undefined;
+  const decided = await inTransaction(async (q) => {
     await input.guard?.(q);
     const row = (await q(
       "SELECT *, expires_at <= NOW() AS lapsed FROM claw_assistant_confirmations WHERE confirmation_id = $1 AND user_id = $2 FOR UPDATE",
       [input.confirmationId, input.userId],
     )).rows[0] as Record<string, any> | undefined;
     if (!row) throw new DecisionRefused(404, "not_found", "no confirmation of yours has that id");
+    // A choice card's answer names one of its options; no other card takes one.
+    const choices = Array.isArray(row.params?.choices) ? (row.params.choices as unknown[]).map(String) : null;
+    const choice = input.choice ?? null;
+    if (choice !== null && !choices) throw new DecisionRefused(400, "invalid_choice", "that card offers no options");
+    if (choices && input.decision === "allow" && (choice === null || !choices.includes(choice))) {
+      throw new DecisionRefused(400, "invalid_choice", "pick one of the card's options");
+    }
     if (row.status !== "pending") return outcome(row, false);
     const close = async (status: string, result: Record<string, unknown> | null) => (await q(
       `UPDATE claw_assistant_confirmations SET status = $2, result = $3::jsonb, decided_via = $4, decided_at = NOW()
@@ -456,12 +473,25 @@ export async function decideConfirmation(input: {
         const { seatRoleDecided } = await import("./seats.js");
         return outcome(await close("denied", await seatRoleDecided(q, input.userId, row.params as Record<string, unknown>, false)), true);
       }
+      if (row.kind === "seat_dispatch") {
+        // The task it would have handed over is dropped (`seat-dispatch.ts`).
+        const { seatDispatchDecided } = await import("./seat-dispatch.js");
+        return outcome(await close("denied", (await seatDispatchDecided(q, input.userId, row, false, null)).result), true);
+      }
       return outcome(await close("denied", null), true);
     }
     if (row.kind === "github_comment") {
       const posted = await githubCommentPorts.post(input.userId, row.params as CommentParams);
       logger.info({ userId: input.userId, via: input.via, ok: "url" in posted }, "assistant.github_comment_decided");
       return outcome(await close("url" in posted ? "done" : "failed", posted), true);
+    }
+    if (row.kind === "seat_dispatch") {
+      // A task for one of the person's seats, the seat checked again as it is pressed (`seat-dispatch.ts`, loaded here to keep the
+      // modules acyclic); it is sent, or queued, once this commits, and what came of it is added to the card's result.
+      const { seatDispatchDecided } = await import("./seat-dispatch.js");
+      const done = await seatDispatchDecided(q, input.userId, row, true, choice);
+      after = done.after;
+      return outcome(await close(done.result.ok ? "done" : "failed", done.result), true);
     }
     if (row.kind === "devenv_send") {
       // An instruction for an agent on the person's machine, as the card showed it, sent now (`devenv-tools.ts`, loaded here to keep the
@@ -516,6 +546,16 @@ export async function decideConfirmation(input: {
       ...(row.params.next_run && nextRun !== row.params.next_run ? { first_run_moved: true } : {}),
     }), true);
   });
+  if (!after || !decided.answered_now) return decided;
+  try {
+    const more = await after();
+    await db.query("UPDATE claw_assistant_confirmations SET result = COALESCE(result, '{}'::jsonb) || $2::jsonb WHERE confirmation_id = $1",
+      [decided.confirmation_id, JSON.stringify(more)]);
+    return { ...decided, ...(more.ok === false ? { status: "failed" } : {}), result: { ...(decided.result ?? {}), ...more } };
+  } catch (err) {
+    logger.warn({ err, confirmationId: decided.confirmation_id }, "assistant.seat_dispatch_after_failed");
+    return decided;
+  }
 }
 
 /** The user's confirmations still waiting for them. */
@@ -539,8 +579,8 @@ export async function scheduleConfirmationAnswer(
   const q: Querier = (text, params) => db.query(text, params);
   const { userId } = await assertLiveRun(q, claims);
   const mine = (await q(
-    "SELECT confirmation_id, created_at FROM claw_assistant_confirmations WHERE user_id = $1 AND status = 'pending'", [userId],
-  )).rows as Array<{ confirmation_id: string; created_at: Date }>;
+    "SELECT confirmation_id, created_at, params ? 'choices' AS choices FROM claw_assistant_confirmations WHERE user_id = $1 AND status = 'pending'", [userId],
+  )).rows as Array<{ confirmation_id: string; created_at: Date; choices: boolean }>;
   if (!mine.length) return null;
   let id: string | null = null;
   let guard: ((q: Querier) => Promise<void>) | undefined;
@@ -557,6 +597,9 @@ export async function scheduleConfirmationAnswer(
       throw new ToolRefused(err.code, `this message cannot let the card through (${err.message}): tell the user to press the button on the card instead`);
     }
     if (named.length > 1) throw new ToolRefused("which_confirmation", "that short id fits more than one card: ask the user to press the button on the one they mean");
+    if (named[0].choices) {
+      throw new ToolRefused("choice_card", "that card offers several places: the user picks one on the card, or says which one to hand it to");
+    }
     if (new Date(named[0].created_at) > message!.receivedAt) {
       throw new ToolRefused("confirmation_after_message", "that card was shown after the user's message: let them answer it");
     }
@@ -657,6 +700,10 @@ export function describeCard(kind: string, params: Record<string, unknown> | nul
       return `confirm Claw's guess of what a seat on the machine ${JSON.stringify(oneLine(p.machine, 60))} handles (the guess is shown on the card only; Deny: do not send it work)`;
     case "seat_set":
       return `keep what the user said of a seat on the machine ${JSON.stringify(oneLine(p.machine, 60))}: ${[p.alias ? `name ${JSON.stringify(oneLine(p.alias, 16))}` : "", p.role ? `handles ${JSON.stringify(oneLine(p.role, 120))}` : ""].filter(Boolean).join(", ")}`;
+    case "seat_dispatch":
+      return Array.isArray(p.choices)
+        ? `hand a task to one of the user's seats (a choice card: ${(p.choices as unknown[]).map((c) => oneLine(c, 40)).join(", ")}): ${JSON.stringify(oneLine(p.title, 60))}`
+        : `hand a task to the seat ${JSON.stringify(oneLine(p.seat_id, 40))}${p.followup ? " (one more instruction)" : ""}: ${JSON.stringify(oneLine(p.title, 60))}`;
     case "devenv_hide": {
       const n = (k: string) => (Array.isArray(p[k]) ? (p[k] as unknown[]).length : 0);
       return `on the machine ${JSON.stringify(oneLine(p.machine, 60))}: hide ${n("hide")} conversation(s) from the lists, show ${n("show")} again, disconnect ${n("close")} session(s)`;
@@ -680,6 +727,9 @@ export async function renderScheduleState(userId: string, lang: CommandLanguage 
     // works; the router does not offer it). A yes they say in words is skill_save with the draft's id.
     if (w.kind === "seat_role") {
       return `- ref #${String(w.ref)} | confirmation_id: ${String(w.confirmation_id)} | ${what} | the user answers it on its card (Right / Deny); if they tell you instead what that seat handles or what to call it, that is seat_set${note}`;
+    }
+    if (w.kind === "seat_dispatch" && Array.isArray((w.params as Record<string, unknown> | null)?.choices)) {
+      return `- ref #${String(w.ref)} | confirmation_id: ${String(w.confirmation_id)} | ${what} | the user picks a place on its card, or names one in the chat (then work_create for that one); it takes no typed approval${note}`;
     }
     if (w.kind === "skill_save") {
       return `- ref #${String(w.ref)} | confirmation_id: ${String(w.confirmation_id)} | ${what} | the user answers it on its card (Save / Discard); never ask them about it in words or give them a command to type${note}`;

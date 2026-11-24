@@ -63,7 +63,8 @@ function encodedList(v: unknown): unknown {
   return asked.length === 1 && asked[0] === v ? v : asked;
 }
 import { devenvHide, devenvList, devenvPair, devenvSend, devenvToolsOn } from "./devenv-tools.js";
-import { ALIAS_MAX, ROLE_MAX, seatRoster, seatsAnywhere, seatSet } from "./seats.js";
+import { ALIAS_MAX, ROLE_MAX, seatDispatchOn, seatRoster, seatsAnywhere, seatSet } from "./seats.js";
+import { parseTarget, seatWorkCreate } from "./seat-dispatch.js";
 
 const logger = pino({ name: "assistant-mcp" });
 
@@ -333,8 +334,13 @@ function registerJobWatchTools(mcp: McpServer, claims: AssistantTokenClaims): vo
 
 /** `work_create`, and the pull requests its title and brief name watched by the new item from the start (`github-events.ts`). */
 async function workCreateWatching(
-  claims: AssistantTokenClaims, args: { title: string; brief: string; repo?: unknown; model?: string },
+  claims: AssistantTokenClaims, args: { title: string; brief: string; repo?: unknown; model?: string; target?: unknown; new_session?: boolean },
 ): Promise<Record<string, unknown>> {
+  // A task for one of the user's seats (`seat-dispatch.ts`); a target that names none is refused there too.
+  if (args.target !== undefined) {
+    const target = parseTarget(args.target);
+    if (!target || target.kind === "seats") return seatWorkCreate(claims, args);
+  }
   const created = await workCreate(claims, args);
   if (created.deduplicated || !githubEventsEnabled()) return created;
   const owner = (await db.query("SELECT user_id FROM claw_assistants WHERE session_id = $1", [claims.sid])).rows[0] as { user_id: string } | undefined;
@@ -476,6 +482,8 @@ export function createAssistantMcpServer(
   modelChoice: boolean = modelChoiceOn(), citations: boolean = assistantCitationsOn(), devenv: boolean = devenvToolsOn(),
   suggested: boolean = suggestedRepliesOn(), choices: boolean = sayChoicesOn(), userSkills: boolean = CLAW_USER_SKILLS_ENABLED,
   registered?: string[], web: WebTools | null = null,
+  /** The turn's user may hand tasks to their seats (`seatDispatchOn`): `work_create` and `work_send` say how. */
+  seatDispatch = false,
 ): McpServer {
   const mcp = new McpServer({ name: "PrimusClawAssistant", version: "1.0.0" });
   // Every tool registered below, in order: the router's claw_capabilities reads it when it is called, once all are registered.
@@ -525,12 +533,24 @@ export function createAssistantMcpServer(
     registerDeliverText(mcp, claims);
     mcp.tool(
       "work_create",
-      "Start a new work item and give it to a worker. Returns its item_id and number.",
+      seatDispatch
+        ? "Start a new work item and give it to a worker: a sandbox worker (default), or the agent of one of the user's seats on their "
+          + "machine (target). Returns its item_id and number; for a seat also how it went: sent, queued (its place), or a card the user presses."
+        : "Start a new work item and give it to a worker. Returns its item_id and number.",
       {
         title: z.string().describe("At most 40 characters."),
         brief: z.string().describe("Everything the worker needs, as a self-contained task: it cannot see the conversation."),
         repo: z.unknown().optional().describe(WORK_CREATE_REPO_PARAM),
         ...(modelChoice ? { model: z.string().optional().describe(MODEL_PARAM_CHOICE) } : {}),
+        ...(seatDispatch
+          ? {
+            target: z.union([z.string(), z.array(z.string()).max(5)]).optional().describe(
+              "\"sandbox\" (the default), or \"seat:<seat_id>\" with a seat_id from seat_roster (never an alias or a machine name), or a list of "
+              + "2 to 5 of those (\"sandbox\" may be one) for a choice card the user picks from.",
+            ),
+            new_session: z.boolean().optional().describe("Only with one seat: a new session in its folder even when its conversation is open in a terminal."),
+          }
+          : {}),
       },
       (args) => answer(claims, "work_create", () => workCreateWatching(claims, args)),
     );
@@ -540,6 +560,7 @@ export function createAssistantMcpServer(
       {
         item_id: z.string().describe(ITEM_ID_PARAM), text: z.string(),
         ...(modelChoice ? { model: z.string().optional().describe(`${MODEL_PARAM_ASKED}; the item runs on it from now on. Left out keeps the one it has.`) } : {}),
+        ...(seatDispatch ? { new_session: z.boolean().optional().describe("A seat's task only: send it again in a new session of that seat.") } : {}),
       },
       (args) => answer(claims, "work_send", () => workSend(claims, args)),
     );
@@ -713,6 +734,9 @@ export function createAssistantMcpServer(
             alias: z.string().max(64).optional().describe(`The name they gave it, at most ${ALIAS_MAX} characters.`),
             role: z.string().max(400).optional().describe(`What it handles, in their words, one or two sentences, at most ${ROLE_MAX} characters.`),
             refresh: z.boolean().optional().describe("true: ask the seat again and make a new guess (shown to them on a card)."),
+            ...(seatDispatch
+              ? { confirm_each: z.boolean().optional().describe("true: a card every time a task goes to this seat (每次都确认, always ask first); false: back to a card only the first time.") }
+              : {}),
           },
           (args) => answer(claims, "seat_set", () => seatSet(claims, args)),
         );
@@ -800,9 +824,13 @@ export async function registerAssistantMcpRoutes(
   if (!enabled) return;
   app.all(ASSISTANT_MCP_PATH, { preHandler: assistantTokenAuth }, async (req, reply) => {
     const claims = claimsOf.get(req) as AssistantTokenClaims;
+    // Seat dispatch is the turn's user's (the seats' allow list): only their router's tools say how to hand a task to a seat.
+    const seatDispatch = claims.role === "router" && seatsAnywhere()
+      ? seatDispatchOn(((await db.query("SELECT user_id FROM claw_assistants WHERE session_id = $1", [claims.sid])).rows[0] as { user_id?: string } | undefined)?.user_id)
+      : false;
     // The web tools the Brain running the turn has, as it names them (`capabilities.ts`, WebTools): only claw_capabilities reads them.
     const mcp = createAssistantMcpServer(claims, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
-      undefined, parseWebTools(req.headers[WEB_TOOLS_HEADER]));
+      undefined, parseWebTools(req.headers[WEB_TOOLS_HEADER]), seatDispatch);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined as never });
     await mcp.connect(transport);
     await transport.handleRequest(req.raw, reply.raw, req.body);

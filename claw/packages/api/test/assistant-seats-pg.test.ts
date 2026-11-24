@@ -272,7 +272,7 @@ describe("seats", { skip }, () => {
     const out = await seats.seatRoster(turn) as { seats: Recorded[] };
     assert.equal(await untrusted(turn), false, "reading the roster does not mark the turn");
     assert.deepEqual(out.seats.map((s) => Object.keys(s).sort()), out.seats.map(() =>
-      ["alias", "dispatch_mode", "last_item", "machine_online", "role", "role_state", "seat_id", "state"]));
+      ["alias", "confirm_each", "dispatch_mode", "last_item", "machine_online", "queue_len", "role", "role_state", "seat_id", "state"]));
     const text = JSON.stringify(out);
     // (the seat's tags are slugs of that remote and branch: kept, but never in the roster)
     assert.deepEqual((await seatRows()).find((r) => r.cwd === "/home/u/rel")!.tags,

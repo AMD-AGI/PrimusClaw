@@ -684,6 +684,9 @@ export const CLAW_DEVENV_SEATS = env("CLAW_DEVENV_SEATS", "off").trim().toLowerC
 export const CLAW_DEVENV_SEATS_USERS: ReadonlySet<string> = new Set(
   env("CLAW_DEVENV_SEATS_USERS").split(",").map((u) => u.trim()).filter(Boolean),
 );
+// Seat dispatch (default ON, for the users who have seats): work_create may hand a task to one of the user's seats
+// (`assistant/seat-dispatch.ts`). Only an emergency off: who has it is who has seats (CLAW_DEVENV_SEATS, CLAW_DEVENV_SEATS_USERS).
+export const CLAW_DEVENV_SEAT_DISPATCH = env("CLAW_DEVENV_SEAT_DISPATCH", "on").trim().toLowerCase() !== "off";
 
 // --- GitHub pull request review (default OFF) ---
 // When false: no tables, no routes, no MCP server offered to a session, and a session
