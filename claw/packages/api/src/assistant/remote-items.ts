@@ -879,9 +879,14 @@ async function applySession(owner: string, sessionId: string): Promise<Notice[] 
       await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [item.item_id, storableJsonText(p)]);
       return notices;
     }
-    // What a seat's task sent this session, and whether one runs there now: its events are its own, never this item's.
-    const errandSeqs = await errandSeqsOf(q, sessionId);
-    const errandRunning = await errandRunningOn(q, owner, sessionId);
+    // What a seat's task sent this session, and whether one runs there now: its events are its own, never this item's. (Read only
+    // for a session a task was ever sent to.)
+    const hadErrand = (await q(
+      "SELECT 1 FROM claw_work_items WHERE user_id = $1 AND kind = 'remote' AND params->>'errand' = 'true' AND params->>'session_id' = $2 LIMIT 1",
+      [owner, sessionId],
+    )).rows.length > 0;
+    const errandSeqs = hadErrand ? await errandSeqsOf(q, sessionId) : new Set<number>();
+    const errandRunning = hadErrand && await errandRunningOn(q, owner, sessionId);
     for (const e of events) {
       p.last_event_id = e.id;
       if (errandOwns(e, errandSeqs, errandRunning)) continue;
@@ -1654,13 +1659,11 @@ async function applyErrands(owner: string, sessionId: string): Promise<ErrandPas
 /** A seat task's end, reported: the router is woken to say it (or the answer is said whole). Then nothing is due any more. */
 export async function reportErrand(r: { itemId: string; generation: number; kind: "answer" | "failed"; summary: string }): Promise<void> {
   const { ingestReport } = await import("./reports.js");
-  try {
-    await ingestReport({ itemId: r.itemId, workerSessionId: errandWorkerSessionId(r.itemId), generation: r.generation, runId: null },
-      { kind: r.kind, summary: r.summary }, "remote");
-  } finally {
-    await db.query("UPDATE claw_work_items SET params = params - 'report_due' WHERE item_id = $1 AND (params->'report_due'->>'generation')::int = $2",
-      [r.itemId, r.generation]);
-  }
+  // (Applied, or stale: a newer instruction or a stop moved the item on. Either way nothing is due; a failure leaves it for the sweep.)
+  await ingestReport({ itemId: r.itemId, workerSessionId: errandWorkerSessionId(r.itemId), generation: r.generation, runId: null },
+    { kind: r.kind, summary: r.summary }, "remote");
+  await db.query("UPDATE claw_work_items SET params = params - 'report_due' WHERE item_id = $1 AND (params->'report_due'->>'generation')::int = $2",
+    [r.itemId, r.generation]);
 }
 
 /** The session's seat tasks take their events, their ends are reported, and what they say is said. Never throws. */

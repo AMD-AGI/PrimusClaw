@@ -60,7 +60,6 @@ export const OFFLINE_TOLD_MS = 3600_000;
 /** Two calls for one title and seat within this long are one task (a replayed call). */
 const DUPLICATE_WINDOW = "10 minutes";
 const LABEL_MAX = 40;
-const CARD_BRIEF_MAX = 1500;
 
 const flat = (v: unknown, max: number): string => clipOneLine(typeof v === "string" ? v.replace(/[\u0000-\u001f\u007f]+/g, " ") : "", max);
 
@@ -133,7 +132,8 @@ function otherSeats(all: Map<string, SeatLive>, except: string): string[] {
 export function seatCardText(
   p: { label: string; cwd: string; brief: string; why: string | null; makesAuto: boolean; unattended: boolean; choice?: string[] }, ref: string, zh: boolean,
 ): string {
-  const brief = clipOneLine(p.brief, CARD_BRIEF_MAX).length < p.brief.length ? `${Array.from(p.brief).slice(0, CARD_BRIEF_MAX).join("")}…` : p.brief;
+  // Whole: what the card lets through is exactly what it shows.
+  const brief = p.brief;
   if (p.choice) {
     return zh
       ? `这件事交给谁？\n${brief}\n${p.choice.map((c) => `- ${inertMd(c)}`).join("\n")}\n在下面选一个，或直接告诉我交给哪个。`
@@ -435,7 +435,10 @@ export async function seatWorkCreate(claims: AssistantTokenClaims, args: SeatCre
       ...(choice ? { choices: params.choices } : {}),
     };
   }
-  return { ...base, ...dispatchAnswer((await dispatchErrand(userId, made.itemId))!) };
+  const out = (await dispatchErrand(userId, made.itemId))!;
+  // Nothing was sent and nothing waits: the item it made is dropped, and the refusal said.
+  if ("error" in out) await dropErrand(q, made.itemId, out.message);
+  return { ...base, ...dispatchAnswer(out) };
 }
 
 // --- the card pressed ---------------------------------------------------------------------------------------------------------
@@ -587,15 +590,18 @@ export async function errandWorkSend(
       await assertLiveRun(tx, claims);
       await tx("SELECT 1 FROM claw_assistants WHERE user_id = $1 FOR UPDATE", [userId]);
       if (!running) await reopenErrand(tx, itemId, text, newSession, true);
-      return proposeConfirmation(tx, claims, userId, "seat_dispatch", {
+      const made = await proposeConfirmation(tx, claims, userId, "seat_dispatch", {
         item_id: itemId, seat_id: p.seat_id, title: String(item.title ?? ""), brief: text, lang, why_card: why, label: seatLabel(live!),
         cwd: flat(live!.seat.cwd, 300), ...(running ? { followup: text } : {}),
       }, {
         text: (ref) => seatCardText({ label: seatLabel(live!), cwd: flat(live!.seat.cwd, 300), brief: text, why, makesAuto: false, unattended: live!.unattended }, ref, zh),
         allowLabel: zh ? "发送" : "Send",
       });
+      if (!running) {
+        await tx("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [itemId, JSON.stringify({ confirmation_id: String(made.row.confirmation_id) })]);
+      }
+      return made;
     });
-    if (!running) await q("UPDATE claw_work_items SET params = params || $2::jsonb WHERE item_id = $1", [itemId, JSON.stringify({ confirmation_id: String(card.row.confirmation_id) })]);
     if (card.announce) await card.announce();
     return { ok: true, item_id: itemId, seq: Number(item.seq), dispatch: "card", why_card: why, ...proposed(card.row, card.subscribers, "sent", lang) };
   }
@@ -649,8 +655,8 @@ export async function drainSeatsOf(owner: string, _sessionIds: readonly string[]
       if (!head) continue;
       const out = await dispatchErrand(owner, head.item_id, { wait: false });
       if (out && "dispatch" in out && out.dispatch === "sent") sent += 1;
-      if (out && "error" in out && out.error !== "seat_queue_full") {
-        // It can never go now (the seat retired, unsupported): failed, and said.
+      if (out && "error" in out && PERMANENT.has(out.error)) {
+        // It can never go now (the seat is gone, retired, or cannot take tasks): failed, and said. Anything else is tried again.
         await failQueued(owner, head.item_id, out.message);
       }
     } catch (err) {
@@ -659,6 +665,9 @@ export async function drainSeatsOf(owner: string, _sessionIds: readonly string[]
   }
   return sent;
 }
+
+/** Refusals a queued task never gets past. */
+const PERMANENT = new Set(["seat_not_found", "seat_retired", "seat_unsupported", "item_closed"]);
 
 /** A task that waited in a queue and will not go: it fails, said as such, and the router hears of it. */
 async function failQueued(owner: string, itemId: string, why: string): Promise<void> {
