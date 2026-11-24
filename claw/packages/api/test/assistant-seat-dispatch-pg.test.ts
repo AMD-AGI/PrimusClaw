@@ -657,6 +657,29 @@ describe("seat dispatch", { skip }, () => {
     assert.equal((await item(out.item_id)).board_state, "in_progress");
   });
 
+  test("D18 an end reported as the next instruction lands, after the user deleted their assistant session, is still said to the user", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    await w.q("UPDATE claw_work_items SET params = params || jsonb_build_object('open_cmd_seqs', '[]'::jsonb, 'report_due', jsonb_build_object('kind', 'answer', 'summary', '发布完成', 'generation', generation)) WHERE item_id = $1", [out.item_id]);
+    // The user deleted the assistant's session: nobody would read it, and no sweep says a seat task's answer later.
+    await w.q("UPDATE claw_sessions SET deleted_at = NOW() WHERE session_id = $1", [alice.routerSid]);
+    const tools = await import("../src/assistant/devenv-tools.js");
+    const sent = await tools.executeSend("alice", {
+      connector_id: cid, machine: "devbox", agent_id: "claude", agent_name: null, session_id: s.sid, resume_ref: null, cwd: "/home/u/rel", label: "x",
+    }, "再补一个", "errand-test-deleted", "zh", undefined, { errandItemId: String(out.item_id), queueBehind: true });
+    assert.equal(sent.ok, true, JSON.stringify(sent));
+    const now = (await w.q("SELECT session_id FROM claw_assistants WHERE user_id = 'alice'"))[0]?.session_id;
+    assert.ok(now && now !== alice.routerSid, "the assistant has a session again");
+    const said = await w.q("SELECT text FROM claw_assistant_says WHERE user_id = 'alice' AND item_id = $1", [out.item_id]);
+    const woke = await w.q("SELECT content FROM claw_pending_messages WHERE session_id = $1", [now]);
+    assert.ok(said.some((r) => String(r.text).includes("发布完成")) || woke.some((r) => String(r.content).includes("发布完成")),
+      JSON.stringify({ said, woke }));
+    assert.equal((await item(out.item_id)).board_state, "in_progress");
+  });
+
   test("D12 the prompt asks for parking only from a connector that can park", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox", [claude({ permission_park: true })]);
