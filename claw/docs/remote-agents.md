@@ -78,7 +78,7 @@ Claw matches on `cmd_seq`: a `cmd_id` may be a client's `Idempotency-Key`, which
 events can change, and a number it never does. A connector from before this change sends neither in `turn_end`,
 and its dropped prompts are not refused.
 
-A turn the agent takes by itself, with no prompt running (Claude Code answering a command it put in the background, once
+A turn the agent takes by itself, with no prompt running (the agent answering a command it put in the background, once
 that command finished), is streamed as any turn's updates are, and from connector 0.3.3 on it ends with a `turn_end`
 that names no prompt: `cmd_seq` and `cmd_id` `null`, `agent_initiated: true`, and `ended_by` (`result`: the usage the
 agent reports at the end of its model turn; `quiet`; `prompt`: a prompt started; `adapter_exited`). A `cancel` stops such

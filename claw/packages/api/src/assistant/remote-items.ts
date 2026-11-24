@@ -1417,7 +1417,7 @@ export function errandNotice(kind: ErrandNoticeKind, p: Partial<ErrandParams>, s
 }
 
 /**
- * A `turn_end` of a turn the agent took by itself (connector 0.3.3 and later, session.ts `agentTurn`): Claude Code answering a command
+ * A `turn_end` of a turn the agent took by itself (connector 0.3.3 and later, session.ts `agentTurn`): the agent answering a command
  * it put in the background, once that finished. It names no prompt (`cmd_seq: null`) and ends none.
  */
 const agentInitiated = (e: MovingEvent): boolean => e.type === REMOTE_EVENT_TURN_END && e.data.agent_initiated === true;

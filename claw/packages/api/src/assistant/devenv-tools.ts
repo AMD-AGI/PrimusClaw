@@ -85,7 +85,7 @@ const TURN_EVENTS = new Set([
 interface ActivityEvent { type: string; occurred_at: string; text: string; action_id: string | null; stop: string | null; replay: boolean }
 
 /**
- * A turn the agent took by itself (no prompt since the last `turn_end`: Claude Code answering a command it put in the background) counts
+ * A turn the agent took by itself (no prompt since the last `turn_end`: the agent answering a command it put in the background) counts
  * as under way for at most this long after its last event. A connector from 0.3.3 on ends such a turn with a `turn_end` of its own
  * (`agent_initiated`); an older one never does, and its session would read as working for good.
  */
