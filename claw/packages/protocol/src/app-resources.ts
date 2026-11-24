@@ -23,6 +23,7 @@
  * stores and what the app sees through `env_map.grant_limits`.
  */
 import type { AppManifestV1 } from "./app-manifest.js";
+import { renderTemplateMounts } from "./app-template-mounts.js";
 
 /** The GPU resource name a sandbox spec carries. */
 export const APP_GPU_RESOURCE = "amd.com/gpu";
@@ -351,15 +352,24 @@ export function resolveAppResources(
  * The manifest's templates as the grant hands them to Agent Sandbox. A template
  * that sets its own `image` or `workspace` keeps it; one that does not inherits
  * the run's image and `sandbox_workspace` (which defaults to `workspace`).
- * Everything else in a template passes through untouched.
+ * `host_mounts` becomes the template's read-only hostPath volumes
+ * (renderTemplateMounts). Everything else in a template passes through untouched.
  */
 export function appGrantTemplates(
   manifest: AppManifestV1,
   resolved: Pick<ResolvedAppResources, "image" | "sandboxWorkspace">,
 ): Array<Record<string, unknown>> {
-  return (manifest.sandbox_templates ?? []).map((t) => ({
+  return (manifest.sandbox_templates ?? []).map((t) => renderTemplateMounts({
     ...t,
     image: t.image ?? resolved.image,
     workspace: t.workspace ?? resolved.sandboxWorkspace,
   }));
+}
+
+/** The workspace a template's sandboxes run in: its own, else the run's `sandbox_workspace`. */
+export function appTemplateWorkspace(
+  template: Record<string, unknown>,
+  resolved: Pick<ResolvedAppResources, "sandboxWorkspace">,
+): string {
+  return typeof template.workspace === "string" ? template.workspace : resolved.sandboxWorkspace;
 }

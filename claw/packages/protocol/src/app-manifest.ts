@@ -36,6 +36,7 @@
 import { validateAgainstSchema, type SchemaNode } from "./json-schema-lite.js";
 import { parseQuantity } from "./app-resources.js";
 import { isBashFuncInjection, isClawInternalEnv, isHandsInternalEnv, USER_ENV_DENY_LIST } from "./user-env.js";
+import { templateMountIssues, type AppTemplateMount } from "./app-template-mounts.js";
 
 export const APP_MANIFEST_SCHEMA = "claw.app-manifest/v1" as const;
 
@@ -140,14 +141,21 @@ export interface AppSandboxTemplateDataPlane {
 /**
  * A sandbox template, passed to Agent Sandbox as part of the grant. Its fields
  * are owned by the Agent Sandbox design, not by Claw: Claw reads `name`
- * (roles refer to it) and `per_gpu_count`, and hands every other field through
- * unvalidated and unchanged (Agent Sandbox stores them whole as the template's
- * `spec`).
+ * (roles refer to it), `per_gpu_count` and `host_mounts`, and hands every other
+ * field through unvalidated and unchanged (Agent Sandbox stores them whole as
+ * the template's `spec`). Agent Sandbox's `volumes` and `volumeMounts` are
+ * refused: a template reaches a host path only through `host_mounts`.
  */
 export interface AppSandboxTemplate {
   name: string;
   /** Allowed GPU counts per sandbox; Agent Sandbox's `perGpuCount`. */
   per_gpu_count?: number[];
+  /**
+   * Host directories mounted read-only at the same path, each under a
+   * directory the sandbox's workspace mounts for sandboxes (see
+   * app-template-mounts.ts). Rendered as the template's hostPath volumes.
+   */
+  host_mounts?: AppTemplateMount[];
   [field: string]: unknown;
 }
 
@@ -411,7 +419,7 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
   const bad = (path: string, reason: string): void => void issues.push({ path, reason });
   const obj = (v: unknown): Record<string, unknown> => (isObj(v) ? v : {});
 
-  // Templates: unique names (the only thing Claw reads besides the roles).
+  // Templates: unique names, and host directories only through checked `host_mounts`.
   const defined = new Set<string>();
   if (Array.isArray(value.sandbox_templates)) {
     value.sandbox_templates.forEach((t, i) => {
@@ -421,6 +429,7 @@ export function validateAppManifest(value: unknown): AppManifestIssue[] {
         if (defined.has(t.name)) bad(`${at}.name`, `template ${JSON.stringify(t.name)} is defined twice`);
         defined.add(t.name);
       }
+      issues.push(...templateMountIssues(t, at));
     });
   }
 

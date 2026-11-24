@@ -113,6 +113,14 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Claw: a sandbox template of an app manifest can mount host directories read-only, `sandbox_templates[].host_mounts:
+  [{ "hostPath": "/shared/team/cache", "readOnly": true }]`, for example a cache the application writes through the
+  workspace's read-write mount and its measurement sandboxes only read. Each mount is a hostPath volume of the Agent
+  Sandbox template at the same path. Only `readOnly: true` is accepted, the path must be absolute and normalised and stay
+  clear of system directories, and an app run is refused (`403 sandbox_template_mount_not_granted`) unless the path lies
+  under a directory the template's workspace already mounts for sandboxes, read from SaFE as the caller. A template may
+  no longer set Agent Sandbox's `volumes` or `volumeMounts` itself, and the Agent Sandbox grant service refuses a grant
+  template whose volumes are anything but read-only host directories at their own path.
 - Claw: the assistant knows what it can and cannot do. Its router turn has a new read tool, `claw_capabilities`, that
   answers a list generated from what that turn really has: the tools registered on its assistant server, each by how
   it takes effect (`acts_at_once`, `asks_first`, `reads`), the deployment's switches (pull request and job watching,

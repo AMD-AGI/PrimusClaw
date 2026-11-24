@@ -642,3 +642,77 @@ curl -X POST "$CLAW/v1/plugins/upsert" -H "Authorization: Bearer $KEY" \
   -H 'content-type: application/json' \
   -d '{"name":"probe-2026-11-11","version":"0.1.0","ttl_seconds":86400}'
 ```
+
+---
+
+## 7. App Manifest: Read-Only Host Directories in Sandbox Templates
+
+A sandbox template of an app manifest (`resource.app.manifest.sandbox_templates[]`)
+can mount directories of its workspace's storage read-only with `host_mounts`.
+The typical use is a cache the application publishes through the workspace's
+own read-write mount while the sandboxes it starts from the template may only
+read it:
+
+```json
+{
+  "name": "measurement",
+  "fromImage": "registry.example.invalid/measure@sha256:...",
+  "per_gpu_count": [1, 8],
+  "host_mounts": [
+    { "hostPath": "/shared/team/cache", "readOnly": true }
+  ]
+}
+```
+
+| Key | Required | Meaning |
+| --- | -------- | ------- |
+| `hostPath` | yes | The host directory, mounted at the same path in the sandbox. |
+| `mountPath` | no | When given, must equal `hostPath`: the sandbox workload mounts a host path at its own path and has no field for another one. |
+| `readOnly` | yes | Must be `true`. |
+
+Checked when the manifest is registered and on every app run:
+
+- At most 8 mounts per template, no path twice, no other key.
+- `readOnly: true` only. The workspace already mounts its storage into every
+  sandbox it runs, read-write where it allows writes, so a read-write template
+  mount would grant nothing new; and the sandbox workload mounts every host
+  path it is given read-only, so `readOnly: false` could not be kept.
+- `hostPath` is absolute and normalised: no `.` or `..` segment, no `//`, no
+  trailing `/`, not `/`, and none of `:`, `,`, a blank or a control character
+  (the container runtimes' bind syntax cannot carry them). It is not, is not
+  under, and does not contain a system directory (`/bin`, `/boot`, `/dev`,
+  `/etc`, `/lib*`, `/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/tmp`, `/usr`,
+  `/var/lib`, `/var/run`, `/var/tmp`; so not `/var` either).
+- A template may not set Agent Sandbox's own `volumes` or `volumeMounts` (flat
+  or in a nested `template`): `host_mounts` is the only way a template reaches
+  a host path.
+
+Checked when an app run is created, as the caller: every `hostPath` must lie
+under a directory the template's workspace (the template's `workspace`, else the
+run's `sandbox_workspace`) already mounts for sandboxes, read from the
+workspace's `volumes`. A `hostpath` volume declares its `hostPath` joined with
+its `subPath` when it applies to the `Sandbox` scope and does not set
+`requiresPrivilegedGrant`; one with `enableUserDir` declares only the
+directories under it other than `users`. Otherwise the run is refused with
+`403 sandbox_template_mount_not_granted` and the field of each mount that is not
+granted. A plugin therefore never reaches a host path its workspace does not
+already give its sandboxes. `host_mounts` cannot be changed by run-time
+`overrides`.
+
+The grant hands each mount to Agent Sandbox as a `hostPath` volume
+(`template-mount-<i>`, type `Directory`) and a `readOnly: true` volume mount at
+the same path; Agent Sandbox refuses a grant template whose volumes have any
+other shape.
+
+**A read-only directory inside a read-write one.** When the workspace mounts
+`/shared` read-write and a template mounts `/shared/team/cache` read-only, the
+sandbox sees `/shared` writable and `/shared/team/cache` read-only: a write
+under the cache fails with `EROFS` (`Read-only file system`). This needs the
+nested mount to be applied after its parent, and no layer depends on the order
+the mounts are listed in: the sandbox workload orders a pod's host-path mounts
+by path depth before the pod is made; the kubelet passes a container's
+`volumeMounts` to the runtime in list order, and the CRI runtimes (containerd,
+CRI-O) sort them by the number of path components; the Docker daemon sorts a
+container's mounts by destination depth; Apptainer sorts its user binds
+(`--bind`) by destination depth and applies `ro` with a read-only remount of
+each bind.
