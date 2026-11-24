@@ -687,11 +687,16 @@ Checked when the manifest is registered and on every app run:
   may not be `hostPath` volumes (other sources pass through as before), and
   neither they nor its `volumeMounts` may use a name starting with
   `template-mount-`; `volumes`,
-  `volumeMounts` and `template` must be spelt exactly (Agent Sandbox matches
-  field names case-insensitively). Every key of a template, at any depth, must
-  be ASCII: Agent Sandbox's JSON decoder folds some other letters onto ASCII
-  ones (`ſ`, U+017F, is `s`; `K`, U+212A, is `k`), so `volumeſ` would reach it
-  as `volumes`. `host_mounts` is the only way a template reaches a host path.
+  `volumeMounts`, `template`, `fromImage`, `image`, `workspace`, `resources`
+  (with its `requests` and `limits`) and `gpu` (with its `sharedMemory`) must
+  be spelt exactly (Agent Sandbox matches field names case-insensitively).
+  Every key of a template, at any depth, must be ASCII: Agent Sandbox's JSON
+  decoder folds some other letters onto ASCII ones (`ſ`, U+017F, is `s`; `K`,
+  U+212A, is `k`), so `volumeſ` would reach it as `volumes`. No object of a
+  template, at any depth, may have two keys that differ only in case: the
+  decoder keeps the last, so `"workspace":"W2","Workspace":"W1"` would be
+  checked against W2 and run in W1. `host_mounts` is the only way a template
+  reaches a host path.
 
 Checked when an app run is created, as the caller: every `hostPath` must lie
 under a directory the template's workspace (the template's `workspace`, else the
@@ -716,7 +721,8 @@ Sandbox refuses to issue or extend a grant whose template has a hostPath
 volume that is not a clean absolute path, is a system directory (or under or
 above one), is mounted anywhere but read-only at its own path, or is mounted by
 a sidecar. It checks the decoded template, so it sees a hostPath volume however
-its keys were spelt.
+its keys were spelt, and it refuses a template spec in which one object has two
+keys its decoder reads as one.
 
 **A read-only directory inside a read-write one.** When the workspace mounts
 `/shared` read-write and a template mounts `/shared/team/cache` read-only, the

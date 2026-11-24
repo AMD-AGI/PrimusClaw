@@ -101,6 +101,15 @@ test("a read-write mount or a raw hostPath volume never reaches the workspace ch
   }
 });
 
+test("a template whose workspace is given twice in different cases is refused before any workspace is read", async () => {
+  // The review's probe: admission would check W2, Agent Sandbox's decoder reads W1.
+  const t = measurement({ workspace: "W2", Workspace: "W1", host_mounts: [{ hostPath: "/mnt/x", readOnly: true }] });
+  const { out, asked } = await check(manifestWith([t]), async (ws) => ({ volumes: ws === "W2" ? [{ id: 1, type: "hostpath", hostPath: "/mnt" }] : [] }));
+  assert.equal(out.statusCode, 422, JSON.stringify(out));
+  assert.equal(out.response.error, "app_manifest_invalid");
+  assert.deepEqual(asked, []);
+});
+
 test("a workspace the caller cannot read, or SaFE not answering, refuses the run", async () => {
   const m = manifestWith([measurement({ host_mounts: [{ hostPath: CACHE, readOnly: true }] })]);
   assert.equal((await check(m, async () => ({ verdict: "forbidden" }))).out.statusCode, 403);

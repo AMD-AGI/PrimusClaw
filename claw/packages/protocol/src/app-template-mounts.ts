@@ -51,8 +51,14 @@
  * `Volumes` is `volumes` and also `ſ` (U+017F) is `s` and `K` (U+212A) is `k`.
  * So every key of a template, at any depth, must be ASCII, and the ASCII keys
  * are compared case-insensitively, which is then exactly the decoder's
- * matching: `host_mounts` is the only way a plugin template reaches a host
- * path, so the checks above cannot be stepped around. Agent Sandbox's grant
+ * matching. No object of a template, at any depth, may have two keys that
+ * fold to one: the decoder keeps the last of them, so `{"workspace":"W2",
+ * "Workspace":"W1"}` would be checked here as W2 and run in W1. The keys Claw
+ * reads from a template must be spelt exactly ({@link EXACT_KEYS}), and are
+ * read as the decoder reads them ({@link foldedValue}). `host_mounts` is the
+ * only way a plugin template reaches a host path, and the workspace it is
+ * checked against is the one the sandbox runs in, so the checks above cannot
+ * be stepped around. Agent Sandbox's grant
  * service checks the decoded template as well (hostPath volumes read-only,
  * at their own path, outside the system directories).
  *
@@ -88,12 +94,17 @@ export const TEMPLATE_RAW_VOLUME_KEYS = ["volumes", "volumeMounts"] as const;
 export const TEMPLATE_MOUNT_VOLUME_PREFIX = "template-mount-";
 
 /**
- * Keys Agent Sandbox reads that a template must spell exactly: its JSON decoder
- * matches field names case-insensitively, so `Volumes` would reach it as
- * `volumes` past every check here. Keys are ASCII ({@link nonAsciiKeyIssues}),
- * so an ASCII case-insensitive comparison is the decoder's own.
+ * Keys of a template object (the template, and its nested `template`) that
+ * Claw reads or writes and Agent Sandbox decodes, which must be spelt exactly:
+ * its JSON decoder matches field names case-insensitively, so `Volumes` would
+ * reach it as `volumes`, and `Workspace` as `workspace`, past every check
+ * here. Keys are ASCII ({@link keyIssues}), so an ASCII case-insensitive
+ * comparison is the decoder's own.
  */
-const EXACT_KEYS = ["template", ...TEMPLATE_RAW_VOLUME_KEYS] as const;
+const EXACT_KEYS = ["template", "fromImage", "image", "workspace", "resources", "gpu", ...TEMPLATE_RAW_VOLUME_KEYS] as const;
+
+/** Keys below a template object's `resources` and `gpu` that launch overrides write. */
+const EXACT_SUB_KEYS: Readonly<Record<string, readonly string[]>> = { resources: ["requests", "limits"], gpu: ["sharedMemory"] };
 
 /**
  * Directories a mount may not be, be under, or be above. `/var` and `/` are
@@ -147,7 +158,7 @@ export function templateMountIssues(template: Record<string, unknown>, at: strin
   const nested = isObj(template.template) ? template.template : undefined;
   // The volume names host_mounts renders are reserved only where it renders them.
   const reserveNames = Object.hasOwn(template, "host_mounts");
-  nonAsciiKeyIssues(template, at, bad);
+  keyIssues(template, at, bad);
   rawVolumeIssues(template, at, bad, reserveNames);
   if (nested) rawVolumeIssues(nested, `${at}.template`, bad, reserveNames);
   const mounts = template.host_mounts;
@@ -195,23 +206,44 @@ const isAscii = (key: string): boolean => /^[\u0000-\u007f]*$/.test(key);
 const foldAscii = (key: string): string => key.replace(/[A-Z]/g, (c) => c.toLowerCase());
 
 /**
- * Every key of a template that is not ASCII, at any depth. Go's encoding/json,
- * which decodes the template in Agent Sandbox, folds some non-ASCII letters
- * onto ASCII ones (`ſ` U+017F is `s`, `K` U+212A is `k`), so `volumeſ` or
- * `hoſtPath` would reach it as `volumes` or `hostPath` past every check here.
+ * The value of `key` in `obj` as Go's encoding/json decodes it into a field
+ * named `key`: the last key that matches it case-insensitively (keys are
+ * ASCII, {@link keyIssues}), or undefined when none does.
  */
-function nonAsciiKeyIssues(value: unknown, at: string, bad: (path: string, reason: string) => void): void {
+export function foldedValue(obj: Record<string, unknown>, key: string): unknown {
+  const want = foldAscii(key);
+  let value: unknown;
+  for (const [k, v] of Object.entries(obj)) if (foldAscii(k) === want) value = v;
+  return value;
+}
+
+/**
+ * The keys of a template, at any depth, that Agent Sandbox's decoder would read
+ * other than as written. A key that is not ASCII: Go's encoding/json folds some
+ * non-ASCII letters onto ASCII ones (`ſ` U+017F is `s`, `K` U+212A is `k`), so
+ * `volumeſ` or `hoſtPath` would reach it as `volumes` or `hostPath` past every
+ * check here. Two keys of one object that fold to one: the decoder keeps the
+ * last, so `{"workspace":"W2","Workspace":"W1"}` reaches it as W1 while a
+ * reader of the exact key sees W2.
+ */
+function keyIssues(value: unknown, at: string, bad: (path: string, reason: string) => void): void {
   if (Array.isArray(value)) {
-    value.forEach((v, i) => nonAsciiKeyIssues(v, `${at}[${i}]`, bad));
+    value.forEach((v, i) => keyIssues(v, `${at}[${i}]`, bad));
     return;
   }
   if (!isObj(value)) return;
+  const seen = new Map<string, string>();
   for (const [key, v] of Object.entries(value)) {
     if (!isAscii(key)) {
       bad(`${at}.${key}`, "keys must be ASCII: Agent Sandbox's JSON decoder folds some other letters onto ASCII ones (ſ is s, K is k)");
       continue;
     }
-    nonAsciiKeyIssues(v, `${at}.${key}`, bad);
+    const prev = seen.get(foldAscii(key));
+    if (prev !== undefined) {
+      bad(`${at}.${key}`, `must not repeat ${prev} in another case: Agent Sandbox's JSON decoder reads them as one key and keeps the last`);
+    }
+    seen.set(foldAscii(key), key);
+    keyIssues(v, `${at}.${key}`, bad);
   }
 }
 
@@ -230,6 +262,14 @@ function rawVolumeIssues(
   for (const key of Object.keys(obj)) {
     const exact = EXACT_KEYS.find((k) => foldAscii(k) === foldAscii(key));
     if (exact && exact !== key) bad(`${at}.${key}`, `must be spelt ${exact}`);
+  }
+  for (const [parent, keys] of Object.entries(EXACT_SUB_KEYS)) {
+    const sub = obj[parent];
+    if (!isObj(sub)) continue;
+    for (const key of Object.keys(sub)) {
+      const exact = keys.find((k) => foldAscii(k) === foldAscii(key));
+      if (exact && exact !== key) bad(`${at}.${parent}.${key}`, `must be spelt ${exact}`);
+    }
   }
   const reserved = (name: unknown): boolean =>
     reserveNames && typeof name === "string" && name.startsWith(TEMPLATE_MOUNT_VOLUME_PREFIX);
@@ -279,8 +319,11 @@ export function renderTemplateMounts(template: Record<string, unknown>): Record<
     volumes: [...(Array.isArray(target.volumes) ? target.volumes : []), ...volumes],
     volumeMounts: [...(Array.isArray(target.volumeMounts) ? target.volumeMounts : []), ...volumeMounts],
   });
-  const nested = isObj(rest.template) && typeof rest.template.fromImage === "string" && rest.template.fromImage !== "";
-  if (nested) return { ...rest, template: merged(rest.template as Record<string, unknown>) };
+  // Selected as Agent Sandbox selects it (templateFromSpec): the nested
+  // template when its fromImage is set, each key read as its decoder reads it.
+  const inner = foldedValue(rest, "template");
+  const fromImage = isObj(inner) ? foldedValue(inner, "fromImage") : undefined;
+  if (isObj(inner) && typeof fromImage === "string" && fromImage !== "") return { ...rest, template: merged(inner) };
   return merged(rest);
 }
 

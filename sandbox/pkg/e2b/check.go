@@ -233,6 +233,11 @@ func parseSpec(spec string) (specBody, error) {
 	if spec == "" {
 		return specBody{}, nil
 	}
+	// specBody's fields are matched case-insensitively; a spec with two keys
+	// that match one field is refused rather than read as its last one.
+	if err := grant.CheckSpecKeys(spec); err != nil {
+		return specBody{}, grant.Op(http.StatusInternalServerError, "template_spec_invalid", err.Error())
+	}
 	var body specBody
 	if err := json.Unmarshal([]byte(spec), &body); err != nil {
 		return specBody{}, grant.Op(http.StatusInternalServerError, "template_spec_invalid", "template spec is not JSON")

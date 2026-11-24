@@ -9,7 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  APP_MANIFEST_SCHEMA, appGrantTemplates, renderTemplateMounts, sandboxHostPathRoots, templateMountRefusals,
+  APP_MANIFEST_SCHEMA, appGrantTemplates, appTemplateWorkspace, foldedValue, renderTemplateMounts, sandboxHostPathRoots, templateMountRefusals,
   validateAppManifest, TEMPLATE_MOUNTS_MAX, type AppManifestV1,
 } from "../src/index.js";
 
@@ -99,7 +99,49 @@ test("Agent Sandbox's keys must be spelt exactly: its decoder matches them case-
   ]);
   assert.deepEqual(paths({ VOLUMEMOUNTS: [] }), ["sandbox_templates[0].VOLUMEMOUNTS"]);
   assert.deepEqual(paths({ Template: { fromImage: "x" } }), ["sandbox_templates[0].Template"]);
-  assert.deepEqual(paths({ template: { fromImage: "x", volumes: [], Volumes: [] } }), ["sandbox_templates[0].template.Volumes"]);
+  assert.deepEqual(paths({ template: { fromImage: "x", volumes: [], Volumes: [] } }), [
+    "sandbox_templates[0].template.Volumes", "sandbox_templates[0].template.Volumes",
+  ], "repeated in another case, and misspelt");
+  for (const key of ["Workspace", "Image", "FromImage", "Resources", "GPU"]) {
+    // The template also has fromImage, so FromImage is a repeat as well.
+    const flat = key === "FromImage" ? 2 : 1;
+    assert.deepEqual(paths({ [key]: "x" }), Array(flat).fill(`sandbox_templates[0].${key}`), key);
+    assert.deepEqual(paths({ template: { fromImage: "x", [key]: "x" } }), Array(flat).fill(`sandbox_templates[0].template.${key}`), `nested ${key}`);
+  }
+  assert.deepEqual(paths({ resources: { Limits: {} }, gpu: { SharedMemory: "1Gi" } }), [
+    "sandbox_templates[0].resources.Limits", "sandbox_templates[0].gpu.SharedMemory",
+  ]);
+});
+
+test("two keys of one template object that fold to one are refused, at any depth: the decoder keeps the last", () => {
+  // The review's probe: admission read W2, Agent Sandbox's decoder reads W1.
+  const probe = { name: "measurement", workspace: "W2", Workspace: "W1", host_mounts: [{ hostPath: "/mnt/x", readOnly: true }] };
+  const issues = validateAppManifest({ ...manifest({}), sandbox_templates: [{ fromImage: "registry.example.invalid/m:1", ...probe }] });
+  assert.deepEqual(issues.map((i) => i.path), ["sandbox_templates[0].Workspace", "sandbox_templates[0].Workspace"]);
+  assert.match(issues[0]!.reason, /keeps the last/);
+  // A duplicate in the nested template, and deeper, is refused the same way.
+  assert.deepEqual(paths({ template: { fromImage: "x", workspace: "W2", WORKSPACE: "W1" } }), [
+    "sandbox_templates[0].template.WORKSPACE", "sandbox_templates[0].template.WORKSPACE",
+  ]);
+  assert.deepEqual(paths({ template: { fromImage: "x", env: [{ name: "A", Name: "B" }] } }), ["sandbox_templates[0].template.env[0].Name"]);
+  assert.deepEqual(paths({ labels: { app: "a", App: "b" } }), ["sandbox_templates[0].labels.App"]);
+  assert.deepEqual(issuesOf({ labels: { app: "a", tier: "b" }, env: [{ name: "A" }, { name: "B" }] }), []);
+});
+
+test("the workspace a template is checked against is the one Agent Sandbox's decoder reads", () => {
+  const resolved = { image: "img", sandboxWorkspace: "run-ws" };
+  // Its own key in another case is what the decoder reads (were it allowed),
+  // and the grant hands it over spelt exactly, once.
+  const t = { name: "m", fromImage: "x", Workspace: "W1" };
+  assert.equal(appTemplateWorkspace(t, resolved), "W1");
+  const [granted] = appGrantTemplates({ ...manifest({}), sandbox_templates: [t] } as AppManifestV1, resolved);
+  assert.equal(granted!.workspace, "W1");
+  assert.equal(Object.hasOwn(granted!, "Workspace"), false);
+  // Of two, the last, as the decoder reads them.
+  assert.equal(appTemplateWorkspace({ name: "m", workspace: "W2", Workspace: "W1" }, resolved), "W1");
+  assert.equal(foldedValue({ workspace: "W2", Workspace: "W1" }, "workspace"), "W1");
+  assert.equal(appTemplateWorkspace({ name: "m" }, resolved), "run-ws");
+  assert.equal(appTemplateWorkspace({ name: "m", workspace: "W3" }, resolved), "W3");
 });
 
 test("a key that Go's decoder folds onto an Agent Sandbox key (\u017f is s, \u212a is k) is refused, at any depth", () => {
@@ -170,6 +212,10 @@ test("the grant carries each mount as a hostPath volume and a read-only mount at
 });
 
 test("a template in the nested form gets its volumes inside the template Agent Sandbox reads; one without mounts is unchanged", () => {
+  // The nested template is selected as Agent Sandbox's decoder selects it, whatever the case of its keys.
+  const folded = renderTemplateMounts({ name: "m", template: { FromImage: "img:1" }, host_mounts: [{ hostPath: CACHE, readOnly: true }] });
+  assert.equal(Object.hasOwn(folded, "volumes"), false);
+  assert.equal(((folded.template as Record<string, unknown>).volumes as unknown[]).length, 1);
   const nested = renderTemplateMounts({ name: "m", template: { fromImage: "img:1" }, host_mounts: [{ hostPath: CACHE, readOnly: true }] });
   assert.equal(Object.hasOwn(nested, "volumes"), false);
   assert.deepEqual((nested.template as Record<string, unknown>).volumeMounts, [{ name: "template-mount-0", mountPath: CACHE, readOnly: true }]);
