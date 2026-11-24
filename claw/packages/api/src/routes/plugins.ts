@@ -7,6 +7,7 @@ import { isAdmin } from "../auth/models.js";
 import { MarketplaceDb, PLUGIN_LIST_SCOPES, type JsonObject, type PluginListScope } from "../infra/db.js";
 import {
   AccessDeniedError,
+  AppManifestInvalidError,
   BadGatewayError,
   BadRequestError,
   ConflictError,
@@ -23,6 +24,7 @@ import {
   UpsertToolTypeChangeError,
 } from "../shared/errors.js";
 import {
+  assertStorableAppManifest,
   commitImportSelections,
   enrichDiscoverCandidatesNameFlags,
   createMcpTool,
@@ -54,6 +56,10 @@ const T_MAX = 10 * 1024 * 1024;
 const ICON_MAX = 2 * 1024 * 1024;
 
 function mapServiceError(reply: FastifyReply, e: unknown): ReturnType<FastifyReply["send"]> | null {
+  // The body an app run answers for the same manifest, plus a message.
+  if (e instanceof AppManifestInvalidError) {
+    return reply.status(422).send({ ...authErrorPayload("app_manifest_invalid", e.message), issues: e.issues });
+  }
   if (e instanceof NotFoundError) return reply.status(404).send(authErrorPayload("not_found", e.message));
   if (e instanceof AccessDeniedError) return reply.status(403).send(authErrorPayload("access_denied", e.message));
   if (e instanceof NotConfiguredError) return reply.status(503).send(authErrorPayload("not_configured", e.message));
@@ -549,6 +555,7 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
     const u = getUser(req)!;
     const body = req.body as JsonObject;
     try {
+      assertStorableAppManifest(body?.resource);
       const row = await MarketplaceDb.pluginInsert({
         ...body,
         owner_user_id: u.userId,
@@ -665,6 +672,7 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
     delete raw.owner_user_id;
     raw.author = (u.userName || "").trim() || null;
     try {
+      if ("resource" in raw) assertStorableAppManifest(raw.resource);
       const out = await MarketplaceDb.pluginUpdate(id, raw);
       if (!out) return reply.status(404).send(authErrorPayload("not_found", "plugin not found"));
       return { ok: true, data: await formatPluginRow(out, true) };
