@@ -518,6 +518,37 @@ describe("seat dispatch", { skip }, () => {
     assert.equal((await notices()).length, 1);
   });
 
+  test("D14 asks across seats: five a minute one by one, then one line; a machine offline over an hour under a task is said once", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const made: Array<{ sid: string; seq: number; cmd: number; item: string }> = [];
+    for (let i = 0; i < 7; i += 1) {
+      const s = await seat(cid, `/home/u/w${i}`, { alias: `w${i}`, role: "工作", role_state: "confirmed", dispatch_mode: "auto" });
+      const out = await create(await userTurn(alice, `任务 ${i}`), `seat:${s.seatId}`, `任务 ${i}`);
+      assert.equal(out.dispatch, "sent", JSON.stringify(out));
+      made.push({ sid: s.sid, seq: Number(out.seq), cmd: Number((await prompted(cid)).at(-1)!.cmd_seq), item: String(out.item_id) });
+    }
+    await collect(cid);
+    for (const [i, m] of made.entries()) {
+      await events("alice", cid, m.sid, [["permissionRequest", { actionId: `a${i}`, tool: `step ${i}`, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }], cmd_seq: m.cmd }]]);
+    }
+    const told = (await notices()).filter((n) => n.remote.kind === "needs_you");
+    assert.equal(told.filter((n) => n.remote.ask).length, 5, "five asks one by one");
+    const lines = told.filter((n) => !n.remote.ask);
+    assert.equal(lines.length, 1, JSON.stringify(told.map((t) => t.text)));
+    assert.match(lines[0]!.text, /个交给工位的事项在等你批准/);
+    for (const m of made) assert.equal((await item(m.item)).board_state, "needs_you", "every one waits for the user all the same");
+    // The machine goes away for over an hour: said once, not every sweep, and no hourly line while it is away.
+    await w.q("UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '2 hours', stream_seen_at = NULL WHERE connector_id = $1", [cid]);
+    await w.q("UPDATE claw_work_items SET params = params || jsonb_build_object('dispatched_at', (NOW() - interval '3 hours')::text) WHERE item_id = $1", [made[0]!.item]);
+    await dispatch.runErrandSweep("alice");
+    await dispatch.runErrandSweep("alice");
+    const away = (await notices()).filter((n) => n.remote.item_seq === made[0]!.seq && n.remote.kind === "progress");
+    assert.equal(away.length, 1, JSON.stringify(away.map((a) => a.text)));
+    assert.match(away[0]!.text, /离线超过 1 小时/);
+  });
+
   test("D12 the prompt asks for parking only from a connector that can park", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox", [claude({ permission_park: true })]);
