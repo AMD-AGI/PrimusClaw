@@ -122,7 +122,7 @@ test("a turn Claw put to the session for itself is nothing to the reader, and wh
   assert.equal(state.ended, true);
 });
 
-test("a turn Claw put for itself ends at its refusal, at the session's end, and at another prompt's turn end", () => {
+test("a turn Claw put for itself ends at its refusal and the session's end, never at the end of a prompt the reader did not see", () => {
   const refused = turn();
   refused.feed(frame("user_prompt", { cmd_seq: 3, client: "seat_probe" }, "1"));
   refused.feed(frame("command_rejected", { type: "prompt", cmd_seq: 3, reason: "busy" }, "2"));
@@ -136,11 +136,16 @@ test("a turn Claw put for itself ends at its refusal, at the session's end, and 
   assert.equal(step.closed, "stopped");
   assert.equal(closed.hiding, false);
 
+  // the end of a prompt this reader never saw (read after Claw's question, though it ran before): the question goes on
   const other = turn();
   other.feed(frame("user_prompt", { cmd_seq: 3, client: "seat_probe" }, "1"));
-  const end = other.feed(frame("turn_end", { stopReason: "end_turn", cmd_seq: 4 }, "2"));
-  assert.equal(end.finished, true);
+  const end = other.feed(frame("turn_end", { stopReason: "end_turn", cmd_seq: 2 }, "2"));
+  assert.equal(end.finished, false);
+  assert.equal(other.hiding, true);
+  other.feed(acp("agent_message_chunk", "3", { content: { text: "I handle billing." } }));
+  other.feed(frame("turn_end", { stopReason: "end_turn", cmd_seq: 3 }, "4"));
   assert.equal(other.hiding, false);
+  assert.equal(other.answer, "");
 
   // a prompt of any other client is no such turn
   const mine = turn();

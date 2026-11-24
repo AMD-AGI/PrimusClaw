@@ -15,8 +15,8 @@ const PROMPTS_KEPT = 32;
  * `user_prompt`, and the agent runs them one after another, so the prompts read and not yet ended are a queue whose first is the
  * turn running now. While that one is Claw's own, every event is nothing to any reader of the chat: its text, steps and mode
  * switches. A prompt ends at its `turn_end` (one naming it, or the first one naming none) or its refusal; the session closing, or its
- * connector restarting with the turn gone, ends the running one, and a `turn_end` naming a prompt this reader never saw while Claw's
- * own is first means that one never ran (it is refused: an answer-only prompt is, behind another).
+ * connector restarting with the turn gone, ends the running one. A `turn_end` naming a prompt this reader never saw ends none of
+ * them: Claw's own always gets an end or a refusal that names it (from the connector, or from Claw when it was never delivered).
  */
 export class OwnTurns {
   private readonly queue: { readonly seq: number; readonly own: boolean; readonly before: string }[] = [];
@@ -63,10 +63,8 @@ export class OwnTurns {
   /** A turn end: the prompt it names, else the one running, is over. Whether it was Claw's own (then it is not shown). */
   private ended(seq: number | null): boolean {
     if (seq === null) return this.queue.shift()?.own === true;
-    const own = this.drop(seq);
-    if (own !== undefined) return own;
-    if (this.hiding) this.queue.shift(); // (a turn this reader never saw the prompt of ran first: Claw's own did not run)
-    return false;
+    // (the end of a prompt this reader never saw: Claw's own, if it runs, still has its own end or refusal, naming it, to come)
+    return this.drop(seq) ?? this.hiding;
   }
 
   /** Forget the prompt `seq`: whether it was Claw's own, undefined when it is not one this reader saw. */
