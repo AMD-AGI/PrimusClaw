@@ -44,7 +44,15 @@ export const terminalApprovalText = defineCatalog({
     approvalsOff: "Approvals from terminals are off: questions stay in the terminal.",
     approvalsTurnedOn: "Turned on: questions your terminals ask come here too. `/approvals off` stops it.",
     approvalsTurnedOff: "Turned off: questions stay in the terminal. `/approvals on` brings them back.",
-    approvalsUsage: "Use `/approvals on`, `/approvals off`, or `/approvals` to see which it is.",
+    approvalsUsage:
+      "Use `/approvals on`, `/approvals off`, or `/approvals` to see which it is; `/approvals mute #12` (or `unmute #12`) for one terminal conversation, by the number its message names.",
+    muted: (p: { item: string; where: string }) =>
+      `Muted #${p.item}${p.where ? ` (${p.where})` : ""}: what that conversation asks, waits for or finishes stays in its terminal. \`/approvals unmute #${p.item}\` brings it back.`,
+    unmuted: (p: { item: string; where: string }) =>
+      `Unmuted #${p.item}${p.where ? ` (${p.where})` : ""}: that conversation's questions and ends come here again.`,
+    muteNotFound: (p: { item: string }) => `I have no item #${p.item} of yours.`,
+    muteNotTerminal: (p: { item: string }) =>
+      `#${p.item} is not a conversation open in one of your terminals, so there is nothing to mute.`,
     approvalsUnavailable: "I could not reach the setting just now. Try again in a moment.",
   },
   zh: {
@@ -80,7 +88,13 @@ export const terminalApprovalText = defineCatalog({
     approvalsOff: "终端审批推送已关闭：这些问题只在终端里问。",
     approvalsTurnedOn: "已开启：终端里的问题也会推到这里。发 `/approvals off` 关闭。",
     approvalsTurnedOff: "已关闭：问题只在终端里问。发 `/approvals on` 重新开启。",
-    approvalsUsage: "用 `/approvals on` 或 `/approvals off`；只发 `/approvals` 看当前状态。",
+    approvalsUsage:
+      "用 `/approvals on` 或 `/approvals off`；只发 `/approvals` 看当前状态；对单个终端会话用 `/approvals mute #12`（或 `unmute #12`），编号见推送消息开头。",
+    muted: (p) =>
+      `已静音 #${p.item}${p.where ? `（${p.where}）` : ""}：这个会话的提问、等待和完成都只留在终端里。发 \`/approvals unmute #${p.item}\` 恢复。`,
+    unmuted: (p) => `已恢复 #${p.item}${p.where ? `（${p.where}）` : ""}：这个会话的提问和完成会重新推到这里。`,
+    muteNotFound: (p) => `你没有编号为 #${p.item} 的事项。`,
+    muteNotTerminal: (p) => `#${p.item} 不是你终端里打开的会话，没有可静音的。`,
     approvalsUnavailable: "暂时读不到这个设置，请稍后再试。",
   },
 });

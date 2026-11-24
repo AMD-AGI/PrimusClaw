@@ -23,6 +23,7 @@ import {
   type UserRef,
 } from "@primusclaw/personal-agent";
 import { cardDataOf, cardKindOf, cardVerb, isCardClick } from "./actions.js";
+import { forwardsInText, forwardsOf, logUnreadKinds, ownWords } from "./forwards.js";
 import { clientPlatform, conversationId, conversationKind, isPersonal, senderOf, tenantOf } from "./identity.js";
 import { inboundLinksOf } from "./links.js";
 import { addressedToBot, DEFAULT_BOT_NAME, isMentioned, isTargeted, mentionsOf, messageText } from "./mentions.js";
@@ -87,12 +88,17 @@ function messageOf(activity: Activity, sender: UserRef, options: ToEventOptions)
   const personal = isPersonal(activity);
   const found = quotesOf(activity);
   const attached = inboundFiles(activity);
+  const forwarded = forwardsOf(activity, attached.files, logger);
   logPlaceholderQuotes(activity, found, logger);
+  logUnreadKinds(activity, logger);
   const bot = partOf(activity, "recipient");
   return {
     type: "message",
     ...base(activity, sender),
-    text: messageText(activity),
+    text:
+      forwarded.forwards.length && !forwardsInText(activity)
+        ? ownWords(messageText(activity), forwarded.forwards, /<attachment\b/iu.test(pyStr(activity.text)))
+        : messageText(activity),
     mentioned: isMentioned(activity),
     targeted: isTargeted(activity),
     namesBotFirst: addressedToBot(activity, options.botName ?? DEFAULT_BOT_NAME),
@@ -108,7 +114,8 @@ function messageOf(activity: Activity, sender: UserRef, options: ToEventOptions)
       deleted: q.deleted,
       source: q.source,
     })),
-    files: attached.files,
+    ...(forwarded.forwards.length ? { forwards: forwarded.forwards } : {}),
+    files: forwarded.files,
     unreadableFiles: attached.unreadable,
     provenance: "typed",
   };

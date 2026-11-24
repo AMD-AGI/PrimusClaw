@@ -24,10 +24,10 @@ import { SnapshotFile, STATE_WRITE_WAIT_MS, within, writeWhole, type WriteReport
 import { SessionManager, type Command } from "./manager.js";
 import { Outbox, type OutEvent } from "./outbox.js";
 import { failureKind, PoisonFinder } from "./poison.js";
-import { ApprovalBroker, type HookAgent, serveApprovals } from "./approvals.js";
+import { ApprovalBroker, type HookAgent, serveApprovals, TURN_END_AWAY_MS } from "./approvals.js";
 import { cursorConfigDir } from "./cursor-approvals.js";
 import {
-  childrenFile, identityFile, identityKeepFile, logDir, outboxDir, pauseFile, pidFile, quarantineFile, sessionsFile, type Dirs,
+  childrenFile, identityFile, identityKeepFile, logDir, outboxDir, uploadsDir, pauseFile, pidFile, quarantineFile, sessionsFile, type Dirs,
 } from "./paths.js";
 import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, type RemoteAgentDescriptor } from "./protocol.js";
 import { redactDeep, storableDeep } from "./redact.js";
@@ -60,6 +60,8 @@ export interface ConnectorTiming extends SessionTiming {
   heartbeatMs: number;
   /** How long a terminal's question waits on the phone before its card is withdrawn (it stays open in the terminal). */
   approvalTtlMs: number;
+  /** How long a terminal goes without input after a turn ended there before its owner is told the turn ended (approvals.ts). */
+  turnEndAwayMs: number;
   /** No byte on the command stream for this long: drop it and reconnect. */
   watchdogMs: number;
   /** Events are posted this long after the first one is waiting, or at once when `batchMax` are. */
@@ -136,6 +138,7 @@ export const DEFAULT_TIMING: ConnectorTiming = {
   ...DEFAULT_SESSION_TIMING,
   heartbeatMs: REMOTE_AGENT_TIMING.heartbeatMs,
   approvalTtlMs: 60 * 60_000,
+  turnEndAwayMs: TURN_END_AWAY_MS,
   watchdogMs: REMOTE_AGENT_TIMING.watchdogMs,
   batchMs: 150,
   batchMax: 20,
@@ -446,7 +449,7 @@ export class Connector {
     }
     const env: SessionEnv = {
       config: d.config, audit: d.audit, registry: this.registry, store: this.store, attach: this.attach, timing: this.timing,
-      logDir: logDir(d.dirs), version: d.version, log: d.log,
+      logDir: logDir(d.dirs), uploadDir: uploadsDir(d.dirs), version: d.version, log: d.log,
       emit: (sid, type, data, after, at) => this.emit(sid, type, data, after, at),
     };
     this.manager = new SessionManager(env);
@@ -455,6 +458,8 @@ export class Connector {
       emit: (sid, type, data) => this.emit(sid, type, data),
       audit: (event, detail) => d.audit.record(event, detail),
       ttlMs: this.timing.approvalTtlMs,
+      attached: (ref) => this.manager.followsRef(ref),
+      awayMs: this.timing.turnEndAwayMs,
     });
     this.manager.approvals = this.approvals;
   }
@@ -549,6 +554,8 @@ export class Connector {
         // `answer_only`: a prompt can ask for a turn that only answers: every permission its agent asks for in it is refused here
         // (Session.onPermission). `git_info`: the heartbeat reports each folder's git remote and branch (`workspaces`, git-info.ts).
         answer_only: true, git_info: true,
+        // `prompt_files`: a prompt's files (`prompt.files`) are saved on this machine and named in the prompt (prompt-files.ts)
+        prompt_files: true,
         ...(support ? { watch_live: true, ...(support.typesIntoTerminals() ? { terminal_input: true } : {}) } : {}),
         ...(a.readOnlyModes.length ? { read_only_modes: a.readOnlyModes } : {}),
         ...(readOnly ? { edits: false, edits_hint: READ_ONLY_HINT } : {}),

@@ -29,6 +29,7 @@ import {
   channelActions,
   channelContext,
   connectionsText,
+  forwardBlock,
   limitsText,
   MessageRateLimiter,
   noteMessage,
@@ -56,7 +57,14 @@ const mask = (text: string): string => redactText(text).text;
  */
 export function messageTextFor(channelName: string): MessageText {
   return {
-    quoteBlock: (message, group) => quoteBlock(message.quotes, { group, redact: mask }),
+    // (what the person forwarded, then what they quoted: both stand before their own words)
+    quoteBlock: (message, group) =>
+      [
+        forwardBlock(message.forwards ?? [], { group, redact: mask }),
+        quoteBlock(message.quotes, { group, redact: mask }),
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
     withLinks: (text, message) => withLinks(text, message.links, { group: isGroup(message), redact: mask }),
     withQuote,
     unreadable(message) {

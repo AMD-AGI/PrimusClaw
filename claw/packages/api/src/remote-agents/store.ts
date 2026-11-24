@@ -13,7 +13,7 @@ import { storableJsonText } from "@claw/utils";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import {
-  REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS,
+  REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS,
   REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED, REMOTE_EVENT_USER_PROMPT,
   type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteCommandType, type RemoteTerminalSessionOpen, type RemoteEventRejection, type RemoteHeartbeat, type RemoteHidden, type RemoteWorkspace,
 } from "@claw/protocol";
@@ -1034,7 +1034,11 @@ async function commandIssued(q: Querier, owner: string, connectorId: string, cmd
     [owner, connectorId, cmdId],
   )).rows[0];
   if (!a) return null;
-  return { cmd_seq: null, cmd_id: cmdId, session_id: a.session_id, type: a.detail?.type, payload: { option_id: a.detail?.option_id } };
+  // (a prompt's files as the audit names them: a repeat is answered with how many the original carried)
+  return {
+    cmd_seq: null, cmd_id: cmdId, session_id: a.session_id, type: a.detail?.type,
+    payload: { option_id: a.detail?.option_id, files: a.detail?.files },
+  };
 }
 
 export type IssueOutcome =
@@ -1332,9 +1336,82 @@ export async function setApprovalsEnabled(owner: string, enabled: boolean, clien
   });
 }
 
+/** Whether the owner muted the pushes of one conversation open in a terminal of theirs (`claw_remote_terminal_mutes`). */
+export async function terminalMuted(owner: string, connectorId: string, ref: string, q: Querier = direct): Promise<boolean> {
+  return (await q(
+    "SELECT 1 FROM claw_remote_terminal_mutes WHERE owner_user_id = $1 AND connector_id = $2 AND ref = $3", [owner, connectorId, ref],
+  )).rows.length > 0;
+}
+
+export type TerminalMuteOutcome =
+  | { status: "ok"; muted: boolean; machine: string; title: string; seq: number }
+  | { status: "not_found" | "not_terminal" };
+
+/**
+ * Mute (or unmute) the conversation behind one of the owner's work items (`#<seq>`): an item of a conversation open in a terminal
+ * (origin `terminal`), whose terminal-hook session names the machine and the conversation. Muted, its open terminal-hook session is
+ * closed (the connector gives what waits back to the terminal) and none is opened for it again (`session_muted`): its questions, its
+ * waits and its ends stay in the terminal. Audited.
+ */
+export async function setTerminalMute(owner: string, seq: number, muted: boolean, client: string | null): Promise<TerminalMuteOutcome> {
+  const out = await inTransaction(async (q): Promise<TerminalMuteOutcome & { close?: { session_id: string; connector_id: string; agent_id: string } }> => {
+    const item = (await q(
+      "SELECT kind, params FROM claw_work_items WHERE user_id = $1 AND seq = $2", [owner, seq],
+    )).rows[0] as { kind: string; params: Record<string, unknown> | null } | undefined;
+    if (!item) return { status: "not_found" };
+    const sessionId = String(item.params?.session_id ?? "");
+    if (item.kind !== "remote" || item.params?.origin !== "terminal" || !UUID_SHAPE.test(sessionId)) return { status: "not_terminal" };
+    const s = (await q(
+      `SELECT s.connector_id::text AS connector_id, s.agent_id, s.ref, c.name FROM claw_remote_sessions s
+         JOIN claw_remote_connectors c ON c.connector_id = s.connector_id
+        WHERE s.session_id = $1 AND s.owner_user_id = $2 AND s.origin = $3 AND s.ref IS NOT NULL`,
+      [sessionId, owner, REMOTE_ORIGIN_TERMINAL_HOOK],
+    )).rows[0] as { connector_id: string; agent_id: string; ref: string; name: string } | undefined;
+    if (!s) return { status: "not_terminal" };
+    const title = String(item.params?.title ?? "") || String(item.params?.asked ?? "");
+    if (muted) {
+      await q(
+        `INSERT INTO claw_remote_terminal_mutes (owner_user_id, connector_id, ref, title) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (owner_user_id, connector_id, ref) DO UPDATE SET title = EXCLUDED.title, muted_at = NOW()`,
+        [owner, s.connector_id, s.ref, title.slice(0, 200)],
+      );
+    } else {
+      await q("DELETE FROM claw_remote_terminal_mutes WHERE owner_user_id = $1 AND connector_id = $2 AND ref = $3", [owner, s.connector_id, s.ref]);
+    }
+    await writeAudit(q, {
+      owner, actor: owner, client, connectorId: s.connector_id, agentId: s.agent_id, sessionId,
+      action: "terminal_mute.set", detail: { ref: s.ref, muted },
+    });
+    const open = muted ? (await q(
+      `SELECT session_id::text AS session_id FROM claw_remote_sessions
+        WHERE connector_id = $1 AND ref = $2 AND origin = $3 AND status = 'active'`,
+      [s.connector_id, s.ref, REMOTE_ORIGIN_TERMINAL_HOOK],
+    )).rows[0] : undefined;
+    return {
+      status: "ok", muted, machine: String(s.name ?? ""), title, seq,
+      ...(open ? { close: { session_id: String(open.session_id), connector_id: s.connector_id, agent_id: s.agent_id } } : {}),
+    };
+  });
+  if (out.status !== "ok" || !out.close) return out;
+  // Its open session is closed after the mute is stored, so the next question finds it muted; best effort: a close that does not
+  // get through leaves only cards Claw no longer puts to the owner.
+  const { close, ...told } = out;
+  try {
+    const queued = await issueCommand({
+      owner, client, connectorId: close.connector_id, agentId: close.agent_id, sessionId: close.session_id, type: "close",
+      cmdId: `mute:${close.session_id}`, payload: {}, auditDetail: { reason: "muted" }, closesSession: true,
+      commandsPerMinute: REMOTE_AGENT_LIMITS.commandsPerMinute,
+    });
+    if (queued.status === "queued") wakeConnector(close.connector_id);
+  } catch { /* the mute is stored; the close is best effort */ }
+  return told;
+}
+
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export type TerminalSessionOutcome =
   | { status: "opened"; session_id: string; created: boolean }
-  | { status: "approvals_off" | "agent_not_found" | "rate_limited" | "gone" };
+  | { status: "approvals_off" | "session_muted" | "agent_not_found" | "rate_limited" | "gone" };
 
 /**
  * The session that carries the approvals one conversation open in a terminal asks for: the one this connector already has open for
@@ -1349,6 +1426,7 @@ export async function openTerminalSession(
     // One at a time per connector and conversation: two hooks of one conversation asking at once find one session.
     await lock(q, `terminal:${connectorId}:${o.ref}`);
     if (!await approvalsEnabled(owner, q)) return { status: "approvals_off" };
+    if (await terminalMuted(owner, connectorId, o.ref, q)) return { status: "session_muted" };
     const live = (await q("SELECT revoked_at FROM claw_remote_connectors WHERE connector_id = $1 AND owner_user_id = $2", [connectorId, owner])).rows[0];
     if (!live || live.revoked_at) throw new ConnectorGone();
     const agent = (await q("SELECT 1 FROM claw_remote_agents WHERE connector_id = $1 AND agent_id = $2", [connectorId, o.agent_id])).rows[0];

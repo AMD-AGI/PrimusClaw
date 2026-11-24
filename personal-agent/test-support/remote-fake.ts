@@ -60,6 +60,8 @@ export class FakeRemote {
   readonly keysSeen: string[] = [];
   readonly clientLabels: string[] = [];
   onCommand: CommandHook | null = null;
+  /** This Claw takes a prompt's `files` (false: one older than them, which drops them and counts none). */
+  takesPromptFiles = true;
   readonly fail = new Map<string, Failure>();
   enabled = true;
   /** A Claw with `POST /pairings` (off: one from before it, which answers 404). */
@@ -429,6 +431,12 @@ export class FakeRemote {
     return offered.includes(body.option_id) ? null : refuse(400, "unknown_option");
   }
 
+  /** A prompt's `files` count, as a Claw that takes files answers it (none from an older one). */
+  private filesCount(type: string, body: Json): { files?: number } {
+    if (type !== "prompt" || !this.takesPromptFiles) return {};
+    return { files: Array.isArray(body["files"]) ? body["files"].length : 0 };
+  }
+
   async issue(user: string, sid: string, type: string, body: Json, idempotency: string | null): Promise<Reply> {
     const s = this.mine(user, sid);
     if (!s) return refuse(404, "not_found");
@@ -441,7 +449,14 @@ export class FakeRemote {
       if (refused) return refused;
       cmdId = `dec:${s.session_id}:${String(body.action_id)}`;
     }
-    if (this.idem.has(cmdId)) return reply(200, { ok: true, data: { cmd_id: cmdId, duplicate: true } });
+    if (this.idem.has(cmdId)) {
+      // (a Claw that takes files says how many a repeat carries, as its first answer did)
+      return reply(200, { ok: true, data: { cmd_id: cmdId, duplicate: true, ...this.filesCount(type, body) } });
+    }
+    // (a Claw older than `prompt.files` keeps the words and drops the files unread, and its answer counts none)
+    if (type === "prompt" && !this.takesPromptFiles) {
+      body = Object.fromEntries(Object.entries(body).filter(([field]) => field !== "files"));
+    }
     this.idem.set(cmdId, body);
     if (type === "close") s.status = "closed";
     await this.hook({
@@ -458,6 +473,7 @@ export class FakeRemote {
         cmd_id: cmdId,
         cmd_seq: this.commands.length,
         connector_online: c.online,
+        ...this.filesCount(type, body),
       },
     });
   }

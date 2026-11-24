@@ -10,7 +10,9 @@
  *   `approval-hook.js ask|settled --agent cursor --hold <seconds> --dir <Cursor config dir> --socket <connector socket> --managed-by claw-connector`
  *
  * `ask` (the `PermissionRequest` hook) hands the request to the running connector and prints the owner's decision, if one
- * comes; `settled` (the events that follow an answer, run in the background) only tells the connector. Only a session with a
+ * comes; `settled` (the events that follow an answer, run in the background) only tells the connector. On the end of a turn
+ * (`Stop`, `StopFailure`) it also names the terminal the session runs in (`tty`), whose last input tells the connector whether
+ * anyone is at it. Only a session with a
  * person at its terminal is handed on (approval-skip.ts): not `claude -p`, not one the connector itself runs (it already asks
  * through its own cards), not a question asked in bypass mode, and nothing at all with `CLAW_APPROVAL_HOOKS=off`
  * (the opt-out and the bypass mode hold for Codex too).
@@ -97,6 +99,15 @@ async function main(): Promise<void> {
     since = last;
   }
 
+  // The end of a turn (Claude Code's `Stop` or `StopFailure`, Codex's `Stop`): the terminal it runs in, so the connector can tell
+  // whether anyone is at it before it tells the owner the turn ended (approvals.ts). Codex: only the TUI, as for its questions.
+  let endTty: string | null = null;
+  const hookEvent = (event as { hook_event_name?: unknown }).hook_event_name;
+  if (mode === "settled" && agent !== "cursor" && (hookEvent === "Stop" || hookEvent === "StopFailure")) {
+    if (agent === "codex" && !codexTuiTranscript((event as { transcript_path?: unknown }).transcript_path)) return;
+    endTty = terminalOf(process.ppid);
+  }
+
   const reply = await new Promise<string>((resolve) => {
     let buf = "";
     let watch: NodeJS.Timeout | undefined;
@@ -107,7 +118,7 @@ async function main(): Promise<void> {
       clearTimeout(connectTimer);
       const msg = agent === "cursor"
         ? { v: 1, type: mode, agent, dir, event, ...(mode === "ask" && Number.isFinite(holdS) && holdS > 0 ? { hold_ms: Math.round(holdS * 1000) } : {}) }
-        : { v: 1, type: mode, dir, ...(agent === "codex" ? { agent } : {}), event };
+        : { v: 1, type: mode, dir, ...(agent === "codex" ? { agent } : {}), ...(endTty ? { tty: endTty } : {}), event };
       sock.write(`${JSON.stringify(msg)}\n`);
       if (mode === "settled") sock.end();
       // Someone typed in the terminal: the question is theirs there. Closing the socket withdraws the card.

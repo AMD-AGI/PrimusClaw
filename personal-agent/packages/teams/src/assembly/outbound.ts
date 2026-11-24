@@ -10,7 +10,7 @@
 import { readFileSync } from "node:fs";
 
 import type { Clock, Logger } from "@primusclaw/personal-agent";
-import { silentLogger } from "@primusclaw/personal-agent";
+import { silentLogger, turn } from "@primusclaw/personal-agent";
 import { StartupError } from "@primusclaw/personal-agent-runtime/worker";
 
 import { FederatedCredential, readWorkerKey } from "../azure/workload-identity.js";
@@ -25,10 +25,25 @@ import type { GateEntry } from "../gate/entry-env.js";
 import { GateToken, NoQueue } from "../gate/no-queue.js";
 import type { Outbox } from "../outbound/outbox.js";
 import { azureBusClient, type BusClient, type BusConnection } from "../servicebus/client.js";
+import { RECEIVE_DEADLINE_MS, SESSION_HOLD_MS, SETTLE_DEADLINE_MS } from "../servicebus/consumer.js";
 import { ServiceBusOutbox } from "../servicebus/outbox.js";
 
-/** The longest a session's lock is renewed for while one conversation's messages are handled. */
-export const LOCK_RENEWAL_MS = 5 * 60_000;
+/**
+ * The work a handler does around the turn it follows (TURN_DEADLINE_SECONDS): the Claw calls before the turn is submitted
+ * and the replies sent after it ends, with room to spare. Part of the lock renewal, so that work never outlives the lock.
+ */
+export const HANDLER_MARGIN_MS = 10 * 60_000;
+
+/**
+ * The longest a session's lock is renewed for, from its accept: past the consumer's hold of a session (SESSION_HOLD_MS),
+ * the wait for one more message (RECEIVE_DEADLINE_MS), a handler that runs as long as the chat follows a turn
+ * (TURN_DEADLINE_SECONDS) plus the work around it (HANDLER_MARGIN_MS), and the settlement after it (SETTLE_DEADLINE_MS),
+ * so the lock never lapses while a message is in hand: a lapsed lock makes the broker hand the message to another
+ * receiver, and the request runs twice. A closed session releases its lock at once, and a worker that dies loses it
+ * after the queue's lock duration: this bound only caps the renewal of a live worker.
+ */
+export const LOCK_RENEWAL_MS =
+  SESSION_HOLD_MS + RECEIVE_DEADLINE_MS + turn.TURN_DEADLINE_SECONDS * 1000 + HANDLER_MARGIN_MS + SETTLE_DEADLINE_MS;
 
 export interface AssemblyDeps {
   readonly clock: Clock;
@@ -119,6 +134,8 @@ export interface Outbound {
   readonly tokens: TokenSource | undefined;
   /** Where the bot's token may go. */
   readonly policy: ServiceUrlPolicy;
+  /** The outbound queue itself (the delivery probe's answer always goes through the relay); none for the gate. */
+  readonly queue?: Outbox;
   close(): Promise<void>;
 }
 
@@ -144,7 +161,7 @@ export function gateOutbound(gate: GateEntry, deps: AssemblyDeps): Outbound {
 export function productionOutbound(settings: TeamsSettings, outbound: BusClient, deps: AssemblyDeps): Outbound {
   const queue = new ServiceBusOutbox(outbound, settings.bus.outboundQueue, deps.clock, deps.logger);
   if (settings.outboundMode !== "direct") {
-    return { outbox: queue, tokens: undefined, policy: DEFAULT_CONNECTOR_HOSTS, close: () => queue.close() };
+    return { outbox: queue, queue, tokens: undefined, policy: DEFAULT_CONNECTOR_HOSTS, close: () => queue.close() };
   }
   (deps.logger ?? silentLogger).info("outbound mode: direct to the Bot Connector (the queue is the fallback)");
   const tokens = botTokenSource(settings, deps);
@@ -157,6 +174,7 @@ export function productionOutbound(settings: TeamsSettings, outbound: BusClient,
   });
   return {
     outbox,
+    queue,
     tokens,
     policy: DEFAULT_CONNECTOR_HOSTS,
     close: async () => {

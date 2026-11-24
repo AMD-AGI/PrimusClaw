@@ -29,6 +29,14 @@ import { loads, plain, type PyValue } from "./py-json.js";
  */
 export const ACK_TYPE = "primusclaw.delivered";
 
+/**
+ * The delivery probe (the worker's `probe/probe.ts`): what the timer queues, the conversation (and session) it goes
+ * under, and the outbound operation of the worker's answer, which is acked like a posted message and posts nothing.
+ */
+export const PROBE_TYPE = "primusclaw.probe";
+export const PROBE_CONVERSATION = "primusclaw-probe";
+export const PROBE_OPERATION = "probe";
+
 const ERROR_CODE = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
 
 /** A Python AttributeError: `.get()` on something that is not a dict. */
