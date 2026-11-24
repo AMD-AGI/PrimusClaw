@@ -320,6 +320,8 @@ async function sendFollowup(
   owner: string, itemId: string, text: string, onlineWindowMs: number,
   /** How the user let this instruction through: without a card, or pressing one (that said whether its agent runs unattended). */
   approved: { by: "auto" | "card"; unattended: boolean },
+  /** The command's id, when a repeat of this instruction must be the same command (one router turn's words); else a new one. */
+  cmdId?: string,
 ): Promise<DispatchOutcome> {
   const read = async () => (await db.query(
     "SELECT item_id, seq, board_state, outcome, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote'",
@@ -331,13 +333,13 @@ async function sendFollowup(
   return (await withSeatLock(String(first.params.seat_id), true, async () => {
     const item = await read();
     if (!item || (item.board_state === "done" && item.outcome !== "answered")) return { error: "item_closed", message: "that task is closed" };
-    return followupLocked(owner, itemId, item, text, onlineWindowMs, approved);
+    return followupLocked(owner, itemId, item, text, onlineWindowMs, approved, cmdId);
   }))!;
 }
 
 async function followupLocked(
   owner: string, itemId: string, item: { seq: number; params: ErrandParams }, text: string, onlineWindowMs: number,
-  approved: { by: "auto" | "card"; unattended: boolean },
+  approved: { by: "auto" | "card"; unattended: boolean }, cmdId?: string,
 ): Promise<DispatchOutcome> {
   const p = item.params;
   const live = (await seatsLive(owner, onlineWindowMs, [p.seat_id])).get(p.seat_id);
@@ -352,7 +354,7 @@ async function followupLocked(
     cwd: String(live!.seat.cwd), label: `${p.machine}/${p.agent_id}`,
   };
   const caps = live!.agent?.capabilities as Row | undefined;
-  const sent = await executeSend(owner, plan, errandText(Number(item.seq), text, lang), `errand:${itemId}:f:${randomUUID().slice(0, 8)}`, lang,
+  const sent = await executeSend(owner, plan, errandText(Number(item.seq), text, lang), cmdId ?? `errand:${itemId}:f:${randomUUID().slice(0, 8)}`, lang,
     onlineWindowMs, { errandItemId: itemId, parkPermissions: caps?.permission_park === true, queueBehind: true });
   if (!sent.ok) return { error: sent.error, message: sent.message };
   return { dispatch: "sent", session_id: sent.session_id };
@@ -680,6 +682,14 @@ async function claimTurnSend(q: Querier, itemId: string, task: string, key: stri
   )).rows.length > 0;
 }
 
+/** Whether the command `cmdId` (as `executeSend` was given it) was issued to the owner's machine: the audit trail keeps every one. */
+async function commandWasIssued(owner: string, cmdId: string): Promise<boolean> {
+  return (await db.query(
+    "SELECT 1 FROM claw_remote_audit WHERE owner_user_id = $1 AND action = 'command.issued' AND detail->>'cmd_id' = $2 LIMIT 1",
+    [owner, `k:${cmdId}`],
+  )).rows.length > 0;
+}
+
 /** A claim whose instruction went nowhere, given back: the same words may be sent again in this turn. */
 async function releaseTurnSend(q: Querier, itemId: string, task: string, key: string): Promise<void> {
   await q(
@@ -766,11 +776,13 @@ export async function errandWorkSend(
   if (!await claimTurnSend(q, itemId, claims.task_id, key)) return already();
   const giveBack = () => releaseTurnSend(q, itemId, claims.task_id, key).catch(() => undefined);
   if (running) {
+    // One command id for the turn's words: a call made again after a failure that came once the command was queued is that command.
+    const cmdId = `errand:${itemId}:f:${createHash("sha256").update(`${claims.task_id}\u0000${key}`).digest("hex").slice(0, 16)}`;
     let out: DispatchOutcome;
     try {
-      out = await sendFollowup(userId, itemId, text, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "auto", unattended: false });
+      out = await sendFollowup(userId, itemId, text, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "auto", unattended: false }, cmdId);
     } catch (err) {
-      await giveBack();
+      if (!await commandWasIssued(userId, cmdId).catch(() => true)) await giveBack();
       throw err;
     }
     if ("error" in out) await giveBack();
@@ -787,6 +799,8 @@ export async function errandWorkSend(
   try {
     out = (await dispatchErrand(userId, itemId))!;
   } catch (err) {
+    // Failed after its command was queued (`dispatchErrand` sends under this generation's id): it went, so it stays open and claimed.
+    if (await commandWasIssued(userId, `errand:${itemId}:${prior.generation}`).catch(() => true)) throw err;
     await restoreErrand(q, itemId, prior).catch(() => undefined);
     await giveBack();
     throw err;

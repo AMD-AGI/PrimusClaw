@@ -819,6 +819,8 @@ describe("seat dispatch", { skip }, () => {
     assert.deepEqual(reopened.map((r) => r.dispatch).sort(), ["already_sent", "sent"], JSON.stringify(reopened));
     const open = await item(done.item_id);
     assert.deepEqual([open.board_state, Number(open.generation), open.params.open_cmd_seqs.length], ["in_progress", gen + 1, 1]);
+    // Once it runs again, the same words later in that turn are not a follow-up either.
+    assert.equal((await send(again, done.item_id, "再补一节")).dispatch, "already_sent");
     assert.equal((await prompted(cid2)).length, 1, "the finished task's machine got one command");
 
     // A seat that asks first: one card, and pressing it sends once.
