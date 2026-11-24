@@ -2,17 +2,19 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Runs the whole suite once under c8, then holds each package to its own floor on lines, statements, functions and
- * branches. `--all` counts a source file no test loads as uncovered, so a module without tests lowers its package's
- * numbers instead of vanishing from them; only files with no runtime at all are left out (scripts/type-only.ts).
+ * Runs the whole suite once with V8 coverage on, then holds each package to its own floor (one c8 report each) on
+ * lines, statements, functions and branches. `--all` counts a source file no test loads as uncovered, so a module
+ * without tests lowers its package's numbers instead of vanishing from them; only files with no runtime at all are
+ * left out (scripts/type-only.ts).
  *
  *   node --import tsx scripts/coverage.ts [--names <file>]
  *
  * `--names <file>` also writes the names of the tests that ran (scripts/test-names-reporter.ts) for the ported-tests
  * check, so the suite runs once in CI.
  */
-import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { oddCaseSources, SOURCE_EXTENSIONS, sourceFiles, symlinksUnder, typeOnlyFiles } from "./type-only.js";
@@ -114,8 +116,47 @@ const temp = path.join(root, ".c8-tmp");
 const c8 = path.join(root, "node_modules", ".bin", "c8");
 const TESTS = ["packages/*/test/**/*.test.ts", "test-support/**/*.test.ts", "test/**/*.test.ts"];
 
-function run(args: readonly string[]): number {
-  return spawnSync(c8, args, { cwd: root, stdio: "inherit" }).status ?? 1;
+/**
+ * Runs the suite with V8 coverage written to `temp`. Not under the c8 wrapper: c8 converts the whole of `temp` to a
+ * report once its child exits, even with `--reporter=none`, which took about 35 s in CI for a report nobody reads;
+ * the per-package reports below are the ones the gate reads.
+ */
+function runTests(args: readonly string[]): number {
+  mkdirSync(temp, { recursive: true });
+  const env = { ...process.env, NODE_V8_COVERAGE: temp };
+  return spawnSync(process.execPath, args, { cwd: root, stdio: "inherit", env }).status ?? 1;
+}
+
+/** One c8 run with its output held back, so runs side by side still print one package after another. */
+function runCaptured(args: readonly string[]): Promise<{ readonly status: number; readonly output: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(c8, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+    const chunks: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => chunks.push(chunk));
+    // A child that does not start may never emit "close": settle here too (a second resolve is ignored).
+    child.on("error", (error) => {
+      chunks.push(Buffer.from(`coverage: c8 did not start: ${error.message}\n`));
+      resolve({ status: 1, output: Buffer.concat(chunks).toString("utf8") });
+    });
+    child.on("close", (code) => {
+      resolve({ status: code ?? 1, output: Buffer.concat(chunks).toString("utf8") });
+    });
+  });
+}
+
+/** `work` over `items`, at most `limit` at a time, the results in the order of `items`. */
+export async function inPool<T, R>(items: readonly T[], limit: number, work: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array<R>(items.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (next < items.length) {
+      const at = next++;
+      results[at] = await work(items[at] as T);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+  return results;
 }
 
 function reporters(names: string | undefined): string[] {
@@ -144,16 +185,22 @@ function reportedFiles(summary: string): string[] {
   return Object.keys(parsed).filter((key) => key !== "total");
 }
 
-function checkPackage(pkg: string, floor: number): boolean {
+/**
+ * One package's report and floor. Each c8 report reads and merges the whole of `temp` on one core (about 33 s each in
+ * CI), so the packages run side by side; what each prints is held and printed in package order.
+ */
+async function checkPackage(pkg: string, floor: number): Promise<{ readonly ok: boolean; readonly output: string }> {
   const src = path.join("packages", pkg, "src");
   const excluded = typeOnlyFiles(path.join(root, src), root);
   const expected = sourceFiles(path.join(root, src))
     .map((f) => path.relative(root, f))
     .filter((f) => !excluded.includes(f));
   const reportDir = path.join(temp, "report", pkg);
-  console.log(`\n== ${pkg}: floor ${String(floor)}% (lines, statements, functions, branches)`);
-  console.log(`   type-only, not counted: ${excluded.length === 0 ? "none" : excluded.join(", ")}`);
-  const status = run([
+  const lines = [
+    `\n== ${pkg}: floor ${String(floor)}% (lines, statements, functions, branches)`,
+    `   type-only, not counted: ${excluded.length === 0 ? "none" : excluded.join(", ")}`,
+  ];
+  const { status, output } = await runCaptured([
     "report",
     "--temp-directory",
     temp,
@@ -174,41 +221,32 @@ function checkPackage(pkg: string, floor: number): boolean {
     "--check-coverage",
     ...["lines", "statements", "functions", "branches"].map((metric) => `--${metric}=${String(floor)}`),
   ]);
-  if (status !== 0) console.error(`coverage: ${pkg} is below its floor of ${String(floor)}%`);
+  lines.push(output.replace(/\n$/, ""));
+  if (status !== 0) lines.push(`coverage: ${pkg} is below its floor of ${String(floor)}%`);
   const summary = path.join(reportDir, "coverage-summary.json");
   const missing = existsSync(summary) ? missingFromReport(expected, reportedFiles(summary), root) : expected;
-  for (const file of missing) console.error(`coverage: ${file} has runtime code but is not in c8's report`);
-  return status === 0 && missing.length === 0;
+  for (const file of missing) lines.push(`coverage: ${file} has runtime code but is not in c8's report`);
+  return { ok: status === 0 && missing.length === 0, output: lines.join("\n") };
 }
 
-function main(argv: readonly string[]): number {
+async function main(argv: readonly string[]): Promise<number> {
   const at = argv.indexOf("--names");
   const names = at === -1 ? undefined : argv[at + 1];
   const { packages, errors } = packagesToCheck(path.join(root, "packages"), FLOORS);
   for (const error of errors) console.error(`coverage: ${error}`);
   if (errors.length > 0) return 1;
   rmSync(temp, { recursive: true, force: true });
-  const tests = run([
-    "--temp-directory",
-    temp,
-    "--reporter=none",
-    "node",
-    "--import",
-    "tsx",
-    "--test",
-    "--test-concurrency=2",
-    ...reporters(names),
-    ...TESTS,
-  ]);
+  const tests = runTests(["--import", "tsx", "--test", "--test-concurrency=2", ...reporters(names), ...TESTS]);
   if (tests !== 0) {
     console.error(`coverage: the test run failed (exit ${String(tests)})`);
     return tests;
   }
-  const results = packages.map(([pkg, floor]) => checkPackage(pkg, floor));
+  const results = await inPool(packages, availableParallelism(), ([pkg, floor]) => checkPackage(pkg, floor));
+  for (const { output } of results) console.log(output);
   rmSync(temp, { recursive: true, force: true });
-  return results.every(Boolean) ? 0 : 1;
+  return results.every(({ ok }) => ok) ? 0 : 1;
 }
 
 if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  process.exit(main(process.argv.slice(2)));
+  process.exit(await main(process.argv.slice(2)));
 }
