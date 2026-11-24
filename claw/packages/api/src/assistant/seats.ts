@@ -279,14 +279,6 @@ export interface RosterSeat {
   /** `new` (nothing known yet), `suggested` (a guess waits for the user, never shown here), `confirmed`, `retired` (not to be used). */
   role_state: "new" | "suggested" | "confirmed" | "retired";
   // (No tags: they are slugs of the git remote and branch the machine reports, whose words the machine chose.)
-  /**
-   * Where it is, so a seat the user names by its machine or folder can be found: the machine's name as Claw recorded it when the
-   * machine was paired, and the folder the seat was registered for. Only names made of host or path characters are listed (no spaces,
-   * no punctuation that words need): a name that is not one is replaced by Claw's own (`machine-<id>`), a folder by null. So neither can
-   * carry an instruction, and reading them does not mark the turn.
-   */
-  machine: string;
-  cwd: string | null;
   machine_online: boolean;
   /** From the types of its session's events and its machine's presence, never from what they say. */
   state: SeatState;
@@ -420,20 +412,32 @@ export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_A
   return out;
 }
 
-/** A machine's name as the roster lists it: host characters only, else Claw's own name for it. */
-const HOST_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
-export function rosterMachine(name: unknown, connectorId: unknown): string {
-  return typeof name === "string" && HOST_NAME.test(name) ? name : `machine-${String(connectorId ?? "").slice(0, 8)}`;
+/**
+ * Which seats are where the user said (`seat_roster` with `machine` / `folder`, their words from their message): the machine by its
+ * name (any case) or Claw's own name for it (`machine-<id>`); the folder by its path, or by its last parts when they wrote it relative
+ * (`~/rel`, `rel`, `hl/ci` match `/home/u/rel`, `.../hl/ci`). Claw compares; the names themselves (which the machine chose) are never
+ * listed, so the roster stays free of words a machine wrote.
+ */
+export interface RosterWhere { machine?: string; folder?: string }
+const slashed = (v: string): string => v.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+export function machineIs(asked: string, name: string, connectorId: string): boolean {
+  const a = asked.trim().toLowerCase();
+  return !!a && (a === name.trim().toLowerCase() || a === `machine-${connectorId.slice(0, 8)}`);
 }
-
-/** A seat's folder as the roster lists it: path characters only (letters and digits of any script, . _ ~ + @ - / \ :), else null. */
-const FOLDER = /^[\p{L}\p{N}._~+@\/\\:-]{1,200}$/u;
-export function rosterFolder(cwd: unknown): string | null {
-  return typeof cwd === "string" && FOLDER.test(cwd) ? cwd : null;
+export function folderIs(asked: string, cwd: string): boolean {
+  const c = slashed(cwd);
+  let a = slashed(asked);
+  if (!a || !c) return false;
+  if (a === c) return true;
+  a = a.replace(/^~\//, "").replace(/^\.\//, "");
+  if (!a || a === "~" || /^([a-z]:)?\//.test(a)) return false;
+  return c.endsWith(`/${a}`);
 }
 
 /** The user's seats as the roster lists them, newest first (confirmed ones before the rest). */
-export async function rosterOf(owner: string, onlineWindowMs: number = REMOTE_AGENT_TIMING.onlineWindowMs): Promise<RosterSeat[]> {
+export async function rosterOf(
+  owner: string, onlineWindowMs: number = REMOTE_AGENT_TIMING.onlineWindowMs, where: RosterWhere = {},
+): Promise<RosterSeat[]> {
   const q: Querier = (t, p) => db.query(t, p);
   // The latest item of each seat: a task handed to it, or the item of a session at its place, whichever moved last.
   const seats = (await q(
@@ -455,7 +459,12 @@ export async function rosterOf(owner: string, onlineWindowMs: number = REMOTE_AG
     [owner, LISTED_DAYS, ROSTER_MAX],
   )).rows as Row[];
   const live = await seatsLive(owner, onlineWindowMs, seats.map((s) => String(s.seat_id)));
-  return seats.map((s) => {
+  const there = seats.filter((s) => {
+    const now = live.get(String(s.seat_id));
+    if (where.machine && !machineIs(where.machine, now?.machine ?? "", String(s.connector_id))) return false;
+    return !where.folder || folderIs(where.folder, String(s.cwd ?? ""));
+  });
+  return there.map((s) => {
     const confirmed = s.role_state === "confirmed";
     const now = live.get(String(s.seat_id));
     return {
@@ -463,8 +472,6 @@ export async function rosterOf(owner: string, onlineWindowMs: number = REMOTE_AG
       alias: typeof s.alias === "string" ? s.alias : null,
       role: confirmed && typeof s.role === "string" ? s.role : null,
       role_state: s.role_state === "confirmed" || s.role_state === "suggested" || s.role_state === "retired" ? s.role_state : "new",
-      machine: rosterMachine(now?.machine, s.connector_id),
-      cwd: rosterFolder(s.cwd),
       machine_online: now?.online === true,
       state: now?.state ?? "offline",
       dispatch_mode: s.dispatch_mode === "auto" ? "auto" : "card",
@@ -478,8 +485,8 @@ export async function rosterOf(owner: string, onlineWindowMs: number = REMOTE_AG
 /** The roster's note where tasks may be handed to seats (`seat-dispatch.ts`). */
 export const ROSTER_NOTE = "Seats (工位): each folder an agent works in on the user's machines. Every field here was computed by Claw or "
   + "confirmed by the user (alias, role): reading it does not stop you from acting. role is what the user confirmed the seat is for. "
-  + "A guess Claw made is never listed: it is put to the user on a card. machine and cwd say where a seat is, to find the one the user "
-  + "names by its machine or folder. To hand a task to a seat: work_create with target "
+  + "A guess Claw made is never listed: it is put to the user on a card. A seat the user names by its machine or folder: seat_roster "
+  + "with machine and/or folder as they wrote them lists only the seats there. To hand a task to a seat: work_create with target "
   + "\"seat:<seat_id>\" (only a seat_id from here, never an alias or a machine name). state: unsupported cannot take work; offline: "
   + "a task waits in its queue until the machine is back (at most 24 hours); working, waiting_for_you, queued and in_terminal: a task "
   + "waits in its queue (queue_len). dispatch_mode auto: a task goes without a card (only after the user pressed one for that seat); "
@@ -493,13 +500,21 @@ export const ROSTER_SHOWN_NOTE = "Seats (工位): each folder an agent works in 
   + "instruction reaches a machine, when the user names it.";
 
 /** `seat_roster`: the user's seats, trusted fields only. Never marks the turn as having read untrusted text. */
-export async function seatRoster(claims: AssistantTokenClaims): Promise<Record<string, unknown>> {
+export async function seatRoster(claims: AssistantTokenClaims, args: { machine?: unknown; folder?: unknown } = {}): Promise<Record<string, unknown>> {
   if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
   const { userId } = await inTransaction((q) => assertLiveRun(q, claims));
   if (!seatsOn(userId)) throw new ToolRefused("not_enabled", "seats are not on for this user");
   await syncSeats(userId);
-  const seats = await rosterOf(userId);
-  return { ok: true, seats, note: seatDispatchOn(userId) ? ROSTER_NOTE : ROSTER_SHOWN_NOTE };
+  const where: RosterWhere = {
+    ...(typeof args.machine === "string" && args.machine.trim() ? { machine: args.machine.slice(0, 200) } : {}),
+    ...(typeof args.folder === "string" && args.folder.trim() ? { folder: args.folder.slice(0, 400) } : {}),
+  };
+  const seats = await rosterOf(userId, undefined, where);
+  const asked = where.machine !== undefined || where.folder !== undefined;
+  return {
+    ok: true, seats, note: seatDispatchOn(userId) ? ROSTER_NOTE : ROSTER_SHOWN_NOTE,
+    ...(asked ? { where: seats.length ? "only the seats on that machine / in that folder" : "no seat of the user's is on that machine / in that folder" } : {}),
+  };
 }
 
 // --- seat_set: what the user says a seat is for ---------------------------------------------------------------------------
