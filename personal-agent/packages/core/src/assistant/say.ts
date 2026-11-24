@@ -11,7 +11,7 @@
  *   a card that says so (only for a say that puts no choice and offers no replies of its own; one that does keeps its choice card and
  *   replies), with the pull request it still watches and that a reply changes it (none for the system's own notice, whose
  *   words say all that); when it holds a write for the person, a card
- *   that lets it through or not; when it puts a command to the person, a card with Run and Cancel; when it puts a choice to the
+ *   that lets it through or not (a seat dispatch that offers several places: a button for each, and Cancel); when it puts a command to the person, a card with Run and Cancel; when it puts a choice to the
  *   person, a card with the options and Send; when it is about one of the person's skills, the skill's card with Undo and Edit,
  *   or a draft's with Save and Discard (each recorded first, so its buttons mean something). A card holds the words only when they
  *   are short and not shown already; a skill's card always does.
@@ -211,8 +211,17 @@ export class SayPlanner {
         held.confirmationId,
         held.kind,
         held.allowLabel,
+        held.options,
       );
-      const model = { text: inCard || held.allowLabel, cardId, allowLabel: held.allowLabel, kind: held.kind, lang };
+      const options = held.options?.map(({ label, detail }) => ({ label, detail }));
+      const model = {
+        text: inCard || held.allowLabel,
+        cardId,
+        allowLabel: held.allowLabel,
+        kind: held.kind,
+        ...(options ? { options } : {}),
+        lang,
+      };
       return view({ name: "confirmWrite", model });
     }
     const confirm = confirmActionOf(event, this.deps.exactCommand);

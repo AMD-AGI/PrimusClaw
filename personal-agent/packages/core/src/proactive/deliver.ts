@@ -23,7 +23,7 @@ import { clip } from "../text/plain.js";
 import { clientLocaleOf, noRequestScope } from "../ports/request-scope.js";
 import { pyRstrip, pyStrip } from "../text/py-text.js";
 import { replyParts } from "../turn/answer-parts.js";
-import type { ProactiveDeps } from "./deps.js";
+import type { ProactiveDeps, RemoteAskRequest } from "./deps.js";
 import { EXPIRES_KEY, REMOTE_SAID, finishedAt, turnAckOf, type AnsweredInChat } from "./events.js";
 import { remoteAskExpiry, zoneOf } from "./quiet.js";
 import { noteCard } from "../remote/views.js";
@@ -60,6 +60,20 @@ function terminalOffer(
     return typeof id === "string" && ids.has(id);
   });
   return { options, ask: { ...ask, [SHOWN_WHOLE]: view.complete } };
+}
+
+/**
+ * Which work item a pushed request is for (`#seq title`, or for a task handed to a seat, named by number only, `#seq`; "" none),
+ * the seat's name, and whether it is a parked request's reminder.
+ */
+function seatAsk(event: JsonObject, remote: RemoteNotice): Pick<RemoteAskRequest, "about" | "seat" | "parked"> {
+  const item = parseWorkItem(event["item"]);
+  const about = item ? `#${String(item.seq)} ${item.title}` : remote.itemSeq ? `#${String(remote.itemSeq)}` : "";
+  return {
+    about,
+    ...(remote.seatAlias ? { seat: remote.seatAlias } : {}),
+    ...(remote.parked === true ? { parked: true } : {}),
+  };
 }
 
 /** A terminal's question names its request by an id the connector made, a uuid: anything else is said as words, no card. */
@@ -425,28 +439,26 @@ export class Deliveries {
     const lang = answerLang(prefs.lang, this.clientLocale(), event["text"]);
     const shown = terminal ? terminalOffer(ask, offered, remote, lang) : { options: offered, ask };
     const options = shown.options;
-    if (
-      !store.remotePermissions.saveRemotePermission({
-        userId,
-        sessionId: remote.sessionId,
-        actionId,
-        tool,
-        options,
-        expiresAt,
-        lang,
-        ...(terminal ? { ask: shown.ask } : {}),
-      })
-    ) {
-      return false; // (one request, one card: the attached chat's reader, or an earlier delivery of this push, showed it)
-    }
-    const item = parseWorkItem(event["item"]);
+    const saved = store.remotePermissions.saveRemotePermission({
+      userId,
+      sessionId: remote.sessionId,
+      actionId,
+      tool,
+      options,
+      expiresAt,
+      lang,
+      ...(terminal ? { ask: shown.ask } : {}),
+    });
+    // (one request, one card: the attached chat's reader, or an earlier delivery of this push, showed it; a parked request's one
+    // reminder is the exception)
+    if (!saved && !this.keptParked(userId, remote, actionId, expiresAt)) return false;
     const card = this.deps.remote.askCard({
       ask,
       options,
       sessionId: remote.sessionId,
       machine: remote.machine,
       agent: remote.agent,
-      about: item ? `#${String(item.seq)} ${item.title}` : "",
+      ...seatAsk(event, remote),
       expiresAt,
       zone: zoneOf(prefs),
       lang,
@@ -460,10 +472,24 @@ export class Deliveries {
         await conversation.send(card);
       }
     } catch (error) {
-      store.remotePermissions.forgetRemotePermission(remote.sessionId, actionId); // (nobody saw it: Claw's retry must show it)
+      // (nobody saw it: Claw's retry must show it; a reminder's request keeps the card shown before)
+      if (saved) store.remotePermissions.forgetRemotePermission(remote.sessionId, actionId);
       throw error;
     }
     return true;
+  }
+
+  /**
+   * The one reminder of a request the agent keeps waiting on (parked) whose card the person was shown already: it waits again until
+   * the longer wait ends, unless it was answered (or an answer is on its way). True when it does, and its card comes again.
+   */
+  private keptParked(userId: string, remote: RemoteNotice, actionId: string, expiresAt: number): boolean {
+    const permissions = this.deps.store.remotePermissions;
+    return (
+      remote.parked === true &&
+      permissions.getRemotePermission(remote.sessionId, actionId)?.userId === userId &&
+      permissions.keepRemotePermission(remote.sessionId, actionId, expiresAt)
+    );
   }
 
   /**

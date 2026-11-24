@@ -14,6 +14,7 @@ import {
 } from "../locales/assistant-actions.js";
 import type { Lang } from "../locales/lang.js";
 import { devenvHideOutcome } from "./devenv-hide-outcome.js";
+import { seatDispatchOutcome } from "./seat-dispatch-outcome.js";
 import { seatOutcome } from "./seat-outcome.js";
 import { skillText } from "../locales/skills.js";
 
@@ -212,21 +213,25 @@ export function githubWriteOutcome(kind: string, out: Fields, lang: Lang): strin
 }
 
 /** The kinds whose outcome has words of its own; undefined for the scheduled task's and the comment's. */
-function ownOutcome(kind: string, status: string, out: Fields, lang: Lang): string | undefined {
+function ownOutcome(kind: string, status: string, out: Fields, lang: Lang, picked: string): string | undefined {
   if (kind === "devenv_send") return devenvSendOutcome(status, out, lang);
+  if (kind === "seat_dispatch") return seatDispatchOutcome(status, out, lang, picked);
   if (kind === "devenv_hide") return devenvHideOutcome(status, out, lang);
   if (kind === "skill_save") return skillSaveOutcome(status, out, lang);
   if (kind === "seat_role" || kind === "seat_set") return seatOutcome(kind, status, out, lang);
   return undefined;
 }
 
-/** What came of a press on a held write's card of `kind`, in one line: Claw's answer said plainly. */
-export function confirmOutcome(kind: string, out: Fields, lang: Lang): string {
+/**
+ * What came of a press on a held write's card of `kind`, in one line: Claw's answer said plainly. `picked`: the label of the place a
+ * choice card's press picked ("" none).
+ */
+export function confirmOutcome(kind: string, out: Fields, lang: Lang, picked = ""): string {
   const t = assistantActionText.in(lang);
   const status = or(out["status"], "");
   if (isGithubWrite(kind)) return githubWriteOutcome(kind, out, lang);
   const create = kind === "trigger_create";
-  const own = ownOutcome(kind, status, out, lang);
+  const own = ownOutcome(kind, status, out, lang, picked);
   if (own !== undefined) return own;
   const comment = kind === "github_comment" ? commentOutcome(out, lang) : undefined;
   if (comment !== undefined) return comment;

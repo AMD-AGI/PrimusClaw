@@ -117,6 +117,18 @@ export class SqliteRemotePermissionRepository implements RemotePermissionReposit
     );
   }
 
+  keepRemotePermission(sessionId: string, actionId: string, expiresAt: number): boolean {
+    return (
+      this.ctx.db.run(
+        "UPDATE remote_permissions SET state = 'pending', expires_at = ? " +
+          "WHERE session_id = ? AND action_id = ? AND state IN ('pending', 'expired')",
+        expiresAt,
+        sessionId,
+        actionId,
+      ) === 1
+    );
+  }
+
   getRemotePermission(sessionId: string, actionId: string): RemotePermission | null {
     const row = this.ctx.db.get(
       `SELECT ${PERMISSION_COLUMNS} FROM remote_permissions WHERE session_id = ? AND action_id = ?`,
