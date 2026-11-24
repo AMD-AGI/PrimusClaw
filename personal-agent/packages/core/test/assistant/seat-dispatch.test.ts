@@ -69,6 +69,19 @@ it("a seat dispatch's places are read whole, each one plain line, and anything e
   assert.equal(confirmWriteOf(choiceSay(OPTIONS, "trigger_create"))?.options, undefined);
 });
 
+it("a choice card's words said apart leave it its buttons alone, never the word of its Allow", () => {
+  const { store } = openTestStore();
+  const say = new SayPlanner({
+    store,
+    exactCommand: () => false,
+    style: () => ({ citations: true, suggestedReplies: true }),
+  });
+  const out = say.messages(ALICE, { ...choiceSay(), text: "x ".repeat(400) });
+  const card = out.at(-1);
+  assert.ok(card?.body.type === "view" && card.body.view.name === "confirmWrite");
+  assert.equal(card.body.view.model.text, "");
+});
+
 it("a choice card is recorded with its places first and shows a button for each", () => {
   const { store } = openTestStore();
   const say = new SayPlanner({
@@ -80,6 +93,7 @@ it("a choice card is recorded with its places first and shows a button for each"
   assert.ok(card?.body.type === "view" && card.body.view.name === "confirmWrite");
   const model = card.body.view.model;
   assert.equal(model.kind, "seat_dispatch");
+  assert.equal(model.text, "Hyperloom 的两个工位都合适，交给哪里？");
   assert.deepEqual(model.options, [
     { label: "发布台", detail: "~/rel" },
     { label: "mi300/claude", detail: "~/hl-ci" },

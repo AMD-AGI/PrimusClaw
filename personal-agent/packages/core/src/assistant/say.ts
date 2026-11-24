@@ -214,8 +214,9 @@ export class SayPlanner {
         held.options,
       );
       const options = held.options?.map(({ label, detail }) => ({ label, detail }));
+      // (a choice card's buttons name the places: its words are the say's own, or none when said apart)
       const model = {
-        text: inCard || held.allowLabel,
+        text: options ? inCard : inCard || held.allowLabel,
         cardId,
         allowLabel: held.allowLabel,
         kind: held.kind,
