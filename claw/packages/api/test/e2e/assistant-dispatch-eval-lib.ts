@@ -341,6 +341,7 @@ export async function runDispatchCase(c: DispatchCase, o: { llm: Llm; tools: Too
     let reply: ModelResponse;
     try {
       reply = await o.llm({ system, messages, tools: o.tools });
+      if (!Array.isArray(reply?.content)) throw new Error(`the model answered without content: ${JSON.stringify(reply).slice(0, 200)}`);
     } catch (err) {
       trace.error = err instanceof Error ? err.message : String(err);
       return trace;
@@ -459,10 +460,11 @@ export interface Score { id: string; cat: Category; pass: boolean; why: string[]
 const HAN = /\p{Script=Han}/u;
 
 export function scoreDispatch(c: DispatchCase, t: Trace): Score {
-  const mis = t.error ? [] : misDispatches(c, t);
+  // What was dispatched before a model error still counts.
+  const mis = misDispatches(c, t);
   const said = t.said.trim();
   const asked = !t.calls.some((x) => isEffect(x) && !x.refused) && QUESTION.test(said);
-  if (t.error) return { id: c.id, cat: c.cat, pass: false, why: [`model unreachable: ${t.error}`], misDispatch: [], asked: false };
+  if (t.error) return { id: c.id, cat: c.cat, pass: false, why: [`model unreachable: ${t.error}`, ...mis], misDispatch: mis, asked: false };
   const why: string[] = [];
   if (!c.want.some((d) => matches(d, t.calls, said))) why.push(`wanted ${c.want.map(describe).join(" or ")}`);
   why.push(...mis);

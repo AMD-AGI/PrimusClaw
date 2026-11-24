@@ -185,6 +185,15 @@ test("V5 mis-dispatch: alias targets, sends outside the case, any seat dispatch 
   assert.deepEqual((await run("alias-rel-zh", [create(SEAT.rel), create(seat(SEAT.rel)), say("已交给发布台。")])).score.misDispatch, [], "a bare seat_id is only malformed");
   const instead = await run("confirm-each-zh", [create(seat(SEAT.rel)), say("已交给发布台。")]);
   assert.match(instead.score.misDispatch.join(), /sent to 发布台/, "work sent where the user only asked to be asked first");
+  // A model error after the send keeps the mis-dispatch; an answer without content is an error, not a crash.
+  let k = 0;
+  const failing: Llm = async () => {
+    if (k++ === 0) return { content: [{ type: "tool_use", id: "t1", name: `${P}work_create`, input: { title: "t", brief: "b", target: seat(SEAT.notes) } }], stop_reason: "tool_use" };
+    return {} as never;
+  };
+  const broke = scoreDispatch(byId("alias-rel-en"), await runDispatchCase(byId("alias-rel-en"), { llm: failing, tools, system }));
+  assert.equal(broke.pass, false);
+  assert.match(broke.misDispatch.join(), /queued to notes/);
   const wrong = await run("sandbox-intro-en", [create(seat(SEAT.rel)), say("Sent to 发布台.")]);
   assert.match(wrong.score.misDispatch.join(), /sent to 发布台/);
   const queuedWrong = await run("alias-rel-en", [create(seat(SEAT.notes)), say("Queued on notes.")]);
