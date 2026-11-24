@@ -16,7 +16,7 @@ import {
   WorkClicks,
   type ClawWorkItemsPort,
   type Decision,
-  type WatchClicks,
+  WatchClicks,
   type WorkItem,
   routedReviewTurns,
   silentLogger,
@@ -35,6 +35,7 @@ import { Credentials } from "../../packages/core/src/routing/credentials.js";
 import { CommandViews } from "../../packages/core/src/routing/views.js";
 import { inboundAction } from "../inbound.js";
 import { SeededRandom } from "../random.js";
+import { FakeWorkItems } from "./work-items.js";
 import {
   ALICE,
   ALICE_DM,
@@ -296,9 +297,16 @@ export function itemsWorld(options: ReviewOptions = {}) {
       routerCtx.itemStopped(itemId);
     },
   });
+  // No press in these worlds watches a pull; a real handler over a Claw of its own stands in for the worker's.
+  const watch = new WatchClicks({
+    store: w.store,
+    claw: new FakeWorkItems(),
+    exchange: w.exchange,
+    logger: silentLogger,
+  });
   const clicks = new WorkCardClicks(
     work,
-    {} as WatchClicks,
+    watch,
     w.exchange,
     (userId) => w.store.links.getKey(userId) !== null,
     silentLogger,
