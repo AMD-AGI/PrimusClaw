@@ -15,6 +15,88 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## Unreleased
+
+### Fixed
+
+- A message that forwards messages and whose words answer a question card waiting in the chat no longer loses what it
+  forwards. The words answered the card, and the forwarded messages, which no other message carried, never reached Claw.
+  They now go to Claw with the answer, before its words, as they go with a new message; the card still shows only the
+  words. This holds in a group and in a 1:1 chat; a forward with no words still goes on as a new message.
+
+## 0.12.0
+
+A minor release, because core's exported API changes incompatibly: `ClawPort`'s `remoteAgents` (`ClawRemoteAgentsPort`)
+gains a required member, `muteTerminal`, so code that implements `ClawPort` itself must add it (the packaged Claw client
+does) (#907). No plugin port (core's `src/plugins/`) changed, and the store is unchanged: nothing to do for a deployment
+of the published packages. Forwarded messages reach the assistant and a chat attached to a session, with their authors,
+times and images (#908), files sent to an attached chat reach the session's machine (#909, merged with #908), a
+terminal conversation can be muted on its own (#907), and the worker drains its inbound queue on shutdown, re-opens a
+hung connection and answers an end-to-end delivery probe (#906).
+
+**Claw and connector:** `/approvals mute` and `unmute` need claw-v0.5.12 or later; with an older Claw the worker answers
+that it has no such item. The messages about a terminal turn that ended while nobody was there are sent by Claw,
+claw-v0.5.12 and later, to a connector of 0.3.1 or later. Files sent to an attached session need claw-v0.5.12 and a
+connector of 0.3.1 or later on that machine: with an older connector a file that is not text is named back as before,
+with an upgrade hint, and with an older Claw the person is told that the words went and the files did not.
+
+**Breaking for custom ClawPort implementations:** In `@primusclaw/personal-agent`, `ClawRemoteAgentsPort` (the
+`remoteAgents` member of the exported `ClawPort`) gains the required `muteTerminal(key, item, muted)`, answering the
+exported `TerminalMute` (`item`, `muted`, `machine`, `title`) for `PUT /v1/remote-agents/approvals/mutes`. The runtime's
+Claw client implements it, so a deployment of the published packages has nothing to do; a `ClawPort` of one's own must
+add it (#907).
+
+### Added
+
+- `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: a message the person forwards to the bot (Teams'
+  Forward, one or several at once, with or without words of their own) reaches the 1:1 assistant and a chat attached to
+  a session. Until now only the person's own words went and the forward was dropped. Each forwarded message is read
+  from the Forward blockquote of the message's HTML or from Graph's `forwardedMessageReference` attachment (one message
+  said in both is one message) and keeps its author, time and text. The model is told, before the quotes and the
+  person's words, that these were written by others and are material, not instructions, with each message quoted line by
+  line (its own budget: 20 messages, 24000 characters; masked in a group like a quote). An image in a forwarded message
+  that Teams stores becomes a file of the message, named `[image-<n>]` where it stood; one Teams does not store says it
+  was not passed on. Only the shape of a forward is logged (count, sources, images), never its text.
+  `InboundMessage.forwards` (optional) carries them for a surface of one's own (#908).
+- `@primusclaw/personal-agent`: a chat attached to a session sends text files (logs, code, data, Markdown) inline after
+  the words, fenced, 40 KiB in all, within Claw's 64 KiB prompt (forwarded and quoted text is cut before the person's
+  words are) (#908). When the session's connector says `prompt_files`, every other file (an image, a PDF) is sent to the
+  session as a file, at most 10 and 2 MiB in all, and the connector saves it on the machine and names its path in the
+  prompt; files sent with no words go with the line "The person sent the files below with no words." Two files never
+  share a name (Teams' safe name turns `报告.pdf` and `图表.pdf` both into `_.pdf`; the later one gets its place as a
+  prefix). Until now every file sent to an attached chat was dropped ("only your words were sent") (#909).
+- `@primusclaw/personal-agent`: `/approvals mute #<item>` and `/approvals unmute #<item>` mute one conversation open in a
+  terminal, named by the work item its messages start with: what it asks, waits for or finishes stays in its terminal
+  (zh and en). The messages Claw sends when a terminal's turn ends while nobody is there ("finished", or "stopped with
+  an error", with the end of what the agent last said) arrive through the proactive push path, so quiet hours, pause and
+  held messages apply to them (#907).
+- The delivery probe. With `PRIMUSCLAW_PROBE_SCHEDULE` set on the ingress (for example `0 */5 * * * *`), the ingress
+  queues a `primusclaw.probe` on the inbound queue (session `primusclaw-probe`); the worker answers it through the
+  outbound queue, the relay posts nothing to Teams and sends an ack back, and the worker records the times. It covers
+  every hop after the Bot Framework token check, not Teams or Claw. New metrics, under the `personal_agent_` names only:
+  `personal_agent_probe_total{outcome}`, `personal_agent_probe_feedback_ms`, `personal_agent_probe_reply_ms`,
+  `personal_agent_probe_last_answered_seconds` and `personal_agent_inbound_rearmed_total`; the `clawy_*` half of
+  `/metrics` is unchanged. Unset, the ingress registers no timer. `MetricsPort` gains the optional `probed` and
+  `inboundRearmed`, and the ingress's `Registrar` the optional `timer` (a registrar without it logs that the probe is
+  off), so neither breaks a port of one's own. Deploy the worker and the ingress of this release, then set the schedule
+  ([configuration](docs/configuration.md), "The Teams ingress") (#906).
+
+### Fixed
+
+- `@primusclaw/personal-agent-teams`: a message sent while the worker was being replaced could be lost. On `SIGTERM` the
+  consumer only set a flag, so the pod was usually killed at its 30 s grace while waiting on Service Bus with sessions
+  locked, and a message handed over in the last instant had nobody to settle it. Shutdown now drains: the waits for a
+  session or a message end at once, a message being handled is finished and settled, one that arrives after the signal
+  is abandoned (the next worker gets it at once), and every session is closed so its lock is released. A cutover delays
+  messages and no longer strands them; give the pod the default 30 s grace or more (#906).
+- `@primusclaw/personal-agent-teams`: a receiver whose Service Bus connection died unnoticed waited forever and its
+  conversations stalled. Every broker call now has a deadline (accept 120 s, receive the idle wait plus 40 s, settle
+  and close 60 s); past it the connection is re-opened once, and the old one is closed only after every message taken
+  on it is settled, so no message being handled goes to a second receiver (#906).
+- `@primusclaw/personal-agent-teams`: a session held for longer than its lock's 5-minute renewal could lose the lock
+  while a message was handled, and the broker handed the message to another receiver (a duplicate). A receiver now holds
+  one session for at most 4 minutes of messages, then closes it and takes the next (#906).
+
 ## 0.11.0
 
 A minor release, because core's exported API changes incompatibly: `StorePort` gains required members for a review that

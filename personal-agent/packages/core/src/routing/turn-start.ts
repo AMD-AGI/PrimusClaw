@@ -82,6 +82,11 @@ export interface StartTurn {
   readonly messageId: string;
   readonly clientPlatform: string;
   readonly quote?: string;
+  /**
+   * What it forwards, alone, as text for the model ("": nothing): part of `quote` (beside what it quotes and, in a group, the
+   * chat's recent messages), and what goes with the words when they answer a waiting question. Read only then.
+   */
+  readonly forward?: () => string;
   readonly sent?: string;
   readonly files?: readonly InboundFile[];
   readonly review?: ReviewTurnStart;
@@ -139,6 +144,7 @@ export class TurnStarter {
     return answerWaitingQuestion(this.ctx, {
       chat: request.chat,
       text: request.text,
+      ...(request.forward ? { forward: request.forward } : {}),
       credential: provider ?? (() => Promise.resolve(request.credential)),
     });
   }
