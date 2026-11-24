@@ -291,7 +291,8 @@ describe("seats", { skip }, () => {
       ["/home/u/rel/", "/home/u/rel", true], ["el", "/home/u/rel", false], ["~", "/home/u/rel", false], ["/rel", "/home/u/rel", false],
       ["rel", "C:\\work\\rel", true], ["~/hl-ci", "/home/u/hl-ci2", false],
       // A POSIX path keeps its case; a Windows one does not.
-      ["~/Release", "/home/u/release", false], ["release", "C:\\Work\\Release", true]] as const) {
+      ["~/Release", "/home/u/release", false], ["release", "C:\\Work\\Release", true],
+      ["~/Release/foo", "/home/u/release\\foo", false], ["~/release/foo", "/home/u/release\\foo", false], ["release/foo", "\\\\srv\\Share\\Release\\Foo", true]] as const) {
       assert.equal(seats.folderIs(asked, cwd), is, `${asked} ${cwd}`);
     }
     assert.ok(seats.machineIs("machine-01234567", "x", "0123456789abcdef"));
