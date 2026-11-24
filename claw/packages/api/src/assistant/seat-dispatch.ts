@@ -316,7 +316,11 @@ export async function dispatchErrand(
 }
 
 /** Send one more instruction to a task running in its session (the connector queues it behind the turn under way). */
-async function sendFollowup(owner: string, itemId: string, text: string, onlineWindowMs: number): Promise<DispatchOutcome> {
+async function sendFollowup(
+  owner: string, itemId: string, text: string, onlineWindowMs: number,
+  /** How the user let this instruction through: without a card, or pressing one (that said whether its agent runs unattended). */
+  approved: { by: "auto" | "card"; unattended: boolean },
+): Promise<DispatchOutcome> {
   const read = async () => (await db.query(
     "SELECT item_id, seq, board_state, outcome, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote'",
     [itemId, owner],
@@ -327,16 +331,20 @@ async function sendFollowup(owner: string, itemId: string, text: string, onlineW
   return (await withSeatLock(String(first.params.seat_id), true, async () => {
     const item = await read();
     if (!item || (item.board_state === "done" && item.outcome !== "answered")) return { error: "item_closed", message: "that task is closed" };
-    return followupLocked(owner, itemId, item, text, onlineWindowMs);
+    return followupLocked(owner, itemId, item, text, onlineWindowMs, approved);
   }))!;
 }
 
 async function followupLocked(
   owner: string, itemId: string, item: { seq: number; params: ErrandParams }, text: string, onlineWindowMs: number,
+  approved: { by: "auto" | "card"; unattended: boolean },
 ): Promise<DispatchOutcome> {
   const p = item.params;
   const live = (await seatsLive(owner, onlineWindowMs, [p.seat_id])).get(p.seat_id);
-  const refused = seatRefusal(live, p.seat_id);
+  // The seat as it is now, under its lock: what let the instruction through still holds (a card each time asked for since, an agent
+  // turned unattended), or nothing is sent.
+  const refused = seatRefusal(live, p.seat_id)
+    ?? policyRefusal(live!, { lang: p.lang, approved: approved.by, approved_unattended: approved.unattended });
   if (refused) return { error: refused.code, message: refused.message };
   const lang: RemoteLang = p.lang === "zh" ? "zh" : "en";
   const plan: SendPlan = {
@@ -556,7 +564,9 @@ export async function seatDispatchDecided(
   return {
     result: { ok: true, item_id: itemId, seq: Number(item.seq), seat_id: seatId, alias: live!.seat.alias ?? null },
     after: async () => {
-      const out = followup !== null ? await sendFollowup(userId, itemId, followup, REMOTE_AGENT_TIMING.onlineWindowMs) : await dispatchErrand(userId, itemId);
+      const out = followup !== null
+        ? await sendFollowup(userId, itemId, followup, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "card", unattended: live!.unattended })
+        : await dispatchErrand(userId, itemId);
       if (!out) return { ok: false, error: "busy", message: "try again" };
       if ("error" in out) {
         if (followup === null) await dropErrand((t, v) => db.query(t, v), itemId, out.message);
@@ -668,7 +678,7 @@ export async function errandWorkSend(
     return { ok: true, item_id: itemId, seq: Number(item.seq), dispatch: "card", why_card: why, ...proposed(card.row, card.subscribers, "sent", lang) };
   }
   if (running) {
-    const out = await sendFollowup(userId, itemId, text, REMOTE_AGENT_TIMING.onlineWindowMs);
+    const out = await sendFollowup(userId, itemId, text, REMOTE_AGENT_TIMING.onlineWindowMs, { by: "auto", unattended: false });
     return { ok: true, item_id: itemId, seq: Number(item.seq), ...dispatchAnswer(out) };
   }
   await inTransaction(async (tx) => { await reopenErrand(tx, itemId, text, newSession, false); });

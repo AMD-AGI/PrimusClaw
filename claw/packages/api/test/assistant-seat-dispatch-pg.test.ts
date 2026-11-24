@@ -618,6 +618,27 @@ describe("seat dispatch", { skip }, () => {
     assert.ok((await wakes(alice.routerSid)).some((m) => m.includes("第二段回答")), "and the second");
   });
 
+  test("D17 one more instruction to a running task passes the same gate: a card once the seat asks for one, sent when pressed", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    await collect(cid);
+    const direct = await tools.workSend(await userTurn(alice, "顺便更新 changelog"), { item_id: String(out.item_id), text: "顺便更新 changelog" }) as Recorded;
+    assert.equal(direct.dispatch, "sent", JSON.stringify(direct));
+    assert.equal((await item(out.item_id)).params.open_cmd_seqs.length, 2, "queued behind the turn under way, the task's own");
+    await collect(cid);
+    await seats.seatSet(await userTurn(alice, "发布台每次都确认"), { seat: s.seatId, confirm_each: true });
+    const carded = await tools.workSend(await userTurn(alice, "再打个 tag"), { item_id: String(out.item_id), text: "再打个 tag" }) as Recorded;
+    assert.deepEqual([carded.dispatch, carded.why_card], ["card", "confirm_each"]);
+    assert.deepEqual(await prompted(cid), [], "nothing sent for the card");
+    const pressed = await press(carded.confirmation_id);
+    assert.equal(pressed.result?.dispatch, "sent", JSON.stringify(pressed));
+    assert.equal((await item(out.item_id)).params.open_cmd_seqs.length, 3);
+    // A wake hands nothing more over.
+    assert.equal((await refusal(tools.workSend(await w.routerTurn(alice), { item_id: String(out.item_id), text: "x" }))).code, "not_from_user");
+  });
+
   test("D12 the prompt asks for parking only from a connector that can park", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox", [claude({ permission_park: true })]);

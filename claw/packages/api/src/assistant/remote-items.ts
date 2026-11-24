@@ -1460,18 +1460,32 @@ export interface NoteErrandPrompt {
  * again (a new generation), so neither answer is lost. Then its events are caught up.
  */
 export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
-  const pending = (await db.query("SELECT params->'report_due' AS due FROM claw_work_items WHERE item_id = $1 AND user_id = $2", [p.itemId, p.owner]))
-    .rows[0]?.due as ErrandParams["report_due"] | null | undefined;
-  if (pending) {
-    await reportErrand({ itemId: p.itemId, generation: Number(pending.generation), kind: pending.kind, summary: String(pending.summary) })
-      .catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_report_failed"));
+  // The end still to be reported is reported before the prompt is noted, and the note is made only once the item, locked, has none
+  // left (one recorded meanwhile is reported, and the note tried again). Past the tries the note is made all the same, in a new
+  // generation, so the new prompt's end is never lost to an old report closing the item.
+  for (let attempt = 0; ; attempt += 1) {
+    const pending = (await db.query("SELECT params->'report_due' AS due FROM claw_work_items WHERE item_id = $1 AND user_id = $2", [p.itemId, p.owner]))
+      .rows[0]?.due as ErrandParams["report_due"] | null | undefined;
+    if (pending) {
+      await reportErrand({ itemId: p.itemId, generation: Number(pending.generation), kind: pending.kind, summary: String(pending.summary) })
+        .catch((err) => logger.warn({ err, itemId: p.itemId }, "assistant.errand_report_failed"));
+    }
+    if (await notePromptLocked(p, attempt >= ERRAND_NOTE_TRIES - 1)) return;
   }
-  await inTransaction(async (q) => {
+}
+
+/** How often a prompt's note waits for an end being reported. */
+const ERRAND_NOTE_TRIES = 5;
+
+/** The note itself, the item locked; false (nothing written) while an end is still to be reported, unless `anyway`. */
+async function notePromptLocked(p: NoteErrandPrompt, anyway: boolean): Promise<boolean> {
+  return inTransaction(async (q) => {
     const row = (await q(
       "SELECT board_state, outcome, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' FOR UPDATE", [p.itemId, p.owner],
     )).rows[0] as { board_state: string; outcome: string | null; params: ErrandParams } | undefined;
-    if (!row) return;
-    if (row.board_state === "done" && row.outcome === "answered") {
+    if (!row) return true;
+    if (row.params.report_due && !anyway) return false;
+    if ((row.board_state === "done" && row.outcome === "answered") || row.params.report_due) {
       await q(
         `UPDATE claw_work_items SET board_state = 'in_progress', outcome = NULL, closed_at = NULL, last_report_kind = 'progress', summary = '',
                 generation = generation + 1, params = params - 'report_due', updated_at = NOW()
@@ -1501,6 +1515,7 @@ export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
        SELECT item_id, 'progress', 'remote', generation, $2 FROM claw_work_items WHERE item_id = $1`,
       [p.itemId, p.machine],
     );
+    return true;
   });
 }
 
