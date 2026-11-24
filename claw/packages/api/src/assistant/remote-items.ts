@@ -1429,7 +1429,7 @@ const AGENT_TURN_ANSWER_MAX = 1500;
 /**
  * The turns the seat's agent took by itself after a task's turn ended (a command it put in the background finished, and it answered
  * that): each one's answer is said once, as a late word of the task whose turn ended last before it (the prompt that turn's end names,
- * `cmd_id` `k:errand:<item>:…`), and kept on that item. A turn with no answer text says nothing. Read from the session's events after
+ * `cmd_id` `k:errand:<item>:…`), and kept on that item. A turn with no answer text, or one after a prompt that was no task's, says nothing. Read from the session's events after
  * the last one any task of the session took (`agent_turn_seen`).
  */
 async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice[]> {
@@ -1467,14 +1467,17 @@ async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice
     )).rows as Array<{ id: string; cmd_id: string | null }>;
     if (!ends.length) return [];
     const notices: Notice[] = [];
-    // Whose it is: the task the prompt of the last turn that ended before it was sent for; else the task sent there last.
+    // How far the session's turns of the agent's own were read: kept on the task sent there last.
     const latest = [...items].sort((a, b) => String(a.params.dispatched_at).localeCompare(String(b.params.dispatched_at)) || a.seq - b.seq).at(-1)!;
-    const touched = new Map<string, number>();
+    const touched = new Map<string, number>([[latest.item_id, Number(ends.at(-1)!.id)]]);
     for (const end of ends) {
       const id = Number(end.id);
+      // Whose it is: the task the prompt of the last turn that ended before it was sent for. One that follows anyone else's prompt (one
+      // typed into a chat attached to the session) is not a task's, and is not said here: that chat shows it.
       const named = /^k:errand:([^:]+):/.exec(String(end.cmd_id ?? ""))?.[1];
-      const item = items.find((i) => i.item_id === named) ?? latest;
-      touched.set(item.item_id, id);
+      const item = items.find((i) => i.item_id === named);
+      if (!item) continue;
+      touched.set(item.item_id, Math.max(touched.get(item.item_id) ?? 0, id));
       const whole = await answerOf(q, sessionId, id);
       const answer = tailLines(whole, AGENT_TURN_ANSWER_MAX);
       if (!answer) continue;

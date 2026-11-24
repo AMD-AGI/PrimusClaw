@@ -832,6 +832,15 @@ describe("seat dispatch", { skip }, () => {
     // Posted again (a retry): nothing said twice.
     await events("alice", cid, s.sid, [chunk("ok")]);
     assert.equal((await notices()).filter((n) => n.remote.item_seq === long.seq).length, 2);
+    // A prompt typed into a chat attached to the session (no task's): the agent's own turn after it is nobody's task, and not said here.
+    const said = (await notices()).length;
+    const summary = (await item(long.item_id)).summary;
+    await w.q(`INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data) VALUES ($1, $2, 'user_prompt', NOW(), $3::jsonb)`,
+      [s.sid, store.userPromptSeq(900), JSON.stringify({ text: "跑个后台", cmd_id: "k:chat-1", cmd_seq: 900, client: "web", by: "claw" })]);
+    await events("alice", cid, s.sid, [chunk("后台跑着"), ["turn_end", { stopReason: "end_turn", cmd_id: "k:chat-1", cmd_seq: 900 }],
+      chunk("chat-bg-done"), ["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true }]]);
+    assert.equal((await notices()).length, said, JSON.stringify((await notices()).slice(said)));
+    assert.equal((await item(long.item_id)).summary, summary);
   });
 
   test("D22 an older connector never ends the agent's own turn: once it has been quiet, the seat is free and the sweep sends what waits", async () => {
