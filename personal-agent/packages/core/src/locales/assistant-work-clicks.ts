@@ -11,8 +11,8 @@ const fixed = {
   retried: (p: { label: string }) =>
     `已重新开始 ${p.label}，有结果或需要你时我会告诉你。 / Started ${p.label} again; I will tell you when there is news.`,
   tooMany: (p: { label: string }) =>
-    `${p.label} 没有重新开始：你进行中的任务已经到上限了，先停掉或接受一个再重试。 / Not started again: ` +
-    "you have as many tasks running as you may. Stop or accept one, then retry.",
+    `${p.label} 没有重新开始：你进行中的任务已经到上限了，先停掉一个再重试。 / Not started again: ` +
+    "you have as many tasks running as you may. Stop one, then retry.",
   notRetryable: (p: { label: string }) =>
     `${p.label} 现在不能重试（只有失败或已停止的任务可以）。 / It cannot be retried now (only a task that failed or was stopped can).`,
   noRetry: "这个版本的 PrimusClaw 还不能重试任务。 / This PrimusClaw cannot retry a task yet.",
@@ -63,6 +63,10 @@ const fixed = {
     `${p.note} The card below is for version ${String(p.version)}.`,
   lookAgain: (p: { note: string }) => `${p.note} Please look at it again.`,
   alreadyClosed: (p: { label: string; outcome: string }) => `${p.label} is already ${p.outcome}.`,
+  /** An Accept pressed on a card drawn before Claw delivered the result by itself. */
+  alreadyDelivered: (p: { label: string; version: number }) =>
+    `${p.label} v${String(p.version)} 已交付，不用再接受；要改直接回复我。 / ${p.label} v${String(p.version)} was delivered; ` +
+    "there is nothing to accept. Reply to me to have it changed.",
   waitingVersion: (p: { label: string; version: number }) =>
     `${p.label} has a result waiting (version ${String(p.version)}).`,
   waitingForYou: (p: { label: string; question: string }) =>

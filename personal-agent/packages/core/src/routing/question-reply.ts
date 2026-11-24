@@ -10,14 +10,14 @@
 import { cardQuestions, typedAnswers, type CardQuestion } from "../approvals/questions.js";
 import { viewMessage } from "../approvals/click.js";
 import { errorName } from "../errors.js";
-import { answerLang } from "../language/detect.js";
+import { answerLang, pickLang, writtenLang } from "../language/detect.js";
 import { approvalText } from "../locales/approval.js";
 import { zoneOf } from "../proactive/quiet.js";
 import type { PendingQuestion } from "../ports/store/index.js";
 import { pyStrip } from "../text/py-text.js";
 import { ClawError } from "../claw/errors.js";
 import { isClawOrNetwork, statusOrKind } from "../turn/engine/claw-errors.js";
-import type { Chat } from "./chat.js";
+import { groupChosenLang, type Chat } from "./chat.js";
 import type { RouterContext } from "./context.js";
 
 /**
@@ -80,11 +80,22 @@ export async function answerWaitingQuestion(ctx: RouterContext, reply: TypedRepl
     questions: questions.length,
     card: pending.cardId ? "edited" : "not editable",
   });
-  // The card speaks the chat's language (the person's chosen or learnt language, else the client's locale, as `chat.lang()`),
-  // and without either the question's: never the reply's alone, since "1" or "a" typed in a Chinese chat is no English.
-  const lang = answerLang(store.prefs.getPrefs(chat.sender.id).lang, chat.locale, questions[0]?.question, reply.text);
-  await settleCard(ctx, chat, pending.cardId, [...answers.answers], lang);
+  await settleCard(ctx, chat, pending.cardId, [...answers.answers], answeredCardLang(ctx, reply, questions));
   return true;
+}
+
+/**
+ * The language of the answered card. It speaks the chat's language (the person's chosen or learnt language, else the
+ * client's locale, as `chat.lang()`), and without either the question's: never the reply's alone, since "1" or "a" typed in
+ * a Chinese chat is no English. In a group the person's own language and locale are not read (`groupLangOf`): the group's,
+ * else the reply's words, else the question's.
+ */
+function answeredCardLang(ctx: RouterContext, reply: TypedReply, questions: readonly CardQuestion[]) {
+  const { store } = ctx.deps;
+  const { chat } = reply;
+  return chat.scope
+    ? (groupChosenLang(store, chat.scope) ?? writtenLang(reply.text) ?? pickLang(questions[0]?.question, reply.text))
+    : answerLang(store.prefs.getPrefs(chat.sender.id).lang, chat.locale, questions[0]?.question, reply.text);
 }
 
 /**

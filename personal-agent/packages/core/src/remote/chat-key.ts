@@ -22,6 +22,12 @@ export function personOf(chatKey: string): string {
   return at < 0 ? chatKey : chatKey.slice(0, at);
 }
 
+/** The group conversation a chat key binds ("" for a 1:1 chat's). */
+export function groupConversationOf(chatKey: string): string {
+  const at = chatKey.indexOf(GROUP_KEY_SEP);
+  return at < 0 ? "" : chatKey.slice(at + 1);
+}
+
 export function isGroupKey(chatKey: string): boolean {
   return chatKey.includes(GROUP_KEY_SEP);
 }

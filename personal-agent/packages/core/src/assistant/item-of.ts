@@ -9,6 +9,7 @@
 import { z } from "zod";
 
 import type { WorkItem } from "../claw/model.js";
+import { deliveredOf, delivery } from "../claw/work-item.js";
 import type { JsonObject } from "../json.js";
 
 const text = z.string().min(1).optional().catch(undefined);
@@ -29,6 +30,8 @@ const itemSchema = z.looseObject({
   kind: text,
   params: z.record(z.string(), z.unknown()).optional().catch(undefined),
   updated_at: text,
+  delivered_version: z.unknown().optional(),
+  watching_pr: z.unknown().optional(),
 });
 
 export function parseWorkItem(raw: unknown): WorkItem | undefined {
@@ -53,6 +56,7 @@ function itemOf(r: z.output<typeof itemSchema>): WorkItem {
     params,
     pull: pull.success ? pull.data : null,
     updatedAt: r.updated_at ?? "",
+    ...delivery(deliveredOf(r)),
   };
 }
 

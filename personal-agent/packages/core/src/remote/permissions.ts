@@ -79,7 +79,12 @@ export class Permissions {
     to: Conversation,
   ): Promise<void> {
     const state = this.state.attached(chatKey);
-    const lang = this.state.lang(chatKey);
+    // A group binding's request goes to the binder's 1:1 chat: the group sees only that it waits, never what it asks for. The card,
+    // and what its click and settled card say (the row keeps it), is in that 1:1 chat's language; only the notice in the group is
+    // in the group's.
+    const personal = isGroupKey(chatKey) ? this.ctx.references.getReference(personOf(chatKey)) : null;
+    const groupLang = this.state.lang(chatKey);
+    const lang = personal ? this.state.lang(personOf(chatKey)) : groupLang;
     const actionId = textOf(request["actionId"]);
     // A question a terminal asks reaches the owner as its own card (Claw's push, which shows its content): a chat attached to the
     // session that carries it draws nothing, so the request is never shown here with every option and none of the content.
@@ -87,7 +92,7 @@ export class Permissions {
     if (TERMINAL_ORIGINS.has(textOf(request["origin"]))) return;
     const options = parseOptions(request["options"]);
     if (!actionId || options.length === 0) {
-      await to.send(textMessage(saidIn(lang, "noAnswerableOption")));
+      await to.send(textMessage(saidIn(groupLang, "noAnswerableOption")));
       return;
     }
     const expiresAt = this.ctx.clock.epochMs() / 1000 + secondsOf(request["timeout_ms"]);
@@ -105,7 +110,9 @@ export class Permissions {
       })
     )
       return;
-    const who = state ? words.agentOnHost({ agent: state.agentLabel, host: state.host }) : words.theAgent;
+    const whoIn = (words: ReturnType<typeof remoteText.in>): string =>
+      state ? words.agentOnHost({ agent: state.agentLabel, host: state.host }) : words.theAgent;
+    const who = whoIn(words);
     const forget = (): void => {
       this.ctx.permissions.forgetRemotePermission(sessionId, actionId); // the connector's next resend must be able to show it
     };
@@ -117,8 +124,6 @@ export class Permissions {
       });
       return;
     }
-    // A group binding's request goes to the binder's 1:1 chat: the group sees only that it waits, never what it asks for.
-    const personal = isGroupKey(chatKey) ? this.ctx.references.getReference(personOf(chatKey)) : null;
     try {
       // (a card that cannot be built, from a request no card can show, is forgotten as one that could not be sent)
       const card = this.ctx.views.permission({
@@ -135,7 +140,10 @@ export class Permissions {
       forget();
       throw error;
     }
-    if (personal) await to.send(textMessage(remoteAgentText.in(lang).approvalInPersonal({ who })));
+    if (personal)
+      await to.send(
+        textMessage(remoteAgentText.in(groupLang).approvalInPersonal({ who: whoIn(remoteText.in(groupLang)) })),
+      );
   }
 
   /** The card again with its buttons and `text` on it: the decision did not go through. */

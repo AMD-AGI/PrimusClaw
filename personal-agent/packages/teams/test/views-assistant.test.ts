@@ -161,6 +161,28 @@ test("a work card offers auto-reply on a task, or turning it off once on, and on
   assert.deepEqual(actions(waiting)[0]?.["data"], { primusclaw: "work", op: "stop", card: "c1" });
 });
 
+test("a delivered result's card says the version and the pull request it still watches, in the person's language, with no buttons", () => {
+  const item = wi({
+    boardState: "in_progress",
+    canAccept: false,
+    delivered: { version: 1, watching: ["a/b#1", "a/b#2"] },
+  });
+  const zh = cardOf(assistantRenderers.workDelivered({ item, text: "已开 PR。", lang: "zh" }));
+  valid(zh);
+  assert.ok(texts(body(zh)).includes("v1 已交付，继续盯 PR a/b#1、a/b#2"), texts(body(zh)).join(" | "));
+  assert.ok(texts(body(zh)).includes("要改直接回复我。"));
+  assert.deepEqual(actions(zh), []);
+  const en = cardOf(
+    assistantRenderers.workDelivered({
+      item: wi({ ...item, delivered: { version: 3, watching: [] } }),
+      text: "",
+      lang: "en",
+    }),
+  );
+  assert.ok(texts(body(en)).includes("v3 delivered"), texts(body(en)).join(" | "));
+  assert.ok(texts(body(en)).includes("Reply to me to have it changed."));
+});
+
 test("a work card lays every line out as a paragraph and clips what does not fit", () => {
   const card = work({ text: `${"x".repeat(700)}\n\ny` });
   const shown = texts(body(card))[2] ?? "";
