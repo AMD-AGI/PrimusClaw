@@ -72,10 +72,19 @@ async function prompt(id, params) {
   ] : [];
   if (said) writeTurn(params.sessionId, s, { message: { role: "user", content: said }, promptSource: "sdk", origin: { kind: "human" } }, said.startsWith("say ") ? said.slice(4) : "ok", ran);
   // The connector's own "go on" after a restart (manager.ts CONTINUE_PROMPT): like a real agent, it asks again.
-  const text = said.startsWith("[claw-connector]") ? "write continued.txt" : said;
+  let text = said.startsWith("[claw-connector]") ? "write continued.txt" : said;
   s.cancelled = false;
   log({ prompt: said, mode: s.mode });
   const done = (stopReason) => reply(id, { stopReason, usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } });
+  // `gate <file> <rest>`: the turn waits until <file> exists (unless cancelled first), then goes on as <rest> in whatever mode it is
+  // in by then (as an agent's later tool call in a turn whose mode was changed under it).
+  const g = /^gate (\S+) (.+)$/.exec(text);
+  if (g) {
+    for (let i = 0; i < 1200 && !s.cancelled && !fs.existsSync(g[1]); i++) await new Promise((r) => setTimeout(r, 25));
+    if (s.cancelled) return done("cancelled");
+    log({ gateOpened: g[1], mode: s.mode });
+    text = g[2];
+  }
   const m = /^write (\S+)(?: (.*))?$/.exec(text);
   if (m) {
     const file = path.join(s.cwd, m[1]);
@@ -143,6 +152,15 @@ async function prompt(id, params) {
     update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "waited" } });
     return done(s.cancelled ? "cancelled" : "end_turn");
   }
+  // `leave-mode <mode>`: the agent switches its own mode mid-turn (as Claude Code leaving plan), then works on until cancelled.
+  if ((n = /^leave-mode (\S+)$/.exec(text))) {
+    s.mode = n[1];
+    update(params.sessionId, { sessionUpdate: "current_mode_update", currentModeId: s.mode });
+    for (let i = 0; i < 200 && !s.cancelled; i++) await new Promise((r) => setTimeout(r, 25));
+    return done(s.cancelled ? "cancelled" : "end_turn");
+  }
+  // `crash`: the adapter process dies in the middle of the turn.
+  if (text === "crash") process.exit(3);
   if (text === "hang") {
     for (let i = 0; i < 600 && !s.cancelled; i++) await new Promise((r) => setTimeout(r, 25));
     return done(s.cancelled ? "cancelled" : "end_turn");
@@ -241,6 +259,11 @@ readline.createInterface({ input: process.stdin }).on("line", async (line) => {
     case "session/set_mode": {
       const s = sessions.get(params.sessionId);
       if (!s) return fail(id, -32602, "no such session");
+      // FAKE_PLAN_DELAY_MS: switching to plan takes that long (the connector readying a turn that may only answer, as the user acts).
+      if (params.modeId === "plan" && env.FAKE_PLAN_DELAY_MS) await new Promise((r) => setTimeout(r, Number(env.FAKE_PLAN_DELAY_MS)));
+      // FAKE_MODE_DELAYS ("mode:ms,..."): switching to those modes takes that long (a set_mode of the user's arriving meanwhile).
+      const slow = (env.FAKE_MODE_DELAYS || "").split(",").map((x) => x.split(":")).find(([m]) => m === params.modeId);
+      if (slow) await new Promise((r) => setTimeout(r, Number(slow[1])));
       if (env.FAKE_IGNORE_SET_MODE !== "1") s.mode = params.modeId;
       reply(id, {});
       if (env.FAKE_WARN_AFTER_LOCK === "1") setTimeout(() => process.stderr.write("Warning: canUseTool will not be invoked: late\n"), 300);

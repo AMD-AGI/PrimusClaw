@@ -193,6 +193,117 @@ export interface RemoteHeartbeat {
   cmdCursor: number | null;
   /** What the connector holds that Claw has not acknowledged yet (`outbox` on the wire); absent from an older connector. */
   outbox?: RemoteOutboxReport | null;
+  /**
+   * The git repository of each folder its sessions work in (`workspaces` on the wire, {@link parseWorkspacesReport}); absent (null)
+   * from a connector that does not report it, which is every connector before the agent capability `git_info`.
+   */
+  workspaces?: RemoteWorkspace[] | null;
+}
+
+/**
+ * How much of the folders' git facts one heartbeat carries. A folder named by anyone, a remote and a branch named by whoever made the
+ * repository: each is cut to a shape that cannot carry more than a name, and the whole report is bounded.
+ */
+export const REMOTE_WORKSPACE_LIMITS = {
+  /** Folders one heartbeat reports, at most. */
+  maxEntries: 32,
+  maxCwdChars: 1024,
+  /** A remote as {@link normalizeGitRemote} writes it: `host/owner/repo`. */
+  maxRemoteChars: 200,
+  maxBranchChars: 100,
+} as const;
+
+/** One folder's git facts: the remote its `origin` names and the branch checked out, each null when there is none or it is unreadable. */
+export interface RemoteWorkspace {
+  cwd: string;
+  git_remote: string | null;
+  git_branch: string | null;
+}
+
+/** A path segment of a remote that is a credential, not a name: a token's known prefixes, or a long opaque run. */
+const REMOTE_SECRET_SEGMENT_RE = /^(?:gh[opsur]_[A-Za-z0-9]{16,}|github_pat_\w{16,}|glpat-[\w-]{16,}|xox[abprs]-[\w-]{10,}|x-access-token|[A-Za-z0-9+=_-]{40,})$/i;
+const REMOTE_SEGMENT_RE = /^[A-Za-z0-9._~-]{1,100}$/;
+const REMOTE_HOST_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::\d{1,5})?$/;
+
+/**
+ * A git remote as `host/owner/repo` (lower-case host, no scheme, no `.git`), or null when it is not a remote that can be written that
+ * way. Whatever names a person or carries a secret goes: the user (`git@`, `user:token@`), a query and a fragment; and a remote with a
+ * path segment shaped like a credential (`ghp_...`, a long opaque run) is no remote at all, never one with the secret cut out. A local
+ * path (`/srv/repo.git`, `file://`) is null: it names a folder on that machine, not a repository anyone else knows.
+ */
+export function normalizeGitRemote(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const text = raw.trim();
+  if (!text || text.length > 2048 || /[\u0000-\u001f\u007f\s]/u.test(text)) return null;
+  let host: string;
+  let path: string;
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\/(.*)$/.exec(text);
+  if (scheme) {
+    if (!/^(?:https?|ssh|git|git\+ssh|ssh\+git)$/i.test(scheme[1]!)) return null;
+    const rest = scheme[2]!.replace(/[?#].*$/, "");
+    const slash = rest.indexOf("/");
+    const authority = slash < 0 ? rest : rest.slice(0, slash);
+    path = slash < 0 ? "" : rest.slice(slash + 1);
+    host = authority.slice(authority.lastIndexOf("@") + 1);
+  } else {
+    // scp-like: [user@]host:path (never a Windows drive, `C:\repo`, which has no host).
+    const m = /^(?:[^@/:]+@)?([^@/:]+):(?!\/\/)(.+)$/.exec(text);
+    if (!m || m[1]!.length < 2) return null;
+    host = m[1]!;
+    path = m[2]!.replace(/[?#].*$/, "");
+  }
+  host = host.toLowerCase();
+  if (!REMOTE_HOST_RE.test(host)) return null;
+  const segments = path.replace(/\/+$/, "").replace(/\.git$/i, "").split("/").filter(Boolean);
+  if (!segments.length || segments.length > 8) return null;
+  for (const seg of segments) {
+    if (!REMOTE_SEGMENT_RE.test(seg) || seg === "." || seg === ".." || REMOTE_SECRET_SEGMENT_RE.test(seg)) return null;
+  }
+  const out = `${host}/${segments.join("/")}`;
+  return out.length > REMOTE_WORKSPACE_LIMITS.maxRemoteChars ? null : out;
+}
+
+/**
+ * A remote as a connector reports it: already `host/owner/repo` ({@link normalizeGitRemote} on the machine), checked to be exactly
+ * that shape again; else null. A URL (a connector that sent one raw) is normalized here the same way.
+ */
+export function normalizedRemote(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  if (/^[^/:@]+(?::\d{1,5})?\/[^:@]+$/.test(raw)) {
+    const again = normalizeGitRemote(`https://${raw}`);
+    return again === raw ? raw : null;
+  }
+  return normalizeGitRemote(raw);
+}
+
+/** A branch name as git allows it (and no more), or null: no `..`, no leading `-` or `/`, no control or space, at most 100 characters. */
+export function normalizeGitBranch(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const b = raw.trim().replace(/^refs\/heads\//, "");
+  if (!b || b.length > REMOTE_WORKSPACE_LIMITS.maxBranchChars) return null;
+  if (!/^[A-Za-z0-9._/+@-]+$/.test(b) || b.includes("..") || b.startsWith("-") || b.startsWith("/") || b.endsWith("/") || b.endsWith(".lock")) return null;
+  return b;
+}
+
+/**
+ * The heartbeat's `workspaces`, or null when it is absent or not a list. Lenient, as the outbox report is: an entry that does not fit
+ * is left out, never a reason to refuse the heartbeat; a remote or a branch that does not normalize is null; at most
+ * {@link REMOTE_WORKSPACE_LIMITS.maxEntries} folders, each once. Normalized again here whatever the connector did: Claw never stores
+ * what it did not shape itself.
+ */
+export function parseWorkspacesReport(raw: unknown): RemoteWorkspace[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: RemoteWorkspace[] = [];
+  const seen = new Set<string>();
+  for (const e of raw) {
+    if (out.length >= REMOTE_WORKSPACE_LIMITS.maxEntries) break;
+    if (!isObject(e) || typeof e.cwd !== "string") continue;
+    const cwd = e.cwd;
+    if (!cwd || cwd.length > REMOTE_WORKSPACE_LIMITS.maxCwdChars || /[\u0000-\u001f\u007f]/u.test(cwd) || seen.has(cwd)) continue;
+    seen.add(cwd);
+    out.push({ cwd, git_remote: normalizedRemote(e.git_remote), git_branch: normalizeGitBranch(e.git_branch) });
+  }
+  return out;
 }
 
 /** Sessions an outbox report names at most, the longest waiting first. */
@@ -298,7 +409,7 @@ export function parseHeartbeat(body: unknown): Parsed<RemoteHeartbeat> {
     if (!isCount(body.cmd_cursor)) return fail("invalid_cmd_cursor");
     cmdCursor = body.cmd_cursor;
   }
-  return { ok: true, value: { version, agents, cmdCursor, outbox: parseOutboxReport(body.outbox) } };
+  return { ok: true, value: { version, agents, cmdCursor, outbox: parseOutboxReport(body.outbox), workspaces: parseWorkspacesReport(body.workspaces) } };
 }
 
 export interface RemoteEventIn {
@@ -614,9 +725,15 @@ export const REMOTE_COMMANDS: Record<RemoteCommandType, RemoteCommandSpec> = {
       const text = body.text;
       if (typeof text !== "string" || text.trim() === "") return fail("text_required");
       if (new TextEncoder().encode(text).length > REMOTE_AGENT_LIMITS.maxPromptBytes) return fail("prompt_too_large");
+      if (body.answer_only !== undefined && body.answer_only !== null && typeof body.answer_only !== "boolean") return fail("invalid_answer_only");
       const files = parsePromptFiles(body.files);
       if (!files.ok) return files;
-      return { ok: true, value: files.value.length ? { text, files: files.value } : { text } };
+      // `answer_only`: the turn only answers. A connector that knows it (the agent capability `answer_only`) refuses every permission
+      // the agent asks for in that turn on the machine, so nothing is changed or run there; one that does not ignores the field and asks as always.
+      return {
+        ok: true,
+        value: { text, ...(files.value.length ? { files: files.value } : {}), ...(body.answer_only === true ? { answer_only: true } : {}) },
+      };
     },
     // (a file's name, type and size and the hash of its bytes; never the bytes)
     audit: (p) => ({
@@ -632,6 +749,7 @@ export const REMOTE_COMMANDS: Record<RemoteCommandType, RemoteCommandSpec> = {
             })),
           }
         : {}),
+      ...(p.answer_only === true ? { answer_only: true } : {}),
     }),
   },
   cancel: {

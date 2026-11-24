@@ -70,7 +70,7 @@ export type ScheduleKind = "trigger_create" | "trigger_cancel" | "github_comment
  * Every write a card holds: those above, an instruction for an agent on the user's machine (`devenv-tools.ts`), and a personal skill the
  * assistant drafted on its own (`skill-writes.ts`).
  */
-export type ConfirmKind = ScheduleKind | "devenv_send" | "devenv_hide" | "skill_save";
+export type ConfirmKind = ScheduleKind | "devenv_send" | "devenv_hide" | "skill_save" | "seat_role" | "seat_set";
 /** The longest comment the router puts on a card: the card shows all of it, since the user approves exactly what is posted. */
 export const ROUTER_COMMENT_MAX = 4000;
 
@@ -451,6 +451,11 @@ export async function decideConfirmation(input: {
         const { decideSkillDraft } = await import("./skill-writes.js");
         await decideSkillDraft(q, input.userId, row.params as Record<string, unknown>, false);
       }
+      if (row.kind === "seat_role") {
+        // "Don't send it work": the seat is retired (`seats.ts`). A card that lapses unanswered retires nothing.
+        const { seatRoleDecided } = await import("./seats.js");
+        return outcome(await close("denied", await seatRoleDecided(q, input.userId, row.params as Record<string, unknown>, false)), true);
+      }
       return outcome(await close("denied", null), true);
     }
     if (row.kind === "github_comment") {
@@ -470,6 +475,13 @@ export async function decideConfirmation(input: {
       // every check of a save again, and a refusal fails the card with nothing saved.
       const { decideSkillDraft } = await import("./skill-writes.js");
       const done = await decideSkillDraft(q, input.userId, row.params as Record<string, unknown>, input.decision === "allow");
+      return outcome(await close(done.ok ? "done" : "failed", done), true);
+    }
+    if (row.kind === "seat_role" || row.kind === "seat_set") {
+      // What a seat is for, kept as the card showed it (`seats.ts`): Claw's guess the user said is right, or the user's own words.
+      const { seatRoleDecided, seatSetConfirmed } = await import("./seats.js");
+      const params = row.params as Record<string, unknown>;
+      const done = row.kind === "seat_role" ? await seatRoleDecided(q, input.userId, params, true) : await seatSetConfirmed(q, input.userId, params);
       return outcome(await close(done.ok ? "done" : "failed", done), true);
     }
     if (row.kind === "devenv_hide") {
@@ -639,6 +651,12 @@ export function describeCard(kind: string, params: Record<string, unknown> | nul
       return `send to ${JSON.stringify(oneLine(p.agent_id, 40))} on the machine ${JSON.stringify(oneLine(p.machine, 60))}: ${JSON.stringify(oneLine(p.text, 120))}`;
     case "skill_save":
       return `save the personal skill ${JSON.stringify(oneLine(p.name, 64))} the assistant drafted (no scheduled task): ${JSON.stringify(oneLine(p.description, 120))}`;
+    case "seat_role":
+      // (Never the guess itself: it is a model's reading of what machines and agents wrote, and this line goes into every router
+      // turn's state while the card waits. The user reads the guess on the card.)
+      return `confirm Claw's guess of what a seat on the machine ${JSON.stringify(oneLine(p.machine, 60))} handles (the guess is shown on the card only; Deny: do not send it work)`;
+    case "seat_set":
+      return `keep what the user said of a seat on the machine ${JSON.stringify(oneLine(p.machine, 60))}: ${[p.alias ? `name ${JSON.stringify(oneLine(p.alias, 16))}` : "", p.role ? `handles ${JSON.stringify(oneLine(p.role, 120))}` : ""].filter(Boolean).join(", ")}`;
     case "devenv_hide": {
       const n = (k: string) => (Array.isArray(p[k]) ? (p[k] as unknown[]).length : 0);
       return `on the machine ${JSON.stringify(oneLine(p.machine, 60))}: hide ${n("hide")} conversation(s) from the lists, show ${n("show")} again, disconnect ${n("close")} session(s)`;
@@ -660,6 +678,9 @@ export async function renderScheduleState(userId: string, lang: CommandLanguage 
     const note = w.kind === "devenv_send" ? "" : toldNote(told.get(String(w.ref)));
     // A skill draft's card is the question: never put to the user again in words, nor as a command to type (the typed approval still
     // works; the router does not offer it). A yes they say in words is skill_save with the draft's id.
+    if (w.kind === "seat_role") {
+      return `- ref #${String(w.ref)} | confirmation_id: ${String(w.confirmation_id)} | ${what} | the user answers it on its card (Right / Deny); if they tell you instead what that seat handles or what to call it, that is seat_set${note}`;
+    }
     if (w.kind === "skill_save") {
       return `- ref #${String(w.ref)} | confirmation_id: ${String(w.confirmation_id)} | ${what} | the user answers it on its card (Save / Discard); never ask them about it in words or give them a command to type${note}`;
     }

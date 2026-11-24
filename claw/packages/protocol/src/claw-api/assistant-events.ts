@@ -85,7 +85,7 @@ export interface AssistantConfirmWrite {
    * started for the person's own account holds for them (`claw_github_confirmations`, `assistant/review-items.ts`); the same decision
    * route answers it, and it is made exactly as `POST /v1/github-review/confirmations/{confirmation_id}/decision` makes it.
    */
-  kind: "trigger_create" | "trigger_cancel" | "github_comment" | "devenv_send" | "devenv_hide" | "skill_save" | "github_merge" | "github_review";
+  kind: "trigger_create" | "trigger_cancel" | "github_comment" | "devenv_send" | "devenv_hide" | "skill_save" | "seat_role" | "seat_set" | "github_merge" | "github_review";
   /** What the button that lets it through says, in the language of the text. */
   allow_label: string;
   expires_at: string;

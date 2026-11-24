@@ -162,7 +162,7 @@ export class SessionManager {
     switch (type) {
       case "prompt":
         if (typeof cmd.text !== "string" || cmd.text === "") { s.rejectCommand("prompt", cmdId, "text_required", cmdSeqOf(cmd)); return false; }
-        s.enqueuePrompt(this.withFiles(cmd.text, cmd), cmdId, handled, cmdSeqOf(cmd), mayRun);
+        s.enqueuePrompt(this.withFiles(cmd.text, cmd), cmdId, handled, cmdSeqOf(cmd), mayRun, cmd.answer_only === true);
         return true;
       case "cancel":
         await s.cancel();
