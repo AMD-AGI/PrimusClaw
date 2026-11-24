@@ -19,6 +19,16 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
 
 ### Fixed
 
+- `@primusclaw/personal-agent`: in a group chat with no language set (or set to follow the asker), a message that says no
+  language of its own ("help", the bare @mention, `/whoami`, "ok #3") is answered in English. It was answered in the
+  sender's own language, the one their 1:1 messages were written in or their Teams client's, so "help" from a member who
+  writes Chinese to the bot got Chinese help in a group of English speakers. Words of their own still pick the language
+  ("你能做什么" gets Chinese help), and a group set with `/lang zh|en` keeps its language; such a turn is asked for an English
+  answer too (`[Reply language: English]`), even when the sender's last question in the group was in another (a group no
+  longer remembers each member's last language), and its own texts say the same language as the line. An answered question card in a group follows the group, the reply's words or the
+  question, never the sender's own language. A 1:1 chat is unchanged: the approval card a group binding sends to the
+  binder's 1:1 chat, and what its click and settled card say, stay in that chat's language; only the group's notice that
+  it waits follows the group.
 - A message that forwards messages and whose words answer a question card waiting in the chat no longer loses what it
   forwards. The words answered the card, and the forwarded messages, which no other message carried, never reached Claw.
   They now go to Claw with the answer, before its words, as they go with a new message; the card still shows only the

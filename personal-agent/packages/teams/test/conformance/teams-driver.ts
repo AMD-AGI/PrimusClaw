@@ -124,7 +124,7 @@ class TeamsDriver implements ChatDriver {
     this.gate = `${baseUrl}/gate/v1/activity`;
   }
 
-  private base(chat: KitChat, from: KitPerson): Json {
+  private base(chat: KitChat, from: KitPerson, locale = "en-US"): Json {
     this.n += 1;
     return {
       id: `act-${String(this.n)}`,
@@ -137,7 +137,7 @@ class TeamsDriver implements ChatDriver {
         conversationType: chat.kind === "personal" ? "personal" : "groupChat",
         tenantId: "conformance-tenant",
       },
-      locale: "en-US",
+      locale,
     };
   }
 
@@ -152,7 +152,7 @@ class TeamsDriver implements ChatDriver {
     const mention = { type: "mention", mentioned: BOT, text: at };
     const mentioned = options.mentionsBot === true;
     return this.post({
-      ...this.base(chat, from),
+      ...this.base(chat, from, options.locale),
       type: "message",
       text: mentioned ? `${at} ${text}` : text,
       ...(mentioned ? { entities: [mention] } : {}),

@@ -214,6 +214,39 @@ test("in a group chat, the asker's reply that @mentions the bot answers their qu
   assert.ok(w.surface.outbox.some((r) => r.op === "update" && r.id === "card-g"));
 });
 
+test("in a group chat the answered card speaks the group's language, never the asker's own or their client's", async () => {
+  const ask = { ...QUESTION, question: "Which one?", options: [...QUESTION.options] };
+  for (const [setting, typed, question, want] of [
+    [undefined, "1", ask, "en"], // (her own Chinese and her Chinese client are not read: the question's English)
+    [undefined, "火锅", ask, "zh"], // (the reply's own words)
+    [undefined, "1", QUESTION, "zh"], // (the question's Chinese)
+    ["en", "火锅", QUESTION, "en"], // (the group's own language wins)
+  ] as const) {
+    const w = world();
+    link(w, ALICE.id, "ak");
+    w.store.prefs.setLang(ALICE.id, "zh");
+    if (setting !== undefined) w.store.groupLanguage.setGroupLanguage("g-1", setting);
+    w.store.sessions.setSession(ALICE.id, { sessionId: "sess-g", shared: true }, "g-1");
+    w.claw.busy.set("sess-g", true);
+    w.store.approvals.saveApproval({
+      userId: ALICE.id,
+      sessionId: "sess-g",
+      toolUseId: "tu-g",
+      tool: "ask_user_question",
+      expiresAt: w.store.now() + 600,
+      envelope: {},
+      questions: [question] as never,
+    });
+    w.store.approvals.approvalSent("sess-g", "tu-g", "card-g");
+    await w.router.handle(message(typed, { kind: "group", conversation: "g-1", locale: "zh-CN" }));
+    await w.router.settled();
+    const update = w.surface.outbox.find((r) => r.op === "update" && r.id === "card-g");
+    const card = update?.op === "update" ? update.message : undefined;
+    assert.ok(card?.body.type === "view" && card.body.view.name === "questionAnswered", typed);
+    assert.equal(card.body.view.model.replied, want, `${String(setting)} ${typed} ${question.question}`);
+  }
+});
+
 /** As the worker reads what a message forwards and quotes (`messageTextFor`), with no mask. */
 const FORWARD_TEXT = {
   quoteBlock: (m: InboundMessage, group: boolean) =>

@@ -12,6 +12,7 @@ import type { PublicErrors } from "../public-error/public-errors.js";
 import type { Clock } from "../ports/clock.js";
 import type { Logger } from "../ports/logger.js";
 import type { Random } from "../ports/random.js";
+import type { GroupLanguageRepository } from "../ports/store/group-language.js";
 import type { ConversationRefRepository, PrefsRepository } from "../ports/store/people.js";
 import type {
   RemotePermissionRepository,
@@ -83,6 +84,8 @@ export interface RemoteContext {
   readonly sessionNames: RemoteSessionNameRepository;
   readonly permissions: RemotePermissionRepository;
   readonly prefs: PrefsRepository;
+  /** The language each group chat's members set (none given: a group binding's texts are English). */
+  readonly groupLanguage?: GroupLanguageRepository;
   readonly references: ConversationRefRepository;
   /** The conversation a stored reference posts to. */
   conversationFor(reference: JsonObject): Conversation;
@@ -103,7 +106,7 @@ export interface RemoteContext {
   readonly logger: Logger;
   /** The hex digest of `text` (UTF-8): an idempotency key, a correlation id. */
   digestHex(algorithm: "sha1" | "sha256", text: string): string;
-  /** The language a person is answered in. */
+  /** The language a person is answered in (their 1:1 chat's; a group binding's is the group's, `ChatState.lang`). */
   langOf(person: string): Lang;
   /** PA_DIRECT_CHAT: whose 1:1 chat is the agent's window itself. */
   readonly directChat: DirectChat;
