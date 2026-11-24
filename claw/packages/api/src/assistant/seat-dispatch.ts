@@ -733,10 +733,11 @@ async function releaseTurnSend(q: Querier, itemId: string, task: string, key: st
 export async function errandWorkSend(
   claims: AssistantTokenClaims, userId: string, itemId: string, text: string, newSession: boolean,
 ): Promise<Record<string, unknown>> {
-  // Two calls with the same words in one turn, at once: the second waits for the first, then finds its claim (it went) or none (it
-  // went nowhere, and the second tries for itself), so neither is told "already sent" of words that were not.
+  // Two calls to one task at once wait for each other. The same words in one turn: the second finds the first's claim (it went) or
+  // none (it went nowhere, and the second tries for itself), so neither is told "already sent" of words that were not. Other words:
+  // the second finds the task the first opened again and follows it up, rather than opening it again over the first's instruction.
   return inTransaction(async (lk) => {
-    await lk("SELECT pg_advisory_xact_lock(hashtext($1))", [`claw-seat-turn-send:${itemId}:${claims.task_id}:${sendKey(text)}`]);
+    await lk("SELECT pg_advisory_xact_lock(hashtext($1))", [`claw-seat-work-send:${itemId}`]);
     return errandWorkSendOnce(claims, userId, itemId, text, newSession);
   });
 }

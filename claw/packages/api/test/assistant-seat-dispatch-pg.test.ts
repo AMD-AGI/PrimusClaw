@@ -859,6 +859,23 @@ describe("seat dispatch", { skip }, () => {
     assert.deepEqual(both.map((r) => r.status === "rejected" ? (r.reason as { code?: string }).code : (r.value as Recorded).dispatch), ["seat_queue_full", "seat_queue_full"]);
   });
 
+  test("D24 two different instructions at once to a finished task: it is opened once, and both reach the machine", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/docs", { alias: "文档台", role: "负责文档", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid, s, "整理文档");
+    const gen = Number(done.generation);
+    const turn = await userTurn(alice, "补一节安装，再补一节升级");
+    const both = await Promise.all(["补一节安装", "补一节升级"].map((text) => tools.workSend(turn, { item_id: String(done.item_id), text }) as Promise<Recorded>));
+    assert.deepEqual(both.map((r) => r.dispatch), ["sent", "sent"], JSON.stringify(both));
+    const open = await item(done.item_id);
+    assert.deepEqual([open.board_state, Number(open.generation), open.params.open_cmd_seqs.length], ["in_progress", gen + 1, 2]);
+    const sent = await prompted(cid);
+    assert.equal(sent.length, 2, "two commands reached the machine");
+    const texts = JSON.stringify(sent);
+    for (const text of ["补一节安装", "补一节升级"]) assert.ok(texts.includes(text), `${text} went: ${texts}`);
+  });
+
   test("D23 a follow-up whose command went but whose noting failed: noted then, and the same call again sends nothing more", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox");
