@@ -7,6 +7,7 @@
  * conversation open in a terminal, and the one-time tokens of the cards it showed. Keyed by the chat key (`chat-key.ts`). All of it
  * is lost when the process restarts, as it was in the Python worker; what must survive is in the store.
  */
+import { groupConversationOf } from "./chat-key.js";
 import type { Follower } from "./follow/follower.js";
 import type { Task } from "./tasks.js";
 import type { TurnDisplay } from "./turns/display.js";
@@ -98,6 +99,15 @@ export class ChatRegistry {
   /** The chat went on below its running turn's display: that turn's answer must come below what was said since (`movedOn`). */
   movedOn(chatKey: string): void {
     this.turns.get(chatKey)?.display?.movedOn?.();
+  }
+
+  /** The turns running now in a 1:1 chat (`userId`) or, with `scope`, in that group (every binding's there). */
+  turnsIn(userId: string, scope: string): RemoteTurn[] {
+    if (!scope) {
+      const turn = this.turns.get(userId);
+      return turn ? [turn] : [];
+    }
+    return [...this.turns].filter(([chatKey]) => groupConversationOf(chatKey) === scope).map(([, turn]) => turn);
   }
 
   /** How many messages wait behind the chat's running turn. */

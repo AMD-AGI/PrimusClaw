@@ -21,8 +21,8 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
 
 - `@primusclaw/personal-agent`: a remote agent's answer in a 1:1 chat that streams is never read from its middle. A stream's
   message stays where the stream opened, under the person's message it answers; when the person wrote again while the agent
-  worked (or the chat was told something meanwhile, such as that the message is queued, what the terminal asks or a
-  permission card), the answer's first part ended in that bubble, above all of it, and its "(cont. 2/2)" came at the
+  worked, sent a command (`/agent sessions`) or pressed a button whose outcome is said (or the chat was told something
+  meanwhile, such as that the message is queued, what the terminal asks or a permission card), the answer's first part ended in that bubble, above all of it, and its "(cont. 2/2)" came at the
   bottom, under the queued message's notice, so the first part looked lost. Once the chat goes on below the stream, nothing of the agent's goes into
   the bubble: a status-only bubble floats on until the turn ends, one that already shows words is closed at once, and either
   way it ends with "The answer follows below, as new messages."; the whole answer then comes below what was said since, every

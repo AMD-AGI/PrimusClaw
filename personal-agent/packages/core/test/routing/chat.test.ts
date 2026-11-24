@@ -8,7 +8,7 @@ import { type Conversation, type OutMessage, type Logger } from "@primusclaw/per
 
 import { FakeSurface } from "../../../../test-support/surface.js";
 import { openTestStore } from "../../../../test-support/store.js";
-import { Chat, helpLang, langOf, learnLang, settleClick } from "../../src/routing/chat.js";
+import { Chat, helpLang, langOf, learnLang, postingAfter, settleClick } from "../../src/routing/chat.js";
 import { ALICE, click, note, personal } from "./fixtures.js";
 
 const quiet: Logger = {
@@ -98,4 +98,27 @@ test("a settled click replaces the card and says the outcome; a failed edit stil
   assert.equal(await settleClick({ action: click("x"), conversation: mute, note }, quiet, "Lost line."), true);
   const dead = wrap(broken, { send: () => Promise.reject(new Error("send refused")) });
   await assert.rejects(settleClick({ action: click("x"), conversation: dead, note }, quiet, "Nothing."));
+});
+
+test("postingAfter: told before each new message or stream, never for an edit, and the rest is the conversation's", async () => {
+  const surface = new FakeSurface();
+  const conversation = surface.conversation(personal());
+  let told = 0;
+  const posting = postingAfter(conversation, () => {
+    told += 1;
+  });
+  await posting.update("m-1", note("edited"));
+  posting.markSettled("m-2");
+  assert.equal(told, 0);
+  assert.ok(posting.edited.has("m-1") && posting.edited.has("m-2"));
+  assert.equal(posting.ref, conversation.ref);
+  await posting.send(note("one"));
+  await posting.post(note("two"));
+  await posting.deliver(posting.outgoing(note("three")));
+  await posting.openStream("", "working");
+  assert.equal(told, 4);
+  assert.deepEqual(
+    surface.outbox.map((r) => r.op),
+    ["update", "send", "post", "send", "stream.open"],
+  );
 });
