@@ -78,23 +78,49 @@ export interface PendingPermission {
   /** Answer the adapter. `null` means cancelled. */
   settle(optionId: string | null): void;
   timer: NodeJS.Timeout;
+  /** Set once its timeout passed in a turn that parks: it keeps waiting until then (epoch ms). */
+  parkedUntil?: number;
 }
+
+/**
+ * How a request whose turn parks its permissions (`prompt.park_permissions`) outlives the timeout: it is not cancelled then;
+ * `onPark` says so once, and it keeps waiting, answerable as before, until `maxMs` after it was opened.
+ */
+export interface ParkPolicy {
+  maxMs: number;
+  onPark: (actionId: string, parkedUntil: number) => void;
+}
+
+/** Why a request ended unanswered when its time ran out: the timeout, or the end of its park. */
+export type ExpiredBy = "timeout" | "park_expired";
 
 export type DecideResult = { ok: true; optionId: string } | { ok: false; reason: "unknown_action" | "option_not_offered" };
 
 export class PermissionBook {
   private readonly pending = new Map<string, PendingPermission>();
 
-  constructor(private readonly ttlMs: number, private readonly onExpire: (actionId: string) => void) {}
+  constructor(private readonly ttlMs: number, private readonly onExpire: (actionId: string, by: ExpiredBy) => void) {}
 
   get ttl(): number { return this.ttlMs; }
 
-  open(options: OfferedOption[], payload: (actionId: string) => Record<string, unknown>, settle: (optionId: string | null) => void): PendingPermission {
+  open(
+    options: OfferedOption[], payload: (actionId: string) => Record<string, unknown>, settle: (optionId: string | null) => void,
+    park: ParkPolicy | null = null, now: () => number = Date.now,
+  ): PendingPermission {
     const actionId = randomUUID();
+    const openedAt = now();
+    const expire = (by: ExpiredBy) => {
+      if (this.pending.delete(actionId)) { clearTimeout(p.timer); settle(null); this.onExpire(actionId, by); }
+    };
     const p: PendingPermission = {
       actionId, options, payload: payload(actionId), settle,
       timer: setTimeout(() => {
-        if (this.pending.delete(actionId)) { clearTimeout(p.timer); settle(null); this.onExpire(actionId); }
+        // (a park no longer than the timeout is no park: it ends as before)
+        if (!park || park.maxMs <= this.ttlMs || !this.pending.has(actionId)) return expire("timeout");
+        p.parkedUntil = openedAt + park.maxMs;
+        p.timer = setTimeout(() => expire("park_expired"), Math.max(0, p.parkedUntil - now()));
+        p.timer.unref?.();
+        park.onPark(actionId, p.parkedUntil);
       }, this.ttlMs),
     };
     p.timer.unref?.();

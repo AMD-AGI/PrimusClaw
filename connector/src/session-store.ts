@@ -33,6 +33,8 @@ export interface TurnRecord {
   waiting?: boolean;
   /** ... and at least one of those was a permission request for a tool call (not a plan or a question). */
   waiting_permission?: boolean;
+  /** Its prompt parks the permission requests of its turn (`prompt.park_permissions`). */
+  park?: boolean;
 }
 
 export class SessionStore {

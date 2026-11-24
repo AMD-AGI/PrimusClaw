@@ -368,6 +368,41 @@ describe("permission book", () => {
     assert.deepEqual(expired, [p.actionId]);
     assert.equal(book.size, 0);
   });
+  test("a request that parks is not cancelled at the time-to-live: said parked once, answerable, then cancelled at the end of its park", async () => {
+    const answers: Array<string | null> = [];
+    const expired: Array<[string, string]> = [];
+    const parked: Array<[string, number]> = [];
+    const book = new PermissionBook(40, (id, by) => expired.push([id, by]));
+    const t0 = Date.now();
+    const p = book.open(options, (id) => ({ actionId: id }), (o) => answers.push(o), { maxMs: 300, onPark: (id, until) => parked.push([id, until]) });
+    await sleep(120);
+    assert.deepEqual(answers, []);
+    assert.equal(parked.length, 1);
+    assert.equal(parked[0]![0], p.actionId);
+    assert.ok(parked[0]![1] >= t0 + 300 && parked[0]![1] <= Date.now() + 300);
+    assert.equal(p.parkedUntil, parked[0]![1]);
+    await sleep(350);
+    assert.deepEqual(answers, [null]);
+    assert.deepEqual(expired, [[p.actionId, "park_expired"]]);
+    assert.equal(book.size, 0);
+    // Answered while parked: settled once, nothing expires later.
+    const late: Array<string | null> = [];
+    const q = book.open(options, (id) => ({ actionId: id }), (o) => late.push(o), { maxMs: 300, onPark: () => {} });
+    await sleep(80);
+    assert.deepEqual(book.decide(q.actionId, "allow-once"), { ok: true, optionId: "allow-once" });
+    await sleep(350);
+    assert.deepEqual(late, ["allow-once"]);
+    assert.equal(expired.length, 1);
+  });
+  test("a park no longer than the time-to-live is no park: the request ends at the time-to-live, by timeout", async () => {
+    const expired: Array<[string, string]> = [];
+    let parkedCalls = 0;
+    const book = new PermissionBook(40, (id, by) => expired.push([id, by]));
+    const p = book.open(options, (id) => ({ actionId: id }), () => {}, { maxMs: 40, onPark: () => { parkedCalls++; } });
+    await sleep(120);
+    assert.deepEqual(expired, [[p.actionId, "timeout"]]);
+    assert.equal(parkedCalls, 0);
+  });
   test("cancelAll answers every waiting request cancelled", () => {
     const answers: Array<string | null> = [];
     const book = new PermissionBook(60_000, () => {});

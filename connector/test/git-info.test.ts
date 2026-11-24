@@ -152,6 +152,7 @@ describe("G3 and A1-A3 end to end", () => {
     assert.ok(!JSON.stringify(hb).includes("supersecretpassword"), "the credential never leaves the machine");
     assert.equal(hb.agents[0].capabilities.git_info, true);
     assert.equal(hb.agents[0].capabilities.answer_only, true);
+    assert.equal(hb.agents[0].capabilities.permission_park, true);
     const parsed = parseHeartbeat(hb);
     assert.ok(parsed.ok);
     assert.deepEqual(parsed.value.workspaces?.find((w) => w.cwd === work), entry);
