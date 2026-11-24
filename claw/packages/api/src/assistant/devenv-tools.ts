@@ -112,7 +112,7 @@ export interface SessionReading {
  * A permission asked and not yet resolved means it waits for the user; events after the last `turn_end`, or a prompt its
  * connector has not yet collected, mean a turn is under way; anything else is idle.
  */
-export function readSession(events: ActivityEvent[], queued: number, now: number = Date.now()): SessionReading {
+export function readSession(events: ActivityEvent[], queued: number, now: number = Date.now(), openPrompts = 0): SessionReading {
   const pending = new Set<string>();
   let lastEnd = -1;
   let prevEnd = -1;
@@ -126,10 +126,10 @@ export function readSession(events: ActivityEvent[], queued: number, now: number
   const live = events.slice(lastEnd + 1).filter((e) => !e.replay);
   const activity = live.filter((e) => TURN_EVENTS.has(e.type));
   let working = queued > 0 || activity.length > 0;
-  // No prompt of Claw's is open (every `user_prompt` in the window has its own end, named by `cmd_seq`): what came is a turn the agent
-  // took by itself, which an older connector never ends. Once it has been quiet for AGENT_TURN_QUIET_MS (and asks nothing) it is over.
-  // Only when that end is in the window read: without it a prompt may be further back than the window.
-  if (working && queued === 0 && lastEnd >= 0 && pending.size === 0 && !promptOpen(events)) {
+  // No prompt of Claw's is open (every `user_prompt` has its own end, named by `cmd_seq`: in the window, and `openPrompts` beyond it):
+  // what came is a turn the agent took by itself, which an older connector never ends. Once it has been quiet for AGENT_TURN_QUIET_MS
+  // (and asks nothing) it is over. Only when that end is in the window read: without it a prompt may be further back than the window.
+  if (working && queued === 0 && openPrompts === 0 && lastEnd >= 0 && pending.size === 0 && !promptOpen(events)) {
     const last = Date.parse(activity[activity.length - 1]!.occurred_at);
     if (Number.isFinite(last) && now - last > AGENT_TURN_QUIET_MS) working = false;
   }
@@ -147,6 +147,11 @@ export function readSession(events: ActivityEvent[], queued: number, now: number
     state: pending.size > 0 ? "waiting_for_you" : working ? "working" : "idle",
     step: flat(step, STEP_MAX), answer: tail(answer, ANSWER_MAX), asked: flat(asked, ASKED_MAX), last_stop: lastStop,
   };
+}
+
+/** {@link readSession} of a row of `sessionActivity`: its events, its prompts not yet collected and its prompts not yet ended. */
+export function readActivity(row: { events?: unknown; queued?: unknown; open_prompts?: unknown }, now: number = Date.now()): SessionReading {
+  return readSession(Array.isArray(row.events) ? row.events as ActivityEvent[] : [], Number(row.queued) || 0, now, Number(row.open_prompts) || 0);
 }
 
 /**
@@ -690,7 +695,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
     // The sessions open through Claw on this machine, newest activity first.
     for (const s of open.filter((o) => o.connector_id === String(c.connector_id))) {
       const agent = agentOf(s.agent_id);
-      const reading = readSession(Array.isArray(s.events) ? s.events as ActivityEvent[] : [], Number(s.queued) || 0);
+      const reading = readActivity(s);
       const ref = String(s.session_id);
       const row: DevenvSession = {
         label: label(String(s.agent_id)), agent: String(s.agent_id), agent_name: shown(agent?.name, NAME_MAX), cwd: shown(s.cwd, CWD_MAX),
@@ -895,7 +900,7 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
     const label = (agentId: string) => { const n = (counter.get(agentId) ?? 0) + 1; counter.set(agentId, n); return `${nameOf(c)}/${agentId}/${n}`; };
     const agents: Row[] = Array.isArray(c.agents) ? c.agents : [];
     for (const s of open.filter((o) => o.connector_id === String(c.connector_id))) {
-      const reading = readSession(Array.isArray(s.events) ? s.events as ActivityEvent[] : [], Number(s.queued) || 0);
+      const reading = readActivity(s);
       named.push({
         c, agent: agents.find((a) => a.agent_id === s.agent_id), label: label(String(s.agent_id)), session_id: String(s.session_id),
         resume_ref: null, cwd: typeof s.cwd === "string" ? s.cwd : null,
@@ -1129,7 +1134,7 @@ export async function executeSend(
     if (s.read_only === true) return { ok: false, error: "session_read_only", message: "that session is open in a terminal on the machine and can only be watched: nothing was sent" };
     // Read again now: a session that started working since the plan (or the card) is not sent another instruction.
     const [now] = (await sessionActivity(userId, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser)).filter((r) => r.session_id === sessionId);
-    if (!opts.queueBehind && now && readSession(Array.isArray(now.events) ? now.events as ActivityEvent[] : [], Number(now.queued) || 0).state !== "idle") {
+    if (!opts.queueBehind && now && readActivity(now).state !== "idle") {
       return { ok: false, error: "busy", message: "that session is working on something now: nothing was sent" };
     }
   } else {

@@ -833,12 +833,16 @@ export async function listSessions(owner: string, connectorId: string | null, li
 /** How many of a session's newest events {@link sessionActivity} reads, and how much of each one's text. */
 export const ACTIVITY_EVENTS = 300;
 const ACTIVITY_TEXT = 400;
+/** How many of a session's newest prompts {@link sessionActivity} looks at for one that has not ended (`open_prompts`). */
+const ACTIVITY_PROMPTS = 10;
 
 /**
  * The owner's open sessions, newest activity first, each with its newest events cut down to what says what it is doing: the
  * type, when, the text of a message chunk or the title of a tool step (at most {@link ACTIVITY_TEXT} characters), a permission
  * request's id, a turn's stop reason, and whether the event is replayed history. `queued` counts prompts accepted for it that its connector has not
- * yet acknowledged. Nothing of anyone else's: every row is filtered on `owner`.
+ * yet acknowledged; `open_prompts` how many of its newest {@link ACTIVITY_PROMPTS} prompts (`user_prompt`) no `turn_end` or refusal
+ * after it names (by `cmd_seq`), wherever they are: a prompt queued behind a long turn can be further back than the events read.
+ * Nothing of anyone else's: every row is filtered on `owner`.
  */
 export async function sessionActivity(owner: string, limit: number, events = ACTIVITY_EVENTS): Promise<Row[]> {
   return (await direct(
@@ -846,6 +850,14 @@ export async function sessionActivity(owner: string, limit: number, events = ACT
             s.created_at, s.updated_at, ${READ_ONLY_SQL} AS read_only,
             (SELECT COUNT(*)::int FROM claw_remote_commands m
               WHERE m.connector_id = s.connector_id AND m.session_id = s.session_id AND m.type = 'prompt') AS queued,
+            (SELECT COUNT(*)::int FROM (
+               SELECT u.id, u.data->'cmd_seq' AS cmd_seq FROM claw_remote_events u
+                WHERE u.session_id = s.session_id AND u.seq > $5 AND u.seq <= $6 AND u.type = $7
+                ORDER BY u.seq LIMIT $8
+             ) p
+              WHERE jsonb_typeof(p.cmd_seq) = 'number' AND NOT EXISTS (
+                SELECT 1 FROM claw_remote_events t
+                 WHERE t.session_id = s.session_id AND t.id > p.id AND t.type = ANY($9::text[]) AND t.data->'cmd_seq' = p.cmd_seq)) AS open_prompts,
             COALESCE((
               SELECT json_agg(x ORDER BY x.id) FROM (
                 SELECT e.id, e.type, e.occurred_at,
@@ -859,7 +871,8 @@ export async function sessionActivity(owner: string, limit: number, events = ACT
        FROM claw_remote_sessions s
       WHERE s.owner_user_id = $1 AND s.status = 'active' AND ${NOT_TERMINAL_HOOK_SQL}
       ORDER BY s.updated_at DESC LIMIT $2`,
-    [owner, limit, events, ACTIVITY_TEXT],
+    [owner, limit, events, ACTIVITY_TEXT, REVOKED_CLOSE_SEQ, userPromptSeq(1), REMOTE_EVENT_USER_PROMPT, ACTIVITY_PROMPTS,
+      ["turn_end", "command_rejected"]],
   )).rows;
 }
 
