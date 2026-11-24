@@ -525,6 +525,13 @@ export async function stopWorkItem(input: {
   let refused: StopRefusal | null = null;
   const stopped = await inTransaction(async (query) => {
     await input.guard?.(query);
+    // A task handed to a seat is stopped under its seat's lock (`seat-dispatch.ts`), so it is never sent as it is being stopped: one being
+    // sent is stopped once it was (and its turn cancelled), one not sent yet is never sent.
+    const seat = (await query(
+      "SELECT params->>'seat_id' AS seat_id FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote' AND params->>'errand' = 'true'",
+      [input.itemId, input.userId],
+    )).rows[0] as { seat_id: string | null } | undefined;
+    if (seat?.seat_id) await query("SELECT pg_advisory_xact_lock(hashtext($1))", [`claw-seat-dispatch:${seat.seat_id}`]);
     const open = (await query(
       "SELECT kind, params, worker_session_id FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND board_state <> 'done' FOR UPDATE",
       [input.itemId, input.userId],
