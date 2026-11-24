@@ -193,7 +193,9 @@ test("the lines of an attached chat in either language", () => {
   assert.ok(!readOnlyRefused("en").includes("Take over"));
   assert.equal(switchedLine("⬛ Codex", "dev-pod", "en"), "—— Now: dev-pod · ⬛ Codex ——");
   assert.equal(backLine("zh"), "—— 已回到助理 ——");
-  assert.ok(terminalClosedLine("en").startsWith("The conversation was closed in the terminal"));
+  assert.ok(terminalClosedLine("en", "Clawy").startsWith("The conversation was closed in the terminal"));
+  assert.ok(terminalClosedLine("en", "Clawy").includes("your messages go to Clawy again"));
+  assert.ok(terminalClosedLine("zh", "Clawy").includes("你的消息回到 Clawy"));
   assert.ok(recoveredLine("cx", "box", "en", true, true).includes("comes back as a new card"));
   assert.ok(recoveredLine("cx", "box", "zh", true, false).includes("发「继续」"));
   assert.ok(recoveredLine("cx", "box", "en", false, false).includes("just keep writing"));

@@ -10,6 +10,7 @@
 import { agentReplies, backReply, enteredLine } from "../direct-chat/direct-chat.js";
 import { errorName } from "../errors.js";
 import { remoteAgentText } from "../locales/remote-agents.js";
+import { neutral } from "../text/neutral.js";
 import type { RemoteState } from "../ports/store/remote.js";
 import { type Conversation, type MessageId, type OutMessage, textMessage } from "../ports/surface.js";
 import { type ButtonFields } from "./actions.js";
@@ -350,7 +351,9 @@ export class StatusBoard {
     const state = this.state.attached(chatKey);
     if (state === null) return;
     if (this.state.direct(chatKey)) {
-      await this.sayEntered(chatKey, to, state, unattended, lead);
+      // (a session still starting: where messages go is said once it has, by the watch of its start)
+      if (phase === "starting") await this.sayStarting(chatKey, to, state);
+      else await this.sayEntered(chatKey, to, state, unattended, lead);
       return;
     }
     const card = this.statusOf(chatKey, state, phase, lead, unattended);
@@ -388,6 +391,20 @@ export class StatusBoard {
     });
     const [title, value] = backReply(lang, this.ctx.settings.botName);
     await to.send({ ...textMessage(line), suggestions: [{ title, value }] });
+  }
+
+  /**
+   * A chat that is the agent's window itself has just asked for a new session: one line says what starts where. Nothing says the
+   * chat's messages go there yet: that is said once the agent has started (`sayEntered`), and a session that cannot start says
+   * that the messages still go to the bot (2026-11-24: "now go to" said before a start that failed, then taken back).
+   */
+  async sayStarting(chatKey: string, to: Conversation, state: RemoteState): Promise<void> {
+    const words = remoteAgentText.in(this.state.lang(chatKey));
+    this.ctx.remoteState.setRemoteStatusCard(chatKey, "");
+    const folder = state.cwd ? `\`${neutral(state.cwd, 120)}\`` : "";
+    await to.send(
+      textMessage(words.starting({ label: neutral(state.agentLabel, 80), host: neutral(state.host, 80), folder })),
+    );
   }
 
   /**

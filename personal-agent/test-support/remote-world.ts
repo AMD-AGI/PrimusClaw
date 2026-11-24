@@ -115,6 +115,8 @@ export interface WorldOptions {
   readonly watchSeconds?: { readonly start: number; readonly mode: number };
   readonly windowDefault?: "card" | "chat";
   readonly direct?: boolean;
+  /** The bot's name in this deployment ("PrimusClaw Assistant" when not given). */
+  readonly botName?: string;
   /** The follower's timings (TEST_TIMINGS when not given). */
   readonly timings?: FollowTimings;
   /** A turn is shown by a stream (Teams' floating status, then the answer in its bubble), as in a 1:1 chat that streams. */
@@ -174,7 +176,7 @@ export class RemoteWorld {
       windowDefault: options.windowDefault ?? "chat",
       timings: options.timings ?? TEST_TIMINGS,
       watchTimings: TEST_TIMINGS,
-      botName: "PrimusClaw Assistant",
+      botName: options.botName ?? "PrimusClaw Assistant",
       streaming: options.streaming ?? false,
       ...(options.watchSeconds ? { watchSeconds: options.watchSeconds } : {}),
     };
@@ -214,7 +216,7 @@ export class RemoteWorld {
       logger: silentLogger,
       digestHex: (algorithm, text) => createHash(algorithm).update(text).digest("hex"),
       langOf: (person) => this.langs.get(person) ?? "en",
-      directChat: new DirectChat(options.direct ?? false),
+      directChat: new DirectChat(options.direct ?? false, [], options.botName),
     };
     this.remote = new RemoteAgents(ctx);
   }

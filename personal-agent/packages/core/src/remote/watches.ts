@@ -140,16 +140,15 @@ export class Watches {
   private async couldNotStart(w: StartWatch, state: RemoteState, reason: string): Promise<void> {
     this.ctx.guard.giveBack(w.chatKey, "remote_agent", w.ticket);
     const lang = this.state.lang(w.chatKey);
-    const said = await this.ended.said(
-      w.chatKey,
-      remoteLeads.couldNotStart,
-      w.key,
-      w.provider,
-      state.connectorId,
-      reason,
-    );
+    // (the folder it was asked to start in, so that a folder that is not there is seen to be the one typed)
+    const lead = state.cwd ? remoteLeads.couldNotStartIn(`\`${neutral(state.cwd, 120)}\``) : remoteLeads.couldNotStart;
+    const said = await this.ended.said(w.chatKey, lead, w.key, w.provider, state.connectorId, reason);
+    // A chat that is the agent's window was only told the session was starting: its messages never left the bot.
+    const direct = this.state.direct(w.chatKey);
     this.follow.detach(w.chatKey);
-    await w.to.send(textMessage(`${said} ${saidIn(lang, "backToPrimusclaw")}`));
+    const words = remoteAgentText.in(lang);
+    const bot = this.ctx.settings.botName;
+    await w.to.send(textMessage(`${said} ${direct ? words.stillToBot({ bot }) : words.backToBot({ bot })}`));
   }
 
   /** Open in a terminal: watched, read-only; its output is told as it comes. */
@@ -158,7 +157,8 @@ export class Watches {
     this.ctx.guard.giveBack(w.chatKey, "remote_agent", w.ticket);
     const state = this.state.attached(w.chatKey);
     if (state?.sessionId !== w.sessionId) return;
-    if (await this.board.settleStatus(w.chatKey, w.to, state, "watching")) return;
+    if (this.state.direct(w.chatKey)) await this.board.sayEntered(w.chatKey, w.to, state);
+    else if (await this.board.settleStatus(w.chatKey, w.to, state, "watching")) return;
     const lang = this.state.lang(w.chatKey);
     const head = remoteAgentText.in(lang).watchingHead({ label: state.agentLabel, host: state.host });
     await w.to.send(textMessage(`${head} ${readOnlyRefused(lang, this.state.offersTakeover(w.chatKey))}`));
@@ -176,6 +176,8 @@ export class Watches {
     const state = this.state.attached(w.chatKey);
     if (state?.sessionId !== w.sessionId) return;
     if (state.unattended === false) this.ctx.guard.giveBack(w.chatKey, "remote_agent", w.ticket); // (it asks: not what was counted)
+    // A chat that is the agent's window: now that the agent has started, where its messages go (and the switch's outcome).
+    if (this.state.direct(w.chatKey)) return this.board.sayEntered(w.chatKey, w.to, state, undefined, switched.trim());
     // Ready is what the status card says (in place): a new message only when there is no card, or for the switch's outcome.
     if (await this.board.settleStatus(w.chatKey, w.to, state, "idle", switched.trim())) {
       if (switched) await w.to.send(textMessage(switched.trim()));
@@ -188,6 +190,8 @@ export class Watches {
     const lang = this.state.lang(w.chatKey);
     const state = this.state.attached(w.chatKey);
     const lead = remoteAgentText.in(lang).notReportedLead;
+    if (state !== null && this.state.direct(w.chatKey))
+      return this.board.sayEntered(w.chatKey, w.to, state, undefined, lead);
     if (state === null || !(await this.board.settleStatus(w.chatKey, w.to, state, "idle", lead))) {
       await w.to.send(textMessage(saidIn(lang, "notReported")));
     }
