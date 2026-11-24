@@ -289,7 +289,9 @@ describe("seats", { skip }, () => {
     assert.equal(await untrusted(turn), false, "asking where does not mark the turn either");
     for (const [asked, cwd, is] of [["~/rel", "/home/u/rel", true], ["rel", "/home/u/rel", true], ["u/rel", "/home/u/rel", true],
       ["/home/u/rel/", "/home/u/rel", true], ["el", "/home/u/rel", false], ["~", "/home/u/rel", false], ["/rel", "/home/u/rel", false],
-      ["rel", "C:\\work\\rel", true], ["~/hl-ci", "/home/u/hl-ci2", false]] as const) {
+      ["rel", "C:\\work\\rel", true], ["~/hl-ci", "/home/u/hl-ci2", false],
+      // A POSIX path keeps its case; a Windows one does not.
+      ["~/Release", "/home/u/release", false], ["release", "C:\\Work\\Release", true]] as const) {
       assert.equal(seats.folderIs(asked, cwd), is, `${asked} ${cwd}`);
     }
     assert.ok(seats.machineIs("machine-01234567", "x", "0123456789abcdef"));

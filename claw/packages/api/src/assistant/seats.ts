@@ -419,7 +419,11 @@ export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_A
  * listed, so the roster stays free of words a machine wrote.
  */
 export interface RosterWhere { machine?: string; agent?: string; folder?: string }
-const slashed = (v: string): string => v.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+/** A path with forward slashes and no trailing one; lower case only on Windows, whose paths ignore case (a POSIX path keeps it). */
+const slashed = (v: string, windows: boolean): string => {
+  const p = v.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  return windows ? p.toLowerCase() : p;
+};
 export function machineIs(asked: string, name: string, connectorId: string): boolean {
   const a = asked.trim().toLowerCase();
   return !!a && (a === name.trim().toLowerCase() || a === `machine-${connectorId.slice(0, 8)}`);
@@ -430,8 +434,9 @@ export function agentIs(asked: string, agentId: string, kind: string): boolean {
   return !!a && (a === agentId.trim().toLowerCase() || a === kind.trim().toLowerCase());
 }
 export function folderIs(asked: string, cwd: string): boolean {
-  const c = slashed(cwd);
-  let a = slashed(asked);
+  const windows = /^[A-Za-z]:[\\/]/.test(cwd.trim()) || cwd.includes("\\");
+  const c = slashed(cwd, windows);
+  let a = slashed(asked, windows);
   if (!a || !c) return false;
   if (a === c) return true;
   a = a.replace(/^~\//, "").replace(/^\.\//, "");
