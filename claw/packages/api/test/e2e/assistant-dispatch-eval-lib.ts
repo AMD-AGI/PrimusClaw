@@ -376,7 +376,8 @@ const seatTargetOf = (c: Call): string | null => {
   const t = targetsOf(c.input.target)[0];
   return t && "seat" in t ? t.seat : null;
 };
-const QUESTION = /[?？]|吗|哪(个|一)|which|what do you mean|could you|can you (clarify|tell)/i;
+/** A question put to the user: a question mark, or a Chinese sentence ending in 吗 / 呢. */
+const QUESTION = /[?？]|(吗|呢)\s*[。.!！]?\s*$/m;
 
 function matches(d: Decision, calls: readonly Call[], said: string): boolean {
   const done = calls.filter((c) => isEffect(c) && !c.refused);
