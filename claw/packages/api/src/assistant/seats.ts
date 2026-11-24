@@ -186,15 +186,23 @@ export async function syncSeats(owner: string, q: Querier = (t, p) => db.query(t
   }
   const workspaces = await workspacesOf(owner, q);
   await inTransaction(async (tx) => {
-    // A machine set up again under its old name: its seats follow it, when that name now has exactly one registration.
+    // A machine set up again under its old name: its seats follow it, when that name now has exactly one registration. At most one
+    // seat moves to each place of the new registration (two old registrations of that name, both live once, may each hold a seat for
+    // the same agent and folder): the confirmed one, else the one of the newest registration; the others stay where they were.
     await tx(
-      `UPDATE claw_devenv_seats s SET connector_id = n.connector_id, current_session_id = NULL, updated_at = NOW()
-         FROM claw_remote_connectors o, claw_remote_connectors n
-        WHERE s.owner_user_id = $1 AND o.connector_id = s.connector_id AND o.revoked_at IS NOT NULL
-          AND n.owner_user_id = $1 AND n.name = o.name AND n.revoked_at IS NULL AND n.created_at > o.created_at
-          AND (SELECT COUNT(*) FROM claw_remote_connectors x WHERE x.owner_user_id = $1 AND x.name = o.name AND x.revoked_at IS NULL) = 1
-          AND NOT EXISTS (SELECT 1 FROM claw_devenv_seats d WHERE d.owner_user_id = $1 AND d.connector_id = n.connector_id
-                            AND d.agent_id = s.agent_id AND d.cwd = s.cwd AND COALESCE(d.conversation_ref, '') = COALESCE(s.conversation_ref, ''))`,
+      `WITH pick AS (
+         SELECT DISTINCT ON (n.connector_id, s.agent_id, s.cwd, COALESCE(s.conversation_ref, '')) s.seat_id, n.connector_id AS to_id
+           FROM claw_devenv_seats s
+           JOIN claw_remote_connectors o ON o.connector_id = s.connector_id AND o.revoked_at IS NOT NULL
+           JOIN claw_remote_connectors n ON n.owner_user_id = $1 AND n.name = o.name AND n.revoked_at IS NULL AND n.created_at > o.created_at
+          WHERE s.owner_user_id = $1
+            AND (SELECT COUNT(*) FROM claw_remote_connectors x WHERE x.owner_user_id = $1 AND x.name = o.name AND x.revoked_at IS NULL) = 1
+            AND NOT EXISTS (SELECT 1 FROM claw_devenv_seats d WHERE d.owner_user_id = $1 AND d.connector_id = n.connector_id
+                              AND d.agent_id = s.agent_id AND d.cwd = s.cwd AND COALESCE(d.conversation_ref, '') = COALESCE(s.conversation_ref, ''))
+          ORDER BY n.connector_id, s.agent_id, s.cwd, COALESCE(s.conversation_ref, ''),
+                   (s.role_state = 'confirmed') DESC NULLS LAST, o.created_at DESC, s.updated_at DESC, s.seat_id)
+       UPDATE claw_devenv_seats s SET connector_id = pick.to_id, current_session_id = NULL, updated_at = NOW()
+         FROM pick WHERE s.seat_id = pick.seat_id`,
       [owner],
     );
     for (const p of places.values()) {
@@ -755,12 +763,19 @@ const ASKS_PER_SWEEP = 2;
 const GUESSES_PER_SWEEP = 2;
 
 /** The users the sweep looks at: every user with a machine (seats on for all), else the users named. */
-async function sweepUsers(): Promise<string[]> {
+/** Users a pass takes at most; the next pass goes on after the last one taken, from the first again once all had a turn. */
+export const SWEEP_USERS_MAX = 500;
+let sweepCursor = "";
+
+export async function sweepUsers(max: number = SWEEP_USERS_MAX): Promise<string[]> {
   if (!seatsSettings.all) return [...seatsSettings.users];
-  return (await db.query(
+  const users = (await db.query(
     `SELECT DISTINCT c.owner_user_id FROM claw_remote_connectors c JOIN claw_assistants a ON a.user_id = c.owner_user_id
-      WHERE c.revoked_at IS NULL LIMIT 500`,
+      WHERE c.revoked_at IS NULL AND c.owner_user_id > $1 ORDER BY c.owner_user_id LIMIT $2`,
+    [sweepCursor, max],
   )).rows.map((r: Row) => String(r.owner_user_id));
+  sweepCursor = users.length < max ? "" : users[users.length - 1]!;
+  return users;
 }
 
 /**

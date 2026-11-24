@@ -8,6 +8,9 @@
  *      conversation; tags from the folder's git remote and branch (as the heartbeat reported them, credential gone); a closed session
  *      leaves its seat with none; a heartbeat without `workspaces` (an older connector) changes none of it; a machine set up again under
  *      its name keeps its seats and their confirmed roles
+ *   S1b two old registrations of one name holding a seat on the same folder: one of them (the confirmed one) moves to the new
+ *      registration, the other stays, and syncing again works
+ *   S1c with seats on for everyone, a pass takes the users after the last pass's, from the first again once all had a turn
  *   S2 seat_roster holds only what Claw computed or the user confirmed (no folder, machine, title, guess, nor tags: a branch or a
  *      repository named as an instruction is not in it), and reading it does not mark the turn: seat_set still works after it, where
  *      after devenv_list it is refused
@@ -206,6 +209,52 @@ describe("seats", { skip }, () => {
     assert.equal(moved.connector_id, String(again.connector_id));
     assert.deepEqual([moved.alias, moved.role, moved.role_state], ["发布台", "负责 PrimusClaw 发布", "confirmed"]);
     assert.equal(rows.length, 2, "moved, not made again");
+  });
+
+  test("S1b two old registrations of one name holding the same folder: one seat moves to the new one, and every sync after works", async () => {
+    // Two registrations named "box" live at once (a reinstall while the old one was still online), each with a seat on the same folder.
+    const a = await machine("alice", "box");
+    const b = await machine("alice", "box");
+    assert.notEqual(a, b);
+    await chatSession("alice", a, "/home/u/rel");
+    await chatSession("alice", b, "/home/u/rel");
+    await seats.syncSeats("alice");
+    assert.equal((await seatRows()).length, 2);
+    await w.q("UPDATE claw_devenv_seats SET alias = '发布台', role = '负责发布', role_state = 'confirmed' WHERE connector_id = $1", [a]);
+    // Both go offline; a third registration of that name revokes both.
+    await w.q(`UPDATE claw_remote_connectors SET heartbeat_at = NOW() - interval '1 hour', stream_seen_at = NULL,
+                 created_at = NOW() - CASE WHEN connector_id = $1 THEN interval '2 days' ELSE interval '1 day' END
+                WHERE connector_id IN ($1, $2)`, [a, b]);
+    const c = await store.registerConnector("alice", "box", "0.3.1", null, 10, null, 90_000);
+    assert.ok(c);
+    const cid = String(c.connector_id);
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_remote_connectors WHERE revoked_at IS NOT NULL"))[0].n, 2);
+    await beat("alice", cid);
+    await seats.syncSeats("alice");
+    await seats.syncSeats("alice");
+    const rows = await seatRows();
+    const moved = rows.filter((r) => r.connector_id === cid);
+    assert.equal(moved.length, 1, "one seat per place");
+    assert.deepEqual([moved[0]!.alias, moved[0]!.role, moved[0]!.role_state], ["发布台", "负责发布", "confirmed"], "the confirmed one moved");
+    assert.deepEqual(rows.filter((r) => r.connector_id !== cid).map((r) => r.connector_id), [b], "the other stays where it was");
+    const listed = await http("GET", "alice", "/v1/remote-agents/seats");
+    assert.equal(listed.status, 200, JSON.stringify(listed.body));
+  });
+
+  test("S1c with seats on for everyone, each pass takes the next users after the last pass's, so every user gets a turn", async () => {
+    for (const u of ["u1", "u2", "u3"]) {
+      await w.user(u);
+      await machine(u, "box");
+    }
+    const was = seats.seatsSettings.all;
+    seats.seatsSettings.all = true;
+    try {
+      const passes: string[][] = [];
+      for (let i = 0; i < 3; i += 1) passes.push(await seats.sweepUsers(2));
+      assert.deepEqual(passes, [["u1", "u2"], ["u3"], ["u1", "u2"]]);
+    } finally {
+      seats.seatsSettings.all = was;
+    }
   });
 
   test("S2 seat_roster holds only trusted fields and does not mark the turn; devenv_list does", async () => {

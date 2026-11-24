@@ -409,3 +409,43 @@ it("a posted comment's address is a link only when the whole value is exactly on
     );
   }
 });
+
+it("a seat card is drawn with its buttons, and what came of a press on it is said plainly", () => {
+  for (const kind of ["seat_role", "seat_set"] as const) {
+    const held = {
+      type: "assistant.say",
+      text: "x",
+      confirm_write: { confirmation_id: `cf-${kind}`, ref: "cf0002", kind, allow_label: "对" },
+    };
+    assert.deepEqual(confirmWriteOf(held), { confirmationId: `cf-${kind}`, kind, allowLabel: "对" });
+  }
+  const kept = {
+    status: "done",
+    answered_now: true,
+    result: { ok: true, seat_id: "s1", alias: "发布台", role: "负责 Hyperloom 发布", role_state: "confirmed" },
+  };
+  assert.equal(confirmOutcome("seat_role", kept, "zh"), "记下了：发布台，负责 Hyperloom 发布。");
+  assert.equal(
+    confirmOutcome("seat_set", { ...kept, result: { ok: true, alias: null, role: "CI fixes" } }, "en"),
+    "Kept: CI fixes.",
+  );
+  assert.equal(confirmOutcome("seat_role", { status: "done" }, "en"), "That card was already answered.");
+  assert.equal(
+    confirmOutcome("seat_role", { status: "denied", result: { ok: true, role_state: "retired" } }, "zh"),
+    "好的，这个工位标记为不再使用。",
+  );
+  assert.equal(confirmOutcome("seat_set", { status: "denied" }, "zh"), "好的，什么都没改。");
+  assert.equal(confirmOutcome("seat_set", { status: "expired" }, "en"), "That card has expired; nothing changed.");
+  assert.equal(
+    confirmOutcome("seat_role", { status: "failed", result: { ok: false, error: "stale" } }, "en"),
+    "That guess was replaced (or the seat retired) since the card was made; nothing was kept.",
+  );
+  assert.equal(
+    confirmOutcome("seat_set", { status: "failed", result: { ok: false, error: "no_seat" } }, "zh"),
+    "这个工位已经不在了，什么都没记下。",
+  );
+  assert.equal(
+    confirmOutcome("seat_set", { status: "failed", result: { ok: false, error: "odd" } }, "en"),
+    "It could not be kept (odd).",
+  );
+});

@@ -27,6 +27,8 @@ export const CONFIRM_KINDS = [
   "github_comment",
   "devenv_hide",
   "skill_save",
+  "seat_role",
+  "seat_set",
   "github_merge",
   "github_review",
 ] as const;
