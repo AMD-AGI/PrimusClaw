@@ -700,7 +700,11 @@ its `subPath` when it applies to the `Sandbox` scope and does not set
 directories under it other than `users`. Otherwise the run is refused with
 `403 sandbox_template_mount_not_granted` and the field of each mount that is not
 granted. A plugin therefore never reaches a host path its workspace does not
-already give its sandboxes. `host_mounts` cannot be changed by run-time
+already give its sandboxes. The check is lexical; a symlink under the
+workspace root is resolved where the path is mounted, which stays inside the
+root: SaFE mounts the declared root and reaches the path through `subPath`
+(the kubelet refuses a `subPath` that escapes it), and on an external node the
+provider opens the path without following symlinks. `host_mounts` cannot be changed by run-time
 `overrides`.
 
 The grant hands each mount to Agent Sandbox as a `hostPath` volume

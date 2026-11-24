@@ -36,6 +36,15 @@
  *    its `subPath`; one with `enableUserDir` declares only the directories
  *    under it other than `users` (the per-user directories).
  *
+ * The check is lexical. A symlink under the workspace root (which anything
+ * writing the workspace can create) is not resolved here; it is resolved
+ * where the path is mounted, and the sandbox platform does that without
+ * leaving the root: on its own nodes it mounts the declared root and reaches
+ * the path through `subPath`, which the kubelet resolves inside the root and
+ * refuses when it escapes; on an external node the provider opens the path
+ * without following symlinks (and the platform refuses a path below a root
+ * where the provider cannot).
+ *
  * A template's own Agent Sandbox `volumes` may not be hostPath ones, and
  * Agent Sandbox's keys must be spelt exactly (its JSON decoder matches them
  * case-insensitively): `host_mounts` is the only way a plugin template reaches
