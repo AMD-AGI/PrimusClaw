@@ -378,12 +378,16 @@ describe("seats", { skip }, () => {
     // Just used: not asked.
     await sweep();
     assert.equal((await prompts(cid)).length, 0, "something happened there within ten minutes");
-    // Working (a turn under way, long ago): not asked.
+    // Working (a prompt's turn under way, long ago): not asked. (The prompt is on record as Claw records every prompt it sends: a turn
+    // with none since the last end is one the agent took by itself, which counts as under way only while it is fresh.)
+    await w.q(`INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data) VALUES ($1, $2, 'user_prompt', NOW(), '{"text": "make", "cmd_seq": 1}'::jsonb)`,
+      [sid, store.userPromptSeq(1)]);
     await events("alice", cid, sid, [["tool_call", { update: { sessionUpdate: "tool_call", title: "make" } }]]);
     await age(sid, 30);
     await sweep();
     assert.equal((await prompts(cid)).length, 0, "working");
     await events("alice", cid, sid, [["turn_end", { stopReason: "end_turn" }]]);
+    await w.q("DELETE FROM claw_remote_events WHERE session_id = $1 AND seq = $2", [sid, store.userPromptSeq(1)]);
     await age(sid, 30);
     // A conversation of that folder open in a terminal, working: not asked.
     await beat("alice", cid, { agents: [{ ...CLAUDE, capabilities: { ...CLAUDE.capabilities, resumable: [
