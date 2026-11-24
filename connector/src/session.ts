@@ -1299,7 +1299,7 @@ export class Session {
 
   /**
    * The turn the agent took by itself is over: said with a `turn_end` naming no prompt, unless (`data` null) the caller says its end
-   * itself (a cancel), or the connector is going away.
+   * itself (a cancel), a prompt takes it over while a question of it waits, or the connector is going away.
    */
   private endAgentTurn(by: string, data: Record<string, unknown> | null): void {
     const t = this.agentTurn;
@@ -1525,9 +1525,6 @@ export class Session {
   private async pump(): Promise<void> {
     if (this.turnRunning) return;
     this.turnRunning = true;
-    // A turn the agent took by itself ends where the prompt's starts: what comes from here on is the prompt's (an agent that is
-    // still at it takes the prompt into that turn, and answers both in the prompt's).
-    this.endAgentTurn("prompt", { stopReason: "end_turn" });
     try {
       while (this.queue.length && !this.closed) {
         const next = this.queue.shift()!;
@@ -1538,6 +1535,11 @@ export class Session {
         if (verdict === "keep") { this.queue.unshift(next); break; }
         if (verdict === "drop") { next.started(); continue; }
         if (this.closed) { this.rejectCommand("prompt", next.cmdId, "session_closed", next.cmdSeq); next.started(); break; }
+        // A turn the agent took by itself ends where a prompt's starts, and only then (a prompt kept back or dropped above leaves it
+        // open): what comes from here on is the prompt's (an agent that is still at it takes the prompt into that turn, and answers
+        // both in the prompt's). While a question of that turn waits, its end is not said: the question is the prompt's turn's now,
+        // and stays one the person is waited on for until that turn ends.
+        this.endAgentTurn("prompt", this.book.size > 0 ? null : { stopReason: "end_turn" });
         await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq, next.answerOnly === true, next.park === true);
       }
     } finally {

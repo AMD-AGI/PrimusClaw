@@ -30,6 +30,8 @@
  *   D22 a turn the seat's agent takes by itself after a task ended (a command it put in the background finished): the seat is busy
  *       while it runs; its end (`agent_initiated`) frees the seat, the queue goes on, and its answer is said once as a late word of
  *       that task (never of the next one); from an older connector, which never ends it, the seat is free once it has been quiet
+ *   D23 an instruction queued behind a turn under way, or sent while the agent is on a turn of its own, is the seat's work until its own
+ *       end names it, however quiet it is: its prompt is on record before the end of the turn it waited behind
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -863,6 +865,45 @@ describe("seat dispatch", { skip }, () => {
     const sent = await item(second.item_id);
     assert.equal(sent.params.queued, undefined, JSON.stringify(sent.params));
     assert.equal((await item(long.item_id)).board_state, "done");
+  });
+
+  test("D23 a prompt is the seat's work until its own end, though recorded before the end of the turn it waited behind", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const { AGENT_TURN_QUIET_MS } = await import("../src/assistant/devenv-tools.js");
+    const age = () => w.q("UPDATE claw_remote_events SET occurred_at = NOW() - make_interval(secs => $2::float8) WHERE session_id = $1",
+      [s.sid, AGENT_TURN_QUIET_MS / 1000 + 60]);
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    const seqA = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [chunk("开始发布")]);
+    // One more instruction while that turn runs: queued behind it, so its prompt is on record before that turn's end.
+    const more = await tools.workSend(await userTurn(alice, "顺便更新 changelog"), { item_id: String(out.item_id), text: "顺便更新 changelog" }) as Recorded;
+    assert.equal(more.dispatch, "sent", JSON.stringify(more));
+    const seqB = Number((await prompted(cid)).at(-1)!.cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: "x", cmd_seq: seqA }],
+      ["tool_call", { update: { sessionUpdate: "tool_call", toolCallId: "b1", title: "make release" } }]]);
+    await age();
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "working", "its build, quiet for long: still the instruction's turn");
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: "y", cmd_seq: seqB }], chunk("后台任务完成")]);
+    // A prompt that comes while the agent is on a turn of its own (sent to the session from a chat): the connector ends that turn
+    // (naming no prompt) after it was recorded, then runs it.
+    const devenv = await import("../src/assistant/devenv-tools.js");
+    const again = await devenv.executeSend("alice", {
+      connector_id: cid, machine: "devbox", agent_id: "claude", agent_name: null, session_id: s.sid, resume_ref: null, cwd: "/home/u/rel", label: "x",
+    }, "再打个 tag", "chat-tag", "zh", undefined, { queueBehind: true });
+    assert.equal(again.ok, true, JSON.stringify(again));
+    const seqC = Number((await prompted(cid)).at(-1)!.cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true, ended_by: "prompt" }],
+      ["tool_call", { update: { sessionUpdate: "tool_call", toolCallId: "c1", title: "git push --tags" } }]]);
+    await age();
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "working", "the instruction's turn, not the agent's own");
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: "z", cmd_seq: seqC }], chunk("又补一句")]);
+    await age();
+    assert.notEqual((await seats.rosterOf("alice"))[0]!.state, "working", "every instruction ended: the agent's own turn, quiet, is over");
   });
 
   test("D12 the prompt asks for parking only from a connector that can park", async () => {

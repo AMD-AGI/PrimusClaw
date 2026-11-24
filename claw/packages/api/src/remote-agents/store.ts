@@ -851,7 +851,8 @@ export async function sessionActivity(owner: string, limit: number, events = ACT
                 SELECT e.id, e.type, e.occurred_at,
                        LEFT(COALESCE(e.data->'update'->'content'->>'text', e.data->'update'->>'title', ''), $4) AS text,
                        e.data->>'actionId' AS action_id, e.data->>'stopReason' AS stop,
-                       COALESCE(e.data->>'replay', '') = 'true' AS replay
+                       COALESCE(e.data->>'replay', '') = 'true' AS replay,
+                       CASE WHEN jsonb_typeof(e.data->'cmd_seq') = 'number' THEN (e.data->>'cmd_seq')::float8 END AS cmd_seq
                   FROM claw_remote_events e WHERE e.session_id = s.session_id ORDER BY e.id DESC LIMIT $3
               ) x
             ), '[]'::json) AS events

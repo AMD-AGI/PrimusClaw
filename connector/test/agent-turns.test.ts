@@ -10,6 +10,8 @@
  *   T2 an agent that says nothing at the end: the turn ends once it has been quiet for `agentTurnQuietMs`
  *   T3 a prompt that starts while it is open ends it first, so what follows is the prompt's
  *   T4 a cancel stops it (the agent is told) and says one end, naming no prompt, as a cancel with nothing running does
+ *   T5 a prompt that starts while a question of it waits takes it over without saying its end: the question stays one the person is
+ *      waited on for, until the prompt's turn ends
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -92,5 +94,22 @@ describe("a turn the agent takes by itself", () => {
     await wait(200);
     assert.equal(h.turnEnds(sid).length, 2);
     assert.ok(h.audit().some((a) => a.kind === "cancelled" && a.agent_turn === true));
+  });
+
+  test("T5 a prompt that starts while a question of it waits takes it over without saying its end", async () => {
+    const h = await Harness.create({ env: { FAKE_AUTONOMOUS: "ask" }, timing: { agentTurnQuietMs: 600_000 } });
+    const sid = await h.newSession();
+    const done = path.join(h.work, "bg-done");
+    h.prompt(sid, `background ${done}`);
+    await h.turnEnd(sid, 1);
+    fs.writeFileSync(done, "");
+    await h.claw.until("its question", () => h.claw.eventsOf(sid).some((e) => e.type === "permissionRequest"));
+    const seq = h.prompt(sid, "say two");
+    const prompt = await h.turnEnd(sid, 2);
+    assert.equal(prompt.data.cmd_seq, seq, "the next end is the prompt's");
+    const events = h.claw.eventsOf(sid);
+    assert.ok(!events.some((e) => e.type === "turn_end" && e.data.agent_initiated === true), "no end said for the turn it took over");
+    assert.ok(events.findIndex((e) => e.type === "permissionRequest") < events.indexOf(prompt));
+    assert.ok(h.audit().some((a) => a.kind === "agent_turn_ended" && a.by === "prompt"));
   });
 });

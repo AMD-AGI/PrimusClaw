@@ -379,7 +379,10 @@ release version, and its `appVersion` stays `latest`.
   or when the agent exits; a cancel stops it. Claw then frees the seat, sends what waits in its queue, and says that
   turn's answer once in the chat as a late word of the task whose turn ended before it. From an older connector,
   which never ends such a turn, Claw counts a session as working for at most five minutes after its last event when
-  no prompt was sent to it since its last `turn_end`.
+  every prompt it sent there has its own `turn_end` (matched by `cmd_seq`, not by order: a prompt queued behind a
+  running turn, or sent while the agent is on a turn of its own, is recorded before that turn's end and stays working
+  until its own end). A prompt that starts while a permission request of such a turn waits takes the turn over without
+  ending it, so the request stays one the user is waited on for.
 - Claw: a plugin write (`POST /v1/plugins`, `POST /v1/plugins/upsert`, `PUT`/`PATCH /v1/plugins/:id`,
   `POST /v1/plugins/:id/new-version`) runs the app manifest's static checks on `resource.app.manifest` and refuses a
   manifest that fails them with `422 app_manifest_invalid` and its `issues`, writing nothing. A sandbox template with

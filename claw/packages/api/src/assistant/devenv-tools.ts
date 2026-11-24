@@ -82,10 +82,14 @@ const TURN_EVENTS = new Set([
   "permission_auto_allowed",
 ]);
 
-interface ActivityEvent { type: string; occurred_at: string; text: string; action_id: string | null; stop: string | null; replay: boolean }
+interface ActivityEvent {
+  type: string; occurred_at: string; text: string; action_id: string | null; stop: string | null; replay: boolean;
+  /** The prompt it is of (`user_prompt`), ends (`turn_end`) or refused unrun (`command_rejected`), when it names one by number. */
+  cmd_seq?: number | null;
+}
 
 /**
- * A turn the agent took by itself (no prompt since the last `turn_end`: the agent answering a command it put in the background) counts
+ * A turn the agent took by itself (no prompt of Claw's still open: the agent answering a command it put in the background) counts
  * as under way for at most this long after its last event. A connector from 0.3.3 on ends such a turn with a `turn_end` of its own
  * (`agent_initiated`); an older one never does, and its session would read as working for good.
  */
@@ -122,10 +126,10 @@ export function readSession(events: ActivityEvent[], queued: number, now: number
   const live = events.slice(lastEnd + 1).filter((e) => !e.replay);
   const activity = live.filter((e) => TURN_EVENTS.has(e.type));
   let working = queued > 0 || activity.length > 0;
-  // Nothing was asked since the last end (no prompt of Claw's, `user_prompt`): what came is a turn the agent took by itself, which an
-  // older connector never ends. Once it has been quiet for AGENT_TURN_QUIET_MS (and asks nothing) it is over. Only when that end is in
-  // the window read: without it a prompt may be further back than the window.
-  if (working && queued === 0 && lastEnd >= 0 && pending.size === 0 && !live.some((e) => e.type === REMOTE_EVENT_USER_PROMPT)) {
+  // No prompt of Claw's is open (every `user_prompt` in the window has its own end, named by `cmd_seq`): what came is a turn the agent
+  // took by itself, which an older connector never ends. Once it has been quiet for AGENT_TURN_QUIET_MS (and asks nothing) it is over.
+  // Only when that end is in the window read: without it a prompt may be further back than the window.
+  if (working && queued === 0 && lastEnd >= 0 && pending.size === 0 && !promptOpen(events)) {
     const last = Date.parse(activity[activity.length - 1]!.occurred_at);
     if (Number.isFinite(last) && now - last > AGENT_TURN_QUIET_MS) working = false;
   }
@@ -143,6 +147,26 @@ export function readSession(events: ActivityEvent[], queued: number, now: number
     state: pending.size > 0 ? "waiting_for_you" : working ? "working" : "idle",
     step: flat(step, STEP_MAX), answer: tail(answer, ANSWER_MAX), asked: flat(asked, ASKED_MAX), last_stop: lastStop,
   };
+}
+
+/**
+ * Whether a prompt of Claw's in the window has not ended: its `user_prompt` is there and no `turn_end` (nor a refusal: it never ran)
+ * names its `cmd_seq`. Matched by number, never by position: Claw writes a prompt's `user_prompt` when it queues it, which can be
+ * before the end of the turn it waits behind (a follow-up sent while a turn runs, or a prompt that comes while the agent is on a turn
+ * of its own), so a prompt's turn may have no `user_prompt` after the last end. An end that names none (`cmd_seq` null: a cancel with
+ * nothing running, the agent's own turn; or absent: a connector from before ends named their prompt) ends none, so a session of such a
+ * connector never reads as idle by the quiet alone.
+ */
+function promptOpen(events: ActivityEvent[]): boolean {
+  const asked = new Set<number>();
+  const ended = new Set<number>();
+  for (const e of events) {
+    if (typeof e.cmd_seq !== "number") continue;
+    if (e.type === REMOTE_EVENT_USER_PROMPT) asked.add(e.cmd_seq);
+    else if ((e.type === "turn_end" && !e.replay) || e.type === "command_rejected") ended.add(e.cmd_seq);
+  }
+  for (const seq of asked) if (!ended.has(seq)) return true;
+  return false;
 }
 
 export interface DevenvSession {

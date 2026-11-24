@@ -138,6 +138,13 @@ async function prompt(id, params) {
       if (!env.FAKE_AUTONOMOUS) return;
       update(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: `toolu_${task}`, status: "completed" });
       update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `finished ${path.basename(n[1])}` } });
+      // `ask`: it then asks for a permission in that turn, and waits for the answer.
+      if (env.FAKE_AUTONOMOUS === "ask") {
+        const toolCall = { toolCallId: `toolu_${task}_ask`, title: "Write after-bg", kind: "edit", rawInput: { file_path: "after-bg" } };
+        update(params.sessionId, { sessionUpdate: "tool_call", ...toolCall, status: "pending" });
+        await ask("session/request_permission", { sessionId: params.sessionId, toolCall, options: OPTION_IDS.map((optionId, i) => ({ optionId, name: optionId, kind: OPTION_KINDS[i] })) });
+        return;
+      }
       if (env.FAKE_AUTONOMOUS !== "quiet") update(params.sessionId, { sessionUpdate: "usage_update", used: 10, size: 1000, cost: { amount: 0.01, currency: "USD" } });
     })();
     return done("end_turn");
