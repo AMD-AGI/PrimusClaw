@@ -688,8 +688,10 @@ Checked when the manifest is registered and on every app run:
   neither they nor its `volumeMounts` may use a name starting with
   `template-mount-`; `volumes`,
   `volumeMounts` and `template` must be spelt exactly (Agent Sandbox matches
-  field names case-insensitively). `host_mounts` is the only way a template
-  reaches a host path.
+  field names case-insensitively). Every key of a template, at any depth, must
+  be ASCII: Agent Sandbox's JSON decoder folds some other letters onto ASCII
+  ones (`ſ`, U+017F, is `s`; `K`, U+212A, is `k`), so `volumeſ` would reach it
+  as `volumes`. `host_mounts` is the only way a template reaches a host path.
 
 Checked when an app run is created, as the caller: every `hostPath` must lie
 under a directory the template's workspace (the template's `workspace`, else the
@@ -711,8 +713,10 @@ The grant hands each mount to Agent Sandbox as a `hostPath` volume
 (`template-mount-<i>`, type `Directory`) and a `readOnly: true` volume mount at
 the same path, after the template's own `volumes` and `volumeMounts`. Agent
 Sandbox refuses to issue or extend a grant whose template has a hostPath
-volume that is not a clean absolute path, is mounted anywhere but read-only at
-its own path, or is mounted by a sidecar.
+volume that is not a clean absolute path, is a system directory (or under or
+above one), is mounted anywhere but read-only at its own path, or is mounted by
+a sidecar. It checks the decoded template, so it sees a hostPath volume however
+its keys were spelt.
 
 **A read-only directory inside a read-write one.** When the workspace mounts
 `/shared` read-write and a template mounts `/shared/team/cache` read-only, the

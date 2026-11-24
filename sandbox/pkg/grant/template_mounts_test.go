@@ -68,6 +68,8 @@ func TestTemplateMountsRefused(t *testing.T) {
 		"unknown volume":  `{` + img + `,"volumeMounts":[{"name":"v","mountPath":"/shared/c"}]}`,
 		"mounted twice":   `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"},{"name":"v","mountPath":"/shared/c"}]}`,
 		"sidecar mount":   `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"}],"sidecars":[{"name":"s","image":"i","volumeMounts":[{"name":"v","mountPath":"/w"}]}]}`,
+		"system dir":      `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/etc/ssl"}}],"volumeMounts":[{"name":"v","mountPath":"/etc/ssl"}]}`,
+		"above system":    `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/var"}}],"volumeMounts":[{"name":"v","mountPath":"/var"}]}`,
 		"duplicate names": `{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}},{"name":"v","hostPath":{"path":"/shared/d"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"}]}`,
 	}
 	for name, spec := range cases {
@@ -114,5 +116,28 @@ func TestExtendRefusesAStoredWritableHostMount(t *testing.T) {
 	_, err = svc.Extend(context.Background(), req.GrantID, ExtendRequest{ExpiresAt: now.Add(2 * time.Hour), Attestation: req.Attestation})
 	if !IsReason(err, "invalid_grant") || !strings.Contains(err.Error(), "read-only") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+// Keys the JSON decoder folds onto Agent Sandbox's (U+017F is s, U+212A is k)
+// decode as those keys, and the decoded template is what is checked: the two
+// probes of a hostPath volume spelt this way are refused, as is a writable
+// mount of an allowed path reached the same way.
+func TestTemplateMountsCheckTheDecodedTemplate(t *testing.T) {
+	img := `"fromImage":"example@sha256:` + strings.Repeat("0", 64) + `"`
+	cases := map[string]string{
+		"volume\u017f":    `{` + img + `,"volume\u017f":[{"name":"a","hostPath":{"path":"/etc"}}],"volumeMounts":[{"name":"a","mountPath":"/etc"}]}`,
+		"ho\u017ftPath":   `{` + img + `,"volumes":[{"name":"a","ho\u017ftPath":{"path":"/root"}}],"volumeMounts":[{"name":"a","mountPath":"/root"}]}`,
+		"folded writable": `{` + img + `,"volumes":[{"name":"a","ho\u017ftPath":{"path":"/shared/c"}}],"volumeMount\u017f":[{"name":"a","mountPath":"/shared/c","readOnly":false}]}`,
+		"nested":          `{"template":{` + img + `,"volumes":[{"name":"a","ho\u017ftPath":{"path":"/root"}}],"volumeMounts":[{"name":"a","mountPath":"/root"}]}}`,
+	}
+	for name, spec := range cases {
+		base, ok, err := templateFromSpec(spec)
+		if err != nil || !ok || len(base.template.Volumes) != 1 || base.template.Volumes[0].HostPath == nil {
+			t.Fatalf("%s: the decoder did not fold the key onto hostPath: ok=%v err=%v", name, ok, err)
+		}
+		if err := validateTemplateMounts(grantTemplate(spec)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }

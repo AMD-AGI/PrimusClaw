@@ -107,7 +107,8 @@ func validateTemplateLayers(templates []runtimev1alpha1.GrantTemplate) error {
 // template comes from an application platform, which lets a template reach a
 // host path only through a mount it has checked against the workspace (an
 // absolute, clean path under a directory the workspace mounts for
-// sandboxes): the sandbox workload mounts each hostPath volume read-only at
+// sandboxes, outside the system directories, which this check refuses as
+// well): the sandbox workload mounts each hostPath volume read-only at
 // the same path and has no field for another mount path, so any other shape
 // would not be what it says. Volumes of other sources are not this check's.
 //
@@ -195,8 +196,24 @@ func checkTemplateMounts(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate) e
 	return nil
 }
 
+// systemPaths are the host directories a template's hostPath volume may not
+// be, be under, or be above. /var and / are refused as the parents of
+// /var/run, /var/lib and everything else.
+var systemPaths = []string{
+	"/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/proc", "/root", "/run",
+	"/sbin", "/sys", "/tmp", "/usr", "/var/lib", "/var/run", "/var/tmp",
+}
+
+// pathWithin reports whether p is root or lies under it; both are clean and absolute.
+func pathWithin(root, p string) bool {
+	return p == root || strings.HasPrefix(p, root+"/")
+}
+
 // checkMountPath accepts an absolute, clean path other than / that a bind
-// spec can carry (no ':' or ',', no blank or control character).
+// spec can carry (no ':' or ',', no blank or control character) and that is
+// not a system directory, under one, or above one. It checks the decoded
+// template, so a key the JSON decoder folds onto hostPath (hoſtPath, with
+// U+017F) is checked like hostPath itself.
 func checkMountPath(p string) error {
 	if !strings.HasPrefix(p, "/") || p == "/" || path.Clean(p) != p {
 		return fmt.Errorf("hostPath %q must be an absolute, clean path other than /", p)
@@ -204,6 +221,11 @@ func checkMountPath(p string) error {
 	for _, r := range p {
 		if r == ':' || r == ',' || unicode.IsSpace(r) || unicode.IsControl(r) {
 			return fmt.Errorf("hostPath %q must not contain ':', ',', a blank or a control character", p)
+		}
+	}
+	for _, s := range systemPaths {
+		if pathWithin(s, p) || pathWithin(p, s) {
+			return fmt.Errorf("hostPath %q must not be, be under, or contain the system directory %s", p, s)
 		}
 	}
 	return nil

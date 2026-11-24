@@ -46,9 +46,15 @@
  * where the provider cannot).
  *
  * A template's own Agent Sandbox `volumes` may not be hostPath ones, and
- * Agent Sandbox's keys must be spelt exactly (its JSON decoder matches them
- * case-insensitively): `host_mounts` is the only way a plugin template reaches
- * a host path, so the checks above cannot be stepped around.
+ * Agent Sandbox's keys must be spelt exactly: its JSON decoder (Go's
+ * encoding/json) matches field names with Unicode case folding, under which
+ * `Volumes` is `volumes` and also `ſ` (U+017F) is `s` and `K` (U+212A) is `k`.
+ * So every key of a template, at any depth, must be ASCII, and the ASCII keys
+ * are compared case-insensitively, which is then exactly the decoder's
+ * matching: `host_mounts` is the only way a plugin template reaches a host
+ * path, so the checks above cannot be stepped around. Agent Sandbox's grant
+ * service checks the decoded template as well (hostPath volumes read-only,
+ * at their own path, outside the system directories).
  *
  * Mount order. A template mount is usually nested inside a workspace mount
  * (workspace `/shared` read-write, template `/shared/team/cache` read-only),
@@ -84,7 +90,8 @@ export const TEMPLATE_MOUNT_VOLUME_PREFIX = "template-mount-";
 /**
  * Keys Agent Sandbox reads that a template must spell exactly: its JSON decoder
  * matches field names case-insensitively, so `Volumes` would reach it as
- * `volumes` past every check here.
+ * `volumes` past every check here. Keys are ASCII ({@link nonAsciiKeyIssues}),
+ * so an ASCII case-insensitive comparison is the decoder's own.
  */
 const EXACT_KEYS = ["template", ...TEMPLATE_RAW_VOLUME_KEYS] as const;
 
@@ -140,6 +147,7 @@ export function templateMountIssues(template: Record<string, unknown>, at: strin
   const nested = isObj(template.template) ? template.template : undefined;
   // The volume names host_mounts renders are reserved only where it renders them.
   const reserveNames = Object.hasOwn(template, "host_mounts");
+  nonAsciiKeyIssues(template, at, bad);
   rawVolumeIssues(template, at, bad, reserveNames);
   if (nested) rawVolumeIssues(nested, `${at}.template`, bad, reserveNames);
   const mounts = template.host_mounts;
@@ -180,6 +188,33 @@ export function templateMountIssues(template: Record<string, unknown>, at: strin
   return issues;
 }
 
+/** Whether `key` is ASCII only. */
+const isAscii = (key: string): boolean => /^[\u0000-\u007f]*$/.test(key);
+
+/** Lower-cases ASCII letters only; for an ASCII key this is how Go's decoder folds it. */
+const foldAscii = (key: string): string => key.replace(/[A-Z]/g, (c) => c.toLowerCase());
+
+/**
+ * Every key of a template that is not ASCII, at any depth. Go's encoding/json,
+ * which decodes the template in Agent Sandbox, folds some non-ASCII letters
+ * onto ASCII ones (`ſ` U+017F is `s`, `K` U+212A is `k`), so `volumeſ` or
+ * `hoſtPath` would reach it as `volumes` or `hostPath` past every check here.
+ */
+function nonAsciiKeyIssues(value: unknown, at: string, bad: (path: string, reason: string) => void): void {
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => nonAsciiKeyIssues(v, `${at}[${i}]`, bad));
+    return;
+  }
+  if (!isObj(value)) return;
+  for (const [key, v] of Object.entries(value)) {
+    if (!isAscii(key)) {
+      bad(`${at}.${key}`, "keys must be ASCII: Agent Sandbox's JSON decoder folds some other letters onto ASCII ones (ſ is s, K is k)");
+      continue;
+    }
+    nonAsciiKeyIssues(v, `${at}.${key}`, bad);
+  }
+}
+
 /**
  * Agent Sandbox's own volume keys of one template object: spelt exactly, no
  * hostPath among its `volumes` (in any spelling), and, when the template
@@ -193,7 +228,7 @@ function rawVolumeIssues(
   reserveNames: boolean,
 ): void {
   for (const key of Object.keys(obj)) {
-    const exact = EXACT_KEYS.find((k) => k.toLowerCase() === key.toLowerCase());
+    const exact = EXACT_KEYS.find((k) => foldAscii(k) === foldAscii(key));
     if (exact && exact !== key) bad(`${at}.${key}`, `must be spelt ${exact}`);
   }
   const reserved = (name: unknown): boolean =>
@@ -203,7 +238,7 @@ function rawVolumeIssues(
     else obj.volumes.forEach((v, i) => {
       if (!isObj(v)) {
         bad(`${at}.volumes[${i}]`, "must be an object");
-      } else if (Object.keys(v).some((k) => k.toLowerCase() === "hostpath")) {
+      } else if (Object.keys(v).some((k) => foldAscii(k) === "hostpath")) {
         bad(`${at}.volumes[${i}]`, "a template's own volumes may not be hostPath volumes; a host directory goes in host_mounts");
       } else if (reserved(v.name)) {
         bad(`${at}.volumes[${i}].name`, `must not start with ${TEMPLATE_MOUNT_VOLUME_PREFIX}`);

@@ -102,6 +102,24 @@ test("Agent Sandbox's keys must be spelt exactly: its decoder matches them case-
   assert.deepEqual(paths({ template: { fromImage: "x", volumes: [], Volumes: [] } }), ["sandbox_templates[0].template.Volumes"]);
 });
 
+test("a key that Go's decoder folds onto an Agent Sandbox key (\u017f is s, \u212a is k) is refused, at any depth", () => {
+  // The two probes of the review: both decode in Agent Sandbox as a hostPath volume.
+  assert.deepEqual(paths({ "volume\u017f": [{ name: "a", hostPath: { path: "/etc" } }], volumeMounts: [{ name: "a", mountPath: "/etc" }] }), [
+    "sandbox_templates[0].volume\u017f",
+  ]);
+  assert.deepEqual(paths({ volumes: [{ name: "a", "ho\u017ftPath": { path: "/root" } }], volumeMounts: [{ name: "a", mountPath: "/root" }] }), [
+    "sandbox_templates[0].volumes[0].ho\u017ftPath",
+  ]);
+  assert.deepEqual(paths({ template: { fromImage: "x", volumes: [{ name: "a", "ho\u017ftPath": { path: "/root" } }] } }), [
+    "sandbox_templates[0].template.volumes[0].ho\u017ftPath",
+  ]);
+  assert.deepEqual(paths({ "volumeMount\u017f": [] }), ["sandbox_templates[0].volumeMount\u017f"]);
+  assert.deepEqual(paths({ volumes: [{ name: "a", emptyDir: { "\u212aey": 1 } }] }), ["sandbox_templates[0].volumes[0].emptyDir.\u212aey"]);
+  assert.match(issuesOf({ "volume\u017f": [] })[0]!.reason, /ASCII/);
+  assert.deepEqual(issuesOf({ volumes: [{ name: "a", emptyDir: {} }], volumeMounts: [{ name: "a", mountPath: "/w\u00e9" }] }), [],
+    "a non-ASCII value is not a key");
+});
+
 test("a template's own volumes and their mounts are kept, and may not take a host mount's volume name", () => {
   const scratch = { volumes: [{ name: "scratch", emptyDir: {} }], volumeMounts: [{ name: "scratch", mountPath: "/scratch", readOnly: false }] };
   assert.deepEqual(issuesOf(scratch), []);
