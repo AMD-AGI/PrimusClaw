@@ -15,6 +15,15 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## Unreleased
+
+### Fixed
+
+- A message that forwards messages and whose words answer a question card waiting in the chat no longer loses what it
+  forwards. The words answered the card, and the forwarded messages, which no other message carried, never reached Claw.
+  They now go to Claw with the answer, before its words, as they go with a new message; the card still shows only the
+  words. This holds in a group and in a 1:1 chat; a forward with no words still goes on as a new message.
+
 ## 0.12.0
 
 A minor release, because core's exported API changes incompatibly: `ClawPort`'s `remoteAgents` (`ClawRemoteAgentsPort`)
