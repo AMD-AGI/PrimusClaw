@@ -225,13 +225,20 @@ export async function dispatchErrand(
   owner: string, itemId: string, opts: { wait?: boolean; onlineWindowMs?: number } = {},
 ): Promise<DispatchOutcome | null> {
   const onlineWindowMs = opts.onlineWindowMs ?? REMOTE_AGENT_TIMING.onlineWindowMs;
-  const item = (await db.query(
+  const read = async () => (await db.query(
     "SELECT item_id, seq, generation, board_state, params FROM claw_work_items WHERE item_id = $1 AND user_id = $2 AND kind = 'remote'",
     [itemId, owner],
   )).rows[0] as { item_id: string; seq: number; generation: number; board_state: string; params: ErrandParams } | undefined;
-  if (!item || item.board_state === "done" || item.params?.errand !== true) return { error: "item_closed", message: "that task is closed" };
-  const seatId = String(item.params.seat_id ?? "");
+  const first = await read();
+  if (!first || first.board_state === "done" || first.params?.errand !== true) return { error: "item_closed", message: "that task is closed" };
+  const seatId = String(first.params.seat_id ?? "");
   return withSeatLock(seatId, opts.wait !== false, async () => {
+    // Read again under the seat's lock: another dispatch may have sent it meanwhile, and it is never sent (or queued) a second time.
+    const item = await read();
+    if (!item || item.board_state === "done" || item.params?.errand !== true) return { error: "item_closed", message: "that task is closed" };
+    if (!item.params.queued && Array.isArray(item.params.open_cmd_seqs) && item.params.open_cmd_seqs.length > 0) {
+      return { dispatch: "sent", session_id: String(item.params.session_id) };
+    }
     const all = await seatsLive(owner, onlineWindowMs);
     const live = all.get(seatId);
     const refused = seatRefusal(live, seatId);
