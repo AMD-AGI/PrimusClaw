@@ -17,19 +17,6 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
 
 ## Unreleased
 
-### Added
-
-- `@primusclaw/personal-agent`, `-runtime`, `-teams`: a task the assistant hands to one of the person's seats (a folder on
-  their machine whose purpose they confirmed). Claw's `seat_dispatch` card is drawn like any held write (Send, Don't);
-  when several places fit, it is a choice card: a button for each place, its folder under it as text, and Cancel. A
-  button carries only the card and the place's index, the place Claw is told was picked (`choice`) is read from the
-  card's record (`assistant_confirm_cards.options_json`, added at start-up), and a press that names no place on the card
-  sends nothing. What came of a press is said in one line: sent as which item, waiting in line behind which items (busy,
-  in use in the terminal, or its machine offline), or why nothing was sent. A request such a task waits on names the
-  seat and the item; its one reminder after the first wait (`ask.parked`) brings the card back, valid until the longer
-  wait ends (at most a day), unless it was answered. The hourly progress line of a long task is said as Claw words it.
-  Needs a Claw that sends `seat_dispatch` cards; with an older Claw nothing changes.
-
 ### Fixed
 
 - `@primusclaw/personal-agent`: a remote agent's answer in a 1:1 chat that streams is never read from its middle. A stream's
