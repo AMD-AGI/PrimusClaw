@@ -34,7 +34,7 @@ import {
   errandNotice, errandText, errandWorkerSessionId, langOf, noteErrandPrompt, REMOTE_EVENT_COMMAND_REJECTED, REMOTE_EVENT_TURN_END, reportErrand,
   SEAT_QUEUE_REASONS, type ErrandParams, type ErrandQueue, type RemoteLang,
 } from "./remote-items.js";
-import { SEAT_DISPATCH_AGENT_KINDS, SEAT_QUEUE_MAX, seatDispatchOn, seatDisplayName, seatsLive, syncSeats, type SeatLive } from "./seats.js";
+import { SEAT_QUEUE_MAX, seatDispatchOn, seatDisplayName, seatsLive, syncSeats, type SeatLive } from "./seats.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
 import { typedCommand } from "./typed-commands.js";
@@ -128,6 +128,16 @@ export function seatRefusal(live: SeatLive | undefined, seatId: string): ToolRef
         : "that seat's agent is no longer offered by its machine", live.upgrade_command ? { upgrade_command: live.upgrade_command } : undefined);
   }
   return null;
+}
+
+/**
+ * A new session asked for a seat that is one conversation: refused. That session would be another conversation, so another seat, than
+ * the one the user confirmed (and a card for this seat would show this seat): a task for a seat only ever goes to its own conversation.
+ */
+export function newSessionRefusal(live: SeatLive | undefined, newSession: boolean): ToolRefused | null {
+  if (!newSession || !live?.seat.conversation_ref) return null;
+  return new ToolRefused("seat_new_session", "a seat is one session: a task for it goes to that session (it waits in its queue while the "
+    + "user is in its terminal). A new session in its folder is not that seat: for one, devenv_send with new_session (a card), or another seat");
 }
 
 /**
@@ -231,11 +241,9 @@ function planFor(live: SeatLive, newSession: boolean): { plan: SendPlan } | { wa
   // ③ Its own conversation, taken over (a seat is one conversation: never a new one in its folder, unless the user asked for that).
   let ref: string | null = typeof seat.conversation_ref === "string" && seat.conversation_ref ? seat.conversation_ref : null;
   if (ref && newSession) {
-    // A new session in its folder was asked for: one of an agent of its machine that starts sessions (it is a seat of its own then).
-    const starter = (Array.isArray(live.connector?.agents) ? live.connector!.agents as Row[] : [])
-      .find((a) => String(a.kind) !== "attach" && SEAT_DISPATCH_AGENT_KINDS.has(String(a.kind)));
-    if (!starter) return { error: "seat_unsupported", message: "no agent on that seat's machine starts a new session; send it to the seat's own conversation" };
-    return { plan: { ...base, agent_id: String(starter.agent_id), session_id: null, resume_ref: null, label: `${live.machine}/${String(starter.agent_id)}/new` } };
+    // (refused before it was made: `newSessionRefusal`; a task from before seats were per conversation that asked for one goes there too)
+    const refusal = newSessionRefusal(live, true)!;
+    return { error: refusal.code, message: refusal.message };
   }
   // (Its conversation, held by no session open through Claw: its agent takes it over.)
   if (ref) return { plan: { ...base, session_id: null, resume_ref: ref, label: `${live.machine}/${String(seat.agent_id)}` } };
@@ -330,8 +338,8 @@ export async function dispatchErrand(
       return { error: sent.error, message: sent.message };
     }
     // A session opened for it (its conversation taken over, or a new one in its folder) is the seat's own from now on: the next task
-    // goes into it, not into one more. (Not a new session asked for beside a seat's conversation: that is a seat of its own.)
-    if (!planned.plan.session_id && !(item.params.new_session === true && live!.seat.conversation_ref)) {
+    // goes into it, not into one more.
+    if (!planned.plan.session_id) {
       await db.query("UPDATE claw_devenv_seats SET current_session_id = $2::uuid, updated_at = NOW() WHERE seat_id = $1 AND owner_user_id = $3",
         [seatId, sent.session_id, owner]);
     }
@@ -437,6 +445,8 @@ export async function seatWorkCreate(claims: AssistantTokenClaims, args: SeatCre
   const newSession = args.new_session === true && target.seats.length === 1 && !target.sandbox;
   const choice = target.seats.length > 1 || target.sandbox;
   const live = choice ? null : all.get(target.seats[0]!)!;
+  const noNew = newSessionRefusal(live ?? undefined, newSession);
+  if (noNew) throw noNew;
   const why = live ? whyCard(live, attendedRefusal) : "choice";
   const { assistantSchedulesOn, proposeConfirmation, proposed } = await import("./schedules.js");
   if (why && !assistantSchedulesOn()) throw new ToolRefused("cards_off", "confirmation cards are off here, so nothing can be handed to the user's machine");
@@ -863,7 +873,7 @@ async function errandWorkSendOnce(
     attendedRefusal = err.code;
   }
   const live = (await seatsLive(userId, undefined, [p.seat_id])).get(p.seat_id);
-  const refused = seatRefusal(live, p.seat_id);
+  const refused = seatRefusal(live, p.seat_id) ?? newSessionRefusal(live, newSession);
   if (refused) throw refused;
   const running = errandRunning(item, p);
   if (!running) {
@@ -1058,7 +1068,7 @@ export async function drainSeatsOf(owner: string, _sessionIds: readonly string[]
 }
 
 /** Refusals a queued task never gets past. */
-const PERMANENT = new Set(["seat_not_found", "seat_retired", "seat_gone", "seat_unsupported", "item_closed", "needs_card", "seat_unattended"]);
+const PERMANENT = new Set(["seat_not_found", "seat_retired", "seat_gone", "seat_new_session", "seat_unsupported", "item_closed", "needs_card", "seat_unattended"]);
 
 /** A task that waited in a queue and will not go: it fails, said as such, and the router hears of it. */
 async function failQueued(owner: string, itemId: string, why: string): Promise<void> {

@@ -766,7 +766,8 @@ and its decision names one (`choice`), which Claw checks.
 
 A task goes to the seat's own conversation: into the session open through Claw that holds it, else typed into its terminal (below),
 else that conversation taken over by the agent that takes conversations over (`resume_ref`), never a new session in its folder
-(`new_session: true` asks for one beside it, which is then a seat of its own); the session opened for it is the seat's from then on.
+(`new_session: true` for such a seat is refused, `seat_new_session`: a new session in that folder is another conversation, so
+`devenv_send` with `new_session`, a card); the session opened for it is the seat's from then on.
 When the machine refuses it as `unknown_session` (the conversation was deleted, or is too old to resume) the task fails, saying so,
 and the seat is `gone` (`seat_gone` for every task, a queued one fails) until a heartbeat after that lists the conversation again. A
 seat whose conversation was held only by a session open through Claw, closed on a machine where no agent takes conversations over, is

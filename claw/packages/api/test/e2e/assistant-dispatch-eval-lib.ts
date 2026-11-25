@@ -26,7 +26,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import * as seats from "../../src/assistant/seats.js";
 import { errandText } from "../../src/assistant/remote-items.js";
 import {
-  errandClosed, errandNotStarted, errandRunning, parseTarget, seatRefusal, sendKey, whyCard, type Target,
+  errandClosed, errandNotStarted, errandRunning, newSessionRefusal, parseTarget, seatRefusal, sendKey, whyCard, type Target,
 } from "../../src/assistant/seat-dispatch.js";
 import type { ToolRefused } from "../../src/assistant/tools.js";
 import { REMOTE_AGENT_LIMITS } from "@claw/protocol";
@@ -129,7 +129,8 @@ const itemOf = (ref: unknown) => {
  * `unsupported: "agent_kind"`, as `seatsLive` marks it).
  */
 const liveOf = (s: FixtureSeat): seats.SeatLive => ({
-  seat: { seat_id: s.seat_id, role_state: s.role_state, confirm_each: s.confirm_each, dispatch_mode: s.dispatch_mode },
+  // (each fixture seat is one session: its conversation)
+  seat: { seat_id: s.seat_id, role_state: s.role_state, confirm_each: s.confirm_each, dispatch_mode: s.dispatch_mode, conversation_ref: sessionIdOf(s) },
   unattended: s.unattended,
   ...(seats.SEAT_DISPATCH_AGENT_KINDS.has(s.kind) ? {} : { unsupported: "agent_kind" }),
 } as unknown as seats.SeatLive);
@@ -294,6 +295,9 @@ export class DispatchStub {
       return ok({ ...this.card("seat_dispatch", { choices }), item_id: itemId, seq, dispatch: "card", why_card: "choice", choices });
     }
     const s = seatOf(target.seats[0]!)!;
+    // A seat is one session: a new session beside it is not that seat (`newSessionRefusal`).
+    const noNew = newSessionRefusal(liveOf(s), input.new_session === true);
+    if (noNew) return refused(noNew, refuse);
     const queue = this.queues.get(s.seat_id)!;
     const fresh = input.new_session === true && s.state === "in_terminal";
     // A full queue is said before anything is made (a seat that is not idle), or when the task would wait behind it.
@@ -352,7 +356,7 @@ export class DispatchStub {
       return refuse("brief_too_long", `the instruction is too long to send to a machine (at most ${REMOTE_AGENT_LIMITS.maxPromptBytes} bytes)`);
     }
     const s = seatOf(seatId);
-    const no = seatRefusal(s && liveOf(s), seatId);
+    const no = seatRefusal(s && liveOf(s), seatId) ?? (s ? newSessionRefusal(liveOf(s), input.new_session === true) : null);
     if (no) return refused(no, refuse);
     const running = errandRunning({ board_state: this.reopened.has(item.itemId) ? "in_progress" : item.boardState }, p);
     if (!running) {

@@ -42,7 +42,8 @@
  *   D27 an instruction queued behind a turn under way, or sent while the agent is on a turn of its own, is the seat's work until its own
  *       end names it, however quiet it is: its prompt is on record before the end of the turn it waited behind, and may be further
  *       back than the events a reading takes
- *   D30 one session, one seat: a task for a seat takes over that seat's own conversation (never a new session in its folder), and the
+ *   D30 one session, one seat: a task for a seat takes over that seat's own conversation (never a new session in its folder: one asked
+ *       for is refused), and the
  *       next goes into the session that holds it; two seats of one folder queue apart; a conversation its machine no longer has fails
  *       the task, said plainly, and the seat is gone (refused) until its machine lists it again
  *   D31 a seat whose conversation a session open through Claw held, once closed where no agent of its machine takes a conversation over,
@@ -1394,6 +1395,9 @@ describe("seat dispatch", { skip }, () => {
     const opened = async () => (await w.q(
       "SELECT session_id::text AS session_id, payload FROM claw_remote_commands WHERE connector_id = $1 AND type = 'session.new' ORDER BY cmd_seq", [cid],
     ));
+    // A new session asked for a seat that is one session: refused, nothing made or sent (it would be another conversation than the seat).
+    assert.equal((await refusal(create(await userTurn(alice, "让 s1 新开一个会话发布"), `seat:${s1}`, "发布 new", "发布", { new_session: true }))).code, "seat_new_session");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_items WHERE user_id = 'alice'"))[0].n, 0);
     // A task for seat 1: its own conversation is taken over (never a new session in the folder).
     const a = await create(await userTurn(alice, "让 s1 发布"), `seat:${s1}`, "发布 a");
     assert.equal(a.dispatch, "sent", JSON.stringify(a));

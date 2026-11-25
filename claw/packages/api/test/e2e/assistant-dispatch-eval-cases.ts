@@ -203,7 +203,7 @@ export const CASES: readonly DispatchCase[] = [
     "Have the docs seat update the install section of the README for connector 0.3.1", [{ seat: "docs" }],
     { why: "a seat with no confirmed role: always a card, which the tools decide" }),
   ...both("alias-hlci2", "terminal", "让 hl-ci2 跑一下 Hyperloom 的 lint", "Have hl-ci2 run the Hyperloom lint",
-    [{ seat: "hlci2" }, { seat: "hlci2", newSession: true }], { why: "its conversation is open in a terminal: it waits, or a new session" }),
+    [{ seat: "hlci2" }], { why: "its conversation is open in a terminal: it waits in its queue (a seat is one session: a new session is not that seat)" }),
   // 2. By what the seat handles.
   ...both("role-rel", "role", "交给负责发布的那个工位：把 connector 0.3.2 发出去",
     "Give this to the seat that does releases: publish connector 0.3.2", [{ seat: "rel" }]),
@@ -264,9 +264,11 @@ export const CASES: readonly DispatchCase[] = [
     [{ seat: "notes" }, { sandbox: true }, { ask: true }]),
   ...both("busy-unnamed", "busy", "在 GPU 上复现一下昨天 Hyperloom 那个 NaN 问题", "Reproduce yesterday's Hyperloom NaN issue on the GPU",
     [{ seat: "hlci" }, { sandbox: true }]),
-  // 11. A new session beside the one in the terminal.
+  // 11. A new session beside the one in the terminal: a seat is one session, so that is the explicit devenv_send path (a card), or
+  // the refusal said.
   ...both("terminal-new", "terminal", "让 hl-ci2 新开一个会话跑 lint，别动我终端里那个",
-    "Have hl-ci2 run the lint in a new session; leave the one in my terminal alone", [{ seat: "hlci2", newSession: true }]),
+    "Have hl-ci2 run the lint in a new session; leave the one in my terminal alone",
+    [{ devenv: { machine: "devbox", agent: "claude" } }, { refused: "hlci2", code: "seat_new_session" }]),
   // 12. A full queue: the refusal is the answer; offer to wait, the sandbox or another seat, and do none of them unasked.
   ...both("queue-full", "queue-full", "叫 hl-ci 再跑一遍 GPU 回归", "Have hl-ci run the GPU regression once more",
     [{ refused: "hlci", code: "seat_queue_full" }], { hlciQueue: 3 }),
