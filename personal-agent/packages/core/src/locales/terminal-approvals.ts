@@ -53,6 +53,13 @@ export const terminalApprovalText = defineCatalog({
     muteNotFound: (p: { item: string }) => `I have no item #${p.item} of yours.`,
     muteNotTerminal: (p: { item: string }) =>
       `#${p.item} is not a conversation open in one of your terminals, so there is nothing to mute.`,
+    endDone: "finished",
+    endError: (p: { error: string }) => `stopped with an error (${p.error})`,
+    endIdle: "terminal idle",
+    endFull: "Show all",
+    endRest: "The rest is in the terminal.",
+    endAttach: "Attach",
+    endMute: "Mute this conversation",
     approvalsUnavailable: "I could not reach the setting just now. Try again in a moment.",
   },
   zh: {
@@ -89,12 +96,19 @@ export const terminalApprovalText = defineCatalog({
     approvalsTurnedOn: "已开启：终端里的问题也会推到这里。发 `/approvals off` 关闭。",
     approvalsTurnedOff: "已关闭：问题只在终端里问。发 `/approvals on` 重新开启。",
     approvalsUsage:
-      "用 `/approvals on` 或 `/approvals off`；只发 `/approvals` 看当前状态；对单个终端会话用 `/approvals mute #12`（或 `unmute #12`），编号见推送消息开头。",
+      "用 `/approvals on` 或 `/approvals off`；只发 `/approvals` 看当前状态；对单个终端会话用 `/approvals mute #12`（或 `unmute #12`），编号见推送消息里的 #N。",
     muted: (p) =>
       `已静音 #${p.item}${p.where ? `（${p.where}）` : ""}：这个会话的提问、等待和完成都只留在终端里。发 \`/approvals unmute #${p.item}\` 恢复。`,
     unmuted: (p) => `已恢复 #${p.item}${p.where ? `（${p.where}）` : ""}：这个会话的提问和完成会重新推到这里。`,
     muteNotFound: (p) => `你没有编号为 #${p.item} 的事项。`,
     muteNotTerminal: (p) => `#${p.item} 不是你终端里打开的会话，没有可静音的。`,
+    endDone: "做完了",
+    endError: (p) => `出错停下（${p.error}）`,
+    endIdle: "终端空闲",
+    endFull: "全文",
+    endRest: "全文见终端。",
+    endAttach: "接入会话",
+    endMute: "静音此会话",
     approvalsUnavailable: "暂时读不到这个设置，请稍后再试。",
   },
 });

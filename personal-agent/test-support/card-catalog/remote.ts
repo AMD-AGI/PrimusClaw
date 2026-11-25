@@ -14,6 +14,7 @@ import {
   windowCard,
 } from "../../packages/teams/src/views/remote/index.js";
 import { disconnectCard } from "../../packages/teams/src/views/remote/small-cards.js";
+import { terminalEndCard } from "../../packages/teams/src/views/remote/terminal-end-card.js";
 import { type CatalogEntry, NOW, TZ, entriesWithEmoji } from "./catalog.js";
 
 /** What the worker's tests configure: the address it reaches Claw at. */
@@ -300,6 +301,49 @@ export const REMOTE: readonly CatalogEntry[] = entriesWithEmoji(
           bot: "PrimusClaw Assistant",
           view: windowState({ text: "Done: the build is green.", queued: "a turn is running in the terminal" }),
           approvals: [],
+        }),
+      ),
+  ],
+  [
+    "terminal_end",
+    () =>
+      terminalEndCard(
+        remoteView.terminalEndView({
+          end: {
+            itemSeq: 268,
+            name: "ops",
+            folder: "ops/tools",
+            error: "",
+            summary:
+              "staging 已经清空：04:50Z 起没有任何 Pod，job 1930 的沙箱和 job 1932 的 Pod 都没了。这两台节点还挂着，是否释放由集群那边决定，我没动。",
+            full: "staging 已经清空：04:50Z 起没有任何 Pod，job 1930 的沙箱和 job 1932 的 Pod 都没了。这两台节点还挂着，是否释放由集群那边决定，我没动。\n\n重跑起来后，我只读观察三项：\n- 第一个测试的冷启动秒数；\n- 预读的结果文件 `weight_prefetch.json`；\n- 页缓存命中率。",
+            more: true,
+            attach: "/agent attach 3f2a9c1e",
+          },
+          machine: "robin-dev",
+          agent: "Claude Code",
+          lang: "zh",
+        }),
+      ),
+  ],
+  [
+    "terminal_end_error_en",
+    () =>
+      terminalEndCard(
+        remoteView.terminalEndView({
+          end: {
+            itemSeq: 7,
+            name: "",
+            folder: "work/claw",
+            error: "rate_limit",
+            summary: "API Error: rate limit reached for this organization.",
+            full: "API Error: rate limit reached for this organization.",
+            more: false,
+            attach: "",
+          },
+          machine: "robin-dev",
+          agent: "Claude Code",
+          lang: "en",
         }),
       ),
   ],

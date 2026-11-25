@@ -291,6 +291,15 @@ release version, and its `appVersion` stays `latest`.
 
 ### Changed
 
+- Claw, personal agent: the message for a terminal turn that ended while nobody was at it says which conversation first. Its
+  title is the conversation's name (as Claude Code's session list shows it, else its title) with its status (finished, or
+  stopped with an error and why); one small line names the tool, the machine, the folder and the item number. Then what the
+  agent did, in whole sentences from the start of its last answer (from its summary block or last paragraph when the
+  connector had to cut it), never a tail that starts mid-sentence; its whole last answer folds out under *Show all*; buttons
+  send `/agent attach <ref>` (for a conversation its connector lists) and `/approvals mute #<item>` as the user's own
+  message. Claw sends what the card shows as `remote.end` on the `assistant.say` (`kind` `done` or `error`), with text for a
+  channel that shows no cards; the rules of when it is said (one per conversation every five minutes, `/approvals off`,
+  mute) are unchanged.
 - Agent Sandbox: a GPU template's CPU, memory, pod storage and `/dev/shm` now come from the template when it sets them,
   instead of always 24 CPU, 224Gi memory, 187.5Gi storage and 125Gi shared memory per card. A sandbox can ask for what
   it needs (for example 16 CPU and 448Gi for two cards, or 32 CPU and 1792Gi for eight) and leave the rest of the node

@@ -7,11 +7,12 @@
  * production schema. The events are what the connector posts for the hook payloads Claude Code 2.1.328 and Codex 0.153.4 hand it
  * (measured; connector/test/turn-ends.test.ts). Skipped without DATABASE_URL, and a skip is not a pass.
  *
- *   U1 a finished turn: the item is made (or closed) with the end, and the owner is told once, naming the machine, the tool, the
- *      conversation and its folder, the item, the agent's last words and how to mute it; `remote.kind` done
+ *   U1 a finished turn: the item is made (or closed) with the end, and the owner is told once: one line naming the conversation,
+ *      its status, the machine, the folder and the item; what the agent did, from the start of its last answer; how to mute it;
+ *      `remote.kind` done, with `remote.end` for a channel's card
  *   U2 a turn that failed: told as an error, with its reason (`remote.kind` error)
  *   U3 several ends of one conversation within the gap: each recorded on the item, one told
- *   U4 the conversation's own name (the connector's list) is said instead of its folder's
+ *   U4 the conversation's own name (the connector's list) is said first, and the command that attaches the chat to it
  *   U5 off for the owner (`/approvals off`): recorded, not told
  *   U6 muted by its item: nothing more told (ends, requests), its open session closed for the connector, a new one refused
  *      (`session_muted`) while every other conversation goes on; unmuted, it opens again
@@ -111,7 +112,7 @@ describe("turn ends and mutes from terminals", { skip }, () => {
   }];
   const mute = (user: string, item: unknown, muted = true) => call(user, "PUT", "/v1/remote-agents/approvals/mutes", { item, muted });
 
-  test("U1 a finished turn is told once, with where, the item, the last words and how to mute it", async () => {
+  test("U1 a finished turn is told once: the conversation first, what it did, how to mute it", async () => {
     const alice = await w.user("alice");
     await w.subscribe(alice.userId);
     const cid = await machine("alice", "laptop");
@@ -124,8 +125,12 @@ describe("turn ends and mutes from terminals", { skip }, () => {
     assert.match(item.summary, /^已完成 全部测试通过/);
     const got = await pushed(item.item_id);
     assert.equal(got.length, 1, JSON.stringify(got));
-    assert.equal(got[0].text, `#${item.seq} laptop 上终端里的 Claude Code（修 CI，work/claw）做完了，之后终端那边一直没人操作。\n它最后说：\n全部测试通过。\n下一步：发 PR。\n（不想再收到这个会话的推送：/approvals mute #${item.seq}）`);
+    assert.equal(got[0].text, `【修 CI】做完了 · laptop · work/claw · 终端空闲 · #${item.seq}\n全部测试通过。下一步：发 PR。\n静音：/approvals mute #${item.seq}`);
     assert.deepEqual([got[0].remote.kind, got[0].remote.session_id, got[0].remote.machine, got[0].remote.tool, got[0].remote.ask], ["done", sid, "laptop", "claude", undefined]);
+    // Not listed by its connector (no `resumable` entry): nothing to attach it by.
+    assert.deepEqual(got[0].remote.end, {
+      item_seq: item.seq, name: "修 CI", folder: "work/claw", summary: "全部测试通过。下一步：发 PR。", full: "全部测试通过。\n下一步：发 PR。", more: false,
+    });
     assert.equal(await filed(item.item_id), 1, "filed under the item");
     // The same event posted again (a connector's retry) says nothing twice.
     await events("alice", cid, sid, []);
@@ -145,9 +150,11 @@ describe("turn ends and mutes from terminals", { skip }, () => {
     const got = await pushed(item.item_id);
     assert.equal(got.length, 1);
     assert.equal(got[0].remote.kind, "error");
-    assert.match(got[0].text, new RegExp(`^#${item.seq} Claude Code in a terminal on laptop \\(fix CI, work/claw\\) stopped with an error \\(unknown\\); nobody has typed in that terminal since\\.$`, "m"));
-    assert.match(got[0].text, /Invalid model name/);
-    assert.match(got[0].text, new RegExp(`/approvals mute #${item.seq}\\)$`));
+    const [head, said, commands] = String(got[0].text).split("\n");
+    assert.equal(head, `[fix CI] stopped with an error (unknown) · laptop · work/claw · terminal idle · #${item.seq}`);
+    assert.match(said ?? "", /Invalid model name/);
+    assert.equal(commands, `Mute: /approvals mute #${item.seq}`);
+    assert.equal(got[0].remote.end.error, "unknown");
   });
 
   test("U3 several ends of one conversation within the gap: each recorded, one told", async () => {
@@ -168,7 +175,7 @@ describe("turn ends and mutes from terminals", { skip }, () => {
     assert.equal((await pushed(item.item_id)).length, 2);
   });
 
-  test("U4 the conversation's own name, as its machine lists it, is said instead of the folder's", async () => {
+  test("U4 the conversation's own name, as its machine lists it, is said first, with the command that attaches the chat to it", async () => {
     const alice = await w.user("alice");
     await w.subscribe(alice.userId);
     const cid = await machine("alice", "laptop", [{ ...CLAUDE, capabilities: { roots: ["/home/u"], resumable: [
@@ -177,7 +184,10 @@ describe("turn ends and mutes from terminals", { skip }, () => {
     const sid = (await open("alice", cid, "conv-1")).body.data.session_id as string;
     await events("alice", cid, sid, [started, end()]);
     const item = await remoteItem(sid);
-    assert.match((await pushed(item.item_id))[0].text, /Claude Code（支付服务重构，work\/claw）做完了/);
+    const got = (await pushed(item.item_id))[0];
+    assert.match(got.text, /^【支付服务重构】做完了 · laptop · work\/claw · 终端空闲 · #\d+\n/);
+    assert.match(got.text, new RegExp(`\n接入：/agent attach conv-1　静音：/approvals mute #${item.seq}$`));
+    assert.deepEqual([got.remote.end.name, got.remote.end.attach], ["支付服务重构", "/agent attach conv-1"]);
   });
 
   test("U5 off for the owner: the end is recorded, not told", async () => {
@@ -276,7 +286,7 @@ describe("turn ends and mutes from terminals", { skip }, () => {
     const item = await remoteItem(sid);
     const got = await pushed(item.item_id);
     assert.equal(got[0].remote.tool, "codex");
-    assert.match(got[0].text, /Codex in a terminal on laptop \(fix CI, work\/claw\) finished/);
+    assert.match(got[0].text, /^\[fix CI\] finished · laptop · work\/claw · terminal idle · #\d+\n/);
     assert.match(got[0].text, /codex probe done\./);
   });
 });

@@ -21,6 +21,7 @@ export {
   type AssistantItemSnapshot,
   type AssistantRemoteAsk,
   type AssistantRemoteNotice,
+  type AssistantTerminalEnd,
   type AssistantReviewHandoff,
   type AssistantSayChoice,
   type AssistantSayPayload,

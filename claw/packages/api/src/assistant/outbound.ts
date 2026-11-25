@@ -272,6 +272,13 @@ function redactedRemote(r: AssistantRemoteNotice): AssistantRemoteNotice {
     // A task handed to a seat (`seat-dispatch.ts`): its number, and the seat with the name the user confirmed.
     ...(r.item_seq !== undefined ? { item_seq: r.item_seq } : {}),
     ...(r.seat ? { seat: { seat_id: r.seat.seat_id, alias: r.seat.alias === null ? null : redact(r.seat.alias) } } : {}),
+    // A terminal's turn that ended while nobody was there (`remote-items.ts`): the words a card shows, scrubbed as the text is.
+    ...(r.end ? {
+      end: {
+        item_seq: r.end.item_seq, name: redact(r.end.name), folder: redact(r.end.folder), ...(r.end.error ? { error: redact(r.end.error) } : {}),
+        summary: redact(r.end.summary), full: redact(r.end.full), more: r.end.more, ...(r.end.attach ? { attach: r.end.attach } : {}),
+      },
+    } : {}),
   };
 }
 
