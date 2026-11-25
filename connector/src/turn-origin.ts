@@ -74,8 +74,9 @@ export function originOfTail(text: string): TurnOrigin | null {
 }
 
 /**
- * Who started the turn that ended in conversation `ref`, from its transcript at `transcriptPath`: only a transcript of that
- * conversation (`<ref>.jsonl`) under the agent's config folder (`<configDir>/projects/`) is read.
+ * Who started the turn that ended in conversation `ref`, from its transcript at `transcriptPath`: only a regular file of that
+ * conversation (`<ref>.jsonl`) that really lies under the agent's config folder (`<configDir>/projects/`, after every symbolic link
+ * on the way is resolved) is read.
  */
 export function turnOrigin(transcriptPath: unknown, configDir: string, ref: string, tail: number = TURN_ORIGIN_TAIL): TurnOrigin | null {
   if (typeof transcriptPath !== "string" || !path.isAbsolute(transcriptPath)) return null;
@@ -84,8 +85,13 @@ export function turnOrigin(transcriptPath: unknown, configDir: string, ref: stri
   if (!file.startsWith(projects) || path.basename(file) !== `${ref}.jsonl`) return null;
   let fd: number | null = null;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-    const size = fs.fstatSync(fd).size;
+    // (a folder under `projects` that is a link to elsewhere is not followed out of it)
+    const real = fs.realpathSync(file);
+    if (!real.startsWith(fs.realpathSync(projects) + path.sep) || path.basename(real) !== `${ref}.jsonl`) return null;
+    fd = fs.openSync(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return null;
+    const size = st.size;
     const len = Math.min(size, tail);
     const buf = Buffer.alloc(len);
     fs.readSync(fd, buf, 0, len, size - len);

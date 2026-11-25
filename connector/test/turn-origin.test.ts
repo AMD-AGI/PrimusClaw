@@ -8,7 +8,7 @@
  *      accepted suggestion and a typed slash command are a person's; another session's message and a scheduled prompt are not;
  *      a background task's notification continues the turn before it; lines Claude Code inserts into a turn are skipped
  *   O2 a Claude Code older than `origin`/`promptSource`: judged by how the words begin
- *   O3 only `<configDir>/projects/.../<ref>.jsonl` is read; anything else, or a transcript without a prompt in its tail, says nothing
+ *   O3 only `<configDir>/projects/.../<ref>.jsonl` is read (no link out of it is followed); anything else, or a transcript without a prompt in its tail, says nothing
  *   O4 the end of a turn nobody typed is told with `origin: "automation"`; one a person typed with `origin: "person"`; an end
  *      whose transcript says nothing is told as before (no `origin`)
  *   O5 ends of turns nobody typed that follow one another (a new prompt came before the wait was over) are told once, as the
@@ -82,6 +82,19 @@ describe("who started the turn", () => {
     assert.equal(turnOrigin("work/x.jsonl", config, REF), null, "not absolute");
     assert.equal(turnOrigin(path.join(config, "projects", "..", "..", `${REF}.jsonl`), config, REF), null, "out by ..");
     assert.equal(turnOrigin(path.join(config, "projects", "-none", `${REF}.jsonl`), config, REF), null, "no file");
+    // a folder under projects that links out of it is not followed, nor is a transcript that is a link
+    const outside = path.join(dir, "elsewhere");
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, `${REF}.jsonl`), lines(typed("secret")));
+    fs.symlinkSync(outside, path.join(config, "projects", "-linked"));
+    assert.equal(turnOrigin(path.join(config, "projects", "-linked", `${REF}.jsonl`), config, REF), null, "linked folder");
+    fs.mkdirSync(path.join(config, "projects", "-file-link"));
+    fs.symlinkSync(path.join(outside, `${REF}.jsonl`), path.join(config, "projects", "-file-link", `${REF}.jsonl`));
+    assert.equal(turnOrigin(path.join(config, "projects", "-file-link", `${REF}.jsonl`), config, REF), null, "linked file");
+    // a config folder that is itself a link (a home on another disk) is still read
+    const linkedConfig = path.join(dir, ".claude-link");
+    fs.symlinkSync(config, linkedConfig);
+    assert.equal(turnOrigin(path.join(linkedConfig, "projects", "-work", `${REF}.jsonl`), linkedConfig, REF), "automation");
     // only the tail is read: a first line cut in half is ignored, and a tail with no prompt says nothing
     fs.writeFileSync(file, lines(typed("x".repeat(5000)), assistant("y".repeat(5000))));
     assert.equal(turnOrigin(file, config, REF, 2000), null);

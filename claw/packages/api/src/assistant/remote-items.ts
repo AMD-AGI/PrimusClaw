@@ -1317,11 +1317,14 @@ async function applyTerminal(
       // held back by the gap, are gathered for the conversation's next summary instead (terminal-digest.ts): never lost, never
       // said twice.
       const origin = e.data.origin === "automation" ? "automation" : e.data.origin === "person" ? "person" : null;
-      const asks = !failed && asksPerson(message);
       const turns = Number.isSafeInteger(e.data.turns) && Number(e.data.turns) > 1 ? Math.min(Number(e.data.turns), 10_000) : 1;
-      const earlier = Array.isArray(e.data.earlier)
-        ? e.data.earlier.filter((x): x is string => typeof x === "string").slice(-EARLIER_KEPT).map((x) => terminalEndSummary(x.slice(-END_FULL_MAX)).summary)
+      const earlierSaid = Array.isArray(e.data.earlier)
+        ? e.data.earlier.filter((x): x is string => typeof x === "string").slice(-EARLIER_KEPT).map((x) => x.slice(-END_FULL_MAX))
         : [];
+      const earlier = earlierSaid.map((x) => terminalEndSummary(x).summary);
+      // A question in any turn of a folded run counts: the run is pushed, and the summary says something asked the person.
+      const earlierAsks = earlierSaid.some((x) => asksPerson(x));
+      const asks = (!failed && asksPerson(message)) || earlierAsks;
       const failedEarlier = Number.isSafeInteger(e.data.failed_earlier) && Number(e.data.failed_earlier) > 0
         ? Math.min(Number(e.data.failed_earlier), turns - 1) : 0;
       const gathered = { turns, failed: (failed ? 1 : 0) + failedEarlier, asks, said: [...earlier, told.summary] };
@@ -1329,7 +1332,7 @@ async function applyTerminal(
       if (Number(p.end_told_at) > now - TERMINAL_END_GAP_MS) { gather(p, now, gathered); continue; }
       p.end_told_at = now;
       // Told now: the newest end. The earlier turns folded into it (none of them told) go to the summary, so none is lost.
-      if (turns > 1) gather(p, now, { turns: turns - 1, failed: failedEarlier, asks: false, said: earlier });
+      if (turns > 1) gather(p, now, { turns: turns - 1, failed: failedEarlier, asks: earlierAsks, said: earlier });
       said.push({
         key: `end:${e.id}`, text: terminalEndNotice(p, seq, failed, error, told, attach), end: failed ? "error" : "done",
         endCard: {

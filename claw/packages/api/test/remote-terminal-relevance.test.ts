@@ -265,5 +265,12 @@ describe("which terminal ends are pushed, and the summary", { skip }, () => {
     const other = await remoteItem(bob.sid);
     assert.equal((await pushed(other.item_id)).length, 1, "a failure in the run pushes it");
     assert.deepEqual([other.params.digest.turns, other.params.digest.failed], [1, 1]);
+
+    // a question in an earlier turn of the run, the newest a plain report: pushed, and the summary says something asked
+    const carol = await convo("carol");
+    await events("carol", carol.cid, carol.sid, [auto("日志已归档。", { turns: 2, earlier: ["可以合入了。要不要我现在合？"], since: "2026-11-25T01:00:00Z" })]);
+    const third = await remoteItem(carol.sid);
+    assert.equal((await pushed(third.item_id)).length, 1);
+    assert.deepEqual([third.params.digest.turns, third.params.digest.asks], [1, 1]);
   });
 });
