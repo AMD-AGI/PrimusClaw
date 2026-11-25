@@ -618,8 +618,10 @@ export const CARD_AGENT_BLOCKS = 6;
 
 /** One agent's conversations in the agents card's order, each with whether the card shows it. Pure, for the tests. */
 export function cardOrder<T extends { state: string }>(conversations: readonly T[]): Array<{ c: T; shown: boolean }> {
+  // As the card reads them: the first twelve as reported, and only then without the attached ones (an attached one among the first
+  // twelve does not let a thirteenth in).
+  const head = conversations.slice(0, CARD_RESUMABLE_READ).filter((c) => c.state !== "attached");
   const read = conversations.filter((c) => c.state !== "attached");
-  const head = read.slice(0, CARD_RESUMABLE_READ);
   const live = head.filter((c) => c.state === "live");
   const idle = head.filter((c) => c.state === "idle");
   const unknown = head.filter((c) => c.state !== "live" && c.state !== "idle");
