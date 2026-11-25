@@ -108,7 +108,7 @@ const angles = (v: string): string =>
 /** Text shown as it is, in a fixed-width font: credentials masked, no link or markup can be built from it. */
 const codeText = (v: string): string => breakLinks(masked(v)).replace(CODE_MARKUP, "\\$&");
 /** Text whose markdown (lists, bold) is kept, but no link can be built from it (`](` gets a zero-width space inside). */
-const wordsText = (v: string): string => breakLinks(angles(masked(v)).replaceAll("](", "]\u200b("));
+export const wordsText = (v: string): string => breakLinks(angles(masked(v)).replaceAll("](", "]\u200b("));
 
 /**
  * A character a card does not show as itself: a control character (but a line break or a tab), or an invisible format character

@@ -309,6 +309,56 @@ export interface RemoteNotice {
    * request whose card may be in the chat already.
    */
   readonly parked?: boolean;
+  /** A turn of a conversation open in a terminal that ended while nobody was at it (`remote.end`, with `kind` done or error). */
+  readonly end?: TerminalEnd;
+}
+
+/**
+ * A terminal's turn that ended while nobody was at that terminal, as Claw describes it for a card (`remote.end`). Every string is the
+ * agent's or its machine's: shown as inert text, never followed.
+ */
+export interface TerminalEnd {
+  readonly itemSeq: number;
+  readonly name: string;
+  readonly folder: string;
+  /** Why it stopped ("" for a turn that finished). */
+  readonly error: string;
+  readonly summary: string;
+  readonly full: string;
+  readonly more: boolean;
+  /** `/agent attach <ref>` for the conversation, as Claw wrote it ("" when its connector does not list it). */
+  readonly attach: string;
+}
+
+/** Code points of what an end's card names and says (Claw sends at most 80, 200 and 2000). */
+const END_NAME_MAX = 120;
+const END_ERROR_MAX = 60;
+const END_SUMMARY_MAX = 400;
+const END_FULL_MAX = 2000;
+/** The attach command an end's card may put to the person, and nothing else: one ref the channel's `/agent attach` takes. */
+const END_ATTACH = /^\/agent attach [A-Za-z0-9._:-]{6,128}$/u;
+
+const clipText = (value: unknown, max: number): string =>
+  typeof value === "string" ? Array.from(value).slice(0, max).join("") : "";
+
+/** `remote.end` as far as it is what Claw says it is; undefined otherwise (the message then goes on as words). */
+function terminalEndOf(remote: Event): TerminalEnd | undefined {
+  const kind = remote["kind"];
+  const end = record(remote["end"]);
+  if (end === undefined || (kind !== "done" && kind !== "error")) return undefined;
+  const seq = end["item_seq"];
+  if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq <= 0) return undefined;
+  const attach = typeof end["attach"] === "string" && END_ATTACH.test(end["attach"]) ? end["attach"] : "";
+  return {
+    itemSeq: seq,
+    name: clipText(end["name"], END_NAME_MAX),
+    folder: clipText(end["folder"], END_NAME_MAX),
+    error: kind === "error" ? clipText(end["error"], END_ERROR_MAX) : "",
+    summary: clipText(end["summary"], END_SUMMARY_MAX),
+    full: clipText(end["full"], END_FULL_MAX),
+    more: end["more"] === true,
+    attach,
+  };
 }
 
 const REMOTE_KINDS = new Set(["done", "needs_you", "error", "resolved", "progress"]);
@@ -361,8 +411,10 @@ export function remoteNoticeOf(event: Event): RemoteNotice | undefined {
   const resolved = kind === "resolved" ? resolvedOf(remote) : undefined;
   if (kind === "resolved" && resolved === undefined) return undefined;
   const ask = record(remote["ask"]);
+  const end = terminalEndOf(remote);
   return {
     ...(resolved ? { resolved } : {}),
+    ...(end ? { end } : {}),
     ...seatOf(remote, ask),
     kind: kind as RemoteNotice["kind"],
     sessionId,

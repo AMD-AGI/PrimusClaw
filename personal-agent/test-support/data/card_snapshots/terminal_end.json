@@ -1,0 +1,121 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "msteams": {
+        "type": "imBack",
+        "value": "/agent attach 3f2a9c1e"
+       }
+      },
+      "title": "接入会话",
+      "type": "Action.Submit"
+     },
+     {
+      "data": {
+       "msteams": {
+        "type": "imBack",
+        "value": "/approvals mute #268"
+       }
+      },
+      "title": "静音此会话",
+      "type": "Action.Submit"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Good",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "✅ ops 做完了",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         },
+         {
+          "isSubtle": true,
+          "size": "Small",
+          "spacing": "None",
+          "text": "Claude Code · robin-dev · ops/tools · 终端空闲 · #268",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "spacing": "Small",
+      "text": "staging 已经清空：04:50Z 起没有任何 Pod，job 1930 的沙箱和 job 1932 的 Pod 都没了。这两台节点还挂着，是否释放由集群那边决定，我没动。",
+      "type": "TextBlock",
+      "wrap": true
+     },
+     {
+      "id": "end-full-toggle",
+      "items": [
+       {
+        "color": "Accent",
+        "size": "Small",
+        "text": "全文 ▾",
+        "type": "TextBlock",
+        "weight": "Bolder",
+        "wrap": true
+       }
+      ],
+      "selectAction": {
+       "targetElements": [
+        "end-full"
+       ],
+       "title": "全文",
+       "type": "Action.ToggleVisibility"
+      },
+      "spacing": "Small",
+      "type": "Container"
+     },
+     {
+      "id": "end-full",
+      "isVisible": false,
+      "items": [
+       {
+        "spacing": "Small",
+        "text": "staging 已经清空：04:50Z 起没有任何 Pod，job 1930 的沙箱和 job 1932 的 Pod 都没了。这两台节点还挂着，是否释放由集群那边决定，我没动。\n\n重跑起来后，我只读观察三项：\n- 第一个测试的冷启动秒数；\n- 预读的结果文件 `weight_prefetch.json`；\n- 页缓存命中率。",
+        "type": "TextBlock",
+        "wrap": true
+       }
+      ],
+      "spacing": "Small",
+      "type": "Container"
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}
