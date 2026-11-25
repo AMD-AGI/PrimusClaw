@@ -1436,6 +1436,24 @@ const AGENT_TURN_SEEN_SQL = `SELECT COALESCE(MAX(GREATEST(COALESCE((w.params->'a
    WHERE w.user_id = $2 AND w.kind = 'remote' AND w.params->>'errand' = 'true'
      AND (w.params->>'session_id' = $1::text OR w.params->'agent_turn_seen_in' ? $1::text)`;
 
+/**
+ * The ends of the turns the agent took by itself on session `$1` (owner `$2`) not yet read, oldest first, at most `$5`, each with the
+ * `cmd_id` of the prompt whose turn ended last before it (`$3` `turn_end`, `$4` `user_prompt`). Only those after a seat task's prompt:
+ * one after anyone else's says nothing here, so it is never what a pass is spent on.
+ */
+const AGENT_TURN_ENDS_SQL = `SELECT x.id, x.cmd_id FROM (
+    SELECT e.id,
+           (SELECT u.data->>'cmd_id' FROM claw_remote_events t
+              JOIN claw_remote_events u ON u.session_id = t.session_id AND u.type = $4 AND u.data->>'cmd_seq' = t.data->>'cmd_seq'
+             WHERE t.session_id = e.session_id AND t.type = $3 AND t.id < e.id AND jsonb_typeof(t.data->'cmd_seq') = 'number'
+             ORDER BY t.id DESC LIMIT 1) AS cmd_id
+      FROM claw_remote_events e
+     WHERE e.session_id = $1::uuid AND e.type = $3 AND e.data->>'agent_initiated' = 'true' AND COALESCE(e.data->>'replay', '') <> 'true'
+       AND e.id > (${AGENT_TURN_SEEN_SQL})
+  ) x
+  WHERE x.cmd_id LIKE 'k:errand:%'
+  ORDER BY x.id LIMIT $5`;
+
 /** How many of a session's turns the agent took by itself one pass reads, and how much of each one's answer a message says. */
 const AGENT_TURNS_PER_PASS = 20;
 const AGENT_TURN_ANSWER_MAX = 1500;
@@ -1450,10 +1468,8 @@ const AGENT_TURN_ANSWER_MAX = 1500;
 async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice[]> {
   // Most posts bring none: looked at without a lock first.
   const any = (await db.query(
-    `SELECT 1 FROM claw_remote_events e
-      WHERE e.session_id = $1::uuid AND e.type = $3 AND e.data->>'agent_initiated' = 'true' AND e.id > (${AGENT_TURN_SEEN_SQL})
-      LIMIT 1`,
-    [sessionId, owner, REMOTE_EVENT_TURN_END],
+    `SELECT 1 FROM (${AGENT_TURN_ENDS_SQL}) x LIMIT 1`,
+    [sessionId, owner, REMOTE_EVENT_TURN_END, REMOTE_EVENT_USER_PROMPT, 1],
   )).rows.length > 0;
   if (!any) return [];
   return inTransaction(async (q) => {
@@ -1466,18 +1482,8 @@ async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice
         ORDER BY w.seq FOR UPDATE OF w`,
       [owner, sessionId],
     )).rows as Array<{ item_id: string; seq: number; board_state: string; params: ErrandParams; router_sid: string }>;
-    const seen = Number((await q(`SELECT (${AGENT_TURN_SEEN_SQL}) AS seen`, [sessionId, owner])).rows[0]?.seen) || 0;
-    const ends = (await q(
-      `SELECT e.id,
-              (SELECT u.data->>'cmd_id' FROM claw_remote_events t
-                 JOIN claw_remote_events u ON u.session_id = t.session_id AND u.type = $4 AND u.data->>'cmd_seq' = t.data->>'cmd_seq'
-                WHERE t.session_id = e.session_id AND t.type = $3 AND t.id < e.id AND jsonb_typeof(t.data->'cmd_seq') = 'number'
-                ORDER BY t.id DESC LIMIT 1) AS cmd_id
-         FROM claw_remote_events e
-        WHERE e.session_id = $1 AND e.id > $2 AND e.type = $3 AND e.data->>'agent_initiated' = 'true' AND COALESCE(e.data->>'replay', '') <> 'true'
-        ORDER BY e.id LIMIT $5`,
-      [sessionId, seen, REMOTE_EVENT_TURN_END, REMOTE_EVENT_USER_PROMPT, AGENT_TURNS_PER_PASS],
-    )).rows as Array<{ id: string; cmd_id: string | null }>;
+    const ends = (await q(AGENT_TURN_ENDS_SQL, [sessionId, owner, REMOTE_EVENT_TURN_END, REMOTE_EVENT_USER_PROMPT, AGENT_TURNS_PER_PASS]))
+      .rows as Array<{ id: string; cmd_id: string | null }>;
     if (!ends.length) return [];
     // A task named by a turn's prompt that is not among them now (moved to a new session of its own since): read by its id, so the
     // turn is still said as its word and is never passed over unsaid. Only one that no longer exists is.

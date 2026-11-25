@@ -1186,6 +1186,36 @@ describe("seat dispatch", { skip }, () => {
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_item_events WHERE item_id = $1 AND result->>'agent_initiated' = 'true'", [b.item_id]))[0].n, 1);
   });
 
+  test("D28 a moved task's late turn after many turns of nobody's task on a session with no task left on it is still read", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const b = await finished(alice, cid, s, "跑 sleep 60");
+    const bPrompt = (await w.q("SELECT data FROM claw_remote_events WHERE session_id = $1 AND type = 'user_prompt' ORDER BY id DESC LIMIT 1", [s.sid]))[0].data;
+    await w.q("UPDATE claw_work_items SET params = params || jsonb_build_object('session_id', gen_random_uuid()::text) WHERE item_id = $1", [b.item_id]);
+    // Recorded with no pass in between (as from one late batch): a chat's prompt and many turns of the agent's own after it, then the
+    // task's prompt once more, its end, and the agent's own turn after that.
+    const own = { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true };
+    const raw: Array<[number, string, Recorded]> = [
+      [store.userPromptSeq(900), "user_prompt", { text: "chat", cmd_id: "k:chat-9", cmd_seq: 900, client: "web", by: "claw" }],
+      [200000, "turn_end", { stopReason: "end_turn", cmd_id: "k:chat-9", cmd_seq: 900 }],
+      ...Array.from({ length: 25 }, (_, i): [number, string, Recorded] => [200001 + i, "turn_end", own]),
+      [store.userPromptSeq(901), "user_prompt", { ...bPrompt, cmd_seq: 901 }],
+      [200100, "turn_end", { stopReason: "end_turn", cmd_id: bPrompt.cmd_id, cmd_seq: 901 }],
+      [200101, "agent_message_chunk", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "late-many-A0B1" } } }],
+      [200102, "turn_end", own],
+    ];
+    for (const [seq, type, data] of raw) {
+      await w.q("INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data) VALUES ($1, $2, $3, NOW(), $4::jsonb)", [s.sid, seq, type, JSON.stringify(data)]);
+    }
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    const late = (await notices()).filter((n) => /late-many-A0B1/.test(n.text));
+    assert.equal(late.length, 1, JSON.stringify(await notices()));
+    assert.equal(late[0]!.remote.item_seq, b.seq);
+  });
+
   test("D29 the agent's own turn with a command still running keeps the seat busy past the quiet; once the command is done, quiet frees it", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox");
