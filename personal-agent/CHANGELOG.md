@@ -50,8 +50,8 @@ renderer, as Teams' has) (#936). Everything else is additive: `remoteView.termin
 - `@primusclaw/personal-agent`, `@primusclaw/personal-agent-teams`: the end of a terminal turn that ended while nobody was
   at that terminal comes as a card. Its title is the conversation's name (as Claude Code's session list shows it, else its
   title) with its status (finished, or stopped with an error and why); one small line names the tool, the machine, the
-  folder and the item number. Then what the agent did, in whole sentences from the start of its last answer, the end
-  of that answer (its last 2000 characters at most) folded under _Show all_, and buttons that send `/agent attach <ref>` (for a conversation its connector lists)
+  folder and the item number. Then what the agent did, in whole sentences from the start of its last answer (from its
+  summary block, else its last paragraph, when the connector had to cut it), the end of that answer (its last 2000 characters at most) folded under _Show all_, and buttons that send `/agent attach <ref>` (for a conversation its connector lists)
   and `/approvals mute #<item>` as the person's own message. A chat that shows no cards gets Claw's words, as before (#936).
 - `@primusclaw/personal-agent`: when the end Claw pushes stands for a run of turns nobody typed, the card first says the
   earlier turn that asked the person something, or that failed, in whole sentences (or how many did, when their words are
