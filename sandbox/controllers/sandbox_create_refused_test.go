@@ -86,11 +86,18 @@ func TestWebhookDeniedPodFailsTheSandboxAtOnce(t *testing.T) {
 	}
 	podCreates := 0
 	transient := false
+	getFails := false
 	c := fake.NewClientBuilder().
 		WithScheme(Scheme).
 		WithStatusSubresource(&sandboxv1alpha1.Sandbox{}).
 		WithObjects(sandbox).
 		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.Pod); ok && getFails {
+					return k8serrors.NewServiceUnavailable("apiserver restarting")
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			},
 			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 				if _, ok := obj.(*corev1.Pod); ok {
 					podCreates++
@@ -135,7 +142,22 @@ func TestWebhookDeniedPodFailsTheSandboxAtOnce(t *testing.T) {
 	require.NotNil(t, failed)
 	require.Equal(t, sandboxv1alpha1.SandboxReasonPodCreateRefused, failed.Reason)
 
+	// A Pod that cannot be read this time is no reason to forget the refusal
+	// of this spec and send it to the webhook again.
+	getFails = true
+	_, err = r.Reconcile(t.Context(), req)
+	require.Error(t, err)
+	getFails = false
+	require.NoError(t, c.Get(t.Context(), req.NamespacedName, got))
+	failed = meta.FindStatusCondition(got.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	require.NotNil(t, failed)
+	require.Equal(t, sandboxv1alpha1.SandboxReasonPodCreateRefused, failed.Reason)
+	_, err = r.Reconcile(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, 1, podCreates)
+
 	// A new spec may be admitted, so it is tried.
+	require.NoError(t, c.Get(t.Context(), req.NamespacedName, got))
 	got.Generation = 2
 	require.NoError(t, c.Update(t.Context(), got))
 	_, err = r.Reconcile(t.Context(), req)
