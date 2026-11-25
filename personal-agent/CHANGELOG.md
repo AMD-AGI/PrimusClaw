@@ -15,10 +15,36 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
-## Unreleased
+## 0.14.0
+
+A minor release, because two exports of core change incompatibly: in `@primusclaw/personal-agent`,
+`remoteDomain.terminalClosedLine` takes the bot's name as a second argument, and `remoteView.remoteText`'s
+`terminalClosed` is a function of the bot's name instead of a string (#923). No plugin port (core's `src/plugins/`)
+changed, and the store is unchanged: nothing to do for a deployment of the published packages. A remote agent's answer
+that streams in a 1:1 chat comes whole below what the chat said meanwhile, never begun above it (#922); starting a session
+from an agent's window says the chat is in it only once the agent has started, a slip of `/agents` shows the agents card,
+and the lines that say a chat's messages go back to the bot use the bot's name (#923).
+
+**Claw:** these work with any Claw and any connector.
+
+**Breaking for code that uses core's exports directly:** In `@primusclaw/personal-agent`,
+`remoteDomain.terminalClosedLine(lang)` is `terminalClosedLine(lang, bot)`, and `remoteView.remoteText`'s entry
+`terminalClosed` is `({ bot }) => string` instead of a string (#923). Everything else is additive: `isAgentsSlip` (#923),
+`postingAfter` and `Chat.through` (#922), and `RemoteAgents.goesOn` (#922).
 
 ### Fixed
 
+- `@primusclaw/personal-agent`: starting a session on a remote agent from a chat that is the agent's own window (the
+  agents card's New session, or `/agent new`) now says "Starting <agent> on <machine> in <folder>…" at once, and that the
+  chat's messages go to the agent (with the unattended warning) only once the agent has started. Before, the switch and
+  the warning were said at the tap, and a start the connector then refused took them back a second later. A start that
+  fails names the folder it was asked for ("could not start in `/path`: that folder does not exist on that machine: pick
+  one that exists there, or create it there first") and says that the messages still go to the bot (#923).
+- `@primusclaw/personal-agent`: a slip of `/agents` (`/agnets`, `/agens`, `/agentss`, `／agents`, `/agents.`) shows the
+  agents card as `/agents` does; it never starts or attaches a session and no longer goes to the assistant as words (#923).
+- `@primusclaw/personal-agent`: the lines that say a chat's messages go back to the bot (a session that could not start,
+  was closed, ended while idle, or was closed in its terminal) use the bot's name in this deployment
+  (`PERSONAL_AGENT_BOT_NAME`), as the rest of the remote-agent lines do, instead of a fixed "PrimusClaw" (#923).
 - `@primusclaw/personal-agent`: a remote agent's answer in a 1:1 chat that streams is never read from its middle. A stream's
   message stays where the stream opened, under the person's message it answers; when the person wrote again while the agent
   worked, sent a command (`/agent sessions`) or pressed a button whose outcome is said (or the chat was told something
@@ -26,7 +52,7 @@ feature needs), follow the repository's versioning rules in the root [CHANGELOG.
   bottom, under the queued message's notice, so the first part looked lost. Once the chat goes on below the stream, nothing of the agent's goes into
   the bubble: a status-only bubble floats on until the turn ends, one that already shows words is closed at once, and either
   way it ends with "The answer follows below, as new messages."; the whole answer then comes below what was said since, every
-  part as a new message, in order. When the chat goes on while the answer is going out, the whole answer is sent again below.
+  part as a new message, in order. When the chat goes on while the answer is going out, the whole answer is sent again below (#922).
 
 ## 0.13.0
 
@@ -82,18 +108,6 @@ over every key of `ViewMap` needs its renderer, as Teams' has) (#875), and two m
   Needs a Claw that sends `seat_dispatch` cards; with an older Claw nothing changes.
 
 ### Fixed
-
-- `@primusclaw/personal-agent`: starting a session on a remote agent from a chat that is the agent's own window (the
-  agents card's New session, or `/agent new`) now says "Starting <agent> on <machine> in <folder>…" at once, and that the
-  chat's messages go to the agent (with the unattended warning) only once the agent has started. Before, the switch and
-  the warning were said at the tap, and a start the connector then refused took them back a second later. A start that
-  fails names the folder it was asked for ("could not start in `/path`: that folder does not exist on that machine: pick
-  one that exists there, or create it there first") and says that the messages still go to the bot.
-- `@primusclaw/personal-agent`: a slip of `/agents` (`/agnets`, `/agens`, `/agentss`, `／agents`, `/agents.`) shows the
-  agents card as `/agents` does; it never starts or attaches a session and no longer goes to the assistant as words.
-- `@primusclaw/personal-agent`: the lines that say a chat's messages go back to the bot (a session that could not start,
-  was closed, ended while idle, or was closed in its terminal) use the bot's name in this deployment
-  (`PERSONAL_AGENT_BOT_NAME`), as the rest of the remote-agent lines do, instead of a fixed "PrimusClaw".
 
 - `@primusclaw/personal-agent`: in a group chat with no language set (or set to follow the asker), a message that says no
   language of its own ("help", the bare @mention, `/whoami`, "ok #3") is answered in English. It was answered in the
