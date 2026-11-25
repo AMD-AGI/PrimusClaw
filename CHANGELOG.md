@@ -306,7 +306,7 @@ release version, and its `appVersion` stays `latest`.
   keeping its alias, role and auto dispatch; where that conversation already had a seat holding less of the user's words, the two become
   one, with the other's tasks (when both hold the user's words, the next session there is tried; a folder's seat none is left for
   takes no task, `seat_unbound`, rather than a guessed session). A task for a seat takes over that very conversation (or goes into the session holding it), never a new
-  session in its folder (`new_session` for such a seat is refused, `seat_new_session`). When the machine says the conversation a task went to take over is gone (`unknown_session` for the session opened for that takeover; the same reason for a session open through Claw only closes that session), the task fails saying so, and the seat is
+  session in its folder (`new_session` for such a seat is refused, `seat_new_session`). When the machine refuses to start the session that was to take over (or type into) the seat's conversation because that conversation is not there (`unknown_session` as that session's first word; the same reason later, for a session the machine no longer knows, only closes that session), the task fails saying so, and the seat is
   `gone` in the roster and refused (`seat_gone`) until its machine lists that conversation again; one a session open through Claw held,
   closed on a machine where no agent takes conversations over, is `gone` too. Prompts `router-seats-v3`, `router-dispatch-v2`.
 - Claw, Agent Sandbox: a sandbox template says how its sandbox mounts its workspace's storage with `workspaceStorage`:

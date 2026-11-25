@@ -377,6 +377,10 @@ describe("seat dispatch", { skip }, () => {
     assert.ok(it.params.session_id);
     const opened = (await w.q("SELECT payload FROM claw_remote_commands WHERE connector_id = $1 AND type = 'session.new'", [cid]))[0];
     assert.equal(opened?.payload?.resume_ref, "11111111-1111-4111-8111-111111111111", JSON.stringify(opened));
+    // The conversation left the machine before its connector opened it: the start is refused, and the seat is gone.
+    await events("alice", cid, String(it.params.session_id), [["session_closed", { reason: "unknown_session" }]]);
+    assert.equal((await item(out.item_id)).last_report_kind, "failed");
+    assert.equal((await seats.rosterOf("alice")).find((s) => s.seat_id === row.seat_id)!.state, "gone");
   });
 
   test("D6 a task waiting for its machine fails after a day, said once, and the router hears of it", async () => {
@@ -1452,7 +1456,6 @@ describe("seat dispatch", { skip }, () => {
     assert.equal(next.params.session_id, sidA, "into the session that holds seat 1's conversation");
     assert.equal((await opened()).length, 0, "no new session (the ones before were collected)");
     assert.deepEqual((await seats.rosterOf("alice")).filter((x) => x.seat_id === s1).map((x) => x.sessions), [[sidA]]);
-    assert.equal(next.params.takeover_session, undefined, "a prompt into a session open through Claw takes nothing over");
     // The machine no longer knows that session (closed or cleaned up there): only that session closed. Seat 1's conversation is still
     // on the machine, so the seat is not gone and nobody is told it was deleted.
     await events("alice", cid, sidA, [["session_closed", { reason: "unknown_session" }]]);
@@ -1466,7 +1469,6 @@ describe("seat dispatch", { skip }, () => {
     const c = await create(await userTurn(alice, "让 s3 整理"), `seat:${s3}`, "整理 c");
     assert.equal(c.dispatch, "sent");
     const sidC = String((await item(c.item_id)).params.session_id);
-    assert.equal((await item(c.item_id)).params.takeover_session, sidC, "the session opened to take seat 3's conversation over");
     await events("alice", cid, sidC, [["session_closed", { reason: "unknown_session" }]]);
     const failed = await item(c.item_id);
     assert.equal(failed.last_report_kind, "failed", JSON.stringify(failed));
@@ -1479,6 +1481,16 @@ describe("seat dispatch", { skip }, () => {
     await w.q("UPDATE claw_devenv_seats SET gone_at = NOW() - interval '1 minute' WHERE seat_id = $1", [s3]);
     await beat("alice", cid, [claude(), conversations([1, 2, 3])]);
     await seats.syncSeats("alice");
+    assert.notEqual((await seats.rosterOf("alice")).find((x) => x.seat_id === s3)!.state, "gone");
+    // A takeover refused for another reason (another session holds that conversation): its prompt, reaching a session the machine
+    // never started, is answered `unknown_session` too; that says nothing about the conversation, and the seat is not gone.
+    const d = await create(await userTurn(alice, "让 s3 再整理一次"), `seat:${s3}`, "整理 d");
+    assert.equal(d.dispatch, "sent", JSON.stringify(d));
+    const sidD = String((await item(d.item_id)).params.session_id);
+    assert.notEqual(sidD, sidC);
+    await events("alice", cid, sidD, [["session_closed", { reason: "already_attached" }], ["session_closed", { reason: "unknown_session" }]]);
+    assert.equal((await item(d.item_id)).last_report_kind, "failed");
+    assert.doesNotMatch((await notices()).filter((n) => n.remote.item_seq === d.seq).map((n) => n.text).join("\n"), /不存在/);
     assert.notEqual((await seats.rosterOf("alice")).find((x) => x.seat_id === s3)!.state, "gone");
   });
 

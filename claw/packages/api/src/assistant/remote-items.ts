@@ -1608,11 +1608,6 @@ export interface ErrandParams extends RemoteParams {
   report_due?: { kind: "answer" | "failed"; summary: string; generation: number };
   /** The instructions `work_send` let through to it in one router turn (`task`), by their words' key (`seat-dispatch.ts`). */
   turn_sends?: { task: string; keys: string[] };
-  /**
-   * The session its latest prompt opened to take the seat's conversation over (`noteErrandPrompt`): only there does the connector's
-   * `unknown_session` mean that conversation is gone. Anywhere else it means the machine no longer knows a session open through Claw.
-   */
-  takeover_session?: string;
 }
 
 /** How much of the agent's answer an errand's report carries (its end). */
@@ -1834,8 +1829,6 @@ function errandOwns(e: MovingEvent, seqs: ReadonlySet<number>, running: boolean)
 
 export interface NoteErrandPrompt {
   owner: string; itemId: string; sessionId: string; connectorId: string; agentId: string; machine: string; cmdSeq: number; since?: number;
-  /** The prompt went into a session opened to take the seat's conversation over (`resume_ref`, not a terminal). */
-  takeover?: boolean;
 }
 
 /**
@@ -1900,11 +1893,9 @@ export async function noteErrandPrompt(p: NoteErrandPrompt): Promise<void> {
       session_id: p.sessionId, connector_id: p.connectorId, agent_id: p.agentId, machine: p.machine,
       open_cmd_seqs: same ? [...was.open_cmd_seqs!, p.cmdSeq] : [p.cmdSeq], open_turns: same ? (Number(was.open_turns) || 0) + 1 : 1,
       ...(same ? {} : { last_event_id: since, waiting: [], dispatched_at: new Date().toISOString() }),
-      ...(p.takeover ? { takeover_session: p.sessionId } : {}),
     };
     await q(
-      `UPDATE claw_work_items SET params = (params - 'queued' - 'queued_at' - 'queue_expires_at' - 'progress_told_at' - 'progress_told_h' - 'offline_told'
-                - 'takeover_session') || $2::jsonb,
+      `UPDATE claw_work_items SET params = (params - 'queued' - 'queued_at' - 'queue_expires_at' - 'progress_told_at' - 'progress_told_h' - 'offline_told') || $2::jsonb,
               board_state = CASE WHEN board_state = 'needs_you' AND last_report_kind = 'waiting' THEN board_state ELSE 'in_progress' END,
               updated_at = NOW()
         WHERE item_id = $1`,
@@ -2107,15 +2098,22 @@ async function applyErrands(owner: string, sessionId: string): Promise<ErrandPas
           }
         } else if (e.type === REMOTE_EVENT_SESSION_CLOSED) {
           if (!running && !p.waiting.length) continue;
-          if (p.seat_id && flat(e.data.reason, 40) === "unknown_session" && p.takeover_session === sessionId) {
-            // The seat's conversation, which this task went to take over, is no longer on its machine: the seat is gone (until its
-            // machine lists that conversation again), and the user is told plainly. (The same reason for a prompt into a session open
-            // through Claw that the machine no longer knows says nothing about the conversation: that session closed, below.)
-            await q(
-              `UPDATE claw_devenv_seats SET gone_at = NOW(), updated_at = NOW()
-                WHERE seat_id = $1 AND owner_user_id = $2 AND conversation_ref IS NOT NULL AND gone_at IS NULL`,
-              [p.seat_id, owner],
-            );
+          // `unknown_session` as the first word of a session is its start refused: the conversation this task went to take over (or type
+          // into) is not on the machine. Said after the session started, or after it closed for another reason, it only answers a command
+          // for a session the machine no longer knows (a prompt into the session open through Claw that holds the seat's conversation,
+          // after the machine closed or cleaned it up): that session closed, and nothing is known about the conversation.
+          const refusedStart = p.seat_id && flat(e.data.reason, 40) === "unknown_session" && !(await q(
+            `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND id < $2 AND type IN ('session_started', 'session_resumed', $3) LIMIT 1`,
+            [sessionId, e.id, REMOTE_EVENT_SESSION_CLOSED],
+          )).rows.length;
+          // (Only a seat that is one conversation is gone so; a folder's seat takes over none.)
+          const gone = refusedStart && (await q(
+            `UPDATE claw_devenv_seats SET gone_at = COALESCE(gone_at, NOW()), updated_at = NOW()
+              WHERE seat_id = $1 AND owner_user_id = $2 AND conversation_ref IS NOT NULL RETURNING seat_id`,
+            [p.seat_id, owner],
+          )).rows.length > 0;
+          if (gone) {
+            // The seat is gone (until its machine lists that conversation again), and the user is told plainly.
             fail(`gone:${e.id}`, p.lang === "zh"
               ? "这个工位的会话在机器上已经不存在了（被删除，或太久没用无法恢复），没有发出；这个工位不能再派活，可以交给别的工位或沙箱"
               : "that seat's conversation is no longer on its machine (deleted, or too old to resume), so it was not sent; the seat takes no more tasks: hand it to another seat or the sandbox");

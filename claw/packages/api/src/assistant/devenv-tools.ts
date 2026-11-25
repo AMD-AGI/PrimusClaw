@@ -1266,8 +1266,6 @@ export async function executeSend(
       await noteErrandPrompt({
         owner: userId, itemId: opts.errandItemId, sessionId: target, connectorId: plan.connector_id, agentId: plan.agent_id, machine: plan.machine,
         since, cmdSeq: Number(out.row.cmd_seq),
-        // (A session opened to take a conversation over, not typed into a terminal: its refusal says that conversation is gone.)
-        takeover: fresh && !!plan.resume_ref && plan.terminal !== true,
       });
     } else if (out.status === "queued") {
       await noteRemotePrompt({
