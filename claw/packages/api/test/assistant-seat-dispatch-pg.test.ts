@@ -1037,7 +1037,7 @@ describe("seat dispatch", { skip }, () => {
     assert.doesNotMatch(late[0]!.text, /已放到后台/, "only what it said in that turn");
     const it = await item(long.item_id);
     assert.deepEqual([it.board_state, it.outcome, it.summary], ["done", "answered", "long-0357A978"]);
-    assert.equal(it.params.agent_turn_seen > 0, true);
+    assert.equal(it.params.agent_turn_seen_in[s.sid] > 0, true);
     // The next task's prompt is out; another own turn of the agent's now (its prompt took it over) is still the long task's word.
     await collect(cid);
     await events("alice", cid, s.sid, [chunk("又补一句"), ["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true }]]);
@@ -1167,6 +1167,23 @@ describe("seat dispatch", { skip }, () => {
     assert.equal(late[0]!.remote.item_seq, b.seq);
     await events("alice", cid, s.sid, [chunk("ok")]);
     assert.equal((await notices()).filter((n) => /late-B-91C2/.test(n.text)).length, 1, "said once");
+  });
+
+  test("D28 the agent's own turn after the only task of its session, moved to a new session since, is still said once", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const b = await finished(alice, cid, s, "跑 sleep 60");
+    await events("alice", cid, s.sid, [chunk("late-only-5D1E")]);
+    await w.q("UPDATE claw_work_items SET params = params || jsonb_build_object('session_id', gen_random_uuid()::text) WHERE item_id = $1", [b.item_id]);
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true, ended_by: "result" }]]);
+    const late = (await notices()).filter((n) => /late-only-5D1E/.test(n.text));
+    assert.equal(late.length, 1, JSON.stringify(await notices()));
+    assert.equal(late[0]!.remote.item_seq, b.seq);
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    assert.equal((await notices()).filter((n) => /late-only-5D1E/.test(n.text)).length, 1, "said once");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_item_events WHERE item_id = $1 AND result->>'agent_initiated' = 'true'", [b.item_id]))[0].n, 1);
   });
 
   test("D29 the agent's own turn with a command still running keeps the seat busy past the quiet; once the command is done, quiet frees it", async () => {

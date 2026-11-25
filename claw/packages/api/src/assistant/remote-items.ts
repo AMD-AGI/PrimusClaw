@@ -1361,8 +1361,10 @@ export interface ErrandParams extends RemoteParams {
    */
   approved?: "auto" | "card";
   approved_unattended?: boolean;
-  /** The last turn its agent took by itself that was said as a late word of this task, or of another of its session (`applyAgentTurns`). */
+  /** The last turn its agent took by itself that was read here (said as a late word of this task, or of another of its session), as kept before `agent_turn_seen_in`: read only, dropped once that is written. */
   agent_turn_seen?: number;
+  /** The same by session: how far it read the agent's own turns of each session it was on (`applyAgentTurns`). */
+  agent_turn_seen_in?: Record<string, number>;
   /** An end recorded and not yet reported (`ingestReport` runs after the commit; the sweep retries what it missed). */
   report_due?: { kind: "answer" | "failed"; summary: string; generation: number };
   /** The instructions `work_send` let through to it in one router turn (`task`), by their words' key (`seat-dispatch.ts`). */
@@ -1424,6 +1426,16 @@ export function errandNotice(kind: ErrandNoticeKind, p: Partial<ErrandParams>, s
  */
 const agentInitiated = (e: MovingEvent): boolean => e.type === REMOTE_EVENT_TURN_END && e.data.agent_initiated === true;
 
+/**
+ * How far a session's turns of the agent's own were read (`$1` the session, `$2` the owner): the furthest any seat task noted for it
+ * (`agent_turn_seen_in`), or, from before that was kept by session, the furthest a task still on it noted (`agent_turn_seen`).
+ */
+const AGENT_TURN_SEEN_SQL = `SELECT COALESCE(MAX(GREATEST(COALESCE((w.params->'agent_turn_seen_in'->>$1::text)::bigint, 0),
+      CASE WHEN w.params->>'session_id' = $1::text THEN COALESCE((w.params->>'agent_turn_seen')::bigint, 0) ELSE 0 END)), 0)
+    FROM claw_work_items w
+   WHERE w.user_id = $2 AND w.kind = 'remote' AND w.params->>'errand' = 'true'
+     AND (w.params->>'session_id' = $1::text OR w.params->'agent_turn_seen_in' ? $1::text)`;
+
 /** How many of a session's turns the agent took by itself one pass reads, and how much of each one's answer a message says. */
 const AGENT_TURNS_PER_PASS = 20;
 const AGENT_TURN_ANSWER_MAX = 1500;
@@ -1433,20 +1445,20 @@ const AGENT_TURN_ANSWER_MAX = 1500;
  * that): each one's answer is said once, as a late word of the task whose turn ended last before it (the prompt that turn's end names,
  * `cmd_id` `k:errand:<item>:…`), and kept on that item, whatever that task is doing now (opened again and waiting for the seat,
  * which that very turn keeps busy, or sent to a new session). A turn with no answer text, or one after a prompt that was no task's,
- * says nothing. Read from the session's events after the last one any task of the session took (`agent_turn_seen`).
+ * says nothing. Read from the session's events after the last one any task read of it (`agent_turn_seen_in`).
  */
 async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice[]> {
   // Most posts bring none: looked at without a lock first.
   const any = (await db.query(
     `SELECT 1 FROM claw_remote_events e
-      WHERE e.session_id = $1::uuid AND e.type = $3 AND e.data->>'agent_initiated' = 'true'
-        AND e.id > (SELECT COALESCE(MAX((w.params->>'agent_turn_seen')::bigint), 0) FROM claw_work_items w
-                     WHERE w.user_id = $2 AND w.kind = 'remote' AND w.params->>'errand' = 'true' AND w.params->>'session_id' = $1::text)
+      WHERE e.session_id = $1::uuid AND e.type = $3 AND e.data->>'agent_initiated' = 'true' AND e.id > (${AGENT_TURN_SEEN_SQL})
       LIMIT 1`,
     [sessionId, owner, REMOTE_EVENT_TURN_END],
   )).rows.length > 0;
   if (!any) return [];
   return inTransaction(async (q) => {
+    // One pass a session at a time (the tasks that keep its cursor can all have moved on to other sessions).
+    await q("SELECT pg_advisory_xact_lock(hashtext('claw_errand_agent_turns'), hashtext($1))", [sessionId]);
     const items = (await q(
       `SELECT w.item_id, w.seq, w.board_state, w.params, a.session_id AS router_sid
          FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id
@@ -1454,8 +1466,7 @@ async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice
         ORDER BY w.seq FOR UPDATE OF w`,
       [owner, sessionId],
     )).rows as Array<{ item_id: string; seq: number; board_state: string; params: ErrandParams; router_sid: string }>;
-    if (!items.length) return [];
-    const seen = Math.max(0, ...items.map((i) => Number(i.params.agent_turn_seen) || 0));
+    const seen = Number((await q(`SELECT (${AGENT_TURN_SEEN_SQL}) AS seen`, [sessionId, owner])).rows[0]?.seen) || 0;
     const ends = (await q(
       `SELECT e.id,
               (SELECT u.data->>'cmd_id' FROM claw_remote_events t
@@ -1482,10 +1493,10 @@ async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice
       )).rows as typeof items);
     }
     const notices: Notice[] = [];
-    // How far the session's turns of the agent's own were read: kept on the task sent there last.
+    // How far the session's turns of the agent's own were read: kept on the task sent there last (when one still is there).
     const latest = items.filter((i) => i.params.session_id === sessionId)
-      .sort((a, b) => String(a.params.dispatched_at ?? "").localeCompare(String(b.params.dispatched_at ?? "")) || a.seq - b.seq).at(-1)!;
-    const touched = new Map<string, number>([[latest.item_id, Number(ends.at(-1)!.id)]]);
+      .sort((a, b) => String(a.params.dispatched_at ?? "").localeCompare(String(b.params.dispatched_at ?? "")) || a.seq - b.seq).at(-1);
+    const touched = new Map<string, number>(latest ? [[latest.item_id, Number(ends.at(-1)!.id)]] : []);
     for (const end of ends) {
       const id = Number(end.id);
       // Whose it is: the task the prompt of the last turn that ended before it was sent for. One that follows anyone else's prompt (one
@@ -1514,8 +1525,15 @@ async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice
         remote: { kind: "done", session_id: sessionId, machine: p.machine, agent: p.agent_id, item_seq: Number(item.seq), ...(seat ? { seat } : {}) },
       });
     }
+    // Each task that read them keeps how far, by session (`agent_turn_seen_in`): one moved to another session since still holds this one's.
     for (const [itemId, id] of touched) {
-      await q("UPDATE claw_work_items SET params = params || jsonb_build_object('agent_turn_seen', $2::bigint) WHERE item_id = $1", [itemId, id]);
+      await q(
+        `UPDATE claw_work_items
+            SET params = (params - 'agent_turn_seen')
+                  || jsonb_build_object('agent_turn_seen_in', COALESCE(params->'agent_turn_seen_in', '{}'::jsonb) || jsonb_build_object($3::text, $2::bigint))
+          WHERE item_id = $1`,
+        [itemId, id, sessionId],
+      );
     }
     return notices;
   });
