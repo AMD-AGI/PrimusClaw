@@ -34,7 +34,8 @@
  *       one the machine collected before it could be noted is noted all the same
  *   D24 two different instructions at once to a finished task: it is opened once, and both reach the machine
  *   D25 calls to one task waiting for each other hold no main-pool connection while they wait (the lock is on the lock pool); a task
- *       opened again by another call after this one read it is not opened over it (refused, nothing sent, the words free again)
+ *       opened again by another call after this one read it is not opened over it (refused, nothing sent, the words free again), nor
+ *       when that call's lock connection dropped before it sent; one left opened and unsent by a call that ended goes again later
  *   D26 a turn the seat's agent takes by itself after a task ended (a command it put in the background finished): the seat is busy
  *       while it runs; its end (`agent_initiated`) frees the seat, the queue goes on, and its answer is said once as a late word of
  *       that task (never of the next one); from an older connector, which never ends it, the seat is free once it has been quiet
@@ -1004,6 +1005,70 @@ describe("seat dispatch", { skip }, () => {
     assert.equal((await prompted(cid)).length, 0, "nothing was sent");
     assert.equal((await item(done.item_id)).board_state, "done", "and it was not opened again");
     assert.equal(((await tools.workSend(turn, { item_id: String(done.item_id), text: "补一节安装" })) as Recorded).dispatch, "sent");
+  });
+
+  test("D25 a call whose lock connection drops between reopening a finished task and sending it: a second call does not open it over the first", async () => {
+    const { db } = await import("../src/infra/db.js");
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/docs", { alias: "文档台", role: "负责文档", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid, s, "整理文档");
+    const gen = Number(done.generation);
+    const turn = await userTurn(alice, "补一节安装，再补一节升级");
+    const waiters = async (n: number): Promise<void> => {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        if ((await w.q("SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"))[0].n >= n) return;
+        assert.ok(Date.now() < deadline, `fewer than ${n} calls reached a lock`);
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    };
+    // The seat's lock is held: the first call opens the task again and then waits to send it.
+    const holder = await db.pool.connect();
+    const seatKey = `claw-seat-dispatch:${s.seatId}`;
+    await holder.query("SELECT pg_advisory_lock(hashtext($1))", [seatKey]);
+    const holderPid = Number((await holder.query("SELECT pg_backend_pid() AS pid")).rows[0].pid);
+    let a: Promise<Recorded> | undefined;
+    let b: Promise<{ code: string }> | undefined;
+    try {
+      a = tools.workSend(turn, { item_id: String(done.item_id), text: "补一节安装" }) as Promise<Recorded>;
+      a.catch(() => undefined);
+      await waiters(1);
+      const open = await item(done.item_id);
+      assert.deepEqual([open.board_state, Number(open.generation)], ["in_progress", gen + 1], "the first call opened it again");
+      b = refusal(tools.workSend(turn, { item_id: String(done.item_id), text: "补一节升级" }));
+      b.catch(() => undefined);
+      await waiters(2);
+      // The first call's lock connection drops: the server lets the second call in.
+      const lockers = await w.q(
+        "SELECT DISTINCT pid FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid <> $1", [holderPid]);
+      assert.equal(lockers.length, 1, JSON.stringify(lockers));
+      await w.q("SELECT pg_terminate_backend($1)", [lockers[0].pid]);
+      assert.equal((await b).code, "item_changed", "the second call is refused rather than opening it over the first");
+    } finally {
+      await holder.query("SELECT pg_advisory_unlock(hashtext($1))", [seatKey]);
+      holder.release();
+    }
+    assert.equal((await a).dispatch, "sent");
+    const sent = await prompted(cid);
+    assert.equal(sent.length, 1, JSON.stringify(sent));
+    assert.ok(JSON.stringify(sent).includes("补一节安装"), "the first call's instruction is the one that went");
+    const after = await item(done.item_id);
+    assert.deepEqual([Number(after.generation), after.params.brief], [gen + 1, "补一节安装"]);
+  });
+
+  test("D25 a task left opened again and unsent by a call that ended is opened again once that is stale", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/docs", { alias: "文档台", role: "负责文档", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid, s, "整理文档");
+    // As a reopening whose process went away before sending would leave it, three minutes ago.
+    await w.q(`UPDATE claw_work_items SET board_state = 'in_progress', outcome = NULL, closed_at = NULL, generation = generation + 1,
+                 params = (params - 'dispatched_at') || jsonb_build_object('open_cmd_seqs', '[]'::jsonb, 'reopened_at', NOW() - interval '3 minutes')
+               WHERE item_id = $1`, [String(done.item_id)]);
+    const out = (await tools.workSend(await userTurn(alice, "补一节安装"), { item_id: String(done.item_id), text: "补一节安装" })) as Recorded;
+    assert.equal(out.dispatch, "sent", JSON.stringify(out));
+    assert.equal((await prompted(cid)).length, 1);
   });
 
   test("D26 a turn the agent takes by itself after a task: busy while it runs, its end frees the seat and is said as a late word of that task", async () => {

@@ -789,7 +789,8 @@ async function withSeatSendLock<T>(itemId: string, fn: () => Promise<T>): Promis
     throw err;
   }
   // Taken on a connection that has since gone is not held (the server released it with the backend): nothing is done under it. A
-  // loss after this point is not seen by the call; the task's reopening checks its generation (`reopenErrand`) for that.
+  // loss after this point is not seen by the call: a second call may then come in, and the task's reopening refuses to open it over
+  // the first (`reopenErrand`: its generation, and a reopening still under way).
   const lost = connectionLost(client);
   if (lost) {
     client.release(lost);
@@ -928,6 +929,12 @@ interface ErrandBefore {
   pending_question: string | null; summary: string; params: Record<string, unknown>;
 }
 
+/**
+ * How long a task opened again but not yet sent (nor queued, nor put back) is taken as another call's reopening still under way. Longer
+ * than that, it is one whose call ended without finishing (its process gone), and it is opened again as an ended one.
+ */
+const REOPEN_IN_FLIGHT_MS = 120_000;
+
 /** The task was opened again (a new generation) since the caller read it: its reopening is not done twice. */
 class ReopenedMeanwhile extends ToolRefused {
   constructor() {
@@ -944,18 +951,25 @@ async function reopenErrand(
   q: Querier, itemId: string, text: string, newSession: boolean, approved: { by: "auto" } | { by: "card"; unattended: boolean },
   generation?: number,
 ): Promise<ErrandBefore> {
-  const { generation: was, ...before } = (await q(
-    "SELECT generation, board_state, outcome, closed_at, last_report_kind, pending_question, summary, params FROM claw_work_items WHERE item_id = $1 FOR UPDATE",
-    [itemId],
-  )).rows[0] as Omit<ErrandBefore, "generation"> & { generation: number };
+  const { generation: was, in_flight: inFlight, ...before } = (await q(
+    `SELECT generation, board_state, outcome, closed_at, last_report_kind, pending_question, summary, params,
+            (board_state <> 'done' AND NOT (params ? 'queued') AND NOT (params ? 'dispatched_at')
+              AND jsonb_array_length(COALESCE(params->'open_cmd_seqs', '[]'::jsonb)) = 0
+              AND (params->>'reopened_at')::timestamptz > NOW() - make_interval(secs => $2::float8 / 1000)) AS in_flight
+       FROM claw_work_items WHERE item_id = $1 FOR UPDATE`,
+    [itemId, REOPEN_IN_FLIGHT_MS],
+  )).rows[0] as Omit<ErrandBefore, "generation"> & { generation: number; in_flight: boolean };
   if (generation !== undefined && Number(was) !== generation) throw new ReopenedMeanwhile();
+  // Opened again just now and not sent yet: another call's reopening still under way (its lock lost with its connection, else this one
+  // would still be waiting for it). Not opened over it, which would replace its instruction before either went.
+  if (generation !== undefined && inFlight) throw new ReopenedMeanwhile();
   const reopened = (await q(
     `UPDATE claw_work_items
         SET board_state = 'in_progress', outcome = NULL, closed_at = NULL, last_report_kind = 'progress', pending_question = NULL, summary = '',
             generation = generation + 1,
             params = (params - 'report_due' - 'progress' - 'progress_told_at' - 'progress_told_h' - 'offline_told' - 'new_session' - 'dispatched_at' - 'queued' - 'queued_at'
                        - 'approved' - 'approved_unattended')
-                     || $2::jsonb,
+                     || $2::jsonb || jsonb_build_object('reopened_at', NOW()),
             updated_at = NOW()
       WHERE item_id = $1
       RETURNING generation`,
