@@ -33,15 +33,15 @@ pairs this machine with you (running the command is the approval; the code works
 for the agents it finds (`claude`, `codex`, `cursor-agent` on your `PATH`), each asking before it writes a file or runs a
 command and working in that folder (one that is installed but not signed in, such as `codex` before `codex login`, is written
 commented out, and the command prints what to run before you turn it on), and starts the connector as a service (see [Keep it running](#quick-start-about-5-minutes)).
-Before it starts the connector it asks once whether to add the Claude Code hooks to your Claude `settings.json` (Enter is yes):
-the session hooks, and the approval hooks that also put a question Claude Code asks in a terminal on your chat (see
-[Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)). Run where nobody can answer (a script,
-a pipe), it adds nothing and prints the command that would; `--no-hooks` skips the question, `--no-approval-hooks` leaves the
-approval hooks out. On a machine where Claude Code is installed but has never run (`claude` is on your `PATH`, and its
-config directory, `~/.claude` or `$CLAUDE_CONFIG_DIR`, does not exist yet), it asks the same question, and Enter creates that
-directory with the hooks in it; Claude Code adds its own files there on its first run. Where Claude Code is not installed
-(no `claude` on your `PATH`), nothing is asked or created: it says so and prints `claw-connector hooks install --approvals`,
-to run once you have installed it (`--hooks` adds them anyway). The chat tells you when the machine is connected. To disconnect it, `/agent off <machine>` in the chat or `claw-connector logout`
+Before it starts the connector it adds the Claude Code hooks to your Claude `settings.json`, without asking: the session
+hooks, and the approval hooks that also put a question Claude Code asks in a terminal on your chat (see
+[Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)). There is nothing to run for them,
+now or later: every start of the connector, including the first one after it upgraded itself, puts them back in place
+(see [The Claude Code hooks are kept in place](#the-claude-code-hooks-are-kept-in-place)). `--no-hooks` leaves them out for
+good, `--no-approval-hooks` the approval hooks only. On a machine where Claude Code is installed but has never run (`claude`
+is on your `PATH`, and its config directory, `~/.claude` or `$CLAUDE_CONFIG_DIR`, does not exist yet), that directory is
+created with the hooks in it; Claude Code adds its own files there on its first run. Where Claude Code is not installed (no
+`claude` on your `PATH`), nothing is created; the connector adds them once it is (`--hooks` adds them anyway). The chat tells you when the machine is connected. To disconnect it, `/agent off <machine>` in the chat or `claw-connector logout`
 here; either ends this machine's sign-in for good. An `agents.toml` that is already there is kept as it is.
 
 The pairing is a connector grant: it reaches the connector routes of Claw for this one machine and nothing else, and it ends
@@ -435,8 +435,7 @@ is noticed even if it has exited by the next prompt: that prompt goes to a fresh
 while the agent is starting refuses the takeover (`session_live`) and stops the agent. A terminal that opens and closes the
 conversation between two reads, which is shorter than anything that can take a turn, is not seen.
 
-The first thing asked is the terminal itself. `claw-connector hooks install` (or `claw-connector init` and `claw-connector pair`,
-when you say yes at their question or pass `--hooks`) adds two Claude Code hooks, `SessionStart` and `SessionEnd`, to the user-level `settings.json` of the Claude config directory. Each runs a tiny
+The first thing asked is the terminal itself. The connector (each start, and `init` and `pair`) adds two Claude Code hooks, `SessionStart` and `SessionEnd`, to the user-level `settings.json` of the Claude config directory. Each runs a tiny
 program that keeps one row per terminal session, `<config dir>/claw-connector-terminals/<pid>.json`: the session id and the
 process that holds it, with that process's start time. Claude Code runs the same hooks for sessions started by an ACP adapter
 (this connector's own included) and by `claude -p`; they are told apart by `CLAUDE_CODE_ENTRYPOINT` in the hook's environment
@@ -584,18 +583,13 @@ session stops the agent process; it never deletes the conversation.
 
 A Claude Code session you started yourself, in your own terminal, still stops and waits for you when it wants to run a command,
 edit a file, leave plan mode or put a multiple-choice question to you. With the approval hooks installed, that question is also
-put to you in the chat as a card with the same choices, so you can answer it away from the screen. `claw-connector init` and
-`claw-connector pair` offer them together with the session hooks (one question at the terminal, Enter is yes; `--no-approval-hooks`
-leaves them out); on a machine set up before, or to add them by hand:
+put to you in the chat as a card with the same choices, so you can answer it away from the screen. The connector installs them
+by itself, together with the session hooks, and keeps them in place (next section); a machine set up before gets them at the
+next start of its connector. To take them out, and keep them out:
 
 ```sh
-claw-connector hooks install --approvals      # "hooks uninstall --approvals" takes them out again
+claw-connector hooks uninstall --approvals    # "hooks install --approvals" puts them back
 ```
-
-A setup that already has the session hooks gets only the approval hooks offered when `init` or `pair` runs again at a terminal;
-run without one (a script, a pipe), they add nothing to `settings.json` and print this command instead. With Claude Code
-installed but never run, `hooks install` (like `init` and `pair`) creates its config directory with the hooks in it; with
-Claude Code not installed and no `--config-dir`, it refuses and says so, since there is nothing to hook into yet.
 
 The card names the tool that asked and the machine, as in "Claude Code in a terminal on dev-pod (fix CI, work/claw) is waiting
 for you" (or Codex, or Cursor, for their hooks below).
@@ -629,11 +623,9 @@ directory only you can enter).
   - anything started with `CLAW_APPROVAL_HOOKS=off` in its environment (also `0`, `false`, `no`). Use it for what the hook
     cannot tell from a person: a script that drives an interactive `claude` in tmux, or a terminal you do not want on your
     phone (`CLAW_APPROVAL_HOOKS=off claude`, or export it in that shell).
-- **A machine set up before.** Where the session hooks are installed and the approval hooks are not, the next
-  `claw-connector` command you run at a terminal (`status`, `doctor`, `service install`, ...) asks once whether to add them
-  (`[y/N]`; yes runs `hooks install --approvals` for you). The answer is kept in the state directory
-  (`approval-hooks-offer.json`) and never asked again for that Claude config directory; a no prints the command. Nothing is
-  asked where nobody can answer (a script, a pipe, the service), after `--json`, or with `CLAW_APPROVAL_HOOKS=off`.
+- **A machine set up before.** Where the session hooks are installed and the approval hooks are not, the next start of the
+  connector adds them, unless you said no to them before (above). A connector started with `CLAW_APPROVAL_HOOKS=off` in its
+  own environment adds none.
 - **On Claw's side** each conversation's questions go on a session of its own (`origin: "terminal_hook"`) that carries
   nothing but these cards: it cannot be sent a prompt. Turning the cards off there (`/approvals off`) makes the connector
   leave every question to the terminal.
@@ -665,6 +657,25 @@ text. Nothing is said:
 or send `/approvals mute #<item>` (`/approvals unmute #<item>` brings it back): its questions, waits and ends then stay in
 its terminal, and Claw refuses to open a card session for it (`session_muted`). The audit log records each end told or not
 (`turn_end_sent`, `turn_end_not_sent` with the reason), never the agent's words.
+
+### The Claude Code hooks are kept in place
+
+Every start of the connector (the service starting it, a restart, the first run after it upgraded itself) makes sure each Claude
+config directory it serves (those of its `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`) has the session
+hooks and the approval hooks, and that they run this installation (a moved install or another `node` rewrites the old entries).
+Nothing is asked or shown; the connector's log gets one line when something changed (`Claude Code hooks: ...settings.json:
+approval hooks added`). Only entries marked `--managed-by claw-connector` are ever added or rewritten; everything else in the
+file stays as it was, a file that is not valid JSON is left alone (the log says so), and the file is written whole through a
+rename, one writer at a time. Before the first change to a `settings.json` that holds anything of yours, a copy is kept next to
+it, once: `settings.json.bak-claw-<UTC time>`. A Claude config directory that does not exist is created only where Claude Code
+is installed (`claude` on the connector's `PATH`).
+
+A no is kept, in `claude-hooks.json` in the connector's configuration directory, and no start or upgrade overrides it:
+`hooks uninstall` (both sets) or `hooks uninstall --approvals` (the approval hooks) for the directories it names, `init` or
+`pair` with `--no-hooks` or `--no-approval-hooks` for every directory, and a no to the question connectors 0.1.23 to 0.3.3
+asked about the approval hooks. `hooks install` (with `--approvals` for those) takes it back for its directories, `init --hooks`
+or `pair --hooks` for every directory. The Codex and Cursor hooks are not installed by themselves (Codex asks you to trust a
+new hook): see below.
 
 ### The same for Codex
 
@@ -738,9 +749,9 @@ never approve one. So for Cursor the phone goes first and the terminal second:
 
 | Command | |
 |---|---|
-| `init [--approval ask\|never \| AGENT=ask\|never] [--hooks \| --no-hooks] [--no-approval-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). At a terminal it then asks once (`[Y/n]`, Enter is yes) before adding the Claude Code hooks to Claude's `settings.json`: the session hooks and the approval hooks (only those not there yet are offered); `--hooks` adds them without asking, `--no-hooks` skips them, `--no-approval-hooks` leaves the approval hooks out, and with nobody to answer (a script, a pipe) nothing is added and the `hooks install --approvals` command is printed instead. |
+| `init [--approval ask\|never \| AGENT=ask\|never] [--hooks \| --no-hooks] [--no-approval-hooks]` | Write a sample `agents.toml`; an existing file is never touched. `--approval never` turns per-step approval off (see above). It then adds the Claude Code hooks to Claude's `settings.json`, without asking: the session hooks and the approval hooks (see [The Claude Code hooks are kept in place](#the-claude-code-hooks-are-kept-in-place)); `--no-hooks` leaves them out for good, `--no-approval-hooks` the approval hooks only, and `--hooks` adds them even where Claude Code is not installed yet. |
 | `pair CODE --server URL [--name HOST] [--no-start] [--hooks \| --no-hooks] [--no-approval-hooks]` | Connect this machine with the one-time code from the chat (see [Fastest](#fastest-pair-from-the-chat-one-command)); offers the Claude Code hooks as `init` does, then starts the service. |
-| `hooks install\|uninstall\|status [--approvals] [--agent claude\|codex\|cursor] [--hold SECONDS]` | The `SessionStart`/`SessionEnd` hooks alone (with `--approvals`, also the approval hooks: see [Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)); `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). `--agent codex` (or `--codex`): the Codex approval hook instead (see [The same for Codex](#the-same-for-codex)), in `DIR/hooks.json` (default: the `CODEX_HOME` of the `codex` agents, else `$CODEX_HOME` or `~/.codex`). `--agent cursor`: Cursor's approval hooks instead (see [Cursor](#cursor)), in the Cursor directory of each `cursor` agent; `--hold` is how long Cursor waits for the phone. |
+| `hooks install\|uninstall\|status [--approvals] [--agent claude\|codex\|cursor] [--hold SECONDS]` | The Claude Code hooks the connector keeps in place by itself: the `SessionStart`/`SessionEnd` hooks and the approval hooks (see [Questions asked in a terminal](#questions-asked-in-a-terminal-answered-from-the-chat)). `uninstall` takes both out (`--approvals`: only the approval hooks) and keeps them out; `install` puts them back (the approval hooks you took out need `--approvals`); `--config-dir DIR` names the Claude config directory (default: those of the `claude-attach` agents, else `$CLAUDE_CONFIG_DIR` or `~/.claude`). `--agent codex` (or `--codex`): the Codex approval hook instead (see [The same for Codex](#the-same-for-codex)), in `DIR/hooks.json` (default: the `CODEX_HOME` of the `codex` agents, else `$CODEX_HOME` or `~/.codex`). `--agent cursor`: Cursor's approval hooks instead (see [Cursor](#cursor)), in the Cursor directory of each `cursor` agent; `--hold` is how long Cursor waits for the phone. |
 | `login` | Device sign-in. `--key <api key>` (or `CLAW_CONNECTOR_KEY`) is for development only. After a revocation, run it again: it connects this machine as a new connector. |
 | `run [--supervised]` | Connect and serve. Exit code 78 means starting it again will not help: the connector was revoked, Claw or the identity service refused the sign-in (at start, or for two minutes in a row while running), or there is no usable `agents.toml` or sign-in; the reason is kept in `needs-login.json`, and until `login` removes it `run` exits 78 at once without contacting Claw. `--supervised` marks a run the service started. Any other non-zero exit is worth a restart. A unit written by hand for 0.1.2 and older (`RestartPreventExitStatus=3`): replace it with `claw-connector service install`, which writes the same file. |
 | `service install\|uninstall\|status [--supervisor systemd\|launchd\|script] [--env NAME ...]` | Keep `run` up (see [Keeping it running](#keeping-it-running)). `install` stops a `run` started by hand so the service takes over, and starts an installed service again (a script supervisor too) so an edited `agents.toml` or environment takes effect; `status` also lists the last five disconnects and why. |
@@ -863,9 +874,9 @@ moment) has no package directory: under the script supervisor the old version is
 systemd or launchd, run the command the chat shows for the machine, or rename `.connector-backup-<old version>` back to
 `connector` in the same directory.
 
-The first run of the new version brings the hooks it finds installed (the Claude Code session and approval hooks, the
-Codex approval hook) up to date. It never adds hooks you did not install; when the session hooks are missing it says so
-once in the log, with `claw-connector hooks install`.
+Like every start, the first run of the new version puts the Claude Code hooks in place, running the new version (see
+[The Claude Code hooks are kept in place](#the-claude-code-hooks-are-kept-in-place)); a no you said to them stays a no. The
+Codex approval hook is brought up to date where it is installed, and never added.
 
 Only a supervised run upgrades itself (`claw-connector run` in a terminal does not: nothing would start it again). Turn it
 off with `claw-connector auto-upgrade off` (`auto_upgrade = false` at the top of `agents.toml`) or

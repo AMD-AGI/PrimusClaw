@@ -291,6 +291,18 @@ release version, and its `appVersion` stays `latest`.
 
 ### Changed
 
+- Connector: the Claude Code hooks (the session hooks and the approval hooks) are installed and kept in place by the connector
+  itself, as it keeps itself up to date. Every start, including the first run after an auto-upgrade, makes sure each Claude
+  config directory it serves has them and that they run the installation that is running (stale node or script paths are
+  rewritten), with one line in the connector log when something changed and nothing shown to the person. Only entries marked
+  `--managed-by claw-connector` change; the file is written through a rename under a lock, re-read if another writer changed
+  it meanwhile, and backed up once (`settings.json.bak-claw-<time>`) before the first change to anything of the person's.
+  `init` and `pair` no longer ask or print a command: they add the hooks unless `--no-hooks` / `--no-approval-hooks`. An
+  explicit no is kept for good in `claude-hooks.json` in the configuration directory: `hooks uninstall` (`--approvals` for the
+  approval hooks only), `--no-hooks` / `--no-approval-hooks`, or a no to the question 0.1.23 to 0.3.3 asked; `hooks install`
+  (`--approvals`) and `--hooks` take it back. `hooks install` now installs the approval hooks too, unless they were taken out.
+  The one-time question about the approval hooks after other commands is gone. Codex and Cursor hooks are unchanged (Codex
+  needs the person to trust a new hook). See `connector/README.md`, "The Claude Code hooks are kept in place".
 - Claw, personal agent: the message for a terminal turn that ended while nobody was at it says which conversation first. Its
   title is the conversation's name (as Claude Code's session list shows it, else its title) with its status (finished, or
   stopped with an error and why); one small line names the tool, the machine, the folder and the item number. Then what the

@@ -10,6 +10,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import { TERMINALS_DIR, terminalsDir } from "./terminals.js";
 
 export class HooksError extends Error {}
@@ -61,16 +62,100 @@ function load(configDir: string, given = settingsFile(configDir)): Loaded {
   return { doc, text, file };
 }
 
-/** Write through a temp file in the same directory and a rename, keeping the file's mode; a symlinked settings.json keeps being a symlink. */
-function save(l: Loaded, doc: Json): void {
+/**
+ * Write through a temp file in the same directory and a rename, keeping the file's mode; a symlinked settings.json keeps being a
+ * symlink. Only if the file still holds what was read (`l.text`): another writer (Claude Code itself, or the person) that changed it
+ * in between wins, and false says so, so the caller reads it again and redoes its edit on top.
+ */
+function save(l: Loaded, doc: Json): boolean {
   const indent = l.text?.match(/^([ \t]+)"/m)?.[1] ?? "  ";
   const body = JSON.stringify(doc, null, indent) + "\n";
   fs.mkdirSync(path.dirname(l.file), { recursive: true, mode: 0o700 });
   let mode = 0o600;
   try { mode = fs.statSync(l.file).mode & 0o777; } catch { /* a new file */ }
-  const tmp = `${l.file}.claw-connector.${process.pid}.tmp`;
+  const tmp = `${l.file}.claw-connector.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   fs.writeFileSync(tmp, body, { mode });
-  try { fs.renameSync(tmp, l.file); } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
+  try {
+    if (readOrNull(l.file) !== l.text) { fs.rmSync(tmp, { force: true }); return false; }
+    fs.renameSync(tmp, l.file);
+  } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
+  return true;
+}
+
+function readOrNull(file: string): string | null {
+  try { return fs.readFileSync(file, "utf8"); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw e;
+  }
+}
+
+/** How long a lock left by a writer that died is honoured, and how long a writer waits for one that is alive. */
+const LOCK_STALE_MS = 10_000;
+const LOCK_WAIT_MS = 5_000;
+const pause = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+
+/**
+ * One writer of ours at a time per settings file (two connectors on one machine, `init` while the service starts): a lock file
+ * next to it, created exclusively. A lock older than {@link LOCK_STALE_MS} is a writer that died, and is taken over.
+ */
+function withLock<T>(file: string, fn: () => T): T {
+  const lock = `${file}.claw-connector.lock`;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      fs.writeFileSync(lock, String(process.pid), { flag: "wx", mode: 0o600 });
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      let age = 0;
+      try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; /* just released */ }
+      if (age > LOCK_STALE_MS) { fs.rmSync(lock, { force: true }); continue; }
+      if (Date.now() > deadline) throw new HooksError(`${file} is being written by another claw-connector (${lock}); left as it is`);
+      pause(20);
+    }
+  }
+  try { return fn(); } finally { fs.rmSync(lock, { force: true }); }
+}
+
+/** The one backup of a Claude config directory's settings before the connector first changes them: `settings.json.bak-claw-<time>`. */
+export const BACKUP_PREFIX = "settings.json.bak-claw-";
+function backupOnce(dir: string, l: Loaded): void {
+  if (l.text === null || l.text.trim() === "" || onlyOurs(l.doc)) return;
+  let names: string[] = [];
+  try { names = fs.readdirSync(dir); } catch { /* no directory: nothing to back up */ }
+  if (names.some((n) => n.startsWith(BACKUP_PREFIX))) return;
+  const at = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  fs.writeFileSync(path.join(dir, `${BACKUP_PREFIX}${at}`), l.text, { mode: 0o600, flag: "wx" });
+}
+
+/** A settings file that holds nothing but entries of ours (one this connector just made): nothing of the person's to back up. */
+function onlyOurs(doc: Json): boolean {
+  if (Object.keys(doc).some((k) => k !== "hooks")) return false;
+  if (doc.hooks === undefined) return true;
+  if (!isObject(doc.hooks)) return false;
+  return Object.values(doc.hooks).every((groups) => Array.isArray(groups) && groups.every((g) =>
+    isObject(g) && Object.keys(g).every((k) => k === "hooks") && Array.isArray(g.hooks) && g.hooks.every((h) => isOurs(h) || isOursApproval(h))));
+}
+
+/**
+ * Read, edit, write: `edit` changes `doc` in place and says whether there is anything to write. Done once without the lock (a file
+ * already as it should be is not touched, and no directory is made); then under the lock, read again and written only if nobody
+ * changed the file meanwhile (else read again, a few times). `backupDir`: back the file up there once, before the first change.
+ */
+function rewrite(read: () => Loaded, edit: (doc: Json, l: Loaded) => boolean, backupDir?: string): InstallResult {
+  const first = read();
+  if (!edit(JSON.parse(JSON.stringify(first.doc)), first)) return { changed: false, file: first.file };
+  fs.mkdirSync(path.dirname(first.file), { recursive: true, mode: 0o700 });
+  return withLock(first.file, () => {
+    for (let i = 0; i < 5; i++) {
+      const l = read();
+      const doc: Json = JSON.parse(JSON.stringify(l.doc));
+      if (!edit(doc, l)) return { changed: false, file: l.file };
+      if (backupDir) backupOnce(backupDir, l);
+      if (save(l, doc)) return { changed: true, file: l.file };
+    }
+    throw new HooksError(`${first.file} kept changing while it was being written; left as it is`);
+  });
 }
 
 function hooksOf(doc: Json, where: string): Json | null {
@@ -93,66 +178,64 @@ export interface InstallResult { changed: boolean; file: string }
  * `node` and `script` are what the entries will run.
  */
 export function installHooks(configDir: string, node: string, script: string): InstallResult {
-  const l = load(configDir);
   const where = settingsFile(configDir);
-  const before = JSON.stringify(l.doc);
-  const doc: Json = JSON.parse(before);
-  const hooks: Json = hooksOf(doc, where) ?? (doc.hooks = {}) as Json;
-  for (const h of HOOKED) {
-    const entry = { type: "command", command: hookCommand(node, script, h.arg, configDir), timeout: h.timeout };
-    const groups = groupsOf(hooks, h.event, where) ?? (hooks[h.event] = []) as unknown[];
-    let seen = false;
-    for (let i = 0; i < groups.length; i++) {
-      const g = groups[i];
-      if (!isObject(g) || !Array.isArray(g.hooks)) continue;
-      const kept: unknown[] = [];
-      let dropped = false;
-      for (const x of g.hooks) {
-        if (!isOurs(x)) { kept.push(x); continue; }
-        if (seen) { dropped = true; continue; } // a second copy of ours (a hand edit) is dropped
-        seen = true;
-        kept.push({ ...(x as Json), ...entry });
+  return rewrite(() => load(configDir), (doc, l) => {
+    const before = JSON.stringify(doc);
+    const hooks: Json = hooksOf(doc, where) ?? (doc.hooks = {}) as Json;
+    for (const h of HOOKED) {
+      const entry = { type: "command", command: hookCommand(node, script, h.arg, configDir), timeout: h.timeout };
+      const groups = groupsOf(hooks, h.event, where) ?? (hooks[h.event] = []) as unknown[];
+      let seen = false;
+      for (let i = 0; i < groups.length; i++) {
+        const g = groups[i];
+        if (!isObject(g) || !Array.isArray(g.hooks)) continue;
+        const kept: unknown[] = [];
+        let dropped = false;
+        for (const x of g.hooks) {
+          if (!isOurs(x)) { kept.push(x); continue; }
+          if (seen) { dropped = true; continue; } // a second copy of ours (a hand edit) is dropped
+          seen = true;
+          kept.push({ ...(x as Json), ...entry });
+        }
+        g.hooks = kept;
+        // A group that held only a duplicate of ours is empty now (whatever matcher it has): it is ours to drop, and nothing else is.
+        if (dropped && kept.length === 0) { groups.splice(i, 1); i--; }
       }
-      g.hooks = kept;
-      // A group that held only a duplicate of ours is empty now (whatever matcher it has): it is ours to drop, and nothing else is.
-      if (dropped && kept.length === 0) { groups.splice(i, 1); i--; }
+      if (!seen) groups.push({ hooks: [entry] });
     }
-    if (!seen) groups.push({ hooks: [entry] });
-  }
-  const changed = JSON.stringify(doc) !== before || l.text === null;
-  if (changed) save(l, doc);
-  return { changed, file: l.file };
+    return JSON.stringify(doc) !== before || l.text === null;
+  }, configDir);
 }
 
 /** Remove our entries, and only the containers that removing them left empty; delete the rows we wrote. */
 export function uninstallHooks(configDir: string): InstallResult {
-  const l = load(configDir);
   const where = settingsFile(configDir);
-  const doc: Json = JSON.parse(JSON.stringify(l.doc));
-  const hooks = hooksOf(doc, where);
-  let touchedAny = false;
-  if (hooks) {
-    for (const h of HOOKED) {
-      const groups = groupsOf(hooks, h.event, where);
-      if (!groups) continue;
-      let touched = false;
-      for (let i = groups.length - 1; i >= 0; i--) {
-        const g = groups[i];
-        if (!isObject(g) || !Array.isArray(g.hooks)) continue;
-        const rest = g.hooks.filter((x) => !isOurs(x));
-        if (rest.length === g.hooks.length) continue;
-        touched = true;
-        g.hooks = rest;
-        if (rest.length === 0) groups.splice(i, 1);
+  const r = rewrite(() => load(configDir), (doc) => {
+    const hooks = hooksOf(doc, where);
+    let touchedAny = false;
+    if (hooks) {
+      for (const h of HOOKED) {
+        const groups = groupsOf(hooks, h.event, where);
+        if (!groups) continue;
+        let touched = false;
+        for (let i = groups.length - 1; i >= 0; i--) {
+          const g = groups[i];
+          if (!isObject(g) || !Array.isArray(g.hooks)) continue;
+          const rest = g.hooks.filter((x) => !isOurs(x));
+          if (rest.length === g.hooks.length) continue;
+          touched = true;
+          g.hooks = rest;
+          if (rest.length === 0) groups.splice(i, 1);
+        }
+        if (touched && groups.length === 0) delete hooks[h.event];
+        touchedAny ||= touched;
       }
-      if (touched && groups.length === 0) delete hooks[h.event];
-      touchedAny ||= touched;
+      if (touchedAny && Object.keys(hooks).length === 0) delete doc.hooks;
     }
-    if (touchedAny && Object.keys(hooks).length === 0) delete doc.hooks;
-  }
-  if (touchedAny) save(l, doc);
+    return touchedAny;
+  });
   fs.rmSync(terminalsDir(configDir), { recursive: true, force: true });
-  return { changed: touchedAny, file: l.file };
+  return r;
 }
 
 export interface HooksStatus {
@@ -222,37 +305,35 @@ export function approvalHookCommand(node: string, script: string, arg: "ask" | "
 export function installApprovalHooks(configDir: string, node: string, script: string, socket: string): InstallResult {
   return installApprovalEntries(settingsFile(configDir), APPROVAL_HOOKED.map((h) => ({
     event: h.event, entry: { type: "command", command: approvalHookCommand(node, script, h.arg, configDir, socket), timeout: h.timeout, ...(h.async ? { async: true } : {}) },
-  })), configDir);
+  })), configDir, configDir);
 }
 
-function installApprovalEntries(where: string, entries: Array<{ event: string; entry: Json }>, configDir: string): InstallResult {
-  const l = load(configDir, where);
-  const before = JSON.stringify(l.doc);
-  const doc: Json = JSON.parse(before);
-  const hooks: Json = hooksOf(doc, where) ?? (doc.hooks = {}) as Json;
-  for (const { event, entry } of entries) {
-    const groups = groupsOf(hooks, event, where) ?? (hooks[event] = []) as unknown[];
-    let seen = false;
-    for (let i = 0; i < groups.length; i++) {
-      const g = groups[i];
-      if (!isObject(g) || !Array.isArray(g.hooks)) continue;
-      const kept: unknown[] = [];
-      let dropped = false;
-      for (const x of g.hooks) {
-        if (!isOursApproval(x)) { kept.push(x); continue; }
-        if (seen) { dropped = true; continue; }
-        seen = true;
-        const { async: _a, statusMessage: _s, ...rest } = x as Json;
-        kept.push({ ...rest, ...entry });
+function installApprovalEntries(where: string, entries: Array<{ event: string; entry: Json }>, configDir: string, backupDir?: string): InstallResult {
+  return rewrite(() => load(configDir, where), (doc, l) => {
+    const before = JSON.stringify(doc);
+    const hooks: Json = hooksOf(doc, where) ?? (doc.hooks = {}) as Json;
+    for (const { event, entry } of entries) {
+      const groups = groupsOf(hooks, event, where) ?? (hooks[event] = []) as unknown[];
+      let seen = false;
+      for (let i = 0; i < groups.length; i++) {
+        const g = groups[i];
+        if (!isObject(g) || !Array.isArray(g.hooks)) continue;
+        const kept: unknown[] = [];
+        let dropped = false;
+        for (const x of g.hooks) {
+          if (!isOursApproval(x)) { kept.push(x); continue; }
+          if (seen) { dropped = true; continue; }
+          seen = true;
+          const { async: _a, statusMessage: _s, ...rest } = x as Json;
+          kept.push({ ...rest, ...entry });
+        }
+        g.hooks = kept;
+        if (dropped && kept.length === 0) { groups.splice(i, 1); i--; }
       }
-      g.hooks = kept;
-      if (dropped && kept.length === 0) { groups.splice(i, 1); i--; }
+      if (!seen) groups.push({ hooks: [entry] });
     }
-    if (!seen) groups.push({ hooks: [entry] });
-  }
-  const changed = JSON.stringify(doc) !== before || l.text === null;
-  if (changed) save(l, doc);
-  return { changed, file: l.file };
+    return JSON.stringify(doc) !== before || l.text === null;
+  }, backupDir);
 }
 
 /** Remove the approval hooks only (the session hooks stay). */
@@ -261,31 +342,30 @@ export function uninstallApprovalHooks(configDir: string): InstallResult {
 }
 
 function uninstallApprovalEntries(where: string, events: readonly string[], configDir: string): InstallResult {
-  const l = load(configDir, where);
-  const doc: Json = JSON.parse(JSON.stringify(l.doc));
-  const hooks = hooksOf(doc, where);
-  let touchedAny = false;
-  if (hooks) {
-    for (const event of new Set(events)) {
-      const groups = groupsOf(hooks, event, where);
-      if (!groups) continue;
-      let touched = false;
-      for (let i = groups.length - 1; i >= 0; i--) {
-        const g = groups[i];
-        if (!isObject(g) || !Array.isArray(g.hooks)) continue;
-        const rest = g.hooks.filter((x) => !isOursApproval(x));
-        if (rest.length === g.hooks.length) continue;
-        touched = true;
-        g.hooks = rest;
-        if (rest.length === 0) groups.splice(i, 1);
+  return rewrite(() => load(configDir, where), (doc) => {
+    const hooks = hooksOf(doc, where);
+    let touchedAny = false;
+    if (hooks) {
+      for (const event of new Set(events)) {
+        const groups = groupsOf(hooks, event, where);
+        if (!groups) continue;
+        let touched = false;
+        for (let i = groups.length - 1; i >= 0; i--) {
+          const g = groups[i];
+          if (!isObject(g) || !Array.isArray(g.hooks)) continue;
+          const rest = g.hooks.filter((x) => !isOursApproval(x));
+          if (rest.length === g.hooks.length) continue;
+          touched = true;
+          g.hooks = rest;
+          if (rest.length === 0) groups.splice(i, 1);
+        }
+        if (touched && groups.length === 0) delete hooks[event];
+        touchedAny ||= touched;
       }
-      if (touched && groups.length === 0) delete hooks[event];
-      touchedAny ||= touched;
+      if (touchedAny && Object.keys(hooks).length === 0) delete doc.hooks;
     }
-    if (touchedAny && Object.keys(hooks).length === 0) delete doc.hooks;
-  }
-  if (touchedAny) save(l, doc);
-  return { changed: touchedAny, file: l.file };
+    return touchedAny;
+  });
 }
 
 /** Whether the approval hooks are in place (all of them), and whether what they run still exists; never throws. */
@@ -410,52 +490,49 @@ function loadCursor(cursorDir: string): Loaded {
 
 /** Add (or bring up to date) the Cursor approval hooks; every other entry in the file is carried over as it was. */
 export function installCursorApprovalHooks(cursorDir: string, node: string, script: string, socket: string, holdS: number): InstallResult {
-  const l = loadCursor(cursorDir);
   const where = cursorHooksFile(cursorDir);
-  const before = JSON.stringify(l.doc);
-  const doc: Json = JSON.parse(before);
-  doc.version ??= 1;
-  const hooks: Json = hooksOf(doc, where) ?? (doc.hooks = {}) as Json;
-  for (const h of CURSOR_APPROVAL_HOOKED) {
-    const entry: Json = {
-      command: cursorHookCommand(node, script, h.arg, cursorDir, socket, holdS),
-      timeout: h.arg === "ask" ? holdS + CURSOR_ASK_MARGIN_S : CURSOR_SETTLED_TIMEOUT_S,
-    };
-    const list = groupsOf(hooks, h.event, where) ?? (hooks[h.event] = []) as unknown[];
-    let seen = false;
-    for (let i = 0; i < list.length; i++) {
-      if (!isOursCursor(list[i])) continue;
-      if (seen) { list.splice(i, 1); i--; continue; } // a second copy of ours (a hand edit) is dropped
-      seen = true;
-      list[i] = { ...(list[i] as Json), ...entry };
+  return rewrite(() => loadCursor(cursorDir), (doc, l) => {
+    const before = JSON.stringify(doc);
+    doc.version ??= 1;
+    const hooks: Json = hooksOf(doc, where) ?? (doc.hooks = {}) as Json;
+    for (const h of CURSOR_APPROVAL_HOOKED) {
+      const entry: Json = {
+        command: cursorHookCommand(node, script, h.arg, cursorDir, socket, holdS),
+        timeout: h.arg === "ask" ? holdS + CURSOR_ASK_MARGIN_S : CURSOR_SETTLED_TIMEOUT_S,
+      };
+      const list = groupsOf(hooks, h.event, where) ?? (hooks[h.event] = []) as unknown[];
+      let seen = false;
+      for (let i = 0; i < list.length; i++) {
+        if (!isOursCursor(list[i])) continue;
+        if (seen) { list.splice(i, 1); i--; continue; } // a second copy of ours (a hand edit) is dropped
+        seen = true;
+        list[i] = { ...(list[i] as Json), ...entry };
+      }
+      if (!seen) list.push(entry);
     }
-    if (!seen) list.push(entry);
-  }
-  const changed = JSON.stringify(doc) !== before || l.text === null;
-  if (changed) save(l, doc);
-  return { changed, file: l.file };
+    return JSON.stringify(doc) !== before || l.text === null;
+  });
 }
 
 /** Remove the Cursor approval hooks, and only the lists that removing them left empty. */
 export function uninstallCursorApprovalHooks(cursorDir: string): InstallResult {
   if (!fs.existsSync(cursorHooksFile(cursorDir))) return { changed: false, file: cursorHooksFile(cursorDir) };
-  const l = loadCursor(cursorDir);
   const where = cursorHooksFile(cursorDir);
-  const doc: Json = JSON.parse(JSON.stringify(l.doc));
-  const hooks = hooksOf(doc, where);
-  let touchedAny = false;
-  if (hooks) {
-    for (const event of new Set(CURSOR_APPROVAL_HOOKED.map((h) => h.event))) {
-      const list = groupsOf(hooks, event, where);
-      if (!list) continue;
-      const rest = list.filter((x) => !isOursCursor(x));
-      if (rest.length === list.length) continue;
-      touchedAny = true;
-      if (rest.length === 0) delete hooks[event]; else hooks[event] = rest;
+  return rewrite(() => loadCursor(cursorDir), (doc) => {
+    const hooks = hooksOf(doc, where);
+    let touchedAny = false;
+    if (hooks) {
+      for (const event of new Set(CURSOR_APPROVAL_HOOKED.map((h) => h.event))) {
+        const list = groupsOf(hooks, event, where);
+        if (!list) continue;
+        const rest = list.filter((x) => !isOursCursor(x));
+        if (rest.length === list.length) continue;
+        touchedAny = true;
+        if (rest.length === 0) delete hooks[event]; else hooks[event] = rest;
+      }
     }
-  }
-  if (touchedAny) save(l, doc);
-  return { changed: touchedAny, file: l.file };
+    return touchedAny;
+  });
 }
 
 /** Whether the Cursor approval hooks are all in place, and whether what they run still exists; never throws. */

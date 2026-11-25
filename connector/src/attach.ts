@@ -298,7 +298,7 @@ export class AttachSupport {
     if (this.hookNote) return;
     this.hookNote = true;
     const st = hooksStatus(this.configDir);
-    if (!st.installed) this.d.log.info("the terminal hooks are not installed in this Claude config directory; sessions open in a terminal are found by listing processes only (claw-connector hooks install)", { agent: this.agent.id, dir: this.configDir });
+    if (!st.installed) this.d.log.info("the terminal hooks are not installed in this Claude config directory; sessions open in a terminal are found by listing processes only (the connector adds them at its next start unless they were taken out)", { agent: this.agent.id, dir: this.configDir });
     else if (!st.healthy) this.d.log.warn("an installed terminal hook points at a file that is gone", { agent: this.agent.id, problem: st.problem });
   }
 
