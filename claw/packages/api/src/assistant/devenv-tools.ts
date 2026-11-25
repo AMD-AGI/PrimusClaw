@@ -746,11 +746,13 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
     sessionActivity(userId, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser),
   ]);
   const shown = flat;
-  // Each session's seat (its folder's alias and confirmed role), for a user who has seats.
+  // Each session's seat (its conversation's alias and confirmed role, else its folder's), for a user who has seats.
   const seatsMod = await import("./seats.js");
   const seats = seatsMod.seatsOn(userId) ? await seatsMod.seatsByPlace(userId).catch(() => null) : null;
-  const seatOf = (connectorId: string, agentId: string, cwd: unknown) => {
-    const s = seats && typeof cwd === "string" ? seats.get(seatsMod.seatPlaceKey(connectorId, agentId, cwd)) : undefined;
+  const seatOf = (connectorId: string, agentId: string, cwd: unknown, ref: unknown) => {
+    const byRef = seatsMod.seatConversationKey(connectorId, ref);
+    // (a session whose conversation its machine has not named yet is its folder's)
+    const s = !seats ? undefined : byRef ? seats.get(byRef) : typeof cwd === "string" ? seats.get(seatsMod.seatPlaceKey(connectorId, agentId, cwd)) : undefined;
     return s ? { seat: s } : {};
   };
 
@@ -795,7 +797,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
           ...(can ? {} : { why_not: !online ? "the machine is offline" : "it is open in a terminal on that machine; only the terminal can use it now" }),
           ...(can && inTerminal ? (r.typed ? { typed_into_terminal: true as const, note: TYPED_NOTE } : { read_only: true as const, note: READ_ONLY_NOTE }) : {}),
           ...(carded && block ? {} : { not_on_agents_card: true as const }),
-          ...seatOf(String(c.connector_id), String(a.agent_id), r.cwd),
+          ...seatOf(String(c.connector_id), String(a.agent_id), r.cwd, r.ref),
         };
         if (inTerminal && r.terminal_state) row.terminal_state = r.terminal_state;
         if (activity && r.terminal_state === "waiting_for_you") row.waiting_for = r.waiting_for;
@@ -816,7 +818,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
         ...(online ? {} : { why_not: "the machine is offline" }),
         ...(s.read_only === true ? { read_only: true, note: READ_ONLY_NOTE } : {}),
         ...(onCard.has(ref) ? {} : { not_on_agents_card: true as const }),
-        ...seatOf(String(c.connector_id), String(s.agent_id), s.cwd),
+        ...seatOf(String(c.connector_id), String(s.agent_id), s.cwd, s.conversation_ref),
       };
       if (activity) Object.assign(row, { step: reading.step, last_answer: reading.answer, asked: reading.asked, last_stop: reading.last_stop, queued_prompts: Number(s.queued) || 0 });
       sessions.push(row);

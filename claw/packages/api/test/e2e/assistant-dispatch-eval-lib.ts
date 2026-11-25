@@ -32,7 +32,7 @@ import type { ToolRefused } from "../../src/assistant/tools.js";
 import { REMOTE_AGENT_LIMITS } from "@claw/protocol";
 import { messagesLlm, promptFor, userTurn, type Block, type Llm, type Message, type ModelResponse, type ToolSchema } from "./assistant-router-eval-lib.js";
 import {
-  CHANNEL_ACTIONS, ERRAND_SEAT, INJECT_EN, INJECT_ZH, ITEM, MACHINES, MANIFEST, NOW, SEAT, SEATS, seatOf,
+  CHANNEL_ACTIONS, ERRAND_SEAT, INJECT_EN, INJECT_ZH, ITEM, MACHINES, MANIFEST, NOW, SEAT, SEATS, seatOf, sessionIdOf,
   type Category, type Decision, type DispatchCase, type FixtureSeat, type SeatKey,
 } from "./assistant-dispatch-eval-cases.js";
 
@@ -181,6 +181,8 @@ export class DispatchStub {
       seat_id: s.seat_id, alias: s.alias, role: s.role_state === "confirmed" ? s.role : null, role_state: s.role_state,
       machine_online: MACHINES.find((m) => m.machine === s.machine)?.online === true, state: this.stateOf(s), dispatch_mode: s.dispatch_mode,
       last_item: s.last_item, queue_len: this.queues.get(s.seat_id)?.length ?? 0,
+      // (one session per seat: its id, as devenv_list lists it; none while its machine is offline)
+      sessions: MACHINES.find((m) => m.machine === s.machine)?.online === true ? [sessionIdOf(s)] : [],
     }));
   }
 
@@ -385,7 +387,7 @@ export class DispatchStub {
         sessions: SEATS.filter((s) => s.machine === m.machine).map((s, i) => ({
           label: `${m.machine}/${s.agent}/${i + 1}`, agent: s.agent, cwd: s.cwd.replace("/home/dev", "~"), opened_in: s.state === "in_terminal" ? "machine" : "chat",
           state: s.state === "unsupported" ? "idle" : s.state, last_activity: "2026-11-24T08:30:00.000Z",
-          ref: m.online ? `${s.seat_id.slice(5, 13)}-0000-4000-8000-000000000000` : null,
+          id: sessionIdOf(s), ref: m.online ? sessionIdOf(s) : null,
           ...(activity ? { title: s.seat_id === SEAT.hlci && this.c.inject === "title" ? (this.c.lang === "zh" ? INJECT_ZH : INJECT_EN) : `work in ${s.cwd.replace("/home/dev", "~")}` } : {}),
           seat: { seat_id: s.seat_id, alias: s.alias, role: s.role_state === "confirmed" ? s.role : null },
         })),

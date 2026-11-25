@@ -86,7 +86,8 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
       connector_id         UUID NOT NULL REFERENCES claw_remote_connectors(connector_id) ON DELETE CASCADE,
       agent_id             TEXT NOT NULL,
       cwd                  TEXT NOT NULL,
-      -- A seat held to one conversation of that folder; NULL (every seat made so far): the folder itself.
+      -- The conversation the seat is (one seat per conversation, its id on the machine, lower case); NULL: a folder whose session's
+      -- conversation is not known yet (and every seat made before seats were per conversation, until syncSeats moves it to one).
       conversation_ref     TEXT,
       alias                TEXT CHECK (alias IS NULL OR char_length(alias) BETWEEN 1 AND 16),
       role                 TEXT CHECK (role IS NULL OR char_length(role) BETWEEN 1 AND 120),
@@ -129,6 +130,12 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
   await client.query(`ALTER TABLE claw_devenv_seats
     ADD COLUMN IF NOT EXISTS confirm_each BOOLEAN NOT NULL DEFAULT false,
     ADD COLUMN IF NOT EXISTS auto_since TIMESTAMPTZ`);
+  // One seat per conversation (`conversation_ref`, lower case): `gone_at`, when its machine said that conversation is no longer there (a
+  // task that went to resume it was refused as an unknown session); cleared once a heartbeat after that lists it again.
+  // `conversation_title`: what its conversation was last called on the machine (the machine's words: only shown on cards and compared).
+  await client.query(`ALTER TABLE claw_devenv_seats
+    ADD COLUMN IF NOT EXISTS gone_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS conversation_title TEXT`);
   // Every change of presence the sweep saw. No owner index: it is read per connector.
   await client.query(`
     CREATE TABLE IF NOT EXISTS claw_remote_connector_transitions (

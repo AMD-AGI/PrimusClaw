@@ -1861,6 +1861,19 @@ async function applyErrands(owner: string, sessionId: string): Promise<ErrandPas
           }
         } else if (e.type === REMOTE_EVENT_SESSION_CLOSED) {
           if (!running && !p.waiting.length) continue;
+          if (p.seat_id && flat(e.data.reason, 40) === "unknown_session") {
+            // The seat's conversation, which this task went to take over, is no longer on its machine: the seat is gone (until its
+            // machine lists that conversation again), and the user is told plainly.
+            await q(
+              `UPDATE claw_devenv_seats SET gone_at = NOW(), updated_at = NOW()
+                WHERE seat_id = $1 AND owner_user_id = $2 AND conversation_ref IS NOT NULL AND gone_at IS NULL`,
+              [p.seat_id, owner],
+            );
+            fail(`gone:${e.id}`, p.lang === "zh"
+              ? "这个工位的会话在机器上已经不存在了（被删除，或太久没用无法恢复），没有发出；这个工位不能再派活，可以交给别的工位或沙箱"
+              : "that seat's conversation is no longer on its machine (deleted, or too old to resume), so it was not sent; the seat takes no more tasks: hand it to another seat or the sandbox");
+            continue;
+          }
           fail(`closed:${e.id}`, p.lang === "zh" ? "它的会话关闭了" : "its session closed");
         } else if (e.type === "plan" && running) {
           const entries = Array.isArray((e.data.update as Record<string, unknown> | undefined)?.entries)

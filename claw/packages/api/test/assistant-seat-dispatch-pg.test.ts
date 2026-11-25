@@ -42,6 +42,11 @@
  *   D27 an instruction queued behind a turn under way, or sent while the agent is on a turn of its own, is the seat's work until its own
  *       end names it, however quiet it is: its prompt is on record before the end of the turn it waited behind, and may be further
  *       back than the events a reading takes
+ *   D30 one session, one seat: a task for a seat takes over that seat's own conversation (never a new session in its folder), and the
+ *       next goes into the session that holds it; two seats of one folder queue apart; a conversation its machine no longer has fails
+ *       the task, said plainly, and the seat is gone (refused) until its machine lists it again
+ *   D31 a seat whose conversation a session open through Claw held, once closed where no agent of its machine takes a conversation over,
+ *       is gone, and the task waiting in its queue fails, said
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -1368,5 +1373,93 @@ describe("seat dispatch", { skip }, () => {
     assert.match(d, /offline: a task for it waits in its queue until its machine is back/);
     assert.doesNotMatch(d, /offline\/unsupported cannot take work/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true, send: true }), /"task handed to seat" is not one of these: another instruction for it is work_send/);
+  });
+  test("D30 one session, one seat: a task resumes that seat's conversation; two seats of a folder queue apart; a conversation gone is said, and its seat takes no more", async () => {
+    // 2026-11-25: a seat is one session. Six sessions in one folder are six seats, and a task for one goes to that conversation.
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const ref = (i: number) => `5eb00000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+    const t = Math.floor(Date.now() / 1000);
+    const listed = (refs: number[]) => refs.map((i) => ({ ref: ref(i), title: `s${i}`, cwd: "/home/u/w", updated_at: t - 3600 - i, state: "idle" }));
+    const conversations = (refs: number[]): Recorded => ({
+      agent_id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)",
+      capabilities: { roots: ["/home/u"], answer_only: true, ask_mode: "default", read_only_modes: ["plan"], unattended: false, takeover: true, watch_live: true, resumable: listed(refs) },
+    });
+    const cid = await machine("alice", "devbox", [claude(), conversations([1, 2, 3])]);
+    await seats.syncSeats("alice");
+    const seatIs = async (i: number) => String((await w.q("SELECT seat_id FROM claw_devenv_seats WHERE conversation_ref = $1", [ref(i)]))[0].seat_id);
+    const [s1, s2, s3] = [await seatIs(1), await seatIs(2), await seatIs(3)];
+    assert.equal(new Set([s1, s2, s3]).size, 3, "three sessions in one folder: three seats");
+    await w.q("UPDATE claw_devenv_seats SET role = '负责发布', role_state = 'confirmed', dispatch_mode = 'auto' WHERE owner_user_id = 'alice'");
+    const opened = async () => (await w.q(
+      "SELECT session_id::text AS session_id, payload FROM claw_remote_commands WHERE connector_id = $1 AND type = 'session.new' ORDER BY cmd_seq", [cid],
+    ));
+    // A task for seat 1: its own conversation is taken over (never a new session in the folder).
+    const a = await create(await userTurn(alice, "让 s1 发布"), `seat:${s1}`, "发布 a");
+    assert.equal(a.dispatch, "sent", JSON.stringify(a));
+    let news = await opened();
+    assert.deepEqual(news.map((n) => [n.payload.agent_id, n.payload.resume_ref, n.payload.cwd]), [["claude-sessions", ref(1), "/home/u/w"]]);
+    const sidA = String((await item(a.item_id)).params.session_id);
+    // Seat 2 of the same folder is not busy because seat 1 is: its task goes at once, to its own conversation.
+    const b = await create(await userTurn(alice, "让 s2 看一下"), `seat:${s2}`, "检查 b");
+    assert.equal(b.dispatch, "sent", JSON.stringify(b));
+    news = await opened();
+    assert.deepEqual(news.map((n) => n.payload.resume_ref), [ref(1), ref(2)]);
+    // A second task for seat 1 waits in seat 1's queue, behind its own first.
+    const a2 = await create(await userTurn(alice, "s1 再发一次"), `seat:${s1}`, "发布 a2");
+    assert.deepEqual([a2.dispatch, a2.queued_reason, a2.position], ["queued", "seat_busy", 2], JSON.stringify(a2));
+    // Its first ends: the next goes into the session that holds its conversation now, not into another one.
+    const seqA = Number((await prompted(cid)).find((p) => p.session_id === sidA)!.cmd_seq);
+    await collect(cid);
+    await events("alice", cid, sidA, [["session_started", { acp_session_id: ref(1), agent_id: "claude-sessions", kind: "attach", cwd: "/home/u/w", attached: true, currentMode: "default", unattended: false }],
+      chunk("released"), ["turn_end", { stopReason: "end_turn", cmd_seq: seqA }]]);
+    await seats.syncSeats("alice");
+    await dispatch.runErrandSweep("alice");
+    const next = await item(a2.item_id);
+    assert.equal(next.params.queued, undefined, JSON.stringify(next.params));
+    assert.equal(next.params.session_id, sidA, "into the session that holds seat 1's conversation");
+    assert.equal((await opened()).length, 0, "no new session (the ones before were collected)");
+    assert.deepEqual((await seats.rosterOf("alice")).filter((x) => x.seat_id === s1).map((x) => x.sessions), [[sidA]]);
+    // Seat 3's conversation was deleted on the machine: the task that went to take it over is refused there, and that is said plainly.
+    const c = await create(await userTurn(alice, "让 s3 整理"), `seat:${s3}`, "整理 c");
+    assert.equal(c.dispatch, "sent");
+    const sidC = String((await item(c.item_id)).params.session_id);
+    await events("alice", cid, sidC, [["session_closed", { reason: "unknown_session" }]]);
+    const failed = await item(c.item_id);
+    assert.equal(failed.last_report_kind, "failed", JSON.stringify(failed));
+    const told = (await notices()).filter((n) => n.remote.item_seq === c.seq);
+    assert.match(told.map((n) => n.text).join("\n"), /这个工位的会话在机器上已经不存在了/);
+    assert.equal((await seats.rosterOf("alice")).find((x) => x.seat_id === s3)!.state, "gone");
+    const refused = await refusal(create(await userTurn(alice, "让 s3 再整理"), `seat:${s3}`, "整理 c2"));
+    assert.equal(refused.code, "seat_gone");
+    // Listed again by its machine later (it was there after all): it takes tasks again.
+    await w.q("UPDATE claw_devenv_seats SET gone_at = NOW() - interval '1 minute' WHERE seat_id = $1", [s3]);
+    await beat("alice", cid, [claude(), conversations([1, 2, 3])]);
+    await seats.syncSeats("alice");
+    assert.notEqual((await seats.rosterOf("alice")).find((x) => x.seat_id === s3)!.state, "gone");
+  });
+
+  test("D31 a seat whose conversation a session open through Claw held, closed where no agent takes it over: gone, said, and its queued task fails", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    await events("alice", cid, s.sid, [["session_started", { acp_session_id: "5ec00000-0000-4000-8000-000000000001", agent_id: "claude", currentMode: "default", unattended: false }]]);
+    await seats.syncSeats("alice");
+    const row = (await w.q("SELECT seat_id, conversation_ref, current_session_id::text AS sid FROM claw_devenv_seats WHERE owner_user_id = 'alice'"));
+    assert.deepEqual(row.map((r) => [r.seat_id, r.conversation_ref, r.sid]), [[s.seatId, "5ec00000-0000-4000-8000-000000000001", s.sid]], "the folder's seat is its session's conversation now");
+    // Busy, a task queues; the session closes; no agent on the machine takes a conversation over: the seat is gone.
+    const first = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`, "发布 1");
+    assert.equal(first.dispatch, "sent");
+    const queued = await create(await userTurn(alice, "再发布"), `seat:${s.seatId}`, "发布 2");
+    assert.equal(queued.dispatch, "queued");
+    await http("POST", "alice", `/v1/remote-agents/sessions/${s.sid}/commands`, { type: "close" });
+    await events("alice", cid, s.sid, [["session_closed", { reason: "closed" }]]);
+    await seats.syncSeats("alice");
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "gone");
+    await dispatch.runErrandSweep("alice");
+    const it = await item(queued.item_id);
+    assert.deepEqual([it.last_report_kind, it.params.queued], ["failed", undefined], JSON.stringify(it));
+    assert.match((await notices()).filter((n) => n.remote.item_seq === queued.seq).map((n) => n.text).join("\n"), /closed and no agent on its machine can take it over/);
   });
 });

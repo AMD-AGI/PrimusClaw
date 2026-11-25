@@ -291,6 +291,16 @@ release version, and its `appVersion` stays `latest`.
 
 ### Changed
 
+- Claw: one session, one seat. A seat is now one conversation of an agent on the user's machine (`claw_devenv_seats.conversation_ref`,
+  the agent's own id of it), not a folder: six named Claude Code sessions in one folder are six seats, each called what that session is
+  called (as `/agents` shows it), each with its own confirmed role, alias, queue, guess and cards (still one guess card at a time, at
+  most three a day). Every conversation a connector reports and every one a session open through Claw holds is a seat. A seat of a
+  folder made before moves to the session that occupies it (its session's conversation, else the one open there now, else its latest),
+  keeping its alias, role and auto dispatch; where that conversation already had a seat holding less of the user's words, the two become
+  one, with the other's tasks. A task for a seat takes over that very conversation (or goes into the session holding it), never a new
+  session in its folder. When the machine says the conversation is gone (`unknown_session`), the task fails saying so, and the seat is
+  `gone` in the roster and refused (`seat_gone`) until its machine lists that conversation again; one a session open through Claw held,
+  closed on a machine where no agent takes conversations over, is `gone` too. Prompts `router-seats-v3`, `router-dispatch-v2`.
 - Agent Sandbox: a GPU template's CPU, memory, pod storage and `/dev/shm` now come from the template when it sets them,
   instead of always 24 CPU, 224Gi memory, 187.5Gi storage and 125Gi shared memory per card. A sandbox can ask for what
   it needs (for example 16 CPU and 448Gi for two cards, or 32 CPU and 1792Gi for eight) and leave the rest of the node

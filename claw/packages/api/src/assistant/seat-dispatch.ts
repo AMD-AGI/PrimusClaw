@@ -34,7 +34,7 @@ import {
   errandNotice, errandText, errandWorkerSessionId, langOf, noteErrandPrompt, REMOTE_EVENT_COMMAND_REJECTED, REMOTE_EVENT_TURN_END, reportErrand,
   SEAT_QUEUE_REASONS, type ErrandParams, type ErrandQueue, type RemoteLang,
 } from "./remote-items.js";
-import { SEAT_QUEUE_MAX, seatDispatchOn, seatDisplayName, seatsLive, syncSeats, type SeatLive } from "./seats.js";
+import { SEAT_DISPATCH_AGENT_KINDS, SEAT_QUEUE_MAX, seatDispatchOn, seatDisplayName, seatsLive, syncSeats, type SeatLive } from "./seats.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
 import { typedCommand } from "./typed-commands.js";
@@ -116,6 +116,11 @@ export function seatRefusal(live: SeatLive | undefined, seatId: string): ToolRef
     return new ToolRefused("seat_not_found", "no seat of the user's has that seat_id: use the seat_id from seat_roster (an alias or a machine name is not a target)");
   }
   if (live.seat.role_state === "retired") return new ToolRefused("seat_retired", "the user said not to send work to that seat");
+  if (live.unsupported === "conversation_gone" || live.unsupported === "conversation_closed") {
+    return new ToolRefused("seat_gone", live.unsupported === "conversation_gone"
+      ? "that seat's conversation is no longer on its machine (deleted, or too old to resume): nothing can be sent to it; tell the user, and offer another seat or the sandbox"
+      : "that seat's conversation was closed and no agent on its machine can take it over again: nothing can be sent to it; tell the user, and offer another seat or the sandbox");
+  }
   if (live.unsupported) {
     return new ToolRefused("seat_unsupported", live.unsupported === "connector_outdated"
       ? "the connector on that machine is too old to take tasks: tell the user to upgrade it"
@@ -208,6 +213,7 @@ export type DispatchOutcome =
 
 /** Where a task goes in this seat now: a session to continue, a terminal to type into, a new session; or why it waits. */
 function planFor(live: SeatLive, newSession: boolean): { plan: SendPlan } | { wait: ErrandQueue } | { error: string; message: string } {
+  if (live.base === "gone") return { error: "seat_gone", message: "that seat's conversation is gone: nothing can be sent to it" };
   if (live.base === "offline") return { wait: "machine_offline" };
   if (live.base === "unsupported") return { error: "seat_unsupported", message: "that seat cannot take tasks now" };
   if (live.base === "working" || live.base === "waiting_for_you") return { wait: "seat_busy" };
@@ -222,8 +228,17 @@ function planFor(live: SeatLive, newSession: boolean): { plan: SendPlan } | { wa
   if (!newSession && live.terminal?.typed) {
     return { plan: { ...base, agent_id: live.terminal.agent_id, session_id: null, resume_ref: live.terminal.ref, label: `${live.machine}/${live.terminal.agent_id}`, terminal: true } };
   }
-  // ③ A new session in its folder (taking over its own conversation when it is held to one, or when its agent only takes over).
+  // ③ Its own conversation, taken over (a seat is one conversation: never a new one in its folder, unless the user asked for that).
   let ref: string | null = typeof seat.conversation_ref === "string" && seat.conversation_ref ? seat.conversation_ref : null;
+  if (ref && newSession) {
+    // A new session in its folder was asked for: one of an agent of its machine that starts sessions (it is a seat of its own then).
+    const starter = (Array.isArray(live.connector?.agents) ? live.connector!.agents as Row[] : [])
+      .find((a) => String(a.kind) !== "attach" && SEAT_DISPATCH_AGENT_KINDS.has(String(a.kind)));
+    if (!starter) return { error: "seat_unsupported", message: "no agent on that seat's machine starts a new session; send it to the seat's own conversation" };
+    return { plan: { ...base, agent_id: String(starter.agent_id), session_id: null, resume_ref: null, label: `${live.machine}/${String(starter.agent_id)}/new` } };
+  }
+  // (Its conversation, held by no session open through Claw: its agent takes it over.)
+  if (ref) return { plan: { ...base, session_id: null, resume_ref: ref, label: `${live.machine}/${String(seat.agent_id)}` } };
   if (!ref && String(live.agent?.kind) === "attach") {
     const free = resumableOf(live.agent!).filter((r) => r.cwd === seat.cwd && r.state !== "attached" && r.state !== "live")
       .sort((a, b) => (b.updated_at ?? "").localeCompare(a.updated_at ?? ""));
@@ -313,6 +328,12 @@ export async function dispatchErrand(
       if (sent.error === "busy" || sent.error === "session_closed" || sent.error === "session_read_only") return queue("seat_busy");
       if (sent.error === "connector_offline" || sent.error === "machine_reconnected") return queue("machine_offline");
       return { error: sent.error, message: sent.message };
+    }
+    // A session opened for it (its conversation taken over, or a new one in its folder) is the seat's own from now on: the next task
+    // goes into it, not into one more. (Not a new session asked for beside a seat's conversation: that is a seat of its own.)
+    if (!planned.plan.session_id && !(item.params.new_session === true && live!.seat.conversation_ref)) {
+      await db.query("UPDATE claw_devenv_seats SET current_session_id = $2::uuid, updated_at = NOW() WHERE seat_id = $1 AND owner_user_id = $3",
+        [seatId, sent.session_id, owner]);
     }
     return { dispatch: "sent", session_id: sent.session_id };
   });
@@ -1037,7 +1058,7 @@ export async function drainSeatsOf(owner: string, _sessionIds: readonly string[]
 }
 
 /** Refusals a queued task never gets past. */
-const PERMANENT = new Set(["seat_not_found", "seat_retired", "seat_unsupported", "item_closed", "needs_card", "seat_unattended"]);
+const PERMANENT = new Set(["seat_not_found", "seat_retired", "seat_gone", "seat_unsupported", "item_closed", "needs_card", "seat_unattended"]);
 
 /** A task that waited in a queue and will not go: it fails, said as such, and the router hears of it. */
 async function failQueued(owner: string, itemId: string, why: string): Promise<void> {
