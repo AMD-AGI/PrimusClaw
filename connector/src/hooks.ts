@@ -141,12 +141,26 @@ function onlyOurs(doc: Json): boolean {
  * Read, edit, write: `edit` changes `doc` in place and says whether there is anything to write. Done once without the lock (a file
  * already as it should be is not touched, and no directory is made); then under the lock, read again and written only if nobody
  * changed the file meanwhile (else read again, a few times). `backupDir`: back the file up there once, before the first change.
+ * `still`: whether the write is still wanted, asked under the lock. `removing`: an uninstall, which waits for a writer of ours
+ * that holds the lock even when there is nothing to take out yet.
  */
-function rewrite(read: () => Loaded, edit: (doc: Json, l: Loaded) => boolean, backupDir?: string): InstallResult {
+interface RewriteOpts { backupDir?: string; still?: () => boolean; removing?: boolean }
+function rewrite(read: () => Loaded, edit: (doc: Json, l: Loaded) => boolean, o: RewriteOpts = {}): InstallResult {
+  const { backupDir, still } = o;
   const first = read();
-  if (!edit(JSON.parse(JSON.stringify(first.doc)), first)) return { changed: false, file: first.file };
+  if (!edit(JSON.parse(JSON.stringify(first.doc)), first)) {
+    // Nothing to take out yet. A removal still waits for a writer of ours that holds the lock: a start that is adding entries
+    // right now finishes first, and they are read (and taken out) here.
+    if (!o.removing || !fs.existsSync(path.dirname(first.file))) return { changed: false, file: first.file };
+    withLock(first.file, () => undefined);
+    const again = read();
+    if (!edit(JSON.parse(JSON.stringify(again.doc)), again)) return { changed: false, file: first.file };
+  }
   fs.mkdirSync(path.dirname(first.file), { recursive: true, mode: 0o700 });
   return withLock(first.file, () => {
+    // Asked again under the lock: a `hooks uninstall` records its no before it takes the lock, so a start that decided to install
+    // before that no either sees it here or writes before the uninstall does, which then takes the entries out.
+    if (still && !still()) return { changed: false, file: first.file };
     for (let i = 0; i < 5; i++) {
       const l = read();
       const doc: Json = JSON.parse(JSON.stringify(l.doc));
@@ -177,7 +191,7 @@ export interface InstallResult { changed: boolean; file: string }
  * Add (or bring up to date) our entry for each hooked event. Everything else in the file is carried over as it was.
  * `node` and `script` are what the entries will run.
  */
-export function installHooks(configDir: string, node: string, script: string): InstallResult {
+export function installHooks(configDir: string, node: string, script: string, still?: () => boolean): InstallResult {
   const where = settingsFile(configDir);
   return rewrite(() => load(configDir), (doc, l) => {
     const before = JSON.stringify(doc);
@@ -204,7 +218,7 @@ export function installHooks(configDir: string, node: string, script: string): I
       if (!seen) groups.push({ hooks: [entry] });
     }
     return JSON.stringify(doc) !== before || l.text === null;
-  }, configDir);
+  }, { backupDir: configDir, still });
 }
 
 /** Remove our entries, and only the containers that removing them left empty; delete the rows we wrote. */
@@ -233,7 +247,7 @@ export function uninstallHooks(configDir: string): InstallResult {
       if (touchedAny && Object.keys(hooks).length === 0) delete doc.hooks;
     }
     return touchedAny;
-  });
+  }, { removing: true });
   fs.rmSync(terminalsDir(configDir), { recursive: true, force: true });
   return r;
 }
@@ -302,13 +316,13 @@ export function approvalHookCommand(node: string, script: string, arg: "ask" | "
 }
 
 /** Add (or bring up to date) the approval hooks; the same merge rules as {@link installHooks}. */
-export function installApprovalHooks(configDir: string, node: string, script: string, socket: string): InstallResult {
+export function installApprovalHooks(configDir: string, node: string, script: string, socket: string, still?: () => boolean): InstallResult {
   return installApprovalEntries(settingsFile(configDir), APPROVAL_HOOKED.map((h) => ({
     event: h.event, entry: { type: "command", command: approvalHookCommand(node, script, h.arg, configDir, socket), timeout: h.timeout, ...(h.async ? { async: true } : {}) },
-  })), configDir, configDir);
+  })), configDir, configDir, still);
 }
 
-function installApprovalEntries(where: string, entries: Array<{ event: string; entry: Json }>, configDir: string, backupDir?: string): InstallResult {
+function installApprovalEntries(where: string, entries: Array<{ event: string; entry: Json }>, configDir: string, backupDir?: string, still?: () => boolean): InstallResult {
   return rewrite(() => load(configDir, where), (doc, l) => {
     const before = JSON.stringify(doc);
     const hooks: Json = hooksOf(doc, where) ?? (doc.hooks = {}) as Json;
@@ -333,7 +347,7 @@ function installApprovalEntries(where: string, entries: Array<{ event: string; e
       if (!seen) groups.push({ hooks: [entry] });
     }
     return JSON.stringify(doc) !== before || l.text === null;
-  }, backupDir);
+  }, { backupDir, still });
 }
 
 /** Remove the approval hooks only (the session hooks stay). */
@@ -365,7 +379,7 @@ function uninstallApprovalEntries(where: string, events: readonly string[], conf
       if (touchedAny && Object.keys(hooks).length === 0) delete doc.hooks;
     }
     return touchedAny;
-  });
+  }, { removing: true });
 }
 
 /** Whether the approval hooks are in place (all of them), and whether what they run still exists; never throws. */

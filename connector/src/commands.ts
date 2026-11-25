@@ -433,13 +433,14 @@ export function ensureClaudeHooks(ctx: Ctx, o: { create?: boolean } = {}): Ensur
       if (optedOut(ctx.env)) want.approvals = false;
       if (!want.session && !want.approvals) continue;
       if (!o.create && !fs.existsSync(dir) && !claudeInstalled(ctx)) { r.absent = true; continue; }
+      // The choice is read again under the settings file's lock: a no said meanwhile (`hooks uninstall`) wins.
       if (want.session) {
         const had = present(hooksStatus, dir);
-        r.session = installOne(ctx, dir).changed ? (had ? "updated" : "added") : "kept";
+        r.session = installOne(ctx, dir, () => wantedHooks(ctx.dirs, dir).session).changed ? (had ? "updated" : "added") : "kept";
       }
       if (want.approvals) {
         const had = present(approvalHooksStatus, dir);
-        r.approvals = installApprovalsOne(ctx, dir).changed ? (had ? "updated" : "added") : "kept";
+        r.approvals = installApprovalsOne(ctx, dir, () => wantedHooks(ctx.dirs, dir).approvals).changed ? (had ? "updated" : "added") : "kept";
       }
     } catch (e) { r.error = errMessage(e); }
   }
@@ -502,8 +503,8 @@ function hookScript(ctx: Ctx): string {
   return script;
 }
 
-function installOne(ctx: Ctx, dir: string) {
-  return installHooks(dir, ctx.node ?? process.execPath, hookScript(ctx));
+function installOne(ctx: Ctx, dir: string, still?: () => boolean) {
+  return installHooks(dir, ctx.node ?? process.execPath, hookScript(ctx), still);
 }
 
 function approvalScript(ctx: Ctx): string {
@@ -512,8 +513,8 @@ function approvalScript(ctx: Ctx): string {
   return script;
 }
 
-function installApprovalsOne(ctx: Ctx, dir: string) {
-  return installApprovalHooks(dir, ctx.node ?? process.execPath, approvalScript(ctx), approvalSocketFile(ctx.dirs.state));
+function installApprovalsOne(ctx: Ctx, dir: string, still?: () => boolean) {
+  return installApprovalHooks(dir, ctx.node ?? process.execPath, approvalScript(ctx), approvalSocketFile(ctx.dirs.state), still);
 }
 
 const describeInstall = (dir: string, changed: boolean): string =>

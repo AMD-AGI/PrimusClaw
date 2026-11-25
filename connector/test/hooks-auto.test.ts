@@ -16,7 +16,7 @@ import test, { describe } from "node:test";
 import { fileURLToPath } from "node:url";
 import { approvalSocketFile } from "../src/approvals.js";
 import { EXIT, main, type Ctx } from "../src/commands.js";
-import { approvalHooksStatus, BACKUP_PREFIX, hooksStatus, installHooks, settingsFile } from "../src/hooks.js";
+import { approvalHooksStatus, BACKUP_PREFIX, hooksStatus, installApprovalHooks, installHooks, settingsFile } from "../src/hooks.js";
 import { hookPrefsFile, legacyOfferFile } from "../src/hooks-auto.js";
 import { resolveDirs } from "../src/paths.js";
 import { writeUpgradeState, readUpgradeState } from "../src/auto-upgrade.js";
@@ -311,6 +311,33 @@ describe("writers at the same time", () => {
     const after = JSON.parse(fs.readFileSync(settingsFile(dir), "utf8"));
     assert.equal(after.written_under_lock, true);
     assert.equal(approvalHooksStatus(dir).installed, true);
+  });
+
+  test("an uninstall waits for a start that is writing the hooks right now, and takes them out after it; a start asks for the choice again under the lock", async () => {
+    const dir = tmpdir("cc-uninstall-race-");
+    fs.writeFileSync(settingsFile(dir), JSON.stringify(MINE, null, 2));
+    const approvalScript = stand("approval-hook.js");
+    const lock = `${settingsFile(dir)}.claw-connector.lock`;
+    fs.writeFileSync(lock, String(process.pid)); // a start that holds the lock and has decided to install
+    const code = `
+      import { uninstallApprovalHooks } from ${JSON.stringify(path.join(here, "..", "src", "hooks.ts"))};
+      uninstallApprovalHooks(${JSON.stringify(dir)});`;
+    const child = spawn(NODE, ["--import", "tsx", "--input-type=module", "-e", code], { cwd: path.join(here, ".."), stdio: ["ignore", "ignore", "inherit"] });
+    const exited = new Promise<number>((resolve) => child.on("exit", (c) => resolve(c ?? 1)));
+    await new Promise((r) => setTimeout(r, 2500));
+    // What that start writes before it lets go of the lock (made beside, so the lock stays held throughout).
+    const beside = tmpdir("cc-beside-");
+    fs.copyFileSync(settingsFile(dir), settingsFile(beside));
+    installApprovalHooks(beside, NODE, approvalScript, "/s.sock");
+    fs.writeFileSync(settingsFile(dir), fs.readFileSync(settingsFile(beside), "utf8").replaceAll(`'${beside}'`, `'${dir}'`));
+    assert.equal(approvalHooksStatus(dir).installed, true);
+    fs.rmSync(lock);
+    assert.equal(await exited, 0);
+    assert.equal(approvalHooksStatus(dir).events.length, 0, "the uninstall wins");
+    assert.ok(commandsOf(dir).includes("guard.sh"));
+    // A start whose choice turned to no while it waited for the lock writes nothing.
+    assert.equal(installApprovalHooks(dir, NODE, approvalScript, "/s.sock", () => false).changed, false);
+    assert.equal(approvalHooksStatus(dir).events.length, 0);
   });
 
   test("a lock left by a writer that died is taken over", () => {
