@@ -291,19 +291,20 @@ release version, and its `appVersion` stays `latest`.
 
 ### Changed
 
-- Claw, Agent Sandbox: a sandbox template's `host_mounts` now need the sandbox to be created without its workspace's
-  storage: the template sets `useWorkspaceStorage: false` where Agent Sandbox reads it (the nested `template` when it
-  carries the `fromImage`), or the manifest is refused (`422 app_manifest_invalid`, at
-  `sandbox_templates[i].useWorkspaceStorage`). A read-only mount beneath the workspace's read-write mount protected
-  nothing, since the sandbox could write the same directory through its parent, and the sandbox platform's pod
-  admission refuses such a mount on external nodes, where the create then hung until its pending timeout. Agent
-  Sandbox templates have a new field, `useWorkspaceStorage` (apply the updated CodeInterpreter CRD before rolling the
-  control plane); `false` creates the SaFE Workload with `primus-safe.workload.use.workspace.storage: "false"`, so SaFE
-  mounts none of the workspace's volumes. The grant service refuses to issue or extend a grant whose template has a
-  hostPath volume without it, and a sandbox is not created from a grant template that has host paths with the storage
-  on. Incompatible: a manifest with `host_mounts` registered before this change is refused until it adds
-  `useWorkspaceStorage: false`; what such a sandbox needs from the workspace's storage besides those directories must
-  become further `host_mounts` entries.
+- Claw, Agent Sandbox: a sandbox template says how its sandbox mounts its workspace's storage with `workspaceStorage`:
+  `"on"` (the default, as before), `"off"` (none of it; the SaFE Workload gets
+  `primus-safe.workload.use.workspace.storage: "false"`) or `"readOnly"` (all of it read-only, init containers
+  included, without the per-user directory; the Workload gets `primus-safe.workload.workspace.storage.readonly: "true"`,
+  which needs a SaFE that knows it). A template's `host_mounts` now need `"off"` or `"readOnly"` where Agent Sandbox
+  reads the template (the nested `template` when it carries the `fromImage`), or the manifest is refused
+  (`422 app_manifest_invalid`, at `sandbox_templates[i].workspaceStorage`): a read-only mount beneath the workspace's
+  read-write mount protected nothing, since the sandbox could write the same directory through its parent, and the
+  sandbox platform's pod admission refuses such a mount on external nodes, where the create then hung until its
+  pending timeout. Any other value is refused too. Apply the updated CodeInterpreter CRD before rolling the control
+  plane. The grant service refuses to issue or extend a grant whose template has a hostPath volume with the storage
+  on, and a sandbox is not created from a grant template that has host paths with the storage on. `"readOnly"`
+  requires the sandbox to keep all its writes on local disk; roll it out per template with a canary. Incompatible: a
+  manifest with `host_mounts` registered before this change is refused until it sets `workspaceStorage`.
 - Claw, personal agent: the message for a terminal turn that ended while nobody was at it says which conversation first. Its
   title is the conversation's name (as Claude Code's session list shows it, else its title) with its status (finished, or
   stopped with an error and why); one small line names the tool, the machine, the folder and the item number. Then what the

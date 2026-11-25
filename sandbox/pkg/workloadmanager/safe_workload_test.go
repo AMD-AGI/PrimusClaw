@@ -5,6 +5,7 @@ package workloadmanager
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -616,67 +617,86 @@ func TestWorkloadObjectCarriesStepsAndHostPaths(t *testing.T) {
 	}
 }
 
-// A template with useWorkspaceStorage false makes a Workload SaFE renders
-// without the workspace's volumes; a template that leaves it out or sets true
-// leaves the choice to SaFE, which mounts them.
-func TestWorkloadObjectTurnsTheWorkspaceStorageOff(t *testing.T) {
+// A template's workspaceStorage reaches SaFE as its Workload annotations: off
+// turns the workspace's storage off, readOnly asks SaFE to mount it read-only,
+// and on or left out leaves the choice to SaFE, which mounts it. A mode that is
+// none of the three is refused.
+func TestWorkloadObjectCarriesTheWorkspaceStorageMode(t *testing.T) {
 	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
 	req := e2b.CreateRequest{SandboxID: sandboxID, TemplateID: "ar-run-measurement-g1", Role: "measurement", SessionID: "s-8f2a",
 		Workspace: "top-models", GrantID: "gr-1", Attestation: "eyJ.test"}
-	off, on := false, true
-	for name, tc := range map[string]struct {
-		storage *bool
-		want    string
-	}{"off": {&off, "false"}, "on": {&on, ""}, "left out": {nil, ""}} {
+	for mode, want := range map[runtimev1alpha1.WorkspaceStorageMode]map[string]string{
+		runtimev1alpha1.WorkspaceStorageOff:      {useWorkspaceStorageAnnotation: "false"},
+		runtimev1alpha1.WorkspaceStorageReadOnly: {workspaceStorageReadOnlyAnnotation: "true"},
+		runtimev1alpha1.WorkspaceStorageOn:       {},
+		"":                                       {},
+	} {
 		ci := testCodeInterpreter()
-		ci.Spec.Template.UseWorkspaceStorage = tc.storage
+		ci.Spec.Template.WorkspaceStorage = mode
 		obj, err := workloadObject(sandboxID, req, ci)
 		if err != nil {
-			t.Fatalf("%s: %v", name, err)
+			t.Fatalf("%q: %v", mode, err)
 		}
-		got, set := obj.GetAnnotations()[useWorkspaceStorageAnnotation]
-		if got != tc.want || set != (tc.want != "") {
-			t.Fatalf("%s: %s=%q (set %v), want %q", name, useWorkspaceStorageAnnotation, got, set, tc.want)
+		got := map[string]string{}
+		for _, key := range []string{useWorkspaceStorageAnnotation, workspaceStorageReadOnlyAnnotation} {
+			if v, ok := obj.GetAnnotations()[key]; ok {
+				got[key] = v
+			}
 		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%q: storage annotations %v, want %v", mode, got, want)
+		}
+	}
+	if workspaceStorageReadOnlyAnnotation != "primus-safe.workload.workspace.storage.readonly" {
+		t.Fatalf("the read-only annotation is SaFE's name and must match it: %s", workspaceStorageReadOnlyAnnotation)
+	}
+	ci := testCodeInterpreter()
+	ci.Spec.Template.WorkspaceStorage = "readonly"
+	if _, err := workloadObject(sandboxID, req, ci); err == nil || !strings.Contains(err.Error(), "none of on, off and readOnly") {
+		t.Fatalf("misspelt mode: err=%v", err)
 	}
 }
 
 // A grant template's host directories are read-only only with the workspace's
-// storage off. One that reaches the Workload with them and the storage on (a
-// CodeInterpreter schema without useWorkspaceStorage drops the field) is
-// refused rather than created with a read-write parent over them; a template
-// that is not a grant's keeps its host paths as before.
+// storage off or read-only. One that reaches the Workload with them and the
+// storage on (a CodeInterpreter schema without workspaceStorage drops the
+// field) is refused rather than created with a read-write parent over them; a
+// template that is not a grant's keeps its host paths as before.
 func TestWorkloadObjectRefusesAGrantHostPathWithTheWorkspaceStorageOn(t *testing.T) {
 	const sandboxID = "sbx-7a9b9b693452f613877992145c818d29"
 	req := e2b.CreateRequest{SandboxID: sandboxID, TemplateID: "ar-run-measurement-g1", Role: "measurement", SessionID: "s-8f2a",
 		Workspace: "top-models", GrantID: "gr-1", Attestation: "eyJ.test"}
-	withCache := func(grantID string, storage *bool) *runtimev1alpha1.CodeInterpreter {
+	withCache := func(grantID string, storage runtimev1alpha1.WorkspaceStorageMode) *runtimev1alpha1.CodeInterpreter {
 		ci := testCodeInterpreter()
 		if grantID != "" {
 			ci.Labels = map[string]string{grantIDLabel: grantID}
 		}
-		ci.Spec.Template.UseWorkspaceStorage = storage
+		ci.Spec.Template.WorkspaceStorage = storage
 		ci.Spec.Template.Volumes = []corev1.Volume{{Name: "template-mount-0",
 			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/shared/team/jit-cache"}}}}
 		return ci
 	}
-	off, on := false, true
-	for name, storage := range map[string]*bool{"left out": nil, "on": &on} {
+	for _, storage := range []runtimev1alpha1.WorkspaceStorageMode{"", runtimev1alpha1.WorkspaceStorageOn} {
 		_, err := workloadObject(sandboxID, req, withCache("gr-1", storage))
-		if err == nil || !strings.Contains(err.Error(), "useWorkspaceStorage: false") {
-			t.Fatalf("grant template, storage %s: err=%v", name, err)
+		if err == nil || !strings.Contains(err.Error(), "workspaceStorage off or readOnly") {
+			t.Fatalf("grant template, storage %q: err=%v", storage, err)
 		}
 	}
-	obj, err := workloadObject(sandboxID, req, withCache("gr-1", &off))
-	if err != nil {
-		t.Fatal(err)
-	}
-	paths, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "hostpath")
-	if len(paths) != 1 || paths[0] != "/shared/team/jit-cache" || obj.GetAnnotations()[useWorkspaceStorageAnnotation] != "false" {
-		t.Fatalf("hostpath=%v annotations=%v", paths, obj.GetAnnotations())
+	for storage, annotation := range map[runtimev1alpha1.WorkspaceStorageMode]string{
+		runtimev1alpha1.WorkspaceStorageOff:      useWorkspaceStorageAnnotation,
+		runtimev1alpha1.WorkspaceStorageReadOnly: workspaceStorageReadOnlyAnnotation,
+	} {
+		obj, err := workloadObject(sandboxID, req, withCache("gr-1", storage))
+		if err != nil {
+			t.Fatalf("%q: %v", storage, err)
+		}
+		paths, _, _ := unstructured.NestedStringSlice(obj.Object, "spec", "hostpath")
+		if _, set := obj.GetAnnotations()[annotation]; len(paths) != 1 || paths[0] != "/shared/team/jit-cache" || !set {
+			t.Fatalf("%q: hostpath=%v annotations=%v", storage, paths, obj.GetAnnotations())
+		}
 	}
 	for _, id := range []string{"", grant.OwnerTemplatesID} {
-		if _, err := workloadObject(sandboxID, req, withCache(id, nil)); err != nil {
+		if _, err := workloadObject(sandboxID, req, withCache(id, "")); err != nil {
 			t.Fatalf("template of grant id %q: %v", id, err)
 		}
 	}

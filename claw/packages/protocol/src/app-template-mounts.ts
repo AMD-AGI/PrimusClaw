@@ -14,17 +14,17 @@
  *
  * What a mount may name, and why:
  *
- *  - A template with mounts must set `useWorkspaceStorage: false` where Agent
- *    Sandbox reads it (the nested `template` when that carries the image,
- *    else the template itself), so the sandbox is created without its
- *    workspace's storage. Every path a mount may name lies under a directory
- *    the workspace mounts into its sandboxes, read-write where it allows
- *    writes: with that mount in the sandbox, the directory stays writable
- *    through its parent and a read-only mount beneath it protects nothing,
- *    and the sandbox platform's pod admission refuses a mount point beneath
- *    a writable workspace mount (what is written there could redirect it). A
- *    template author is never left believing a directory is read-only when it
- *    is not.
+ *  - A template with mounts must set `workspaceStorage` to `"off"` or
+ *    `"readOnly"` where Agent Sandbox reads it (the nested `template` when
+ *    that carries the image, else the template itself), so the sandbox is
+ *    created without its workspace's storage or with all of it read-only.
+ *    Every path a mount may name lies under a directory the workspace mounts
+ *    into its sandboxes, read-write where it allows writes: with that mount in
+ *    the sandbox, the directory stays writable through its parent and a
+ *    read-only mount beneath it protects nothing, and the sandbox platform's
+ *    pod admission refuses a mount point beneath a writable workspace mount
+ *    (what is written there could redirect it). A template author is never
+ *    left believing a directory is read-only when it is not.
  *  - Only `readOnly: true`: the sandbox workload mounts every host path it is
  *    given read-only, so `readOnly: false` would be a promise the platform
  *    does not keep.
@@ -87,10 +87,16 @@ export interface AppTemplateMount {
 }
 
 /**
- * Agent Sandbox's template key that, set to `false`, creates the sandbox
- * without its workspace's storage; a template with `host_mounts` must set it so.
+ * Agent Sandbox's template key saying how the sandbox mounts its workspace's
+ * storage: `"on"` (the default), `"off"` (none of it) or `"readOnly"` (all of
+ * it read-only, without the per-user directory). A template with
+ * `host_mounts` must set `"off"` or `"readOnly"`.
  */
-export const WORKSPACE_STORAGE_KEY = "useWorkspaceStorage";
+export const WORKSPACE_STORAGE_KEY = "workspaceStorage";
+
+/** The values of {@link WORKSPACE_STORAGE_KEY}. */
+export const WORKSPACE_STORAGE_MODES = ["on", "off", "readOnly"] as const;
+export type WorkspaceStorageMode = (typeof WORKSPACE_STORAGE_MODES)[number];
 
 /** Agent Sandbox's own volume keys of a template; its `volumes` may not be hostPath ones. */
 export const TEMPLATE_RAW_VOLUME_KEYS = ["volumes", "volumeMounts"] as const;
@@ -168,6 +174,8 @@ export function templateMountIssues(template: Record<string, unknown>, at: strin
   keyIssues(template, at, bad);
   rawVolumeIssues(template, at, bad, reserveNames);
   if (nested) rawVolumeIssues(nested, `${at}.template`, bad, reserveNames);
+  storageModeIssues(template, at, bad);
+  if (nested) storageModeIssues(nested, `${at}.template`, bad);
   const mounts = template.host_mounts;
   if (mounts === undefined) return issues;
   if (!Array.isArray(mounts)) {
@@ -205,16 +213,26 @@ export function templateMountIssues(template: Record<string, unknown>, at: strin
   });
   if (mounts.length > 0) {
     const target = agentSandboxTemplate(template);
-    if (target[WORKSPACE_STORAGE_KEY] !== false) {
+    const mode = target[WORKSPACE_STORAGE_KEY];
+    if (mode !== "off" && mode !== "readOnly") {
       bad(
         target === template ? `${at}.${WORKSPACE_STORAGE_KEY}` : `${at}.template.${WORKSPACE_STORAGE_KEY}`,
-        "must be false in a template with host_mounts: with its workspace's storage mounted, a sandbox could write a " +
-          "host_mounts directory through the workspace's read-write mount of its parent, and the sandbox platform refuses " +
-          "a mount beneath a writable workspace mount",
+        'must be "off" or "readOnly" in a template with host_mounts: with its workspace\'s storage mounted read-write, a ' +
+          "sandbox could write a host_mounts directory through the workspace's mount of its parent, and the sandbox " +
+          "platform refuses a mount beneath a writable workspace mount",
       );
     }
   }
   return issues;
+}
+
+/** A `workspaceStorage` that is set must be one of its modes, spelt as Agent Sandbox reads it. */
+function storageModeIssues(obj: Record<string, unknown>, at: string, bad: (path: string, reason: string) => void): void {
+  const mode = obj[WORKSPACE_STORAGE_KEY];
+  if (mode === undefined) return;
+  if (!(WORKSPACE_STORAGE_MODES as readonly unknown[]).includes(mode)) {
+    bad(`${at}.${WORKSPACE_STORAGE_KEY}`, `must be one of ${WORKSPACE_STORAGE_MODES.map((m) => JSON.stringify(m)).join(", ")}`);
+  }
 }
 
 /**

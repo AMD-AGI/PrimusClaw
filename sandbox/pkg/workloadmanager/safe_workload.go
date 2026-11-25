@@ -81,10 +81,18 @@ const (
 	signingSecretFinalizer = "primus-safe/secret.finalizer"
 )
 
-// useWorkspaceStorageAnnotation "false" makes SaFE mount none of the
-// workspace's volumes into the Workload's pods; SaFE sets it to "true" when a
-// Workload is created without it.
-const useWorkspaceStorageAnnotation = "primus-safe.workload.use.workspace.storage"
+const (
+	// useWorkspaceStorageAnnotation "false" makes SaFE mount none of the
+	// workspace's volumes into the Workload's pods; SaFE sets it to "true"
+	// when a Workload is created without it.
+	useWorkspaceStorageAnnotation = "primus-safe.workload.use.workspace.storage"
+	// workspaceStorageReadOnlyAnnotation "true" makes SaFE mount every volume
+	// of the workspace's storage read-only into the Workload's pods, init
+	// containers included, and leave out the per-user directory. The name is
+	// SaFE's and must match it exactly: a SaFE that does not know it mounts
+	// the storage as it always does.
+	workspaceStorageReadOnlyAnnotation = "primus-safe.workload.workspace.storage.readonly"
+)
 
 // secretGVR is a namespace-scoped Secret. The signing key lives in primus-safe.
 var secretGVR = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
@@ -910,15 +918,19 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	if len(paths) > 0 {
 		spec["hostpath"] = paths
 	}
+	storage := ci.Spec.Template.WorkspaceStorageMode()
+	if !storage.Valid() {
+		return nil, fmt.Errorf("template %s: workspaceStorage %q is none of on, off and readOnly", req.TemplateID, storage)
+	}
 	// A grant template's hostPath volumes are read-only views of the
 	// workspace's storage, which the grant service accepts only with the
-	// workspace's storage off. A template that reaches here with hostPath
-	// volumes and the storage on (for example one stored before the
-	// CodeInterpreter schema kept useWorkspaceStorage, which would have
-	// dropped it) is refused rather than created with a read-write parent
-	// over its read-only mounts.
-	if len(paths) > 0 && grantTemplate(ci) && !ci.Spec.Template.WorkspaceStorageOff() {
-		return nil, fmt.Errorf("template %s mounts host paths with its workspace's storage on; a grant template's host paths need useWorkspaceStorage: false", req.TemplateID)
+	// workspace's storage off or read-only. A template that reaches here with
+	// hostPath volumes and the storage on (for example one stored before the
+	// CodeInterpreter schema kept workspaceStorage, which would have dropped
+	// it) is refused rather than created with a read-write parent over its
+	// read-only mounts.
+	if len(paths) > 0 && grantTemplate(ci) && storage.Writable() {
+		return nil, fmt.Errorf("template %s mounts host paths with its workspace's storage on; a grant template's host paths need workspaceStorage off or readOnly", req.TemplateID)
 	}
 	if nodes := strings.TrimSpace(req.AvoidNodes); nodes != "" {
 		spec["customerLabels"] = map[string]any{"excluded-nodes": nodes}
@@ -941,8 +953,11 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 		labels[ownerKeyLabel] = "true"
 	}
 	annotations := map[string]any{}
-	if ci.Spec.Template.WorkspaceStorageOff() {
+	switch storage {
+	case runtimev1alpha1.WorkspaceStorageOff:
 		annotations[useWorkspaceStorageAnnotation] = "false"
+	case runtimev1alpha1.WorkspaceStorageReadOnly:
+		annotations[workspaceStorageReadOnlyAnnotation] = "true"
 	}
 	if req.UserName != "" {
 		annotations[safeUserNameAnnotation] = req.UserName

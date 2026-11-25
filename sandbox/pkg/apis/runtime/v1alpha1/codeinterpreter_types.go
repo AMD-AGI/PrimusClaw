@@ -171,21 +171,54 @@ type CodeInterpreterSandboxTemplate struct {
 	// +kubebuilder:validation:MaxItems=4
 	Layers []SandboxLayer `json:"layers,omitempty"`
 
-	// UseWorkspaceStorage false creates the sandbox without its workspace's
-	// storage: SaFE mounts none of the workspace's volumes (the Workload's
-	// use.workspace.storage is false), so the sandbox reaches only the host
-	// paths of its own hostPath volumes. Left out or true, the workspace's
-	// storage is mounted as SaFE mounts it for every workload. A hostPath
-	// volume of a grant template is read-only protection only with false: the
-	// workspace mounts its storage read-write, so a read-only mount beneath it
-	// could be written through its parent.
+	// WorkspaceStorage says how the sandbox mounts its workspace's storage:
+	//   on (or left out): as SaFE mounts it for every workload;
+	//   off:      none of the workspace's volumes (the Workload's
+	//             use.workspace.storage is false), so the sandbox reaches only
+	//             the host paths of its own hostPath volumes;
+	//   readOnly: every volume of the workspace's storage read-only, without
+	//             the per-user directory SaFE mounts read-write otherwise.
+	// A hostPath volume of a grant template is read-only protection only with
+	// off or readOnly: with the storage on, a read-only mount beneath the
+	// workspace's read-write mount could be written through its parent.
 	// +optional
-	UseWorkspaceStorage *bool `json:"useWorkspaceStorage,omitempty"`
+	// +kubebuilder:validation:Enum=on;off;readOnly
+	WorkspaceStorage WorkspaceStorageMode `json:"workspaceStorage,omitempty"`
 }
 
-// WorkspaceStorageOff reports whether the template turns its workspace's storage off.
-func (t *CodeInterpreterSandboxTemplate) WorkspaceStorageOff() bool {
-	return t != nil && t.UseWorkspaceStorage != nil && !*t.UseWorkspaceStorage
+// WorkspaceStorageMode is how a sandbox mounts its workspace's storage.
+type WorkspaceStorageMode string
+
+const (
+	// WorkspaceStorageOn mounts the workspace's storage as SaFE mounts it for every workload.
+	WorkspaceStorageOn WorkspaceStorageMode = "on"
+	// WorkspaceStorageOff mounts none of the workspace's volumes.
+	WorkspaceStorageOff WorkspaceStorageMode = "off"
+	// WorkspaceStorageReadOnly mounts every volume of the workspace's storage read-only.
+	WorkspaceStorageReadOnly WorkspaceStorageMode = "readOnly"
+)
+
+// WorkspaceStorageMode returns the template's mode, on when it is left out.
+// A value that is none of the three is returned as it is, for the caller to refuse.
+func (t *CodeInterpreterSandboxTemplate) WorkspaceStorageMode() WorkspaceStorageMode {
+	if t == nil || t.WorkspaceStorage == "" {
+		return WorkspaceStorageOn
+	}
+	return t.WorkspaceStorage
+}
+
+// Valid reports whether m is one of on, off and readOnly (or left out).
+func (m WorkspaceStorageMode) Valid() bool {
+	switch m {
+	case "", WorkspaceStorageOn, WorkspaceStorageOff, WorkspaceStorageReadOnly:
+		return true
+	}
+	return false
+}
+
+// Writable reports whether the sandbox may write its workspace's storage.
+func (m WorkspaceStorageMode) Writable() bool {
+	return m == "" || m == WorkspaceStorageOn
 }
 
 // SandboxLayer is one image whose directory is copied into the sandbox.

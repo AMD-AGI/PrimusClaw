@@ -155,13 +155,15 @@ spec:
                           readOnly:
                             type: boolean
                         required: ["image", "from", "mount"]
-                    useWorkspaceStorage:
+                    workspaceStorage:
                       description: >-
-                        false creates the sandbox without its workspace's storage: SaFE mounts
-                        none of the workspace's volumes, and the sandbox reaches only the host
-                        paths of its own hostPath volumes. Left out or true, the workspace's
-                        storage is mounted.
-                      type: boolean
+                        How the sandbox mounts its workspace's storage. on (or left out): as
+                        SaFE mounts it for every workload. off: none of the workspace's volumes;
+                        the sandbox reaches only the host paths of its own hostPath volumes.
+                        readOnly: every volume of the workspace's storage read-only, without
+                        the per-user directory.
+                      type: string
+                      enum: ["on", "off", "readOnly"]
                 gpu:
                   type: object
                   properties:
