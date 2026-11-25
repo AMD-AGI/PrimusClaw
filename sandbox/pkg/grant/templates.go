@@ -231,6 +231,25 @@ func checkMountPath(p string) error {
 	return nil
 }
 
+// validateTemplatePreferredNodes rejects a template whose preferredNodes are
+// not at most 8 distinct node names. reason is the error reason of the caller
+// (invalid_grant, invalid_owner_policy).
+func validateTemplatePreferredNodes(templates []runtimev1alpha1.GrantTemplate, reason string) error {
+	for _, tpl := range templates {
+		base, ok, err := templateFromSpec(tpl.Spec)
+		if err != nil {
+			return specError(reason, tpl.Name, err)
+		}
+		if !ok {
+			continue
+		}
+		if err := runtimev1alpha1.ValidatePreferredNodes(base.template.PreferredNodes); err != nil {
+			return opWrap(http.StatusBadRequest, reason, "template "+tpl.Name+": "+err.Error(), err)
+		}
+	}
+	return nil
+}
+
 // validateTemplateResources rejects a template whose resources or shared
 // memory cannot be resolved for one of the card counts it is expanded for.
 // reason is the error reason of the caller (invalid_grant, invalid_owner_policy).
@@ -354,6 +373,9 @@ func expandedNames(g *runtimev1alpha1.SandboxGrant) []string {
 // codeInterpreter builds the CodeInterpreter of one expansion of a template.
 // The template's resources and shared memory are resolved by templateResources.
 func codeInterpreter(grantID, name string, base *templateSpec, gpus int32, namespace string) (*runtimev1alpha1.CodeInterpreter, error) {
+	if err := runtimev1alpha1.ValidatePreferredNodes(base.template.PreferredNodes); err != nil {
+		return nil, err
+	}
 	resources, shm, err := templateResources(base, gpus)
 	if err != nil {
 		return nil, err

@@ -155,6 +155,18 @@ spec:
                           readOnly:
                             type: boolean
                         required: ["image", "from", "mount"]
+                    preferredNodes:
+                      description: >-
+                        Node names a sandbox of this template prefers to run on (soft; a name
+                        outside the workspace never matches). A name the create also asks to
+                        avoid is dropped from the preference.
+                      type: array
+                      maxItems: 8
+                      x-kubernetes-list-type: set
+                      items:
+                        type: string
+                        maxLength: 253
+                        pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
                 gpu:
                   type: object
                   properties:

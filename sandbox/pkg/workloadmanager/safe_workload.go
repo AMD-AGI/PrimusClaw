@@ -49,7 +49,12 @@ const (
 	sandboxIDLabel                = "agent-sandbox.io/sandbox-id"
 	grantAttestationAnnotation    = "agent-sandbox.io/grant-attestation"
 	identityAttestationAnnotation = "agent-sandbox.io/identity-attestation"
-	// nodesAffinityAnnotation asks SaFE to treat excluded-nodes as a preference.
+	// excludedNodesLabel and specifiedNodesLabel are the SaFE customer labels
+	// naming the nodes a Workload avoids and prefers, space-separated.
+	excludedNodesLabel  = "excluded-nodes"
+	specifiedNodesLabel = "specified-nodes"
+	// nodesAffinityAnnotation asks SaFE to treat specified-nodes and
+	// excluded-nodes as preferences rather than requirements.
 	nodesAffinityAnnotation  = "primus-safe.nodes.affinity"
 	nodesAffinityPreferred   = "preferred"
 	workloadEphemeralStorage = "50Gi"
@@ -235,6 +240,7 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 		PodPort:              envdPort,
 		NodeName:             nodeName,
 		Cluster:              cluster,
+		PreferredNodes:       workloadPreferredNodes(created),
 		Kind:                 store.WorkloadKind,
 		MaxSessionDuration:   req.Timeout,
 		RuntimePolicy:        ci.Spec.RuntimePolicy,
@@ -352,11 +358,12 @@ func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2
 		cluster := obj.GetLabels()[safeClusterIDLabel]
 		if _, remote := c.remoteClusters[cluster]; remote && cluster != "" {
 			return e2b.CreateResult{
-				SandboxName: sandboxID,
-				Namespace:   workspace,
-				PodPort:     envdPort,
-				NodeName:    nodeFromUsage(obj),
-				Cluster:     cluster,
+				SandboxName:    sandboxID,
+				Namespace:      workspace,
+				PodPort:        envdPort,
+				NodeName:       nodeFromUsage(obj),
+				Cluster:        cluster,
+				PreferredNodes: workloadPreferredNodes(obj),
 			}, e2b.WorkloadRunning, nil
 		}
 		ip, node, ok := c.address(ctx, obj, workspace, sandboxID)
@@ -364,12 +371,13 @@ func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2
 			return e2b.CreateResult{}, e2b.WorkloadPending, nil
 		}
 		return e2b.CreateResult{
-			SandboxName: sandboxID,
-			Namespace:   workspace,
-			PodIP:       ip,
-			PodPort:     envdPort,
-			NodeName:    node,
-			Cluster:     cluster,
+			SandboxName:    sandboxID,
+			Namespace:      workspace,
+			PodIP:          ip,
+			PodPort:        envdPort,
+			NodeName:       node,
+			Cluster:        cluster,
+			PreferredNodes: workloadPreferredNodes(obj),
 		}, e2b.WorkloadRunning, nil
 	default:
 		return e2b.CreateResult{}, e2b.WorkloadPending, nil
@@ -903,8 +911,20 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	if paths := templateHostPaths(ci.Spec.Template); len(paths) > 0 {
 		spec["hostpath"] = paths
 	}
-	if nodes := strings.TrimSpace(req.AvoidNodes); nodes != "" {
-		spec["customerLabels"] = map[string]any{"excluded-nodes": nodes}
+	if err := runtimev1alpha1.ValidatePreferredNodes(ci.Spec.Template.PreferredNodes); err != nil {
+		return nil, fmt.Errorf("template %s: %w", req.TemplateID, err)
+	}
+	avoid := strings.TrimSpace(req.AvoidNodes)
+	preferred := preferredNodes(ci.Spec.Template.PreferredNodes, avoid)
+	customerLabels := map[string]any{}
+	if avoid != "" {
+		customerLabels[excludedNodesLabel] = avoid
+	}
+	if preferred != "" {
+		customerLabels[specifiedNodesLabel] = preferred
+	}
+	if len(customerLabels) > 0 {
+		spec["customerLabels"] = customerLabels
 	}
 	if req.SigningKeyPEM != "" {
 		spec["secrets"] = []any{map[string]any{"id": signingSecretName(req.SandboxID), "type": "general"}}
@@ -933,7 +953,9 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	if req.IdentityAttestation != "" {
 		annotations[identityAttestationAnnotation] = req.IdentityAttestation
 	}
-	if strings.TrimSpace(req.AvoidNodes) != "" {
+	// A preferred node list never leaves a sandbox pending when the nodes are
+	// full or not in the workspace.
+	if avoid != "" || preferred != "" {
 		annotations[nodesAffinityAnnotation] = nodesAffinityPreferred
 	}
 	layers, err := sandboxlayer.Resolve(ci.Spec.Template.Layers, sandboxlayer.TemplateMounts(ci.Spec.Template))
@@ -959,6 +981,31 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 }
 
 // ephemeralStorage returns the template pod storage, or the default when unset.
+// workloadPreferredNodes reads the specified-nodes customer label of a Workload.
+func workloadPreferredNodes(obj *unstructured.Unstructured) string {
+	nodes, _, _ := unstructured.NestedString(obj.Object, "spec", "customerLabels", specifiedNodesLabel)
+	return nodes
+}
+
+// preferredNodes is the specified-nodes value for a template's preferred
+// nodes: the names space-separated, without any name in avoid (space-separated).
+// A node both preferred and avoided would score like any other node, so the
+// avoid wins and the node is only avoided.
+func preferredNodes(names []string, avoid string) string {
+	avoided := map[string]struct{}{}
+	for _, name := range strings.Fields(avoid) {
+		avoided[name] = struct{}{}
+	}
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, ok := avoided[name]; ok {
+			continue
+		}
+		out = append(out, name)
+	}
+	return strings.Join(out, " ")
+}
+
 func ephemeralStorage(req corev1.ResourceRequirements) string {
 	if s := quantityString(req.Limits, corev1.ResourceEphemeralStorage); s != "" {
 		return s

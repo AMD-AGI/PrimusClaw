@@ -58,6 +58,9 @@ type CreateResult struct {
 	Cluster string
 	// Failure is the failure text of a finished Workload, when known.
 	Failure string
+	// PreferredNodes are the nodes the Workload prefers, space-separated,
+	// or "" when it prefers none.
+	PreferredNodes string
 }
 
 // Runner creates and deletes sandboxes. It must not inject a platform inference key.

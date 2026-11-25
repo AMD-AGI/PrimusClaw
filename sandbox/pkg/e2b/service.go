@@ -385,14 +385,7 @@ func (s *Service) Create(ctx context.Context, apiKey string, body CreateBody) (S
 		NodeName:    result.NodeName,
 		Cluster:     result.Cluster,
 	}
-	if result.NodeName != "" {
-		running.Metadata = map[string]string{
-			nodeNameMetadata: result.NodeName,
-		}
-		if landedOnAvoidedNode(result.NodeName, metadata[avoidNodesMetadata]) {
-			running.Metadata[sameNodeMetadata] = "true"
-		}
-	}
+	running.Metadata = placementMetadata(result, metadata[avoidNodesMetadata])
 	if err := s.grants.MarkRunning(context.WithoutCancel(ctx), grantID, sandboxID, running); err != nil {
 		_ = s.runner.Delete(context.WithoutCancel(ctx), sandboxID)
 		_ = s.grants.EndSandbox(context.WithoutCancel(ctx), grantID, sandboxID, "create_failed")
@@ -523,12 +516,7 @@ func (s *Service) adoptPending(ctx context.Context, grantID string, ref runtimev
 		return ref, false, nil
 	}
 	up := grant.RunningUpdate{SandboxName: result.SandboxName, Namespace: result.Namespace, NodeName: result.NodeName, Cluster: result.Cluster}
-	if result.NodeName != "" {
-		up.Metadata = map[string]string{nodeNameMetadata: result.NodeName}
-		if landedOnAvoidedNode(result.NodeName, ref.Metadata[avoidNodesMetadata]) {
-			up.Metadata[sameNodeMetadata] = "true"
-		}
-	}
+	up.Metadata = placementMetadata(result, ref.Metadata[avoidNodesMetadata])
 	if adopter, ok := s.runner.(Adopter); ok {
 		timeout := time.Duration(ref.TimeoutSec) * time.Second
 		if err := adopter.Adopt(context.WithoutCancel(ctx), ref.ID, result, timeout); err != nil {
