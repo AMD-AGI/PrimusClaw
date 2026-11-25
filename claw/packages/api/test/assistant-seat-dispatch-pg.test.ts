@@ -1216,6 +1216,25 @@ describe("seat dispatch", { skip }, () => {
     assert.equal(late[0]!.remote.item_seq, b.seq);
   });
 
+  test("D28 a turn read under a cursor kept as before, by a task that moved on since, is not kept or said again", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const b = await finished(alice, cid, s, "跑 sleep 60");
+    await events("alice", cid, s.sid, [chunk("late-legacy-3C9D"),
+      ["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true, ended_by: "result" }]]);
+    const kept = async () => (await w.q("SELECT COUNT(*)::int AS n FROM claw_work_item_events WHERE item_id = $1 AND result->>'agent_initiated' = 'true'", [b.item_id]))[0].n;
+    assert.equal(await kept(), 1);
+    // Its cursor as an older server kept it, and the task moved to a new session since.
+    await w.q(`UPDATE claw_work_items SET params = (params - 'agent_turn_seen_in')
+                 || jsonb_build_object('agent_turn_seen', (params->'agent_turn_seen_in'->>$2)::bigint, 'session_id', gen_random_uuid()::text)
+               WHERE item_id = $1`, [b.item_id, s.sid]);
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    assert.equal(await kept(), 1, "not kept twice");
+    assert.equal((await notices()).filter((n) => /late-legacy-3C9D/.test(n.text)).length, 1);
+  });
+
   test("D29 the agent's own turn with a command still running keeps the seat busy past the quiet; once the command is done, quiet frees it", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox");

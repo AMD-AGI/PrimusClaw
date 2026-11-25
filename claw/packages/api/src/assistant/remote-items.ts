@@ -1510,6 +1510,11 @@ async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice
       const item = items.find((i) => i.item_id === named(end));
       if (!item) continue;
       touched.set(item.item_id, Math.max(touched.get(item.item_id) ?? 0, id));
+      // Read before (a cursor kept as before `agent_turn_seen_in`, on a task that has moved on since): not said or kept again.
+      if ((await q(
+        "SELECT 1 FROM claw_work_item_events WHERE item_id = $1 AND kind = 'answer' AND result->>'agent_initiated' = 'true' AND result->>'remote_event_id' = $2 LIMIT 1",
+        [item.item_id, String(id)],
+      )).rows.length) continue;
       const whole = await answerOf(q, sessionId, id);
       const answer = tailLines(whole, AGENT_TURN_ANSWER_MAX);
       if (!answer) continue;
