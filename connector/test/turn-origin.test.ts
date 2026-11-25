@@ -16,7 +16,8 @@
  *   O6 a turn a person typed after such an end drops it (they are at the terminal) and is told alone
  *   O7 a run that began with a person's turn is told as theirs
  *   O8 a run of ends that never pauses is still told once its first end is old enough
- *   O9 a failed end folded into a later one that finished is counted (`failed_earlier`), never hidden
+ *   O9 a failed end folded into a later one that finished is counted (`failed_earlier`), never hidden, and its words are marked
+ *      as a failure's (`earlier_failed`)
  *   O10 a question in a folded turn is counted (`asked_earlier`) even once its words are no longer carried
  */
 import assert from "node:assert/strict";
@@ -230,6 +231,7 @@ describe("the end says who started the turn", () => {
     await until(() => r.ends().length === 1);
     const e = r.ends()[0]!;
     assert.deepEqual([e.outcome, e.turns, e.failed_earlier, e.earlier], ["done", 2, 1, ["API Error: 429"]]);
+    assert.deepEqual(e.earlier_failed, [0], "which of the earlier words are a failure's");
   });
 
   test("O10 a folded question is counted even once its words are dropped", async () => {

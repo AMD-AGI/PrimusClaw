@@ -404,6 +404,8 @@ interface Ending {
   turns: number;
   /** The last words of the earlier turns folded into it, oldest first, at most {@link TURN_END_EARLIER_MAX}. */
   earlier: string[];
+  /** Whether each of `earlier` is the last words of a turn that failed (same order, same length). */
+  earlierFailed: boolean[];
   /** How many of the earlier turns folded into it failed: a failure is never hidden behind a later turn that finished. */
   failedEarlier: number;
   /** How many of the earlier turns folded into it asked the person something, counted whether or not their words are kept. */
@@ -657,13 +659,14 @@ export class ApprovalBroker {
     const said = typeof raw.last_assistant_message === "string" ? raw.last_assistant_message : "";
     const at = Date.now();
     const earlier = fold ? [...prev.earlier, ...(prev.message ? [cutEnd(prev.message, TURN_END_EARLIER_CHARS)] : [])].slice(-TURN_END_EARLIER_MAX) : [];
+    const earlierFailed = fold ? [...prev.earlierFailed, ...(prev.message ? [prev.outcome === "error"] : [])].slice(-TURN_END_EARLIER_MAX) : [];
     const since = fold ? prev.since : at;
     // A run that started with a person's turn stays theirs: that turn's end is in it, and it is told as theirs.
     const runOrigin: TurnOrigin | null = fold && prev.origin !== "automation" ? "person" : origin;
     const wait = at - since >= (this.d.runMaxMs ?? TURN_END_RUN_MAX_MS) ? 0 : this.d.awayMs ?? TURN_END_AWAY_MS;
     const e: Ending = {
       ref, agent, configDir: from.configDir, cwd, tty, at, outcome: failed ? "error" : "done", error,
-      message: cutEnd(said, TURN_END_MESSAGE_MAX), origin: runOrigin, turns: fold ? prev.turns + 1 : 1, earlier, since,
+      message: cutEnd(said, TURN_END_MESSAGE_MAX), origin: runOrigin, turns: fold ? prev.turns + 1 : 1, earlier, earlierFailed, since,
       failedEarlier: fold ? prev.failedEarlier + (prev.outcome === "error" ? 1 : 0) : 0,
       askedEarlier: fold ? prev.askedEarlier + (prev.outcome !== "error" && turnAsksPerson(prev.message) ? 1 : 0) : 0,
       timer: setTimeout(() => { void this.tellEnding(e); }, wait),
@@ -738,6 +741,8 @@ export class ApprovalBroker {
       ...(e.origin ? { origin: e.origin } : {}),
       ...(e.turns > 1 ? { turns: e.turns, earlier: e.earlier, since: new Date(e.since).toISOString() } : {}),
       ...(e.failedEarlier > 0 ? { failed_earlier: e.failedEarlier } : {}),
+      // Which of `earlier` are the words of a turn that failed (their positions), so Claw can quote the failure itself.
+      ...(e.turns > 1 && e.earlierFailed.some(Boolean) ? { earlier_failed: e.earlierFailed.flatMap((f, i) => (f ? [i] : [])) } : {}),
       ...(e.askedEarlier > 0 ? { asked_earlier: e.askedEarlier } : {}),
     });
     this.d.audit("turn_end_sent", { session_id: opened.sessionId, ref: e.ref, agent: e.agent, outcome: e.outcome });

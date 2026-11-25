@@ -158,7 +158,10 @@ export const PERMISSION_PARK_MAX_MS = 24 * 3600_000;
  * terminal pushes off or muted that conversation. From connector 0.3.4 it also says who started the turn, as Claude Code's transcript
  * records it (`origin`: "person" or "automation"; absent when that is not known), and an end that stands for a run of turns nobody
  * typed carries `turns` (how many), `earlier` (the earlier ones' last words, oldest first, at most five), `since` (ISO time of the
- * first), `failed_earlier` and `asked_earlier` (how many of the earlier ones failed, or asked the person something, when any did). Claw pushes at once only a person's turn, one that asks the person something, or one that failed; it sums up the others.
+ * first), `failed_earlier` and `asked_earlier` (how many of the earlier ones failed, or asked the person something, when any did),
+ * and `earlier_failed` (the positions in `earlier` of the words of turns that failed, when any are carried). Claw pushes at once only
+ * a person's turn, one that asks the person something, or one that failed (in any turn of the run: the push then leads with that
+ * earlier question or failure); it sums up the others.
  */
 export const REMOTE_EVENT_TERMINAL_TURN_END = "terminal_turn_end";
 /**

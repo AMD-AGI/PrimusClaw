@@ -665,7 +665,8 @@ Each end says who started its turn, as Claude Code's transcript records it: a pe
 an accepted suggestion, a slash command) or something else (a message from another session, a scheduled prompt, a hook). Claw
 pushes at once only the ends of turns a person started and those that ask you something or failed; the others are gathered and
 summed up at most once an hour per conversation (`/approvals summary <minutes>|off`). Ends of turns nobody typed that follow
-one another within the minute are told as one, the newest, carrying how many turns and the earlier ones' last words; a new
+one another within the minute are told as one, the newest, carrying how many turns and the earlier ones' last words (and
+which of them failed); when one of them asked you something or failed, the message says that turn first. A new
 prompt holds an end not yet told until its own turn ends, and a person's prompt drops it. A Claude Code older than these
 fields, and Codex, are told as before.
 

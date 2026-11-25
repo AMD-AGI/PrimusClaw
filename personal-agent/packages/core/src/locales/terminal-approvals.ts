@@ -60,6 +60,19 @@ export const terminalApprovalText = defineCatalog({
     endRest: "The rest is in the terminal.",
     endAttach: "Attach",
     endMute: "Mute this conversation",
+    endEarlierAsked: (p: { text: string; count: number }) =>
+      p.text
+        ? `An earlier turn asked: ${p.text}${p.count > 1 ? ` (${String(p.count)} earlier turns asked; see the terminal)` : ""}`
+        : p.count > 1
+          ? `${String(p.count)} earlier turns asked you something; see the terminal.`
+          : "An earlier turn asked you something; see the terminal.",
+    endEarlierFailed: (p: { text: string; count: number }) =>
+      p.text
+        ? `An earlier turn stopped with an error: ${p.text}${p.count > 1 ? ` (${String(p.count)} earlier turns did; see the terminal)` : ""}`
+        : p.count > 1
+          ? `${String(p.count)} earlier turns stopped with an error; see the terminal.`
+          : "An earlier turn stopped with an error; see the terminal.",
+    endLatest: (p: { text: string }) => `Latest turn: ${p.text}`,
     approvalsUnavailable: "I could not reach the setting just now. Try again in a moment.",
     summaryEvery: (p: { minutes: string }) =>
       `A terminal conversation that keeps working on its own (turns another session or a schedule started) is summed up at most once every ${p.minutes} minutes; the end of a turn you started, or one that asks you something, comes at once. \`/approvals summary <minutes>|off\` changes it.`,
@@ -119,6 +132,15 @@ export const terminalApprovalText = defineCatalog({
     endRest: "全文见终端。",
     endAttach: "接入会话",
     endMute: "静音此会话",
+    endEarlierAsked: (p) =>
+      p.text
+        ? `早先一轮在问你：${p.text}${p.count > 1 ? `（早先共 ${String(p.count)} 轮在问你，详见终端）` : ""}`
+        : `早先有 ${String(p.count)} 轮在问你，详见终端。`,
+    endEarlierFailed: (p) =>
+      p.text
+        ? `早先一轮出错停下：${p.text}${p.count > 1 ? `（早先共 ${String(p.count)} 轮出错，详见终端）` : ""}`
+        : `早先有 ${String(p.count)} 轮出错停下，详见终端。`,
+    endLatest: (p) => `最新一轮：${p.text}`,
     approvalsUnavailable: "暂时读不到这个设置，请稍后再试。",
     summaryEvery: (p) =>
       `其他会话或定时任务驱动、持续在跑的终端会话，最多每 ${p.minutes} 分钟汇总一次；你自己发起的回合、或在问你的回合，结束时立即推送。发 \`/approvals summary <分钟>|off\` 修改。`,

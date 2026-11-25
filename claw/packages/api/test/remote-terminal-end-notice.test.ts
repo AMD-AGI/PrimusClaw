@@ -5,11 +5,15 @@
  * What the message of a terminal's turn that ended while nobody was at it says (`terminalEndNotice`, `terminalEndSummary`): one line
  * that names the conversation first, then what the agent did in whole sentences from the start of its last answer (never a tail that
  * starts mid-sentence), then the commands for it. The answers are shaped as the connector posts them (`message`: at most the last
- * 2000 characters of the agent's last answer, "…" first when cut).
+ * 2000 characters of the agent's last answer, "…" first when cut). An end that folds in an earlier turn that asked the person
+ * something, or failed, leads with that turn (`terminalEarlierLeads`, `terminalAskSummary`): its own words, or how many when the
+ * connector no longer carries them.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { END_SENTENCE_MAX, END_SUMMARY_MAX, terminalAttachCommand, terminalEndNotice, terminalEndSummary } from "../src/assistant/remote-items.js";
+import {
+  END_SENTENCE_MAX, END_SUMMARY_MAX, terminalAskSummary, terminalAttachCommand, terminalEarlierLeads, terminalEndNotice, terminalEndSummary,
+} from "../src/assistant/remote-items.js";
 
 /** An answer as an agent writes one: what it did first, then the details, then what comes next. */
 const ANSWER = [
@@ -103,4 +107,57 @@ test("the attach command names a conversation by the start of its ref, and only 
   assert.equal(terminalAttachCommand("abc"), null);
   assert.equal(terminalAttachCommand("a b c d e f"), null);
   assert.equal(terminalAttachCommand(null), null);
+});
+
+test("an earlier turn that asked or failed leads the message: its question in whole sentences, then the latest turn", () => {
+  const kept = [
+    { text: "构建通过。", failed: false },
+    { text: "…部署包已经构建好，测试也都过了。\n\n发布前还有一件事：staging 的配置我没改。要不要我现在发布到生产？", failed: false },
+    { text: "API Error: 429 [rate limited](https://evil.example)", failed: true },
+    { text: "日志已归档。", failed: false },
+  ];
+  const leads = terminalEarlierLeads(kept, 1, 1);
+  assert.deepEqual(leads, [
+    { kind: "asked", text: "发布前还有一件事：staging 的配置我没改。要不要我现在发布到生产？", count: 1 },
+    { kind: "failed", text: "API Error: 429 [rate limited](https://evil.example)", count: 1 },
+  ]);
+  const notice = terminalEndNotice(WHERE, 9, false, "", { summary: "日志已归档。", more: false }, "/agent attach conv-1", leads);
+  assert.equal(notice.split("\n")[1], "早先一轮在问你：发布前还有一件事：staging 的配置我没改。要不要我现在发布到生产？");
+  assert.match(notice.split("\n")[2] ?? "", /^早先一轮出错停下：API Error: 429 \\\[rate limited\\\]\\\(https/u, "inert");
+  assert.equal(notice.split("\n")[3], "最新一轮：日志已归档。");
+  assert.equal(notice.split("\n")[4], "接入：/agent attach conv-1　静音：/approvals mute #9");
+  const en = terminalEndNotice({ ...WHERE, lang: "en" }, 9, false, "", { summary: "Logs archived.", more: false }, null,
+    terminalEarlierLeads([{ text: "Build is ready.\n\nShould I publish it?", failed: false }], 2, 0));
+  assert.deepEqual(en.split("\n").slice(1, 3), [
+    "An earlier turn asked: Should I publish it? (2 earlier turns asked; see the terminal)", "Latest turn: Logs archived.",
+  ]);
+});
+
+test("an earlier question whose words the connector no longer carries is still said, with how many and where to look", () => {
+  const leads = terminalEarlierLeads([{ text: "report 6", failed: false }], 2, 0);
+  assert.deepEqual(leads, [{ kind: "asked", text: "", count: 2 }]);
+  assert.equal(terminalEndNotice(WHERE, 3, false, "", { summary: "第七份报告。", more: false }, "/agent attach conv-1", leads),
+    "【ops】做完了 · dev-pod · ops/tools · 终端空闲 · #3\n早先有 2 轮在问你，详见终端\n最新一轮：第七份报告。\n接入：/agent attach conv-1　静音：/approvals mute #3");
+  // A failure an older connector does not place among the words: counted, said, never quoted from a turn that did not fail.
+  assert.deepEqual(terminalEarlierLeads([{ text: "API Error: 429", failed: false }], 0, 1), [{ kind: "failed", text: "", count: 1 }]);
+  assert.equal(terminalEndNotice({ ...WHERE, lang: "en" }, 3, false, "", { summary: "", more: false }, null, [{ kind: "failed", text: "", count: 3 }]),
+    "[ops] finished · dev-pod · ops/tools · terminal idle · #3\n3 earlier turns stopped with an error; see the terminal\nMute: /approvals mute #3");
+  assert.deepEqual(terminalEarlierLeads([{ text: "构建通过。", failed: false }], 0, 0), [], "nothing asked or failed: nothing leads");
+});
+
+test("an asking turn's words are the end of its last paragraph, in whole sentences", () => {
+  const sentence = (n: number) => `第${n}句${"很".repeat(40)}长。`;
+  const ask = "要不要我现在合入？";
+  const long = `${[1, 2, 3, 4, 5].map(sentence).join("")}${ask}`;
+  const said = terminalAskSummary(long);
+  assert.equal(said, `…${[2, 3, 4, 5].map(sentence).join("")}${ask}`);
+  assert.ok(Array.from(said).length <= END_SUMMARY_MAX + 1);
+  assert.equal(terminalAskSummary("Done.\n\n**Should I** open the PR?"), "Should I open the PR?");
+  const longAsk = `${"甲".repeat(250)}，要不要继续？`;
+  assert.equal(terminalAskSummary(`前面一句。${longAsk}`), `…${longAsk}`, "a last sentence a little too long is kept whole");
+  assert.ok(Array.from(longAsk).length <= END_SENTENCE_MAX);
+  const huge = `${"乙".repeat(500)}，可以吗？`;
+  const tail = terminalAskSummary(huge);
+  assert.ok(tail.startsWith("…") && tail.endsWith("可以吗？") && Array.from(tail).length === END_SUMMARY_MAX, tail);
+  assert.equal(terminalAskSummary("  "), "");
 });

@@ -18,6 +18,8 @@
  *   R9 two sweeps at once (two replicas): one summary
  *   R10 a folded run whose newest end asks is pushed, and its earlier turns go to the summary; a failure folded into a run that
  *       finished pushes it and is counted
+ *   R11 a run pushed for an earlier turn's question or failure leads with that turn (its words, or how many when they are no longer
+ *       carried), then the latest turn; its card says the same
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -269,5 +271,46 @@ describe("which terminal ends are pushed, and the summary", { skip }, () => {
     const dave = await convo("dave");
     await events("dave", dave.cid, dave.sid, [auto("第七份报告。", { turns: 7, earlier: ["2", "3", "4", "5", "6"], asked_earlier: 1, since: "2026-11-25T01:00:00Z" })]);
     assert.equal((await pushed((await remoteItem(dave.sid)).item_id)).length, 1);
+  });
+
+  test("R11 a run pushed for an earlier question or failure leads with that turn, in the message and on the card", async () => {
+    const { cid, sid } = await convo();
+    await events("alice", cid, sid, [auto("日志已归档。", {
+      turns: 3, earlier: ["构建通过。\n\n发布包已就绪。要不要我现在发布到生产？", "构建通过。"], since: "2026-11-25T01:00:00Z",
+    })]);
+    const item = await remoteItem(sid);
+    const [got] = await pushed(item.item_id);
+    assert.equal(got.text, `【nightly-bot】做完了 · laptop · work/claw · 终端空闲 · #${item.seq}\n`
+      + "早先一轮在问你：发布包已就绪。要不要我现在发布到生产？\n"
+      + "最新一轮：日志已归档。\n"
+      + `接入：/agent attach conv-1　静音：/approvals mute #${item.seq}`);
+    assert.deepEqual(got.remote.end.earlier, [{ kind: "asked", text: "发布包已就绪。要不要我现在发布到生产？", count: 1 }]);
+    assert.equal(got.remote.end.summary, "日志已归档。");
+
+    // its words no longer carried: how many, and where to look
+    const bob = await convo("bob");
+    await events("bob", bob.cid, bob.sid, [auto("第七份报告。", { turns: 7, earlier: ["2", "3", "4", "5", "6"], asked_earlier: 2, since: "2026-11-25T01:00:00Z" })]);
+    const other = await remoteItem(bob.sid);
+    const [told] = await pushed(other.item_id);
+    assert.match(told.text, /\n早先有 2 轮在问你，详见终端\n最新一轮：第七份报告。\n接入：\/agent attach conv-1/);
+    assert.deepEqual(told.remote.end.earlier, [{ kind: "asked", text: "", count: 2 }]);
+
+    // a failure the connector places among the words: quoted
+    const carol = await convo("carol");
+    await events("carol", carol.cid, carol.sid, [auto("重试后完成。", {
+      turns: 2, earlier: ["API Error: 429"], failed_earlier: 1, earlier_failed: [0], since: "2026-11-25T01:00:00Z",
+    })]);
+    const third = await remoteItem(carol.sid);
+    const [failedRun] = await pushed(third.item_id);
+    assert.match(failedRun.text, /\n早先一轮出错停下：API Error: 429\n最新一轮：重试后完成。\n/);
+    assert.deepEqual(failedRun.remote.end.earlier, [{ kind: "failed", text: "API Error: 429", count: 1 }]);
+    assert.deepEqual([third.params.digest.turns, third.params.digest.failed], [1, 1]);
+
+    // nothing earlier asked or failed: the message is the latest turn's alone, as before
+    const dave = await convo("dave");
+    await events("dave", dave.cid, dave.sid, [auto("要不要我现在合？", { turns: 2, earlier: ["构建通过。"], since: "2026-11-25T01:00:00Z" })]);
+    const [plain] = await pushed((await remoteItem(dave.sid)).item_id);
+    assert.doesNotMatch(plain.text, /早先|最新一轮/);
+    assert.equal(plain.remote.end.earlier, undefined);
   });
 });

@@ -328,6 +328,17 @@ export interface TerminalEnd {
   readonly more: boolean;
   /** `/agent attach <ref>` for the conversation, as Claw wrote it ("" when its connector does not list it). */
   readonly attach: string;
+  /**
+   * Earlier turns folded into this end that asked the person something or failed, said before `summary` (the latest turn's): that
+   * turn's words ("" when Claw no longer has them) and how many did. Empty when none did.
+   */
+  readonly earlier: readonly TerminalEarlier[];
+}
+
+export interface TerminalEarlier {
+  readonly kind: "asked" | "failed";
+  readonly text: string;
+  readonly count: number;
 }
 
 /** Code points of what an end's card names and says (Claw sends at most 80, 200 and 2000). */
@@ -340,6 +351,24 @@ const END_ATTACH = /^\/agent attach [A-Za-z0-9._:-]{6,128}$/u;
 
 const clipText = (value: unknown, max: number): string =>
   typeof value === "string" ? Array.from(value).slice(0, max).join("") : "";
+
+/** Code points of an earlier turn's words as an end's card quotes them (Claw sends at most 320). */
+const END_EARLIER_MAX = 400;
+
+/** `remote.end.earlier` as far as it is what Claw says it is: at most one asked and one failed entry; anything else is left out. */
+function terminalEarlierOf(value: unknown): TerminalEarlier[] {
+  if (!Array.isArray(value)) return [];
+  const out: TerminalEarlier[] = [];
+  for (const entry of value.slice(0, 2)) {
+    const e = record(entry);
+    const kind = e?.["kind"];
+    const count = e?.["count"];
+    if (e === undefined || (kind !== "asked" && kind !== "failed") || out.some((o) => o.kind === kind)) continue;
+    if (typeof count !== "number" || !Number.isSafeInteger(count) || count <= 0) continue;
+    out.push({ kind, text: clipText(e["text"], END_EARLIER_MAX), count: Math.min(count, 10_000) });
+  }
+  return out;
+}
 
 /** `remote.end` as far as it is what Claw says it is; undefined otherwise (the message then goes on as words). */
 function terminalEndOf(remote: Event): TerminalEnd | undefined {
@@ -358,6 +387,7 @@ function terminalEndOf(remote: Event): TerminalEnd | undefined {
     full: clipText(end["full"], END_FULL_MAX),
     more: end["more"] === true,
     attach,
+    earlier: terminalEarlierOf(end["earlier"]),
   };
 }
 
