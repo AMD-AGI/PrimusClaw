@@ -1057,6 +1057,31 @@ describe("seat dispatch", { skip }, () => {
     assert.deepEqual([Number(after.generation), after.params.brief], [gen + 1, "补一节安装"]);
   });
 
+  test("D25 a task another call sent after this one read it (same generation, now running): not opened over it", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/docs", { alias: "文档台", role: "负责文档", role_state: "confirmed", dispatch_mode: "auto" });
+    const done = await finished(alice, cid, s, "整理文档");
+    // Between this call's read and its reopening, the task starts running (as the first call's send, recorded meanwhile, would leave it).
+    await w.q("CREATE SEQUENCE IF NOT EXISTS d25_run");
+    await w.q(`CREATE OR REPLACE FUNCTION d25_run_once() RETURNS trigger AS $$
+      BEGIN IF NEW.params ? 'turn_sends' AND NOT (OLD.params ? 'turn_sends') AND nextval('d25_run') = 1 THEN
+        NEW.board_state := 'in_progress'; NEW.params := NEW.params || '{"open_cmd_seqs": [999]}'::jsonb; END IF;
+      RETURN NEW; END $$ LANGUAGE plpgsql`);
+    await w.q("CREATE TRIGGER d25_run BEFORE UPDATE ON claw_work_items FOR EACH ROW EXECUTE FUNCTION d25_run_once()");
+    try {
+      const turn = await userTurn(alice, "补一节安装");
+      assert.equal((await refusal(tools.workSend(turn, { item_id: String(done.item_id), text: "补一节安装" }))).code, "item_changed");
+    } finally {
+      await w.q("DROP TRIGGER IF EXISTS d25_run ON claw_work_items");
+      await w.q("DROP FUNCTION IF EXISTS d25_run_once()");
+      await w.q("DROP SEQUENCE IF EXISTS d25_run");
+    }
+    assert.equal((await prompted(cid)).length, 0, "nothing was sent");
+    const after = await item(done.item_id);
+    assert.deepEqual([Number(after.generation), after.params.open_cmd_seqs], [Number(done.generation), [999]], "its command is still the task's");
+  });
+
   test("D25 a task left opened again and unsent by a call that ended is opened again once that is stale", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox");

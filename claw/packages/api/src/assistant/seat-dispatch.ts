@@ -953,15 +953,15 @@ async function reopenErrand(
 ): Promise<ErrandBefore> {
   const { generation: was, in_flight: inFlight, ...before } = (await q(
     `SELECT generation, board_state, outcome, closed_at, last_report_kind, pending_question, summary, params,
-            (board_state <> 'done' AND NOT (params ? 'queued') AND NOT (params ? 'dispatched_at')
-              AND jsonb_array_length(COALESCE(params->'open_cmd_seqs', '[]'::jsonb)) = 0
-              AND (params->>'reopened_at')::timestamptz > NOW() - make_interval(secs => $2::float8 / 1000)) AS in_flight
+            (board_state <> 'done' AND (params ? 'queued' OR jsonb_array_length(COALESCE(params->'open_cmd_seqs', '[]'::jsonb)) > 0
+              OR (NOT (params ? 'dispatched_at') AND (params->>'reopened_at')::timestamptz > NOW() - make_interval(secs => $2::float8 / 1000))))
+              AS in_flight
        FROM claw_work_items WHERE item_id = $1 FOR UPDATE`,
     [itemId, REOPEN_IN_FLIGHT_MS],
   )).rows[0] as Omit<ErrandBefore, "generation"> & { generation: number; in_flight: boolean };
   if (generation !== undefined && Number(was) !== generation) throw new ReopenedMeanwhile();
-  // Opened again just now and not sent yet: another call's reopening still under way (its lock lost with its connection, else this one
-  // would still be waiting for it). Not opened over it, which would replace its instruction before either went.
+  // Running or queued now, or opened again just now and not sent yet: another call's reopening went or is still under way (its lock
+  // lost with its connection, else this one would still be waiting for it). Not opened over it, which would replace its instruction.
   if (generation !== undefined && inFlight) throw new ReopenedMeanwhile();
   const reopened = (await q(
     `UPDATE claw_work_items
