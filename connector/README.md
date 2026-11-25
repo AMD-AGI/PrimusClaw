@@ -688,9 +688,8 @@ too (on a start and on `hooks install`; `hooks install --approvals` still adds t
 
 Connectors up to 0.3.3 kept no record of a no other than that answer. So the first start after the upgrade (or the first `hooks`
 command, whichever comes first) reads it from what is in place, once: in a Claude config directory that exists, a set with none
-of its hooks there was taken out and stays out (both sets where the session hooks are missing; the approval hooks alone where the
-session hooks are there and that question was already answered). Where the session hooks are in and the question was never
-asked, the approval hooks are added. A directory made after that, and `init` or `pair` run after the upgrade, get both sets.
+of its hooks there was taken out or not agreed to, and stays out until `hooks install` (`--approvals`) or `--hooks`. A directory
+made after that, and `init` or `pair` run after the upgrade, get both sets.
 
 The Codex and Cursor hooks are not installed by themselves (Codex asks you to trust a new hook): see below.
 

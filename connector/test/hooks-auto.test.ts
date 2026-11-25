@@ -109,7 +109,7 @@ describe("the connector keeps the Claude Code hooks in place by itself", () => {
   test("a setup with the session hooks only gets the approval hooks; nothing else in the file changes, and it is backed up once", async () => {
     const claw = await FakeClaw.start();
     try {
-      const s = home(claw, { upgrade: true });
+      const s = home(claw);
       fs.writeFileSync(settingsFile(s.dir), JSON.stringify(MINE, null, 2));
       installHooks(s.dir, NODE, s.scripts.hookScript);
       // As an older connector left it: no backup of ours yet.
@@ -146,7 +146,7 @@ describe("the connector keeps the Claude Code hooks in place by itself", () => {
       fs.rmSync(old, { recursive: true });
       assert.equal(hooksStatus(s.dir).healthy, false);
       const said = await start(claw, s.mk());
-      assert.match(said, /session hooks updated, approval hooks added/);
+      assert.match(said, /settings\.json: session hooks updated$/m, "the approval hooks were not in place before the upgrade: they stay out");
       assert.equal(hooksStatus(s.dir).healthy, true);
       assert.ok(!ours(s.dir).some((c) => c.includes(old)), "nothing names the old install");
       assert.equal(ours(s.dir).filter((c) => c.includes("terminal-hook.js")).length, 2, "rewritten in place, not added beside");
@@ -258,7 +258,7 @@ describe("the connector keeps the Claude Code hooks in place by itself", () => {
 });
 
 describe("an upgrade from 0.3.3 or earlier, which recorded no no", () => {
-  test("hooks taken out there (hooks uninstall, --no-hooks, a \"n\" at init/pair) stay out; a yes to the old question taken back with uninstall --approvals stays out", async () => {
+  test("hooks taken out there (hooks uninstall, --no-hooks, a \"n\" at init/pair) stay out; so do approval hooks left out (--no-approval-hooks, a yes to the old question taken back)", async () => {
     const claw = await FakeClaw.start();
     try {
       // `hooks uninstall`, `init --no-hooks` or a "n": an existing directory with none of ours, the person's own hooks kept.
@@ -289,6 +289,13 @@ describe("an upgrade from 0.3.3 or earlier, which recorded no no", () => {
       assert.match(await start(claw, y.mk()), /settings\.json: session hooks updated$/m);
       assert.equal(hooksStatus(y.dir).healthy, true);
       assert.equal(approvalHooksStatus(y.dir).events.length, 0, "the approval hooks stay out");
+
+      // `init --no-approval-hooks`, or a "n" when init/pair asked about the approval hooks alone: nothing answered in the old file.
+      const na = home(claw, { upgrade: true });
+      installHooks(na.dir, NODE, na.scripts.hookScript);
+      assert.doesNotMatch(await start(claw, na.mk()), /Claude Code hooks:/);
+      assert.equal(hooksStatus(na.dir).installed, true);
+      assert.equal(approvalHooksStatus(na.dir).events.length, 0, "the approval hooks stay out");
     } finally { await claw.close(); }
   });
 

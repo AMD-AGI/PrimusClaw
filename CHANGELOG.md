@@ -309,8 +309,8 @@ release version, and its `appVersion` stays `latest`.
   approval hooks only), `--no-hooks` / `--no-approval-hooks`, or a no to the question 0.1.23 to 0.3.3 asked; `hooks install`
   (`--approvals`) and `--hooks` take it back. `hooks install` now installs the approval hooks too, unless they were taken out
   or `CLAW_APPROVAL_HOOKS=off` is set. Versions up to 0.3.3 recorded no other no, so the first start after the upgrade reads it
-  from what is in place, once: a set none of whose hooks is in an existing Claude config directory stays out there (the
-  approval hooks alone only where the old question was answered); `init` and `pair` run after the upgrade add both sets.
+  from what is in place, once: a set none of whose hooks is in an existing Claude config directory stays out there; `init`
+  and `pair` run after the upgrade add both sets.
   The one-time question about the approval hooks after other commands is gone. Codex and Cursor hooks are unchanged (Codex
   needs the person to trust a new hook). See `connector/README.md`, "The Claude Code hooks are kept in place".
 - Claw, Agent Sandbox: a sandbox template says how its sandbox mounts its workspace's storage with `workspaceStorage`:

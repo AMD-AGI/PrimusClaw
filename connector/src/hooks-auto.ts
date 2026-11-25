@@ -66,20 +66,11 @@ function legacyNo(d: Dirs, dir: string): boolean {
   } catch { return false; }
 }
 
-function legacyAnswered(d: Dirs, dir: string): boolean {
-  try {
-    const doc: unknown = JSON.parse(fs.readFileSync(legacyOfferFile(d), "utf8"));
-    return isObj(doc) && isObj(doc.answered) && isObj(doc.answered[dir]);
-  } catch { return false; }
-}
-
 /**
  * Once, when there is no claude-hooks.json yet: write it, so the choices of a person who used 0.3.3 or earlier are kept. With
- * `fresh` (`init` and `pair`, which add both sets now) nothing is carried over. Otherwise, in each of `dirs` that exists:
- * - no session hooks of ours there means they were taken out (`hooks uninstall`, `--no-hooks`, a "n" at init/pair): "off";
- * - no approval hooks of ours there is "off" too when the session hooks are missing as well, or when the 0.1.23 to 0.3.3
- *   question was already answered for that directory (a yes taken back with `hooks uninstall --approvals`). Where the session
- *   hooks are in and the question was never answered, they are added, as that question would have offered them.
+ * `fresh` (`init` and `pair`, which add both sets now) nothing is carried over. Otherwise, in each of `dirs` that exists, a set
+ * with none of its hooks there was taken out or never agreed to (`hooks uninstall`, `--no-hooks`, `--no-approval-hooks`, a "n"
+ * at init/pair or to the one-time question): "off" for that directory, so it stays out until `hooks install` or `--hooks`.
  * `present` says whether any hook of that set is in that directory's settings, or null when they cannot be read (then nothing is
  * recorded for it, and the hooks go in once the file can be merged into). Never throws: a failure is retried next time.
  */
@@ -91,9 +82,7 @@ export function migrateHookPrefs(d: Dirs, dirs: string[], present: (dir: string,
       for (const dir of dirs) {
         if (!fs.existsSync(dir)) continue;
         const c: Choice = {};
-        const session = present(dir, "session");
-        if (session === false) c.session = "off";
-        if (present(dir, "approvals") === false && (session === false || legacyAnswered(d, dir))) c.approvals = "off";
+        for (const set of ["session", "approvals"] as const) if (present(dir, set) === false) c[set] = "off";
         if (Object.keys(c).length) p.dirs[dir] = c;
       }
     }
