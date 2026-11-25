@@ -26,7 +26,7 @@
  */
 import { createHash } from "node:crypto";
 import pino from "pino";
-import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS } from "@claw/protocol";
+import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_EVENT_USER_PROMPT } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
@@ -82,7 +82,18 @@ const TURN_EVENTS = new Set([
   "permission_auto_allowed",
 ]);
 
-interface ActivityEvent { type: string; occurred_at: string; text: string; action_id: string | null; stop: string | null; replay: boolean }
+interface ActivityEvent {
+  type: string; occurred_at: string; text: string; action_id: string | null; stop: string | null; replay: boolean;
+  /** The prompt it is of (`user_prompt`), ends (`turn_end`) or refused unrun (`command_rejected`), when it names one by number. */
+  cmd_seq?: number | null;
+}
+
+/**
+ * A turn the agent took by itself (no prompt of Claw's still open: the agent answering a command it put in the background) counts
+ * as under way for at most this long after its last event. A connector from 0.3.3 on ends such a turn with a `turn_end` of its own
+ * (`agent_initiated`); an older one never does, and its session would read as working for good.
+ */
+export const AGENT_TURN_QUIET_MS = 5 * 60_000;
 
 export interface SessionReading {
   state: Exclude<DevenvState, "in_terminal" | "unknown">;
@@ -101,7 +112,7 @@ export interface SessionReading {
  * A permission asked and not yet resolved means it waits for the user; events after the last `turn_end`, or a prompt its
  * connector has not yet collected, mean a turn is under way; anything else is idle.
  */
-export function readSession(events: ActivityEvent[], queued: number): SessionReading {
+export function readSession(events: ActivityEvent[], queued: number, now: number = Date.now(), openPrompts = 0): SessionReading {
   const pending = new Set<string>();
   let lastEnd = -1;
   let prevEnd = -1;
@@ -113,7 +124,15 @@ export function readSession(events: ActivityEvent[], queued: number): SessionRea
     else if (e.type === "turn_end") { prevEnd = lastEnd; lastEnd = i; lastStop = e.stop; }
   });
   const live = events.slice(lastEnd + 1).filter((e) => !e.replay);
-  const working = queued > 0 || live.some((e) => TURN_EVENTS.has(e.type));
+  const activity = live.filter((e) => TURN_EVENTS.has(e.type));
+  let working = queued > 0 || activity.length > 0;
+  // No prompt of Claw's is open (every `user_prompt` has its own end, named by `cmd_seq`: in the window, and `openPrompts` beyond it):
+  // what came is a turn the agent took by itself, which an older connector never ends. Once it has been quiet for AGENT_TURN_QUIET_MS
+  // (and asks nothing) it is over. Only when that end is in the window read: without it a prompt may be further back than the window.
+  if (working && queued === 0 && openPrompts === 0 && lastEnd >= 0 && pending.size === 0 && !promptOpen(events)) {
+    const last = Date.parse(activity[activity.length - 1]!.occurred_at);
+    if (Number.isFinite(last) && now - last > AGENT_TURN_QUIET_MS) working = false;
+  }
   // The turn to describe: the one under way, else the last that ended.
   const turn = working ? live : events.slice(prevEnd + 1, lastEnd + 1).filter((e) => !e.replay);
   const step = [...turn].reverse().find((e) => e.type === "tool_call" && e.text)?.text ?? null;
@@ -128,6 +147,31 @@ export function readSession(events: ActivityEvent[], queued: number): SessionRea
     state: pending.size > 0 ? "waiting_for_you" : working ? "working" : "idle",
     step: flat(step, STEP_MAX), answer: tail(answer, ANSWER_MAX), asked: flat(asked, ASKED_MAX), last_stop: lastStop,
   };
+}
+
+/** {@link readSession} of a row of `sessionActivity`: its events, its prompts not yet collected and its prompts not yet ended. */
+export function readActivity(row: { events?: unknown; queued?: unknown; open_prompts?: unknown }, now: number = Date.now()): SessionReading {
+  return readSession(Array.isArray(row.events) ? row.events as ActivityEvent[] : [], Number(row.queued) || 0, now, Number(row.open_prompts) || 0);
+}
+
+/**
+ * Whether a prompt of Claw's in the window has not ended: its `user_prompt` is there and no `turn_end` (nor a refusal: it never ran)
+ * names its `cmd_seq`. Matched by number, never by position: Claw writes a prompt's `user_prompt` when it queues it, which can be
+ * before the end of the turn it waits behind (a follow-up sent while a turn runs, or a prompt that comes while the agent is on a turn
+ * of its own), so a prompt's turn may have no `user_prompt` after the last end. An end that names none (`cmd_seq` null: a cancel with
+ * nothing running, the agent's own turn; or absent: a connector from before ends named their prompt) ends none, so a session of such a
+ * connector never reads as idle by the quiet alone.
+ */
+function promptOpen(events: ActivityEvent[]): boolean {
+  const asked = new Set<number>();
+  const ended = new Set<number>();
+  for (const e of events) {
+    if (typeof e.cmd_seq !== "number") continue;
+    if (e.type === REMOTE_EVENT_USER_PROMPT) asked.add(e.cmd_seq);
+    else if ((e.type === "turn_end" && !e.replay) || e.type === "command_rejected") ended.add(e.cmd_seq);
+  }
+  for (const seq of asked) if (!ended.has(seq)) return true;
+  return false;
 }
 
 export interface DevenvSession {
@@ -651,7 +695,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
     // The sessions open through Claw on this machine, newest activity first.
     for (const s of open.filter((o) => o.connector_id === String(c.connector_id))) {
       const agent = agentOf(s.agent_id);
-      const reading = readSession(Array.isArray(s.events) ? s.events as ActivityEvent[] : [], Number(s.queued) || 0);
+      const reading = readActivity(s);
       const ref = String(s.session_id);
       const row: DevenvSession = {
         label: label(String(s.agent_id)), agent: String(s.agent_id), agent_name: shown(agent?.name, NAME_MAX), cwd: shown(s.cwd, CWD_MAX),
@@ -856,7 +900,7 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
     const label = (agentId: string) => { const n = (counter.get(agentId) ?? 0) + 1; counter.set(agentId, n); return `${nameOf(c)}/${agentId}/${n}`; };
     const agents: Row[] = Array.isArray(c.agents) ? c.agents : [];
     for (const s of open.filter((o) => o.connector_id === String(c.connector_id))) {
-      const reading = readSession(Array.isArray(s.events) ? s.events as ActivityEvent[] : [], Number(s.queued) || 0);
+      const reading = readActivity(s);
       named.push({
         c, agent: agents.find((a) => a.agent_id === s.agent_id), label: label(String(s.agent_id)), session_id: String(s.session_id),
         resume_ref: null, cwd: typeof s.cwd === "string" ? s.cwd : null,
@@ -1090,7 +1134,7 @@ export async function executeSend(
     if (s.read_only === true) return { ok: false, error: "session_read_only", message: "that session is open in a terminal on the machine and can only be watched: nothing was sent" };
     // Read again now: a session that started working since the plan (or the card) is not sent another instruction.
     const [now] = (await sessionActivity(userId, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser)).filter((r) => r.session_id === sessionId);
-    if (!opts.queueBehind && now && readSession(Array.isArray(now.events) ? now.events as ActivityEvent[] : [], Number(now.queued) || 0).state !== "idle") {
+    if (!opts.queueBehind && now && readActivity(now).state !== "idle") {
       return { ok: false, error: "busy", message: "that session is working on something now: nothing was sent" };
     }
   } else {

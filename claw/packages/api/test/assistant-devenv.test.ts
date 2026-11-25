@@ -767,8 +767,11 @@ describe("devenv_list", { skip }, () => {
 
 describe("readSession", () => {
   let readSession: typeof import("../src/assistant/devenv-tools.js").readSession;
-  before(async () => { ({ readSession } = await import("../src/assistant/devenv-tools.js")); });
+  let quiet = 0;
+  before(async () => { ({ readSession, AGENT_TURN_QUIET_MS: quiet } = await import("../src/assistant/devenv-tools.js")); });
   const e = (type: string, text = "", o: Recorded = {}) => ({ type, occurred_at: "2026-11-06T00:00:00Z", text, action_id: null, stop: null, replay: false, ...o });
+  /** When the events above happened: read then, a turn under way is one (R2 says how long it stays one without a prompt). */
+  const T0 = Date.parse("2026-11-06T00:00:00Z");
 
   test("R1 state, step, answer and question from a session's events", () => {
     assert.deepEqual(readSession([], 0), { state: "idle", step: null, answer: null, asked: null, last_stop: null });
@@ -781,11 +784,64 @@ describe("readSession", () => {
       e("agent_message_chunk", "second "), e("agent_message_chunk", "answer"), e("turn_end", "", { stop: "cancelled" })];
     assert.deepEqual(readSession(turns, 0), { state: "idle", step: "Run tests", answer: "second answer", asked: null, last_stop: "cancelled" });
     const busy = [...turns, e("tool_call", "Build"), e("agent_message_chunk", "building")];
-    assert.deepEqual(readSession(busy, 0), { state: "working", step: "Build", answer: "building", asked: null, last_stop: "cancelled" });
+    assert.deepEqual(readSession(busy, 0, T0), { state: "working", step: "Build", answer: "building", asked: null, last_stop: "cancelled" });
     const asking = [...busy, e("permissionRequest", "", { action_id: "a" })];
     assert.equal(readSession(asking, 0).state, "waiting_for_you");
-    assert.equal(readSession([...asking, e("permission_resolved", "", { action_id: "a" })], 0).state, "working");
+    assert.equal(readSession([...asking, e("permission_resolved", "", { action_id: "a" })], 0, T0).state, "working");
     const long = readSession([e("agent_message_chunk", "x".repeat(500) + " the end"), e("turn_end")], 0).answer!;
     assert.ok(long.startsWith("…") && long.endsWith("the end") && long.length === 200, "the end of a long answer");
+  });
+
+  test("R2 a turn the agent took by itself (every prompt ended): working while it is fresh, over once quiet for AGENT_TURN_QUIET_MS", async () => {
+    const { AGENT_TURN_QUIET_MS } = await import("../src/assistant/devenv-tools.js");
+    const now = Date.parse("2026-11-24T20:50:00Z");
+    const at = (msAgo: number) => ({ occurred_at: new Date(now - msAgo).toISOString() });
+    const ended = [e("user_prompt", "", { cmd_seq: 1 }), e("agent_message_chunk", "started in the background"), e("turn_end", "", { stop: "end_turn", cmd_seq: 1 })];
+    const own = [...ended, e("tool_call_update", "", at(AGENT_TURN_QUIET_MS + 60_000)), e("agent_message_chunk", "long-0357A978", at(AGENT_TURN_QUIET_MS + 1_000))];
+    assert.equal(readSession(own, 0, now).state, "idle", "an older connector never ends it: quiet, it is over");
+    assert.equal(readSession(own, 0, now).answer, "started in the background", "the last ended turn is the one described");
+    const fresh = [...ended, e("agent_message_chunk", "long-0357A978", at(30_000))];
+    assert.equal(readSession(fresh, 0, now).state, "working");
+    assert.equal(readSession(own, 1, now).state, "working", "a prompt not yet collected");
+    // A prompt of Claw's since the end: its turn, however quiet (a long build).
+    assert.equal(readSession([...ended, e("user_prompt", "", { cmd_seq: 2, ...at(AGENT_TURN_QUIET_MS * 3) }), e("tool_call", "Build", at(AGENT_TURN_QUIET_MS * 2))], 0, now).state, "working");
+    // It asks for something: it waits for the user, however long.
+    assert.equal(readSession([...own, e("permissionRequest", "", { action_id: "a", ...at(AGENT_TURN_QUIET_MS * 2) })], 0, now).state, "waiting_for_you");
+    // No end in the window: a prompt may be further back, so nothing is assumed.
+    assert.equal(readSession(own.slice(3), 0, now).state, "working");
+    // Ended by the connector (0.3.3 on): idle at once.
+    assert.equal(readSession([...fresh, e("turn_end", "", { stop: "end_turn", cmd_seq: null, agent_initiated: true })], 0, now).state, "idle");
+  });
+
+  /** Read well after the events: a turn of nobody's prompt would be over by now (R3, R4). */
+  const late = () => {
+    const now = Date.parse("2026-11-24T20:50:00Z");
+    const at = (msAgo: number) => ({ occurred_at: new Date(now - msAgo).toISOString() });
+    const old = at(quiet * 3);
+    const asked = (seq: number) => e("user_prompt", "", { cmd_seq: seq, ...old });
+    const ends = (seq: number | null, o: Recorded = {}) => e("turn_end", "", { stop: "end_turn", cmd_seq: seq, ...old, ...o });
+    return { now, old, asked, ends, build: e("tool_call", "Build", at(quiet * 2)) };
+  };
+
+  test("R3 a follow-up queued while a turn runs is under way until its own end (by cmd_seq), though its user_prompt is before that turn's end", () => {
+    const { now, old, asked, ends, build } = late();
+    // A follow-up sent while turn A runs (queued behind it): its user_prompt is written before A's end, then it runs a silent build.
+    const followUp = [asked(1), e("agent_message_chunk", "A", old), asked(2), ends(1), build];
+    assert.equal(readSession(followUp, 0, now).state, "working", "the follow-up's turn: no end names it yet");
+    assert.equal(readSession([...followUp, ends(2)], 0, now).state, "idle");
+    // Its prompts all ended (or refused unrun): what comes after is the agent's own, over once quiet.
+    assert.equal(readSession([asked(1), ends(1), asked(2), e("command_rejected", "", { cmd_seq: 2, ...old }), build], 0, now).state, "idle");
+    // An end that names no prompt at all (a connector from before ends named theirs) ends none: never idle by the quiet alone.
+    assert.equal(readSession([asked(1), e("turn_end", "", { stop: "end_turn", ...old }), build], 0, now).state, "working");
+  });
+
+  test("R4 a prompt that comes while the agent is on a turn of its own is under way until its own end, though that turn's end comes after it", () => {
+    const { now, old, asked, ends, build } = late();
+    // A prompt that comes while the agent is on a turn of its own: the connector ends that turn (naming no prompt) after the prompt was
+    // recorded, then runs the prompt.
+    const overOwn = [asked(1), ends(1), e("agent_message_chunk", "bg done", old), asked(2),
+      ends(null, { agent_initiated: true }), build];
+    assert.equal(readSession(overOwn, 0, now).state, "working", "the prompt's turn, not the agent's own");
+    assert.equal(readSession([...overOwn, ends(2)], 0, now).state, "idle");
   });
 });

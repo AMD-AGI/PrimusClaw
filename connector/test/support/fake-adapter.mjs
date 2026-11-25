@@ -130,7 +130,22 @@ async function prompt(id, params) {
     const note = `<task-notification>\n<task-id>${task}</task-id>\n<status>completed</status>\n</task-notification>`;
     void (async () => {
       for (let i = 0; i < 1200 && !fs.existsSync(n[1]); i++) await new Promise((r) => setTimeout(r, 25));
-      if (fs.existsSync(n[1])) writeTurn(params.sessionId, s, { message: { role: "user", content: note }, promptSource: "system", origin: { kind: "task-notification", producer: "session-task" } }, "finished");
+      if (!fs.existsSync(n[1])) return;
+      writeTurn(params.sessionId, s, { message: { role: "user", content: note }, promptSource: "system", origin: { kind: "task-notification", producer: "session-task" } }, "finished");
+      // FAKE_AUTONOMOUS: that turn of its own is also streamed, as claude-agent-acp 0.99.0 streams it to an ACP v1 client: the
+      // background command's display ends, the agent answers, and the usage of the model turn (with its cost) closes it. `quiet`:
+      // without the usage, as an agent that says nothing at the end of a turn.
+      if (!env.FAKE_AUTONOMOUS) return;
+      update(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: `toolu_${task}`, status: "completed" });
+      update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `finished ${path.basename(n[1])}` } });
+      // `ask`: it then asks for a permission in that turn, and waits for the answer.
+      if (env.FAKE_AUTONOMOUS === "ask") {
+        const toolCall = { toolCallId: `toolu_${task}_ask`, title: "Write after-bg", kind: "edit", rawInput: { file_path: "after-bg" } };
+        update(params.sessionId, { sessionUpdate: "tool_call", ...toolCall, status: "pending" });
+        await ask("session/request_permission", { sessionId: params.sessionId, toolCall, options: OPTION_IDS.map((optionId, i) => ({ optionId, name: optionId, kind: OPTION_KINDS[i] })) });
+        return;
+      }
+      if (env.FAKE_AUTONOMOUS !== "quiet") update(params.sessionId, { sessionUpdate: "usage_update", used: 10, size: 1000, cost: { amount: 0.01, currency: "USD" } });
     })();
     return done("end_turn");
   }

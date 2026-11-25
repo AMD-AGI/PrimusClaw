@@ -35,6 +35,12 @@
  *   D24 two different instructions at once to a finished task: it is opened once, and both reach the machine
  *   D25 calls to one task waiting for each other hold no main-pool connection while they wait (the lock is on the lock pool); a task
  *       opened again by another call after this one read it is not opened over it (refused, nothing sent, the words free again)
+ *   D26 a turn the seat's agent takes by itself after a task ended (a command it put in the background finished): the seat is busy
+ *       while it runs; its end (`agent_initiated`) frees the seat, the queue goes on, and its answer is said once as a late word of
+ *       that task (never of the next one); from an older connector, which never ends it, the seat is free once it has been quiet
+ *   D27 an instruction queued behind a turn under way, or sent while the agent is on a turn of its own, is the seat's work until its own
+ *       end names it, however quiet it is: its prompt is on record before the end of the turn it waited behind, and may be further
+ *       back than the events a reading takes
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -998,6 +1004,128 @@ describe("seat dispatch", { skip }, () => {
     assert.equal((await prompted(cid)).length, 0, "nothing was sent");
     assert.equal((await item(done.item_id)).board_state, "done", "and it was not opened again");
     assert.equal(((await tools.workSend(turn, { item_id: String(done.item_id), text: "补一节安装" })) as Recorded).dispatch, "sent");
+  });
+
+  test("D26 a turn the agent takes by itself after a task: busy while it runs, its end frees the seat and is said as a late word of that task", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const long = await create(await userTurn(alice, "跑 sleep 60"), `seat:${s.seatId}`, "跑 sleep 60");
+    assert.equal(long.dispatch, "sent");
+    const seq = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [chunk("已放到后台运行，完成后会告诉你。"), ["turn_end", { stopReason: "end_turn", cmd_id: "x", cmd_seq: seq }]]);
+    assert.equal((await item(long.item_id)).board_state, "done");
+    // The command finishes and the agent answers it, on its own.
+    await events("alice", cid, s.sid, [
+      ["tool_call_update", { update: { sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed" } }], chunk("long-0357A978"),
+    ]);
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "working");
+    const second = await create(await userTurn(alice, "再跑 echo"), `seat:${s.seatId}`, "跑 echo");
+    assert.deepEqual([second.dispatch, second.queued_reason], ["queued", "seat_busy"]);
+    // Its end (connector 0.3.3 on): the seat is free and the queued task goes; the answer is the long task's, said once.
+    const end: [string, Recorded] = ["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true, ended_by: "result" }];
+    await events("alice", cid, s.sid, [["usage_update", { update: { sessionUpdate: "usage_update", used: 1, size: 2, cost: { amount: 0.01, currency: "USD" } } }], end]);
+    const sent = await item(second.item_id);
+    assert.equal(sent.params.queued, undefined, JSON.stringify(sent.params));
+    assert.equal(sent.params.session_id, s.sid);
+    const late = (await notices()).filter((n) => n.remote.item_seq === long.seq);
+    assert.equal(late.length, 1, JSON.stringify(await notices()));
+    assert.equal(late[0]!.remote.kind, "done");
+    assert.match(late[0]!.text, /long-0357A978/);
+    assert.doesNotMatch(late[0]!.text, /已放到后台/, "only what it said in that turn");
+    const it = await item(long.item_id);
+    assert.deepEqual([it.board_state, it.outcome, it.summary], ["done", "answered", "long-0357A978"]);
+    assert.equal(it.params.agent_turn_seen > 0, true);
+    // The next task's prompt is out; another own turn of the agent's now (its prompt took it over) is still the long task's word.
+    await collect(cid);
+    await events("alice", cid, s.sid, [chunk("又补一句"), ["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true }]]);
+    assert.equal((await notices()).filter((n) => n.remote.item_seq === long.seq).length, 2);
+    assert.equal((await notices()).filter((n) => n.remote.item_seq === second.seq).length, 0);
+    const two = await item(second.item_id);
+    assert.deepEqual([two.board_state, two.params.open_cmd_seqs.length], ["in_progress", 1], "the next task's turn is not ended by it");
+    // Posted again (a retry): nothing said twice.
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    assert.equal((await notices()).filter((n) => n.remote.item_seq === long.seq).length, 2);
+    // A prompt typed into a chat attached to the session (no task's): the agent's own turn after it is nobody's task, and not said here.
+    const said = (await notices()).length;
+    const summary = (await item(long.item_id)).summary;
+    await w.q(`INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data) VALUES ($1, $2, 'user_prompt', NOW(), $3::jsonb)`,
+      [s.sid, store.userPromptSeq(900), JSON.stringify({ text: "跑个后台", cmd_id: "k:chat-1", cmd_seq: 900, client: "web", by: "claw" })]);
+    await events("alice", cid, s.sid, [chunk("后台跑着"), ["turn_end", { stopReason: "end_turn", cmd_id: "k:chat-1", cmd_seq: 900 }],
+      chunk("chat-bg-done"), ["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true }]]);
+    assert.equal((await notices()).length, said, JSON.stringify((await notices()).slice(said)));
+    assert.equal((await item(long.item_id)).summary, summary);
+  });
+
+  test("D26 an older connector never ends the agent's own turn: once it has been quiet, the seat is free and the sweep sends what waits", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const long = await create(await userTurn(alice, "跑 sleep 60"), `seat:${s.seatId}`, "跑 sleep 60");
+    const seq = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [chunk("已放到后台"), ["turn_end", { stopReason: "end_turn", cmd_id: "x", cmd_seq: seq }], chunk("long-0357A978")]);
+    const second = await create(await userTurn(alice, "再跑 echo"), `seat:${s.seatId}`, "跑 echo");
+    assert.equal(second.dispatch, "queued");
+    await dispatch.runErrandSweep("alice");
+    assert.equal((await item(second.item_id)).params.queued, "seat_busy", "still fresh: still busy");
+    const { AGENT_TURN_QUIET_MS } = await import("../src/assistant/devenv-tools.js");
+    await w.q("UPDATE claw_remote_events SET occurred_at = NOW() - make_interval(secs => $2::float8) WHERE session_id = $1 AND type <> 'user_prompt'",
+      [s.sid, AGENT_TURN_QUIET_MS / 1000 + 60]);
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "queued");
+    await dispatch.runErrandSweep("alice");
+    const sent = await item(second.item_id);
+    assert.equal(sent.params.queued, undefined, JSON.stringify(sent.params));
+    assert.equal((await item(long.item_id)).board_state, "done");
+  });
+
+  test("D27 a prompt is the seat's work until its own end, though recorded before the end of the turn it waited behind", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const { AGENT_TURN_QUIET_MS } = await import("../src/assistant/devenv-tools.js");
+    const devenv = await import("../src/assistant/devenv-tools.js");
+    /** How the session reads (what devenv_list, the seat's state and the send guard go by). */
+    const reads = async () => devenv.readActivity((await store.sessionActivity("alice", 50)).find((r) => r.session_id === s.sid)!).state;
+    const age = () => w.q("UPDATE claw_remote_events SET occurred_at = NOW() - make_interval(secs => $2::float8) WHERE session_id = $1",
+      [s.sid, AGENT_TURN_QUIET_MS / 1000 + 60]);
+    const out = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`);
+    const seqA = Number((await prompted(cid))[0].cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [chunk("开始发布")]);
+    // One more instruction while that turn runs: queued behind it, so its prompt is on record before that turn's end.
+    const more = await tools.workSend(await userTurn(alice, "顺便更新 changelog"), { item_id: String(out.item_id), text: "顺便更新 changelog" }) as Recorded;
+    assert.equal(more.dispatch, "sent", JSON.stringify(more));
+    const seqB = Number((await prompted(cid)).at(-1)!.cmd_seq);
+    await collect(cid);
+    // That turn goes on for long after: the instruction's prompt is further back than the events a reading takes.
+    await w.q(`INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data)
+               SELECT $1, 100000 + n, 'tool_call_update', NOW(), '{"update": {"sessionUpdate": "tool_call_update", "toolCallId": "a1"}}'::jsonb
+                 FROM generate_series(1, $2::int) n`, [s.sid, store.ACTIVITY_EVENTS + 20]);
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: "x", cmd_seq: seqA }],
+      ["tool_call", { update: { sessionUpdate: "tool_call", toolCallId: "b1", title: "make release" } }]]);
+    await age();
+    assert.equal(await reads(), "working", "its build, quiet for long: still the instruction's turn");
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "working");
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: "y", cmd_seq: seqB }], chunk("后台任务完成")]);
+    // A prompt that comes while the agent is on a turn of its own (sent to the session from a chat): the connector ends that turn
+    // (naming no prompt) after it was recorded, then runs it.
+    const again = await devenv.executeSend("alice", {
+      connector_id: cid, machine: "devbox", agent_id: "claude", agent_name: null, session_id: s.sid, resume_ref: null, cwd: "/home/u/rel", label: "x",
+    }, "再打个 tag", "chat-tag", "zh", undefined, { queueBehind: true });
+    assert.equal(again.ok, true, JSON.stringify(again));
+    const seqC = Number((await prompted(cid)).at(-1)!.cmd_seq);
+    await collect(cid);
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true, ended_by: "prompt" }],
+      ["tool_call", { update: { sessionUpdate: "tool_call", toolCallId: "c1", title: "git push --tags" } }]]);
+    await age();
+    assert.equal(await reads(), "working", "the instruction's turn, not the agent's own");
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "working");
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: "z", cmd_seq: seqC }], chunk("又补一句")]);
+    await age();
+    assert.equal(await reads(), "idle", "every instruction ended: the agent's own turn, quiet, is over");
   });
 
   test("D12 the prompt asks for parking only from a connector that can park", async () => {

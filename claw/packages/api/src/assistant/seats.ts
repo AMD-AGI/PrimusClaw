@@ -35,7 +35,7 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_DEVENV_SEAT_DISPATCH, CLAW_DEVENV_SEATS, C
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { issueCommand, listConnectors, sessionActivity, wakeConnector, workspacesOf, type Row } from "../remote-agents/store.js";
-import { inertMd, readSession, resumableOf, type Resumable } from "./devenv-tools.js";
+import { inertMd, readActivity, resumableOf, type Resumable } from "./devenv-tools.js";
 import { versionVerdict } from "../remote-agents/setup.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { briefLanguage } from "./brief.js";
@@ -395,7 +395,7 @@ export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_A
     if (!agent) unsupported = "no_agent";
     else if (!SEAT_DISPATCH_AGENT_KINDS.has(String(agent.kind))) unsupported = "agent_kind";
     else if (version.version_status === "unsupported") unsupported = "connector_outdated";
-    const reading = session ? readSession(Array.isArray(session.events) ? session.events : [], Number(session.queued) || 0) : null;
+    const reading = session ? readActivity(session) : null;
     let base: SeatLive["base"];
     if (!online) base = "offline";
     else if (unsupported) base = "unsupported";
@@ -889,7 +889,7 @@ export async function seatInputs(q: Querier, seat: Row, onlineWindowMs: number =
 export function mayAsk(seat: Row, online: boolean, activity: Row | undefined, conversations: Row[], now: number): boolean {
   if (!online || !activity || activity.read_only === true) return false;
   const events = Array.isArray(activity.events) ? activity.events as Row[] : [];
-  if (readSession(events as never, Number(activity.queued) || 0).state !== "idle") return false;
+  if (readActivity(activity).state !== "idle") return false;
   const last = Math.max(
     new Date(activity.updated_at ?? 0).getTime() || 0,
     ...events.map((e) => new Date(e.occurred_at ?? 0).getTime() || 0),

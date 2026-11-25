@@ -78,6 +78,17 @@ Claw matches on `cmd_seq`: a `cmd_id` may be a client's `Idempotency-Key`, which
 events can change, and a number it never does. A connector from before this change sends neither in `turn_end`,
 and its dropped prompts are not refused.
 
+A turn the agent takes by itself, with no prompt running (the agent answering a command it put in the background, once
+that command finished), is streamed as any turn's updates are, and from connector 0.3.3 on it ends with a `turn_end`
+that names no prompt: `cmd_seq` and `cmd_id` `null`, `agent_initiated: true`, and `ended_by` (`result`: the usage the
+agent reports at the end of its model turn; `quiet`; `prompt`: a prompt started; `adapter_exited`). A `cancel` stops such
+a turn and posts its usual end naming no prompt instead; a prompt that starts while a permission request of that turn
+waits takes the turn over and no end of it is posted. Claw ends no prompt with it; for a seat's task it says that
+turn's answer once as a late word of the task whose turn ended before it. An older connector never ends such a turn:
+Claw reads a session as working for at most five minutes after its last event when every prompt it sent there has a
+`turn_end` (or a refusal) naming its `cmd_seq`. The match is by number, not by order: Claw records a prompt when it
+queues it, which can be before the end of the turn the prompt waits behind.
+
 After a restart the connector ends a turn its previous run left running with `turn_end`
 `{"stopReason": "error", "error": "connector_restarted"}` (naming its prompt), or carries it on under the same prompt
 when the agent was waiting for a permission (it asks again; that prompt's own `turn_end` ends it). Each session used

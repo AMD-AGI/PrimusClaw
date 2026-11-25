@@ -85,6 +85,12 @@ export interface SessionTiming {
    * Claude Code draws a paste late. The phone is told it waits after ECHO_SLOW_MS (terminal-input.ts).
    */
   terminalShowMs: number;
+  /**
+   * A turn the agent takes by itself ({@link agentTurn}) ends once nothing has come from it for this long, when its agent says
+   * nothing that ends it; `agentTurnToolQuietMs` instead while a tool call of it is still running.
+   */
+  agentTurnQuietMs: number;
+  agentTurnToolQuietMs: number;
 }
 
 /**
@@ -104,8 +110,14 @@ export function entryTime(at: number | undefined, now = Date.now()): number | un
 export const DEFAULT_SESSION_TIMING: SessionTiming = {
   idleMs: 30 * 60_000, permissionTtlMs: 10 * 60_000, modeConfirmMs: 3_000, twinWatchMs: 1_000, spectateMs: SPECTATE_MS, spectateCheckMs: 5_000,
   rootCheckMs: 10_000, authWaitMs: 3_000, takeoverWaitMs: 15_000, terminalWaitMs: 10 * 60_000, terminalEchoMs: 20_000, terminalIdleMs: 5_000, terminalScreenWaitMs: 30_000,
-  terminalShowMs: ECHO_WAIT_MS,
+  terminalShowMs: ECHO_WAIT_MS, agentTurnQuietMs: 2 * 60_000, agentTurnToolQuietMs: 30 * 60_000,
 };
+
+/**
+ * The updates that make a turn the agent takes by itself (no prompt running): what it says, thinks or runs. The same updates Claw
+ * reads as a turn under way when they come after the last `turn_end` (devenv-tools.ts `readSession`).
+ */
+const AGENT_TURN_UPDATES = new Set(["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan", "user_message_chunk"]);
 
 /**
  * Why a command to a read-only session is refused: the conversation is open in a terminal, and a second writer would fork
@@ -199,6 +211,15 @@ export class Session {
    */
   private twinSeen = false;
   private turnRunning = false;
+  /**
+   * A turn the agent took by itself, with no prompt of Claw's running: Claude Code answers a command it put in the background once
+   * that command finishes, and claude-agent-acp streams that turn as session updates with no prompt whose response would end it. It
+   * opens with its first update and ends with a `turn_end` that names no prompt (`cmd_seq: null`, `agent_initiated: true`): at the
+   * usage the agent reports at the end of every model turn (a `usage_update` with its cost), else once it has been quiet for
+   * `agentTurnQuietMs` (`agentTurnToolQuietMs` while a tool call of it runs; never while a permission request waits), and when a prompt
+   * starts or the agent exits. Without it Claw reads the session as working for good, and the seat's queue never goes on.
+   */
+  private agentTurn: { timer: NodeJS.Timeout | undefined; tools: Set<string> } | null = null;
   /**
    * The connector is going away (stopped, or restarted by its supervisor) and will come back. What this process cannot
    * finish is left recorded for the next run instead of being ended here: the running turn (no `turn_end`), its waiting
@@ -322,7 +343,10 @@ export class Session {
   }
 
   get pendingCount(): number { return this.book.size; }
-  get busy(): boolean { return this.turnRunning || this.queue.length > 0 || this.book.size > 0 || this.terminalTurn !== null || this.terminalQueue.length > 0; }
+  get busy(): boolean {
+    return this.turnRunning || this.queue.length > 0 || this.book.size > 0 || this.terminalTurn !== null || this.terminalQueue.length > 0
+      || this.agentTurn !== null;
+  }
 
   /** Whether what is sent to this session is typed into the terminal that has it open. */
   get typesIntoTerminal(): boolean { return this.terminal !== null; }
@@ -1210,6 +1234,8 @@ export class Session {
   private onExit(info: { code: number | null; signal: NodeJS.Signals | null }): void {
     this.adapter = null;
     const hadTurn = this.turnRunning;
+    // A turn the agent took by itself ends with it (before the cards close, as a prompt's turn ends with its own error).
+    if (this.agentTurn) this.endAgentTurn("adapter_exited", { stopReason: "error", error: "adapter_exited" });
     const cancelled = this.book.cancelAll();
     // Going away: the next run closes these cards (by connector_restart) and knows the turn was waiting on them.
     if (!this.stopping) for (const actionId of cancelled) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "adapter_exit" });
@@ -1239,7 +1265,49 @@ export class Session {
       if (type === "user_message_chunk" || type === "agent_message_chunk" || type === "agent_thought_chunk" || type === "tool_call") this.emit(type, { ...data, replay: true });
       return;
     }
+    const own = !this.turnRunning && !this.readOnly && !this.closed;
+    if (own && (this.agentTurn || AGENT_TURN_UPDATES.has(type))) this.agentActivity(update, type);
     this.emit(type, data);
+    // The usage the agent reports as a model turn of its own ends (claude-agent-acp: at its result, with what it cost).
+    if (own && this.agentTurn && type === "usage_update" && isObject(update.cost)) this.endAgentTurn("result", { stopReason: "end_turn" });
+  }
+
+  /** Something of a turn the agent takes by itself: it opens one when none is open, and its quiet is counted from here. */
+  private agentActivity(update: AcpParams | null, type: string | null): void {
+    if (!this.agentTurn) {
+      this.agentTurn = { timer: undefined, tools: new Set() };
+      this.audit("agent_turn_started", { update: type });
+    }
+    const t = this.agentTurn;
+    const toolCallId = update && typeof update.toolCallId === "string" ? update.toolCallId : null;
+    if (toolCallId && (type === "tool_call" || type === "tool_call_update")) {
+      const status = typeof update!.status === "string" ? update!.status : null;
+      if (status === "completed" || status === "failed") t.tools.delete(toolCallId);
+      else if (type === "tool_call" || status !== null) t.tools.add(toolCallId);
+    }
+    clearTimeout(t.timer);
+    t.timer = setTimeout(() => this.agentTurnQuiet(t), t.tools.size ? this.env.timing.agentTurnToolQuietMs : this.env.timing.agentTurnQuietMs);
+    t.timer.unref?.();
+  }
+
+  private agentTurnQuiet(t: NonNullable<Session["agentTurn"]>): void {
+    if (this.agentTurn !== t) return;
+    // A question of its own waits for the person: the turn goes on until it is answered (or times out).
+    if (this.book.size > 0) return this.agentActivity(null, null);
+    this.endAgentTurn("quiet", { stopReason: "end_turn" });
+  }
+
+  /**
+   * The turn the agent took by itself is over: said with a `turn_end` naming no prompt, unless (`data` null) the caller says its end
+   * itself (a cancel), a prompt takes it over while a question of it waits, or the connector is going away.
+   */
+  private endAgentTurn(by: string, data: Record<string, unknown> | null): void {
+    const t = this.agentTurn;
+    if (!t) return;
+    clearTimeout(t.timer);
+    this.agentTurn = null;
+    this.audit("agent_turn_ended", { by });
+    if (data && !this.stopping && !this.closed) this.emit("turn_end", { ...data, cmd_id: null, cmd_seq: null, agent_initiated: true, ended_by: by });
   }
 
   private onNotification(method: string, params: AcpParams): void {
@@ -1256,6 +1324,8 @@ export class Session {
     const toolCall = (isObject(params.toolCall) ? params.toolCall : {}) as AcpParams;
     const options = normalizeOptions(params.options);
     if (this.closed || options.length === 0) return Promise.resolve({ outcome: { outcome: "cancelled" } });
+    // Asked in a turn the agent took by itself: part of that turn (opened by it when nothing else came first).
+    if (!this.turnRunning && !this.readOnly) this.agentActivity(null, "permission");
 
     if (this.answerOnlyTurn) {
       // A turn asked only to answer: nothing it wants to run or change is let through, not even by the owner's own rules, and nobody
@@ -1445,6 +1515,8 @@ export class Session {
   /** The connector is about to stop its adapters and will come back: see {@link stopping}. */
   shutdown(): void {
     this.stopping = true;
+    // (its end is not said: the next run starts the agent afresh, and Claw sees the session idle once it is quiet)
+    this.endAgentTurn("connector_stopping", null);
     this.dropQueued(true);
     // Not counted as handled: Claw delivers the messages that were waiting for the terminal again after the restart.
     this.terminalQueue = [];
@@ -1463,6 +1535,11 @@ export class Session {
         if (verdict === "keep") { this.queue.unshift(next); break; }
         if (verdict === "drop") { next.started(); continue; }
         if (this.closed) { this.rejectCommand("prompt", next.cmdId, "session_closed", next.cmdSeq); next.started(); break; }
+        // A turn the agent took by itself ends where a prompt's starts, and only then (a prompt kept back or dropped above leaves it
+        // open): what comes from here on is the prompt's (an agent that is still at it takes the prompt into that turn, and answers
+        // both in the prompt's). While a question of that turn waits, its end is not said: the question is the prompt's turn's now,
+        // and stays one the person is waited on for until that turn ends.
+        this.endAgentTurn("prompt", this.book.size > 0 ? null : { stopReason: "end_turn" });
         await this.runTurn(next.text, next.started, next.cmdId, next.cmdSeq, next.answerOnly === true, next.park === true);
       }
     } finally {
@@ -1857,9 +1934,12 @@ export class Session {
     this.dropQueued();
     for (const [cmdId, cmdSeq] of dropped) this.rejectCommand("prompt", cmdId, "cancelled", cmdSeq);
     const wasRunning = this.turnRunning;
-    if (wasRunning && this.adapter && this.acpId) await this.adapter.notify("session/cancel", { sessionId: this.acpId }).catch(() => undefined);
+    // A turn the agent took by itself is stopped as a prompt's is; its end is the one said below, which names no prompt.
+    const agentTurn = !wasRunning && this.agentTurn !== null;
+    this.endAgentTurn("cancel", null);
+    if ((wasRunning || agentTurn) && this.adapter && this.acpId) await this.adapter.notify("session/cancel", { sessionId: this.acpId }).catch(() => undefined);
     for (const actionId of this.book.cancelAll()) this.emit("permission_resolved", { actionId, optionId: null, outcome: "cancelled", by: "cancel" });
-    this.audit("cancelled", { turn_running: wasRunning, queued_dropped: queued });
+    this.audit("cancelled", { turn_running: wasRunning, queued_dropped: queued, ...(agentTurn ? { agent_turn: true } : {}) });
     // A running turn ends with its own `turn_end` (stopReason cancelled, naming its prompt). With none running, say so once,
     // naming no prompt: it ended none.
     if (!wasRunning) this.emit("turn_end", { stopReason: "cancelled", cmd_id: null, cmd_seq: null });
@@ -1887,6 +1967,7 @@ export class Session {
     if (this.closed) return;
     this.closed = true;
     clearTimeout(this.idle);
+    this.endAgentTurn("session_closed", null);
     this.dropTerminalQueue("session_closed");
     if (this.terminalTurn) this.endTerminalTurn("error", reason === "terminal_closed" ? "terminal_closed" : "session_closed");
     this.stopTail();
