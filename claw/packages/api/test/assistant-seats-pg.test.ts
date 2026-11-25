@@ -799,6 +799,12 @@ describe("seats", { skip }, () => {
     await legacy("seat_w7", "claude-sessions", "/w7", { alias: "乙", role: "负责乙", role_state: "confirmed" });
     await legacy("seat_w8_conv", "claude-sessions", "/w8", { alias: "丙", role: "负责丙", role_state: "confirmed" }, ref(8));
     await legacy("seat_w8", "claude-sessions", "/w8", { alias: "丁", role: "负责丁", role_state: "confirmed" });
+    // A folder's seat whose session holds a conversation that has its own confirmed seat (and none other there): it lets go of that
+    // session, so nothing for it reaches the other seat's conversation.
+    const chat9 = await chatSession("alice", cid, "/w9");
+    await events("alice", cid, chat9, [["session_started", { acp_session_id: ref(11), agent_id: "claude", currentMode: "default", unattended: false }]]);
+    await legacy("seat_w9_conv", "claude-sessions", "/w9", { alias: "戊", role: "负责戊", role_state: "confirmed" }, ref(11));
+    await legacy("seat_w9", "claude", "/w9", { alias: "己", role: "负责己", role_state: "confirmed", current_session_id: chat9 });
     const errand = async (seatId: string) => {
       const id = `it-${seatId}`;
       await w.q(
@@ -842,7 +848,10 @@ describe("seats", { skip }, () => {
     const dispatch = await import("../src/assistant/seat-dispatch.js");
     assert.equal(dispatch.seatRefusal((await seats.seatsLive("alice")).get("seat_w8"), "seat_w8")?.code, "seat_unbound",
       "a folder's seat left with no session of its own takes no task (which session would be a guess)");
-    assert.equal(rows.length, 11);
+    const w9 = rows.find((r) => r.seat_id === "seat_w9")!;
+    assert.deepEqual([w9.conversation_ref, w9.current_session_id, byRef.get(ref(11))!.seat_id, byRef.get(ref(11))!.current_session_id],
+      [null, null, "seat_w9_conv", chat9], "the session is its conversation's seat's only");
+    assert.equal(rows.length, 13);
     // Again: nothing moves, nothing is made twice.
     await seats.syncSeats("alice");
     assert.deepEqual((await seatRows()).map((r) => [r.seat_id, r.conversation_ref]), rows.map((r) => [r.seat_id, r.conversation_ref]));

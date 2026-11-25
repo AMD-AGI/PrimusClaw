@@ -344,19 +344,16 @@ export async function syncSeats(owner: string, q: Querier = (t, p) => db.query(t
     )).rows as Row[];
     for (const f of folders) {
       if (!live.has(String(f.connector_id))) continue;
-      let candidates: Place[];
       const cur = f.current_session_id ? openById.get(String(f.current_session_id)) : undefined;
-      if (cur) {
-        const ref = conversationRefOf(cur.conversation_ref);
-        // (its session's conversation is not named yet: it stays the folder's until it is)
-        if (!ref) continue;
-        const p = places.get(conversationKey(String(f.connector_id), ref));
-        candidates = p ? [p] : [];
-      } else {
-        candidates = [...places.values()]
-          .filter((p) => p.ref && p.connector_id === String(f.connector_id) && p.cwd === f.cwd && (p.agent_id === f.agent_id || p.agents.has(String(f.agent_id))))
-          .sort((x, y) => Number(y.open) - Number(x.open) || y.session_at - x.session_at || y.seen_at - x.seen_at);
-      }
+      const curRef = cur ? conversationRefOf(cur.conversation_ref) : null;
+      // (its session's conversation is not named yet: it stays the folder's until it is)
+      if (cur && !curRef) continue;
+      // Its session's conversation first, then the others of its folder: open ones, newest first.
+      const first = curRef ? places.get(conversationKey(String(f.connector_id), curRef)) : undefined;
+      const candidates = [...(first ? [first] : []), ...[...places.values()]
+        .filter((p) => p !== first && p.ref && p.connector_id === String(f.connector_id) && p.cwd === f.cwd
+          && (p.agent_id === f.agent_id || p.agents.has(String(f.agent_id))))
+        .sort((x, y) => Number(y.open) - Number(x.open) || y.session_at - x.session_at || y.seen_at - x.seen_at)];
       for (const to of candidates) {
         const there = (await tx(
           "SELECT * FROM claw_devenv_seats WHERE owner_user_id = $1 AND connector_id = $2::uuid AND conversation_ref = $3 FOR UPDATE",
@@ -410,6 +407,13 @@ export async function syncSeats(owner: string, q: Querier = (t, p) => db.query(t
           p.seen_at, p.proven_at],
       );
     }
+    // A seat of a folder holds no session whose conversation is named (that session is its conversation's seat's, even when this one
+    // could not move there): a task for it never reaches another seat's conversation.
+    await tx(
+      `UPDATE claw_devenv_seats s SET current_session_id = NULL, updated_at = NOW()
+        WHERE s.owner_user_id = $1 AND s.conversation_ref IS NULL AND s.current_session_id = ANY($2::uuid[])`,
+      [owner, [...openById.values()].filter((o) => conversationRefOf(o.conversation_ref) || claimed.has(String(o.session_id))).map((o) => String(o.session_id))],
+    );
     // A seat whose session closed has none now (the next one open through Claw that holds its conversation is its).
     await tx(
       `UPDATE claw_devenv_seats s SET current_session_id = NULL, updated_at = NOW()
