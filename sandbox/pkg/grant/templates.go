@@ -112,12 +112,16 @@ func validateTemplateLayers(templates []runtimev1alpha1.GrantTemplate) error {
 // the same path and has no field for another mount path, so any other shape
 // would not be what it says. Volumes of other sources are not this check's.
 //
-// A read-only mount nested inside a read-write workspace mount (workspace
-// /shared, template /shared/team/cache) relies on the nested mount being
-// applied after its parent. The workload's mounts are ordered by path depth
-// before the pod is made, and the runtimes order them again: Kubernetes CRI
-// runtimes and the Docker daemon sort a container's mounts by path depth, and
-// Apptainer sorts its user binds the same way.
+// A template with a hostPath volume must also set workspaceStorage to off or
+// readOnly. Every host path a sandbox may mount lies under a directory its
+// workspace declares for sandboxes, and with its storage on the workspace
+// mounts that directory read-write into every sandbox it runs: a read-only
+// mount beneath it would protect nothing, since the same directory stays
+// writable through its parent, and the sandbox platform's pod admission
+// refuses a mount point beneath a writable workspace mount (a symlink written
+// there could redirect it). With the storage off the sandbox has the host
+// paths of its own volumes only, each read-only; with it read-only nothing of
+// the workspace's storage is writable.
 func validateTemplateMounts(templates []runtimev1alpha1.GrantTemplate) error {
 	for _, tpl := range templates {
 		base, ok, err := templateFromSpec(tpl.Spec)
@@ -178,6 +182,12 @@ func checkTemplateMounts(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate) e
 		if !mounted[name] {
 			return fmt.Errorf("volume %q is not mounted", name)
 		}
+	}
+	if mode := tmpl.WorkspaceStorageMode(); !mode.Valid() {
+		return fmt.Errorf("workspaceStorage %q is none of on, off and readOnly", mode)
+	} else if len(hostPaths) > 0 && mode.Writable() {
+		return fmt.Errorf("a template with host directory volumes must set workspaceStorage to off or readOnly: " +
+			"with its workspace's storage on, the sandbox could write those directories through the workspace's read-write mount")
 	}
 	// A sidecar mounts a volume with Kubernetes' own default, read-write: a
 	// host directory is the main container's alone.

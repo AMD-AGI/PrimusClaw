@@ -648,16 +648,19 @@ curl -X POST "$CLAW/v1/plugins/upsert" -H "Authorization: Bearer $KEY" \
 ## 7. App Manifest: Read-Only Host Directories in Sandbox Templates
 
 A sandbox template of an app manifest (`resource.app.manifest.sandbox_templates[]`)
-can mount directories of its workspace's storage read-only with `host_mounts`.
-The typical use is a cache the application publishes through the workspace's
-own read-write mount while the sandboxes it starts from the template may only
-read it:
+can mount directories of its workspace's storage read-only with `host_mounts`,
+in a sandbox created without the workspace's storage
+(`"workspaceStorage": "off"`) or with all of it read-only
+(`"workspaceStorage": "readOnly"`, see below). The typical use is a cache the
+application publishes through the workspace's own read-write mount while the
+sandboxes it starts from the template may only read it:
 
 ```json
 {
   "name": "measurement",
   "fromImage": "registry.example.invalid/measure@sha256:...",
   "per_gpu_count": [1, 8],
+  "workspaceStorage": "off",
   "host_mounts": [
     { "hostPath": "/shared/team/cache", "readOnly": true }
   ]
@@ -683,10 +686,21 @@ checked.
 
 
 - At most 8 mounts per template, no path twice, no other key.
-- `readOnly: true` only. The workspace already mounts its storage into every
-  sandbox it runs, read-write where it allows writes, so a read-write template
-  mount would grant nothing new; and the sandbox workload mounts every host
-  path it is given read-only, so `readOnly: false` could not be kept.
+- `workspaceStorage`, wherever a template sets it, is `"on"`, `"off"` or
+  `"readOnly"` (anything else is refused: "must be one of ...").
+- A template with `host_mounts` sets `workspaceStorage` to `"off"` or
+  `"readOnly"` where Agent Sandbox reads the template: in the nested
+  `template` when that carries the `fromImage`, else at the template's top.
+  Every path a mount may name lies under a directory the workspace mounts into
+  its sandboxes, read-write where it allows writes; with that mount in the
+  sandbox the directory would stay writable through its parent, and a
+  read-only mount beneath it would protect nothing. Left out, `"on"`, or set
+  only beside a nested template, it is refused
+  (`sandbox_templates[i].workspaceStorage` or
+  `sandbox_templates[i].template.workspaceStorage`: "must be \"off\" or
+  \"readOnly\" in a template with host_mounts").
+- `readOnly: true` only: the sandbox workload mounts every host path it is
+  given read-only, so `readOnly: false` could not be kept.
 - `hostPath` is absolute and normalised: no `.` or `..` segment, no `//`, no
   trailing `/`, not `/`, and none of `:`, `,`, a blank or a control character
   (the container runtimes' bind syntax cannot carry them). It is not, is not
@@ -697,9 +711,9 @@ checked.
   may not be `hostPath` volumes (other sources pass through as before), and
   neither they nor its `volumeMounts` may use a name starting with
   `template-mount-`; `volumes`,
-  `volumeMounts`, `template`, `fromImage`, `image`, `workspace`, `resources`
-  (with its `requests` and `limits`) and `gpu` (with its `sharedMemory`) must
-  be spelt exactly (Agent Sandbox matches field names case-insensitively).
+  `volumeMounts`, `template`, `fromImage`, `image`, `workspace`,
+  `workspaceStorage`, `resources` (with its `requests` and `limits`) and
+  `gpu` (with its `sharedMemory`) must be spelt exactly (Agent Sandbox matches field names case-insensitively).
   Every key of a template, at any depth, must be ASCII: Agent Sandbox's JSON
   decoder folds some other letters onto ASCII ones (`ſ`, U+017F, is `s`; `K`,
   U+212A, is `k`), so `volumeſ` would reach it as `volumes`. No object of a
@@ -734,22 +748,64 @@ the same path, after the template's own `volumes` and `volumeMounts`. Agent
 Sandbox refuses to issue or extend a grant whose template has a hostPath
 volume that is not a clean absolute path, is a system directory (or under or
 above one), is mounted anywhere but read-only at its own path, or is mounted by
-a sidecar. It checks the decoded template, so it sees a hostPath volume however
-its keys were spelt, and it refuses a template spec in which one object has two
-keys its decoder reads as one.
+a sidecar, whose `workspaceStorage` is none of `on`, `off` and `readOnly`, or
+whose template has a hostPath volume and does not set `workspaceStorage` to
+`off` or `readOnly`. It checks the decoded template, so it sees a
+hostPath volume however its keys were spelt, and it refuses a template spec in
+which one object has two keys its decoder reads as one. It also refuses to
+create a sandbox from a grant's template that reaches it with host paths and
+the workspace's storage on (a CodeInterpreter schema older than
+`workspaceStorage` drops the field), rather than create it with a
+read-write parent over its read-only mounts.
 
-**A read-only directory inside a read-write one.** When the workspace mounts
-`/shared` read-write and a template mounts `/shared/team/cache` read-only, the
-sandbox sees `/shared` writable and `/shared/team/cache` read-only: a write
-under the cache fails with `EROFS` (`Read-only file system`). This needs the
-nested mount to be applied after its parent, and no layer depends on the order
-the mounts are listed in: the sandbox workload orders a pod's host-path mounts
-by path depth before the pod is made; the kubelet passes a container's
-`volumeMounts` to the runtime in list order, and the CRI runtimes (containerd,
-CRI-O) sort them by the number of path components; the Docker daemon sorts a
-container's mounts by destination depth; Apptainer sorts its user binds
-(`--bind`) by destination depth and applies `ro` with a read-only remount of
-each bind.
+**Without the workspace's storage (`"off"`).** Agent Sandbox creates the sandbox's SaFE
+Workload with `primus-safe.workload.use.workspace.storage: "false"`, and SaFE
+mounts none of the workspace's volumes into it: the sandbox sees each
+`host_mounts` directory read-only at its own path, and no other directory of
+the workspace's storage. A write under one fails with `EROFS`
+(`Read-only file system`), and there is no parent mount to write it through.
+Whatever else the sandbox must read from the workspace's storage (a model
+directory, say) is another `host_mounts` entry; what it produces it writes to
+its own file system and returns through the sandbox API, not to the
+workspace's storage. On nodes outside the cluster (SaFE external execution) a
+mount below a workspace volume's root needs SaFE's
+`external_execution.user_dir_mounts`; without it SaFE refuses the Workload. A
+nested read-only mount under a read-write workspace mount is refused outright
+by the sandbox platform's pod admission on such nodes (a mount point resolved
+through a writable share can be redirected by what is written there), which is
+why a template with `host_mounts` may not leave the storage on.
+
+**The workspace's storage read-only (`"readOnly"`).** Agent Sandbox creates the
+sandbox's SaFE Workload with
+`primus-safe.workload.workspace.storage.readonly: "true"`, and SaFE mounts the
+whole of the workspace's storage read-only, init containers included, with no
+user directory: the per-user directory SaFE otherwise mounts read-write
+(`users/<id>` of a volume with `enableUserDir`) is not mounted, and nothing of
+the workspace's storage is writable from the sandbox. It suits a sandbox that
+reads much of the workspace's storage (models, datasets, caches) and must not
+change any of it; the `host_mounts` such a template would list are already
+visible read-only, so leave them out (a mount point below the workspace's
+mount can still be refused by the pod admission of nodes outside the cluster).
+
+- Per-user directories nested under the storage (`users/<id>`, a per-user
+  scratch directory) are not used in this mode: on nodes whose platform still
+  lays them over the workspace's mount they are read-only like the rest, and
+  nothing the sandbox writes reaches them.
+- Never put a store several people or sandboxes share under a `users/<id>`
+  directory: a sandbox that does not mount that user's directory cannot see
+  it, and in this mode none is mounted at all.
+- Enabling it requires the consumer to keep all its writes on local disk (the
+  container's own file system, an `emptyDir`, or the sandbox's working
+  directory): a tool that stages, caches or logs under the workspace's storage
+  fails with `EROFS` (`Read-only file system`). Check the first load of every
+  dataset and model the sandbox reads (library caches default to paths under
+  home or the workspace) before switching a template.
+- Roll it out per template, with a canary: switch one template, run it on
+  each kind of node it lands on (in the cluster and outside it), check
+  `/proc/mounts` shows the workspace's mount `ro` and that the workload passes,
+  and only then switch the next. The annotation name is SaFE's: a SaFE that
+  does not yet know it mounts the storage read-write as before, so confirm the
+  deployed SaFE supports it before relying on it.
 
 ### Preferred nodes
 
