@@ -45,6 +45,7 @@ import * as store from "../remote-agents/store.js";
 import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
 import { startTerminalWaitSweep, TERMINAL_WAIT_NOTICE_MS } from "../remote-agents/terminal-waits.js";
+import { startTerminalDigestSweep } from "../assistant/terminal-digest.js";
 import { DELIVERY_SWEEP_MS, deliveryWritesIdle, noteEventsPost, recordOutboxReport, startDeliveryHealthSweep } from "../remote-agents/delivery-health.js";
 import { metrics } from "../infra/metrics.js";
 import { closeCardsOfConnector } from "../assistant/devenv-tools.js";
@@ -338,6 +339,16 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     when: presenceSweepMs > 0,
     start: () => {
       const stop = startTerminalWaitSweep({ onlineWindowMs, noticeAfterMs: opts.terminalWaitNoticeMs ?? TERMINAL_WAIT_NOTICE_MS, sweepMs: presenceSweepMs });
+      app.addHook("onClose", async () => stop());
+    },
+  });
+  // The summary of a terminal conversation that keeps working, at most once per its owner's interval (`assistant/terminal-digest.ts`).
+  // Every replica sweeps; each summary is decided under its item's row lock, so it is said once.
+  loops.push({
+    name: "remote_agents.terminal_digest_sweep",
+    when: presenceSweepMs > 0,
+    start: () => {
+      const stop = startTerminalDigestSweep();
       app.addHook("onClose", async () => stop());
     },
   });

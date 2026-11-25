@@ -59,6 +59,13 @@ export interface ClawRemoteAgentsPort {
    * is pushed while muted (`PUT /approvals/mutes`). Answers what Claw stored, and the machine and conversation it names.
    */
   muteTerminal(key: ClawCredential, item: number, muted: boolean): Promise<TerminalMute>;
+  /**
+   * How often (minutes; 0 never) a conversation of the caller's that keeps working in a terminal on its own is summed up
+   * (`GET /approvals`, `summary_minutes`; an hour unless they set otherwise).
+   */
+  summary(key: ClawCredential): Promise<number>;
+  /** Set it (`PUT /approvals/summary`: 0, or 15 to 1440); answers what Claw stored. ClawError(400) for anything else. */
+  setSummary(key: ClawCredential, minutes: number): Promise<number>;
   createSession(key: ClawCredential, session: NewRemoteSession): Promise<RemoteSession>;
   sessions(key: ClawCredential): Promise<RemoteSession[]>;
   session(key: ClawCredential, sessionId: string): Promise<RemoteSession>;

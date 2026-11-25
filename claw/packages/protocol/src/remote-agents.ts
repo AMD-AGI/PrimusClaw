@@ -155,7 +155,10 @@ export const PERMISSION_PARK_MAX_MS = 24 * 3600_000;
  * away_ms}`. `message` is the end of what the agent last said (untrusted text); `error` names why a turn that failed did
  * (Claude Code's `StopFailure` reason, such as `rate_limit`). The connector posts it only once the terminal has had no input for a
  * minute after the turn ended, and never while a chat follows the conversation; Claw tells the owner, unless they turned the
- * terminal pushes off or muted that conversation.
+ * terminal pushes off or muted that conversation. From connector 0.3.4 it also says who started the turn, as Claude Code's transcript
+ * records it (`origin`: "person" or "automation"; absent when that is not known), and an end that stands for a run of turns nobody
+ * typed carries `turns` (how many), `earlier` (the earlier ones' last words, oldest first, at most five) and `since` (ISO time of the
+ * first). Claw pushes at once only a person's turn, one that asks the person something, or one that failed; it sums up the others.
  */
 export const REMOTE_EVENT_TERMINAL_TURN_END = "terminal_turn_end";
 /**

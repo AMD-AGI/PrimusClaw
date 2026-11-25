@@ -45,6 +45,7 @@ import { approvalsEnabled, DELIVERY_UNCONFIRMED, findSession, issueCommand, onli
 import { newWorkItemId } from "../tasks/ids.js";
 import type { AssistantRemoteAsk, AssistantRemoteNotice, AssistantTerminalEnd } from "../notifications/assistant-events.js";
 import { ensureLiveAssistant, itemSession, personWritesChinese, recordSystemNotice, storeAnswerWhole } from "./outbound.js";
+import { asksPerson, gather, type TerminalDigest } from "./terminal-digest.js";
 import { applyWorkerReport, clipOneLine, clipWords, graphemes, TITLE_MAX } from "./work-items.js";
 
 const logger = pino({ name: "assistant-remote-items" });
@@ -89,6 +90,8 @@ export const TERMINAL_ASKS_PER_MINUTE = 5;
 export const TERMINAL_END_GAP_MS = 5 * 60_000;
 /** How much of what the agent last said an end's card carries whole ("show all"): all the connector posts. */
 const END_FULL_MAX = 2000;
+/** The earlier ends a connector folded into one (`earlier`) that are read: its own most. */
+const EARLIER_KEPT = 5;
 const MINUTE_MS = 60_000;
 /** The newest message chunks of a turn its answer is read from. */
 const ANSWER_CHUNKS = 400;
@@ -149,6 +152,10 @@ export interface RemoteParams {
   carded?: string[];
   /** A terminal's item: when (ms) the user was last told that one of its turns ended ({@link TERMINAL_END_GAP_MS}). */
   end_told_at?: number;
+  /** A terminal's item: the ends gathered for its next summary instead of being pushed one by one (terminal-digest.ts). */
+  digest?: TerminalDigest;
+  /** A terminal's item: when (ms) its last summary was said. */
+  summary_told_at?: number;
   /** A terminal's item: the conversation's own name, as its connector lists it (`capabilities.resumable` title), when it has one. */
   name?: string;
   /** Prompts (`cmd_seq`) Claw ended as `delivery_unconfirmed`: an end of the machine's own for one of them still ends the item. */
@@ -1300,7 +1307,19 @@ async function applyTerminal(
         [summary], { kind: "answer", summary, result: { outcome: failed ? "error" : "done", error: error || null, remote_event_id: e.id } },
       );
       if (!enabled) continue;
-      if (Number(p.end_told_at) > now - TERMINAL_END_GAP_MS) continue;
+      // Pushed at once only when the person has a reason to hear it now: they started the turn (or the connector is too old to
+      // say who did), it asks them something, or it failed. An end of a turn another session or a schedule started, and an end
+      // held back by the gap, are gathered for the conversation's next summary instead (terminal-digest.ts): never lost, never
+      // said twice.
+      const origin = e.data.origin === "automation" ? "automation" : e.data.origin === "person" ? "person" : null;
+      const asks = !failed && asksPerson(message);
+      const turns = Number.isSafeInteger(e.data.turns) && Number(e.data.turns) > 1 ? Math.min(Number(e.data.turns), 10_000) : 1;
+      const earlier = Array.isArray(e.data.earlier)
+        ? e.data.earlier.filter((x): x is string => typeof x === "string").slice(-EARLIER_KEPT).map((x) => terminalEndSummary(x.slice(-END_FULL_MAX)).summary)
+        : [];
+      const gathered = { turns, failed, asks, said: [...earlier, told.summary] };
+      if (origin === "automation" && !asks && !failed) { gather(p, now, gathered); continue; }
+      if (Number(p.end_told_at) > now - TERMINAL_END_GAP_MS) { gather(p, now, gathered); continue; }
       p.end_told_at = now;
       said.push({
         key: `end:${e.id}`, text: terminalEndNotice(p, seq, failed, error, told, attach), end: failed ? "error" : "done",
