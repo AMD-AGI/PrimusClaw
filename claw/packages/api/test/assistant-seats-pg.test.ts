@@ -789,8 +789,8 @@ describe("seats", { skip }, () => {
     };
     await legacy("seat_rel", "claude-sessions", "/w", { alias: "发布台", role: "负责 PrimusClaw 发布", role_state: "confirmed", dispatch_mode: "auto", confirmed_at: new Date() });
     await legacy("seat_blog", "claude", "/w2", { alias: "博客", role: "写博客", role_state: "confirmed", current_session_id: chat });
-    await legacy("seat_docs_old", "claude-sessions", "/w3", { role_state: "suggested", suggestion: JSON.stringify({ id: "g", role: "文档" }) });
-    await legacy("seat_docs", "claude-sessions", "/w3", { alias: "文档台", role: "负责文档", role_state: "confirmed" }, ref(4));
+    await legacy("seat_docs_old", "claude-sessions", "/w3", { role_state: "suggested", suggestion: JSON.stringify({ id: "g", role: "文档" }), confirm_each: true });
+    await legacy("seat_docs", "claude-sessions", "/w3", { alias: "文档台", role: "负责文档", role_state: "confirmed", dispatch_mode: "auto" }, ref(4));
     await legacy("seat_ci", "claude-sessions", "/w5", { alias: "CI", role: "负责 CI", role_state: "confirmed" });
     await legacy("seat_ci_new", "claude-sessions", "/w5", {}, ref(5));
     await legacy("seat_none", "claude", "/w6", { alias: "空", role: "没有会话", role_state: "confirmed" });
@@ -835,6 +835,7 @@ describe("seats", { skip }, () => {
     // A folder's guess where the conversation's seat is confirmed: one seat, the confirmed one, with the other's task.
     assert.equal(rows.find((r) => r.seat_id === "seat_docs_old"), undefined);
     assert.deepEqual([byRef.get(ref(4))!.seat_id, (await w.q("SELECT params->>'seat_id' AS s FROM claw_work_items WHERE item_id = $1", [docsTask]))[0].s], ["seat_docs", "seat_docs"]);
+    assert.deepEqual([byRef.get(ref(4))!.confirm_each, byRef.get(ref(4))!.dispatch_mode], [true, "card"], "a card every time, asked of the seat folded in, is kept");
     // A folder's confirmed role where the conversation's seat holds nothing: the confirmed one is kept, and takes its task.
     assert.equal(rows.find((r) => r.seat_id === "seat_ci_new"), undefined);
     assert.deepEqual([byRef.get(ref(5))!.seat_id, byRef.get(ref(5))!.alias, (await w.q("SELECT params->>'seat_id' AS s FROM claw_work_items WHERE item_id = $1", [ciTask]))[0].s],

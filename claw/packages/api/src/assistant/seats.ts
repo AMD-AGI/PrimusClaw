@@ -426,9 +426,16 @@ export async function syncSeats(owner: string, q: Querier = (t, p) => db.query(t
 
 /**
  * Two seats that are one conversation made one: `drop`'s tasks, and its cards still waiting for the user (a task's, a name's), are
- * `keep`'s now; a guess card of its is closed; then it is deleted.
+ * `keep`'s now, and so is its "a card every time" when it had one; a guess card of its is closed; then it is deleted.
  */
 async function mergeSeat(q: Querier, owner: string, drop: string, keep: string): Promise<void> {
+  // A card every time, asked for either: kept (the more careful of the two never gets lost with the seat that said it).
+  await q(
+    `UPDATE claw_devenv_seats k SET confirm_each = true, dispatch_mode = 'card', auto_since = NULL, updated_at = NOW()
+       FROM claw_devenv_seats d
+      WHERE k.seat_id = $2 AND k.owner_user_id = $1 AND d.seat_id = $3 AND d.owner_user_id = $1 AND d.confirm_each AND NOT k.confirm_each`,
+    [owner, keep, drop],
+  );
   await q(
     `UPDATE claw_work_items SET params = jsonb_set(params, '{seat_id}', to_jsonb($3::text)), updated_at = NOW()
       WHERE user_id = $1 AND kind = 'remote' AND params->>'errand' = 'true' AND params->>'seat_id' = $2`,
