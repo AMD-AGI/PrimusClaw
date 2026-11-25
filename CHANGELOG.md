@@ -377,9 +377,9 @@ release version, and its `appVersion` stays `latest`.
   of each machine, in its order (the rest when that machine is asked for, marked `not_on_agents_card`), and the router names
   sessions by title and label (the labels `devenv_send` takes as targets) and nothing its results do not list. A seat is now called
   what its sessions are called on the machine: `seat_roster` lists the ids of the sessions in each seat (which `devenv_list` names)
-  and takes `name` (a session's name or the alias, compared by Claw and never listed), `seat_set` takes `name` too, and the seat
-  cards show the session names beside an alias (one line, at most 40 characters, control characters removed). Seats prompt
-  router-seats-v2. Router prompt router-devenv-v16.
+  and takes `name` (a session's name or the alias, compared by Claw and never listed; a name the user's message does not hold marks
+  the turn), `seat_set` takes `name` too, and the seat cards show the session names beside an alias (one line, at most 40
+  characters, control characters removed). Seats prompt router-seats-v2. Router prompt router-devenv-v16.
 - Claw: the answer a seat's agent gave by itself, after a command it put in the background finished, was lost when its
   task had been opened again meanwhile (waiting for the seat that very turn kept busy) or sent to a new session: it
   is now said as that task's late word. The five-minute quiet that ends such a turn for an older connector now waits

@@ -275,6 +275,12 @@ describe("devenv_list", { skip }, () => {
     const all = (await call(await userTurn(alice, "devpod 上所有会话"), { machine: "devpod" })).body.machines[0].sessions;
     assert.deepEqual(all.filter((s: Recorded) => s.not_on_agents_card).map((s: Recorded) => [s.label, s.title]),
       [["devpod/claude-sessions/6", "weekly report"], ["devpod/claude-sessions/7", "approval test"]]);
+    // The card shows the conversations of six online agents of all machines, in order: a seventh agent's are only counted.
+    await machine("alice", "spare", { online: true, agents: Array.from({ length: 6 }, (_, i) => ({ id: `a${i}`, kind: "attach", name: `A${i}`, watch: true,
+      resumable: [{ ref: `5a5a0000-0000-4000-8000-00000000000${i}`, title: `spare ${i}`, cwd: "/s", updated_at: now() - 5, state: "live" }] })) });
+    const two = (await call(await userTurn(alice, "两台机器上的会话"))).body;
+    assert.deepEqual(two.machines[1].sessions.map((s: Recorded) => s.title), ["spare 0", "spare 1", "spare 2", "spare 3", "spare 4"]);
+    assert.equal(two.machines[1].sessions_not_shown, 1);
     // The card's rule, alone: at most five open in terminals, idle ones only in the room left (at most two), unknown ones (at most two).
     const order = devenv.cardOrder([
       { state: "idle", n: 1 }, { state: "live", n: 2 }, { state: "attached", n: 3 }, { state: "weird", n: 4 }, { state: "idle", n: 5 }, { state: "idle", n: 6 },

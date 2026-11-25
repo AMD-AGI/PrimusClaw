@@ -595,8 +595,8 @@ has none. With no session anywhere and one such agent, it is `attach_default`
 (`new_session: true`).
 
 When every machine is asked for, each machine lists the sessions the user's agents card (`/agents`)
-shows of it, in its order: under each agent of an online machine the conversations open in a
-terminal (at most five among its twelve newest), then idle ones in the room left (at most two),
+shows of it, in its order: under each of the first six agents of online machines (all machines
+counted) the conversations open in a terminal (at most five among its twelve newest), then idle ones in the room left (at most two),
 then ones the connector cannot tell (at most two); and the five newest sessions open through Claw
 of all machines. The rest are counted (`session_count`, `sessions_by_state`, `sessions_not_shown`)
 and listed when that machine is asked for by name, marked `not_on_agents_card`.
@@ -730,7 +730,8 @@ A seat is called what its sessions are called on the user's machine: the titles 
 latest conversation, each one line of at most 40 characters with control characters removed. Those are the machine's words, so they
 are never in the roster: the seat cards (`seat_set`, a guess, a task) show them, beside the alias the user gave the seat when it has
 one, and Claw compares them with the user's words when they name a seat that way (`seat_roster` and `seat_set` with `name`, whole
-names before parts of them). A task still goes only to a `seat_id`.
+names before parts of them). A name the user's message does not hold was read from what a machine wrote: `seat_roster` then marks
+the turn as having read untrusted text, and `seat_set` refuses it (`name_not_said`). A task still goes only to a `seat_id`.
 
 The connector reports each folder's git remote and branch in its heartbeat (`workspaces`, agent capability `git_info`), read from
 the files git keeps (never by running git) and normalized on the machine and again by Claw: `host/owner/repo` with no user or

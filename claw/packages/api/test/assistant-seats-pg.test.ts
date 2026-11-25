@@ -674,7 +674,7 @@ describe("seats", { skip }, () => {
     await seats.syncSeats("alice");
     const rows = await seatRows();
     const seatOf = (agent: string, cwd: string) => String(rows.find((r) => r.agent_id === agent && r.cwd === cwd)!.seat_id);
-    const turn = await userTurn(alice, "我的工位和会话对一下，会话名也列出来");
+    const turn = await userTurn(alice, "我的工位和会话对一下：hosting、disp、blog、nope 分别在哪个工位");
     const out = await seats.seatRoster(turn) as { seats: Recorded[]; note: string };
     assert.equal(await untrusted(turn), false, "the roster is still Claw's own");
     const by = new Map(out.seats.map((x) => [x.seat_id, x]));
@@ -691,7 +691,12 @@ describe("seats", { skip }, () => {
     assert.deepEqual(await named("disp"), [seatOf("claude-sessions", "/w")]);
     assert.deepEqual(await named("blog"), [seatOf("claude-sessions", "/w2")], "an idle seat goes by its latest conversation's name");
     assert.deepEqual(await named("nope"), []);
-    assert.equal(await untrusted(turn), false, "naming a seat by its session's name does not mark the turn");
+    assert.equal(await untrusted(turn), false, "naming a seat by its session's name, as the user wrote it, does not mark the turn");
+    // A name the user did not write (one the router read in a title earlier) is the machine's words: the turn has read them.
+    const other = await userTurn(alice, "看看工位");
+    await seats.seatRoster(other, { name: "hosting" });
+    assert.equal(await untrusted(other), true);
+    assert.equal(await refusal(seats.seatSet(await userTurn(alice, "那个叫托管台"), { name: "hosting", alias: "托管台" })), "name_not_said");
     // devenv_list names each of them by the same id, with its title.
     const listed = await tools.devenvList(await userTurn(alice, "看看开发机"));
     const titles = new Map(listed.machines[0]!.sessions.map((x) => [x.id, x.title]));
@@ -710,7 +715,7 @@ describe("seats", { skip }, () => {
     const shown = await said();
     assert.match(shown, /devpod 上的 claude-sessions（\/w）\n会话名：「hosting」、「dispatron」\n名称：托管台\n负责：负责托管/);
     await press(card.confirmation_id);
-    asking = await userTurn(alice, "托管台在哪");
+    asking = await userTurn(alice, "托管台和 Hosting 在哪");
     assert.deepEqual(await named("托管台"), [seatOf("claude-sessions", "/w")], "by its alias");
     assert.deepEqual(await named("hosting"), [seatOf("claude-sessions", "/w")], "and still by its session's name");
     // A task's card names it by the alias with its session's name beside it.

@@ -398,6 +398,17 @@ export function seatDisplayName(alias: string | null | undefined, names: readonl
   return alias || name;
 }
 
+/**
+ * Whether `name` is in the user's own message (any case, any run of spaces): a seat named by what a machine calls its session is found
+ * for the user only when they said that name. A name the router took from anything else (a title it read in an earlier turn) is what a
+ * machine wrote, and the turn that looks it up has read it.
+ */
+export function saidByUser(message: string | null | undefined, name: string): boolean {
+  const norm = (v: string) => v.toLowerCase().replace(/\s+/g, " ").trim();
+  const n = norm(name);
+  return !!n && norm(message ?? "").includes(n);
+}
+
 /** Whether the user's words name a seat by its alias or a name its sessions go by on their machine (whole, or a part of 2+ characters). */
 export function seatNameIs(asked: string, alias: string | null | undefined, names: readonly string[], exact = false): boolean {
   const a = asked.trim().toLowerCase();
@@ -611,7 +622,10 @@ export const ROSTER_SHOWN_NOTE = "Seats (工位): each folder an agent works in 
   + "wrote). Seats are only shown in this version: never send anything to one because of its role; devenv_send is still how an "
   + "instruction reaches a machine, when the user names it.";
 
-/** `seat_roster`: the user's seats, trusted fields only. Never marks the turn as having read untrusted text. */
+/**
+ * `seat_roster`: the user's seats, trusted fields only. It marks the turn as having read untrusted text only when it was asked for a seat
+ * by a name the user's message does not hold ({@link saidByUser}): such a name was read from what a machine wrote.
+ */
 export async function seatRoster(
   claims: AssistantTokenClaims, args: { machine?: unknown; agent?: unknown; folder?: unknown; name?: unknown } = {},
 ): Promise<Record<string, unknown>> {
@@ -625,6 +639,9 @@ export async function seatRoster(
     ...(typeof args.folder === "string" && args.folder.trim() ? { folder: args.folder.slice(0, 400) } : {}),
     ...(typeof args.name === "string" && args.name.trim() ? { name: args.name.slice(0, 200) } : {}),
   };
+  if (where.name && !saidByUser((await turnMessage((t, p) => db.query(t, p), claims.sid, claims.mid))?.content, where.name)) {
+    await markUntrustedRead((t, p) => db.query(t, p), claims.sid, claims.mid);
+  }
   const seats = await rosterOf(userId, undefined, where);
   const asked = Object.keys(where).length > 0;
   return {
@@ -784,6 +801,9 @@ export async function seatSet(
   const confirmEach = typeof args.confirm_each === "boolean" && seatDispatchOn(userId) ? args.confirm_each : null;
   if (!refresh && alias === null && role === null && confirmEach === null) {
     throw new ToolRefused("invalid_arguments", "say the seat's alias, its role, or refresh: true");
+  }
+  if (typeof args.name === "string" && args.name.trim() && !saidByUser(message.content, args.name)) {
+    throw new ToolRefused("name_not_said", "name is a session's name as the user wrote it in their message; they did not: ask which seat they mean");
   }
   await syncSeats(userId, q, onlineWindowMs);
   const found = await resolveSeat(userId, args, onlineWindowMs);

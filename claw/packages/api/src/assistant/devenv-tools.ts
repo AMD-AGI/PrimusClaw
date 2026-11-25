@@ -603,7 +603,7 @@ export function compactMachines(machines: readonly DevenvMachine[]): DevenvMachi
 
 /**
  * What the agents card (`/agents`, personal-agent `remote-view/agents-view.ts` and `conversations-view.ts`) lists, so that the router
- * lists the same sessions in the same order: under each online agent the first {@link CARD_RESUMABLE_READ} of its conversations as the
+ * lists the same sessions in the same order: under each of the first {@link CARD_AGENT_BLOCKS} online agents the first {@link CARD_RESUMABLE_READ} of its conversations as the
  * machine reported them (newest first), none it holds for a session (`attached`), those open in a terminal first (at most
  * {@link CARD_RESUMABLE_SHOWN}), then the ones no process runs (at most {@link CARD_IDLE_SHOWN}, within the same five), then those it
  * cannot tell (at most {@link CARD_UNKNOWN_SHOWN}); and, under "your sessions", the {@link CARD_SESSIONS_SHOWN} newest open through Claw.
@@ -613,6 +613,8 @@ export const CARD_RESUMABLE_SHOWN = 5;
 export const CARD_IDLE_SHOWN = 2;
 export const CARD_UNKNOWN_SHOWN = 2;
 export const CARD_SESSIONS_SHOWN = 5;
+/** The card shows the conversations of at most this many online agents, of all machines, in order; the others it only counts. */
+export const CARD_AGENT_BLOCKS = 6;
 
 /** One agent's conversations in the agents card's order, each with whether the card shows it. Pure, for the tests. */
 export function cardOrder<T extends { state: string }>(conversations: readonly T[]): Array<{ c: T; shown: boolean }> {
@@ -758,6 +760,8 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
   const machines: DevenvMachine[] = [];
   const attachable: Attachable[] = [];
   const onlineConnectors = connectors.filter((c) => c.online === true);
+  // The card shows the conversations of the first CARD_AGENT_BLOCKS online agents of all machines (in this order), and only names the rest.
+  let blocks = 0;
   for (const c of connectors) {
     const machine = shown(c.name, NAME_MAX);
     const machineLabel = machine && !machine.includes("/") ? machine : `machine-${String(c.connector_id).slice(0, 8)}`;
@@ -775,6 +779,8 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
     // ("attached" ones are), in the card's order (it lists none of an offline machine's); then, under "your sessions", the sessions open
     // through Claw, newest activity first (the card lists the newest few of all machines').
     for (const a of agents) {
+      const block = online && blocks < CARD_AGENT_BLOCKS;
+      if (online) blocks += 1;
       const newest = resumableOf(a).sort((x, y) => (y.updated_at ?? "").localeCompare(x.updated_at ?? ""));
       for (const { c: r, shown: carded } of cardOrder(newest)) {
         const inTerminal = r.state === "live";
@@ -788,7 +794,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
           ref: can ? r.ref : null, attach_command: can ? attachCommand(r.ref) : null,
           ...(can ? {} : { why_not: !online ? "the machine is offline" : "it is open in a terminal on that machine; only the terminal can use it now" }),
           ...(can && inTerminal ? (r.typed ? { typed_into_terminal: true as const, note: TYPED_NOTE } : { read_only: true as const, note: READ_ONLY_NOTE }) : {}),
-          ...(carded && online ? {} : { not_on_agents_card: true as const }),
+          ...(carded && block ? {} : { not_on_agents_card: true as const }),
           ...seatOf(String(c.connector_id), String(a.agent_id), r.cwd),
         };
         if (inTerminal && r.terminal_state) row.terminal_state = r.terminal_state;
