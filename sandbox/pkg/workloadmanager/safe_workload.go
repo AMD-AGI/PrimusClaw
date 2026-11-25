@@ -27,6 +27,7 @@ import (
 
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	"sigs.k8s.io/agent-sandbox/pkg/sandboxlayer"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -79,6 +80,11 @@ const (
 	// signingSecretFinalizer makes deletion wait until the mirrored copy is removed.
 	signingSecretFinalizer = "primus-safe/secret.finalizer"
 )
+
+// useWorkspaceStorageAnnotation "false" makes SaFE mount none of the
+// workspace's volumes into the Workload's pods; SaFE sets it to "true" when a
+// Workload is created without it.
+const useWorkspaceStorageAnnotation = "primus-safe.workload.use.workspace.storage"
 
 // secretGVR is a namespace-scoped Secret. The signing key lives in primus-safe.
 var secretGVR = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
@@ -900,8 +906,19 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	if len(env) > 0 {
 		spec["env"] = env
 	}
-	if paths := templateHostPaths(ci.Spec.Template); len(paths) > 0 {
+	paths := templateHostPaths(ci.Spec.Template)
+	if len(paths) > 0 {
 		spec["hostpath"] = paths
+	}
+	// A grant template's hostPath volumes are read-only views of the
+	// workspace's storage, which the grant service accepts only with the
+	// workspace's storage off. A template that reaches here with hostPath
+	// volumes and the storage on (for example one stored before the
+	// CodeInterpreter schema kept useWorkspaceStorage, which would have
+	// dropped it) is refused rather than created with a read-write parent
+	// over its read-only mounts.
+	if len(paths) > 0 && grantTemplate(ci) && !ci.Spec.Template.WorkspaceStorageOff() {
+		return nil, fmt.Errorf("template %s mounts host paths with its workspace's storage on; a grant template's host paths need useWorkspaceStorage: false", req.TemplateID)
 	}
 	if nodes := strings.TrimSpace(req.AvoidNodes); nodes != "" {
 		spec["customerLabels"] = map[string]any{"excluded-nodes": nodes}
@@ -924,6 +941,9 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 		labels[ownerKeyLabel] = "true"
 	}
 	annotations := map[string]any{}
+	if ci.Spec.Template.WorkspaceStorageOff() {
+		annotations[useWorkspaceStorageAnnotation] = "false"
+	}
 	if req.UserName != "" {
 		annotations[safeUserNameAnnotation] = req.UserName
 	}
@@ -1069,6 +1089,17 @@ func applyTemplateRuntime(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate, 
 	if script := strings.Join(steps, " && "); script != "" {
 		env[startupEnv] = script
 	}
+}
+
+// grantTemplate reports whether ci was registered for one grant, whose
+// templates the grant service holds to its mount rules; the owner policy's
+// templates are an administrator's and are not.
+func grantTemplate(ci *runtimev1alpha1.CodeInterpreter) bool {
+	id := ci.Labels[grantIDLabel]
+	if id == "" {
+		id = ci.Annotations[grantIDLabel]
+	}
+	return id != "" && id != grant.OwnerTemplatesID
 }
 
 // templateHostPaths returns host paths SaFE mounts at the same path.

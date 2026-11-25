@@ -13,8 +13,9 @@ import (
 )
 
 // mountSpec is a template spec as an application platform renders a read-only
-// host directory: a hostPath volume and a read-only mount at the same path.
-const mountSpec = `{"fromImage":"example@sha256:` + "0000000000000000000000000000000000000000000000000000000000000000" + `",
+// host directory: a hostPath volume and a read-only mount at the same path, in
+// a template without its workspace's storage.
+const mountSpec = `{"fromImage":"example@sha256:` + "0000000000000000000000000000000000000000000000000000000000000000" + `","useWorkspaceStorage":false,
  "volumes":[{"name":"template-mount-0","hostPath":{"path":"/shared/team/cache","type":"Directory"}}],
  "volumeMounts":[{"name":"template-mount-0","mountPath":"/shared/team/cache","readOnly":true}]}`
 
@@ -47,6 +48,42 @@ func TestTemplateMountReachesTheTemplateReadOnly(t *testing.T) {
 	m := tmpl.VolumeMounts[0]
 	if m.MountPath != "/shared/team/cache" || m.ReadOnly == nil || !*m.ReadOnly {
 		t.Fatalf("mount=%+v readOnly=%v", m, m.ReadOnly)
+	}
+	if !tmpl.WorkspaceStorageOff() {
+		t.Fatalf("useWorkspaceStorage=%v, want false on the registered template", tmpl.UseWorkspaceStorage)
+	}
+}
+
+// A host directory is read-only only in a sandbox that does not also mount its
+// workspace's storage, which is read-write and holds the directory: a template
+// with a hostPath volume must turn the storage off, where Agent Sandbox reads
+// the template (the nested template when it carries the image).
+func TestTemplateMountsNeedTheWorkspaceStorageOff(t *testing.T) {
+	img := `"fromImage":"example@sha256:` + strings.Repeat("0", 64) + `"`
+	vol := `"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c","readOnly":true}]`
+	refused := map[string]string{
+		"storage left out":        `{` + img + `,` + vol + `}`,
+		"storage on":              `{` + img + `,"useWorkspaceStorage":true,` + vol + `}`,
+		"off beside the template": `{"useWorkspaceStorage":false,"template":{` + img + `,` + vol + `}}`,
+		"nested, storage on":      `{"template":{` + img + `,"useWorkspaceStorage":true,` + vol + `}}`,
+	}
+	for name, spec := range refused {
+		err := validateTemplateMounts(grantTemplate(spec))
+		if err == nil || !strings.Contains(err.Error(), "useWorkspaceStorage: false") {
+			t.Errorf("%s: err=%v", name, err)
+		}
+	}
+	accepted := []string{
+		`{` + img + `,"useWorkspaceStorage":false,` + vol + `}`,
+		`{"template":{` + img + `,"useWorkspaceStorage":false,` + vol + `}}`,
+		// Without host directories the storage is the template's own choice.
+		`{` + img + `,"useWorkspaceStorage":true}`,
+		`{` + img + `,"useWorkspaceStorage":false}`,
+	}
+	for _, spec := range accepted {
+		if err := validateTemplateMounts(grantTemplate(spec)); err != nil {
+			t.Errorf("%q: %v", spec, err)
+		}
 	}
 }
 
@@ -81,7 +118,7 @@ func TestTemplateMountsRefused(t *testing.T) {
 	// another source is not this check's, and neither is a template without
 	// volumes or without an image.
 	ok := []string{
-		`{` + img + `,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"}]}`,
+		`{` + img + `,"useWorkspaceStorage":false,"volumes":[{"name":"v","hostPath":{"path":"/shared/c"}}],"volumeMounts":[{"name":"v","mountPath":"/shared/c"}]}`,
 		`{` + img + `,"volumes":[{"name":"s","emptyDir":{}}],"volumeMounts":[{"name":"s","mountPath":"/scratch","readOnly":false}],"sidecars":[{"name":"c","image":"i","volumeMounts":[{"name":"s","mountPath":"/scratch"}]}]}`,
 		`{` + img + `,"volumes":[{"name":"c","configMap":{"name":"cfg"}}],"volumeMounts":[{"name":"c","mountPath":"/config"}]}`,
 		`{` + img + `}`,

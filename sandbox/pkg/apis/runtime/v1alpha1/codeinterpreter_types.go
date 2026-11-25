@@ -170,6 +170,22 @@ type CodeInterpreterSandboxTemplate struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=4
 	Layers []SandboxLayer `json:"layers,omitempty"`
+
+	// UseWorkspaceStorage false creates the sandbox without its workspace's
+	// storage: SaFE mounts none of the workspace's volumes (the Workload's
+	// use.workspace.storage is false), so the sandbox reaches only the host
+	// paths of its own hostPath volumes. Left out or true, the workspace's
+	// storage is mounted as SaFE mounts it for every workload. A hostPath
+	// volume of a grant template is read-only protection only with false: the
+	// workspace mounts its storage read-write, so a read-only mount beneath it
+	// could be written through its parent.
+	// +optional
+	UseWorkspaceStorage *bool `json:"useWorkspaceStorage,omitempty"`
+}
+
+// WorkspaceStorageOff reports whether the template turns its workspace's storage off.
+func (t *CodeInterpreterSandboxTemplate) WorkspaceStorageOff() bool {
+	return t != nil && t.UseWorkspaceStorage != nil && !*t.UseWorkspaceStorage
 }
 
 // SandboxLayer is one image whose directory is copied into the sandbox.

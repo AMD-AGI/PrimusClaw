@@ -14,11 +14,20 @@
  *
  * What a mount may name, and why:
  *
- *  - Only `readOnly: true`. The workspace already mounts its storage into every
- *    sandbox it runs, read-write where the workspace says so, so a read-write
- *    template mount would add nothing a sandbox lacks; and the sandbox workload
- *    mounts every host path it is given read-only anyway, so `readOnly: false`
- *    would be a promise the platform does not keep.
+ *  - A template with mounts must set `useWorkspaceStorage: false` where Agent
+ *    Sandbox reads it (the nested `template` when that carries the image,
+ *    else the template itself), so the sandbox is created without its
+ *    workspace's storage. Every path a mount may name lies under a directory
+ *    the workspace mounts into its sandboxes, read-write where it allows
+ *    writes: with that mount in the sandbox, the directory stays writable
+ *    through its parent and a read-only mount beneath it protects nothing,
+ *    and the sandbox platform's pod admission refuses a mount point beneath
+ *    a writable workspace mount (what is written there could redirect it). A
+ *    template author is never left believing a directory is read-only when it
+ *    is not.
+ *  - Only `readOnly: true`: the sandbox workload mounts every host path it is
+ *    given read-only, so `readOnly: false` would be a promise the platform
+ *    does not keep.
  *  - `mountPath` is the `hostPath` itself (it may be left out). The sandbox
  *    workload mounts a host path at the same path in the container and has no
  *    field for another one, so a different `mountPath` would be ignored.
@@ -62,16 +71,6 @@
  * service checks the decoded template as well (hostPath volumes read-only,
  * at their own path, outside the system directories).
  *
- * Mount order. A template mount is usually nested inside a workspace mount
- * (workspace `/shared` read-write, template `/shared/team/cache` read-only),
- * and the nested mount only wins when it is applied after its parent. No
- * layer here relies on the order the mounts are listed in: the sandbox
- * platform sorts a pod's host-path mounts by depth (parents first) before the
- * pod is made, Kubernetes' CRI runtimes (containerd, CRI-O) sort a
- * container's mounts by the number of path components, the Docker daemon
- * sorts them by destination depth (`SortMounts`), and Apptainer sorts user
- * binds (`--bind`) by destination depth and applies `ro` with a read-only
- * remount of the bind. The kubelet itself passes `volumeMounts` in list order.
  */
 import type { AppManifestIssue } from "./app-manifest.js";
 
@@ -87,6 +86,12 @@ export interface AppTemplateMount {
   readOnly: true;
 }
 
+/**
+ * Agent Sandbox's template key that, set to `false`, creates the sandbox
+ * without its workspace's storage; a template with `host_mounts` must set it so.
+ */
+export const WORKSPACE_STORAGE_KEY = "useWorkspaceStorage";
+
 /** Agent Sandbox's own volume keys of a template; its `volumes` may not be hostPath ones. */
 export const TEMPLATE_RAW_VOLUME_KEYS = ["volumes", "volumeMounts"] as const;
 
@@ -101,7 +106,9 @@ export const TEMPLATE_MOUNT_VOLUME_PREFIX = "template-mount-";
  * here. Keys are ASCII ({@link keyIssues}), so an ASCII case-insensitive
  * comparison is the decoder's own.
  */
-const EXACT_KEYS = ["template", "fromImage", "image", "workspace", "resources", "gpu", ...TEMPLATE_RAW_VOLUME_KEYS] as const;
+const EXACT_KEYS = [
+  "template", "fromImage", "image", "workspace", "resources", "gpu", WORKSPACE_STORAGE_KEY, ...TEMPLATE_RAW_VOLUME_KEYS,
+] as const;
 
 /** Keys below a template object's `resources` and `gpu` that launch overrides write. */
 const EXACT_SUB_KEYS: Readonly<Record<string, readonly string[]>> = { resources: ["requests", "limits"], gpu: ["sharedMemory"] };
@@ -177,7 +184,7 @@ export function templateMountIssues(template: Record<string, unknown>, at: strin
     }
     for (const k of Object.keys(m)) if (!MOUNT_KEYS.has(k)) bad(`${mat}.${k}`, "unknown key (expected hostPath, mountPath or readOnly)");
     if (m.readOnly !== true) {
-      bad(`${mat}.readOnly`, "must be true: the workspace already mounts its storage read-write where it allows writes, and a sandbox's host paths are mounted read-only");
+      bad(`${mat}.readOnly`, "must be true: a sandbox's host paths are mounted read-only");
     }
     if (typeof m.hostPath !== "string") {
       bad(`${mat}.hostPath`, "must be a string");
@@ -196,7 +203,29 @@ export function templateMountIssues(template: Record<string, unknown>, at: strin
     if (seen.has(m.hostPath)) bad(`${mat}.hostPath`, `${m.hostPath} is mounted twice`);
     seen.add(m.hostPath);
   });
+  if (mounts.length > 0) {
+    const target = agentSandboxTemplate(template);
+    if (target[WORKSPACE_STORAGE_KEY] !== false) {
+      bad(
+        target === template ? `${at}.${WORKSPACE_STORAGE_KEY}` : `${at}.template.${WORKSPACE_STORAGE_KEY}`,
+        "must be false in a template with host_mounts: with its workspace's storage mounted, a sandbox could write a " +
+          "host_mounts directory through the workspace's read-write mount of its parent, and the sandbox platform refuses " +
+          "a mount beneath a writable workspace mount",
+      );
+    }
+  }
   return issues;
+}
+
+/**
+ * The template object Agent Sandbox takes the container from (templateFromSpec):
+ * the nested `template` when its `fromImage` is set, else the template itself,
+ * each key read as its decoder reads it.
+ */
+function agentSandboxTemplate(template: Record<string, unknown>): Record<string, unknown> {
+  const inner = foldedValue(template, "template");
+  const fromImage = isObj(inner) ? foldedValue(inner, "fromImage") : undefined;
+  return isObj(inner) && typeof fromImage === "string" && fromImage !== "" ? inner : template;
 }
 
 /** Whether `key` is ASCII only. */
@@ -319,12 +348,8 @@ export function renderTemplateMounts(template: Record<string, unknown>): Record<
     volumes: [...(Array.isArray(target.volumes) ? target.volumes : []), ...volumes],
     volumeMounts: [...(Array.isArray(target.volumeMounts) ? target.volumeMounts : []), ...volumeMounts],
   });
-  // Selected as Agent Sandbox selects it (templateFromSpec): the nested
-  // template when its fromImage is set, each key read as its decoder reads it.
-  const inner = foldedValue(rest, "template");
-  const fromImage = isObj(inner) ? foldedValue(inner, "fromImage") : undefined;
-  if (isObj(inner) && typeof fromImage === "string" && fromImage !== "") return { ...rest, template: merged(inner) };
-  return merged(rest);
+  const target = agentSandboxTemplate(rest);
+  return target === rest ? merged(rest) : { ...rest, template: merged(target) };
 }
 
 /** A directory a workspace volume declares for sandboxes, as the sandbox platform reads it. */
