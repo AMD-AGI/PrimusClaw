@@ -89,16 +89,13 @@ func TestWorkloadObjectNodePreferences(t *testing.T) {
 			} else if affinity != nodesAffinityPreferred {
 				t.Fatalf("annotations=%v, want preferred", obj.GetAnnotations())
 			}
-			if got := workloadPreferredNodes(obj); got != stringOr(tc.labels["specified-nodes"]) {
+			// The Workload records the template's whole preference, avoided
+			// names included, for the preferred-node metadata.
+			if got := workloadPreferredNodes(obj); got != strings.Join(tc.preferred, " ") {
 				t.Fatalf("workloadPreferredNodes=%q", got)
 			}
 		})
 	}
-}
-
-func stringOr(v any) string {
-	s, _ := v.(string)
-	return s
 }
 
 // A template stored with invalid preferredNodes (outside the API) makes no Workload.
@@ -109,6 +106,7 @@ func TestWorkloadObjectRefusesInvalidPreferredNodes(t *testing.T) {
 		"twice":  {"node-a", "node-a"},
 		"upper":  {"Node-A"},
 		"nine":   {"n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9"},
+		"label":  {strings.Repeat("a", 64) + ".example"},
 		"spaces": {" node-a"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -140,8 +138,8 @@ func TestValidateTemplateRequestPreferredNodes(t *testing.T) {
 	}
 }
 
-// Observe reports the specified-nodes of a running Workload, so a sandbox
-// adopted after a restart is marked like one created in this process.
+// Observe reports the preferred nodes recorded on a running Workload, so a
+// sandbox adopted after a restart is marked like one created in this process.
 func TestObserveReportsPreferredNodes(t *testing.T) {
 	const name = "sbx-remote"
 	dc := dynfake.NewSimpleDynamicClientWithCustomListKinds(k8sruntime.NewScheme(), map[schema.GroupVersionResource]string{
@@ -151,8 +149,9 @@ func TestObserveReportsPreferredNodes(t *testing.T) {
 		"apiVersion": "amd.com/v1",
 		"kind":       "Workload",
 		"metadata": map[string]any{
-			"name":   name,
-			"labels": map[string]any{safeClusterIDLabel: "cluster-a"},
+			"name":        name,
+			"labels":      map[string]any{safeClusterIDLabel: "cluster-a"},
+			"annotations": map[string]any{preferredNodesAnnotation: "node-a node-b node-c"},
 		},
 		"spec": map[string]any{
 			"workspace":      "ws-a",
@@ -169,7 +168,7 @@ func TestObserveReportsPreferredNodes(t *testing.T) {
 	creator := NewSafeWorkloadCreator(dc, nil)
 	creator.SetRemoteClusters([]string{"cluster-a"})
 	result, phase, err := creator.Observe(context.Background(), name)
-	if err != nil || phase != e2b.WorkloadRunning || result.NodeName != "node-b" || result.PreferredNodes != "node-a node-b" {
+	if err != nil || phase != e2b.WorkloadRunning || result.NodeName != "node-b" || result.PreferredNodes != "node-a node-b node-c" {
 		t.Fatalf("result=%+v phase=%q err=%v", result, phase, err)
 	}
 }

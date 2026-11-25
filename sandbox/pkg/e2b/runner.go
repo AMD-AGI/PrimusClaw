@@ -58,8 +58,9 @@ type CreateResult struct {
 	Cluster string
 	// Failure is the failure text of a finished Workload, when known.
 	Failure string
-	// PreferredNodes are the nodes the Workload prefers, space-separated,
-	// or "" when it prefers none.
+	// PreferredNodes are the nodes the sandbox's template prefers,
+	// space-separated (including any the create also avoided), or "" when it
+	// prefers none.
 	PreferredNodes string
 }
 

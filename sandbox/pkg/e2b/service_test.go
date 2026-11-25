@@ -746,8 +746,8 @@ func TestPreferredNodeMarksTheLanding(t *testing.T) {
 	}
 }
 
-// A sandbox adopted from a running Workload is marked from the Workload's
-// specified-nodes, like one created in this process.
+// A sandbox adopted from a running Workload is marked from the preferred
+// nodes recorded on the Workload, like one created in this process.
 func TestReplayMarksAPreferredNode(t *testing.T) {
 	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
 	runner.started = make(chan struct{})

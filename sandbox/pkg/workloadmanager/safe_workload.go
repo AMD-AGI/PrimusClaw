@@ -55,8 +55,11 @@ const (
 	specifiedNodesLabel = "specified-nodes"
 	// nodesAffinityAnnotation asks SaFE to treat specified-nodes and
 	// excluded-nodes as preferences rather than requirements.
-	nodesAffinityAnnotation  = "primus-safe.nodes.affinity"
-	nodesAffinityPreferred   = "preferred"
+	nodesAffinityAnnotation = "primus-safe.nodes.affinity"
+	nodesAffinityPreferred  = "preferred"
+	// preferredNodesAnnotation records the template's preferredNodes on the
+	// Workload, space-separated, before avoid-nodes are removed from them.
+	preferredNodesAnnotation = "agent-sandbox.io/preferred-nodes"
 	workloadEphemeralStorage = "50Gi"
 	workloadPriority         = int64(2)
 	workloadTTLSeconds       = int64(10)
@@ -958,6 +961,9 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	if avoid != "" || preferred != "" {
 		annotations[nodesAffinityAnnotation] = nodesAffinityPreferred
 	}
+	if len(ci.Spec.Template.PreferredNodes) > 0 {
+		annotations[preferredNodesAnnotation] = strings.Join(ci.Spec.Template.PreferredNodes, " ")
+	}
 	layers, err := sandboxlayer.Resolve(ci.Spec.Template.Layers, sandboxlayer.TemplateMounts(ci.Spec.Template))
 	if err != nil {
 		return nil, fmt.Errorf("template %s: %w", req.TemplateID, err)
@@ -981,10 +987,10 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 }
 
 // ephemeralStorage returns the template pod storage, or the default when unset.
-// workloadPreferredNodes reads the specified-nodes customer label of a Workload.
+// workloadPreferredNodes reads the template's preferred nodes recorded on a
+// Workload, including any the create also avoided.
 func workloadPreferredNodes(obj *unstructured.Unstructured) string {
-	nodes, _, _ := unstructured.NestedString(obj.Object, "spec", "customerLabels", specifiedNodesLabel)
-	return nodes
+	return obj.GetAnnotations()[preferredNodesAnnotation]
 }
 
 // preferredNodes is the specified-nodes value for a template's preferred
