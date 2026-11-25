@@ -26,7 +26,7 @@ import { approvalPolicyFromMcp } from "./approval-policy.js";
 import { decisionWaitMs, HitlController } from "./hitl.js";
 import { bashApprovalFromEnvValue, bashApprovalPolicyFrom } from "./bash-approval.js";
 import { DecisionDispatcher } from "../delivery/decision-dispatcher.js";
-import { connectPlatformMcp, mcpUnavailableNote } from "../clients/mcp.js";
+import { connectPlatformMcp, mcpUnavailableNote, trustsIdempotentHint } from "../clients/mcp.js";
 import { MCP_POOL_DEFAULTS, McpConnectionPool } from "../clients/mcp-pool.js";
 import { buildPrompt, buildProgressiveSkillHint, buildSkillAndMcpHints, listProgressiveSkills, renderSystemHints } from "./prompt.js";
 import { loadPromptImages, promptContent } from "./prompt-images.js";
@@ -97,6 +97,26 @@ export function streamTextAs(raw: unknown): string | undefined {
  */
 export function webToolClientHeaders(): Record<string, string> {
   return {};
+}
+
+/**
+ * The servers a turn cannot work without, waited for up to MCP_REQUIRED_CONNECT_BUDGET_MS instead of MCP_CONNECT_BUDGET_MS:
+ *
+ * - a review session's review tools (`github_review` in a turn that acts as a user, `actsAsUser`);
+ * - Claw's own assistant server (`assistant` at its internal path, written into every assistant turn by the API): the only way an
+ *   assistant turn speaks to the user (`say`) or hands work on (`review_start`, `work_start`). A turn that went on without it was
+ *   told the server was unavailable and could only tell the user the assistant service was unreachable, while the server
+ *   answered a moment later.
+ *
+ * Any other server, including one of either name in another turn or at another address, waits no longer than the rest.
+ */
+export function requiredMcpServers(servers: Record<string, Record<string, unknown>>, actsAsUser: boolean): string[] {
+  const required: string[] = [];
+  if (actsAsUser && REVIEW_SERVER_NAME in servers) required.push(REVIEW_SERVER_NAME);
+  for (const [name, spec] of Object.entries(servers)) {
+    if (typeof spec?.url === "string" && trustsIdempotentHint(name, spec.url)) required.push(name);
+  }
+  return required;
 }
 
 export class AgentEngine {
@@ -458,13 +478,16 @@ export class AgentEngine {
     // A review session's review tools are the exception (MCP_REQUIRED_CONNECT_BUDGET_MS): the API offers them only to a session that
     // acts as a user (`withhold_sandbox_keys`) to review one pull request, its turn can do nothing without them, and it has no next turn
     // to wait for (a cold connection past 2 s once ended a requested review with no tool call at all and woke the reviewer for it). A
-    // server of that name in any other turn waits no longer than the rest.
+    // server of that name in any other turn waits no longer than the rest. Claw's own assistant server is the other one: an assistant
+    // turn speaks to the user and hands work on only through it, so without it the turn can only tell the user the service is down
+    // (one connection that took 2.1 s once answered a review request with "the assistant service is unreachable", and the
+    // server was ready 0.1 s after the model was called).
     const mcpResult = Object.keys(mergedMcp).length > 0
       ? await connectPlatformMcp(mergedMcp, {
           pool: MCP_POOL_ENABLED ? mcpPool : undefined,
           userId: request.user_id,
           budgetMs: MCP_CONNECT_BUDGET_MS,
-          required: request.withhold_sandbox_keys === true && REVIEW_SERVER_NAME in mergedMcp ? [REVIEW_SERVER_NAME] : [],
+          required: requiredMcpServers(mergedMcp, request.withhold_sandbox_keys === true),
           requiredBudgetMs: MCP_REQUIRED_CONNECT_BUDGET_MS,
         })
       : { clients: new Map(), schemas: [], failed: [], deferred: [], closeAll: async () => {} };
@@ -607,7 +630,7 @@ export class AgentEngine {
         }
       }
       // A server still connecting is unavailable to this turn as much as one that is down, and the model has to know which tools it lacks.
-      const unavailable = mcpUnavailableNote([...mcpResult.failed, ...mcpResult.deferred]);
+      const unavailable = mcpUnavailableNote(mcpResult.failed, mcpResult.deferred);
       const promptText = unavailable ? `${fullPrompt}\n\n${unavailable}` : fullPrompt;
       // The pictures the person sent with this message, beside its words (an assistant's router turn: it has no sandbox to `read`
       // them in). Read from this session's own uploads, under the prefix the workspace sync files them at.
