@@ -4,7 +4,7 @@
 /** Whether the head commit is green: what counts, and what must never be read as green. */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateChecks, requiredContextsFromBranch, requiredContextsFromRules } from "../src/github-review/checks.js";
+import { evaluateChecks, latestCheckRuns, requiredContextsFromBranch, requiredContextsFromRules } from "../src/github-review/checks.js";
 
 const run = (name: string, status = "completed", conclusion: string | null = "success") => ({ name, status, conclusion });
 const base = { statuses: [], required: [], truncated: false };
@@ -32,6 +32,44 @@ test("every other conclusion is a failure, an unfinished run is pending, and nei
 test("the same name twice: the worse result stands", () => {
   const v = evaluateChecks({ ...base, checkRuns: [run("a", "completed", "success"), run("a", "completed", "failure")] });
   assert.equal(v.green, false);
+});
+
+/** A review of 2026-11-25: each check ran twice on the head, the older run CANCELLED by the newer one. */
+const SUPERSEDED = [
+  { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "cancelled", app: "15368" },
+  { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app: "15368" },
+  { id: 45538768282, name: "code-metrics", status: "completed", conclusion: "success", app: "15368" },
+  { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app: "15368" },
+];
+
+test("only the latest run of each check counts: a run a later one superseded is not a failure", () => {
+  const v = evaluateChecks({ ...base, checkRuns: SUPERSEDED, required: ["code-metrics", "pr-hygiene"] });
+  assert.equal(v.green, true, v.reasons.join("; "));
+  assert.deepEqual([v.summary.failedNames, v.summary.passed, v.summary.total], [[], 2, 2]);
+  // Whatever order GitHub lists them in.
+  assert.equal(evaluateChecks({ ...base, checkRuns: [...SUPERSEDED].reverse() }).green, true);
+  assert.deepEqual(latestCheckRuns(SUPERSEDED).map((r) => r.id), [45538768282, 45538768384]);
+});
+
+test("a cancelled, failed or unfinished LATEST run is still not green, and an older success does not hide it", () => {
+  for (const [status, conclusion] of [["completed", "cancelled"], ["completed", "failure"], ["in_progress", null]] as const) {
+    const runs = [
+      { id: 100, name: "code-metrics", status: "completed", conclusion: "success", app: "15368" },
+      { id: 200, name: "code-metrics", status, conclusion, app: "15368" },
+    ];
+    const v = evaluateChecks({ ...base, checkRuns: runs });
+    assert.equal(v.green, false, String(conclusion));
+    assert.deepEqual(conclusion === null ? v.summary.pendingNames : v.summary.failedNames, ["code-metrics"], String(conclusion));
+  }
+});
+
+test("a check is its name and its app: another app's run of the same name is not superseded, and the worse one stands", () => {
+  const v = evaluateChecks({ ...base, checkRuns: [
+    { id: 1, name: "build", status: "completed", conclusion: "failure", app: "1" },
+    { id: 2, name: "build", status: "completed", conclusion: "success", app: "2" },
+  ] });
+  assert.equal(v.green, false);
+  assert.deepEqual(v.summary.failedNames, ["build"]);
 });
 
 test("commit statuses count too: success passes, pending waits, failure and error fail", () => {

@@ -23,7 +23,7 @@
 import { createHash } from "node:crypto";
 import pino from "pino";
 import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
-import { evaluateChecks, hasMergeQueueRule, requiredContextsFromBranch, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
+import { appOfRun, evaluateChecks, hasMergeQueueRule, requiredContextsFromBranch, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
 import { checkCoverage, coverageFiles, coverageText, type CoverageCheck } from "./coverage.js";
 import { commentableLines } from "./diff.js";
 import { bodyWithNotes, runFindingCheck, type Finding, type FindingCheckOutcome } from "./finding-check.js";
@@ -281,6 +281,8 @@ interface QueueEntry {
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 const FILE_PAGE = 100;
+/** Pages of a head commit's check runs read (100 each); more than that is `truncated`, and not green. */
+const MAX_CHECK_RUN_PAGES = 5;
 const MAX_REVIEW_COMMENTS = 30;
 const MAX_COMMENT_CHARS = 4000;
 const MAX_REVIEW_NOTES = 30;
@@ -1702,18 +1704,31 @@ export class GithubReview {
   /** CI on the pinned head commit: its check runs and statuses against what the base branch requires. */
   private async readChecks(ctx: Ctx, ref: PrRef, pr: PrInfo): Promise<ChecksVerdict> {
     const sha = pr.headSha;
-    const runs = await ctx.client.get<{ total_count?: number; check_runs?: Array<{ name?: string; status?: string; conclusion?: string | null }> }>(
-      repoPath(ref, `/commits/${sha}/check-runs`), { per_page: 100 },
-    );
+    // Every page: a workflow started twice on the head lists each of its jobs twice, and a check read on page 1 may have its latest run on page 2.
+    type Run = { id?: number; name?: string; status?: string; conclusion?: string | null; app?: { id?: number; slug?: string } | null };
+    const listed: Run[] = [];
+    let total = 0;
+    for (let page = 1; page <= MAX_CHECK_RUN_PAGES; page++) {
+      const got = (await ctx.client.get<{ total_count?: number; check_runs?: Run[] }>(
+        repoPath(ref, `/commits/${sha}/check-runs`), { per_page: 100, page },
+      )).json;
+      total = Number(got?.total_count ?? 0);
+      const list = Array.isArray(got?.check_runs) ? got.check_runs : [];
+      listed.push(...list);
+      if (list.length < 100 || listed.length >= total) break;
+    }
     const status = await ctx.client.get<{ total_count?: number; statuses?: Array<{ context?: string; state?: string }> }>(
       repoPath(ref, `/commits/${sha}/status`), { per_page: 100 },
     );
     const required = requiredContextsFromRules(await this.baseRules(ctx, ref, pr));
-    const checkRuns = (runs.json?.check_runs ?? []).map((c) => ({ name: String(c.name ?? ""), status: String(c.status ?? ""), conclusion: c.conclusion ?? null }));
+    const checkRuns = listed.map((c) => ({
+      name: String(c.name ?? ""), status: String(c.status ?? ""), conclusion: c.conclusion ?? null,
+      id: typeof c.id === "number" ? c.id : null, app: appOfRun(c),
+    }));
     const statuses = (status.json?.statuses ?? []).map((s) => ({ context: String(s.context ?? ""), state: String(s.state ?? "") }));
     const input = {
       checkRuns, statuses, required,
-      truncated: Number(runs.json?.total_count ?? 0) > checkRuns.length || Number(status.json?.total_count ?? 0) > statuses.length,
+      truncated: total > checkRuns.length || Number(status.json?.total_count ?? 0) > statuses.length,
     };
     const verdict = evaluateChecks(input);
     if (required === null || verdict.summary.failedNames.every((name) => required.includes(name))) return verdict;

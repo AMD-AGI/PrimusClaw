@@ -13,6 +13,36 @@ export interface CheckRunInput {
   name: string;
   status: string;
   conclusion: string | null;
+  /** GitHub's id of the run: a later run of the same check has a larger one. */
+  id?: number | null;
+  /** The app that reported the run (its id or slug), which with the name says which check it is. */
+  app?: string | null;
+}
+
+/** The app of a check run as GitHub answers it (`app.id`, else `app.slug`), for `latestCheckRuns`. */
+export function appOfRun(run: unknown): string | null {
+  const app = (run as { app?: { id?: unknown; slug?: unknown } | null } | null)?.app;
+  if (typeof app?.id === "number") return String(app.id);
+  return typeof app?.slug === "string" ? app.slug : null;
+}
+
+/**
+ * Only the latest run of each check counts, as GitHub's required checks read it: a check is its name and the app that reports it, and
+ * of its runs on the head the one with the largest id stands. A workflow started twice on the same head (a re-push, a base change) runs
+ * every job twice, and the concurrency group cancels the older run; that superseded CANCELLED run is not a failure of the head
+ * (2026-11-25: code-metrics and pr-hygiene, each one CANCELLED run and a later SUCCESS one, were called failing). A
+ * cancelled LATEST run is still not green. A run without an id is kept as it is, beside the others.
+ */
+export function latestCheckRuns<T extends CheckRunInput>(runs: readonly T[]): T[] {
+  const latest = new Map<string, T>();
+  for (const run of runs) {
+    if (typeof run.id !== "number" || !Number.isFinite(run.id)) continue;
+    const key = JSON.stringify([run.name, run.app ?? ""]);
+    const prior = latest.get(key);
+    if (prior === undefined || run.id > (prior.id as number)) latest.set(key, run);
+  }
+  const kept = new Set(latest.values());
+  return runs.filter((run) => typeof run.id !== "number" || !Number.isFinite(run.id) || kept.has(run));
 }
 
 export interface CommitStatusInput {
@@ -49,13 +79,14 @@ export function evaluateChecks(input: {
 }): ChecksVerdict {
   const reasons: string[] = [];
   const state = new Map<string, "pass" | "fail" | "pending">();
-  for (const run of input.checkRuns) {
+  for (const run of latestCheckRuns(input.checkRuns)) {
     // A run with a conclusion is finished whatever its status says: GitHub has been seen to keep a finished job's run at `in_progress`
     // with `conclusion: success` and a `completed_at` (PrimusClaw#712, 2026-11-11, run 130456274919), and a review then waited for ever on
     // "1 check(s) are not finished". A conclusion GitHub gives only for a finished run, so it is read as the run's result.
     const finished = run.status === "completed" || (run.conclusion !== null && run.conclusion !== "");
     const v = !finished ? "pending" : PASSING_CONCLUSIONS.has(run.conclusion ?? "") ? "pass" : "fail";
-    // The same name twice: the worse one stands, so a failure is never hidden by another job's success.
+    // The same name twice after the latest run of each check is taken (another app's check, or a run without an id): the worse one
+    // stands, so a failure is never hidden by another job's success.
     const prior = state.get(run.name);
     if (prior === undefined || rank(v) > rank(prior)) state.set(run.name, v);
   }

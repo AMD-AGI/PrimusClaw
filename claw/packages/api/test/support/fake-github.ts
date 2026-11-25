@@ -47,7 +47,7 @@ export class FakeGithub {
   files: FakeFile[] = [
     { filename: "src/app.ts", status: "modified", additions: 3, deletions: 1, patch: "@@ -1,4 +1,6 @@\n a\n-b\n+b2\n+c\n+d\n e\n f" },
   ];
-  checkRuns: Array<{ name: string; status: string; conclusion: string | null }> = [{ name: "test", status: "completed", conclusion: "success" }];
+  checkRuns: Array<{ name: string; status: string; conclusion: string | null; id?: number; app?: { id?: number; slug?: string } }> = [{ name: "test", status: "completed", conclusion: "success" }];
   statuses: Array<{ context: string; state: string }> = [];
   rules: unknown = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }];
   rulesStatus = 200;
@@ -165,7 +165,11 @@ export class FakeGithub {
       const page = Number(call.query.page ?? 1);
       return json(200, this.files.slice((page - 1) * per, page * per));
     }
-    if (/\/commits\/[0-9a-f]{40}\/check-runs$/.test(p)) return json(200, { total_count: this.checkRuns.length, check_runs: this.checkRuns });
+    if (/\/commits\/[0-9a-f]{40}\/check-runs$/.test(p)) {
+      const per = Number(call.query.per_page ?? 30);
+      const page = Number(call.query.page ?? 1);
+      return json(200, { total_count: this.checkRuns.length, check_runs: this.checkRuns.slice((page - 1) * per, page * per) });
+    }
     if (/\/commits\/[0-9a-f]{40}\/status$/.test(p)) return json(200, { total_count: this.statuses.length, state: "success", statuses: this.statuses });
     if (/^\/repos\/[^/]+\/[^/]+\/branches\/[^/]+$/.test(p)) return this.branchStatus === 200 ? json(200, this.branch) : json(this.branchStatus, { message: "nope" });
     if (/\/rules\/branches\//.test(p)) return this.rulesStatus === 200 ? json(200, this.rules) : json(this.rulesStatus, { message: "nope" });

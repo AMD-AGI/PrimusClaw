@@ -983,6 +983,24 @@ describe("assistant GitHub events", { skip }, () => {
     assert.ok(!(await events(it.itemId)).some((e) => e.kind === "check_failed"), "a run that was not read may still be running");
   });
 
+  test("F7b only the latest run of each check counts: a failed run a later run of the same check superseded is no CI failure", async () => {
+    const it = await watched();
+    const app = { id: 15368, slug: "github-actions" };
+    gh.s.checkRuns.push(
+      { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "failure", app, completed_at: gh.ago(0) },
+      { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app, completed_at: gh.ago(0) },
+      { id: 45538768282, name: "code-metrics", status: "completed", conclusion: "success", app, completed_at: gh.ago(0) },
+      { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app, completed_at: gh.ago(0) },
+    );
+    await poll();
+    assert.ok(!(await events(it.itemId)).some((e) => e.kind === "check_failed"), "the superseded failure is not the head's");
+    // The latest run of a check failing is.
+    gh.s.checkRuns.push({ id: 45538799999, name: "code-metrics", status: "completed", conclusion: "failure", app, completed_at: gh.ago(0) });
+    await poll();
+    const ci = (await events(it.itemId)).filter((e) => e.kind === "check_failed");
+    assert.deepEqual(ci.map((e) => e.body), ["1 of 2 check runs failed: run 45538799999 failure"]);
+  });
+
   test("W1 an answer the owner approved through the github tools is ours when read back; the owner's own words still reach the worker", async () => {
     const it = await watched({ reply: false });
     gh.comment("Could you add a test for the empty case?");

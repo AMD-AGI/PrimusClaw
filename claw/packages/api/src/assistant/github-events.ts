@@ -39,6 +39,7 @@ import { loadUserEnvSnapshot } from "../crypto/user-env.js";
 import { readGithubMcpSettings } from "../github-mcp/settings.js";
 import { resolveGithubToken, type ResolveBinding } from "../github-mcp/mcp.js";
 import { CLAW_WRITE_MARK } from "../github-mcp/tools.js";
+import { appOfRun, latestCheckRuns } from "../github-review/checks.js";
 import { GithubClient, GithubError, parsePrRef, repoPath, type PrRef } from "../github-review/github.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
@@ -634,7 +635,10 @@ export async function readPullRequestEvents(
   }
   const head = typeof pr.head?.sha === "string" ? pr.head.sha : null;
   if (head && pr.state === "open") {
-    const { runs, complete } = await checkRunsOf(gh, repoPath(r, `/commits/${encodeURIComponent(head)}/check-runs`));
+    const read = await checkRunsOf(gh, repoPath(r, `/commits/${encodeURIComponent(head)}/check-runs`));
+    const complete = read.complete;
+    // Only the latest run of each check, as the merge gate reads it (latestCheckRuns): a run a newer one superseded is not a failure.
+    const runs = latestCheckRuns(read.runs.map((c) => ({ ...c, name: String(c?.name ?? ""), app: appOfRun(c), id: typeof c?.id === "number" ? c.id : null })));
     // A head whose runs were not all read is not known to be finished: asked again at the next poll.
     const finished = complete && runs.length > 0 && runs.every((c) => c?.status === "completed");
     const failed = runs.filter((c) => FAILED_CONCLUSIONS.has(String(c?.conclusion)));
