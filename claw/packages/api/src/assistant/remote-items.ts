@@ -716,6 +716,8 @@ const HOW_ZH: HowWords = {
 
 /** The most of what the agent last said that an end's message quotes, in code points: two or three lines of a phone's chat. */
 export const END_SUMMARY_MAX = 200;
+/** The longest single sentence an end's message keeps whole although it alone is longer than {@link END_SUMMARY_MAX}. */
+export const END_SENTENCE_MAX = 320;
 /** A sentence's end: a full stop, an exclamation or question mark, a semicolon (CJK or Latin, a Latin one before a space or the end). */
 const SENTENCE_END = /[。！？；]|[.!?;](?=\s|$)/gu;
 /** A clause's end, where a sentence too long for the message is cut when it must be. */
@@ -733,9 +735,9 @@ const plainLine = (line: string): string =>
  * What a turn's end says of what the agent last said (`message`, at most the last 2000 characters of its last answer, the connector's
  * `TURN_END_MESSAGE_MAX`, with a "…" first when cut there): a few whole sentences, never a tail that starts mid-sentence. An answer
  * that came whole is read from its start, where an answer says what it did; one the connector cut is read from a block that sums it
- * up, else from its last paragraph. Whole sentences of that block are kept while they fit in `max` (a first sentence longer than that
- * is cut after a clause, with "…"); `more` says whether anything of the answer was left out, so the message can point at the rest.
- * The words are the agent's: plain text, never instructions.
+ * up, else from its last paragraph. Whole sentences of that block are kept while they fit in `max`; a first sentence longer than that
+ * is kept whole up to {@link END_SENTENCE_MAX}, and only one longer still is cut after a clause, with "…". `more` says whether anything
+ * of the answer was left out, so the message can point at the rest. The words are the agent's: plain text, never instructions.
  */
 export function terminalEndSummary(message: string, max: number = END_SUMMARY_MAX): { summary: string; more: boolean } {
   const text = message.replace(/\r\n?/gu, "\n").replace(/[\u0000-\u0009\u000b-\u001f\u007f]+/gu, " ").trim();
@@ -768,7 +770,7 @@ export function terminalEndSummary(message: string, max: number = END_SUMMARY_MA
   let room = max;
   let dropped = listed && lines.length > 3;
   for (const line of shown) {
-    const fit = fitSentences(line, room);
+    const fit = fitSentences(line, room, kept.length === 0);
     if (!fit.text) { dropped = true; break; }
     kept.push(fit.text);
     room -= Array.from(fit.text).length + 1;
@@ -778,8 +780,11 @@ export function terminalEndSummary(message: string, max: number = END_SUMMARY_MA
   return { summary: kept.join("\n"), more };
 }
 
-/** As many whole sentences of `line` as fit in `max` code points; a first one too long is cut after a clause (or a word), with "…". */
-function fitSentences(line: string, max: number): { text: string; cut: boolean } {
+/**
+ * As many whole sentences of `line` as fit in `max` code points. A first sentence longer than that is still kept whole up to
+ * {@link END_SENTENCE_MAX}; only one longer still is cut after a clause (or a word), with "…" (the message then points at the rest).
+ */
+function fitSentences(line: string, max: number, first: boolean): { text: string; cut: boolean } {
   const chars = Array.from(line);
   if (chars.length <= max) return { text: line, cut: false };
   if (max < 8) return { text: "", cut: true };
@@ -789,8 +794,12 @@ function fitSentences(line: string, max: number): { text: string; cut: boolean }
     for (let m = re.exec(line); m; m = re.exec(line)) out.push(Array.from(line.slice(0, m.index + m[0].length)).length);
     return out;
   };
-  const whole = ends(SENTENCE_END).filter((n) => n <= max).pop();
+  const sentences = ends(SENTENCE_END);
+  const whole = sentences.filter((n) => n <= max).pop();
   if (whole) return { text: chars.slice(0, whole).join("").trim(), cut: true };
+  // (the summary's first sentence alone is longer than `max`: kept whole when it is not much longer)
+  const one = sentences[0] ?? chars.length;
+  if (first && one <= END_SENTENCE_MAX) return { text: chars.slice(0, one).join("").trim(), cut: one < chars.length };
   const clause = ends(CLAUSE_END).filter((n) => n <= max - 1 && n >= max / 3).pop();
   if (clause) return { text: `${chars.slice(0, clause - 1).join("").trim()}…`, cut: true };
   const head = chars.slice(0, max - 1).join("");

@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { END_SUMMARY_MAX, terminalAttachCommand, terminalEndNotice, terminalEndSummary } from "../src/assistant/remote-items.js";
+import { END_SENTENCE_MAX, END_SUMMARY_MAX, terminalAttachCommand, terminalEndNotice, terminalEndSummary } from "../src/assistant/remote-items.js";
 
 /** An answer as an agent writes one: what it did first, then the details, then what comes next. */
 const ANSWER = [
@@ -77,16 +77,21 @@ test("a whole answer is read from its start: its first paragraph, its emphasis a
   assert.deepEqual(terminalEndSummary("  \n "), { summary: "", more: false });
 });
 
-test("whole sentences are kept while they fit; a first sentence too long is cut after a clause, with an ellipsis", () => {
+test("whole sentences are kept while they fit; a first sentence much too long is cut after a clause, with an ellipsis", () => {
   const sentence = (n: number) => `第${n}句${"很".repeat(40)}长。`;
   const long = [1, 2, 3, 4, 5].map(sentence).join("");
   const said = terminalEndSummary(long);
   assert.equal(said.summary, [1, 2, 3, 4].map(sentence).join(""));
   assert.ok(Array.from(said.summary).length <= END_SUMMARY_MAX);
   assert.equal(said.more, true);
-  const one = `${"甲".repeat(120)}，${"乙".repeat(120)}。`;
-  assert.deepEqual(terminalEndSummary(one), { summary: `${"甲".repeat(120)}…`, more: true });
-  const words = `${"word ".repeat(60).trim()}.`;
+  // A first sentence somewhat longer than the limit is still said whole; only a much longer one is cut, after a clause.
+  const whole = `${"甲".repeat(120)}，${"乙".repeat(120)}。`;
+  assert.deepEqual(terminalEndSummary(`${whole}后面还有。`), { summary: whole, more: true });
+  assert.deepEqual(terminalEndSummary(whole), { summary: whole, more: false });
+  assert.ok(Array.from(whole).length > END_SUMMARY_MAX && Array.from(whole).length <= END_SENTENCE_MAX);
+  const one = `${"甲".repeat(150)}，${"乙".repeat(250)}。`;
+  assert.deepEqual(terminalEndSummary(one), { summary: `${"甲".repeat(150)}…`, more: true });
+  const words = `${"word ".repeat(80).trim()}.`;
   const cutWords = terminalEndSummary(words).summary;
   assert.match(cutWords, /^word( word)+…$/);
   assert.ok(Array.from(cutWords).length <= END_SUMMARY_MAX);
