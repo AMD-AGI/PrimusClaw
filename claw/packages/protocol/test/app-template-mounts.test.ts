@@ -18,7 +18,7 @@ const CACHE = "/shared/team/cache";
 const manifest = (template: Record<string, unknown>): AppManifestV1 => ({
   schema: APP_MANIFEST_SCHEMA, name: "example-app", version: "1.0.0", container: {},
   state_dir: "/state/${run_id}", command: ["run"],
-  sandbox_templates: [{ name: "measurement", fromImage: "registry.example.invalid/m:1", per_gpu_count: [1, 8], ...template }],
+  sandbox_templates: [{ name: "measurement", fromImage: "registry.example.invalid/m:1", per_gpu_count: [1, 8], workspaceStorage: "off", ...template }],
   sandbox_roles: { measurement: ["measurement"] },
 } as AppManifestV1);
 
@@ -115,7 +115,7 @@ test("Agent Sandbox's keys must be spelt exactly: its decoder matches them case-
 
 test("two keys of one template object that fold to one are refused, at any depth: the decoder keeps the last", () => {
   // The review's probe: admission read W2, Agent Sandbox's decoder reads W1.
-  const probe = { name: "measurement", workspace: "W2", Workspace: "W1", host_mounts: [{ hostPath: "/mnt/x", readOnly: true }] };
+  const probe = { name: "measurement", workspace: "W2", Workspace: "W1", workspaceStorage: "off", host_mounts: [{ hostPath: "/mnt/x", readOnly: true }] };
   const issues = validateAppManifest({ ...manifest({}), sandbox_templates: [{ fromImage: "registry.example.invalid/m:1", ...probe }] });
   assert.deepEqual(issues.map((i) => i.path), ["sandbox_templates[0].Workspace", "sandbox_templates[0].Workspace"]);
   assert.match(issues[0]!.reason, /keeps the last/);
@@ -162,6 +162,44 @@ test("a key that Go's decoder folds onto an Agent Sandbox key (\u017f is s, \u21
     "a non-ASCII value is not a key");
 });
 
+test("a template with host_mounts must turn its workspace's storage off or read-only where Agent Sandbox reads it", () => {
+  // A read-only mount beneath the workspace's read-write mount protects nothing.
+  for (const storage of [undefined, "on"]) {
+    const issues = issuesOf({ workspaceStorage: storage, host_mounts: [{ hostPath: CACHE, readOnly: true }] });
+    assert.deepEqual(issues.map((i) => i.path), ["sandbox_templates[0].workspaceStorage"], String(storage));
+    assert.match(issues[0]!.reason, /must be "off" or "readOnly" in a template with host_mounts/);
+  }
+  for (const storage of ["off", "readOnly"]) {
+    assert.deepEqual(issuesOf({ workspaceStorage: storage, host_mounts: [{ hostPath: CACHE, readOnly: true }] }), [], storage);
+  }
+  // The nested template carries the image, so it is the one that must say so.
+  assert.deepEqual(paths({ workspaceStorage: "readOnly", template: { fromImage: "x" }, host_mounts: [{ hostPath: CACHE, readOnly: true }] }), [
+    "sandbox_templates[0].template.workspaceStorage",
+  ]);
+  assert.deepEqual(issuesOf({ template: { fromImage: "x", workspaceStorage: "readOnly" }, host_mounts: [{ hostPath: CACHE, readOnly: true }] }), []);
+  // Spelt in another case it is not the key Claw reads, and is refused as such.
+  const misspelt = { name: "measurement", fromImage: "registry.example.invalid/m:1", WorkspaceStorage: "off", host_mounts: [{ hostPath: CACHE, readOnly: true }] };
+  assert.deepEqual(validateAppManifest({ ...manifest({}), sandbox_templates: [misspelt] }).map((i) => i.path), [
+    "sandbox_templates[0].WorkspaceStorage", "sandbox_templates[0].workspaceStorage",
+  ]);
+  // Without mounts the storage is the template's own choice.
+  for (const storage of ["on", "off", "readOnly", undefined]) assert.deepEqual(issuesOf({ workspaceStorage: storage }), [], String(storage));
+  // The grant hands the setting through unchanged, beside the rendered mounts.
+  const [t] = appGrantTemplates(manifest({ workspaceStorage: "readOnly", host_mounts: [{ hostPath: CACHE, readOnly: true }] }), {
+    image: "i", sandboxWorkspace: "ws",
+  });
+  assert.equal(t!.workspaceStorage, "readOnly");
+});
+
+test("workspaceStorage is one of on, off and readOnly, at the top and in a nested template, with or without mounts", () => {
+  for (const storage of [false, true, "false", "readonly", "ReadOnly", "", 0, null]) {
+    assert.deepEqual(paths({ workspaceStorage: storage }), ["sandbox_templates[0].workspaceStorage"], JSON.stringify(storage));
+    assert.deepEqual(paths({ template: { fromImage: "x", workspaceStorage: storage } }), ["sandbox_templates[0].template.workspaceStorage"], JSON.stringify(storage));
+  }
+  const issue = issuesOf({ workspaceStorage: "readonly" })[0]!;
+  assert.match(issue.reason, /must be one of "on", "off", "readOnly"/);
+});
+
 test("a template's own volumes and their mounts are kept, and may not take a host mount's volume name", () => {
   const scratch = { volumes: [{ name: "scratch", emptyDir: {} }], volumeMounts: [{ name: "scratch", mountPath: "/scratch", readOnly: false }] };
   assert.deepEqual(issuesOf(scratch), []);
@@ -169,7 +207,7 @@ test("a template's own volumes and their mounts are kept, and may not take a hos
   assert.deepEqual(paths({ volumes: [{ name: "template-mount-0", emptyDir: {} }], host_mounts: [{ hostPath: CACHE, readOnly: true }] }), [
     "sandbox_templates[0].volumes[0].name",
   ]);
-  assert.deepEqual(paths({ template: { fromImage: "x", volumes: [{ name: "template-mount-a", emptyDir: {} }] }, host_mounts: [{ hostPath: CACHE, readOnly: true }] }), [
+  assert.deepEqual(paths({ template: { fromImage: "x", workspaceStorage: "off", volumes: [{ name: "template-mount-a", emptyDir: {} }] }, host_mounts: [{ hostPath: CACHE, readOnly: true }] }), [
     "sandbox_templates[0].template.volumes[0].name",
   ]);
   assert.deepEqual(paths({ volumeMounts: [{ name: "template-mount-0", mountPath: "/w", readOnly: false }], host_mounts: [{ hostPath: CACHE, readOnly: true }] }), [

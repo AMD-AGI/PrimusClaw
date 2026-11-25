@@ -204,6 +204,9 @@ export async function ensureRemoteAgentSchema(client: pg.PoolClient): Promise<vo
       updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  // How often (minutes; 0 never) a conversation open in a terminal that works on its own is summed up (`/approvals summary`). NULL: the
+  // default (protocol `TERMINAL_SUMMARY`).
+  await client.query("ALTER TABLE claw_remote_approval_settings ADD COLUMN IF NOT EXISTS summary_minutes INTEGER");
   // The conversations open in a terminal whose pushes their owner muted (`/approvals mute #<item>`, `store.setTerminalMute`): no
   // question, wait or end of theirs is put to the owner; the terminal keeps asking. No row: not muted.
   await client.query(`

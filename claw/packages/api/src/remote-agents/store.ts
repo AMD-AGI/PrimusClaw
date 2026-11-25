@@ -13,7 +13,7 @@ import { storableJsonText } from "@claw/utils";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import {
-  REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS,
+  REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, TERMINAL_SUMMARY, REMOTE_COMMAND_TYPES, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS,
   REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED, REMOTE_EVENT_USER_PROMPT,
   type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteCommandType, type RemoteTerminalSessionOpen, type RemoteEventRejection, type RemoteHeartbeat, type RemoteHidden, type RemoteWorkspace,
 } from "@claw/protocol";
@@ -840,7 +840,10 @@ const ACTIVITY_PROMPTS = 10;
  * The owner's open sessions, newest activity first, each with its newest events cut down to what says what it is doing: the
  * type, when, the text of a message chunk or the title of a tool step (at most {@link ACTIVITY_TEXT} characters), a permission
  * request's id, a turn's stop reason, a tool call's id and status, and whether the event is replayed history. `queued` counts prompts accepted for it that its connector has not
- * yet acknowledged; `open_prompts` how many of its newest {@link ACTIVITY_PROMPTS} prompts (`user_prompt`) no `turn_end` or refusal
+ * yet acknowledged and that no `turn_end` or refusal names (by `cmd_seq`) either: the connector acknowledges what it collected only with its
+ * next heartbeat (every 30 s), and a prompt whose turn has already ended is no work of the session's, so a seat whose task just ended is
+ * free at once (its next task is sent, not queued until the sweep). That end is looked for among the same newest events as the rest
+ * (an end further back leaves the prompt counted until the heartbeat, as before); `open_prompts` how many of its newest {@link ACTIVITY_PROMPTS} prompts (`user_prompt`) no `turn_end` or refusal
  * after it names (by `cmd_seq`), wherever they are: a prompt queued behind a long turn can be further back than the events read.
  * Nothing of anyone else's: every row is filtered on `owner`.
  */
@@ -849,7 +852,11 @@ export async function sessionActivity(owner: string, limit: number, events = ACT
     `SELECT s.session_id::text AS session_id, s.connector_id::text AS connector_id, s.agent_id, s.cwd, s.mode,
             s.created_at, s.updated_at, ${READ_ONLY_SQL} AS read_only,
             (SELECT COUNT(*)::int FROM claw_remote_commands m
-              WHERE m.connector_id = s.connector_id AND m.session_id = s.session_id AND m.type = 'prompt') AS queued,
+              WHERE m.connector_id = s.connector_id AND m.session_id = s.session_id AND m.type = 'prompt'
+                AND NOT EXISTS (
+                  SELECT 1 FROM (SELECT r.type, r.data FROM claw_remote_events r WHERE r.session_id = s.session_id ORDER BY r.id DESC LIMIT $3) t
+                   WHERE t.type = ANY($9::text[]) AND t.data->'cmd_seq' = to_jsonb(m.cmd_seq)
+                     AND COALESCE(t.data->>'replay', '') <> 'true')) AS queued,
             (SELECT COUNT(*)::int FROM (
                SELECT u.id, u.data->'cmd_seq' AS cmd_seq FROM claw_remote_events u
                 WHERE u.session_id = s.session_id AND u.seq > $5 AND u.seq <= $6 AND u.type = $7
@@ -1348,6 +1355,25 @@ export async function setApprovalsEnabled(owner: string, enabled: boolean, clien
       [owner, enabled],
     );
     await writeAudit(q, { owner, actor: owner, client, action: "approvals.set", detail: { enabled } });
+  });
+}
+
+/** How often (minutes) a conversation of the owner's that works on its own in a terminal is summed up; 0: never. */
+export async function terminalSummaryMinutes(owner: string, q: Querier = direct): Promise<number> {
+  const r = (await q("SELECT summary_minutes FROM claw_remote_approval_settings WHERE owner_user_id = $1", [owner])).rows[0];
+  const m = r?.summary_minutes;
+  return typeof m === "number" && Number.isSafeInteger(m) && m >= 0 ? m : TERMINAL_SUMMARY.defaultMinutes;
+}
+
+/** Set it (`/approvals summary <minutes>|off`); a new row keeps the approvals on. Audited. */
+export async function setTerminalSummaryMinutes(owner: string, minutes: number, client: string | null): Promise<void> {
+  await inTransaction(async (q) => {
+    await q(
+      `INSERT INTO claw_remote_approval_settings (owner_user_id, enabled, summary_minutes, updated_at) VALUES ($1, TRUE, $2, NOW())
+       ON CONFLICT (owner_user_id) DO UPDATE SET summary_minutes = EXCLUDED.summary_minutes, updated_at = NOW()`,
+      [owner, minutes],
+    );
+    await writeAudit(q, { owner, actor: owner, client, action: "approvals.summary_set", detail: { minutes } });
   });
 }
 

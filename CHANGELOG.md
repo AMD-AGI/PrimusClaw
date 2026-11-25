@@ -113,6 +113,13 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Agent Sandbox: a template can name the nodes its sandboxes prefer, `preferredNodes` (at most 8 distinct node names,
+  DNS-1123 subdomains; checked by the template API, when a grant or owner policy is applied, and by the CRD). A sandbox
+  Workload gets them as SaFE `specified-nodes`, next to `excluded-nodes` from `agent-sandbox.io/avoid-nodes`, and the node
+  affinity is `preferred` when either list is set. A node in both lists is dropped from `specified-nodes` (avoid wins).
+  A running sandbox of such a template carries `agent-sandbox.io/preferred-node` (`true` or `false`). Claw passes the
+  field through untouched; see "Preferred nodes" in `claw/docs/plugins.md`. Until SaFE applies `excluded-nodes` as a
+  preference under that annotation, `excluded-nodes` stays a required `NotIn` while `specified-nodes` is preferred.
 - Claw: tasks handed to the user's seats (for users with seats; `CLAW_DEVENV_SEAT_DISPATCH=off` turns it off). `work_create` takes
   `target: "seat:<seat_id>"`, or 2 to 5 places for a choice card (`confirm_write.options`, decided with `choice`). Each task is its own
   remote item; a card is required unless the user's own attended message names one confirmed seat they already approved a card for
@@ -303,6 +310,20 @@ release version, and its `appVersion` stays `latest`.
   (`--approvals`) and `--hooks` take it back. `hooks install` now installs the approval hooks too, unless they were taken out.
   The one-time question about the approval hooks after other commands is gone. Codex and Cursor hooks are unchanged (Codex
   needs the person to trust a new hook). See `connector/README.md`, "The Claude Code hooks are kept in place".
+- Claw, Agent Sandbox: a sandbox template says how its sandbox mounts its workspace's storage with `workspaceStorage`:
+  `"on"` (the default, as before), `"off"` (none of it; the SaFE Workload gets
+  `primus-safe.workload.use.workspace.storage: "false"`) or `"readOnly"` (all of it read-only, init containers
+  included, without the per-user directory; the Workload gets `primus-safe.workload.workspace.storage.readonly: "true"`,
+  which needs a SaFE that knows it). A template's `host_mounts` now need `"off"` or `"readOnly"` where Agent Sandbox
+  reads the template (the nested `template` when it carries the `fromImage`), or the manifest is refused
+  (`422 app_manifest_invalid`, at `sandbox_templates[i].workspaceStorage`): a read-only mount beneath the workspace's
+  read-write mount protected nothing, since the sandbox could write the same directory through its parent, and the
+  sandbox platform's pod admission refuses such a mount on external nodes, where the create then hung until its
+  pending timeout. Any other value is refused too. Apply the updated CodeInterpreter CRD before rolling the control
+  plane. The grant service refuses to issue or extend a grant whose template has a hostPath volume with the storage
+  on, and a sandbox is not created from a grant template that has host paths with the storage on. `"readOnly"`
+  requires the sandbox to keep all its writes on local disk; roll it out per template with a canary. Incompatible: a
+  manifest with `host_mounts` registered before this change is refused until it sets `workspaceStorage`.
 - Claw, personal agent: the message for a terminal turn that ended while nobody was at it says which conversation first. Its
   title is the conversation's name (as Claude Code's session list shows it, else its title) with its status (finished, or
   stopped with an error and why); one small line names the tool, the machine, the folder and the item number. Then what the
@@ -312,6 +333,23 @@ release version, and its `appVersion` stays `latest`.
   message. Claw sends what the card shows as `remote.end` on the `assistant.say` (`kind` `done` or `error`), with text for a
   channel that shows no cards; the rules of when it is said (one per conversation every five minutes, `/approvals off`,
   mute) are unchanged.
+- Connector, Claw, personal agent: a terminal turn's end is pushed at once only when a person started that turn (typed at
+  the terminal, a queued prompt, an accepted suggestion, a slash command), when its answer asks the person something or waits
+  for their decision (a question at the end, or explicit choice, approval or confirmation words in Chinese or English), or when
+  it failed. The connector reads who started the turn from Claude Code's transcript (`origin.kind`, `promptSource`) and sends it
+  as `origin` on `terminal_turn_end`; ends of turns nobody typed (another session's message, a schedule, a hook) that follow one
+  another before the terminal has been quiet a minute are sent as one, the newest, with `turns`, `earlier` and `since` (at the
+  latest fifteen minutes after the first; `failed_earlier` and `asked_earlier` count failures and questions among them, and
+  `earlier_failed` marks which of `earlier` failed; such a run is pushed, and its message and card lead with that earlier turn's
+  question or error in whole sentences, or say how many earlier turns asked or failed when their words are no longer carried,
+  before the latest turn's result), and a new
+  prompt holds an end not yet told until its own turn ends. Claw gathers the ends it does not push (the earlier turns of a run
+  it does push, and the ends the five-minute gap holds back, too) on the conversation's item and says, at most once per
+  conversation every hour, what it did since: how many turns, how many failed, the latest result in whole sentences, and
+  whether anything asked the person (`remote.kind` `progress`). `/approvals summary <minutes>|off` (15 to 1440; `PUT
+  /v1/remote-agents/approvals/summary`, read back on `GET /v1/remote-agents/approvals` as `summary_minutes`) sets the interval;
+  `/approvals off`, a mute and quiet hours hold summaries as they hold every push. A connector before this release, a Claude
+  Code without these transcript fields, and Codex are told as before.
 - Agent Sandbox: a GPU template's CPU, memory, pod storage and `/dev/shm` now come from the template when it sets them,
   instead of always 24 CPU, 224Gi memory, 187.5Gi storage and 125Gi shared memory per card. A sandbox can ask for what
   it needs (for example 16 CPU and 448Gi for two cards, or 32 CPU and 1792Gi for eight) and leave the rest of the node
@@ -391,6 +429,11 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: a task handed to a seat within about 30 seconds of the end of the seat's previous task was queued as "the seat
+  is busy" with nothing ahead of it, and a task already waiting did not go on that end: the prompt of a task whose turn
+  had ended still counted as work in progress until the connector's next heartbeat acknowledged it, and that heartbeat
+  sends nothing waiting, so the task waited for the next event or the one-minute seat sweep (up to about a minute). A
+  prompt whose `turn_end` (or refusal) names its `cmd_seq` no longer counts as pending, so the seat is free at its end.
 - Claw: the answer a seat's agent gave by itself, after a command it put in the background finished, was lost when its
   task had been opened again meanwhile (waiting for the seat that very turn kept busy) or sent to a new session: it
   is now said as that task's late word. The five-minute quiet that ends such a turn for an older connector now waits
