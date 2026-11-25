@@ -358,6 +358,8 @@ export interface SeatSession { id: string; name: string | null; opened_in: "chat
 
 /** A name a machine reported, as a seat may be called by it: one line, no control characters, at most {@link SESSION_NAME_MAX}. */
 export const sessionName = (v: unknown): string | null => flat(v, SESSION_NAME_MAX);
+/** The same name whole (up to a bound), for Claw to compare with the user's words: a long title is shortened only on cards. */
+const matchName = (v: unknown): string | null => flat(v, 200);
 
 /**
  * Who is in a seat now and what it is called (see {@link SeatLive}). `open`: the user's sessions open through Claw; `agents`: its
@@ -368,25 +370,32 @@ export function seatOccupants(
 ): { sessions: SeatSession[]; names: string[]; known_names: string[] } {
   const here = (cwd: unknown, ref?: string) => cwd === seat.cwd && (!seat.conversation_ref || ref === undefined || ref === seat.conversation_ref);
   const sessions: SeatSession[] = [];
+  const whole: Array<string | null> = [];
   for (const o of open) {
     if (String(o.connector_id) !== String(seat.connector_id) || String(o.agent_id) !== String(seat.agent_id) || !here(o.cwd)) continue;
     const agent = agents.find((a) => String(a.agent_id) === String(o.agent_id));
-    sessions.push({ id: String(o.session_id), name: sessionName(heldTitle(agent, o)), opened_in: "chat" });
+    const title = heldTitle(agent, o);
+    sessions.push({ id: String(o.session_id), name: sessionName(title), opened_in: "chat" });
+    whole.push(matchName(title));
   }
   // (Only its own agent's: another agent's conversations in that folder are that agent's seat's.)
-  const conversations: Array<Resumable & { name: string | null }> = [];
+  const conversations: Array<Resumable & { name: string | null; whole: string | null }> = [];
   for (const a of agents) {
     if (String(a.agent_id) !== String(seat.agent_id)) continue;
-    for (const r of resumableOf(a)) if (here(r.cwd, r.ref)) conversations.push({ ...r, name: sessionName(r.title) });
+    for (const r of resumableOf(a)) if (here(r.cwd, r.ref)) conversations.push({ ...r, name: sessionName(r.title), whole: matchName(r.title) });
   }
   conversations.sort((x, y) => (y.updated_at ?? "").localeCompare(x.updated_at ?? ""));
-  for (const r of conversations) if (r.state === "live" && !sessions.some((x) => x.id === r.ref)) sessions.push({ id: r.ref, name: r.name, opened_in: "machine" });
+  for (const r of conversations) {
+    if (r.state !== "live" || sessions.some((x) => x.id === r.ref)) continue;
+    sessions.push({ id: r.ref, name: r.name, opened_in: "machine" });
+    whole.push(r.whole);
+  }
   const uniq = (xs: Array<string | null>) => [...new Set(xs.filter((x): x is string => !!x))];
   const occupied = uniq(sessions.map((x) => x.name));
   return {
     sessions,
     names: occupied.length ? occupied : uniq(conversations.map((r) => r.name)).slice(0, 1),
-    known_names: uniq([...occupied, ...conversations.map((r) => r.name)]).slice(0, 20),
+    known_names: uniq([...whole, ...conversations.map((r) => r.whole)]).slice(0, 20),
   };
 }
 
