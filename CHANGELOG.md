@@ -16,7 +16,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 | Release | Tag | Current version |
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
-| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.3 |
+| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.4 |
 | Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.14.0 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
@@ -432,6 +432,16 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: the assistant named the user's sessions differently from their `/agents` card. `devenv_list` gave a session's title (the
+  name the user gave it on their machine) only with `detail: "activity"`, and its default read listed each machine's first six
+  sessions, not the ones the card shows; asked again with a plain read, the router called the titles it had given made up and said
+  it could not read them. Every read now gives each session's `title` and `id`, the default read lists exactly what the card shows
+  of each machine, in its order (the rest when that machine is asked for, marked `not_on_agents_card`), and the router names
+  sessions by title and label (the labels `devenv_send` takes as targets) and nothing its results do not list. A seat is now called
+  what its sessions are called on the machine: `seat_roster` lists the ids of the sessions in each seat (which `devenv_list` names)
+  and takes `name` (a session's name or the alias, compared by Claw and never listed; a name the user's message does not hold marks
+  the turn), `seat_set` takes `name` too, and the seat cards show the session names beside an alias (one line, at most 40
+  characters, control characters removed). Seats prompt router-seats-v2. Router prompt router-devenv-v16.
 - Claw: a task handed to a seat within about 30 seconds of the end of the seat's previous task was queued as "the seat
   is busy" with nothing ahead of it, and a task already waiting did not go on that end: the prompt of a task whose turn
   had ended still counted as work in progress until the connector's next heartbeat acknowledged it, and that heartbeat

@@ -23,7 +23,10 @@
  * Everything an agent or a machine wrote (a title, the answer, a folder, repository or branch name, and so the tags made of them) is data
  * for the guess, never an instruction: it reaches one model call that can call nothing, and its output reaches the user only as a quoted
  * suggestion on a card. Only what the user confirmed, and what Claw itself computed (never a tag), is in the roster the router reads
- * (`seat_roster`), so reading it never marks the turn as having read untrusted text, and the turn may still act afterwards.
+ * (`seat_roster`), so reading it never marks the turn as having read untrusted text, and the turn may still act afterwards. A seat is
+ * called what its sessions are called on the machine (their titles, as `/agents` shows them): that name is shown on its cards beside an
+ * alias the user gave it, and Claw compares it with the user's words when they name a seat by it, but it is never in the roster, which
+ * carries only the ids of the sessions in each seat (`devenv_list` names them, and marks the turn).
  *
  * Shown only (M0): nothing is sent to a seat because of its role. Off unless `CLAW_DEVENV_SEATS` is on, or the user is named in
  * `CLAW_DEVENV_SEATS_USERS`.
@@ -35,7 +38,7 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_DEVENV_SEAT_DISPATCH, CLAW_DEVENV_SEATS, C
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
 import { issueCommand, listConnectors, sessionActivity, wakeConnector, workspacesOf, type Row } from "../remote-agents/store.js";
-import { inertMd, readActivity, resumableOf, type Resumable } from "./devenv-tools.js";
+import { heldTitle, inertMd, readActivity, resumableOf, type Resumable } from "./devenv-tools.js";
 import { versionVerdict } from "../remote-agents/setup.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { briefLanguage } from "./brief.js";
@@ -99,6 +102,16 @@ const GUESSED_DAYS = 7;
 export const SEAT_CARDS_PER_DAY = 3;
 /** The roster lists at most this many seats. */
 export const ROSTER_MAX = 40;
+/**
+ * A seat's name as the user gave it on their machine (a seat is called what its session is called there: the agent's conversation
+ * title, as `/agents` shows it): one line of at most this many code points, made of the machine's words, so shown on cards and compared
+ * by Claw, never put in the roster.
+ */
+export const SESSION_NAME_MAX = 40;
+/** How many of a seat's session names a card shows. */
+const NAMES_SHOWN = 3;
+/** A session or conversation id the roster may carry: a UUID, which holds no words. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** A refresh of one seat at most this often. */
 const REFRESH_MIN_MS = 60 * 60_000;
 
@@ -126,9 +139,11 @@ export const PROBE_CLIENT = "seat_probe";
 /** The command id of a seat's `n`th question. */
 export const probeCmdId = (seatId: string, n: number): string => `seat-probe:${seatId}:${n}`;
 
+/** Bidirectional formatting characters: a machine-written name could use them to reorder how a card's text reads. */
+const BIDI = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 const flat = (v: unknown, max: number): string | null => {
   if (typeof v !== "string") return null;
-  const one = v.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  const one = v.replace(BIDI, "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
   if (!one) return null;
   return Array.from(one).length > max ? `${Array.from(one).slice(0, max - 1).join("")}…` : one;
 };
@@ -289,6 +304,11 @@ export interface RosterSeat {
   queue_len: number;
   /** The latest development environment item of this seat: its number and where it stands. */
   last_item: { seq: number; state: string } | null;
+  /**
+   * The sessions in this seat now, by id (its sessions open through Claw, and its folder's conversations open on the machine): the same
+   * ids `devenv_list` lists them by (`sessions[].id`), with their labels and titles. Only ids: their names are the machine's words.
+   */
+  sessions: string[];
 }
 
 /**
@@ -322,6 +342,93 @@ export interface SeatLive {
   /** Its tasks running, and waiting in its queue in order. */
   running: Array<{ item_id: string; seq: number; waiting: boolean }>;
   queue: Array<{ item_id: string; seq: number; queued: string; new_session: boolean }>;
+  /** Who is in it now: its sessions open through Claw (newest first), then its agent's conversations of its folder open on the machine. */
+  sessions: SeatSession[];
+  /**
+   * What it is called on the user's machine ({@link SESSION_NAME_MAX}): the names of the sessions in it now, else of its folder's latest
+   * conversation. The machine's words: for cards and for Claw to compare ({@link seatNameIs}), never for the router's trusted state.
+   */
+  names: string[];
+  /** Every name a session of its folder goes by on the machine, for Claw to compare the user's words with. */
+  known_names: string[];
+}
+
+/** A session in a seat: its id (Claw's session id, or the machine's conversation id), and its name on the machine. */
+export interface SeatSession { id: string; name: string | null; opened_in: "chat" | "machine" }
+
+/** A name a machine reported, as a seat may be called by it: one line, no control characters, at most {@link SESSION_NAME_MAX}. */
+export const sessionName = (v: unknown): string | null => flat(v, SESSION_NAME_MAX);
+/** The same name whole (up to a bound), for Claw to compare with the user's words: a long title is shortened only on cards. */
+const matchName = (v: unknown): string | null => flat(v, 200);
+
+/**
+ * Who is in a seat now and what it is called (see {@link SeatLive}). `open`: the user's sessions open through Claw; `agents`: its
+ * machine's agents as their connector reported them (the conversations the user hid are not among them). Pure, for the tests.
+ */
+export function seatOccupants(
+  seat: Row, agents: readonly Row[], open: readonly Row[],
+): { sessions: SeatSession[]; names: string[]; known_names: string[] } {
+  const here = (cwd: unknown, ref?: string) => cwd === seat.cwd && (!seat.conversation_ref || ref === undefined || ref === seat.conversation_ref);
+  const sessions: SeatSession[] = [];
+  const whole: Array<string | null> = [];
+  for (const o of open) {
+    if (String(o.connector_id) !== String(seat.connector_id) || String(o.agent_id) !== String(seat.agent_id) || !here(o.cwd)) continue;
+    const agent = agents.find((a) => String(a.agent_id) === String(o.agent_id));
+    const title = heldTitle(agent, o);
+    sessions.push({ id: String(o.session_id), name: sessionName(title), opened_in: "chat" });
+    whole.push(matchName(title));
+  }
+  // (Only its own agent's: another agent's conversations in that folder are that agent's seat's.)
+  const conversations: Array<Resumable & { name: string | null; whole: string | null }> = [];
+  for (const a of agents) {
+    if (String(a.agent_id) !== String(seat.agent_id)) continue;
+    for (const r of resumableOf(a)) if (here(r.cwd, r.ref)) conversations.push({ ...r, name: sessionName(r.title), whole: matchName(r.title) });
+  }
+  conversations.sort((x, y) => (y.updated_at ?? "").localeCompare(x.updated_at ?? ""));
+  for (const r of conversations) {
+    if (r.state !== "live" || sessions.some((x) => x.id === r.ref)) continue;
+    sessions.push({ id: r.ref, name: r.name, opened_in: "machine" });
+    whole.push(r.whole);
+  }
+  const uniq = (xs: Array<string | null>) => [...new Set(xs.filter((x): x is string => !!x))];
+  const occupied = uniq(sessions.map((x) => x.name));
+  return {
+    sessions,
+    names: occupied.length ? occupied : uniq(conversations.map((r) => r.name)).slice(0, 1),
+    known_names: uniq([...whole, ...conversations.map((r) => r.whole)]).slice(0, 20),
+  };
+}
+
+/**
+ * How a seat is named to the user on a card: the alias they gave it on the assistant's side with its name on their machine beside it,
+ * so the two can be matched; else that name (one line); else null. With several sessions in it, the first and how many more.
+ */
+export function seatDisplayName(alias: string | null | undefined, names: readonly string[], max: number = SESSION_NAME_MAX): string | null {
+  const name = names.length ? `${names[0]}${names.length > 1 ? ` +${names.length - 1}` : ""}` : null;
+  if (alias && name) return flat(`${alias} (${name})`, max + ALIAS_MAX + 3);
+  return alias || name;
+}
+
+/**
+ * Whether `name` is in the user's own message (any case, any run of spaces): a seat named by what a machine calls its session is found
+ * for the user only when they said that name. A name the router took from anything else (a title it read in an earlier turn) is what a
+ * machine wrote, and the turn that looks it up has read it.
+ */
+export function saidByUser(message: string | null | undefined, name: string): boolean {
+  const norm = (v: string) => v.toLowerCase().replace(/\s+/g, " ").trim();
+  const n = norm(name);
+  return !!n && norm(message ?? "").includes(n);
+}
+
+/** Whether the user's words name a seat by its alias or a name its sessions go by on their machine (whole, or a part of 2+ characters). */
+export function seatNameIs(asked: string, alias: string | null | undefined, names: readonly string[], exact = false): boolean {
+  const a = asked.trim().toLowerCase();
+  if (!a) return false;
+  if (alias && alias.toLowerCase() === a) return true;
+  return names.some((n) => {
+    const x = n.toLowerCase();
+    return x === a || (!exact && Array.from(a).length >= 2 && x.includes(a));
+  });
 }
 
 /** The latest event of a session that names its mode, as `sessionMode` reads it, for each of these sessions. */
@@ -351,7 +458,8 @@ export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_A
   const out = new Map<string, SeatLive>();
   if (!seats.length) return out;
   const connectors = await listConnectors(owner, onlineWindowMs);
-  const activity = new Map((await sessionActivity(owner, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser)).map((r) => [String(r.session_id), r]));
+  const openSessions = await sessionActivity(owner, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser);
+  const activity = new Map(openSessions.map((r) => [String(r.session_id), r]));
   const tasks = (await q(
     `SELECT item_id, seq, board_state, last_report_kind, params->>'seat_id' AS seat_id, params->>'queued' AS queued,
             params->>'queued_at' AS queued_at, COALESCE(params->>'new_session', '') = 'true' AS new_session,
@@ -406,7 +514,7 @@ export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_A
     out.set(String(seat.seat_id), {
       seat, machine: machineOf(connector), online, connector, agent, base, state: base === "idle" && queue.length ? "queued" : base,
       ...(unsupported ? { unsupported } : {}), ...(unsupported === "connector_outdated" && version.upgrade_command ? { upgrade_command: version.upgrade_command } : {}),
-      session, terminal, unattended, running, queue,
+      session, terminal, unattended, running, queue, ...seatOccupants(seat, agents, openSessions),
     });
   }
   return out;
@@ -415,10 +523,11 @@ export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_A
 /**
  * Which seats are where the user said (`seat_roster` with `machine` / `agent` / `folder`, their words from their message): the machine by
  * its name (any case) or Claw's own name for it (`machine-<id>`); the agent by its id or kind; the folder by its path, or by its last parts when they wrote it relative
- * (`~/rel`, `rel`, `hl/ci` match `/home/u/rel`, `.../hl/ci`). Claw compares; the names themselves (which the machine chose) are never
+ * (`~/rel`, `rel`, `hl/ci` match `/home/u/rel`, `.../hl/ci`); the seat by its alias or by the name a session of it goes by on the machine
+ * (`hosting`: {@link seatNameIs}, whole names before parts of them). Claw compares; the names themselves (which the machine chose) are never
  * listed, so the roster stays free of words a machine wrote.
  */
-export interface RosterWhere { machine?: string; agent?: string; folder?: string }
+export interface RosterWhere { machine?: string; agent?: string; folder?: string; name?: string }
 /** A path with no trailing slash; on Windows, whose paths ignore case and take either slash, lower case with forward slashes (a POSIX path keeps both). */
 const slashed = (v: string, windows: boolean): string => {
   const p = v.trim();
@@ -476,7 +585,12 @@ export async function rosterOf(
     if (where.agent && !agentIs(where.agent, String(s.agent_id ?? ""), String(now?.agent?.kind ?? ""))) return false;
     return !where.folder || folderIs(where.folder, String(s.cwd ?? ""));
   });
-  return there.map((s) => {
+  const named = (exact: boolean) => there.filter((s) => {
+    const now = live.get(String(s.seat_id));
+    return seatNameIs(where.name!, typeof s.alias === "string" ? s.alias : null, now?.known_names ?? [], exact);
+  });
+  const picked = where.name ? (named(true).length ? named(true) : named(false)) : there;
+  return picked.map((s) => {
     const confirmed = s.role_state === "confirmed";
     const now = live.get(String(s.seat_id));
     return {
@@ -490,15 +604,22 @@ export async function rosterOf(
       confirm_each: s.confirm_each === true,
       queue_len: now?.queue.length ?? 0,
       last_item: s.item_seq != null ? { seq: Number(s.item_seq), state: String(s.item_state) } : null,
+      sessions: (now?.sessions ?? []).map((x) => x.id).filter((id) => UUID_RE.test(id)),
     };
   });
 }
+
+/** How the roster's seats are matched with the sessions `devenv_list` names. */
+export const ROSTER_SESSIONS_NOTE = "sessions are the ids of the sessions in a seat now: devenv_list lists each by the same id, with the "
+  + "label and the title (the name the user gave it on their machine, as /agents shows it) to name it by; a seat with none has no session "
+  + "now. Name only seats and sessions these results list.";
 
 /** The roster's note where tasks may be handed to seats (`seat-dispatch.ts`). */
 export const ROSTER_NOTE = "Seats (工位): each folder an agent works in on the user's machines. Every field here was computed by Claw or "
   + "confirmed by the user (alias, role): reading it does not stop you from acting. role is what the user confirmed the seat is for. "
   + "A guess Claw made is never listed: it is put to the user on a card. A seat the user names by its machine, agent or folder: "
-  + "seat_roster with machine, agent and/or folder as they wrote them lists only the seats there. To hand a task to a seat: work_create with target "
+  + "seat_roster with machine, agent and/or folder as they wrote them lists only the seats there; by the name of one of its sessions "
+  + "(what /agents shows) or its alias: seat_roster with name. " + ROSTER_SESSIONS_NOTE + " To hand a task to a seat: work_create with target "
   + "\"seat:<seat_id>\" (only a seat_id from here, never an alias or a machine name). state: unsupported cannot take work; offline: "
   + "a task waits in its queue until the machine is back (at most 24 hours); working, waiting_for_you, queued and in_terminal: a task "
   + "waits in its queue (queue_len). dispatch_mode auto: a task goes without a card (only after the user pressed one for that seat); "
@@ -507,13 +628,17 @@ export const ROSTER_NOTE = "Seats (工位): each folder an agent works in on the
 /** The roster's note while seats are only shown (seat dispatch off). */
 export const ROSTER_SHOWN_NOTE = "Seats (工位): each folder an agent works in on the user's machines. Every field here was computed by Claw or "
   + "confirmed by the user (alias, role): reading it does not stop you from acting. role is what the user confirmed the seat is for. "
-  + "A guess Claw made is never listed: it is put to the user on a card. What its agent is doing is in devenv_list (which the machine "
+  + "A guess Claw made is never listed: it is put to the user on a card. A seat the user names by the name of one of its sessions (what "
+  + "/agents shows) or its alias: seat_roster with name. " + ROSTER_SESSIONS_NOTE + " What its agent is doing is in devenv_list (which the machine "
   + "wrote). Seats are only shown in this version: never send anything to one because of its role; devenv_send is still how an "
   + "instruction reaches a machine, when the user names it.";
 
-/** `seat_roster`: the user's seats, trusted fields only. Never marks the turn as having read untrusted text. */
+/**
+ * `seat_roster`: the user's seats, trusted fields only. It marks the turn as having read untrusted text only when it was asked for a seat
+ * by a name the user's message does not hold ({@link saidByUser}): such a name was read from what a machine wrote.
+ */
 export async function seatRoster(
-  claims: AssistantTokenClaims, args: { machine?: unknown; agent?: unknown; folder?: unknown } = {},
+  claims: AssistantTokenClaims, args: { machine?: unknown; agent?: unknown; folder?: unknown; name?: unknown } = {},
 ): Promise<Record<string, unknown>> {
   if (claims.role !== "router") throw new ToolRefused("not_allowed", `this tool is for the router, not the ${claims.role}`);
   const { userId } = await inTransaction((q) => assertLiveRun(q, claims));
@@ -523,12 +648,16 @@ export async function seatRoster(
     ...(typeof args.machine === "string" && args.machine.trim() ? { machine: args.machine.slice(0, 200) } : {}),
     ...(typeof args.agent === "string" && args.agent.trim() ? { agent: args.agent.slice(0, 80) } : {}),
     ...(typeof args.folder === "string" && args.folder.trim() ? { folder: args.folder.slice(0, 400) } : {}),
+    ...(typeof args.name === "string" && args.name.trim() ? { name: args.name.slice(0, 200) } : {}),
   };
+  if (where.name && !saidByUser((await turnMessage((t, p) => db.query(t, p), claims.sid, claims.mid))?.content, where.name)) {
+    await markUntrustedRead((t, p) => db.query(t, p), claims.sid, claims.mid);
+  }
   const seats = await rosterOf(userId, undefined, where);
   const asked = Object.keys(where).length > 0;
   return {
     ok: true, seats, note: seatDispatchOn(userId) ? ROSTER_NOTE : ROSTER_SHOWN_NOTE,
-    ...(asked ? { where: seats.length ? "only the seats where the user said (machine, agent, folder)" : "no seat of the user's is where they said (machine, agent, folder)" } : {}),
+    ...(asked ? { where: seats.length ? "only the seats where the user said (machine, agent, folder, name)" : "no seat of the user's is where they said (machine, agent, folder, name)" } : {}),
   };
 }
 
@@ -536,6 +665,8 @@ export async function seatRoster(
 
 export interface SeatSetArgs {
   seat?: unknown; machine?: unknown; agent?: unknown; cwd?: unknown; session_id?: unknown; alias?: unknown; role?: unknown; refresh?: unknown;
+  /** The name of one of its sessions on the user's machine (what `/agents` shows), as they wrote it: Claw compares it. */
+  name?: unknown;
   /** true: a card every time a task goes to the seat ("每次都确认"), at once; false: back to a card the first time only, then direct. */
   confirm_each?: unknown;
 }
@@ -576,8 +707,15 @@ async function resolveSeat(owner: string, args: SeatSetArgs, onlineWindowMs: num
   )).rows as Row[];
   const connectors = new Map((await db.query("SELECT connector_id::text AS connector_id, name FROM claw_remote_connectors WHERE owner_user_id = $1", [owner]))
     .rows.map((c: Row) => [String(c.connector_id), c]));
-  const label = (s: Row) => `${machineOf(connectors.get(String(s.connector_id)))}/${String(s.agent_id)}: ${flat(s.cwd, 200) ?? ""}`;
   const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+  const nameAsked = str(args.name).slice(0, 200);
+  // What each seat is called on the machine: only read when the user named one that way, or when the choices are said.
+  let live: Map<string, SeatLive> | null = null;
+  const names = async () => (live ??= await seatsLive(owner, onlineWindowMs));
+  const label = (s: Row) => {
+    const called = seatDisplayName(null, live?.get(String(s.seat_id))?.names ?? []);
+    return `${machineOf(connectors.get(String(s.connector_id)))}/${String(s.agent_id)}: ${flat(s.cwd, 200) ?? ""}${called ? ` (${called})` : ""}`;
+  };
   const seatAsked = str(args.seat).toLowerCase();
   const machine = str(args.machine).toLowerCase();
   const agent = str(args.agent).toLowerCase();
@@ -589,6 +727,12 @@ async function resolveSeat(owner: string, args: SeatSetArgs, onlineWindowMs: num
     pool = exact;
   }
   if (session) pool = pool.filter((s) => String(s.current_session_id ?? "").toLowerCase() === session);
+  if (nameAsked) {
+    const known = await names();
+    const by = (exact: boolean) => pool.filter((s) => seatNameIs(nameAsked, typeof s.alias === "string" ? s.alias : null, known.get(String(s.seat_id))?.known_names ?? [], exact));
+    const exact = by(true);
+    pool = exact.length ? exact : by(false);
+  }
   if (machine) {
     const name = (s: Row) => machineOf(connectors.get(String(s.connector_id))).toLowerCase();
     const exact = pool.filter((s) => name(s) === machine);
@@ -606,9 +750,10 @@ async function resolveSeat(owner: string, args: SeatSetArgs, onlineWindowMs: num
       return want && (c.endsWith(want.startsWith("/") ? want : `/${want}`) || c.split(/[\\/]/).pop() === want.replace(/^\//, ""));
     });
   }
-  const named = !!(seatAsked || session || machine || agent || cwd);
+  const named = !!(seatAsked || session || machine || agent || cwd || nameAsked);
   if (pool.length === 1 && (named || seats.length === 1)) return { seat: pool[0]!, machine: machineOf(connectors.get(String(pool[0]!.connector_id))) };
   if (!seats.length) return { refused: new ToolRefused("no_seat", "the user has no seat yet: no folder of an agent on their machines is known"), read: false };
+  await names();
   const choices = (pool.length ? pool : seats).slice(0, 20).map(label);
   if (!pool.length) {
     return { refused: new ToolRefused("no_seat", "no seat of the user's matches that: ask which one they mean", { choices }), read: true };
@@ -616,11 +761,23 @@ async function resolveSeat(owner: string, args: SeatSetArgs, onlineWindowMs: num
   return { refused: new ToolRefused("which_seat", "more than one seat matches: ask which one they mean (machine, agent and folder)", { choices }), read: true };
 }
 
-/** The card `seat_set` puts to the user: the seat as the machine names it, and the words that will be kept. */
-export function seatSetCardText(p: { machine: string; agent_id: string; cwd: string; alias: string | null; role: string | null }, ref: string, zh: boolean): string {
+/** A card's line naming the sessions in a seat as the user named them on their machine (the machine's words, made inert), or none. */
+export function sessionNamesLine(names: readonly string[] | undefined, zh: boolean): string[] {
+  const shown = (names ?? []).slice(0, NAMES_SHOWN).map((n) => `「${inertMd(n)}」`);
+  if (!shown.length) return [];
+  const more = (names ?? []).length - shown.length;
+  const list = shown.join(zh ? "、" : ", ") + (more > 0 ? (zh ? ` 等 ${(names ?? []).length} 个` : ` and ${more} more`) : "");
+  return [zh ? `会话名：${list}` : `Session name${(names ?? []).length > 1 ? "s" : ""}: ${list}`];
+}
+
+/** The card `seat_set` puts to the user: the seat as the machine names it (and its sessions), and the words that will be kept. */
+export function seatSetCardText(
+  p: { machine: string; agent_id: string; cwd: string; alias: string | null; role: string | null; names?: string[] }, ref: string, zh: boolean,
+): string {
   const where = zh ? `${inertMd(p.machine)} 上的 ${inertMd(p.agent_id)}（${inertMd(p.cwd)}）` : `${inertMd(p.agent_id)} on ${inertMd(p.machine)} (${inertMd(p.cwd)})`;
   const lines = [
     zh ? `把这个工位记下来：${where}` : `Keep this for the seat ${where}:`,
+    ...sessionNamesLine(p.names, zh),
     ...(p.alias ? [zh ? `名称：${inertMd(p.alias)}` : `Name: ${inertMd(p.alias)}`] : []),
     ...(p.role ? [zh ? `负责：${inertMd(p.role)}` : `Handles: ${inertMd(p.role)}`] : []),
     zh ? `点「确认」生效，或回复 ${typedCommand("approve", ref, "zh")}。` : `Press "Confirm" to keep it, or reply ${typedCommand("approve", ref, "en")}.`,
@@ -655,6 +812,9 @@ export async function seatSet(
   const confirmEach = typeof args.confirm_each === "boolean" && seatDispatchOn(userId) ? args.confirm_each : null;
   if (!refresh && alias === null && role === null && confirmEach === null) {
     throw new ToolRefused("invalid_arguments", "say the seat's alias, its role, or refresh: true");
+  }
+  if (typeof args.name === "string" && args.name.trim() && !saidByUser(message.content, args.name)) {
+    throw new ToolRefused("name_not_said", "name is a session's name as the user wrote it in their message; they did not: ask which seat they mean");
   }
   await syncSeats(userId, q, onlineWindowMs);
   const found = await resolveSeat(userId, args, onlineWindowMs);
@@ -696,8 +856,9 @@ export async function seatSet(
   }
   const lang = langOf(message.content);
   const zh = lang === "zh";
+  const names = (await seatsLive(userId, onlineWindowMs, [String(seat.seat_id)])).get(String(seat.seat_id))?.names ?? [];
   const params = {
-    seat_id: String(seat.seat_id), alias, role, machine, agent_id: String(seat.agent_id), cwd: flat(seat.cwd, 300) ?? "", lang,
+    seat_id: String(seat.seat_id), alias, role, machine, agent_id: String(seat.agent_id), cwd: flat(seat.cwd, 300) ?? "", lang, names,
   };
   const { assistantSchedulesOn, proposeConfirmation, proposed } = await import("./schedules.js");
   if (!assistantSchedulesOn()) throw new ToolRefused("cards_off", "confirmation cards are off here, so a seat cannot be named");
@@ -1081,7 +1242,8 @@ async function sweepUser(owner: string, now: number, onlineWindowMs: number, res
   if (due.length) {
     const connectors = await listConnectors(owner, onlineWindowMs);
     const online = new Map(connectors.map((c) => [String(c.connector_id), c.online === true]));
-    const activity = new Map((await sessionActivity(owner, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser)).map((r) => [String(r.session_id), r]));
+    const openSessions = await sessionActivity(owner, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser);
+  const activity = new Map(openSessions.map((r) => [String(r.session_id), r]));
     let asked = 0;
     for (const seat of due) {
       if (asked >= ASKS_PER_SWEEP) break;
@@ -1157,13 +1319,14 @@ export function startSeatSweep(opts: { sweepMs?: number; onlineWindowMs?: number
 
 /** What the guess card says: the seat as its machine names it, the guess quoted, and the three ways to answer. */
 export function seatRoleCardText(
-  p: { machine: string; agent_id: string; cwd: string; alias: string | null; role: string }, ref: string, zh: boolean,
+  p: { machine: string; agent_id: string; cwd: string; alias: string | null; role: string; names?: string[] }, ref: string, zh: boolean,
 ): string {
   const where = zh ? `${inertMd(p.machine)} 上的 ${inertMd(p.agent_id)}（${inertMd(p.cwd)}）` : `${inertMd(p.agent_id)} on ${inertMd(p.machine)} (${inertMd(p.cwd)})`;
   const name = p.alias ? (zh ? `，可以叫它「${inertMd(p.alias)}」` : `, which could be called "${inertMd(p.alias)}"`) : "";
+  const sessions = sessionNamesLine(p.names, zh).map((l) => `\n${l}`).join("");
   return zh
-    ? `我猜 ${where}${name}负责：${inertMd(p.role)}\n对吗？点「对」或回复 ${typedCommand("approve", ref, "zh")} 确认；点「拒绝」或回复 ${typedCommand("deny", ref, "zh")} 表示别把事情派给它；要改，直接告诉我它负责什么（或给它起个名字）。`
-    : `I think ${where}${name} handles: ${inertMd(p.role)}\nRight? Press "Right" or reply ${typedCommand("approve", ref, "en")} to confirm; press "Deny" or reply ${typedCommand("deny", ref, "en")} if nothing should be sent to it; to change it, just tell me what it handles (or what to call it).`;
+    ? `我猜 ${where}${name}负责：${inertMd(p.role)}${sessions}\n对吗？点「对」或回复 ${typedCommand("approve", ref, "zh")} 确认；点「拒绝」或回复 ${typedCommand("deny", ref, "zh")} 表示别把事情派给它；要改，直接告诉我它负责什么（或给它起个名字）。`
+    : `I think ${where}${name} handles: ${inertMd(p.role)}${sessions}\nRight? Press "Right" or reply ${typedCommand("approve", ref, "en")} to confirm; press "Deny" or reply ${typedCommand("deny", ref, "en")} if nothing should be sent to it; to change it, just tell me what it handles (or what to call it).`;
 }
 
 /**
@@ -1209,7 +1372,7 @@ export async function maybeSeatCard(input: { sessionId: string; userId: string; 
       seat_id: String(seat.seat_id), suggestion_id: String(g.id), alias: cleanAlias(g.alias), role,
       tags: Array.isArray(g.tags) ? g.tags.filter((t: unknown) => typeof t === "string") : [],
       machine: machineOf({ name: seat.machine_name, connector_id: seat.connector_id }), agent_id: String(seat.agent_id),
-      cwd: flat(seat.cwd, 300) ?? "", lang,
+      cwd: flat(seat.cwd, 300) ?? "", lang, names: (await seatsLive(input.userId, undefined, [String(seat.seat_id)])).get(String(seat.seat_id))?.names ?? [],
     };
     const card = await proposeConfirmation(tx, { sid: input.sessionId, mid: input.messageId! }, input.userId, "seat_role", params, {
       text: (ref) => seatRoleCardText(params, ref, zh), allowLabel: zh ? "对" : "Right",

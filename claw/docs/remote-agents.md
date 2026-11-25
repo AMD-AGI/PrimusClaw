@@ -571,9 +571,12 @@ its prompt treats the user's development environments (开发环境, dev box, my
 connectors, never as SaFE workspaces. The tool answers the caller's own connectors that are not
 revoked: each machine's name, whether it is online, when it was last seen, its version and its
 agents; and every session on it, both the ones open through Claw and the agents' own
-conversations a connector offers to take over (`capabilities.resumable`), each with its folder,
-state (`working`, `waiting_for_you`, `idle`, `in_terminal`), last activity, a label
-(`machine/agent/n`) and the command that attaches the user's chat to it
+conversations a connector offers to take over (`capabilities.resumable`), each with its id (the
+Claw session id or the conversation ref), its `title` (the name the user gave it on their machine,
+as `/agents` shows it; for a session open through Claw, the title of the conversation it holds or
+watches), its folder, state (`working`, `waiting_for_you`, `idle`, `in_terminal`), last activity,
+a label (`machine/agent/n`, numbered in the order `/agents` lists them) and the command that
+attaches the user's chat to it
 (`/agent attach <session id or conversation ref>`). The router passes that command to the
 channel with `channel_action`; a machine that is offline has none. A conversation open in a
 terminal on the machine has one too when its agent reports `watch_live`, marked `read_only` with a
@@ -590,6 +593,13 @@ gets one. An agent that only takes over existing conversations (`kind: attach`),
 reports no folder, or one on a machine whose name another online machine of the user's shares
 has none. With no session anywhere and one such agent, it is `attach_default`
 (`new_session: true`).
+
+When every machine is asked for, each machine lists the sessions the user's agents card (`/agents`)
+shows of it, in its order: under each of the first six agents of online machines (all machines
+counted) the conversations open in a terminal (at most five among its twelve newest), then idle ones in the room left (at most two),
+then ones the connector cannot tell (at most two); and the five newest sessions open through Claw
+of all machines. The rest are counted (`session_count`, `sessions_by_state`, `sessions_not_shown`)
+and listed when that machine is asked for by name, marked `not_on_agents_card`.
 
 ### Development environment items
 
@@ -708,11 +718,20 @@ of two sources:
 
 `seat_roster` (a router read) lists the seats with only what Claw computed or the user confirmed: `seat_id`, `alias`, the confirmed
 `role`, `role_state` (`new`, `suggested`, `confirmed`, `retired`), `machine_online`, `state` (from the types of the session's
-events and the machine's presence), `dispatch_mode` and the latest item. It has no tags: they are slugs of the git remote and branch
+events and the machine's presence), `dispatch_mode`, the latest item and `sessions`, the ids of the sessions in the seat now (its
+sessions open through Claw, and its agent's conversations of its folder open on the machine; only UUIDs), which `devenv_list` lists
+by the same ids with their labels and titles. It has no tags: they are slugs of the git remote and branch
 the machine reports, whose words a branch name can make anything, so they are only what a guess may pick from (and the API lists
 them, for a card). Nothing in it was written by a machine or an agent, so
 reading it does not mark the turn as having read untrusted text (`devenv_list` still does). `devenv_list` shows each session's seat
 (alias, confirmed role), and `GET /v1/remote-agents/seats` lists the caller's seats with their machine and folder, for a card.
+
+A seat is called what its sessions are called on the user's machine: the titles of the sessions in it now, else of its folder's
+latest conversation, each one line of at most 40 characters with control characters removed. Those are the machine's words, so they
+are never in the roster: the seat cards (`seat_set`, a guess, a task) show them, beside the alias the user gave the seat when it has
+one, and Claw compares them with the user's words when they name a seat that way (`seat_roster` and `seat_set` with `name`, whole
+names before parts of them). A name the user's message does not hold was read from what a machine wrote: `seat_roster` then marks
+the turn as having read untrusted text, and `seat_set` refuses it (`name_not_said`). A task still goes only to a `seat_id`.
 
 The connector reports each folder's git remote and branch in its heartbeat (`workspaces`, agent capability `git_info`), read from
 the files git keeps (never by running git) and normalized on the machine and again by Claw: `host/owner/repo` with no user or
