@@ -560,7 +560,7 @@ describe("M the merge gates", () => {
     }
   });
 
-  test("M3c a check run superseded by a later run of the same check on the head is not a failure: the gate and gh_pr_get read the latest run only", async () => {
+  test("M3c a cancelled check run superseded by a later run of the same check on the head is not a failure: the gate and gh_pr_get read the latest run only", async () => {
     const superseded = () => {
       e.gh.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "code-metrics" }, { context: "pr-hygiene" }] } }];
       e.gh.checkRuns = [
@@ -599,6 +599,14 @@ describe("M the merge gates", () => {
     e.gh.graphql.mergeStateStatus = "CLEAN";
     superseded();
     e.gh.checkRuns.push({ id: 45538799999, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app: { id: 15368, slug: "github-actions" } });
+    assert.equal(reason(await merge()), "ci_not_green");
+    assert.equal(puts().length, 0);
+
+    // An earlier FAILED run of the same name and app is not superseded by a later success (another workflow's job of that name, a fork's).
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.graphql.mergeStateStatus = "CLEAN";
+    superseded();
+    e.gh.checkRuns[0] = { ...e.gh.checkRuns[0], conclusion: "failure" };
     assert.equal(reason(await merge()), "ci_not_green");
     assert.equal(puts().length, 0);
   });

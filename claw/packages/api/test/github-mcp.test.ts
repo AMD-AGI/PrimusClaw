@@ -774,7 +774,7 @@ describe("B checks and the writes added for them", () => {
     assert.deepEqual([seen.length, seen[0].method, seen[0].url, seen[0].authorization], [1, "POST", `${API}/repos/o/r/actions/runs/123456/rerun-failed-jobs`, `Bearer ${GH_TOKEN}`]);
   });
 
-  test("B19b checks_list marks a run a later run of the same check superseded, so it is not read as the commit's failure", async () => {
+  test("B19b checks_list marks a cancelled run a later run of the same check superseded, so it is not read as the commit's failure", async () => {
     const app = { id: 15368, slug: "github-actions" };
     respond = (url) => {
       if (url.pathname === "/repos/o/r/commits/abc/check-runs") {
@@ -783,6 +783,8 @@ describe("B checks and the writes added for them", () => {
           { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app },
           { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "cancelled", app },
           { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app },
+          { id: 45538700001, name: "build", status: "completed", conclusion: "failure", app },
+          { id: 45538700002, name: "build", status: "completed", conclusion: "success", app },
         ] });
       }
       if (url.pathname === "/repos/o/r/commits/abc/status") return json({ state: "success", statuses: [] });
@@ -792,6 +794,8 @@ describe("B checks and the writes added for them", () => {
     const checks = JSON.parse((await call(c, "checks_list", { repo: "o/r", ref: "abc" })).text);
     assert.deepEqual(checks.check_runs.map((x: any) => [x.id, x.conclusion, x.superseded ?? false]), [
       [45538768282, "success", false], [45538768384, "success", false], [45538748410, "cancelled", true], [45538748336, "cancelled", true],
+      // A failed run is never marked: a later run of the same name may be another workflow's job.
+      [45538700001, "failure", false], [45538700002, "success", false],
     ]);
   });
 

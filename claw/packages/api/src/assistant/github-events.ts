@@ -637,7 +637,7 @@ export async function readPullRequestEvents(
   if (head && pr.state === "open") {
     const read = await checkRunsOf(gh, repoPath(r, `/commits/${encodeURIComponent(head)}/check-runs`));
     const complete = read.complete;
-    // Only the latest run of each check, as the merge gate reads it (latestCheckRuns): a run a newer one superseded is not a failure.
+    // As the merge gate reads them (latestCheckRuns): a cancelled run a later run of the same check superseded is not a failure.
     const runs = latestCheckRuns(read.runs.map((c) => ({ ...c, name: String(c?.name ?? ""), app: appOfRun(c), id: typeof c?.id === "number" ? c.id : null })));
     // A head whose runs were not all read is not known to be finished: asked again at the next poll.
     const finished = complete && runs.length > 0 && runs.every((c) => c?.status === "completed");

@@ -775,7 +775,7 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     return reviews.map((r) => ({ id: r.id, author: login(r.user), state: r.state, submitted_at: r.submitted_at, commit: r.commit_id, body: r.body ?? "" }));
   }));
 
-  mcp.tool("checks_list", "The CI of a commit, branch or tag: every check run (its id is the job id job_logs takes; a GitHub Actions job also gives the run_id of its workflow run, which checks_rerun_failed takes) and every commit status. A run marked superseded was replaced by a later run of the same check on that commit and does not count; only the latest run of each check does.", {
+  mcp.tool("checks_list", "The CI of a commit, branch or tag: every check run (its id is the job id job_logs takes; a GitHub Actions job also gives the run_id of its workflow run, which checks_rerun_failed takes) and every commit status. A run marked superseded is a cancelled run that a later run of the same check on that commit replaced, and does not count; a failed run always counts.", {
     repo: REPO, ref: z.string().describe("A commit sha (a pull request's head_sha), branch or tag"),
   }, (a) => answer("checks_list", async () => {
     const r = repoOf(a.repo);
@@ -783,9 +783,9 @@ export function buildGithubToolServer({ gh, fetchImpl = fetch, webHost = "github
     const runs = (await gh.get<any>(repoPath(r, `/commits/${ref}/check-runs`), { per_page: 100 })).json;
     const status = (await gh.get<any>(repoPath(r, `/commits/${ref}/status`))).json;
     const all: any[] = Array.isArray(runs?.check_runs) ? runs.check_runs : [];
-    // A run a later run of the same check superseded (a workflow started twice on the commit, its older run cancelled) says nothing of
-    // the commit's CI: marked, so it is not read as a failure (latestCheckRuns, as the merge gate reads it).
-    const latest = new Set(latestCheckRuns(all.map((c) => ({ run: c, name: String(c?.name ?? ""), status: "", conclusion: null, app: appOfRun(c), id: typeof c?.id === "number" ? c.id : null }))).map((x) => x.run));
+    // A cancelled run a later run of the same check superseded (a workflow started twice on the commit) says nothing of the commit's CI:
+    // marked, so it is not read as a failure (latestCheckRuns, as the merge gate reads it).
+    const latest = new Set(latestCheckRuns(all.map((c) => ({ run: c, name: String(c?.name ?? ""), status: String(c?.status ?? ""), conclusion: typeof c?.conclusion === "string" ? c.conclusion : null, app: appOfRun(c), id: typeof c?.id === "number" ? c.id : null }))).map((x) => x.run));
     return {
       check_runs: all.map((c: any) => ({
         ...(latest.has(c) ? {} : { superseded: true }),

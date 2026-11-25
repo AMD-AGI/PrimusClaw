@@ -72,6 +72,41 @@ test("a check is its name and its app: another app's run of the same name is not
   assert.deepEqual(v.summary.failedNames, ["build"]);
 });
 
+test("only a cancelled run is superseded: a later run of the same name and app does not hide a failure, and a skipped one supersedes nothing", () => {
+  // Two workflows with a job `build` (one app for every GitHub Actions job), a re-trigger that skips the job, a fork's workflow: a
+  // name and an app do not say which run replaced which, so a finished failure stands.
+  for (const failed of ["failure", "timed_out", "startup_failure", "action_required", "stale"]) {
+    for (const [status, conclusion] of [["completed", "success"], ["completed", "skipped"], ["completed", "neutral"]] as const) {
+      const runs = [
+        { id: 100, name: "build", status: "completed", conclusion: failed, app: "15368" },
+        { id: 200, name: "build", status, conclusion, app: "15368" },
+      ];
+      const v = evaluateChecks({ ...base, checkRuns: runs });
+      assert.equal(v.green, false, `${failed} then ${conclusion}`);
+      assert.deepEqual(v.summary.failedNames, ["build"], `${failed} then ${conclusion}`);
+      assert.deepEqual(latestCheckRuns(runs).map((r) => r.id), [100, 200]);
+    }
+  }
+  // A cancelled run and a later skipped one: the job never ran to an end on the head.
+  const skipped = [
+    { id: 100, name: "test", status: "completed", conclusion: "cancelled", app: "15368" },
+    { id: 200, name: "test", status: "completed", conclusion: "skipped", app: "15368" },
+  ];
+  assert.equal(evaluateChecks({ ...base, checkRuns: skipped }).green, false);
+  assert.deepEqual(latestCheckRuns(skipped).map((r) => r.id), [100, 200]);
+  // A cancelled run whose app is unknown is not superseded either.
+  assert.equal(evaluateChecks({ ...base, checkRuns: [
+    { id: 100, name: "test", status: "completed", conclusion: "cancelled", app: null },
+    { id: 200, name: "test", status: "completed", conclusion: "success", app: null },
+  ] }).green, false);
+  // A later run still running supersedes the cancelled one, and the head waits for it.
+  const running = evaluateChecks({ ...base, checkRuns: [
+    { id: 100, name: "test", status: "completed", conclusion: "cancelled", app: "15368" },
+    { id: 200, name: "test", status: "in_progress", conclusion: null, app: "15368" },
+  ] });
+  assert.deepEqual([running.green, running.summary.failedNames, running.summary.pendingNames], [false, [], ["test"]]);
+});
+
 test("commit statuses count too: success passes, pending waits, failure and error fail", () => {
   assert.equal(evaluateChecks({ ...base, checkRuns: [run("a")], statuses: [{ context: "ci/x", state: "success" }] }).green, true);
   assert.equal(evaluateChecks({ ...base, checkRuns: [run("a")], statuses: [{ context: "ci/x", state: "pending" }] }).summary.pending, 1);
