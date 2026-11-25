@@ -34,7 +34,8 @@
  *   S9 one session, one seat: each conversation a machine lists, and each a session open through Claw holds, is a seat of its own; a
  *      folder's seat (as seats were made before) moves to the session that occupies it (its session's conversation, else the one open
  *      there, else its latest), keeping its alias, role and auto dispatch; a seat that holds less of the user's is folded into the other
- *      with its tasks; two that both hold the user's words stay apart; a folder with no session known keeps its seat; each is found by its
+ *      with its tasks; two that both hold the user's words stay apart (the folder's goes to the next session there, else stays the
+ *      folder's and takes no task); a folder with no session known keeps its seat; each is found by its
  *      own session's name, keeps the name it was last listed by, and devenv_list puts each session beside its own seat
  */
 import assert from "node:assert/strict";
@@ -768,6 +769,9 @@ describe("seats", { skip }, () => {
       { ref: ref(3), title: "blog", cwd: "/w", updated_at: t - 7200, state: "idle" },
       { ref: ref(4), title: "docs", cwd: "/w3", updated_at: t - 60, state: "idle" },
       { ref: ref(5), title: "ci", cwd: "/w5", updated_at: t - 60, state: "idle" },
+      { ref: ref(7), title: "a7", cwd: "/w7", updated_at: t - 60, state: "idle" },
+      { ref: ref(10), title: "b7", cwd: "/w7", updated_at: t - 600, state: "idle" },
+      { ref: ref(8), title: "a8", cwd: "/w8", updated_at: t - 60, state: "idle" },
     ];
     const attach = { agent_id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)", capabilities: { watch_live: true, resumable: listed } };
     const cid = await machine("alice", "devpod", { agents: [CLAUDE, attach] });
@@ -790,6 +794,11 @@ describe("seats", { skip }, () => {
     await legacy("seat_ci", "claude-sessions", "/w5", { alias: "CI", role: "负责 CI", role_state: "confirmed" });
     await legacy("seat_ci_new", "claude-sessions", "/w5", {}, ref(5));
     await legacy("seat_none", "claude", "/w6", { alias: "空", role: "没有会话", role_state: "confirmed" });
+    // Both confirmed: the folder's goes to the next session there; where there is none, it stays the folder's and takes no task.
+    await legacy("seat_w7_conv", "claude-sessions", "/w7", { alias: "甲", role: "负责甲", role_state: "confirmed" }, ref(7));
+    await legacy("seat_w7", "claude-sessions", "/w7", { alias: "乙", role: "负责乙", role_state: "confirmed" });
+    await legacy("seat_w8_conv", "claude-sessions", "/w8", { alias: "丙", role: "负责丙", role_state: "confirmed" }, ref(8));
+    await legacy("seat_w8", "claude-sessions", "/w8", { alias: "丁", role: "负责丁", role_state: "confirmed" });
     const errand = async (seatId: string) => {
       const id = `it-${seatId}`;
       await w.q(
@@ -827,7 +836,13 @@ describe("seats", { skip }, () => {
     // A folder with no session known: it stays the folder's, with its role.
     const none = rows.find((r) => r.seat_id === "seat_none")!;
     assert.deepEqual([none.conversation_ref, none.role_state], [null, "confirmed"]);
-    assert.equal(rows.length, 7);
+    assert.deepEqual([byRef.get(ref(7))!.seat_id, byRef.get(ref(10))!.seat_id, byRef.get(ref(10))!.alias], ["seat_w7_conv", "seat_w7", "乙"]);
+    const unbound = rows.find((r) => r.seat_id === "seat_w8")!;
+    assert.deepEqual([unbound.conversation_ref, unbound.alias, byRef.get(ref(8))!.seat_id], [null, "丁", "seat_w8_conv"]);
+    const dispatch = await import("../src/assistant/seat-dispatch.js");
+    assert.equal(dispatch.seatRefusal((await seats.seatsLive("alice")).get("seat_w8"), "seat_w8")?.code, "seat_unbound",
+      "a folder's seat left with no session of its own takes no task (which session would be a guess)");
+    assert.equal(rows.length, 11);
     // Again: nothing moves, nothing is made twice.
     await seats.syncSeats("alice");
     assert.deepEqual((await seatRows()).map((r) => [r.seat_id, r.conversation_ref]), rows.map((r) => [r.seat_id, r.conversation_ref]));

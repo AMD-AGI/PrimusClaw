@@ -687,8 +687,9 @@ Code and its existing-sessions entry) is one seat, under the agent that takes it
 its machine has not named yet holds a seat of its folder until it does. A seat of a folder (as seats were made before 2026-11-25)
 moves to the conversation that occupies it: its current session's, else the one open there now (newest first), else the latest its
 agent had there, with its alias, role and dispatch mode; when that conversation already has a seat, the one that holds more of the
-user's (a confirmed or retired role, an alias, a guess) is kept, with the other's tasks and waiting cards, and two that both hold the
-user's words stay apart. A seat whose machine registers again under its name (a reinstall that revoked the old row) moves to the new
+user's (a confirmed or retired role, an alias, a guess) is kept, with the other's tasks and waiting cards; when both hold the user's
+words, the next session there is tried, and a folder's seat none is left for stays the folder's: a task for it is refused
+(`seat_unbound`) while no session of it holds a conversation, rather than guessing one. A seat whose machine registers again under its name (a reinstall that revoked the old row) moves to the new
 row, with what the user said of it.
 
 What a seat is for (`alias`, at most 16 characters, and `role`, at most 120) counts only once the user confirmed it on a card, from one

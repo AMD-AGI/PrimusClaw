@@ -229,7 +229,8 @@ const held = (s: Row): number => (s.role_state === "confirmed" || s.role_state =
  * A seat of a folder (made before seats were per conversation, or for such a session) moves to the conversation that occupies it: the one
  * its current session holds, else the one open there now (newest first), else the newest of the conversations its agent had there; its
  * alias, role and state go with it. When that conversation has a seat already, the one that holds more of the user's (a confirmed role,
- * an alias, a guess) is kept, with the other's tasks; two that both hold something the user said stay apart. A seat whose machine registered again under
+ * an alias, a guess) is kept, with the other's tasks; when both hold something the user said, the next session there is tried, and a
+ * seat of a folder that none is left for stays the folder's (no task goes to it until one of its sessions holds it: `seatRefusal`). A seat whose machine registered again under
  * the same name (a reinstall) moves to the new registration, so a role the user confirmed is not lost with the old one. New seats are due
  * a guess.
  */
@@ -343,38 +344,41 @@ export async function syncSeats(owner: string, q: Querier = (t, p) => db.query(t
     )).rows as Row[];
     for (const f of folders) {
       if (!live.has(String(f.connector_id))) continue;
-      let to: Place | undefined;
+      let candidates: Place[];
       const cur = f.current_session_id ? openById.get(String(f.current_session_id)) : undefined;
       if (cur) {
         const ref = conversationRefOf(cur.conversation_ref);
         // (its session's conversation is not named yet: it stays the folder's until it is)
         if (!ref) continue;
-        to = places.get(conversationKey(String(f.connector_id), ref));
+        const p = places.get(conversationKey(String(f.connector_id), ref));
+        candidates = p ? [p] : [];
       } else {
-        to = [...places.values()]
+        candidates = [...places.values()]
           .filter((p) => p.ref && p.connector_id === String(f.connector_id) && p.cwd === f.cwd && (p.agent_id === f.agent_id || p.agents.has(String(f.agent_id))))
-          .sort((x, y) => Number(y.open) - Number(x.open) || y.session_at - x.session_at || y.seen_at - x.seen_at)[0];
+          .sort((x, y) => Number(y.open) - Number(x.open) || y.session_at - x.session_at || y.seen_at - x.seen_at);
       }
-      if (!to?.ref) continue;
-      const there = (await tx(
-        "SELECT * FROM claw_devenv_seats WHERE owner_user_id = $1 AND connector_id = $2::uuid AND conversation_ref = $3 FOR UPDATE",
-        [owner, to.connector_id, to.ref],
-      )).rows[0] as Row | undefined;
-      let keep = f;
-      if (there) {
-        const [mine, theirs] = [held(f), held(there)];
-        // (both hold something the user said: neither is lost, they stay apart)
-        if (mine >= 2 && theirs >= 2) continue;
-        const [win, lose] = mine > theirs ? [f, there] : [there, f];
-        await mergeSeat(tx, owner, String(lose.seat_id), String(win.seat_id));
-        if (win === there) continue;
-        keep = win;
+      for (const to of candidates) {
+        const there = (await tx(
+          "SELECT * FROM claw_devenv_seats WHERE owner_user_id = $1 AND connector_id = $2::uuid AND conversation_ref = $3 FOR UPDATE",
+          [owner, to.connector_id, to.ref],
+        )).rows[0] as Row | undefined;
+        let keep = f;
+        if (there) {
+          const [mine, theirs] = [held(f), held(there)];
+          // (both hold something the user said: neither is lost; the next session there that does not is tried)
+          if (mine >= 2 && theirs >= 2) continue;
+          const [win, lose] = mine > theirs ? [f, there] : [there, f];
+          await mergeSeat(tx, owner, String(lose.seat_id), String(win.seat_id));
+          if (win === there) break;
+          keep = win;
+        }
+        await tx(
+          `UPDATE claw_devenv_seats SET conversation_ref = $3, agent_id = $4, cwd = $5, updated_at = NOW()
+            WHERE seat_id = $1 AND owner_user_id = $2`,
+          [keep.seat_id, owner, to.ref, to.agent_id, to.cwd],
+        );
+        break;
       }
-      await tx(
-        `UPDATE claw_devenv_seats SET conversation_ref = $3, agent_id = $4, cwd = $5, updated_at = NOW()
-          WHERE seat_id = $1 AND owner_user_id = $2`,
-        [keep.seat_id, owner, to.ref, to.agent_id, to.cwd],
-      );
     }
     for (const p of places.values()) {
       const git = workspaces.get(`${p.connector_id}\u0000${p.cwd}`);

@@ -26,7 +26,7 @@ import { readTrustedSessionCredentials, sealedCredentialFields } from "../auth/s
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS, CLAW_ASSISTANT_WORKER_MODEL } from "../config.js";
 import { connectionLost, db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
-import { executeSend, inertMd, resumableOf, type SendPlan } from "./devenv-tools.js";
+import { executeSend, inertMd, type SendPlan } from "./devenv-tools.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordSystemNotice } from "./outbound.js";
@@ -116,6 +116,12 @@ export function seatRefusal(live: SeatLive | undefined, seatId: string): ToolRef
     return new ToolRefused("seat_not_found", "no seat of the user's has that seat_id: use the seat_id from seat_roster (an alias or a machine name is not a target)");
   }
   if (live.seat.role_state === "retired") return new ToolRefused("seat_retired", "the user said not to send work to that seat");
+  // A seat of a folder whose agent only takes conversations over, with no session of its own now: which conversation would be a guess
+  // (each has its own seat), so nothing goes to it until a session of it holds one again.
+  if (!live.seat.conversation_ref && String(live.agent?.kind) === "attach" && !live.session) {
+    return new ToolRefused("seat_unbound", "that seat is a folder's from before seats were per session, and its sessions are seats of their "
+      + "own now: hand the task to one of those (seat_roster), or say which session it is (seat_set)");
+  }
   if (live.unsupported === "conversation_gone" || live.unsupported === "conversation_closed") {
     return new ToolRefused("seat_gone", live.unsupported === "conversation_gone"
       ? "that seat's conversation is no longer on its machine (deleted, or too old to resume): nothing can be sent to it; tell the user, and offer another seat or the sandbox"
@@ -239,7 +245,7 @@ function planFor(live: SeatLive, newSession: boolean): { plan: SendPlan } | { wa
     return { plan: { ...base, agent_id: live.terminal.agent_id, session_id: null, resume_ref: live.terminal.ref, label: `${live.machine}/${live.terminal.agent_id}`, terminal: true } };
   }
   // ③ Its own conversation, taken over (a seat is one conversation: never a new one in its folder, unless the user asked for that).
-  let ref: string | null = typeof seat.conversation_ref === "string" && seat.conversation_ref ? seat.conversation_ref : null;
+  const ref: string | null = typeof seat.conversation_ref === "string" && seat.conversation_ref ? seat.conversation_ref : null;
   if (ref && newSession) {
     // (refused before it was made: `newSessionRefusal`; a task from before seats were per conversation that asked for one goes there too)
     const refusal = newSessionRefusal(live, true)!;
@@ -247,12 +253,8 @@ function planFor(live: SeatLive, newSession: boolean): { plan: SendPlan } | { wa
   }
   // (Its conversation, held by no session open through Claw: its agent takes it over.)
   if (ref) return { plan: { ...base, session_id: null, resume_ref: ref, label: `${live.machine}/${String(seat.agent_id)}` } };
-  if (!ref && String(live.agent?.kind) === "attach") {
-    const free = resumableOf(live.agent!).filter((r) => r.cwd === seat.cwd && r.state !== "attached" && r.state !== "live")
-      .sort((a, b) => (b.updated_at ?? "").localeCompare(a.updated_at ?? ""));
-    ref = free[0]?.ref ?? null;
-    if (!ref) return { error: "seat_unsupported", message: "that seat's agent only takes over a conversation of its folder, and none is free there now" };
-  }
+  // (A seat of a folder whose agent only takes conversations over: never a guess at one of them; `seatRefusal` says so first.)
+  if (String(live.agent?.kind) === "attach") return { error: "seat_unbound", message: "that seat is a folder's: hand the task to one of its sessions' seats" };
   return { plan: { ...base, session_id: null, resume_ref: ref, label: `${live.machine}/${String(seat.agent_id)}/new` } };
 }
 
@@ -1068,7 +1070,7 @@ export async function drainSeatsOf(owner: string, _sessionIds: readonly string[]
 }
 
 /** Refusals a queued task never gets past. */
-const PERMANENT = new Set(["seat_not_found", "seat_retired", "seat_gone", "seat_new_session", "seat_unsupported", "item_closed", "needs_card", "seat_unattended"]);
+const PERMANENT = new Set(["seat_not_found", "seat_retired", "seat_gone", "seat_unbound", "seat_new_session", "seat_unsupported", "item_closed", "needs_card", "seat_unattended"]);
 
 /** A task that waited in a queue and will not go: it fails, said as such, and the router hears of it. */
 async function failQueued(owner: string, itemId: string, why: string): Promise<void> {
