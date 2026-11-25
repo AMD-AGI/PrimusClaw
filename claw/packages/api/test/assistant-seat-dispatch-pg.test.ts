@@ -50,6 +50,8 @@
  *       the task, said plainly, and the seat is gone (refused) until its machine lists it again
  *   D32 a seat whose conversation a session open through Claw held, once closed where no agent of its machine takes a conversation over,
  *       is gone, and the task waiting in its queue fails, said
+ *   D33 the same when the seat's agent is no longer offered by its machine: while its session is open the seat is unsupported (no_agent);
+ *       once that session closes nothing can resume the conversation, so the seat is gone and its queued task fails
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -1518,6 +1520,35 @@ describe("seat dispatch", { skip }, () => {
     await http("POST", "alice", `/v1/remote-agents/sessions/${s.sid}/commands`, { type: "close" });
     await events("alice", cid, s.sid, [["session_closed", { reason: "closed" }]]);
     await seats.syncSeats("alice");
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "gone");
+    await dispatch.runErrandSweep("alice");
+    const it = await item(queued.item_id);
+    assert.deepEqual([it.last_report_kind, it.params.queued], ["failed", undefined], JSON.stringify(it));
+    assert.match((await notices()).filter((n) => n.remote.item_seq === queued.seq).map((n) => n.text).join("\n"), /closed and no agent on its machine can take it over/);
+  });
+
+  test("D33 a seat whose agent its machine no longer offers: unsupported while its session is open, gone once that session closes", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    await events("alice", cid, s.sid, [["session_started", { acp_session_id: "5ec00000-0000-4000-8000-000000000002", agent_id: "claude", currentMode: "default", unattended: false }]]);
+    await seats.syncSeats("alice");
+    const first = await create(await userTurn(alice, "发布"), `seat:${s.seatId}`, "发布 1");
+    assert.equal(first.dispatch, "sent");
+    const queued = await create(await userTurn(alice, "再发布"), `seat:${s.seatId}`, "发布 2");
+    assert.equal(queued.dispatch, "queued");
+    // The machine stops offering the agent; its session is still open, so the conversation is live: unsupported, not gone.
+    await beat("alice", cid, []);
+    await seats.syncSeats("alice");
+    const open = (await seats.seatsLive("alice")).get(s.seatId)!;
+    assert.deepEqual([open.base, open.unsupported], ["unsupported", "no_agent"]);
+    // The session closes: nothing on the machine can resume the conversation any more.
+    await http("POST", "alice", `/v1/remote-agents/sessions/${s.sid}/commands`, { type: "close" });
+    await events("alice", cid, s.sid, [["session_closed", { reason: "closed" }]]);
+    await seats.syncSeats("alice");
+    const closed = (await seats.seatsLive("alice")).get(s.seatId)!;
+    assert.deepEqual([closed.base, closed.unsupported], ["gone", "conversation_closed"]);
     assert.equal((await seats.rosterOf("alice"))[0]!.state, "gone");
     await dispatch.runErrandSweep("alice");
     const it = await item(queued.item_id);

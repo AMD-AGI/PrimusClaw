@@ -695,13 +695,15 @@ export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_A
     const mode = session ? modes.get(String(session.session_id)) : undefined;
     const unattended = caps?.unattended === true || mode?.unattended === true;
     const version = versionVerdict(connector?.version as string | null | undefined);
+    // Its conversation, no session open through Claw holding it, and its agent gone from the machine or one that cannot take a
+    // conversation over: nothing can reach it any more.
+    const closed = online && !!seat.conversation_ref && !session && !terminal && !takesOver(agent);
     let unsupported: string | undefined;
     if (seat.gone_at) unsupported = "conversation_gone";
-    else if (!agent) unsupported = "no_agent";
-    else if (!SEAT_DISPATCH_AGENT_KINDS.has(String(agent.kind))) unsupported = "agent_kind";
+    else if (!agent) unsupported = closed ? "conversation_closed" : "no_agent";
+    else if (!SEAT_DISPATCH_AGENT_KINDS.has(String(agent.kind))) unsupported = closed ? "conversation_closed" : "agent_kind";
     else if (version.version_status === "unsupported") unsupported = "connector_outdated";
-    // Its conversation, no session open through Claw holding it, and an agent that cannot take one over: nothing can reach it any more.
-    else if (online && seat.conversation_ref && !session && !terminal && !takesOver(agent)) unsupported = "conversation_closed";
+    else if (closed) unsupported = "conversation_closed";
     const reading = session ? readActivity(session) : null;
     let base: SeatLive["base"];
     if (unsupported === "conversation_gone" || unsupported === "conversation_closed") base = "gone";
