@@ -15,9 +15,9 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
-## 0.15.0
+## 0.14.1
 
-A minor release, because core's exported API changes incompatibly: `ClawPort`'s `remoteAgents` (`ClawRemoteAgentsPort`)
+A patch release. Core's exported API changes incompatibly: `ClawPort`'s `remoteAgents` (`ClawRemoteAgentsPort`)
 gains two required members, `summary` and `setSummary`, so code that implements `ClawPort` itself must add them (the
 packaged Claw client does) (#937), and a surface of one's own has a new view to draw, `terminalEnd` (#936). No plugin port
 (core's `src/plugins/`) changed, and the store is unchanged: nothing to do for a deployment of the published packages. The
