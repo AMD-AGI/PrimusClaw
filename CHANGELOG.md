@@ -379,6 +379,11 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: a task handed to a seat within about 30 seconds of the end of the seat's previous task was queued as "the seat
+  is busy" with nothing ahead of it, and a task already waiting did not go on that end: the prompt of a task whose turn
+  had ended still counted as work in progress until the connector's next heartbeat acknowledged it, and that heartbeat
+  sends nothing waiting, so the task waited for the next event or the one-minute seat sweep (up to about a minute). A
+  prompt whose `turn_end` (or refusal) names its `cmd_seq` no longer counts as pending, so the seat is free at its end.
 - Claw: the answer a seat's agent gave by itself, after a command it put in the background finished, was lost when its
   task had been opened again meanwhile (waiting for the seat that very turn kept busy) or sent to a new session: it
   is now said as that task's late word. The five-minute quiet that ends such a turn for an older connector now waits

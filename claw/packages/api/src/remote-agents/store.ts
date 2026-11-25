@@ -840,7 +840,9 @@ const ACTIVITY_PROMPTS = 10;
  * The owner's open sessions, newest activity first, each with its newest events cut down to what says what it is doing: the
  * type, when, the text of a message chunk or the title of a tool step (at most {@link ACTIVITY_TEXT} characters), a permission
  * request's id, a turn's stop reason, a tool call's id and status, and whether the event is replayed history. `queued` counts prompts accepted for it that its connector has not
- * yet acknowledged; `open_prompts` how many of its newest {@link ACTIVITY_PROMPTS} prompts (`user_prompt`) no `turn_end` or refusal
+ * yet acknowledged and that no `turn_end` or refusal names (by `cmd_seq`) either: the connector acknowledges what it collected only with its
+ * next heartbeat (every 30 s), and a prompt whose turn has already ended is no work of the session's, so a seat whose task just ended is
+ * free at once (its next task is sent, not queued until the sweep); `open_prompts` how many of its newest {@link ACTIVITY_PROMPTS} prompts (`user_prompt`) no `turn_end` or refusal
  * after it names (by `cmd_seq`), wherever they are: a prompt queued behind a long turn can be further back than the events read.
  * Nothing of anyone else's: every row is filtered on `owner`.
  */
@@ -849,7 +851,11 @@ export async function sessionActivity(owner: string, limit: number, events = ACT
     `SELECT s.session_id::text AS session_id, s.connector_id::text AS connector_id, s.agent_id, s.cwd, s.mode,
             s.created_at, s.updated_at, ${READ_ONLY_SQL} AS read_only,
             (SELECT COUNT(*)::int FROM claw_remote_commands m
-              WHERE m.connector_id = s.connector_id AND m.session_id = s.session_id AND m.type = 'prompt') AS queued,
+              WHERE m.connector_id = s.connector_id AND m.session_id = s.session_id AND m.type = 'prompt'
+                AND NOT EXISTS (
+                  SELECT 1 FROM claw_remote_events t
+                   WHERE t.session_id = s.session_id AND t.type = ANY($9::text[]) AND t.data->'cmd_seq' = to_jsonb(m.cmd_seq)
+                     AND COALESCE(t.data->>'replay', '') <> 'true')) AS queued,
             (SELECT COUNT(*)::int FROM (
                SELECT u.id, u.data->'cmd_seq' AS cmd_seq FROM claw_remote_events u
                 WHERE u.session_id = s.session_id AND u.seq > $5 AND u.seq <= $6 AND u.type = $7
