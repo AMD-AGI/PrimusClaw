@@ -356,6 +356,7 @@ describe("seat dispatch", { skip }, () => {
 
   test("D5 a terminal someone used in the last ten minutes is not typed into; once quiet for ten minutes it is", async () => {
     const alice = await w.user("alice");
+    await w.subscribe("alice");
     const now = Math.floor(Date.now() / 1000);
     const attach = (updated: number, activity = "idle") => ({
       agent_id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)",
@@ -377,9 +378,15 @@ describe("seat dispatch", { skip }, () => {
     assert.ok(it.params.session_id);
     const opened = (await w.q("SELECT payload FROM claw_remote_commands WHERE connector_id = $1 AND type = 'session.new'", [cid]))[0];
     assert.equal(opened?.payload?.resume_ref, "11111111-1111-4111-8111-111111111111", JSON.stringify(opened));
-    // The conversation left the machine before its connector opened it: the start is refused, and the seat is gone.
-    await events("alice", cid, String(it.params.session_id), [["session_closed", { reason: "unknown_session" }]]);
-    assert.equal((await item(out.item_id)).last_report_kind, "failed");
+    // The conversation left the machine before its connector opened it: the start is refused, and the seat is gone. (The prompt behind
+    // the start is then answered `unknown_session` too, in the same batch: the task has failed already, and is told so once.)
+    await events("alice", cid, String(it.params.session_id), [["session_closed", { reason: "unknown_session" }], ["session_closed", { reason: "unknown_session" }]]);
+    const ended = await item(out.item_id);
+    assert.equal(ended.last_report_kind, "failed");
+    assert.match(String(ended.summary), /不存在/, JSON.stringify(ended));
+    const toldD5 = (await notices()).filter((n) => n.remote.item_seq === ended.seq).map((n) => n.text);
+    assert.equal(toldD5.length, 1, JSON.stringify(toldD5));
+    assert.match(toldD5[0]!, /不存在/);
     assert.equal((await seats.rosterOf("alice")).find((s) => s.seat_id === row.seat_id)!.state, "gone");
   });
 
