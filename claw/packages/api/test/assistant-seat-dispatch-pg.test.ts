@@ -42,6 +42,8 @@
  *   D27 an instruction queued behind a turn under way, or sent while the agent is on a turn of its own, is the seat's work until its own
  *       end names it, however quiet it is: its prompt is on record before the end of the turn it waited behind, and may be further
  *       back than the events a reading takes
+ *   D30 a task whose turn has ended frees its seat at once, before the connector's next heartbeat acknowledges its prompt: the next
+ *       task is sent, not queued; one that waited goes on that end (not at the sweep); a prompt not yet collected and not ended is work
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -1339,6 +1341,32 @@ describe("seat dispatch", { skip }, () => {
     await events("alice", cid, s.sid, [["tool_call_update", { update: { sessionUpdate: "tool_call_update", toolCallId: "bg1", status: "completed" } }]]);
     await age();
     assert.notEqual((await seats.rosterOf("alice"))[0]!.state, "working");
+  });
+
+  test("D30 a task whose turn ended frees its seat before the heartbeat acknowledges its prompt: the next is sent, a waiting one goes on that end", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const lastPrompt = async () => Number((await prompted(cid)).at(-1)!.cmd_seq);
+    // The first task is sent; its prompt is on record and not yet acknowledged (no heartbeat since): the seat is working.
+    const first = await create(await userTurn(alice, "发布 1"), `seat:${s.seatId}`, "任务 1");
+    assert.equal(first.dispatch, "sent", JSON.stringify(first));
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "working", "a prompt neither collected nor ended is work");
+    // Its turn ends a few seconds later, before the connector's next heartbeat: the seat is free, and a task asked now goes at once.
+    await events("alice", cid, s.sid, [chunk("ok"), ["turn_end", { stopReason: "end_turn", cmd_seq: await lastPrompt() }]]);
+    assert.equal((await item(first.item_id)).board_state, "done");
+    assert.equal((await prompted(cid)).length, 1, "still unacknowledged");
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "idle");
+    const second = await create(await userTurn(alice, "发布 2"), `seat:${s.seatId}`, "任务 2");
+    assert.equal(second.dispatch, "sent", JSON.stringify(second));
+    // A third waits behind the second; the second's end (still before any heartbeat) sends it on that event, not at the sweep.
+    const third = await create(await userTurn(alice, "发布 3"), `seat:${s.seatId}`, "任务 3");
+    assert.deepEqual([third.dispatch, third.queued_reason], ["queued", "seat_busy"], JSON.stringify(third));
+    await events("alice", cid, s.sid, [chunk("ok"), ["turn_end", { stopReason: "end_turn", cmd_seq: await lastPrompt() }]]);
+    const next = await item(third.item_id);
+    assert.equal(next.params.queued, undefined, JSON.stringify(next.params));
+    assert.ok(next.params.dispatched_at, "sent on the end of the task before it");
+    assert.equal((await prompted(cid)).length, 3);
   });
 
   test("D12 the prompt asks for parking only from a connector that can park", async () => {
