@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: MIT
 
 /**
- * Seats: what each folder an agent works in on the user's machines is for (`claw_devenv_seats`). A session ends, is compacted or is
- * taken over, and its id changes; the folder it worked in does not, so that is what a role is kept on: a seat is (machine, agent, folder).
- * It is made and kept up to date from what Claw already has of the user's remote agents (the sessions open through Claw, the
- * conversations each connector reports) by {@link syncSeats}.
+ * Seats: what each conversation of an agent on the user's machines is for (`claw_devenv_seats`). One session, one seat (2026-11-25): a
+ * seat is (machine, agent, folder, conversation), the conversation being the agent's own id of it on the machine, which outlives the
+ * sessions Claw opens on it (one is closed, another takes it over again). Six named sessions in one folder are six seats, each called
+ * what it is called there, each with its own role, queue and tasks; a task for one resumes that conversation, never a new one in its
+ * folder. They are made and kept up to date from what Claw already has of the user's remote agents (the sessions open through Claw and the
+ * conversation each holds, the conversations each connector reports) by {@link syncSeats}, which also moves a seat of a folder (as seats
+ * were before) to the conversation that occupies it.
  *
  * What a seat is for comes from two places, and either way it counts only once the user said yes on a card:
  *
@@ -37,7 +40,7 @@ import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS } from "@claw
 import { CLAW_ASSISTANT_ENABLED, CLAW_DEVENV_SEAT_DISPATCH, CLAW_DEVENV_SEATS, CLAW_DEVENV_SEATS_USERS, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { issueCommand, listConnectors, sessionActivity, wakeConnector, workspacesOf, type Row } from "../remote-agents/store.js";
+import { CONVERSATION_REF_SQL, issueCommand, listConnectors, sessionActivity, wakeConnector, workspacesOf, type Row } from "../remote-agents/store.js";
 import { heldTitle, inertMd, readActivity, resumableOf, type Resumable } from "./devenv-tools.js";
 import { versionVerdict } from "../remote-agents/setup.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
@@ -121,10 +124,10 @@ const REFRESH_MIN_MS = 60 * 60_000;
  * like any other turn.
  */
 export const PROBE_TEXTS = {
-  en: "(Your assistant, read-only: asked once to learn what this folder's session is for; nothing will be changed.)\n\n"
+  en: "(Your assistant, read-only: asked once to learn what this session is for; nothing will be changed.)\n\n"
     + "Please describe in two or three sentences what you are responsible for in this directory and what you have been working on "
     + "recently. Only answer; do not run any tool or change anything.",
-  zh: "（你的助手 只读询问：只问这一次，用来了解这个目录里的会话负责什么；不会改动任何东西。）\n\n"
+  zh: "（你的助手 只读询问：只问这一次，用来了解这个会话负责什么；不会改动任何东西。）\n\n"
     + "请用两三句话说明你在这个目录里负责什么、最近在做什么。只回答，不要运行任何工具，也不要改动任何东西。",
 } as const;
 /** The question in `lang`. */
@@ -185,50 +188,132 @@ export function tagVocabulary(gitRemote: string | null, gitBranch: string | null
 
 // --- keeping the seats ------------------------------------------------------------------------------------------------------
 
-interface Place { connector_id: string; agent_id: string; cwd: string; session_id: string | null; session_at: number; seen_at: number }
+/** A conversation's id as the machine names it (what a `resume_ref` may be), lower case; else null. */
+const REF_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+export const conversationRefOf = (v: unknown): string | null => (typeof v === "string" && REF_RE.test(v.trim()) ? v.trim().toLowerCase() : null);
+/** Agent kinds that are one agent (a conversation one of them started, another may take over): Claude Code and its takeover entry. */
+const FAMILY: Readonly<Record<string, string>> = { claude: "claude", attach: "claude" };
+const familyOf = (kind: unknown): string => FAMILY[String(kind)] ?? String(kind);
+/** Whether an agent takes over conversations that exist (it lists them, and a task may resume one with it). */
+export const takesOver = (a: Row | undefined): boolean => !!a && (String(a.kind) === "attach" || (isObject(a.capabilities) && a.capabilities.takeover === true));
+const conversationKey = (connectorId: string, ref: string): string => `${connectorId}\u0000#${ref}`;
+
+interface Place {
+  connector_id: string; agent_id: string; cwd: string;
+  /** The conversation it is, or null: a session open through Claw whose conversation its machine has not named yet. */
+  ref: string | null;
+  session_id: string | null; session_at: number; seen_at: number;
+  /** Listed by an agent that takes conversations over (the one a task resumes it with). */
+  listed: boolean;
+  /** Open now: in a terminal, or through Claw. */
+  open: boolean;
+  /** When its machine last said it is there (the heartbeat that listed it, or now for one a session open through Claw holds). */
+  proven_at: number;
+  /** Its name on the machine (the machine's words, compared whole), when known. */
+  title: string | null;
+  /** The agents whose sessions held it, and the one that lists it. */
+  agents: Set<string>;
+}
+
+/** How much a seat holds: a role the user confirmed or retired 3, an alias they gave 2, a guess waiting for them 1, nothing 0. */
+const held = (s: Row): number => (s.role_state === "confirmed" || s.role_state === "retired" ? 3 : s.alias ? 2 : s.role_state === "suggested" ? 1 : 0);
 
 /**
- * The user's seats brought up to date with what Claw has of their machines: every folder a session open through Claw works in, and
- * every folder of a conversation a connector reports (open now, or updated within {@link CONVERSATION_DAYS} days), is a seat; each
- * seat's current session is the newest one open through Claw there (none when there is none); its tags are what its folder's git
- * remote and branch make. A seat whose machine registered again under the same name (a reinstall) moves to the new registration, so
- * a role the user confirmed is not lost with the old one. New seats are due a guess.
+ * The user's seats brought up to date with what Claw has of their machines. A seat is one conversation (2026-11-25: one session, one
+ * seat): every conversation a connector reports (open now, or updated within {@link CONVERSATION_DAYS} days) and every one a session open
+ * through Claw holds (the one it started or took over, as its `session_started` names it) is a seat, called what that conversation is
+ * called on the machine; its current session is the newest one open through Claw that holds it (none when there is none). A session open
+ * through Claw whose conversation its machine has not named yet holds a seat of its folder until it does. Its tags are what its folder's
+ * git remote and branch make.
+ *
+ * A seat of a folder (made before seats were per conversation, or for such a session) moves to the conversation that occupies it: the one
+ * its current session holds, else the one open there now (newest first), else the newest of the conversations its agent had there; its
+ * alias, role and state go with it. When that conversation has a seat already, the one that holds more of the user's (a confirmed role,
+ * an alias, a guess) is kept, with the other's tasks; when both hold something the user said, the next session there is tried, and a
+ * seat of a folder that none is left for stays the folder's (no task goes to it until one of its sessions holds it: `seatRefusal`). A seat whose machine registered again under
+ * the same name (a reinstall) moves to the new registration, so a role the user confirmed is not lost with the old one. New seats are due
+ * a guess.
  */
 export async function syncSeats(owner: string, q: Querier = (t, p) => db.query(t, p), onlineWindowMs: number = REMOTE_AGENT_TIMING.onlineWindowMs): Promise<void> {
   const connectors = await listConnectors(owner, onlineWindowMs);
   const sessions = (await q(
-    `SELECT session_id::text AS session_id, connector_id::text AS connector_id, agent_id, cwd, updated_at
-       FROM claw_remote_sessions WHERE owner_user_id = $1 AND status = 'active' AND origin IS DISTINCT FROM 'terminal_hook'`,
-    [owner],
+    `SELECT s.session_id::text AS session_id, s.connector_id::text AS connector_id, s.agent_id, s.cwd, s.updated_at, s.status,
+            ${CONVERSATION_REF_SQL} AS conversation_ref
+       FROM claw_remote_sessions s
+      WHERE s.owner_user_id = $1 AND s.origin IS DISTINCT FROM 'terminal_hook'
+        AND (s.status = 'active' OR s.updated_at > NOW() - make_interval(days => $2::int))
+      ORDER BY s.updated_at DESC LIMIT 1000`,
+    [owner, CONVERSATION_DAYS],
   )).rows as Row[];
   const places = new Map<string, Place>();
-  const put = (connectorId: string, agentId: string, cwd: unknown, sessionId: string | null, at: number) => {
-    if (typeof cwd !== "string" || !cwd || cwd.length > 4096) return;
-    const k = placeKey(connectorId, agentId, cwd);
-    const was = places.get(k);
-    if (!was) places.set(k, { connector_id: connectorId, agent_id: agentId, cwd, session_id: sessionId, session_at: sessionId ? at : 0, seen_at: at });
-    else {
-      if (sessionId && at >= was.session_at) Object.assign(was, { session_id: sessionId, session_at: at });
-      was.seen_at = Math.max(was.seen_at, at);
-    }
-  };
   const live = new Set(connectors.map((c) => String(c.connector_id)));
-  for (const s of sessions) {
-    if (!live.has(String(s.connector_id))) continue;
-    put(String(s.connector_id), String(s.agent_id), s.cwd, String(s.session_id), new Date(s.updated_at).getTime());
-  }
+  const agentsOf = (cid: string) => (Array.isArray(connectors.find((c) => String(c.connector_id) === cid)?.agents)
+    ? connectors.find((c) => String(c.connector_id) === cid)!.agents : []) as Row[];
   const since = Date.now() / 1000 - CONVERSATION_DAYS * 86_400;
+  // The conversations each machine lists.
   for (const c of connectors) {
+    const cid = String(c.connector_id);
+    const beat = new Date(c.heartbeat_at ?? 0).getTime() || 0;
     for (const a of (Array.isArray(c.agents) ? c.agents : []) as Row[]) {
       const caps = isObject(a.capabilities) ? a.capabilities : {};
       for (const r of Array.isArray(caps.resumable) ? caps.resumable : []) {
         if (!isObject(r)) continue;
-        const recent = r.state === "live" || (typeof r.updated_at === "number" && r.updated_at >= since);
+        const ref = conversationRefOf(r.ref);
+        if (!ref || typeof r.cwd !== "string" || !r.cwd || r.cwd.length > 4096) continue;
+        const recent = r.state === "live" || r.state === "attached" || (typeof r.updated_at === "number" && r.updated_at >= since);
+        if (!recent) continue;
         // When it was last used: now, for one open in a terminal; else when its conversation was last written.
         const at = r.state === "live" ? Date.now() : typeof r.updated_at === "number" ? r.updated_at * 1000 : 0;
-        if (recent) put(String(c.connector_id), String(a.agent_id), r.cwd, null, at);
+        const k = conversationKey(cid, ref);
+        const was = places.get(k);
+        if (was) { was.agents.add(String(a.agent_id)); continue; }
+        places.set(k, {
+          connector_id: cid, agent_id: String(a.agent_id), cwd: r.cwd, ref, session_id: null, session_at: 0, seen_at: at, listed: true,
+          open: r.state === "live" || r.state === "attached", proven_at: beat, title: matchName(r.title), agents: new Set([String(a.agent_id)]),
+        });
       }
     }
+  }
+  // The sessions open through Claw: the conversation each holds (or, while its machine has not named it, its folder; one opened to
+  // take over a seat's conversation is that seat's from the start).
+  const claimed = new Map(((await q(
+    `SELECT current_session_id::text AS session_id, conversation_ref FROM claw_devenv_seats
+      WHERE owner_user_id = $1 AND conversation_ref IS NOT NULL AND current_session_id IS NOT NULL`,
+    [owner],
+  )).rows as Row[]).map((r) => [String(r.session_id), String(r.conversation_ref)]));
+  const openById = new Map<string, Row>();
+  for (const s of sessions) {
+    if (s.status !== "active" || !live.has(String(s.connector_id))) continue;
+    openById.set(String(s.session_id), s);
+    const cid = String(s.connector_id);
+    const agentId = String(s.agent_id);
+    const cwd = s.cwd;
+    if (typeof cwd !== "string" || !cwd || cwd.length > 4096) continue;
+    const at = new Date(s.updated_at).getTime();
+    const ref = conversationRefOf(s.conversation_ref) ?? claimed.get(String(s.session_id)) ?? null;
+    const k = ref ? conversationKey(cid, ref) : placeKey(cid, agentId, cwd);
+    const was = places.get(k);
+    if (!was) {
+      const agents = agentsOf(cid);
+      const self = agents.find((a) => String(a.agent_id) === agentId);
+      // A conversation of an agent that another of the machine's agents takes over: the seat is that one's (a task resumes it with it).
+      const over = ref ? agents.find((a) => takesOver(a) && familyOf(a.kind) === familyOf(self?.kind ?? "")) : undefined;
+      places.set(k, {
+        connector_id: cid, agent_id: over ? String(over.agent_id) : agentId, cwd, ref, session_id: String(s.session_id), session_at: at, seen_at: at,
+        listed: false, open: true, proven_at: Date.now(), title: matchName(heldTitle(self, s)), agents: new Set([agentId]),
+      });
+    } else {
+      was.agents.add(agentId);
+      was.open = true;
+      was.proven_at = Math.max(was.proven_at, Date.now());
+      if (at >= was.session_at) Object.assign(was, { session_id: String(s.session_id), session_at: at });
+      was.seen_at = Math.max(was.seen_at, at);
+    }
+  }
+  // (The agents whose sessions held a conversation before: a seat of their folder may move to it.)
+  for (const s of sessions) {
+    const ref = conversationRefOf(s.conversation_ref);
+    if (ref) places.get(conversationKey(String(s.connector_id), ref))?.agents.add(String(s.agent_id));
   }
   const workspaces = await workspacesOf(owner, q);
   await inTransaction(async (tx) => {
@@ -251,21 +336,85 @@ export async function syncSeats(owner: string, q: Querier = (t, p) => db.query(t
          FROM pick WHERE s.seat_id = pick.seat_id`,
       [owner],
     );
+    // A seat of a folder moves to the conversation that occupies it.
+    const folders = (await tx(
+      `SELECT *, connector_id::text AS connector_id, current_session_id::text AS current_session_id FROM claw_devenv_seats
+        WHERE owner_user_id = $1 AND conversation_ref IS NULL ORDER BY (role_state = 'confirmed') DESC NULLS LAST, last_seen_at DESC FOR UPDATE`,
+      [owner],
+    )).rows as Row[];
+    for (const f of folders) {
+      if (!live.has(String(f.connector_id))) continue;
+      const cur = f.current_session_id ? openById.get(String(f.current_session_id)) : undefined;
+      const curRef = cur ? conversationRefOf(cur.conversation_ref) : null;
+      // (its session's conversation is not named yet: it stays the folder's until it is)
+      if (cur && !curRef) continue;
+      // Its session's conversation first, then the others of its folder: open ones, newest first.
+      const first = curRef ? places.get(conversationKey(String(f.connector_id), curRef)) : undefined;
+      const candidates = [...(first ? [first] : []), ...[...places.values()]
+        .filter((p) => p !== first && p.ref && p.connector_id === String(f.connector_id) && p.cwd === f.cwd
+          && (p.agent_id === f.agent_id || p.agents.has(String(f.agent_id))))
+        .sort((x, y) => Number(y.open) - Number(x.open) || y.session_at - x.session_at || y.seen_at - x.seen_at)];
+      for (const to of candidates) {
+        const there = (await tx(
+          "SELECT * FROM claw_devenv_seats WHERE owner_user_id = $1 AND connector_id = $2::uuid AND conversation_ref = $3 FOR UPDATE",
+          [owner, to.connector_id, to.ref],
+        )).rows[0] as Row | undefined;
+        let keep = f;
+        if (there) {
+          const [mine, theirs] = [held(f), held(there)];
+          // (both hold something the user said: neither is lost; the next session there that does not is tried)
+          if (mine >= 2 && theirs >= 2) continue;
+          const [win, lose] = mine > theirs ? [f, there] : [there, f];
+          await mergeSeat(tx, owner, String(lose.seat_id), String(win.seat_id));
+          if (win === there) break;
+          keep = win;
+        }
+        await tx(
+          `UPDATE claw_devenv_seats SET conversation_ref = $3, agent_id = $4, cwd = $5, updated_at = NOW()
+            WHERE seat_id = $1 AND owner_user_id = $2`,
+          [keep.seat_id, owner, to.ref, to.agent_id, to.cwd],
+        );
+        break;
+      }
+    }
     for (const p of places.values()) {
       const git = workspaces.get(`${p.connector_id}\u0000${p.cwd}`);
       const tags = tagVocabulary(git?.git_remote ?? null, git?.git_branch ?? null);
+      if (p.ref) {
+        // Its seat follows the agent a task resumes it with, and its folder (as its machine says it now).
+        await tx(
+          `UPDATE claw_devenv_seats s SET agent_id = $4, cwd = $5, updated_at = NOW()
+            WHERE s.owner_user_id = $1 AND s.connector_id = $2::uuid AND s.conversation_ref = $3 AND (s.agent_id <> $4 OR s.cwd <> $5)
+              AND NOT EXISTS (SELECT 1 FROM claw_devenv_seats d WHERE d.owner_user_id = $1 AND d.connector_id = $2::uuid AND d.agent_id = $4
+                                AND d.cwd = $5 AND d.conversation_ref = $3)`,
+          [owner, p.connector_id, p.ref, p.agent_id, p.cwd],
+        );
+      }
       await tx(
-        `INSERT INTO claw_devenv_seats (seat_id, owner_user_id, connector_id, agent_id, cwd, tags, current_session_id, infer_state, infer_due_at, last_seen_at)
-         VALUES ($1, $2, $3::uuid, $4, $5, $6::text[], $7::uuid, 'due', NOW(), LEAST(NOW(), to_timestamp($8::float8 / 1000)))
+        `INSERT INTO claw_devenv_seats (seat_id, owner_user_id, connector_id, agent_id, cwd, conversation_ref, conversation_title, tags, current_session_id,
+                                        infer_state, infer_due_at, last_seen_at)
+         VALUES ($1, $2, $3::uuid, $4, $5, $6, $7, $8::text[], $9::uuid, 'due', NOW(), LEAST(NOW(), to_timestamp($10::float8 / 1000)))
          ON CONFLICT (owner_user_id, connector_id, agent_id, cwd, (COALESCE(conversation_ref, ''))) DO UPDATE
            SET current_session_id = EXCLUDED.current_session_id, last_seen_at = GREATEST(claw_devenv_seats.last_seen_at, EXCLUDED.last_seen_at),
-               tags = EXCLUDED.tags, updated_at = NOW()
+               tags = EXCLUDED.tags, conversation_title = COALESCE(EXCLUDED.conversation_title, claw_devenv_seats.conversation_title),
+               gone_at = CASE WHEN claw_devenv_seats.gone_at < to_timestamp($11::float8 / 1000) THEN NULL ELSE claw_devenv_seats.gone_at END,
+               updated_at = NOW()
            WHERE claw_devenv_seats.current_session_id IS DISTINCT FROM EXCLUDED.current_session_id
-              OR claw_devenv_seats.last_seen_at < EXCLUDED.last_seen_at OR claw_devenv_seats.tags IS DISTINCT FROM EXCLUDED.tags`,
-        [`seat_${randomUUID().replace(/-/g, "").slice(0, 20)}`, owner, p.connector_id, p.agent_id, p.cwd, tags, p.session_id, p.seen_at],
+              OR claw_devenv_seats.last_seen_at < EXCLUDED.last_seen_at OR claw_devenv_seats.tags IS DISTINCT FROM EXCLUDED.tags
+              OR (EXCLUDED.conversation_title IS NOT NULL AND claw_devenv_seats.conversation_title IS DISTINCT FROM EXCLUDED.conversation_title)
+              OR claw_devenv_seats.gone_at < to_timestamp($11::float8 / 1000)`,
+        [`seat_${randomUUID().replace(/-/g, "").slice(0, 20)}`, owner, p.connector_id, p.agent_id, p.cwd, p.ref, p.title, tags, p.session_id,
+          p.seen_at, p.proven_at],
       );
     }
-    // A seat whose session closed has none now (the next one open through Claw there is its).
+    // A seat of a folder holds no session whose conversation is named (that session is its conversation's seat's, even when this one
+    // could not move there): a task for it never reaches another seat's conversation.
+    await tx(
+      `UPDATE claw_devenv_seats s SET current_session_id = NULL, updated_at = NOW()
+        WHERE s.owner_user_id = $1 AND s.conversation_ref IS NULL AND s.current_session_id = ANY($2::uuid[])`,
+      [owner, [...openById.values()].filter((o) => conversationRefOf(o.conversation_ref) || claimed.has(String(o.session_id))).map((o) => String(o.session_id))],
+    );
+    // A seat whose session closed has none now (the next one open through Claw that holds its conversation is its).
     await tx(
       `UPDATE claw_devenv_seats s SET current_session_id = NULL, updated_at = NOW()
         WHERE s.owner_user_id = $1 AND s.current_session_id IS NOT NULL
@@ -275,14 +424,41 @@ export async function syncSeats(owner: string, q: Querier = (t, p) => db.query(t
   });
 }
 
+/**
+ * Two seats that are one conversation made one: `drop`'s tasks, and its cards still waiting for the user (a task's, a name's), are
+ * `keep`'s now, and so is its "a card every time" when it had one; a guess card of its is closed; then it is deleted.
+ */
+async function mergeSeat(q: Querier, owner: string, drop: string, keep: string): Promise<void> {
+  // A card every time, asked for either: kept (the more careful of the two never gets lost with the seat that said it).
+  await q(
+    `UPDATE claw_devenv_seats k SET confirm_each = true, dispatch_mode = 'card', auto_since = NULL, updated_at = NOW()
+       FROM claw_devenv_seats d
+      WHERE k.seat_id = $2 AND k.owner_user_id = $1 AND d.seat_id = $3 AND d.owner_user_id = $1 AND d.confirm_each AND NOT k.confirm_each`,
+    [owner, keep, drop],
+  );
+  await q(
+    `UPDATE claw_work_items SET params = jsonb_set(params, '{seat_id}', to_jsonb($3::text)), updated_at = NOW()
+      WHERE user_id = $1 AND kind = 'remote' AND params->>'errand' = 'true' AND params->>'seat_id' = $2`,
+    [owner, drop, keep],
+  );
+  await q(
+    `UPDATE claw_assistant_confirmations SET params = jsonb_set(params, '{seat_id}', to_jsonb($3::text))
+      WHERE user_id = $1 AND status = 'pending' AND kind IN ('seat_dispatch', 'seat_set') AND params->>'seat_id' = $2`,
+    [owner, drop, keep],
+  );
+  await closeGuessCards(q, owner, drop, "seat_merged");
+  await q("DELETE FROM claw_devenv_seats WHERE seat_id = $1 AND owner_user_id = $2", [drop, owner]);
+}
+
 // --- the roster -------------------------------------------------------------------------------------------------------------
 
 /**
- * Where a seat stands, first match wins: its machine offline; it cannot take work (connector too old, agent gone or of a kind tasks are
+ * Where a seat stands, first match wins: its conversation is gone (its machine said it is no longer there, or it was closed where no agent
+ * of its machine can take it over); its machine offline; it cannot take work (connector too old, agent gone or of a kind tasks are
  * not handed to); its session (or a task of it) waits for the user's approval; it is working; its conversation is open in a terminal
  * someone is at; tasks wait in its queue; idle.
  */
-export type SeatState = "offline" | "unsupported" | "waiting_for_you" | "working" | "in_terminal" | "queued" | "idle";
+export type SeatState = "gone" | "offline" | "unsupported" | "waiting_for_you" | "working" | "in_terminal" | "queued" | "idle";
 
 /** One seat as the router reads it: nothing in it was written by a machine or an agent. */
 export interface RosterSeat {
@@ -330,7 +506,7 @@ export interface SeatLive {
   /** The state before its queue is counted, and with it. */
   base: Exclude<SeatState, "queued">;
   state: SeatState;
-  /** Why it cannot take work (`unsupported`): `connector_outdated`, `no_agent`, `agent_kind`. */
+  /** Why it cannot take work: `connector_outdated`, `no_agent`, `agent_kind` (`unsupported`); `conversation_gone`, `conversation_closed` (`gone`). */
   unsupported?: string;
   upgrade_command?: string;
   /** Its current session open through Claw, as `sessionActivity` reads it, when it is active. */
@@ -368,7 +544,28 @@ const matchName = (v: unknown): string | null => flat(v, 200);
 export function seatOccupants(
   seat: Row, agents: readonly Row[], open: readonly Row[],
 ): { sessions: SeatSession[]; names: string[]; known_names: string[] } {
-  const here = (cwd: unknown, ref?: string) => cwd === seat.cwd && (!seat.conversation_ref || ref === undefined || ref === seat.conversation_ref);
+  const uniq = (xs: Array<string | null>) => [...new Set(xs.filter((x): x is string => !!x))];
+  const ref = conversationRefOf(seat.conversation_ref);
+  if (ref) {
+    // One conversation: the sessions open through Claw that hold it (of any agent of its machine), then the conversation itself when it
+    // is open in a terminal there. It is called what it is called on the machine (as listed now, else as it was last listed).
+    let listed: Resumable | undefined;
+    for (const a of agents) listed ??= resumableOf(a).find((r) => r.ref.toLowerCase() === ref);
+    const stored = typeof seat.conversation_title === "string" ? seat.conversation_title : null;
+    const sessions: SeatSession[] = [];
+    let held: string | null = null;
+    for (const o of open) {
+      if (String(o.connector_id) !== String(seat.connector_id) || conversationRefOf(o.conversation_ref) !== ref) continue;
+      held ??= heldTitle(agents.find((a) => String(a.agent_id) === String(o.agent_id)), o);
+      sessions.push({ id: String(o.session_id), name: sessionName(listed?.title ?? held ?? stored), opened_in: "chat" });
+    }
+    if (listed?.state === "live" && !sessions.some((x) => x.id.toLowerCase() === ref)) {
+      sessions.push({ id: listed.ref, name: sessionName(listed.title ?? stored), opened_in: "machine" });
+    }
+    const title = listed?.title ?? held ?? stored;
+    return { sessions, names: uniq([sessionName(title)]), known_names: uniq([matchName(title), matchName(stored)]) };
+  }
+  const here = (cwd: unknown) => cwd === seat.cwd;
   const sessions: SeatSession[] = [];
   const whole: Array<string | null> = [];
   for (const o of open) {
@@ -382,7 +579,7 @@ export function seatOccupants(
   const conversations: Array<Resumable & { name: string | null; whole: string | null }> = [];
   for (const a of agents) {
     if (String(a.agent_id) !== String(seat.agent_id)) continue;
-    for (const r of resumableOf(a)) if (here(r.cwd, r.ref)) conversations.push({ ...r, name: sessionName(r.title), whole: matchName(r.title) });
+    for (const r of resumableOf(a)) if (here(r.cwd)) conversations.push({ ...r, name: sessionName(r.title), whole: matchName(r.title) });
   }
   conversations.sort((x, y) => (y.updated_at ?? "").localeCompare(x.updated_at ?? ""));
   for (const r of conversations) {
@@ -390,7 +587,6 @@ export function seatOccupants(
     sessions.push({ id: r.ref, name: r.name, opened_in: "machine" });
     whole.push(r.whole);
   }
-  const uniq = (xs: Array<string | null>) => [...new Set(xs.filter((x): x is string => !!x))];
   const occupied = uniq(sessions.map((x) => x.name));
   return {
     sessions,
@@ -483,7 +679,7 @@ export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_A
     for (const a of agents) {
       for (const r of resumableOf(a)) {
         if (r.state !== "live" || r.cwd !== seat.cwd) continue;
-        if (seat.conversation_ref && r.ref !== seat.conversation_ref) continue;
+        if (seat.conversation_ref && r.ref.toLowerCase() !== String(seat.conversation_ref)) continue;
         terminal = { ...r, agent_id: String(a.agent_id) };
       }
     }
@@ -499,13 +695,19 @@ export async function seatsLive(owner: string, onlineWindowMs: number = REMOTE_A
     const mode = session ? modes.get(String(session.session_id)) : undefined;
     const unattended = caps?.unattended === true || mode?.unattended === true;
     const version = versionVerdict(connector?.version as string | null | undefined);
+    // Its conversation, no session open through Claw holding it, and its agent gone from the machine or one that cannot take a
+    // conversation over: nothing can reach it any more.
+    const closed = online && !!seat.conversation_ref && !session && !terminal && !takesOver(agent);
     let unsupported: string | undefined;
-    if (!agent) unsupported = "no_agent";
-    else if (!SEAT_DISPATCH_AGENT_KINDS.has(String(agent.kind))) unsupported = "agent_kind";
+    if (seat.gone_at) unsupported = "conversation_gone";
+    else if (!agent) unsupported = closed ? "conversation_closed" : "no_agent";
+    else if (!SEAT_DISPATCH_AGENT_KINDS.has(String(agent.kind))) unsupported = closed ? "conversation_closed" : "agent_kind";
     else if (version.version_status === "unsupported") unsupported = "connector_outdated";
+    else if (closed) unsupported = "conversation_closed";
     const reading = session ? readActivity(session) : null;
     let base: SeatLive["base"];
-    if (!online) base = "offline";
+    if (unsupported === "conversation_gone" || unsupported === "conversation_closed") base = "gone";
+    else if (!online) base = "offline";
     else if (unsupported) base = "unsupported";
     else if (reading?.state === "waiting_for_you" || running.some((r) => r.waiting)) base = "waiting_for_you";
     else if (reading?.state === "working" || running.length) base = "working";
@@ -567,7 +769,9 @@ export async function rosterOf(
          SELECT seq, board_state FROM (
            (SELECT w.seq, w.board_state, w.updated_at FROM claw_remote_sessions r
               JOIN claw_work_items w ON w.worker_session_id = 'remote:' || r.session_id::text AND w.user_id = s.owner_user_id
-             WHERE r.owner_user_id = s.owner_user_id AND r.connector_id = s.connector_id AND r.agent_id = s.agent_id AND r.cwd = s.cwd
+             WHERE r.owner_user_id = s.owner_user_id AND r.connector_id = s.connector_id
+               AND (CASE WHEN s.conversation_ref IS NULL THEN r.agent_id = s.agent_id AND r.cwd = s.cwd
+                         ELSE ${CONVERSATION_REF_SQL.replace(/\bs\.session_id\b/g, "r.session_id")} = s.conversation_ref END)
              ORDER BY w.updated_at DESC LIMIT 1)
            UNION ALL
            (SELECT w.seq, w.board_state, w.updated_at FROM claw_work_items w
@@ -615,18 +819,19 @@ export const ROSTER_SESSIONS_NOTE = "sessions are the ids of the sessions in a s
   + "now. Name only seats and sessions these results list.";
 
 /** The roster's note where tasks may be handed to seats (`seat-dispatch.ts`). */
-export const ROSTER_NOTE = "Seats (工位): each folder an agent works in on the user's machines. Every field here was computed by Claw or "
+export const ROSTER_NOTE = "Seats (工位): each conversation (session) of an agent on the user's machines is one seat. Every field here was computed by Claw or "
   + "confirmed by the user (alias, role): reading it does not stop you from acting. role is what the user confirmed the seat is for. "
   + "A guess Claw made is never listed: it is put to the user on a card. A seat the user names by its machine, agent or folder: "
   + "seat_roster with machine, agent and/or folder as they wrote them lists only the seats there; by the name of one of its sessions "
   + "(what /agents shows) or its alias: seat_roster with name. " + ROSTER_SESSIONS_NOTE + " To hand a task to a seat: work_create with target "
-  + "\"seat:<seat_id>\" (only a seat_id from here, never an alias or a machine name). state: unsupported cannot take work; offline: "
+  + "\"seat:<seat_id>\" (only a seat_id from here, never an alias or a machine name): it goes to that conversation. state: gone: its "
+  + "conversation is no longer on its machine, nothing can be sent to it (say so, and offer another seat or the sandbox); unsupported cannot take work; offline: "
   + "a task waits in its queue until the machine is back (at most 24 hours); working, waiting_for_you, queued and in_terminal: a task "
   + "waits in its queue (queue_len). dispatch_mode auto: a task goes without a card (only after the user pressed one for that seat); "
   + "confirm_each: a card every time.";
 
 /** The roster's note while seats are only shown (seat dispatch off). */
-export const ROSTER_SHOWN_NOTE = "Seats (工位): each folder an agent works in on the user's machines. Every field here was computed by Claw or "
+export const ROSTER_SHOWN_NOTE = "Seats (工位): each conversation (session) of an agent on the user's machines is one seat. Every field here was computed by Claw or "
   + "confirmed by the user (alias, role): reading it does not stop you from acting. role is what the user confirmed the seat is for. "
   + "A guess Claw made is never listed: it is put to the user on a card. A seat the user names by the name of one of its sessions (what "
   + "/agents shows) or its alias: seat_roster with name. " + ROSTER_SESSIONS_NOTE + " What its agent is doing is in devenv_list (which the machine "
@@ -726,7 +931,7 @@ async function resolveSeat(owner: string, args: SeatSetArgs, onlineWindowMs: num
     const exact = pool.filter((s) => String(s.seat_id).toLowerCase() === seatAsked || (typeof s.alias === "string" && s.alias.toLowerCase() === seatAsked));
     pool = exact;
   }
-  if (session) pool = pool.filter((s) => String(s.current_session_id ?? "").toLowerCase() === session);
+  if (session) pool = pool.filter((s) => String(s.current_session_id ?? "").toLowerCase() === session || String(s.conversation_ref ?? "") === session);
   if (nameAsked) {
     const known = await names();
     const by = (exact: boolean) => pool.filter((s) => seatNameIs(nameAsked, typeof s.alias === "string" ? s.alias : null, known.get(String(s.seat_id))?.known_names ?? [], exact));
@@ -1000,26 +1205,33 @@ export async function seatInputs(q: Querier, seat: Row, onlineWindowMs: number =
   const owner = String(seat.owner_user_id);
   const git = (await workspacesOf(owner, q)).get(`${String(seat.connector_id)}\u0000${String(seat.cwd)}`);
   const titles: string[] = [];
+  // A seat of one conversation: that conversation's name only (and the user's words in it only, below); a folder's: its conversations'.
+  const ref = conversationRefOf(seat.conversation_ref);
+  if (ref && typeof seat.conversation_title === "string") titles.push(flat(seat.conversation_title, TITLE_MAX) ?? "");
   for (const c of await listConnectors(owner, onlineWindowMs)) {
     if (String(c.connector_id) !== String(seat.connector_id)) continue;
     for (const a of (Array.isArray(c.agents) ? c.agents : []) as Row[]) {
-      if (String(a.agent_id) !== String(seat.agent_id)) continue;
+      if (!ref && String(a.agent_id) !== String(seat.agent_id)) continue;
       const caps = isObject(a.capabilities) ? a.capabilities : {};
       for (const r of Array.isArray(caps.resumable) ? caps.resumable : []) {
-        const t = isObject(r) && r.cwd === seat.cwd ? flat(r.title, TITLE_MAX) : null;
+        if (!isObject(r) || (ref ? conversationRefOf(r.ref) !== ref : r.cwd !== seat.cwd)) continue;
+        const t = flat(r.title, TITLE_MAX);
         if (t && !titles.includes(t) && titles.length < TITLES_MAX) titles.push(t);
       }
     }
   }
+  if (titles[0] === "") titles.shift();
   // The user's own words there: what they sent (never the question Claw put), and what the agent's transcript replays of theirs.
   const said = (await q(
     `SELECT e.type, COALESCE(e.data->>'text', e.data->'update'->'content'->>'text') AS text, e.data->>'title' AS title
        FROM claw_remote_events e JOIN claw_remote_sessions s ON s.session_id = e.session_id
-      WHERE s.owner_user_id = $1 AND s.connector_id = $2::uuid AND s.agent_id = $3 AND s.cwd = $4
+      WHERE s.owner_user_id = $1 AND s.connector_id = $2::uuid
+        AND (CASE WHEN $6::text IS NULL THEN s.agent_id = $3 AND s.cwd = $4
+                  ELSE ${CONVERSATION_REF_SQL} = $6 OR (s.origin = 'terminal_hook' AND LOWER(s.ref) = $6) END)
         AND (e.type = 'user_message_chunk' OR (e.type = 'user_prompt' AND COALESCE(e.data->>'client', '') <> $5)
              OR (e.type = 'session_started' AND e.data ? 'title'))
       ORDER BY e.id DESC LIMIT 400`,
-    [owner, seat.connector_id, seat.agent_id, seat.cwd, PROBE_CLIENT],
+    [owner, seat.connector_id, seat.agent_id, seat.cwd, PROBE_CLIENT, ref],
   )).rows as Row[];
   const prompts: string[] = [];
   for (const r of said) {
@@ -1388,17 +1600,26 @@ export async function maybeSeatCard(input: { sessionId: string; userId: string; 
 
 // --- what the machines' listing shows of seats ------------------------------------------------------------------------------
 
-/** The user's seats by (connector, agent, folder): what `devenv_list` puts beside each session (its alias, and its role once confirmed). */
+/**
+ * The user's seats by conversation (`seatConversationKey`) and, for a seat of a folder, by (connector, agent, folder): what `devenv_list`
+ * puts beside each session (its alias, and its role once confirmed).
+ */
 export async function seatsByPlace(owner: string): Promise<Map<string, { seat_id: string; alias: string | null; role: string | null }>> {
   const rows = (await db.query(
-    `SELECT seat_id, connector_id::text AS connector_id, agent_id, cwd, alias, role, role_state FROM claw_devenv_seats
-      WHERE owner_user_id = $1 AND conversation_ref IS NULL`,
+    `SELECT seat_id, connector_id::text AS connector_id, agent_id, cwd, conversation_ref, alias, role, role_state FROM claw_devenv_seats
+      WHERE owner_user_id = $1`,
     [owner],
   )).rows as Row[];
-  return new Map(rows.map((r) => [placeKey(String(r.connector_id), String(r.agent_id), String(r.cwd)), {
-    seat_id: String(r.seat_id), alias: typeof r.alias === "string" ? r.alias : null, role: r.role_state === "confirmed" && typeof r.role === "string" ? r.role : null,
-  }]));
+  return new Map(rows.map((r) => [
+    r.conversation_ref ? conversationKey(String(r.connector_id), String(r.conversation_ref)) : placeKey(String(r.connector_id), String(r.agent_id), String(r.cwd)),
+    { seat_id: String(r.seat_id), alias: typeof r.alias === "string" ? r.alias : null, role: r.role_state === "confirmed" && typeof r.role === "string" ? r.role : null },
+  ]));
 }
+/** The key of a conversation's seat in {@link seatsByPlace}, from its id as a machine or a session names it; null for no id. */
+export const seatConversationKey = (connectorId: string, ref: unknown): string | null => {
+  const r = conversationRefOf(ref);
+  return r ? conversationKey(connectorId, r) : null;
+};
 export const seatPlaceKey = placeKey;
 
 /** The user's seats as the API lists them (`GET /v1/remote-agents/seats`): the machine and folder too, for a card that shows them. */
@@ -1407,7 +1628,7 @@ export async function listSeatsForOwner(owner: string): Promise<Row[]> {
   return (await db.query(
     `SELECT s.seat_id, s.connector_id::text AS connector_id, c.name AS machine, s.agent_id, s.cwd, s.alias,
             CASE WHEN s.role_state = 'confirmed' THEN s.role END AS role, COALESCE(s.role_state, 'new') AS role_state, s.tags,
-            s.current_session_id::text AS current_session_id, s.dispatch_mode, s.last_seen_at, s.confirmed_at,
+            s.current_session_id::text AS current_session_id, s.conversation_ref, s.dispatch_mode, s.last_seen_at, s.confirmed_at,
             (s.suggestion IS NOT NULL AND s.card_state = 'shown') AS guess_waiting
        FROM claw_devenv_seats s JOIN claw_remote_connectors c ON c.connector_id = s.connector_id
       WHERE s.owner_user_id = $1 AND (s.role_state = 'confirmed' OR s.alias IS NOT NULL OR s.last_seen_at > NOW() - make_interval(days => $2::int))

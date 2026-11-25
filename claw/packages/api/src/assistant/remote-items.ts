@@ -2098,6 +2098,27 @@ async function applyErrands(owner: string, sessionId: string): Promise<ErrandPas
           }
         } else if (e.type === REMOTE_EVENT_SESSION_CLOSED) {
           if (!running && !p.waiting.length) continue;
+          // `unknown_session` as the first word of a session is its start refused: the conversation this task went to take over (or type
+          // into) is not on the machine. Said after the session started, or after it closed for another reason, it only answers a command
+          // for a session the machine no longer knows (a prompt into the session open through Claw that holds the seat's conversation,
+          // after the machine closed or cleaned it up): that session closed, and nothing is known about the conversation.
+          const refusedStart = p.seat_id && flat(e.data.reason, 40) === "unknown_session" && !(await q(
+            `SELECT 1 FROM claw_remote_events WHERE session_id = $1 AND id < $2 AND type IN ('session_started', 'session_resumed', $3) LIMIT 1`,
+            [sessionId, e.id, REMOTE_EVENT_SESSION_CLOSED],
+          )).rows.length;
+          // (Only a seat that is one conversation is gone so; a folder's seat takes over none.)
+          const gone = refusedStart && (await q(
+            `UPDATE claw_devenv_seats SET gone_at = COALESCE(gone_at, NOW()), updated_at = NOW()
+              WHERE seat_id = $1 AND owner_user_id = $2 AND conversation_ref IS NOT NULL RETURNING seat_id`,
+            [p.seat_id, owner],
+          )).rows.length > 0;
+          if (gone) {
+            // The seat is gone (until its machine lists that conversation again), and the user is told plainly.
+            fail(`gone:${e.id}`, p.lang === "zh"
+              ? "这个工位的会话在机器上已经不存在了（被删除，或太久没用无法恢复），没有发出；这个工位不能再派活，可以交给别的工位或沙箱"
+              : "that seat's conversation is no longer on its machine (deleted, or too old to resume), so it was not sent; the seat takes no more tasks: hand it to another seat or the sandbox");
+            continue;
+          }
           fail(`closed:${e.id}`, p.lang === "zh" ? "它的会话关闭了" : "its session closed");
         } else if (e.type === "plan" && running) {
           const entries = Array.isArray((e.data.update as Record<string, unknown> | undefined)?.entries)
