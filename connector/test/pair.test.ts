@@ -280,6 +280,25 @@ describe("claw-connector pair", () => {
       assert.deepEqual(spent, []);
     });
 
+    test("a --no-approval-hooks that cannot be recorded: paired, but the connector is not started (it would add them)", async () => {
+      const home = tmpdir();
+      const cc = setup(home);
+      const before = fs.readFileSync(path.join(cc, "settings.json"), "utf8");
+      const a = ctx(home, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...scripts() });
+      // claude-hooks.json cannot be replaced: the temporary file it is written through is taken by a directory.
+      fs.mkdirSync(a.c.dirs.config, { recursive: true });
+      fs.mkdirSync(path.join(a.c.dirs.config, `claude-hooks.json.${process.pid}.tmp`));
+      let started = false;
+      const rc = await cmdPair(["ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-approval-hooks"], a.c, {
+        runningPid: () => null, stop: async () => undefined, hooks: setupHooks, start: async () => { started = true; return 0; },
+      });
+      assert.notEqual(rc, 0);
+      assert.equal(started, false, "not started");
+      assert.ok(fs.existsSync(credentialsFile(a.c.dirs)), "still paired");
+      assert.match(a.errText(), /paired, but not started/);
+      assert.equal(fs.readFileSync(path.join(cc, "settings.json"), "utf8"), before, "settings.json untouched");
+    });
+
     test("Claude Code installed but never run here (no config directory yet): the directory is created with the hooks", async () => {
       const home = tmpdir();
       const cc = path.join(home, "never-run", ".claude");

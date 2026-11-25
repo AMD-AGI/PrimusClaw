@@ -363,7 +363,7 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
   // A dev pod's home directory is often thrown away with the pod: say so now, not after the first restart.
   const where = ephemeralWhere(ctx.dirs.config);
   if (where) ctx.out(`note: ${where}`);
-  await setupHooks(ctx, { hooks: !!values.hooks, noHooks: !!values["no-hooks"], noApprovals: !!values["no-approval-hooks"] });
+  const recorded = await setupHooks(ctx, { hooks: !!values.hooks, noHooks: !!values["no-hooks"], noApprovals: !!values["no-approval-hooks"] });
   // Installed first, so the probe below (and the first phone session) starts the adapter without a download.
   await installAdapters(ctx, true);
   if (ctx.probe && !values["no-probe"]) {
@@ -373,6 +373,8 @@ async function cmdInit(args: string[], ctx: Ctx): Promise<number> {
       for (const l of probeLines(await ctx.probe(cfg.agents, { logDir: logDir(ctx.dirs), version: VERSION }))) ctx.out(l);
     } catch (e) { ctx.out(`could not check the agents yet: ${errMessage(e)}; after editing agents.toml run: claw-connector doctor`); }
   }
+  // Said no to the hooks, and the no is not recorded: a start of the connector would add them; run init again once it can be.
+  if (!recorded) { ctx.err("init: the no to the Claude Code hooks could not be recorded, and a start of the connector would add them; run init again once it can be"); return EXIT.failure; }
   return EXIT.ok;
 }
 
@@ -384,26 +386,28 @@ export interface HookChoice { hooks: boolean; noHooks: boolean; noApprovals: boo
  * a question, as every start of the connector adds them (hooks-auto.ts). `--no-hooks` and `--no-approval-hooks` are kept as the
  * person's choice for every directory, so no later start adds them either; `--hooks` takes such a choice back. Where Claude Code
  * has no config directory yet and is not installed, nothing is created: the connector adds them once it is. A file that cannot be
- * merged into is reported, and the command still succeeds.
+ * merged into is reported, and the command still succeeds. Returns false when a no (`--no-hooks`, `--no-approval-hooks`) could not
+ * be recorded: then nothing is added, and the caller must not start the connector, which would add what the person said no to.
  */
-export async function setupHooks(ctx: Ctx, o: HookChoice): Promise<void> {
-  const unmigrated = migrateHookPrefs(ctx.dirs, [], hasSet, true);
-  if (unmigrated) { ctx.err(`hooks: ${unmigrated}, so no hooks were added (everything else is set up)`); return; }
-  try {
-    if (o.noHooks) {
-      recordHooksChoice(ctx.dirs, null, { session: "off", approvals: "off" });
-      ctx.out("left Claude Code's settings alone (--no-hooks); the connector will not add its hooks");
-      return;
-    }
-    const c: Choice = {};
+export async function setupHooks(ctx: Ctx, o: HookChoice): Promise<boolean> {
+  const c: Choice = {};
+  if (o.noHooks) { c.session = "off"; c.approvals = "off"; } else {
     if (o.hooks) c.session = "on";
     if (o.noApprovals) c.approvals = "off";
     else if (o.hooks) c.approvals = "on";
-    if (Object.keys(c).length) recordHooksChoice(ctx.dirs, null, c);
+  }
+  try {
+    // The carry-over (when there is no claude-hooks.json yet) and the choice go into one write: a failure leaves neither.
+    if (Object.keys(c).length) recordHooksChoice(ctx.dirs, null, c, true);
+    else { const unmigrated = migrateHookPrefs(ctx.dirs, [], hasSet, true); if (unmigrated) throw new Error(unmigrated); }
   } catch (e) {
     // Adding the hooks now could go against the very choice that was not recorded (`--no-approval-hooks`).
     ctx.err(`hooks: could not record the choice, so no hooks were added: ${errMessage(e)} (everything else is set up)`);
-    return;
+    return c.session !== "off" && c.approvals !== "off";
+  }
+  if (o.noHooks) {
+    ctx.out("left Claude Code's settings alone (--no-hooks); the connector will not add its hooks");
+    return true;
   }
   for (const r of ensureClaudeHooks(ctx, { create: o.hooks })) {
     if (r.error) { ctx.err(`hooks: ${r.error} (everything else is set up)`); continue; }
@@ -411,6 +415,7 @@ export async function setupHooks(ctx: Ctx, o: HookChoice): Promise<void> {
     if (r.session) ctx.out(describeInstall(r.dir, r.session !== "kept"));
     if (r.approvals) ctx.out(describeApprovals(r.dir, r.approvals !== "kept"));
   }
+  return true;
 }
 
 /** What {@link ensureClaudeHooks} did in one directory: per set, added, brought up to date, or already as it should be. */

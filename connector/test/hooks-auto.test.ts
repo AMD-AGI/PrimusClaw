@@ -446,6 +446,33 @@ describe("an upgrade from 0.3.4 or earlier, which recorded no no", () => {
     } finally { await claw.close(); }
   });
 
+  test("init or pair on an upgrade records the carried-over no and its own choice in one write", async () => {
+    const claw = await FakeClaw.start();
+    try {
+      const s = home(claw, { upgrade: true });
+      const a = s.mk();
+      // A second write of claude-hooks.json would fail: an empty one left by the carry-over would let a start add the hooks.
+      const undo = failPrefWrites(hookPrefsFile(a.c.dirs), (n) => n >= 2);
+      let recorded: boolean;
+      try { recorded = await setupHooks(a.c, { hooks: false, noHooks: true, noApprovals: false }); } finally { undo(); }
+      assert.equal(recorded, true, a.errText());
+      await start(claw, s.mk());
+      assert.equal(ours(s.dir).length, 0, "neither set is added after --no-hooks");
+
+      // When that one write fails, nothing is recorded, init fails, and the next start still carries over what is in place.
+      const f = home(claw, { upgrade: true });
+      const b = f.mk();
+      const undoAll = failPrefWrites(hookPrefsFile(b.c.dirs), () => true);
+      let code: number;
+      try { code = await main(["init", "--no-probe", "--no-approval-hooks"], b.c); } finally { undoAll(); }
+      assert.equal(code, EXIT.failure);
+      assert.match(b.errText(), /could not be recorded/);
+      assert.equal(fs.existsSync(hookPrefsFile(b.c.dirs)), false);
+      await start(claw, f.mk());
+      assert.equal(ours(f.dir).length, 0, "nothing was in place, so nothing is added");
+    } finally { await claw.close(); }
+  });
+
   test("hooks install fails, and changes nothing, when what an older version left cannot be recorded", async () => {
     const claw = await FakeClaw.start();
     try {

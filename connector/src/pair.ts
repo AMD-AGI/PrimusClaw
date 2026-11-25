@@ -37,8 +37,8 @@ export interface PairDeps {
   /** Start it as a service: `service install`, or the installed service again. */
   start: (ctx: Ctx) => Promise<number>;
   runningPid: (ctx: Ctx) => number | null;
-  /** Add the Claude Code hooks (commands.ts `setupHooks`); never fails the pairing. */
-  hooks?: (ctx: Ctx, o: HookChoice) => Promise<void>;
+  /** Add the Claude Code hooks (commands.ts `setupHooks`); false when a no to them could not be recorded. */
+  hooks?: (ctx: Ctx, o: HookChoice) => Promise<boolean>;
 }
 
 const USAGE = "usage: claw-connector pair <code> --server <Claw API URL> [--name <machine name>] [--no-start] [--hooks | --no-hooks] [--no-approval-hooks]";
@@ -241,8 +241,14 @@ export async function cmdPair(args: string[], ctx: Ctx, deps: PairDeps): Promise
 
   // 4. The Claude Code hooks, as init adds them: a terminal's questions reach the chat once the connector runs.
   if (deps.hooks) {
-    try { await deps.hooks(ctx, { hooks: !!values.hooks, noHooks: !!values["no-hooks"], noApprovals: !!values["no-approval-hooks"] }); } catch (e) {
+    let recorded = true;
+    try { recorded = await deps.hooks(ctx, { hooks: !!values.hooks, noHooks: !!values["no-hooks"], noApprovals: !!values["no-approval-hooks"] }); } catch (e) {
       ctx.err(`hooks: ${errMessage(e)} (the machine is paired)`);
+    }
+    // A start now would add the hooks the person just said no to.
+    if (!recorded) {
+      ctx.err("paired, but not started: the no to the Claude Code hooks could not be recorded, and a start would add them. Once it can be, run claw-connector init with the same --no-hooks / --no-approval-hooks, then: claw-connector service install");
+      return 1;
     }
   }
 

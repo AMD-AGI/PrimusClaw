@@ -60,6 +60,13 @@ function writePrefs(d: Dirs, p: Prefs): void {
   fs.renameSync(tmp, file);
 }
 
+/** What a fresh carry-over starts from: a no to the one-time question of 0.1.23 to 0.3.4, as "off" for its directory. */
+function legacyPrefs(d: Dirs): Prefs {
+  const p: Prefs = { v: 1, all: {}, dirs: {} };
+  for (const dir of legacyNoDirs(d)) p.dirs[dir] = { approvals: "off" };
+  return p;
+}
+
 /** The directories 0.1.23 to 0.3.4 were told no for, in their one-time question about the approval hooks. */
 function legacyNoDirs(d: Dirs): string[] {
   try {
@@ -83,8 +90,7 @@ function legacyNoDirs(d: Dirs): string[] {
 export function migrateHookPrefs(d: Dirs, dirs: string[], present: (dir: string, set: HookSet) => boolean | null, fresh: boolean): string | null {
   try {
     if (fs.existsSync(hookPrefsFile(d))) return null;
-    const p: Prefs = { v: 1, all: {}, dirs: {} };
-    for (const dir of legacyNoDirs(d)) p.dirs[dir] = { approvals: "off" };
+    const p = legacyPrefs(d);
     if (!fresh) {
       for (const dir of dirs) {
         if (!fs.existsSync(dir)) continue;
@@ -136,10 +142,11 @@ export function wantedHooks(d: Dirs, dir: string): Record<HookSet, boolean> {
 /**
  * Record a choice for one or both sets, for one directory or (`dir` null) for every directory, in one write: both sets are kept,
  * or neither. A choice for every directory replaces what was said per directory before it (the latest word wins); a later choice
- * for one directory overrides it there.
+ * for one directory overrides it there. With `carryOver` (`init` and `pair`) and no claude-hooks.json yet, the file is written
+ * with the fresh carry-over ({@link migrateHookPrefs}) and the choice together, so no file without the choice is ever left behind.
  */
-export function recordHooksChoice(d: Dirs, dir: string | null, choices: Choice): void {
-  const p = readPrefs(d);
+export function recordHooksChoice(d: Dirs, dir: string | null, choices: Choice, carryOver = false): void {
+  const p = carryOver && !fs.existsSync(hookPrefsFile(d)) ? legacyPrefs(d) : readPrefs(d);
   for (const set of ["session", "approvals"] as const) {
     const value = choices[set];
     if (value === undefined) continue;
