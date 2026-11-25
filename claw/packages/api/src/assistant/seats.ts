@@ -139,9 +139,11 @@ export const PROBE_CLIENT = "seat_probe";
 /** The command id of a seat's `n`th question. */
 export const probeCmdId = (seatId: string, n: number): string => `seat-probe:${seatId}:${n}`;
 
+/** Bidirectional formatting characters: a machine-written name could use them to reorder how a card's text reads. */
+const BIDI = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 const flat = (v: unknown, max: number): string | null => {
   if (typeof v !== "string") return null;
-  const one = v.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  const one = v.replace(BIDI, "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
   if (!one) return null;
   return Array.from(one).length > max ? `${Array.from(one).slice(0, max - 1).join("")}…` : one;
 };
