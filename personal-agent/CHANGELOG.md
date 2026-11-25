@@ -22,7 +22,8 @@ gains two required members, `summary` and `setSummary`, so code that implements 
 packaged Claw client does) (#937), and a surface of one's own has a new view to draw, `terminalEnd` (#936). No plugin port
 (core's `src/plugins/`) changed, and the store is unchanged: nothing to do for a deployment of the published packages. The
 end of a terminal turn nobody was at is shown as its own card: which conversation, what it did in whole sentences, the
-end of its last answer (up to 2000 characters) on a tap, and buttons that attach the chat to it or mute it (#936). With the Claw release that carries #937,
+end of its last answer (up to 2000 characters) on a tap, and buttons that attach the chat to it or mute it (#936).
+With the Claw release that carries #937,
 such an end comes at once only when a person started that turn, it asks the person something or it failed; the ends of
 turns nobody typed that finished (another session's message, a schedule, a hook) and the ends the five-minute gap holds
 back are gathered by Claw and summed up at most once per conversation every hour by default, which `/approvals summary`
@@ -51,7 +52,9 @@ renderer, as Teams' has) (#936). Everything else is additive: `remoteView.termin
   at that terminal comes as a card. Its title is the conversation's name (as Claude Code's session list shows it, else its
   title) with its status (finished, or stopped with an error and why); one small line names the tool, the machine, the
   folder and the item number. Then what the agent did, in whole sentences from the start of its last answer (from its
-  summary block, else its last paragraph, when the connector had to cut it), the end of that answer (its last 2000 characters at most) folded under _Show all_, and buttons that send `/agent attach <ref>` (for a conversation its connector lists)
+  summary block, else its last paragraph, when the connector had to cut it), the end of that answer (its last 2000
+  characters at most) folded under _Show all_, and buttons that send `/agent attach <ref>` (for a conversation its
+  connector lists)
   and `/approvals mute #<item>` as the person's own message. A chat that shows no cards gets Claw's words, as before (#936).
 - `@primusclaw/personal-agent`: when the end Claw pushes stands for a run of turns nobody typed, the card first says the
   earlier turn that asked the person something, or that failed, in whole sentences (or how many did, when their words are
@@ -61,7 +64,8 @@ renderer, as Teams' has) (#936). Everything else is additive: `remoteView.termin
   summaries off (#937). Claw sends such a summary (how many turns ran, how many failed, the latest result, whether any
   asked the person) in place of the ends of finished turns nobody typed, which it no longer pushes one by one; the ends of
   a person's turns, of turns that ask the person something and of failed turns still come at once, as the card above.
-  `/approvals off`, a mute and quiet hours hold summaries as they hold every push (#937).
+  With `/approvals off` no summary is gathered, and turning approvals off or muting the conversation drops the one being
+  gathered; quiet hours hold a summary as they hold every push (#937).
 
 ## 0.14.0
 
