@@ -7,7 +7,7 @@
  * message it amends or replaces), what a remote agent said on its own, a lost turn's answer, or a run's card.
  */
 import { refreshAutoReply } from "../assistant/auto-reply.js";
-import { remoteNoticeOf, type RemoteNotice } from "../assistant/events.js";
+import { remoteNoticeOf, type RemoteNotice, type TerminalEnd } from "../assistant/events.js";
 import { parseWorkItem } from "../assistant/item-of.js";
 import { assistantDeliveries } from "../turn/deliveries.js";
 import { messageWords } from "../assistant/receipt.js";
@@ -30,6 +30,7 @@ import { noteCard } from "../remote/views.js";
 import { parseOptions } from "../remote/options.js";
 import { SHOWN_WHOLE } from "../remote/terminal-asks.js";
 import { terminalAskView } from "../remote-view/terminal-ask-view.js";
+import { terminalEndView } from "../remote-view/terminal-end-view.js";
 import { terminalApprovalText } from "../locales/terminal-approvals.js";
 
 /** What the person asked, as the name of a run in its card and in the line before a lost turn's answer. */
@@ -186,7 +187,28 @@ export class Deliveries {
     }
     if (remote?.kind === "needs_you" && remote.ask !== undefined)
       return this.sendRemoteAsk(userId, conversation, event, remote);
+    if (remote?.end !== undefined) return this.sendTerminalEnd(userId, conversation, event, remote, remote.end);
     return undefined;
+  }
+
+  /**
+   * A turn that ended in a terminal while nobody was at it: its own card (which conversation, what it did, its whole answer on a tap,
+   * and buttons that attach the chat to it or mute it); a channel that cannot show the card says Claw's words instead.
+   */
+  private async sendTerminalEnd(
+    userId: string,
+    conversation: Conversation,
+    event: JsonObject,
+    remote: RemoteNotice,
+    end: TerminalEnd,
+  ): Promise<boolean | undefined> {
+    if (!conversation.caps.views) return undefined; // (the words, then)
+    const lang = answerLang(this.deps.store.prefs.getPrefs(userId).lang, this.clientLocale(), event["text"]);
+    const model = terminalEndView({ end, machine: remote.machine, agent: remote.agent, lang });
+    await conversation.send({
+      body: { type: "view", view: { name: "terminalEnd", model }, fallbackText: str(event["text"]) },
+    });
+    return true;
   }
 
   /**

@@ -207,6 +207,9 @@ func (s *Service) Issue(ctx context.Context, req IssueRequest) (IssueResponse, i
 	if err := validateTemplateResources(stored, "invalid_grant"); err != nil {
 		return IssueResponse{}, 0, err
 	}
+	if err := validateTemplatePreferredNodes(stored, "invalid_grant"); err != nil {
+		return IssueResponse{}, 0, err
+	}
 	if err := s.resolveTemplateGPUCounts(ctx, req.Issuer.AppRunID, stored); err != nil {
 		return IssueResponse{}, 0, err
 	}

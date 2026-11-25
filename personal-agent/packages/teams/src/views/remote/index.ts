@@ -9,6 +9,7 @@ import { sessionsCard } from "./sessions-card.js";
 import { disconnectCard, machineChoiceCard, modeCard, takeoverCard } from "./small-cards.js";
 import { hiddenCard } from "./hidden-card.js";
 import { statusCard } from "./status-card.js";
+import { terminalEndCard } from "./terminal-end-card.js";
 import { windowCard } from "./window-card.js";
 
 export { agentsCard, conversationBlocks } from "./agents-card.js";
@@ -17,6 +18,7 @@ export { connectBlocks, sessionsCard } from "./sessions-card.js";
 export { disconnectButtons, disconnectCard, machineChoiceCard, modeCard, takeoverCard } from "./small-cards.js";
 export { hiddenCard } from "./hidden-card.js";
 export { statusCard } from "./status-card.js";
+export { commandAction, terminalEndCard } from "./terminal-end-card.js";
 export { windowCard } from "./window-card.js";
 
 type RemoteRenderers = Pick<
@@ -27,6 +29,7 @@ type RemoteRenderers = Pick<
   | "remotePermission"
   | "remoteAsk"
   | "terminalAsk"
+  | "terminalEnd"
   | "remoteDecided"
   | "remoteDisconnect"
   | "remoteTakeover"
@@ -44,6 +47,7 @@ export const REMOTE_RENDERERS: RemoteRenderers = {
   remotePermission: permissionCard,
   remoteAsk: remoteAskCard,
   terminalAsk: terminalAskCard,
+  terminalEnd: terminalEndCard,
   remoteDecided: decidedCard,
   remoteDisconnect: disconnectCard,
   remoteTakeover: takeoverCard,

@@ -37,6 +37,7 @@ function template(over: JsonObject = {}): JsonObject {
     name: "probe",
     fromImage: IMAGE,
     resources: { requests: { cpu: "1", memory: "8Gi" }, limits: { cpu: "1", memory: "8Gi" } },
+    workspaceStorage: "off",
     host_mounts: [{ hostPath: "/shared/team/jit-cache", readOnly: true }],
     ...over,
   };
@@ -68,6 +69,8 @@ const REFUSED: Array<[string, JsonObject, string]> = [
     "sandbox_templates[0].host_mounts[0].hostPath"],
   ["a .. segment", template({ host_mounts: [{ hostPath: "/shared/team/../team/jit-cache", readOnly: true }] }),
     "sandbox_templates[0].host_mounts[0].hostPath"],
+  ["the workspace's storage left on", Object.fromEntries(Object.entries(template()).filter(([k]) => k !== "workspaceStorage")),
+    "sandbox_templates[0].workspaceStorage"],
 ];
 
 function pluginRow(over: JsonObject = {}): JsonObject {
