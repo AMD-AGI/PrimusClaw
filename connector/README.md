@@ -688,8 +688,9 @@ too (on a start and on `hooks install`; `hooks install --approvals` still adds t
 
 Connectors up to 0.3.3 kept no record of a no other than that answer. So the first start after the upgrade (or the first `hooks`
 command, whichever comes first) reads it from what is in place, once: in a Claude config directory that exists, a set with none
-of its hooks there was taken out or not agreed to, and stays out until `hooks install` (`--approvals`) or `--hooks`. A directory
-made after that, and `init` or `pair` run after the upgrade, get both sets.
+of its hooks there was taken out or not agreed to, and stays out until `hooks install` (`--approvals`) or `--hooks`. Until that
+record can be written, no hooks are added anywhere; a directory whose `settings.json` cannot be read then is read the first time
+it can be, and nothing is added to it before. A directory made after that, and `init` or `pair` run after the upgrade, get both sets.
 
 The Codex and Cursor hooks are not installed by themselves (Codex asks you to trust a new hook): see below.
 

@@ -25,7 +25,7 @@ import {
 import { CURSOR_HOLD_DEFAULT_S, CURSOR_HOLD_MAX_S, CURSOR_HOLD_MIN_S, cursorConfigDir } from "./cursor-approvals.js";
 import { approvalSocketFile } from "./approvals.js";
 import { OPT_OUT_ENV, optedOut } from "./approval-skip.js";
-import { migrateHookPrefs, recordHooksChoice, wantedHooks, type HookSet } from "./hooks-auto.js";
+import { migrateHookPrefs, recordHooksChoice, settlePending, wantedHooks, type HookSet } from "./hooks-auto.js";
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
 import { checkAll, defaultDeps, formatReport, runProbe, shq, writeReport, type DoctorDeps, type Problem, type Report } from "./doctor.js";
@@ -398,7 +398,11 @@ export async function setupHooks(ctx: Ctx, o: HookChoice): Promise<void> {
     if (o.hooks) recordHooksChoice(ctx.dirs, null, "session", "on");
     if (o.noApprovals) recordHooksChoice(ctx.dirs, null, "approvals", "off");
     else if (o.hooks) recordHooksChoice(ctx.dirs, null, "approvals", "on");
-  } catch (e) { ctx.err(`hooks: could not record the choice: ${errMessage(e)}`); }
+  } catch (e) {
+    // Adding the hooks now could go against the very choice that was not recorded (`--no-approval-hooks`).
+    ctx.err(`hooks: could not record the choice, so no hooks were added: ${errMessage(e)} (everything else is set up)`);
+    return;
+  }
   for (const r of ensureClaudeHooks(ctx, { create: o.hooks })) {
     if (r.error) { ctx.err(`hooks: ${r.error} (everything else is set up)`); continue; }
     if (r.absent) { ctx.out("Claude Code is not installed here (no claude on PATH); the connector adds its hooks once it is"); continue; }
@@ -433,6 +437,8 @@ export function ensureClaudeHooks(ctx: Ctx, o: { create?: boolean } = {}): Ensur
     const r: EnsuredHooks = { dir };
     out.push(r);
     try {
+      const wait = settlePending(ctx.dirs, dir, hasSet);
+      if (wait) { r.error = `${wait} (${hooksStatus(dir).problem ?? "unreadable"})`; continue; }
       const want = wantedHooks(ctx.dirs, dir);
       if (optedOut(ctx.env)) want.approvals = false;
       if (!want.session && !want.approvals) continue;
@@ -645,6 +651,7 @@ function cmdHooks(args: string[], ctx: Ctx): number {
   const report: Array<Record<string, unknown>> = [];
   for (const dir of dirs) {
     try {
+      if (sub !== "status") settlePending(ctx.dirs, dir, hasSet);
       if (sub === "install") {
         // Claude Code installed but not run yet: its directory is made with the hooks in it, as `pair` does.
         if (values["config-dir"] === undefined && !fs.existsSync(dir) && !claudeInstalled(ctx)) {

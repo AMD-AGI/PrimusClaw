@@ -15,7 +15,7 @@ import path from "node:path";
 import test, { describe } from "node:test";
 import { fileURLToPath } from "node:url";
 import { approvalSocketFile } from "../src/approvals.js";
-import { ensureClaudeHooks, EXIT, main, type Ctx } from "../src/commands.js";
+import { ensureClaudeHooks, EXIT, main, setupHooks, type Ctx } from "../src/commands.js";
 import { approvalHooksStatus, BACKUP_PREFIX, hooksStatus, installApprovalHooks, installHooks, settingsFile } from "../src/hooks.js";
 import { hookPrefsFile, legacyOfferFile } from "../src/hooks-auto.js";
 import { resolveDirs } from "../src/paths.js";
@@ -349,6 +349,67 @@ describe("an upgrade from 0.3.3 or earlier, which recorded no no", () => {
     assert.equal(r.length, 1);
     assert.match(r[0]!.error ?? "", /could not write .*claude-hooks\.json/);
     assert.equal(fs.readFileSync(settingsFile(dir), "utf8"), before, "settings.json untouched");
+  });
+
+  test("a directory whose settings cannot be read when the choices are carried over is carried over once they can be", () => {
+    const mkCtx = () => {
+      const h = tmpdir();
+      const dir = path.join(h, "claude-config");
+      fs.mkdirSync(dir);
+      const bin = tmpdir("cc-hookbin-");
+      const c: Ctx = {
+        dirs: resolveDirs({ CLAW_CONNECTOR_HOME: h } as NodeJS.ProcessEnv), env: { CLAUDE_CONFIG_DIR: dir, PATH: "/nonexistent" },
+        out: () => {}, err: () => {}, hostname: "box", node: NODE, hookScript: stand("terminal-hook.js", bin), approvalHookScript: stand("approval-hook.js", bin),
+      };
+      return { c, dir };
+    };
+    // Hooks taken out under 0.3.3, and the file broken at the first start: once it is fixed, they stay out.
+    const out = mkCtx();
+    fs.writeFileSync(settingsFile(out.dir), "{ not json");
+    assert.match(ensureClaudeHooks(out.c)[0]!.error ?? "", /not valid JSON/);
+    fs.writeFileSync(settingsFile(out.dir), JSON.stringify(MINE, null, 2));
+    const before = fs.readFileSync(settingsFile(out.dir), "utf8");
+    const r = ensureClaudeHooks(out.c);
+    assert.equal(r[0]!.error, undefined);
+    assert.equal(fs.readFileSync(settingsFile(out.dir), "utf8"), before, "the no it could not see then is kept");
+    assert.deepEqual(JSON.parse(fs.readFileSync(hookPrefsFile(out.c.dirs), "utf8")).dirs[out.dir], { session: "off", approvals: "off" });
+    ensureClaudeHooks(out.c);
+    assert.equal(ours(out.dir).length, 0, "nor on any later start");
+
+    // The session hooks were in place: once readable, they are kept up to date; the approval hooks left out stay out.
+    const kept = mkCtx();
+    fs.writeFileSync(settingsFile(kept.dir), "{ not json");
+    ensureClaudeHooks(kept.c);
+    fs.rmSync(settingsFile(kept.dir));
+    const old = tmpdir("old-install-");
+    installHooks(kept.dir, stand("node", old), stand("terminal-hook.js", old));
+    const k = ensureClaudeHooks(kept.c)[0]!;
+    assert.equal(k.session, "updated");
+    assert.equal(hooksStatus(kept.dir).healthy, true);
+    assert.equal(approvalHooksStatus(kept.dir).events.length, 0);
+
+    // `init --hooks` meanwhile is a yes for every directory: nothing is carried over.
+    const yes = mkCtx();
+    fs.writeFileSync(settingsFile(yes.dir), "{ not json");
+    ensureClaudeHooks(yes.c);
+    fs.writeFileSync(settingsFile(yes.dir), "{}");
+    return setupHooks(yes.c, { hooks: true, noHooks: false, noApprovals: false }).then(() => {
+      assert.equal(hooksStatus(yes.dir).installed, true);
+      assert.equal(approvalHooksStatus(yes.dir).installed, true);
+    });
+  });
+
+  test("init or pair that cannot record --no-approval-hooks adds no hooks at all", async () => {
+    const claw = await FakeClaw.start();
+    try {
+      const s = home(claw);
+      const a = s.mk();
+      // The file cannot be replaced: the temporary file it is written through is taken by a directory.
+      fs.mkdirSync(`${hookPrefsFile(a.c.dirs)}.${process.pid}.tmp`);
+      await setupHooks(a.c, { hooks: false, noHooks: false, noApprovals: true });
+      assert.match(a.errText(), /could not record the choice, so no hooks were added/);
+      assert.equal(fs.existsSync(settingsFile(s.dir)), false, "settings.json untouched");
+    } finally { await claw.close(); }
   });
 
   test("hooks install keeps the approval hooks out under CLAW_APPROVAL_HOOKS=off, as a start does; --approvals adds them", async () => {

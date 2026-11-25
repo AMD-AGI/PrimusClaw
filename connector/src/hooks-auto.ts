@@ -24,7 +24,8 @@ import type { Dirs } from "./paths.js";
 
 export type HookSet = "session" | "approvals";
 type Choice = Partial<Record<HookSet, "on" | "off">>;
-interface Prefs { v: 1; all: Choice; dirs: Record<string, Choice> }
+/** `pending`: directories whose settings could not be read when what 0.3.3 or earlier left was carried over ({@link settlePending}). */
+interface Prefs { v: 1; all: Choice; dirs: Record<string, Choice>; pending?: string[] }
 
 export const hookPrefsFile = (d: Dirs): string => path.join(d.config, "claude-hooks.json");
 /** Where 0.1.23 to 0.3.3 kept the answer to the question they asked once per directory about the approval hooks. */
@@ -44,7 +45,8 @@ function readPrefs(d: Dirs): Prefs {
     if (isObj(doc)) {
       const dirs: Record<string, Choice> = {};
       if (isObj(doc.dirs)) for (const [k, v] of Object.entries(doc.dirs)) dirs[k] = choice(v);
-      return { v: 1, all: choice(doc.all), dirs };
+      const pending = Array.isArray(doc.pending) ? doc.pending.filter((x): x is string => typeof x === "string") : [];
+      return { v: 1, all: choice(doc.all), dirs, ...(pending.length ? { pending } : {}) };
     }
   } catch { /* none yet */ }
   return { v: 1, all: {}, dirs: {} };
@@ -74,8 +76,8 @@ function legacyNoDirs(d: Dirs): string[] {
  * else is carried over. Otherwise, in each of `dirs` that exists, a set
  * with none of its hooks there was taken out or never agreed to (`hooks uninstall`, `--no-hooks`, `--no-approval-hooks`, a "n"
  * at init/pair or to the one-time question): "off" for that directory, so it stays out until `hooks install` or `--hooks`.
- * `present` says whether any hook of that set is in that directory's settings, or null when they cannot be read (then nothing is
- * recorded for it, and the hooks go in once the file can be merged into). Never throws: it returns why the file could not be
+ * `present` says whether any hook of that set is in that directory's settings, or null when they cannot be read (then the
+ * directory is kept pending, and its sets are carried over the first time they can be read: {@link settlePending}). Never throws: it returns why the file could not be
  * written (then the caller adds nothing, since a no it cannot see yet would be undone), and it is tried again next time.
  */
 export function migrateHookPrefs(d: Dirs, dirs: string[], present: (dir: string, set: HookSet) => boolean | null, fresh: boolean): string | null {
@@ -87,7 +89,13 @@ export function migrateHookPrefs(d: Dirs, dirs: string[], present: (dir: string,
       for (const dir of dirs) {
         if (!fs.existsSync(dir)) continue;
         const c: Choice = { ...p.dirs[dir] };
-        for (const set of ["session", "approvals"] as const) if (present(dir, set) === false) c[set] = "off";
+        let unread = false;
+        for (const set of ["session", "approvals"] as const) {
+          const has = present(dir, set);
+          if (has === false) c[set] = "off";
+          else if (has === null) unread = true;
+        }
+        if (unread) (p.pending ??= []).push(dir);
         if (Object.keys(c).length) p.dirs[dir] = c;
       }
     }
@@ -95,6 +103,26 @@ export function migrateHookPrefs(d: Dirs, dirs: string[], present: (dir: string,
     writePrefs(d, p);
     return null;
   } catch (e) { return `could not write ${hookPrefsFile(d)}: ${(e as Error).message}`; }
+}
+
+/**
+ * A directory whose settings could not be read when what 0.3.3 or earlier left was carried over: the first time they can be,
+ * a set with none of its hooks there is recorded "off" (unless a choice was made for it since), as the carry-over would have.
+ * Returns why nothing may be added to it yet, or null once it is settled (or was never pending). Throws when the choice cannot
+ * be written.
+ */
+export function settlePending(d: Dirs, dir: string, present: (dir: string, set: HookSet) => boolean | null): string | null {
+  const p = readPrefs(d);
+  if (!p.pending?.includes(dir)) return null;
+  const has = { session: present(dir, "session"), approvals: present(dir, "approvals") };
+  if (has.session === null || has.approvals === null) return "its settings could not be read when the choices of an older connector were carried over; the hooks are added once they can be";
+  const c: Choice = { ...p.dirs[dir] };
+  for (const set of ["session", "approvals"] as const) if (has[set] === false && c[set] === undefined && p.all[set] === undefined) c[set] = "off";
+  if (Object.keys(c).length) p.dirs[dir] = c;
+  p.pending = p.pending.filter((x) => x !== dir);
+  if (!p.pending.length) delete p.pending;
+  writePrefs(d, p);
+  return null;
 }
 
 /** Which sets of hooks belong in this directory: a choice made for the directory, else one made for all, else both. */
@@ -114,6 +142,8 @@ export function recordHooksChoice(d: Dirs, dir: string | null, set: HookSet, val
   if (dir === null) {
     if (value === "on") delete p.all[set]; else p.all[set] = "off";
     for (const c of Object.values(p.dirs)) delete c[set];
+    // A yes for every directory (`--hooks`) leaves nothing to carry over.
+    if (value === "on") delete p.pending;
   } else {
     p.dirs[dir] = { ...(p.dirs[dir] ?? {}), [set]: value };
   }
