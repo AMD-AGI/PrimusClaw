@@ -227,9 +227,11 @@ from e2b import Sandbox
 | 404    | `template_not_found`    | No template the caller may use has this id        |
 | 404    | `sandbox_not_found`     | Sandbox does not exist or belongs to another user |
 | 410    | `idempotency_key_spent` | Key already ended; the detail carries the reason  |
+| 422    | `sandbox_refused`       | The cluster refused the sandbox Pod (for example an admission webhook denied it); the detail carries the refusal. Retrying the same request fails the same way |
 | 500    | `owner_policy_invalid`  | Owner policy was rejected; the cause is in the control plane log |
 | 503    | `owner_policy_not_applied` | Owner policy is missing or not applied yet     |
 | 503    | `pending_timeout`       | Sandbox was not running within the pending timeout |
 | 503    | `identity_unavailable`  | Identity or the user record cannot be read        |
+| 504    | `upstream_timeout`      | The gateway stopped waiting; a create is still pending in the control plane, so list the sandboxes before creating another |
 
 A create that waits for a free GPU stays pending until the Workload is scheduled; a larger `request_timeout` keeps the call open while it waits.
