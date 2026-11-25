@@ -1417,7 +1417,8 @@ describe("development environment items and devenv_send", { skip }, () => {
     for (const [named, stopReason] of [[true, "cancelled"], [true, "end_turn"], [false, "cancelled"]] as const) {
       const out = await sendByCard(await userTurn(alice, `跑 make test ${stopReason}`), { text: `跑 make test ${stopReason}` });
       const sid = String(out.session_id);
-      const [p1] = await promptSeqs(sid);
+      // (the newest: a session left idle by the round before is sent to again, its ended prompt not yet acknowledged by a heartbeat)
+      const p1 = (await promptSeqs(sid)).at(-1)!;
       assert.equal((await post("alice", `/v1/work-items/${String(out.item_id)}/stop`, {})).status, 200);
       // Closed by the button, before the machine has said anything: the running prompt is still on the books.
       assert.deepEqual(await open(sid), ["done", "stopped", 1, [p1]]);

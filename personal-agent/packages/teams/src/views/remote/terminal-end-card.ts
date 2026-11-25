@@ -3,7 +3,8 @@
 
 /**
  * The card of a turn that ended in a terminal while nobody was at it: the conversation's name and status as the title, the tool, machine,
- * folder and item number in one small line under it, what the agent did, its whole last answer folded behind "Show all", and buttons
+ * folder and item number in one small line under it, an earlier turn that asked the person something or failed (when one did), what the
+ * agent did, its whole last answer folded behind "Show all", and buttons
  * that send the commands for it as the person's own message (an imBack: the command is handled exactly as if typed).
  */
 import type { remoteView } from "@primusclaw/personal-agent";
@@ -25,6 +26,8 @@ export function terminalEndCard(view: remoteView.TerminalEndView): CardMessage {
       subtitle: view.where,
     }),
   ];
+  // An earlier turn that asked the person something, or failed, comes first: it is why this end was pushed.
+  for (const line of view.earlier) body.push(block(line, { spacing: "Small", weight: "Bolder" }));
   if (view.summary) body.push(block(view.summary, { spacing: "Small" }));
   if (view.full) body.push(...fold("end-full", [block(view.full, { spacing: "Small" })], view.fullLabel));
   if (view.rest) body.push(note(view.rest));

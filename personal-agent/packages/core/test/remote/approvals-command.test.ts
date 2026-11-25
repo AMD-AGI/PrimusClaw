@@ -11,6 +11,7 @@ import type { CommandRoute } from "../../src/ports/routing.js";
 
 function rig(start = true, fail?: Error) {
   let enabled = start;
+  let every = 60;
   const calls: string[] = [];
   const said: string[] = [];
   const command = new TerminalApprovalsCommand({
@@ -23,6 +24,16 @@ function rig(start = true, fail?: Error) {
       if (fail) return Promise.reject(fail);
       enabled = on;
       return Promise.resolve(enabled);
+    },
+    summary: (key) => {
+      calls.push(`summary ${key}`);
+      return fail ? Promise.reject(fail) : Promise.resolve(every);
+    },
+    setSummary: (key, minutes) => {
+      calls.push(`set summary ${key} ${String(minutes)}`);
+      if (fail) return Promise.reject(fail);
+      every = minutes;
+      return Promise.resolve(every);
     },
     muteTerminal: (key, item, muted) => {
       calls.push(`mute ${key} ${String(item)} ${String(muted)}`);
@@ -92,4 +103,24 @@ test("an item that is not theirs, or not a terminal conversation, is said as suc
   const down = rig(true, new ClawError(503, "{}"));
   await down.command.run(down.route(), "unmute #7");
   assert.match(down.said.at(-1) ?? "", /could not reach/);
+});
+
+test("summary: read, set in minutes or off; anything else gets its usage and calls nothing", async () => {
+  const r = rig();
+  await r.command.run(r.route(), "summary");
+  assert.match(r.said.at(-1) ?? "", /at most once every 60 minutes/);
+  await r.command.run(r.route("zh"), "summary 120");
+  assert.match(r.said.at(-1) ?? "", /最多每 120 分钟汇总一次/);
+  await r.command.run(r.route(), "summary OFF");
+  assert.match(r.said.at(-1) ?? "", /no more summaries/);
+  await r.command.run(r.route(), "summary");
+  assert.match(r.said.at(-1) ?? "", /Summaries are off/);
+  for (const bad of ["summary 5", "summary 2000", "summary soon", "summary -1"]) {
+    await r.command.run(r.route(), bad);
+    assert.match(r.said.at(-1) ?? "", /15 to 1440/, bad);
+  }
+  assert.deepEqual(r.calls, ["summary ak-1", "set summary ak-1 120", "set summary ak-1 0", "summary ak-1"]);
+  const refused = rig(true, new ClawError(400, JSON.stringify({ ok: false, error: "minutes_out_of_range" })));
+  await refused.command.run(refused.route(), "summary 30");
+  assert.match(refused.said.at(-1) ?? "", /15 to 1440/);
 });

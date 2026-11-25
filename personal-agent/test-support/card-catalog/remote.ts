@@ -319,6 +319,29 @@ export const REMOTE: readonly CatalogEntry[] = entriesWithEmoji(
             full: "staging 已经清空：04:50Z 起没有任何 Pod，job 1930 的沙箱和 job 1932 的 Pod 都没了。这两台节点还挂着，是否释放由集群那边决定，我没动。\n\n重跑起来后，我只读观察三项：\n- 第一个测试的冷启动秒数；\n- 预读的结果文件 `weight_prefetch.json`；\n- 页缓存命中率。",
             more: true,
             attach: "/agent attach 3f2a9c1e",
+            earlier: [],
+          },
+          machine: "robin-dev",
+          agent: "Claude Code",
+          lang: "zh",
+        }),
+      ),
+  ],
+  [
+    "terminal_end_earlier_asked",
+    () =>
+      terminalEndCard(
+        remoteView.terminalEndView({
+          end: {
+            itemSeq: 31,
+            name: "nightly-bot",
+            folder: "work/claw",
+            error: "",
+            summary: "日志已归档。",
+            full: "日志已归档。",
+            more: false,
+            attach: "/agent attach 3f2a9c1e",
+            earlier: [{ kind: "asked", text: "发布包已就绪。要不要我现在发布到生产？", count: 1 }],
           },
           machine: "robin-dev",
           agent: "Claude Code",
@@ -340,6 +363,7 @@ export const REMOTE: readonly CatalogEntry[] = entriesWithEmoji(
             full: "API Error: rate limit reached for this organization.",
             more: false,
             attach: "",
+            earlier: [],
           },
           machine: "robin-dev",
           agent: "Claude Code",

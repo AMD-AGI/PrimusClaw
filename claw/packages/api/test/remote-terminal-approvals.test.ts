@@ -180,11 +180,11 @@ describe("approvals from terminals", { skip }, () => {
 
   test("T3 the owner's switch: on until turned off", async () => {
     const cid = await machine("alice", "laptop");
-    assert.deepEqual((await call("alice", "GET", "/v1/remote-agents/approvals")).body.data, { enabled: true });
+    assert.deepEqual((await call("alice", "GET", "/v1/remote-agents/approvals")).body.data, { enabled: true, summary_minutes: 60 });
     assert.equal((await call("alice", "PUT", "/v1/remote-agents/approvals", { enabled: "no" })).status, 400);
     assert.deepEqual((await call("alice", "PUT", "/v1/remote-agents/approvals", { enabled: false })).body.data, { enabled: false });
-    assert.deepEqual((await call("alice", "GET", "/v1/remote-agents/approvals")).body.data, { enabled: false });
-    assert.deepEqual((await call("bob", "GET", "/v1/remote-agents/approvals")).body.data, { enabled: true }, "another user's switch is theirs");
+    assert.deepEqual((await call("alice", "GET", "/v1/remote-agents/approvals")).body.data, { enabled: false, summary_minutes: 60 });
+    assert.deepEqual((await call("bob", "GET", "/v1/remote-agents/approvals")).body.data, { enabled: true, summary_minutes: 60 }, "another user's switch is theirs");
     const off = await open("alice", cid, "conv-1");
     assert.deepEqual([off.status, off.body.error], [409, "approvals_off"]);
     assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_remote_sessions"))[0].n, 0);
