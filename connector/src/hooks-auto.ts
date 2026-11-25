@@ -70,14 +70,15 @@ export function wantedHooks(d: Dirs, dir: string): Record<HookSet, boolean> {
   return { session, approvals: approvalsChoice === "on" };
 }
 
-/** Record a choice, for one directory or (`dir` null) for every directory; `on` for all also clears what was said per directory. */
+/**
+ * Record a choice, for one directory or (`dir` null) for every directory. A choice for every directory replaces what was said per
+ * directory before it (the latest word wins); a later choice for one directory overrides it there.
+ */
 export function recordHooksChoice(d: Dirs, dir: string | null, set: HookSet, value: "on" | "off"): void {
   const p = readPrefs(d);
   if (dir === null) {
-    if (value === "on") {
-      delete p.all[set];
-      for (const c of Object.values(p.dirs)) delete c[set];
-    } else p.all[set] = "off";
+    if (value === "on") delete p.all[set]; else p.all[set] = "off";
+    for (const c of Object.values(p.dirs)) delete c[set];
   } else {
     p.dirs[dir] = { ...(p.dirs[dir] ?? {}), [set]: value };
   }

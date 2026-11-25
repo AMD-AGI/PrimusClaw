@@ -202,6 +202,14 @@ describe("the connector keeps the Claude Code hooks in place by itself", () => {
       assert.equal(approvalHooksStatus(na.dir).events.length, 0);
       assert.equal(await main(["init", "--hooks", "--no-probe"], na.mk().c), EXIT.ok);
       assert.equal(approvalHooksStatus(na.dir).installed, true, "--hooks takes the no back");
+
+      // A no for every directory, said after a yes for one directory, wins there too.
+      const later = home(claw);
+      assert.equal(await main(["hooks", "install", "--approvals", "--config-dir", later.dir], later.mk().c), EXIT.ok);
+      fs.writeFileSync(settingsFile(later.dir), "{}"); // taken out by hand
+      assert.equal(await main(["init", "--no-hooks", "--no-probe"], later.mk().c), EXIT.ok);
+      await start(claw, later.mk());
+      assert.equal(ours(later.dir).length, 0, "the earlier yes for the directory does not bring them back");
     } finally { await claw.close(); }
   });
 
