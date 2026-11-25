@@ -813,6 +813,22 @@ describe("readSession", () => {
     assert.equal(readSession([...fresh, e("turn_end", "", { stop: "end_turn", cmd_seq: null, agent_initiated: true })], 0, now).state, "idle");
   });
 
+  test("R5 the agent's own turn with a tool call still running reads as working until past the connector's own 30 minutes", async () => {
+    const { AGENT_TURN_QUIET_MS, AGENT_TURN_TOOL_QUIET_MS } = await import("../src/assistant/devenv-tools.js");
+    const now = Date.parse("2026-11-24T20:50:00Z");
+    const at = (msAgo: number) => ({ occurred_at: new Date(now - msAgo).toISOString() });
+    const ended = [e("user_prompt", "", { cmd_seq: 1 }), e("turn_end", "", { stop: "end_turn", cmd_seq: 1 })];
+    const quiet = AGENT_TURN_QUIET_MS + 60_000;
+    const running = [...ended, e("tool_call", "Build", { tool_id: "t1", tool_status: "pending", ...at(quiet + 1_000) }),
+      e("tool_call_update", "", { tool_id: "t1", tool_status: "in_progress", ...at(quiet) })];
+    assert.equal(readSession(running, 0, now).state, "working", "a connector from 0.3.3 on still waits on it");
+    const done = [...running, e("tool_call_update", "", { tool_id: "t1", tool_status: "completed", ...at(quiet) })];
+    assert.equal(readSession(done, 0, now).state, "idle", "the call finished: quiet as before");
+    const stale = [...ended, e("tool_call", "Build", { tool_id: "t1", tool_status: "pending", ...at(AGENT_TURN_TOOL_QUIET_MS + 60_000) })];
+    assert.equal(readSession(stale, 0, now).state, "idle", "past the connector's own limit (an older one, or one that went away): over");
+    assert.ok(AGENT_TURN_TOOL_QUIET_MS > 30 * 60_000);
+  });
+
   /** Read well after the events: a turn of nobody's prompt would be over by now (R3, R4). */
   const late = () => {
     const now = Date.parse("2026-11-24T20:50:00Z");

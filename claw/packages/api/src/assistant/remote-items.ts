@@ -1431,8 +1431,9 @@ const AGENT_TURN_ANSWER_MAX = 1500;
 /**
  * The turns the seat's agent took by itself after a task's turn ended (a command it put in the background finished, and it answered
  * that): each one's answer is said once, as a late word of the task whose turn ended last before it (the prompt that turn's end names,
- * `cmd_id` `k:errand:<item>:…`), and kept on that item. A turn with no answer text, or one after a prompt that was no task's, says nothing. Read from the session's events after
- * the last one any task of the session took (`agent_turn_seen`).
+ * `cmd_id` `k:errand:<item>:…`), and kept on that item, whatever that task is doing now (opened again and waiting for the seat,
+ * which that very turn keeps busy, or sent to a new session). A turn with no answer text, or one after a prompt that was no task's,
+ * says nothing. Read from the session's events after the last one any task of the session took (`agent_turn_seen`).
  */
 async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice[]> {
   // Most posts bring none: looked at without a lock first.
@@ -1450,7 +1451,6 @@ async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice
       `SELECT w.item_id, w.seq, w.board_state, w.params, a.session_id AS router_sid
          FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id
         WHERE w.user_id = $1 AND w.kind = 'remote' AND w.params->>'errand' = 'true' AND w.params->>'session_id' = $2
-          AND w.params ? 'dispatched_at'
         ORDER BY w.seq FOR UPDATE OF w`,
       [owner, sessionId],
     )).rows as Array<{ item_id: string; seq: number; board_state: string; params: ErrandParams; router_sid: string }>;
@@ -1468,16 +1468,29 @@ async function applyAgentTurns(owner: string, sessionId: string): Promise<Notice
       [sessionId, seen, REMOTE_EVENT_TURN_END, REMOTE_EVENT_USER_PROMPT, AGENT_TURNS_PER_PASS],
     )).rows as Array<{ id: string; cmd_id: string | null }>;
     if (!ends.length) return [];
+    // A task named by a turn's prompt that is not among them now (moved to a new session of its own since): read by its id, so the
+    // turn is still said as its word and is never passed over unsaid. Only one that no longer exists is.
+    const named = (end: { cmd_id: string | null }) => /^k:errand:([^:]+):/.exec(String(end.cmd_id ?? ""))?.[1];
+    const elsewhere = [...new Set(ends.map(named).filter((id): id is string => !!id && !items.some((i) => i.item_id === id)))];
+    if (elsewhere.length) {
+      items.push(...(await q(
+        `SELECT w.item_id, w.seq, w.board_state, w.params, a.session_id AS router_sid
+           FROM claw_work_items w JOIN claw_assistants a ON a.user_id = w.user_id
+          WHERE w.user_id = $1 AND w.kind = 'remote' AND w.params->>'errand' = 'true' AND w.item_id::text = ANY($2::text[])
+          ORDER BY w.seq FOR UPDATE OF w`,
+        [owner, elsewhere],
+      )).rows as typeof items);
+    }
     const notices: Notice[] = [];
     // How far the session's turns of the agent's own were read: kept on the task sent there last.
-    const latest = [...items].sort((a, b) => String(a.params.dispatched_at).localeCompare(String(b.params.dispatched_at)) || a.seq - b.seq).at(-1)!;
+    const latest = items.filter((i) => i.params.session_id === sessionId)
+      .sort((a, b) => String(a.params.dispatched_at ?? "").localeCompare(String(b.params.dispatched_at ?? "")) || a.seq - b.seq).at(-1)!;
     const touched = new Map<string, number>([[latest.item_id, Number(ends.at(-1)!.id)]]);
     for (const end of ends) {
       const id = Number(end.id);
       // Whose it is: the task the prompt of the last turn that ended before it was sent for. One that follows anyone else's prompt (one
       // typed into a chat attached to the session) is not a task's, and is not said here: that chat shows it.
-      const named = /^k:errand:([^:]+):/.exec(String(end.cmd_id ?? ""))?.[1];
-      const item = items.find((i) => i.item_id === named);
+      const item = items.find((i) => i.item_id === named(end));
       if (!item) continue;
       touched.set(item.item_id, Math.max(touched.get(item.item_id) ?? 0, id));
       const whole = await answerOf(q, sessionId, id);

@@ -839,7 +839,7 @@ const ACTIVITY_PROMPTS = 10;
 /**
  * The owner's open sessions, newest activity first, each with its newest events cut down to what says what it is doing: the
  * type, when, the text of a message chunk or the title of a tool step (at most {@link ACTIVITY_TEXT} characters), a permission
- * request's id, a turn's stop reason, and whether the event is replayed history. `queued` counts prompts accepted for it that its connector has not
+ * request's id, a turn's stop reason, a tool call's id and status, and whether the event is replayed history. `queued` counts prompts accepted for it that its connector has not
  * yet acknowledged; `open_prompts` how many of its newest {@link ACTIVITY_PROMPTS} prompts (`user_prompt`) no `turn_end` or refusal
  * after it names (by `cmd_seq`), wherever they are: a prompt queued behind a long turn can be further back than the events read.
  * Nothing of anyone else's: every row is filtered on `owner`.
@@ -864,6 +864,7 @@ export async function sessionActivity(owner: string, limit: number, events = ACT
                        LEFT(COALESCE(e.data->'update'->'content'->>'text', e.data->'update'->>'title', ''), $4) AS text,
                        e.data->>'actionId' AS action_id, e.data->>'stopReason' AS stop,
                        COALESCE(e.data->>'replay', '') = 'true' AS replay,
+                       e.data->'update'->>'toolCallId' AS tool_id, e.data->'update'->>'status' AS tool_status,
                        CASE WHEN jsonb_typeof(e.data->'cmd_seq') = 'number' THEN (e.data->>'cmd_seq')::float8 END AS cmd_seq
                   FROM claw_remote_events e WHERE e.session_id = s.session_id ORDER BY e.id DESC LIMIT $3
               ) x
