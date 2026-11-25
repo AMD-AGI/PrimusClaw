@@ -22,14 +22,18 @@ gains two required members, `summary` and `setSummary`, so code that implements 
 packaged Claw client does) (#937), and a surface of one's own has a new view to draw, `terminalEnd` (#936). No plugin port
 (core's `src/plugins/`) changed, and the store is unchanged: nothing to do for a deployment of the published packages. The
 end of a terminal turn nobody was at is shown as its own card: which conversation, what it did in whole sentences, its
-whole answer on a tap, and buttons that attach the chat to it or mute it (#936); when that end stands for several turns
-nobody typed, the card first says the earlier one that asked something or failed, and `/approvals summary` sets how often
-a conversation that keeps working on its own is summed up (#937).
+whole answer on a tap, and buttons that attach the chat to it or mute it (#936). With the Claw release that carries #937,
+such an end comes at once only when a person started that turn, it asks the person something or it failed; the ends of
+turns nobody typed that finished (another session's message, a schedule, a hook) and the ends the five-minute gap holds
+back are gathered by Claw and summed up at most once per conversation every hour by default, which `/approvals summary`
+reads and changes; when a pushed end stands for several turns nobody typed, the card first says the earlier one that asked something
+or failed (#937).
 
 **Claw and connector:** the card and `/approvals summary` need the first Claw release after claw-v0.6.1 (with #936 and
 #937); with claw-v0.6.1 and before the worker says a turn's end as the text Claw sends, as before, and `/approvals
-summary` answers that the setting cannot be reached now. An end that names the earlier turns of a run needs connector
-0.3.4 or later on that machine.
+summary` answers that the setting cannot be reached now. Telling a person's turns from the others, and an end that names
+the earlier turns of a run, need connector 0.3.4 or later on that machine; Claw pushes every end from an older connector
+at once, as before.
 
 **Breaking for custom ClawPort implementations and surfaces:** In `@primusclaw/personal-agent`, `ClawRemoteAgentsPort`
 (the `remoteAgents` member of the exported `ClawPort`) gains the required `summary(key)` and `setSummary(key, minutes)`,
@@ -54,7 +58,10 @@ renderer, as Teams' has) (#936). Everything else is additive: `remoteView.termin
   no longer carried), then the latest turn's result (#937).
 - `@primusclaw/personal-agent`: `/approvals summary` says how often a conversation that keeps working on its own in a
   terminal is summed up; `/approvals summary <minutes>` (15 to 1440) sets it and `/approvals summary off` turns the
-  summaries off (#937).
+  summaries off (#937). Claw sends such a summary (how many turns ran, how many failed, the latest result, whether any
+  asked the person) in place of the ends of finished turns nobody typed, which it no longer pushes one by one; the ends of
+  a person's turns, of turns that ask the person something and of failed turns still come at once, as the card above.
+  `/approvals off`, a mute and quiet hours hold summaries as they hold every push (#937).
 
 ## 0.14.0
 
