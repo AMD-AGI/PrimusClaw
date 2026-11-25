@@ -42,6 +42,7 @@ import { lastInputMs as ttyLastInputMs } from "./codex-terminal.js";
 import { boundedInput, type OfferedOption } from "./permissions.js";
 import { REMOTE_EVENT_TERMINAL_TURN_END } from "./protocol.js";
 import { redactDeep } from "./redact.js";
+import { turnOrigin, type TurnOrigin } from "./turn-origin.js";
 
 /** What a card's options say, in the order shown. */
 export interface CardSpec {
@@ -86,6 +87,9 @@ export interface PermissionEvent {
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+/** The end of `s`, at most `max` characters (where an answer sums up), marked as cut when it is. */
+const cutEnd = (s: string, max: number): string => (s.length > max ? `…${s.slice(-(max - 1))}` : s);
+
 const oneLine = (s: unknown, max: number): string => {
   const t = typeof s === "string" ? s.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim() : "";
   return t.length > max ? `${t.slice(0, max - 1)}…` : t;
@@ -353,6 +357,8 @@ export interface BrokerDeps {
   awayMs?: number;
   /** When a terminal last had input (default: its device's access time). */
   lastInputMs?: (tty: string) => number | null;
+  /** How old a run of folded ends may get before it is told without waiting (default {@link TURN_END_RUN_MAX_MS}). */
+  runMaxMs?: number;
 }
 
 /**
@@ -362,6 +368,17 @@ export interface BrokerDeps {
 export const TURN_END_AWAY_MS = 60_000;
 /** The most of the agent's last message an end carries (its end: where an answer sums up). Claw keeps less. */
 export const TURN_END_MESSAGE_MAX = 2000;
+/**
+ * Turns started by something other than a person (another session's message, a scheduled prompt) that end one after another are
+ * told as one end: at most this many of the earlier ones' last words go with the newest, each cut to {@link TURN_END_EARLIER_CHARS}.
+ */
+export const TURN_END_EARLIER_MAX = 5;
+export const TURN_END_EARLIER_CHARS = 400;
+/**
+ * Such a run of ends is told once its first end is this old, without waiting for the terminal to be quiet after the newest one: a
+ * conversation that works on its own without a minute's pause is still heard of.
+ */
+export const TURN_END_RUN_MAX_MS = 15 * 60_000;
 /** What a hook names as the terminal a session runs in (codex-terminal.ts `terminalOf`). */
 const TTY_RE = /^\/dev\/(?:pts\/\d+|tty[A-Za-z0-9]+)$/;
 /** The errors Claude Code names in `StopFailure` are words; anything else is cut to one. */
@@ -378,6 +395,17 @@ interface Ending {
   outcome: "done" | "error";
   error: string | null;
   message: string;
+  /**
+   * Who started the turn (turn-origin.ts), null when the transcript does not say: Claw then tells the end as it did before it
+   * knew. A run of ends of turns nobody typed is folded into its newest (`turns`, `earlier`, `since`).
+   */
+  origin: TurnOrigin | null;
+  /** How many turns' ends this one stands for (itself and the earlier ones folded into it). */
+  turns: number;
+  /** The last words of the earlier turns folded into it, oldest first, at most {@link TURN_END_EARLIER_MAX}. */
+  earlier: string[];
+  /** When the first of the folded ends came. */
+  since: number;
   timer: NodeJS.Timeout;
   /**
    * Why the end was taken back, when that also decides what becomes of a session opened for it meanwhile: the conversation
@@ -419,6 +447,11 @@ export class ApprovalBroker {
   private readonly owned = new Set<string>();
   /** Turns that ended in a terminal, one per conversation: told once the terminal has had no input for `awayMs`. */
   private readonly endings = new Map<string, Ending>();
+  /**
+   * Ends a new prompt came after before they were told, one per conversation: who started that prompt's turn is known only once
+   * it ends. A turn a person started drops it (they are at the terminal); a turn nobody typed carries it on (`turnEnded`).
+   */
+  private readonly held = new Map<string, Ending>();
   /**
    * Ends whose session Claw is opening, taken back meanwhile or not: the end of the conversation or a stop in that time still
    * marks them gone, so a session that opens after the conversation ended is closed rather than kept.
@@ -575,7 +608,8 @@ export class ApprovalBroker {
       if (e && !e.gone) e.gone = gone;
       for (const o of this.opening) if (o.ref === ref && !o.gone) o.gone = gone;
     }
-    if (event === "UserPromptSubmit" || event === "SessionEnd") this.dropEnding(ref, "terminal_active");
+    if (event === "SessionEnd") { this.dropEnding(ref, "terminal_active"); this.dropHeld(ref, "terminal_active"); }
+    if (event === "UserPromptSubmit") this.holdEnding(ref);
     if (event === "Stop" || event === "StopFailure") this.turnEnded(raw, ref, from);
     if (event === "SessionEnd") this.ended(ref);
   }
@@ -584,30 +618,70 @@ export class ApprovalBroker {
    * A turn ended in a terminal (Claude Code's `Stop` or `StopFailure`, Codex's `Stop`). Its owner is told (a `terminal_turn_end`
    * event on the conversation's Claw session, which Claw puts to them) only once the terminal has had no input for `awayMs` since:
    * someone who stayed at it saw the end there. Not told at all when the hook could not name the terminal (nobody can tell whether
-   * a person is at it), when a chat follows the conversation (it shows the end itself), when a newer turn ended (that one is told
-   * instead), or when a new prompt or the end of the conversation came first. A `Stop` that leaves background work running is not
-   * an end: Claude Code wakes the conversation again when that work finishes.
+   * a person is at it), when a chat follows the conversation (it shows the end itself), when a newer turn a person started ended
+   * (that one is told instead), or when a new prompt a person typed or the end of the conversation came first. A `Stop` that leaves
+   * background work running is not an end: Claude Code wakes the conversation again when that work finishes.
+   *
+   * The end says who started the turn (`origin`, from the transcript; turn-origin.ts), so Claw pushes only the ends of turns a
+   * person started (or that ask the person something) and gathers the others into a summary. The end of a turn nobody typed
+   * carries the ends before it that were not told yet (folded: `turns`, `earlier`), so the summary misses none of them.
    */
   private turnEnded(raw: Record<string, unknown>, ref: string, from: { agent?: HookAgent; configDir?: string; tty?: unknown }): void {
-    this.dropEnding(ref, "superseded");
     const agent = from.agent ?? "claude";
     const failed = raw.hook_event_name === "StopFailure";
     const skip = (reason: string) => { this.d.audit("turn_end_not_sent", { ref, agent, reason }); };
-    if (agent === "cursor") return;
-    if (!failed && Array.isArray(raw.background_tasks) && raw.background_tasks.length > 0) { skip("background_tasks"); return; }
+    if (agent === "cursor") { this.dropEnding(ref, "superseded"); this.dropHeld(ref, "superseded"); return; }
+    const origin = agent === "claude" && from.configDir ? turnOrigin(raw.transcript_path, from.configDir, ref) : null;
+    // Background work still runs: the turn goes on when it finishes, and what waits to be told waits for that end.
+    if (!failed && Array.isArray(raw.background_tasks) && raw.background_tasks.length > 0) { this.holdEnding(ref); skip("background_tasks"); return; }
+    const prev = this.endings.get(ref) ?? this.held.get(ref);
+    const fold = origin === "automation" && prev !== undefined && !prev.gone;
+    if (fold) {
+      clearTimeout(prev.timer);
+      if (this.endings.get(ref) === prev) this.endings.delete(ref);
+      this.held.delete(ref);
+      this.d.audit("turn_end_not_sent", { ref, agent: prev.agent, reason: "folded" });
+    } else {
+      this.dropEnding(ref, "superseded");
+      this.dropHeld(ref, "terminal_active");
+    }
     const tty = typeof from.tty === "string" && TTY_RE.test(from.tty) ? from.tty : null;
     if (!tty) { skip("no_terminal"); return; }
     const cwd = typeof raw.cwd === "string" && path.isAbsolute(raw.cwd) ? raw.cwd : null;
     if (!cwd || !from.configDir) { skip("no_folder"); return; }
     const error = failed ? (typeof raw.error === "string" && ERROR_RE.test(raw.error) ? raw.error : "unknown") : null;
     const said = typeof raw.last_assistant_message === "string" ? raw.last_assistant_message : "";
+    const at = Date.now();
+    const earlier = fold ? [...prev.earlier, ...(prev.message ? [cutEnd(prev.message, TURN_END_EARLIER_CHARS)] : [])].slice(-TURN_END_EARLIER_MAX) : [];
+    const since = fold ? prev.since : at;
+    // A run that started with a person's turn stays theirs: that turn's end is in it, and it is told as theirs.
+    const runOrigin: TurnOrigin | null = fold && prev.origin !== "automation" ? "person" : origin;
+    const wait = at - since >= (this.d.runMaxMs ?? TURN_END_RUN_MAX_MS) ? 0 : this.d.awayMs ?? TURN_END_AWAY_MS;
     const e: Ending = {
-      ref, agent, configDir: from.configDir, cwd, tty, at: Date.now(), outcome: failed ? "error" : "done", error,
-      message: said.length > TURN_END_MESSAGE_MAX ? `…${said.slice(-(TURN_END_MESSAGE_MAX - 1))}` : said,
-      timer: setTimeout(() => { void this.tellEnding(e); }, this.d.awayMs ?? TURN_END_AWAY_MS),
+      ref, agent, configDir: from.configDir, cwd, tty, at, outcome: failed ? "error" : "done", error,
+      message: cutEnd(said, TURN_END_MESSAGE_MAX), origin: runOrigin, turns: fold ? prev.turns + 1 : 1, earlier, since,
+      timer: setTimeout(() => { void this.tellEnding(e); }, wait),
     };
     e.timer.unref?.();
     this.endings.set(ref, e);
+  }
+
+  /** A new prompt (or background work) came before the end was told: it waits for the end of that turn (`turnEnded`). */
+  private holdEnding(ref: string): void {
+    const e = this.endings.get(ref);
+    if (!e) return;
+    clearTimeout(e.timer);
+    this.endings.delete(ref);
+    this.dropHeld(ref, "superseded");
+    this.held.set(ref, e);
+    this.d.audit("turn_end_held", { ref, agent: e.agent });
+  }
+
+  private dropHeld(ref: string, reason: string): void {
+    const e = this.held.get(ref);
+    if (!e) return;
+    this.held.delete(ref);
+    this.d.audit("turn_end_not_sent", { ref, agent: e.agent, reason });
   }
 
   private dropEnding(ref: string, reason: string): void {
@@ -655,6 +729,8 @@ export class ApprovalBroker {
     this.d.emit(opened.sessionId, REMOTE_EVENT_TERMINAL_TURN_END, {
       ref: e.ref, outcome: e.outcome, ...(e.error ? { error: e.error } : {}), message: e.message, agent: e.agent, cwd: e.cwd,
       ended_at: new Date(e.at).toISOString(), away_ms: Math.max(0, Date.now() - now.last),
+      ...(e.origin ? { origin: e.origin } : {}),
+      ...(e.turns > 1 ? { turns: e.turns, earlier: e.earlier, since: new Date(e.since).toISOString() } : {}),
     });
     this.d.audit("turn_end_sent", { session_id: opened.sessionId, ref: e.ref, agent: e.agent, outcome: e.outcome });
   }
@@ -717,6 +793,7 @@ export class ApprovalBroker {
     for (const e of this.endings.values()) { clearTimeout(e.timer); e.gone = { stopped: true }; }
     for (const e of this.opening) e.gone = { stopped: true };
     this.endings.clear();
+    this.held.clear();
   }
 
   private settle(p: Pending, decision: AnyDecision | null, by: string): void {
