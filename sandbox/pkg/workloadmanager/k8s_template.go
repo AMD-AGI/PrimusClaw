@@ -59,6 +59,18 @@ func validateTemplateLayers(spec runtimev1alpha1.CodeInterpreterSpec) error {
 	return sandboxlayer.Validate(spec.Template.Layers, sandboxlayer.TemplateMounts(spec.Template))
 }
 
+// validateTemplateRequest checks a template spec sent to the template API:
+// its layers and its preferredNodes.
+func validateTemplateRequest(spec runtimev1alpha1.CodeInterpreterSpec) error {
+	if err := validateTemplateLayers(spec); err != nil {
+		return err
+	}
+	if spec.Template == nil {
+		return nil
+	}
+	return runtimev1alpha1.ValidatePreferredNodes(spec.Template.PreferredNodes)
+}
+
 // CreateTemplate creates a new CodeInterpreter CRD object in Kubernetes.
 // If user is non-nil, stamps user identity annotations for auditing.
 // If public is true, marks the template as publicly visible/usable.

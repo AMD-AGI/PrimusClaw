@@ -113,6 +113,13 @@ release version, and its `appVersion` stays `latest`.
 
 ### Added
 
+- Agent Sandbox: a template can name the nodes its sandboxes prefer, `preferredNodes` (at most 8 distinct node names,
+  DNS-1123 subdomains; checked by the template API, when a grant or owner policy is applied, and by the CRD). A sandbox
+  Workload gets them as SaFE `specified-nodes`, next to `excluded-nodes` from `agent-sandbox.io/avoid-nodes`, and the node
+  affinity is `preferred` when either list is set. A node in both lists is dropped from `specified-nodes` (avoid wins).
+  A running sandbox of such a template carries `agent-sandbox.io/preferred-node` (`true` or `false`). Claw passes the
+  field through untouched; see "Preferred nodes" in `claw/docs/plugins.md`. Until SaFE applies `excluded-nodes` as a
+  preference under that annotation, `excluded-nodes` stays a required `NotIn` while `specified-nodes` is preferred.
 - Claw: tasks handed to the user's seats (for users with seats; `CLAW_DEVENV_SEAT_DISPATCH=off` turns it off). `work_create` takes
   `target: "seat:<seat_id>"`, or 2 to 5 places for a choice card (`confirm_write.options`, decided with `choice`). Each task is its own
   remote item; a card is required unless the user's own attended message names one confirmed seat they already approved a card for

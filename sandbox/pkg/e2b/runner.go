@@ -13,6 +13,11 @@ import (
 // ErrTemplateMissing is returned by a Runner when the CodeInterpreter does not exist.
 var ErrTemplateMissing = errors.New("code interpreter template not found")
 
+// ErrCreateRefused is wrapped by a Runner error when the cluster refused the
+// sandbox for good, such as an admission webhook that denied its Pod. Waiting
+// does not change the answer, so the create fails now with the reason.
+var ErrCreateRefused = errors.New("sandbox refused")
+
 // CreateRequest is one sandbox to place in the cluster.
 // SandboxID is also the session id.
 type CreateRequest struct {
@@ -58,6 +63,10 @@ type CreateResult struct {
 	Cluster string
 	// Failure is the failure text of a finished Workload, when known.
 	Failure string
+	// PreferredNodes are the nodes the sandbox's template prefers,
+	// space-separated (including any the create also avoided), or "" when it
+	// prefers none.
+	PreferredNodes string
 }
 
 // Runner creates and deletes sandboxes. It must not inject a platform inference key.

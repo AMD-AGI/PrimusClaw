@@ -4,8 +4,10 @@
 package router
 
 import (
+	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -66,6 +68,23 @@ func (s *Server) proxyToWM(c *gin.Context) {
 	resp, err := httpClient.Do(outReq)
 	if err != nil {
 		log.Error("proxyToWM: upstream error", "target", targetURL, "error", err)
+		if isTimeout(err) {
+			// Workload Manager took the request and has not answered yet: it
+			// is not unreachable, and what it is doing -- placing a sandbox
+			// that has not started, most often -- goes on without this call.
+			message := "workload manager did not answer in time; the request may still be in progress there"
+			if r.Method == http.MethodPost && strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/sandboxes") {
+				message = "the sandbox is still pending: workload manager did not answer before the gateway timeout " +
+					"and the create goes on there; list the sandboxes before creating another"
+			}
+			c.JSON(http.StatusGatewayTimeout, gin.H{
+				"error":   message,
+				"code":    http.StatusGatewayTimeout,
+				"reason":  "upstream_timeout",
+				"message": "upstream_timeout: " + message,
+			})
+			return
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": "workload manager unreachable: " + err.Error()})
 		return
 	}
@@ -96,6 +115,22 @@ func (s *Server) proxyToWM(c *gin.Context) {
 	} else {
 		_, _ = io.Copy(w, resp.Body)
 	}
+}
+
+// isTimeout reports whether a proxied call ended because a deadline passed
+// before the upstream answered, as opposed to the upstream refusing the
+// connection or the caller going away. A deadline that passed while still
+// dialing means the upstream was never reached, so it is not one.
+func isTimeout(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 // proxyRequest forwards the request to the target URL and streams the response back.

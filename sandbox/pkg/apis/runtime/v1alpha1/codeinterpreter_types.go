@@ -184,6 +184,19 @@ type CodeInterpreterSandboxTemplate struct {
 	// +optional
 	// +kubebuilder:validation:Enum=on;off;readOnly
 	WorkspaceStorage WorkspaceStorageMode `json:"workspaceStorage,omitempty"`
+
+	// PreferredNodes are node names a sandbox of this template prefers to run
+	// on. The preference is soft: a sandbox runs on another node of its
+	// workspace when none of these can take it, and a name outside the
+	// workspace never matches. Each name is a DNS-1123 subdomain with labels
+	// of at most 63 characters, with no name twice and at most 8 names. A name the create also asks to avoid
+	// is dropped from the preference.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$`
+	PreferredNodes []string `json:"preferredNodes,omitempty"`
 }
 
 // WorkspaceStorageMode is how a sandbox mounts its workspace's storage.

@@ -117,6 +117,7 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 	t.Cleanup(func() { workloadPollInterval = prev })
 
 	ci := testCodeInterpreter()
+	ci.Spec.Template.PreferredNodes = []string{"node-a", "node-b"}
 	scheme := k8sruntime.NewScheme()
 	if err := runtimev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -169,7 +170,7 @@ func TestCreateWorkloadWaitsForPod(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.SandboxName != sandboxID || result.Namespace != "top-models" || result.PodIP != "10.2.0.4" ||
-		result.PodPort != envdPort || result.NodeName != "node-b" || result.Kind != store.WorkloadKind {
+		result.PodPort != envdPort || result.NodeName != "node-b" || result.Kind != store.WorkloadKind || result.PreferredNodes != "node-a node-b" {
 		t.Fatalf("result=%+v", result)
 	}
 	stored, err := dc.Tracker().Get(workloadGVR, "", sandboxID)

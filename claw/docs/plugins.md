@@ -806,3 +806,31 @@ mount can still be refused by the pod admission of nodes outside the cluster).
   and only then switch the next. The annotation name is SaFE's: a SaFE that
   does not yet know it mounts the storage read-write as before, so confirm the
   deployed SaFE supports it before relying on it.
+
+### Preferred nodes
+
+A sandbox template may also name the nodes its sandboxes prefer to run on, with
+Agent Sandbox's `preferredNodes` (for example to come back to the host whose
+page cache already holds a model):
+
+```json
+{
+  "name": "measurement",
+  "fromImage": "registry.example.invalid/measure@sha256:...",
+  "per_gpu_count": [8],
+  "preferredNodes": ["node-a", "node-b"]
+}
+```
+
+Claw does not read or check `preferredNodes`: like every template key it does
+not handle itself, it passes it to Agent Sandbox untouched (flat, or inside a
+nested `template`). Agent Sandbox refuses a grant whose `preferredNodes` is
+not at most 8 distinct node names (DNS-1123 subdomains), and hands the list to
+SaFE as `specified-nodes` with the node affinity `preferred`. The preference is
+soft: a sandbox runs on another node of its workspace when none of the named
+nodes can take it (full, or not in the workspace), and a node outside the
+workspace never matches. A node the sandbox create also asks to avoid
+(`agent-sandbox.io/avoid-nodes`) is dropped from the preference, so it is only
+avoided. A sandbox of such a template carries the metadata
+`agent-sandbox.io/preferred-node` (`true` or `false`) once it runs: whether it
+landed on one of the named nodes.
