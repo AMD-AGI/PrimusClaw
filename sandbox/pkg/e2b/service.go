@@ -431,6 +431,9 @@ func (s *Service) place(ctx context.Context, grantID, sandboxID string, pending 
 			return CreateResult{}, grant.Op(http.StatusServiceUnavailable, "template_unavailable", req.TemplateID)
 		}
 		failed := grant.Op(http.StatusInternalServerError, "sandbox_create_failed", runErr.Error())
+		if errors.Is(runErr, ErrCreateRefused) {
+			failed = refusedError(runErr)
+		}
 		if timedOut {
 			failed = pendingTimeoutError(pending, runErr.Error())
 		}
@@ -445,6 +448,16 @@ func (s *Service) place(ctx context.Context, grantID, sandboxID string, pending 
 	}
 	return result, nil
 }
+
+// refusedError reports a sandbox the cluster refused, with the refusal text.
+// 422: the request reached the cluster and was judged; it is not retryable as is.
+func refusedError(err error) *grant.OpError {
+	detail := strings.TrimPrefix(err.Error(), ErrCreateRefused.Error()+": ")
+	return grant.Op(http.StatusUnprocessableEntity, sandboxRefusedReason, detail)
+}
+
+// sandboxRefusedReason is the error code of a sandbox the cluster refused.
+const sandboxRefusedReason = "sandbox_refused"
 
 // pendingTimeoutError reports a sandbox that was not running within its pending wait.
 // cause is the last state the runner observed, when known.

@@ -25,6 +25,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
 	"sigs.k8s.io/agent-sandbox/pkg/sandboxlayer"
@@ -555,6 +556,11 @@ func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace s
 		cluster = obj.GetLabels()[safeClusterIDLabel]
 		phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
 		lastPhase, lastText = phase, workloadFailureText(obj)
+		if phase != "Running" {
+			if refusal := workloadRefusal(obj); refusal != "" {
+				return false, fmt.Errorf("%w: workload %s: %s", e2b.ErrCreateRefused, name, refusal)
+			}
+		}
 		switch phase {
 		case "Failed", "Succeeded", "Stopped":
 			return false, terminalWorkloadError(name, phase, obj)
@@ -581,6 +587,45 @@ func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace s
 		return "", "", cluster, err
 	}
 	return podIP, nodeName, cluster, nil
+}
+
+// workloadRefusalLimit bounds the refusal text returned to the caller.
+const workloadRefusalLimit = 1024
+
+// workloadRefusal is the API server's refusal of the sandbox Pod, as the
+// sandbox controller published it (SandboxPodCreateRefusedPrefix) and SaFE
+// copied it onto the Workload status or a condition, or "" when there is none.
+// The same spec is refused the same way on every dispatch, so waiting for the
+// Workload to run cannot end in anything but the pending deadline.
+func workloadRefusal(obj *unstructured.Unstructured) string {
+	texts := []string{}
+	if message, _, _ := unstructured.NestedString(obj.Object, "status", "message"); message != "" {
+		texts = append(texts, message)
+	}
+	conditions, _, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	for _, item := range conditions {
+		condition, ok := item.(map[string]any)
+		if !ok || condition["status"] != "True" {
+			continue
+		}
+		if message, _ := condition["message"].(string); message != "" {
+			texts = append(texts, message)
+		}
+	}
+	for _, text := range texts {
+		_, refusal, ok := strings.Cut(text, sandboxv1alpha1.SandboxPodCreateRefusedPrefix)
+		if !ok {
+			continue
+		}
+		// SaFE appends the failed pod list after ", details: "; a refused Pod
+		// never existed, so nothing there explains it.
+		refusal, _, _ = strings.Cut(refusal, ", details: ")
+		refusal = strings.Join(strings.Fields(refusal), " ")
+		if refusal != "" {
+			return truncateUTF8(refusal, workloadRefusalLimit)
+		}
+	}
+	return ""
 }
 
 // pendingWorkloadError appends the last observed Workload phase and status to head.

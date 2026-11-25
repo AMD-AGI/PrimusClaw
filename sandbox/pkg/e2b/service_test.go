@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -369,6 +370,7 @@ func TestOriginalCreateReportsFailureBeforeReplay(t *testing.T) {
 	}{
 		{name: "workload failed", fail: errors.New("workload sbx-1 phase Failed: CapacityGone: allocation generation is Lost"), status: http.StatusInternalServerError, reason: "sandbox_create_failed", want: "CapacityGone"},
 		{name: "pending timeout", hold: true, status: http.StatusServiceUnavailable, reason: "pending_timeout", want: "not running after 1s"},
+		{name: "admission refused", fail: fmt.Errorf("%w: workload sbx-1: admission webhook \"pod-policy.example.com\" denied the request: PolicyRefused: host path is outside the workspace", ErrCreateRefused), status: http.StatusUnprocessableEntity, reason: "sandbox_refused", want: "denied the request: PolicyRefused"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
