@@ -771,28 +771,9 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
       return `${machineLabel}/${agentId}/${n}`;
     };
     const agentOf = (id: string) => agents.find((a) => a.agent_id === id);
-    // The sessions open through Claw on this machine, newest activity first; the card lists the newest few of all machines'.
-    for (const s of open.filter((o) => o.connector_id === String(c.connector_id))) {
-      const agent = agentOf(s.agent_id);
-      const reading = readActivity(s);
-      const ref = String(s.session_id);
-      const row: DevenvSession = {
-        label: label(String(s.agent_id)), id: ref, title: heldTitle(agent, s), agent: String(s.agent_id), agent_name: shown(agent?.name, NAME_MAX),
-        cwd: shown(s.cwd, CWD_MAX),
-        // A watch is never at work for Claw: what it shows is the terminal's turn, so it reads as that terminal's (as `planSend` does).
-        opened_in: "chat", state: s.read_only === true ? "in_terminal" : reading.state, last_activity: iso(s.updated_at),
-        ref: online ? ref : null, attach_command: online ? attachCommand(ref) : null,
-        ...(online ? {} : { why_not: "the machine is offline" }),
-        ...(s.read_only === true ? { read_only: true, note: READ_ONLY_NOTE } : {}),
-        ...(onCard.has(ref) ? {} : { not_on_agents_card: true as const }),
-        ...seatOf(String(c.connector_id), String(s.agent_id), s.cwd),
-      };
-      if (activity) Object.assign(row, { step: reading.step, last_answer: reading.answer, asked: reading.asked, last_stop: reading.last_stop, queued_prompts: Number(s.queued) || 0 });
-      sessions.push(row);
-      if (online) attachable.push({ label: row.label, ref, opened_in: "chat", ...(s.read_only === true ? { read_only: true as const } : {}) });
-    }
-    // The agents' own conversations on this machine that are not already open through Claw ("attached" ones are), in the order the
-    // agents card lists them (it lists none of an offline machine's).
+    // As the agents card lists them: first each agent's own conversations on this machine that are not already open through Claw
+    // ("attached" ones are), in the card's order (it lists none of an offline machine's); then, under "your sessions", the sessions open
+    // through Claw, newest activity first (the card lists the newest few of all machines').
     for (const a of agents) {
       const newest = resumableOf(a).sort((x, y) => (y.updated_at ?? "").localeCompare(x.updated_at ?? ""));
       for (const { c: r, shown: carded } of cardOrder(newest)) {
@@ -815,6 +796,25 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
         sessions.push(row);
         if (can) attachable.push({ label: row.label, ref: r.ref, opened_in: "machine", ...(inTerminal && !r.typed ? { read_only: true as const } : {}) });
       }
+    }
+    for (const s of open.filter((o) => o.connector_id === String(c.connector_id))) {
+      const agent = agentOf(s.agent_id);
+      const reading = readActivity(s);
+      const ref = String(s.session_id);
+      const row: DevenvSession = {
+        label: label(String(s.agent_id)), id: ref, title: heldTitle(agent, s), agent: String(s.agent_id), agent_name: shown(agent?.name, NAME_MAX),
+        cwd: shown(s.cwd, CWD_MAX),
+        // A watch is never at work for Claw: what it shows is the terminal's turn, so it reads as that terminal's (as `planSend` does).
+        opened_in: "chat", state: s.read_only === true ? "in_terminal" : reading.state, last_activity: iso(s.updated_at),
+        ref: online ? ref : null, attach_command: online ? attachCommand(ref) : null,
+        ...(online ? {} : { why_not: "the machine is offline" }),
+        ...(s.read_only === true ? { read_only: true, note: READ_ONLY_NOTE } : {}),
+        ...(onCard.has(ref) ? {} : { not_on_agents_card: true as const }),
+        ...seatOf(String(c.connector_id), String(s.agent_id), s.cwd),
+      };
+      if (activity) Object.assign(row, { step: reading.step, last_answer: reading.answer, asked: reading.asked, last_stop: reading.last_stop, queued_prompts: Number(s.queued) || 0 });
+      sessions.push(row);
+      if (online) attachable.push({ label: row.label, ref, opened_in: "chat", ...(s.read_only === true ? { read_only: true as const } : {}) });
     }
     // Each agent itself, which is how a user with no session yet gets one: the channel attaches its open session, else starts one.
     const offered: DevenvAgent[] = agents.map((a) => {
@@ -972,14 +972,21 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
     const m = flat(c.name, NAME_MAX);
     return m && !m.includes("/") ? m : `machine-${String(c.connector_id).slice(0, 8)}`;
   };
-  // Every session a target may name: those open through Claw (by id or label), and the agents' own conversations (by ref or label),
-  // labelled as devenv_list labels them.
+  // Every session a target may name: the agents' own conversations (by ref or label) and those open through Claw (by id or label),
+  // labelled as devenv_list labels them (in the agents card's order).
   type Named = { c: Row; agent: Row | undefined; label: string; session_id: string | null; resume_ref: string | null; cwd: string | null; busy: string | null; terminal?: true };
   const named: Named[] = [];
   for (const c of connectors) {
     const counter = new Map<string, number>();
     const label = (agentId: string) => { const n = (counter.get(agentId) ?? 0) + 1; counter.set(agentId, n); return `${nameOf(c)}/${agentId}/${n}`; };
     const agents: Row[] = Array.isArray(c.agents) ? c.agents : [];
+    for (const a of agents) {
+      for (const { c: r } of cardOrder(resumableOf(a).sort((x, y) => (y.updated_at ?? "").localeCompare(x.updated_at ?? "")))) {
+        named.push({ c, agent: a, label: label(String(a.agent_id)), session_id: null, resume_ref: r.ref, cwd: r.cwd,
+          // One its connector types into takes the instruction as the terminal's next input (it waits there while the terminal works).
+          busy: r.state === "live" && !r.typed ? "in_terminal" : null, ...(r.state === "live" && r.typed ? { terminal: true as const } : {}) });
+      }
+    }
     for (const s of open.filter((o) => o.connector_id === String(c.connector_id))) {
       const reading = readActivity(s);
       named.push({
@@ -988,13 +995,6 @@ export async function planSend(userId: string, args: DevenvSendArgs, onlineWindo
         // A session that only watches a terminal's conversation takes no instruction, as the conversation itself does not.
         busy: s.read_only === true ? "in_terminal" : reading.state === "idle" ? null : reading.state,
       });
-    }
-    for (const a of agents) {
-      for (const { c: r } of cardOrder(resumableOf(a).sort((x, y) => (y.updated_at ?? "").localeCompare(x.updated_at ?? "")))) {
-        named.push({ c, agent: a, label: label(String(a.agent_id)), session_id: null, resume_ref: r.ref, cwd: r.cwd,
-          // One its connector types into takes the instruction as the terminal's next input (it waits there while the terminal works).
-          busy: r.state === "live" && !r.typed ? "in_terminal" : null, ...(r.state === "live" && r.typed ? { terminal: true as const } : {}) });
-      }
     }
   }
   const offline = (c: Row): PlanOutcome => ({
