@@ -43,9 +43,10 @@ import { CLAW_ASSISTANT_ENABLED, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { approvalsEnabled, DELIVERY_UNCONFIRMED, findSession, issueCommand, onlineSql, terminalMuted, wakeConnector } from "../remote-agents/store.js";
 import { newWorkItemId } from "../tasks/ids.js";
-import type { AssistantRemoteAsk, AssistantRemoteNotice, AssistantTerminalEnd } from "../notifications/assistant-events.js";
+import type { AssistantRemoteAsk, AssistantRemoteNotice, AssistantTerminalEarlier, AssistantTerminalEnd } from "../notifications/assistant-events.js";
 import { ensureLiveAssistant, itemSession, personWritesChinese, recordSystemNotice, storeAnswerWhole } from "./outbound.js";
 import { inertMd } from "./inert-md.js";
+import { asksPerson, gather, type TerminalDigest } from "./terminal-digest.js";
 import { applyWorkerReport, clipOneLine, clipWords, graphemes, TITLE_MAX } from "./work-items.js";
 
 const logger = pino({ name: "assistant-remote-items" });
@@ -90,6 +91,8 @@ export const TERMINAL_ASKS_PER_MINUTE = 5;
 export const TERMINAL_END_GAP_MS = 5 * 60_000;
 /** How much of what the agent last said an end's card carries whole ("show all"): all the connector posts. */
 const END_FULL_MAX = 2000;
+/** The earlier ends a connector folded into one (`earlier`) that are read: its own most. */
+const EARLIER_KEPT = 5;
 const MINUTE_MS = 60_000;
 /** The newest message chunks of a turn its answer is read from. */
 const ANSWER_CHUNKS = 400;
@@ -150,6 +153,10 @@ export interface RemoteParams {
   carded?: string[];
   /** A terminal's item: when (ms) the user was last told that one of its turns ended ({@link TERMINAL_END_GAP_MS}). */
   end_told_at?: number;
+  /** A terminal's item: the ends gathered for its next summary instead of being pushed one by one (terminal-digest.ts). */
+  digest?: TerminalDigest;
+  /** A terminal's item: when (ms) its last summary was said. */
+  summary_told_at?: number;
   /** A terminal's item: the conversation's own name, as its connector lists it (`capabilities.resumable` title), when it has one. */
   name?: string;
   /** Prompts (`cmd_seq`) Claw ended as `delivery_unconfirmed`: an end of the machine's own for one of them still ends the item. */
@@ -807,6 +814,73 @@ function fitSentences(line: string, max: number, first: boolean): { text: string
   return { text: `${(space >= max / 3 ? head.slice(0, space) : head).trim()}…`, cut: true };
 }
 
+/**
+ * What a turn that asked the person something said to them, for an end that folds it in behind a later turn: the end of its last
+ * paragraph (where an answer that needs the person asks, as {@link asksPerson} reads it), in whole sentences that fit in `max` code
+ * points, with "…" first when the paragraph had more before them. A last sentence longer than that alone is kept whole up to
+ * {@link END_SENTENCE_MAX}, and only one longer still keeps its end. One line, the agent's words: plain text, never instructions.
+ */
+export function terminalAskSummary(message: string, max: number = END_SUMMARY_MAX): string {
+  const text = message.replace(/\r\n?/gu, "\n").replace(/[\u0000-\u0009\u000b-\u001f\u007f]+/gu, " ").trim();
+  const blocks = text.split(/\n\s*\n/u).map((b) => b.trim()).filter(Boolean);
+  const lines = (blocks[blocks.length - 1] ?? "").split("\n").map(plainLine).filter(Boolean);
+  const whole = lines.reduce((all, l) => (all ? `${all}${CJK_END.test(all) ? "" : " "}${l}` : l), "");
+  const cut = whole.startsWith("…");
+  const line = whole.replace(/^…\s*/u, "");
+  const chars = Array.from(line);
+  if (!chars.length) return "";
+  if (chars.length <= max) return `${cut ? "…" : ""}${line}`;
+  // Where each sentence starts (code points), the first at 0: the question is in the last ones.
+  const starts = [0];
+  SENTENCE_END.lastIndex = 0;
+  for (let m = SENTENCE_END.exec(line); m; m = SENTENCE_END.exec(line)) {
+    let at = Array.from(line.slice(0, m.index + m[0].length)).length;
+    while (at < chars.length && /\s/u.test(chars[at] ?? "")) at++;
+    if (at < chars.length) starts.push(at);
+  }
+  const from = starts.find((n) => chars.length - n <= max) ?? (chars.length - (starts[starts.length - 1] ?? 0) <= END_SENTENCE_MAX
+    ? starts[starts.length - 1] ?? 0 : chars.length - (max - 1));
+  return `…${chars.slice(from).join("").trim()}`;
+}
+
+/**
+ * The earlier turns of a folded run (the connector's `earlier`, `earlier_failed`, `asked_earlier` and `failed_earlier`) that the
+ * person must hear of when its end is pushed: the latest that asked them something and the latest that failed, each in its own words
+ * when the connector still carries them ("" when not), with how many did. Empty when none asked or failed.
+ */
+export function terminalEarlierLeads(
+  kept: ReadonlyArray<{ text: string; failed: boolean }>, askedCounted: number, failedCounted: number,
+): AssistantTerminalEarlier[] {
+  const asked = kept.filter((k) => !k.failed && asksPerson(k.text));
+  const failed = kept.filter((k) => k.failed);
+  const leads: AssistantTerminalEarlier[] = [];
+  const askedCount = Math.max(askedCounted, asked.length);
+  if (askedCount > 0) {
+    const last = asked[asked.length - 1];
+    leads.push({ kind: "asked", text: last ? terminalAskSummary(last.text) : "", count: askedCount });
+  }
+  const failedCount = Math.max(failedCounted, failed.length);
+  if (failedCount > 0) {
+    const last = failed[failed.length - 1];
+    leads.push({ kind: "failed", text: last ? clipOneLine(terminalEndSummary(last.text).summary.replace(/\s+/gu, " "), END_SENTENCE_MAX) : "", count: failedCount });
+  }
+  return leads;
+}
+
+/** What one {@link terminalEarlierLeads} entry says first in an end's message: that turn's own words, or how many and where to look. */
+function earlierLeadLine(lead: AssistantTerminalEarlier, zh: boolean): string {
+  const text = inertMd(lead.text);
+  const n = lead.count;
+  if (lead.kind === "asked") {
+    if (!text) return zh ? `早先有 ${n} 轮在问你，详见终端` : n > 1 ? `${n} earlier turns asked you something; see the terminal` : "An earlier turn asked you something; see the terminal";
+    const more = n > 1 ? (zh ? `（早先共 ${n} 轮在问你，详见终端）` : ` (${n} earlier turns asked; see the terminal)`) : "";
+    return zh ? `早先一轮在问你：${text}${more}` : `An earlier turn asked: ${text}${more}`;
+  }
+  if (!text) return zh ? `早先有 ${n} 轮出错停下，详见终端` : n > 1 ? `${n} earlier turns stopped with an error; see the terminal` : "An earlier turn stopped with an error; see the terminal";
+  const more = n > 1 ? (zh ? `（早先共 ${n} 轮出错，详见终端）` : ` (${n} earlier turns did; see the terminal)`) : "";
+  return zh ? `早先一轮出错停下：${text}${more}` : `An earlier turn stopped with an error: ${text}${more}`;
+}
+
 /** What names a conversation in its end's message: its own name (the connector's list), else its title, else the tool. */
 export function terminalEndName(p: Pick<RemoteParams, "agent_id" | "tool" | "title" | "name">): string {
   return flat(p.name, 80) || flat(p.title, 80) || remoteAgentName(p);
@@ -822,7 +896,7 @@ export function terminalEndName(p: Pick<RemoteParams, "agent_id" | "tool" | "tit
  */
 export function terminalEndNotice(
   p: Pick<RemoteParams, "machine" | "agent_id" | "tool" | "lang" | "title" | "cwd" | "name">, seq: number, failed: boolean, error: string,
-  said: { summary: string; more: boolean }, attach: string | null,
+  said: { summary: string; more: boolean }, attach: string | null, earlier: readonly AssistantTerminalEarlier[] = [],
 ): string {
   const zh = p.lang === "zh";
   // Every word the machine or the agent wrote is made inert: a channel reads this text as markdown, and none of it may become a
@@ -833,13 +907,16 @@ export function terminalEndNotice(
   const where = [inertMd(p.machine), inertMd(cwdTail(String(p.cwd ?? ""))), zh ? "终端空闲" : "terminal idle", `#${seq}`]
     .filter(Boolean).join(" · ");
   const head = zh ? `【${name}】${status} · ${where}` : `[${name}] ${status} · ${where}`;
+  // An earlier turn of a folded run that asked the person something, or failed, is said first: the latest turn's words come after it.
+  const leads = earlier.map((l) => earlierLeadLine(l, zh));
+  const latest = leads.length ? (zh ? "最新一轮：" : "Latest turn: ") : "";
   const body = said.summary
-    ? `${inertMd(said.summary)}${said.more ? (zh ? "（全文见终端）" : " (the rest is in the terminal)") : ""}`
+    ? `${latest}${inertMd(said.summary)}${said.more ? (zh ? "（全文见终端）" : " (the rest is in the terminal)") : ""}`
     : "";
   const commands = zh
     ? [attach ? `接入：${attach}` : "", `静音：/approvals mute #${seq}`]
     : [attach ? `Attach: ${attach}` : "", `Mute: /approvals mute #${seq}`];
-  return [head, body, commands.filter(Boolean).join(zh ? "　" : "  ·  ")].filter(Boolean).join("\n");
+  return [head, ...leads, body, commands.filter(Boolean).join(zh ? "　" : "  ·  ")].filter(Boolean).join("\n");
 }
 
 /** The attach command a turn's end offers for a conversation its connector lists (`capabilities.resumable`), by the start of its ref. */
@@ -1314,13 +1391,38 @@ async function applyTerminal(
         [summary], { kind: "answer", summary, result: { outcome: failed ? "error" : "done", error: error || null, remote_event_id: e.id } },
       );
       if (!enabled) continue;
-      if (Number(p.end_told_at) > now - TERMINAL_END_GAP_MS) continue;
+      // Pushed at once only when the person has a reason to hear it now: they started the turn (or the connector is too old to
+      // say who did), it asks them something, or it failed. An end of a turn another session or a schedule started, and an end
+      // held back by the gap, are gathered for the conversation's next summary instead (terminal-digest.ts): never lost, never
+      // said twice.
+      const origin = e.data.origin === "automation" ? "automation" : e.data.origin === "person" ? "person" : null;
+      const turns = Number.isSafeInteger(e.data.turns) && Number(e.data.turns) > 1 ? Math.min(Number(e.data.turns), 10_000) : 1;
+      // The earlier turns' words, each with whether that turn failed (`earlier_failed`: their positions; an older connector names none).
+      const failedAt = new Set(Array.isArray(e.data.earlier_failed) ? e.data.earlier_failed.filter((i) => Number.isSafeInteger(i)) : []);
+      const kept = (Array.isArray(e.data.earlier) ? e.data.earlier : [])
+        .flatMap((x, i) => (typeof x === "string" ? [{ text: x.slice(-END_FULL_MAX), failed: failedAt.has(i) }] : []))
+        .slice(-EARLIER_KEPT);
+      const earlier = kept.map((k) => terminalEndSummary(k.text).summary);
+      const count = (v: unknown) => (Number.isSafeInteger(v) && Number(v) > 0 ? Math.min(Number(v), Math.max(turns - 1, 1)) : 0);
+      // A question or a failure in any turn of a folded run counts: the run is pushed, its message leads with that turn (its words,
+      // or how many when the connector no longer carries them: `asked_earlier`, `failed_earlier` count every folded turn), and the
+      // summary says something asked the person.
+      const leads = terminalEarlierLeads(kept, count(e.data.asked_earlier), count(e.data.failed_earlier));
+      const earlierAsks = leads.some((l) => l.kind === "asked");
+      const asks = (!failed && asksPerson(message)) || earlierAsks;
+      const failedEarlier = leads.find((l) => l.kind === "failed")?.count ?? 0;
+      const gathered = { turns, failed: (failed ? 1 : 0) + failedEarlier, asks, said: [...earlier, told.summary] };
+      if (origin === "automation" && !asks && !failed && !failedEarlier) { gather(p, now, gathered); continue; }
+      if (Number(p.end_told_at) > now - TERMINAL_END_GAP_MS) { gather(p, now, gathered); continue; }
       p.end_told_at = now;
+      // Told now: the newest end. The earlier turns folded into it (none of them told) go to the summary, so none is lost.
+      if (turns > 1) gather(p, now, { turns: turns - 1, failed: failedEarlier, asks: earlierAsks, said: earlier });
       said.push({
-        key: `end:${e.id}`, text: terminalEndNotice(p, seq, failed, error, told, attach), end: failed ? "error" : "done",
+        key: `end:${e.id}`, text: terminalEndNotice(p, seq, failed, error, told, attach, leads), end: failed ? "error" : "done",
         endCard: {
           item_seq: seq, name: terminalEndName(p), folder: cwdTail(String(p.cwd ?? "")), ...(failed ? { error } : {}),
           summary: told.summary, full: tailLines(message, END_FULL_MAX), more: told.more, ...(attach ? { attach } : {}),
+          ...(leads.length ? { earlier: leads } : {}),
         },
       });
     } else if (e.type === REMOTE_EVENT_SESSION_CLOSED) {

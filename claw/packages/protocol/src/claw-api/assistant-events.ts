@@ -243,6 +243,20 @@ export interface AssistantTerminalEnd {
   more: boolean;
   /** The command that attaches the chat to this conversation (`/agent attach <ref>`), when its connector lists it. */
   attach?: string;
+  /**
+   * Earlier turns folded into this end that the person must hear of, said before `summary` (which is the latest turn's): the latest
+   * that asked them something, and the latest that failed, each with how many did. `text` is that turn's words in whole sentences
+   * (untrusted), "" when its connector no longer carries them (the terminal has them). Absent when no earlier turn asked or failed.
+   */
+  earlier?: AssistantTerminalEarlier[];
+}
+
+/** An earlier turn folded into a terminal's end that asked the person something (`asked`) or failed (`failed`). */
+export interface AssistantTerminalEarlier {
+  kind: "asked" | "failed";
+  text: string;
+  /** How many earlier turns of the run did (at least 1). */
+  count: number;
 }
 
 /** A permission request a development environment's agent waits on (`permissionRequest`), as its connector posted it. */

@@ -277,6 +277,7 @@ function redactedRemote(r: AssistantRemoteNotice): AssistantRemoteNotice {
       end: {
         item_seq: r.end.item_seq, name: redact(r.end.name), folder: redact(r.end.folder), ...(r.end.error ? { error: redact(r.end.error) } : {}),
         summary: redact(r.end.summary), full: redact(r.end.full), more: r.end.more, ...(r.end.attach ? { attach: r.end.attach } : {}),
+        ...(r.end.earlier?.length ? { earlier: r.end.earlier.map((l) => ({ kind: l.kind, text: redact(l.text), count: l.count })) } : {}),
       },
     } : {}),
   };

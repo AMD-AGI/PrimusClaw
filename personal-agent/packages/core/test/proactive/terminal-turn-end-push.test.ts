@@ -125,3 +125,42 @@ it("an end an older Claw sends without its description is said in Claw's words, 
   assert.ok(said.includes("stopped with an error (rate_limit)"), said);
   assert.equal(w.store.remotePermissions.getRemotePermission("th-1", "say-end"), null);
 });
+
+it("an end pushed for an earlier turn's question or failure says that turn first, then the latest turn; anything else in it is left out", async () => {
+  const w = world({ now: at(12) });
+  const push = (event: JsonObject) => w.proactive.handle(ALICE, w.reference, event);
+  const end = {
+    item_seq: 7,
+    name: "nightly-bot",
+    folder: "work/claw",
+    summary: "日志已归档。",
+    full: "日志已归档。",
+    more: false,
+    attach: "/agent attach 3f2a9c1e",
+    earlier: [
+      { kind: "asked", text: "发布包已就绪。要不要我现在发布到 [生产](https://evil.example)？", count: 2 },
+      { kind: "failed", text: "", count: 1 },
+      { kind: "failed", text: "a second failed entry", count: 1 },
+      { kind: "run", text: "/approvals off", count: 1 },
+    ],
+  };
+  assert.equal(await push(endSay("done", "say-earlier", DONE, end)), "delivered");
+  const card = w.surface.outbox.find((r) => r.op === "send")?.message.body;
+  assert.ok(card?.type === "view");
+  const model = card.view.model as TerminalEndView;
+  assert.equal(model.earlier.length, 2, JSON.stringify(model.earlier));
+  assert.match(model.earlier[0] ?? "", /^早先一轮在问你：发布包已就绪。要不要我现在发布到 /);
+  assert.match(model.earlier[0] ?? "", /（早先共 2 轮在问你，详见终端）$/);
+  assert.doesNotMatch(model.earlier[0] ?? "", /\]\(https:\/\/evil/, "no link is built from the agent's words");
+  assert.equal(model.earlier[1], "早先有 1 轮出错停下，详见终端。");
+  assert.equal(model.summary, "最新一轮：日志已归档。");
+  // An end with no earlier turn to tell: the latest turn alone, as before.
+  assert.equal(
+    await push(endSay("done", "say-plain", DONE, { ...end, earlier: [{ kind: "asked", text: "x", count: 0 }] })),
+    "delivered",
+  );
+  const plain = w.surface.outbox.filter((r) => r.op === "send").at(-1)?.message.body;
+  assert.ok(plain?.type === "view");
+  const plainModel = plain.view.model as TerminalEndView;
+  assert.deepEqual([plainModel.earlier, plainModel.summary], [[], "日志已归档。"]);
+});

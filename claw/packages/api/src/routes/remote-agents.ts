@@ -26,7 +26,7 @@ import {
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_PROTOCOL_VERSION, REMOTE_AGENT_TIMING, REMOTE_COMMANDS,
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
   REMOTE_HIDDEN_INCLUDE, parseHiddenRequest, parseRemoteId, parseSessionNew, sseFrame, type RemoteCommandType,
-  REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS, parseApprovalsSetting, parseTerminalMute, parseTerminalSessionOpen,
+  REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS, parseApprovalsSetting, parseTerminalMute, parseTerminalSummarySetting, parseTerminalSessionOpen,
 } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED, CLAW_REMOTE_AGENTS_RETENTION_DAYS } from "../config.js";
 import { getUser } from "../auth/middleware.js";
@@ -45,6 +45,7 @@ import * as store from "../remote-agents/store.js";
 import { connectorSetup, connectorVersionPolicy, versionVerdict } from "../remote-agents/setup.js";
 import { OFFLINE_NOTICE_MS, PRESENCE_SWEEP_MS, prunePresenceHistory, startPresenceSweep } from "../remote-agents/presence.js";
 import { startTerminalWaitSweep, TERMINAL_WAIT_NOTICE_MS } from "../remote-agents/terminal-waits.js";
+import { startTerminalDigestSweep } from "../assistant/terminal-digest.js";
 import { DELIVERY_SWEEP_MS, deliveryWritesIdle, noteEventsPost, recordOutboxReport, startDeliveryHealthSweep } from "../remote-agents/delivery-health.js";
 import { metrics } from "../infra/metrics.js";
 import { closeCardsOfConnector } from "../assistant/devenv-tools.js";
@@ -341,6 +342,16 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
       app.addHook("onClose", async () => stop());
     },
   });
+  // The summary of a terminal conversation that keeps working, at most once per its owner's interval (`assistant/terminal-digest.ts`).
+  // Every replica sweeps; each summary is decided under its item's row lock, so it is said once.
+  loops.push({
+    name: "remote_agents.terminal_digest_sweep",
+    when: presenceSweepMs > 0,
+    start: () => {
+      const stop = startTerminalDigestSweep();
+      app.addHook("onClose", async () => stop());
+    },
+  });
   // Whether each connector's events get through, and telling its owner once when they have not for two minutes (and once when
   // they do again): `remote-agents/delivery-health.ts`. A lock makes each sweep one replica's.
   const deliverySweepMs = opts.deliverySweepMs ?? DELIVERY_SWEEP_MS;
@@ -606,7 +617,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   app.get("/v1/remote-agents/approvals", async (req, reply) => {
     const owner = requireOwner(req, reply);
     if (!owner) return;
-    return reply.send({ ok: true, data: { enabled: await store.approvalsEnabled(owner) } });
+    return reply.send({ ok: true, data: { enabled: await store.approvalsEnabled(owner), summary_minutes: await store.terminalSummaryMinutes(owner) } });
   });
 
   app.put("/v1/remote-agents/approvals", async (req, reply) => {
@@ -616,6 +627,16 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!body.ok) return fail(reply, 400, body.error);
     await store.setApprovalsEnabled(owner, body.value.enabled, clientLabel(req));
     return reply.send({ ok: true, data: { enabled: body.value.enabled } });
+  });
+
+  // How often a conversation that works on its own in a terminal is summed up (`store.setTerminalSummaryMinutes`); 0: never.
+  app.put("/v1/remote-agents/approvals/summary", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    const body = parseTerminalSummarySetting(req.body);
+    if (!body.ok) return fail(reply, 400, body.error);
+    await store.setTerminalSummaryMinutes(owner, body.value.minutes, clientLabel(req));
+    return reply.send({ ok: true, data: { summary_minutes: body.value.minutes } });
   });
 
   // One conversation open in a terminal, named by its work item (`#<seq>`): its pushes muted or back on (`store.setTerminalMute`).

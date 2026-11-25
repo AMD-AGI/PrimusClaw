@@ -27,7 +27,12 @@ export interface TerminalEndView {
   readonly failed: boolean;
   /** The tool, the machine, the folder, the terminal idle and the item, in one small line. */
   readonly where: string;
-  /** What it did (markup escaped, links broken); "" when it said nothing. */
+  /**
+   * Earlier turns folded into this end that asked the person something or failed, one line each, said before `summary` (markup
+   * escaped, links broken); empty when none did.
+   */
+  readonly earlier: readonly string[];
+  /** What it did (markup escaped, links broken), "Latest turn:" first when `earlier` says something; "" when it said nothing. */
   readonly summary: string;
   /** Its last answer whole (markdown kept, links broken), shown on "Show all"; "" when the summary is all of it. */
   readonly full: string;
@@ -59,11 +64,18 @@ export function terminalEndView(input: TerminalEndInput): TerminalEndView {
     words.endIdle,
     `#${String(end.itemSeq)}`,
   ].filter(Boolean);
-  const summary = end.summary
+  const earlier = end.earlier.map((e) => {
+    const said = { text: lit(e.text, 400), count: e.count };
+    return e.kind === "asked" ? words.endEarlierAsked(said) : words.endEarlierFailed(said);
+  });
+  const lines = end.summary
     .split("\n")
     .map((line) => lit(line, 400))
-    .filter(Boolean)
-    .join("\n\n");
+    .filter(Boolean);
+  // The latest turn comes after what an earlier one asked or how it failed: said as the latest, so the two are not taken for one.
+  const summary = (
+    earlier.length && lines.length ? [words.endLatest({ text: lines[0] ?? "" }), ...lines.slice(1)] : lines
+  ).join("\n\n");
   const full = end.more && end.full.trim() ? wordsText(end.full.trim()) : "";
   const buttons: CommandButton[] = [];
   if (end.attach) buttons.push({ title: words.endAttach, command: end.attach });
@@ -73,6 +85,7 @@ export function terminalEndView(input: TerminalEndInput): TerminalEndView {
     title: `${name} ${status}`,
     failed,
     where: where.join(" · "),
+    earlier,
     summary,
     full,
     fullLabel: words.endFull,
