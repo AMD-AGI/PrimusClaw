@@ -313,6 +313,23 @@ release version, and its `appVersion` stays `latest`.
   message. Claw sends what the card shows as `remote.end` on the `assistant.say` (`kind` `done` or `error`), with text for a
   channel that shows no cards; the rules of when it is said (one per conversation every five minutes, `/approvals off`,
   mute) are unchanged.
+- Connector, Claw, personal agent: a terminal turn's end is pushed at once only when a person started that turn (typed at
+  the terminal, a queued prompt, an accepted suggestion, a slash command), when its answer asks the person something or waits
+  for their decision (a question at the end, or explicit choice, approval or confirmation words in Chinese or English), or when
+  it failed. The connector reads who started the turn from Claude Code's transcript (`origin.kind`, `promptSource`) and sends it
+  as `origin` on `terminal_turn_end`; ends of turns nobody typed (another session's message, a schedule, a hook) that follow one
+  another before the terminal has been quiet a minute are sent as one, the newest, with `turns`, `earlier` and `since` (at the
+  latest fifteen minutes after the first; `failed_earlier` and `asked_earlier` count failures and questions among them, and
+  `earlier_failed` marks which of `earlier` failed; such a run is pushed, and its message and card lead with that earlier turn's
+  question or error in whole sentences, or say how many earlier turns asked or failed when their words are no longer carried,
+  before the latest turn's result), and a new
+  prompt holds an end not yet told until its own turn ends. Claw gathers the ends it does not push (the earlier turns of a run
+  it does push, and the ends the five-minute gap holds back, too) on the conversation's item and says, at most once per
+  conversation every hour, what it did since: how many turns, how many failed, the latest result in whole sentences, and
+  whether anything asked the person (`remote.kind` `progress`). `/approvals summary <minutes>|off` (15 to 1440; `PUT
+  /v1/remote-agents/approvals/summary`, read back on `GET /v1/remote-agents/approvals` as `summary_minutes`) sets the interval;
+  `/approvals off`, a mute and quiet hours hold summaries as they hold every push. A connector before this release, a Claude
+  Code without these transcript fields, and Codex are told as before.
 - Agent Sandbox: a GPU template's CPU, memory, pod storage and `/dev/shm` now come from the template when it sets them,
   instead of always 24 CPU, 224Gi memory, 187.5Gi storage and 125Gi shared memory per card. A sandbox can ask for what
   it needs (for example 16 CPU and 448Gi for two cards, or 32 CPU and 1792Gi for eight) and leave the rest of the node

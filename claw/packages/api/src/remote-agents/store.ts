@@ -13,7 +13,7 @@ import { storableJsonText } from "@claw/utils";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { redactPublicJson } from "../events/redaction.js";
 import {
-  REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_COMMAND_TYPES, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS,
+  REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, TERMINAL_SUMMARY, REMOTE_COMMAND_TYPES, REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS,
   REMOTE_EVENT_PERMISSION_REQUEST, REMOTE_EVENT_PERMISSION_RESOLVED, REMOTE_EVENT_SESSION_CLOSED, REMOTE_EVENT_USER_PROMPT,
   type ParsedRemoteEvent, type RemoteAgentDescriptor, type RemoteCommandType, type RemoteTerminalSessionOpen, type RemoteEventRejection, type RemoteHeartbeat, type RemoteHidden, type RemoteWorkspace,
 } from "@claw/protocol";
@@ -1355,6 +1355,25 @@ export async function setApprovalsEnabled(owner: string, enabled: boolean, clien
       [owner, enabled],
     );
     await writeAudit(q, { owner, actor: owner, client, action: "approvals.set", detail: { enabled } });
+  });
+}
+
+/** How often (minutes) a conversation of the owner's that works on its own in a terminal is summed up; 0: never. */
+export async function terminalSummaryMinutes(owner: string, q: Querier = direct): Promise<number> {
+  const r = (await q("SELECT summary_minutes FROM claw_remote_approval_settings WHERE owner_user_id = $1", [owner])).rows[0];
+  const m = r?.summary_minutes;
+  return typeof m === "number" && Number.isSafeInteger(m) && m >= 0 ? m : TERMINAL_SUMMARY.defaultMinutes;
+}
+
+/** Set it (`/approvals summary <minutes>|off`); a new row keeps the approvals on. Audited. */
+export async function setTerminalSummaryMinutes(owner: string, minutes: number, client: string | null): Promise<void> {
+  await inTransaction(async (q) => {
+    await q(
+      `INSERT INTO claw_remote_approval_settings (owner_user_id, enabled, summary_minutes, updated_at) VALUES ($1, TRUE, $2, NOW())
+       ON CONFLICT (owner_user_id) DO UPDATE SET summary_minutes = EXCLUDED.summary_minutes, updated_at = NOW()`,
+      [owner, minutes],
+    );
+    await writeAudit(q, { owner, actor: owner, client, action: "approvals.summary_set", detail: { minutes } });
   });
 }
 
