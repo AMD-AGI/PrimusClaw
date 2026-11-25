@@ -45,6 +45,7 @@ import { approvalsEnabled, DELIVERY_UNCONFIRMED, findSession, issueCommand, onli
 import { newWorkItemId } from "../tasks/ids.js";
 import type { AssistantRemoteAsk, AssistantRemoteNotice, AssistantTerminalEnd } from "../notifications/assistant-events.js";
 import { ensureLiveAssistant, itemSession, personWritesChinese, recordSystemNotice, storeAnswerWhole } from "./outbound.js";
+import { inertMd } from "./inert-md.js";
 import { asksPerson, gather, type TerminalDigest } from "./terminal-digest.js";
 import { applyWorkerReport, clipOneLine, clipWords, graphemes, TITLE_MAX } from "./work-items.js";
 
@@ -822,12 +823,16 @@ export function terminalEndNotice(
   said: { summary: string; more: boolean }, attach: string | null,
 ): string {
   const zh = p.lang === "zh";
-  const name = terminalEndName(p);
-  const status = failed ? (zh ? `出错停下（${error}）` : `stopped with an error (${error})`) : (zh ? "做完了" : "finished");
-  const where = [p.machine, cwdTail(String(p.cwd ?? "")), zh ? "终端空闲" : "terminal idle", `#${seq}`].filter(Boolean).join(" · ");
+  // Every word the machine or the agent wrote is made inert: a channel reads this text as markdown, and none of it may become a
+  // link, an image or markup there.
+  const name = inertMd(terminalEndName(p));
+  const reason = inertMd(error);
+  const status = failed ? (zh ? `出错停下（${reason}）` : `stopped with an error (${reason})`) : (zh ? "做完了" : "finished");
+  const where = [inertMd(p.machine), inertMd(cwdTail(String(p.cwd ?? ""))), zh ? "终端空闲" : "terminal idle", `#${seq}`]
+    .filter(Boolean).join(" · ");
   const head = zh ? `【${name}】${status} · ${where}` : `[${name}] ${status} · ${where}`;
   const body = said.summary
-    ? `${said.summary}${said.more ? (zh ? "（全文见终端）" : " (the rest is in the terminal)") : ""}`
+    ? `${inertMd(said.summary)}${said.more ? (zh ? "（全文见终端）" : " (the rest is in the terminal)") : ""}`
     : "";
   const commands = zh
     ? [attach ? `接入：${attach}` : "", `静音：/approvals mute #${seq}`]

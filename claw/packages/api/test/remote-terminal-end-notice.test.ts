@@ -35,8 +35,15 @@ test("the message names the conversation first, says what it did in whole senten
   ].join("\n"));
   assert.equal(
     terminalEndNotice({ ...WHERE, lang: "en", name: undefined }, 7, true, "rate_limit", { summary: "Hit the rate limit.", more: false }, null),
-    "[tools] stopped with an error (rate_limit) · dev-pod · ops/tools · terminal idle · #7\nHit the rate limit.\nMute: /approvals mute #7",
+    "[tools] stopped with an error (rate\\_limit) · dev-pod · ops/tools · terminal idle · #7\nHit the rate limit.\nMute: /approvals mute #7",
   );
+  // What the agent or its machine wrote is inert in the text, which a channel reads as markdown: no link, image or markup.
+  const sly = terminalEndNotice(
+    { ...WHERE, lang: "en", name: "[Confirm](https://x.example)" }, 9, false, "",
+    terminalEndSummary("See [the report](https://x.example/r) and ![x](https://x.example/i.png) at www.x.example."), null,
+  );
+  assert.equal(sly.split("\n")[0], "[\\[Confirm\\]\\(https:/\u200b/x.example\\)] finished · dev-pod · ops/tools · terminal idle · #9");
+  assert.doesNotMatch(sly, /\]\(|https:\/\/|(?<!\\)!\[|www\.x/u);
   // No name and no title: the tool names it. Nothing said: the head and the commands only.
   assert.equal(
     terminalEndNotice({ ...WHERE, name: undefined, title: "" }, 3, false, "", { summary: "", more: false }, null),
