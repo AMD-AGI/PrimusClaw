@@ -26,7 +26,7 @@ import {
   REMOTE_AGENT_LIMITS, REMOTE_AGENT_PROTOCOL_VERSION, REMOTE_AGENT_TIMING, REMOTE_COMMANDS,
   isRemoteCommandType, parseConnectorRegistration, parseCursor, parseEventBatch, parseHeartbeat,
   REMOTE_HIDDEN_INCLUDE, parseHiddenRequest, parseRemoteId, parseSessionNew, sseFrame, type RemoteCommandType,
-  REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS, parseApprovalsSetting, parseTerminalMute, parseTerminalSessionOpen,
+  REMOTE_ORIGIN_TERMINAL_HOOK, TERMINAL_HOOK_COMMANDS, TERMINAL_SESSION_LIMITS, parseApprovalsSetting, parseTerminalMute, parseTerminalSummarySetting, parseTerminalSessionOpen,
 } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED, CLAW_REMOTE_AGENTS_RETENTION_DAYS } from "../config.js";
 import { getUser } from "../auth/middleware.js";
@@ -606,7 +606,7 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
   app.get("/v1/remote-agents/approvals", async (req, reply) => {
     const owner = requireOwner(req, reply);
     if (!owner) return;
-    return reply.send({ ok: true, data: { enabled: await store.approvalsEnabled(owner) } });
+    return reply.send({ ok: true, data: { enabled: await store.approvalsEnabled(owner), summary_minutes: await store.terminalSummaryMinutes(owner) } });
   });
 
   app.put("/v1/remote-agents/approvals", async (req, reply) => {
@@ -616,6 +616,16 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     if (!body.ok) return fail(reply, 400, body.error);
     await store.setApprovalsEnabled(owner, body.value.enabled, clientLabel(req));
     return reply.send({ ok: true, data: { enabled: body.value.enabled } });
+  });
+
+  // How often a conversation that works on its own in a terminal is summed up (`store.setTerminalSummaryMinutes`); 0: never.
+  app.put("/v1/remote-agents/approvals/summary", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    const body = parseTerminalSummarySetting(req.body);
+    if (!body.ok) return fail(reply, 400, body.error);
+    await store.setTerminalSummaryMinutes(owner, body.value.minutes, clientLabel(req));
+    return reply.send({ ok: true, data: { summary_minutes: body.value.minutes } });
   });
 
   // One conversation open in a terminal, named by its work item (`#<seq>`): its pushes muted or back on (`store.setTerminalMute`).

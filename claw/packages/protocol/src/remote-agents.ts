@@ -586,6 +586,21 @@ export function parseApprovalsSetting(body: unknown): Parsed<{ enabled: boolean 
   return { ok: true, value: { enabled: body.enabled } };
 }
 
+/**
+ * The summary of a conversation open in a terminal that keeps working on its own (turns another session or a schedule started):
+ * at most one every `minutes` per conversation, of what it did since the last one. `0` turns the summaries off. Each owner sets theirs
+ * (`PUT /v1/remote-agents/approvals/summary`, `/approvals summary <minutes>|off`); no setting: every hour.
+ */
+export const TERMINAL_SUMMARY = { defaultMinutes: 60, minMinutes: 15, maxMinutes: 24 * 60 } as const;
+
+/** `PUT /v1/remote-agents/approvals/summary`: how often (minutes) such a summary may come, or 0 for never. */
+export function parseTerminalSummarySetting(body: unknown): Parsed<{ minutes: number }> {
+  if (!isObject(body) || typeof body.minutes !== "number" || !Number.isSafeInteger(body.minutes)) return fail("minutes_required");
+  const m = body.minutes;
+  if (m !== 0 && (m < TERMINAL_SUMMARY.minMinutes || m > TERMINAL_SUMMARY.maxMinutes)) return fail("minutes_out_of_range");
+  return { ok: true, value: { minutes: m } };
+}
+
 /** `PUT /v1/remote-agents/approvals/mutes`: mute (or unmute) the conversation behind work item `#item`, one open in a terminal. */
 export function parseTerminalMute(body: unknown): Parsed<{ item: number; muted: boolean }> {
   if (!isObject(body) || typeof body.muted !== "boolean") return fail("muted_required");
