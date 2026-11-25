@@ -647,7 +647,7 @@ function cmdHooks(args: string[], ctx: Ctx): number {
   if (agent === "codex") return cmdCodexHooks(sub, values["config-dir"], !!values.json, ctx);
   const dirs = claudeDirs(ctx, values["config-dir"]);
   const approvals = !!values.approvals;
-  // Carry over what 0.3.3 or earlier left before this records a choice: for the directories this start would serve too.
+  // Carry over what 0.3.4 or earlier left before this records a choice: for the directories this start would serve too.
   // Until that is written, recording a choice would leave out a no it never recorded (the approval hooks would then be added).
   if (sub !== "status") {
     const unmigrated = migrateHookPrefs(ctx.dirs, [...new Set([...claudeDirs(ctx, undefined), ...dirs])], hasSet, false);

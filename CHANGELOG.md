@@ -298,6 +298,17 @@ release version, and its `appVersion` stays `latest`.
 
 ### Changed
 
+- Claw: one session, one seat. A seat is now one conversation of an agent on the user's machine (`claw_devenv_seats.conversation_ref`,
+  the agent's own id of it), not a folder: six named Claude Code sessions in one folder are six seats, each called what that session is
+  called (as `/agents` shows it), each with its own confirmed role, alias, queue, guess and cards (still one guess card at a time, at
+  most three a day). Every conversation a connector reports and every one a session open through Claw holds is a seat. A seat of a
+  folder made before moves to the session that occupies it (its session's conversation, else the one open there now, else its latest),
+  keeping its alias, role and auto dispatch; where that conversation already had a seat holding less of the user's words, the two become
+  one, with the other's tasks (when both hold the user's words, the next session there is tried; a folder's seat none is left for
+  takes no task, `seat_unbound`, rather than a guessed session). A task for a seat takes over that very conversation (or goes into the session holding it), never a new
+  session in its folder (`new_session` for such a seat is refused, `seat_new_session`). When the machine refuses to start the session that was to take over (or type into) the seat's conversation because that conversation is not there (`unknown_session` as that session's first word; the same reason later, for a session the machine no longer knows, only closes that session), the task fails saying so, and the seat is
+  `gone` in the roster and refused (`seat_gone`) until its machine lists that conversation again; one a session open through Claw held,
+  closed on a machine where no agent takes conversations over, is `gone` too. Prompts `router-seats-v3`, `router-dispatch-v2`.
 - Connector: the Claude Code hooks (the session hooks and the approval hooks) are installed and kept in place by the connector
   itself, as it keeps itself up to date. Every start, including the first run after an auto-upgrade, makes sure each Claude
   config directory it serves has them and that they run the installation that is running (stale node or script paths are
@@ -306,9 +317,9 @@ release version, and its `appVersion` stays `latest`.
   it meanwhile, and backed up once (`settings.json.bak-claw-<time>`) before the first change to anything of the person's.
   `init` and `pair` no longer ask or print a command: they add the hooks unless `--no-hooks` / `--no-approval-hooks`. An
   explicit no is kept for good in `claude-hooks.json` in the configuration directory: `hooks uninstall` (`--approvals` for the
-  approval hooks only), `--no-hooks` / `--no-approval-hooks`, or a no to the question 0.1.23 to 0.3.3 asked; `hooks install`
+  approval hooks only), `--no-hooks` / `--no-approval-hooks`, or a no to the question 0.1.23 to 0.3.4 asked; `hooks install`
   (`--approvals`) and `--hooks` take it back. `hooks install` now installs the approval hooks too, unless they were taken out
-  or `CLAW_APPROVAL_HOOKS=off` is set. Versions up to 0.3.3 recorded no other no, so the first start after the upgrade reads it
+  or `CLAW_APPROVAL_HOOKS=off` is set. Versions up to 0.3.4 recorded no other no, so the first start after the upgrade reads it
   from what is in place, once: a set none of whose hooks is in an existing Claude config directory stays out there; `init`
   and `pair` run after the upgrade add both sets.
   The one-time question about the approval hooks after other commands is gone. Codex and Cursor hooks are unchanged (Codex

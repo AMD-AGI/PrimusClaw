@@ -37,7 +37,7 @@ const MINE = { model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", comma
 
 /**
  * A home with agents.toml, a sign-in for the stand-in Claw, and a Claude config directory (made unless `noDir`). Set up by this
- * version (`init`/`pair` wrote claude-hooks.json), unless `upgrade`: then it is what 0.3.3 or earlier left.
+ * version (`init`/`pair` wrote claude-hooks.json), unless `upgrade`: then it is what 0.3.4 or earlier left.
  */
 function home(claw: FakeClaw, o: { noDir?: boolean; upgrade?: boolean } = {}) {
   const h = tmpdir();
@@ -268,7 +268,7 @@ describe("the connector keeps the Claude Code hooks in place by itself", () => {
   });
 });
 
-describe("an upgrade from 0.3.3 or earlier, which recorded no no", () => {
+describe("an upgrade from 0.3.4 or earlier, which recorded no no", () => {
   test("hooks taken out there (hooks uninstall, --no-hooks, a \"n\" at init/pair) stay out; so do approval hooks left out (--no-approval-hooks, a yes to the old question taken back)", async () => {
     const claw = await FakeClaw.start();
     try {
@@ -363,7 +363,7 @@ describe("an upgrade from 0.3.3 or earlier, which recorded no no", () => {
       };
       return { c, dir };
     };
-    // Hooks taken out under 0.3.3, and the file broken at the first start: once it is fixed, they stay out.
+    // Hooks taken out under 0.3.4, and the file broken at the first start: once it is fixed, they stay out.
     const out = mkCtx();
     fs.writeFileSync(settingsFile(out.dir), "{ not json");
     assert.match(ensureClaudeHooks(out.c)[0]!.error ?? "", /not valid JSON/);
@@ -464,7 +464,7 @@ describe("an upgrade from 0.3.3 or earlier, which recorded no no", () => {
       // Once it can be written, the old no for the approval hooks is kept.
       assert.equal(await main(["hooks", "install"], s.mk().c), EXIT.ok);
       assert.equal(hooksStatus(s.dir).installed, true);
-      assert.equal(approvalHooksStatus(s.dir).events.length, 0, "the approval hooks said no to under 0.3.3 stay out");
+      assert.equal(approvalHooksStatus(s.dir).events.length, 0, "the approval hooks said no to under 0.3.4 stay out");
     } finally { await claw.close(); }
   });
 

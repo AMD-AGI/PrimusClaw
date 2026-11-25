@@ -548,7 +548,7 @@ export function createAssistantMcpServer(
               "\"sandbox\" (the default), or \"seat:<seat_id>\" with a seat_id from seat_roster (never an alias or a machine name), or a list of "
               + "2 to 5 of those (\"sandbox\" may be one) for a choice card the user picks from.",
             ),
-            new_session: z.boolean().optional().describe("Only with one seat: a new session in its folder even when its conversation is open in a terminal."),
+            new_session: z.boolean().optional().describe("Only with one seat that is still a folder's (a seat that is one session refuses it: seat_new_session): a new session in its folder even when its conversation is open in a terminal."),
           }
           : {}),
       },
@@ -560,7 +560,7 @@ export function createAssistantMcpServer(
       {
         item_id: z.string().describe(ITEM_ID_PARAM), text: z.string(),
         ...(modelChoice ? { model: z.string().optional().describe(`${MODEL_PARAM_ASKED}; the item runs on it from now on. Left out keeps the one it has.`) } : {}),
-        ...(seatDispatch ? { new_session: z.boolean().optional().describe("A seat's task only: send it again in a new session of that seat.") } : {}),
+        ...(seatDispatch ? { new_session: z.boolean().optional().describe("A seat's task only, of a seat that is still a folder's (a seat that is one session refuses it): send it again in a new session in that folder.") } : {}),
       },
       (args) => answer(claims, "work_send", () => workSend(claims, args)),
     );

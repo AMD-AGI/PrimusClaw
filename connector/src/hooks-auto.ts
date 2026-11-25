@@ -10,10 +10,10 @@
  * Only an explicit no stops it, and it is kept for good (in the configuration directory, next to agents.toml, so it outlives
  * the state directory): `hooks uninstall` (both sets, or `--approvals` for the approval hooks only) for the directories it
  * names, `--no-hooks` / `--no-approval-hooks` on `init` or `pair` for every directory, and a "no" to the question 0.1.23 to
- * 0.3.3 asked once per directory (approval-hooks-offer.json in the state directory). `hooks install` takes a no back for the
+ * 0.3.4 asked once per directory (approval-hooks-offer.json in the state directory). `hooks install` takes a no back for the
  * directories it names, as `init --hooks` / `pair --hooks` do for every directory.
  *
- * Versions up to 0.3.3 recorded no other no: `hooks uninstall`, `--no-hooks` and a "n" at the init/pair question only left the
+ * Versions up to 0.3.4 recorded no other no: `hooks uninstall`, `--no-hooks` and a "n" at the init/pair question only left the
  * hooks out of settings.json. So the first time this version needs the choices and finds no claude-hooks.json, anywhere but in
  * `init` and `pair` it reads them from what is in place ({@link migrateHookPrefs}): a set that is missing from an existing
  * directory was taken out, and stays out.
@@ -24,11 +24,11 @@ import type { Dirs } from "./paths.js";
 
 export type HookSet = "session" | "approvals";
 export type Choice = Partial<Record<HookSet, "on" | "off">>;
-/** `pending`: directories whose settings could not be read when what 0.3.3 or earlier left was carried over ({@link settlePending}). */
+/** `pending`: directories whose settings could not be read when what 0.3.4 or earlier left was carried over ({@link settlePending}). */
 interface Prefs { v: 1; all: Choice; dirs: Record<string, Choice>; pending?: string[] }
 
 export const hookPrefsFile = (d: Dirs): string => path.join(d.config, "claude-hooks.json");
-/** Where 0.1.23 to 0.3.3 kept the answer to the question they asked once per directory about the approval hooks. */
+/** Where 0.1.23 to 0.3.4 kept the answer to the question they asked once per directory about the approval hooks. */
 export const legacyOfferFile = (d: Dirs): string => path.join(d.state, "approval-hooks-offer.json");
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
@@ -60,7 +60,7 @@ function writePrefs(d: Dirs, p: Prefs): void {
   fs.renameSync(tmp, file);
 }
 
-/** The directories 0.1.23 to 0.3.3 were told no for, in their one-time question about the approval hooks. */
+/** The directories 0.1.23 to 0.3.4 were told no for, in their one-time question about the approval hooks. */
 function legacyNoDirs(d: Dirs): string[] {
   try {
     const doc: unknown = JSON.parse(fs.readFileSync(legacyOfferFile(d), "utf8"));
@@ -70,8 +70,8 @@ function legacyNoDirs(d: Dirs): string[] {
 }
 
 /**
- * Once, when there is no claude-hooks.json yet: write it, so the choices of a person who used 0.3.3 or earlier are kept.
- * A no to the one-time question 0.1.23 to 0.3.3 asked is carried over as "off" for its directory, so `--hooks` and
+ * Once, when there is no claude-hooks.json yet: write it, so the choices of a person who used 0.3.4 or earlier are kept.
+ * A no to the one-time question 0.1.23 to 0.3.4 asked is carried over as "off" for its directory, so `--hooks` and
  * `hooks install --approvals` take it back like any other no. With `fresh` (`init` and `pair`, which add both sets now) nothing
  * else is carried over. Otherwise, in each of `dirs` that exists, a set
  * with none of its hooks there was taken out or never agreed to (`hooks uninstall`, `--no-hooks`, `--no-approval-hooks`, a "n"
@@ -106,7 +106,7 @@ export function migrateHookPrefs(d: Dirs, dirs: string[], present: (dir: string,
 }
 
 /**
- * A directory whose settings could not be read when what 0.3.3 or earlier left was carried over: the first time they can be,
+ * A directory whose settings could not be read when what 0.3.4 or earlier left was carried over: the first time they can be,
  * a set with none of its hooks there is recorded "off" (unless a choice was made for it since), as the carry-over would have.
  * Returns why nothing may be added to it yet, or null once it is settled (or was never pending). Throws when the choice cannot
  * be written.
