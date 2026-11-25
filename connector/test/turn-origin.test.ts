@@ -16,6 +16,7 @@
  *   O6 a turn a person typed after such an end drops it (they are at the terminal) and is told alone
  *   O7 a run that began with a person's turn is told as theirs
  *   O8 a run of ends that never pauses is still told once its first end is old enough
+ *   O9 a failed end folded into a later one that finished is counted (`failed_earlier`), never hidden
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -108,8 +109,9 @@ function rig(o: { awayMs?: number; runMaxMs?: number } = {}) {
   const broker = new ApprovalBroker(deps);
   const from = { agent: "claude" as const, configDir, tty: TTY };
   const write = (...docs: unknown[]) => fs.appendFileSync(transcript, lines(...docs));
-  const stop = (said: string) => broker.settled({
-    session_id: REF, transcript_path: transcript, cwd: "/home/u/work/claw", hook_event_name: "Stop", last_assistant_message: said, background_tasks: [],
+  const stop = (said: string, failed = false) => broker.settled({
+    session_id: REF, transcript_path: transcript, cwd: "/home/u/work/claw", hook_event_name: failed ? "StopFailure" : "Stop",
+    last_assistant_message: said, ...(failed ? { error: "rate_limit" } : { background_tasks: [] }),
   }, from);
   const prompt = () => broker.settled({ session_id: REF, transcript_path: transcript, cwd: "/home/u/work/claw", hook_event_name: "UserPromptSubmit", prompt: "…" }, from);
   const ends = () => emitted.filter((e) => e.type === "terminal_turn_end").map((e) => e.data);
@@ -202,5 +204,17 @@ describe("the end says who started the turn", () => {
     await until(() => r.ends().length === 1, 2000);
     assert.deepEqual([r.ends()[0]!.turns, r.ends()[0]!.earlier], [2, ["a"]]);
     r.broker.stopAll();
+  });
+
+  test("O9 a failed end folded into a later one is counted, not hidden", async () => {
+    const r = rig({ awayMs: 250 });
+    r.write(peer("one"), assistant("API Error: 429"));
+    r.stop("API Error: 429", true);
+    r.prompt();
+    r.write(peer("two"), assistant("retried, done"));
+    r.stop("retried, done");
+    await until(() => r.ends().length === 1);
+    const e = r.ends()[0]!;
+    assert.deepEqual([e.outcome, e.turns, e.failed_earlier, e.earlier], ["done", 2, 1, ["API Error: 429"]]);
   });
 });

@@ -44,9 +44,9 @@ describe("which ends ask the person", () => {
 describe("the summary", () => {
   test("S1 gathering counts turns, failures and questions, and keeps the newest three results", () => {
     const p: { digest?: any } = {};
-    gather(p, 1000, { turns: 1, failed: false, asks: false, said: ["one"] });
-    gather(p, 2000, { turns: 3, failed: true, asks: false, said: ["two", "three"] });
-    gather(p, 3000, { turns: 1, failed: false, asks: true, said: ["four"] });
+    gather(p, 1000, { turns: 1, failed: 0, asks: false, said: ["one"] });
+    gather(p, 2000, { turns: 3, failed: 1, asks: false, said: ["two", "three"] });
+    gather(p, 3000, { turns: 1, failed: 0, asks: true, said: ["four"] });
     assert.deepEqual(p.digest, { first_at: 1000, last_at: 3000, turns: 5, failed: 1, asks: 1, said: ["two", "three", "four"] });
   });
 

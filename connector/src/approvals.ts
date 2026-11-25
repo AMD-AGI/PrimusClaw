@@ -404,6 +404,8 @@ interface Ending {
   turns: number;
   /** The last words of the earlier turns folded into it, oldest first, at most {@link TURN_END_EARLIER_MAX}. */
   earlier: string[];
+  /** How many of the earlier turns folded into it failed: a failure is never hidden behind a later turn that finished. */
+  failedEarlier: number;
   /** When the first of the folded ends came. */
   since: number;
   timer: NodeJS.Timeout;
@@ -660,6 +662,7 @@ export class ApprovalBroker {
     const e: Ending = {
       ref, agent, configDir: from.configDir, cwd, tty, at, outcome: failed ? "error" : "done", error,
       message: cutEnd(said, TURN_END_MESSAGE_MAX), origin: runOrigin, turns: fold ? prev.turns + 1 : 1, earlier, since,
+      failedEarlier: fold ? prev.failedEarlier + (prev.outcome === "error" ? 1 : 0) : 0,
       timer: setTimeout(() => { void this.tellEnding(e); }, wait),
     };
     e.timer.unref?.();
@@ -731,6 +734,7 @@ export class ApprovalBroker {
       ended_at: new Date(e.at).toISOString(), away_ms: Math.max(0, Date.now() - now.last),
       ...(e.origin ? { origin: e.origin } : {}),
       ...(e.turns > 1 ? { turns: e.turns, earlier: e.earlier, since: new Date(e.since).toISOString() } : {}),
+      ...(e.failedEarlier > 0 ? { failed_earlier: e.failedEarlier } : {}),
     });
     this.d.audit("turn_end_sent", { session_id: opened.sessionId, ref: e.ref, agent: e.agent, outcome: e.outcome });
   }

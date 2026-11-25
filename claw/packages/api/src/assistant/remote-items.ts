@@ -1322,10 +1322,14 @@ async function applyTerminal(
       const earlier = Array.isArray(e.data.earlier)
         ? e.data.earlier.filter((x): x is string => typeof x === "string").slice(-EARLIER_KEPT).map((x) => terminalEndSummary(x.slice(-END_FULL_MAX)).summary)
         : [];
-      const gathered = { turns, failed, asks, said: [...earlier, told.summary] };
-      if (origin === "automation" && !asks && !failed) { gather(p, now, gathered); continue; }
+      const failedEarlier = Number.isSafeInteger(e.data.failed_earlier) && Number(e.data.failed_earlier) > 0
+        ? Math.min(Number(e.data.failed_earlier), turns - 1) : 0;
+      const gathered = { turns, failed: (failed ? 1 : 0) + failedEarlier, asks, said: [...earlier, told.summary] };
+      if (origin === "automation" && !asks && !failed && !failedEarlier) { gather(p, now, gathered); continue; }
       if (Number(p.end_told_at) > now - TERMINAL_END_GAP_MS) { gather(p, now, gathered); continue; }
       p.end_told_at = now;
+      // Told now: the newest end. The earlier turns folded into it (none of them told) go to the summary, so none is lost.
+      if (turns > 1) gather(p, now, { turns: turns - 1, failed: failedEarlier, asks: false, said: earlier });
       said.push({
         key: `end:${e.id}`, text: terminalEndNotice(p, seq, failed, error, told, attach), end: failed ? "error" : "done",
         endCard: {

@@ -16,6 +16,8 @@
  *   R7 the owner's interval (`PUT /v1/remote-agents/approvals/summary`, read back on `GET /approvals`); 0 drops what was gathered
  *   R8 pushes off: nothing gathered; muted after gathering: the summary is dropped, not said
  *   R9 two sweeps at once (two replicas): one summary
+ *   R10 a folded run whose newest end asks is pushed, and its earlier turns go to the summary; a failure folded into a run that
+ *       finished pushes it and is counted
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -249,5 +251,19 @@ describe("which terminal ends are pushed, and the summary", { skip }, () => {
     const [a, b] = await Promise.all([digest.runTerminalDigestSweep(at), digest.runTerminalDigestSweep(at)]);
     assert.equal(a.told + b.told, 1);
     assert.equal((await pushed(item.item_id)).length, 1);
+  });
+
+  test("R10 a pushed run's earlier turns are summed up; a folded failure is pushed and counted", async () => {
+    const { cid, sid } = await convo();
+    await events("alice", cid, sid, [auto("构建和测试都过了。要不要发布？", { turns: 3, earlier: ["构建通过。", "测试通过。"], since: "2026-11-25T01:00:00Z" })]);
+    const item = await remoteItem(sid);
+    assert.equal((await pushed(item.item_id)).length, 1, "the question is pushed");
+    assert.deepEqual([item.params.digest.turns, item.params.digest.said, item.params.digest.failed], [2, ["构建通过。", "测试通过。"], 0]);
+
+    const bob = await convo("bob");
+    await events("bob", bob.cid, bob.sid, [auto("重试后完成。", { turns: 2, earlier: ["API Error: 429"], failed_earlier: 1, since: "2026-11-25T01:00:00Z" })]);
+    const other = await remoteItem(bob.sid);
+    assert.equal((await pushed(other.item_id)).length, 1, "a failure in the run pushes it");
+    assert.deepEqual([other.params.digest.turns, other.params.digest.failed], [1, 1]);
   });
 });

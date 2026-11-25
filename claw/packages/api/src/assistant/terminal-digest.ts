@@ -22,6 +22,7 @@ import { TERMINAL_SUMMARY } from "@claw/protocol";
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { approvalsEnabled, terminalMuted, terminalSummaryMinutes } from "../remote-agents/store.js";
+import { inertMd } from "./inert-md.js";
 import { recordSystemNotice } from "./outbound.js";
 import { cwdTail, terminalAttachCommand, terminalEndName, terminalToolOf, type RemoteParams } from "./remote-items.js";
 
@@ -71,12 +72,12 @@ const DIGEST_SAID_MAX = 3;
 
 /** One end (and the earlier ends the connector folded into it) gathered for the next summary. */
 export function gather(
-  p: Pick<RemoteParams, "digest">, now: number, e: { turns: number; failed: boolean; asks: boolean; said: string[] },
+  p: Pick<RemoteParams, "digest">, now: number, e: { turns: number; failed: number; asks: boolean; said: string[] },
 ): void {
   const d: TerminalDigest = p.digest ?? { first_at: now, last_at: now, turns: 0, failed: 0, asks: 0, said: [] };
   d.last_at = now;
   d.turns += Math.max(1, e.turns);
-  if (e.failed) d.failed += 1;
+  d.failed += Math.max(0, e.failed);
   if (e.asks) d.asks += 1;
   d.said = [...d.said, ...e.said.filter(Boolean)].slice(-DIGEST_SAID_MAX);
   p.digest = d;
@@ -100,14 +101,15 @@ export function terminalDigestNotice(
   attach: string | null,
 ): string {
   const zh = p.lang === "zh";
-  const name = terminalEndName(p);
-  const where = [p.machine, cwdTail(String(p.cwd ?? "")), `#${seq}`].filter(Boolean).join(" · ");
+  // Every word the machine or the agent wrote is made inert: a channel reads this text as markdown.
+  const name = inertMd(terminalEndName(p));
+  const where = [inertMd(p.machine), inertMd(cwdTail(String(p.cwd ?? ""))), `#${seq}`].filter(Boolean).join(" · ");
   const head = zh ? `【${name}】持续工作中 · ${where}` : `[${name}] still working · ${where}`;
   const during = span(now - d.first_at, zh);
   const count = zh
     ? `过去 ${during}里又跑了 ${d.turns} 轮${d.failed ? `，其中 ${d.failed} 轮出错` : ""}。`
     : `In the last ${during} it ran ${d.turns} more turn${d.turns === 1 ? "" : "s"}${d.failed ? `, ${d.failed} of them failed` : ""}.`;
-  const latest = d.said[d.said.length - 1] ?? "";
+  const latest = inertMd(d.said[d.said.length - 1] ?? "");
   const result = latest ? (zh ? `最近：${latest.replace(/\s*\n\s*/gu, "；")}` : `Latest: ${latest.replace(/\s*\n\s*/gu, "; ")}`) : "";
   const need = d.asks
     ? (zh ? `有 ${d.asks} 轮在问你，详情见终端。` : `${d.asks} of them asked you something; see the terminal.`)

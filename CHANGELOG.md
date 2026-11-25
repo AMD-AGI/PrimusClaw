@@ -306,8 +306,9 @@ release version, and its `appVersion` stays `latest`.
   it failed. The connector reads who started the turn from Claude Code's transcript (`origin.kind`, `promptSource`) and sends it
   as `origin` on `terminal_turn_end`; ends of turns nobody typed (another session's message, a schedule, a hook) that follow one
   another before the terminal has been quiet a minute are sent as one, the newest, with `turns`, `earlier` and `since` (at the
-  latest fifteen minutes after the first), and a new prompt holds an end not yet told until its own turn ends. Claw gathers the
-  ends it does not push (and those the five-minute gap holds back) on the conversation's item and says, at most once per
+  latest fifteen minutes after the first; `failed_earlier` counts failures among them, and such a run is pushed), and a new
+  prompt holds an end not yet told until its own turn ends. Claw gathers the ends it does not push (the earlier turns of a run
+  it does push, and the ends the five-minute gap holds back, too) on the conversation's item and says, at most once per
   conversation every hour, what it did since: how many turns, how many failed, the latest result in whole sentences, and
   whether anything asked the person (`remote.kind` `progress`). `/approvals summary <minutes>|off` (15 to 1440; `PUT
   /v1/remote-agents/approvals/summary`, read back on `GET /v1/remote-agents/approvals` as `summary_minutes`) sets the interval;
