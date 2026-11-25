@@ -370,6 +370,11 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: the answer a seat's agent gave by itself, after a command it put in the background finished, was lost when its
+  task had been opened again meanwhile (waiting for the seat that very turn kept busy) or sent to a new session: it
+  is now said as that task's late word. The five-minute quiet that ends such a turn for an older connector now waits
+  35 minutes while a tool call of the turn is still running, past the 30 minutes connector 0.3.3 waits then itself,
+  so a long command no longer frees the seat while it runs.
 - Connector and Claw: a seat whose agent put a command in the background stayed busy for good. Once the command
   finished, Claude Code took a turn by itself to answer it; the connector forwarded that turn's output but never ended
   it, so Claw read the session as working, the seat's queued tasks waited until the machine went offline, and the

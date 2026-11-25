@@ -86,6 +86,9 @@ interface ActivityEvent {
   type: string; occurred_at: string; text: string; action_id: string | null; stop: string | null; replay: boolean;
   /** The prompt it is of (`user_prompt`), ends (`turn_end`) or refused unrun (`command_rejected`), when it names one by number. */
   cmd_seq?: number | null;
+  /** A tool call's id and status (`tool_call`, `tool_call_update`), when it says them. */
+  tool_id?: string | null;
+  tool_status?: string | null;
 }
 
 /**
@@ -94,6 +97,11 @@ interface ActivityEvent {
  * (`agent_initiated`); an older one never does, and its session would read as working for good.
  */
 export const AGENT_TURN_QUIET_MS = 5 * 60_000;
+/**
+ * The same while a tool call of that turn is still running: past the 30 minutes a connector from 0.3.3 on waits then before it ends
+ * the turn itself (connector session.ts `agentTurnToolQuietMs`), so a long command it still runs never reads as over here first.
+ */
+export const AGENT_TURN_TOOL_QUIET_MS = 35 * 60_000;
 
 export interface SessionReading {
   state: Exclude<DevenvState, "in_terminal" | "unknown">;
@@ -131,7 +139,8 @@ export function readSession(events: ActivityEvent[], queued: number, now: number
   // (and asks nothing) it is over. Only when that end is in the window read: without it a prompt may be further back than the window.
   if (working && queued === 0 && openPrompts === 0 && lastEnd >= 0 && pending.size === 0 && !promptOpen(events)) {
     const last = Date.parse(activity[activity.length - 1]!.occurred_at);
-    if (Number.isFinite(last) && now - last > AGENT_TURN_QUIET_MS) working = false;
+    const quiet = openTools(activity) ? AGENT_TURN_TOOL_QUIET_MS : AGENT_TURN_QUIET_MS;
+    if (Number.isFinite(last) && now - last > quiet) working = false;
   }
   // The turn to describe: the one under way, else the last that ended.
   const turn = working ? live : events.slice(prevEnd + 1, lastEnd + 1).filter((e) => !e.replay);
@@ -152,6 +161,17 @@ export function readSession(events: ActivityEvent[], queued: number, now: number
 /** {@link readSession} of a row of `sessionActivity`: its events, its prompts not yet collected and its prompts not yet ended. */
 export function readActivity(row: { events?: unknown; queued?: unknown; open_prompts?: unknown }, now: number = Date.now()): SessionReading {
   return readSession(Array.isArray(row.events) ? row.events as ActivityEvent[] : [], Number(row.queued) || 0, now, Number(row.open_prompts) || 0);
+}
+
+/** Whether a tool call of these events is still running: started or updated, and neither completed nor failed since (as the connector counts them). */
+function openTools(events: ActivityEvent[]): boolean {
+  const open = new Set<string>();
+  for (const e of events) {
+    if ((e.type !== "tool_call" && e.type !== "tool_call_update") || !e.tool_id) continue;
+    if (e.tool_status === "completed" || e.tool_status === "failed") open.delete(e.tool_id);
+    else if (e.type === "tool_call" || e.tool_status) open.add(e.tool_id);
+  }
+  return open.size > 0;
 }
 
 /**

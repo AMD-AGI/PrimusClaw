@@ -1127,7 +1127,7 @@ describe("seat dispatch", { skip }, () => {
     assert.doesNotMatch(late[0]!.text, /已放到后台/, "only what it said in that turn");
     const it = await item(long.item_id);
     assert.deepEqual([it.board_state, it.outcome, it.summary], ["done", "answered", "long-0357A978"]);
-    assert.equal(it.params.agent_turn_seen > 0, true);
+    assert.equal(it.params.agent_turn_seen_in[s.sid] > 0, true);
     // The next task's prompt is out; another own turn of the agent's now (its prompt took it over) is still the long task's word.
     await collect(cid);
     await events("alice", cid, s.sid, [chunk("又补一句"), ["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true }]]);
@@ -1216,6 +1216,129 @@ describe("seat dispatch", { skip }, () => {
     await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: "z", cmd_seq: seqC }], chunk("又补一句")]);
     await age();
     assert.equal(await reads(), "idle", "every instruction ended: the agent's own turn, quiet, is over");
+  });
+
+  test("D28 the agent's own turn after a task that was opened again while that turn ran is said as that task's, not lost past an older task", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const a = await finished(alice, cid, s, "整理文档");
+    const b = await finished(alice, cid, s, "跑 sleep 60");
+    assert.equal(a.params.dispatched_at !== undefined, true, "the older task keeps when it was sent");
+    // B's background command finishes and the agent answers it on its own; meanwhile B is opened again and waits for the seat.
+    await events("alice", cid, s.sid, [chunk("late-B-7F3A")]);
+    const again = await tools.workSend(await userTurn(alice, "再看一下结果"), { item_id: String(b.item_id), text: "再看一下结果" }) as Recorded;
+    assert.deepEqual([again.dispatch, again.queued_reason], ["queued", "seat_busy"], JSON.stringify(again));
+    assert.equal((await item(b.item_id)).params.dispatched_at, undefined);
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true, ended_by: "result" }]]);
+    const late = (await notices()).filter((n) => /late-B-7F3A/.test(n.text));
+    assert.equal(late.length, 1, JSON.stringify(await notices()));
+    assert.equal(late[0]!.remote.item_seq, b.seq);
+    assert.equal((await notices()).filter((n) => n.remote.item_seq === a.seq && /late-B/.test(n.text)).length, 0);
+    // Posted again: said once.
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    assert.equal((await notices()).filter((n) => /late-B-7F3A/.test(n.text)).length, 1);
+  });
+
+  test("D28 the agent's own turn after a task that has moved to a new session since is still said as that task's", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    await finished(alice, cid, s, "整理文档");
+    const b = await finished(alice, cid, s, "跑 sleep 60");
+    await events("alice", cid, s.sid, [chunk("late-B-91C2")]);
+    // (As a task opened again in a new session of its own is, once sent there.)
+    await w.q("UPDATE claw_work_items SET params = params || jsonb_build_object('session_id', gen_random_uuid()::text) WHERE item_id = $1", [b.item_id]);
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true, ended_by: "result" }]]);
+    const late = (await notices()).filter((n) => /late-B-91C2/.test(n.text));
+    assert.equal(late.length, 1, JSON.stringify(await notices()));
+    assert.equal(late[0]!.remote.item_seq, b.seq);
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    assert.equal((await notices()).filter((n) => /late-B-91C2/.test(n.text)).length, 1, "said once");
+  });
+
+  test("D28 the agent's own turn after the only task of its session, moved to a new session since, is still said once", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const b = await finished(alice, cid, s, "跑 sleep 60");
+    await events("alice", cid, s.sid, [chunk("late-only-5D1E")]);
+    await w.q("UPDATE claw_work_items SET params = params || jsonb_build_object('session_id', gen_random_uuid()::text) WHERE item_id = $1", [b.item_id]);
+    await events("alice", cid, s.sid, [["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true, ended_by: "result" }]]);
+    const late = (await notices()).filter((n) => /late-only-5D1E/.test(n.text));
+    assert.equal(late.length, 1, JSON.stringify(await notices()));
+    assert.equal(late[0]!.remote.item_seq, b.seq);
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    assert.equal((await notices()).filter((n) => /late-only-5D1E/.test(n.text)).length, 1, "said once");
+    assert.equal((await w.q("SELECT COUNT(*)::int AS n FROM claw_work_item_events WHERE item_id = $1 AND result->>'agent_initiated' = 'true'", [b.item_id]))[0].n, 1);
+  });
+
+  test("D28 a moved task's late turn after many turns of nobody's task on a session with no task left on it is still read", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const b = await finished(alice, cid, s, "跑 sleep 60");
+    const bPrompt = (await w.q("SELECT data FROM claw_remote_events WHERE session_id = $1 AND type = 'user_prompt' ORDER BY id DESC LIMIT 1", [s.sid]))[0].data;
+    await w.q("UPDATE claw_work_items SET params = params || jsonb_build_object('session_id', gen_random_uuid()::text) WHERE item_id = $1", [b.item_id]);
+    // Recorded with no pass in between (as from one late batch): a chat's prompt and many turns of the agent's own after it, then the
+    // task's prompt once more, its end, and the agent's own turn after that.
+    const own = { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true };
+    const raw: Array<[number, string, Recorded]> = [
+      [store.userPromptSeq(900), "user_prompt", { text: "chat", cmd_id: "k:chat-9", cmd_seq: 900, client: "web", by: "claw" }],
+      [200000, "turn_end", { stopReason: "end_turn", cmd_id: "k:chat-9", cmd_seq: 900 }],
+      ...Array.from({ length: 25 }, (_, i): [number, string, Recorded] => [200001 + i, "turn_end", own]),
+      [store.userPromptSeq(901), "user_prompt", { ...bPrompt, cmd_seq: 901 }],
+      [200100, "turn_end", { stopReason: "end_turn", cmd_id: bPrompt.cmd_id, cmd_seq: 901 }],
+      [200101, "agent_message_chunk", { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "late-many-A0B1" } } }],
+      [200102, "turn_end", own],
+    ];
+    for (const [seq, type, data] of raw) {
+      await w.q("INSERT INTO claw_remote_events (session_id, seq, type, occurred_at, data) VALUES ($1, $2, $3, NOW(), $4::jsonb)", [s.sid, seq, type, JSON.stringify(data)]);
+    }
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    const late = (await notices()).filter((n) => /late-many-A0B1/.test(n.text));
+    assert.equal(late.length, 1, JSON.stringify(await notices()));
+    assert.equal(late[0]!.remote.item_seq, b.seq);
+  });
+
+  test("D28 a turn read under a cursor kept as before, by a task that moved on since, is not kept or said again", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const b = await finished(alice, cid, s, "跑 sleep 60");
+    await events("alice", cid, s.sid, [chunk("late-legacy-3C9D"),
+      ["turn_end", { stopReason: "end_turn", cmd_id: null, cmd_seq: null, agent_initiated: true, ended_by: "result" }]]);
+    const kept = async () => (await w.q("SELECT COUNT(*)::int AS n FROM claw_work_item_events WHERE item_id = $1 AND result->>'agent_initiated' = 'true'", [b.item_id]))[0].n;
+    assert.equal(await kept(), 1);
+    // Its cursor as an older server kept it, and the task moved to a new session since.
+    await w.q(`UPDATE claw_work_items SET params = (params - 'agent_turn_seen_in')
+                 || jsonb_build_object('agent_turn_seen', (params->'agent_turn_seen_in'->>$2)::bigint, 'session_id', gen_random_uuid()::text)
+               WHERE item_id = $1`, [b.item_id, s.sid]);
+    await events("alice", cid, s.sid, [chunk("ok")]);
+    assert.equal(await kept(), 1, "not kept twice");
+    assert.equal((await notices()).filter((n) => /late-legacy-3C9D/.test(n.text)).length, 1);
+  });
+
+  test("D29 the agent's own turn with a command still running keeps the seat busy past the quiet; once the command is done, quiet frees it", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    await finished(alice, cid, s, "跑 sleep 60");
+    await events("alice", cid, s.sid, [["tool_call", { update: { sessionUpdate: "tool_call", toolCallId: "bg1", title: "make test", status: "pending" } }]]);
+    const { AGENT_TURN_QUIET_MS } = await import("../src/assistant/devenv-tools.js");
+    const age = () => w.q("UPDATE claw_remote_events SET occurred_at = NOW() - make_interval(secs => $2::float8) WHERE session_id = $1 AND type <> 'user_prompt'",
+      [s.sid, AGENT_TURN_QUIET_MS / 1000 + 60]);
+    await age();
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "working", "its command still runs");
+    await events("alice", cid, s.sid, [["tool_call_update", { update: { sessionUpdate: "tool_call_update", toolCallId: "bg1", status: "completed" } }]]);
+    await age();
+    assert.notEqual((await seats.rosterOf("alice"))[0]!.state, "working");
   });
 
   test("D12 the prompt asks for parking only from a connector that can park", async () => {
