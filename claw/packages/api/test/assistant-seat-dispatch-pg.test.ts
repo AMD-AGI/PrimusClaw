@@ -1424,10 +1424,21 @@ describe("seat dispatch", { skip }, () => {
     assert.equal(next.params.session_id, sidA, "into the session that holds seat 1's conversation");
     assert.equal((await opened()).length, 0, "no new session (the ones before were collected)");
     assert.deepEqual((await seats.rosterOf("alice")).filter((x) => x.seat_id === s1).map((x) => x.sessions), [[sidA]]);
+    assert.equal(next.params.takeover_session, undefined, "a prompt into a session open through Claw takes nothing over");
+    // The machine no longer knows that session (closed or cleaned up there): only that session closed. Seat 1's conversation is still
+    // on the machine, so the seat is not gone and nobody is told it was deleted.
+    await events("alice", cid, sidA, [["session_closed", { reason: "unknown_session" }]]);
+    const closed = await item(a2.item_id);
+    assert.equal(closed.last_report_kind, "failed", JSON.stringify(closed));
+    const toldA2 = (await notices()).filter((n) => n.remote.item_seq === a2.seq).map((n) => n.text).join("\n");
+    assert.match(toldA2, /它的会话关闭了/);
+    assert.doesNotMatch(toldA2, /不存在/);
+    assert.equal((await w.q("SELECT gone_at FROM claw_devenv_seats WHERE seat_id = $1", [s1]))[0].gone_at, null, "seat 1 is not gone");
     // Seat 3's conversation was deleted on the machine: the task that went to take it over is refused there, and that is said plainly.
     const c = await create(await userTurn(alice, "让 s3 整理"), `seat:${s3}`, "整理 c");
     assert.equal(c.dispatch, "sent");
     const sidC = String((await item(c.item_id)).params.session_id);
+    assert.equal((await item(c.item_id)).params.takeover_session, sidC, "the session opened to take seat 3's conversation over");
     await events("alice", cid, sidC, [["session_closed", { reason: "unknown_session" }]]);
     const failed = await item(c.item_id);
     assert.equal(failed.last_report_kind, "failed", JSON.stringify(failed));
