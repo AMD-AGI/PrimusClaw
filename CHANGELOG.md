@@ -309,6 +309,21 @@ release version, and its `appVersion` stays `latest`.
   session in its folder (`new_session` for such a seat is refused, `seat_new_session`). When the machine refuses to start the session that was to take over (or type into) the seat's conversation because that conversation is not there (`unknown_session` as that session's first word; the same reason later, for a session the machine no longer knows, only closes that session), the task fails saying so, and the seat is
   `gone` in the roster and refused (`seat_gone`) until its machine lists that conversation again; one a session open through Claw held,
   closed on a machine where no agent takes conversations over, is `gone` too. Prompts `router-seats-v3`, `router-dispatch-v2`.
+- Connector: the Claude Code hooks (the session hooks and the approval hooks) are installed and kept in place by the connector
+  itself, as it keeps itself up to date. Every start, including the first run after an auto-upgrade, makes sure each Claude
+  config directory it serves has them and that they run the installation that is running (stale node or script paths are
+  rewritten), with one line in the connector log when something changed and nothing shown to the person. Only entries marked
+  `--managed-by claw-connector` change; the file is written through a rename under a lock, re-read if another writer changed
+  it meanwhile, and backed up once (`settings.json.bak-claw-<time>`) before the first change to anything of the person's.
+  `init` and `pair` no longer ask or print a command: they add the hooks unless `--no-hooks` / `--no-approval-hooks`. An
+  explicit no is kept for good in `claude-hooks.json` in the configuration directory: `hooks uninstall` (`--approvals` for the
+  approval hooks only), `--no-hooks` / `--no-approval-hooks`, or a no to the question 0.1.23 to 0.3.4 asked; `hooks install`
+  (`--approvals`) and `--hooks` take it back. `hooks install` now installs the approval hooks too, unless they were taken out
+  or `CLAW_APPROVAL_HOOKS=off` is set. Versions up to 0.3.4 recorded no other no, so the first start after the upgrade reads it
+  from what is in place, once: a set none of whose hooks is in an existing Claude config directory stays out there; `init`
+  and `pair` run after the upgrade add both sets.
+  The one-time question about the approval hooks after other commands is gone. Codex and Cursor hooks are unchanged (Codex
+  needs the person to trust a new hook). See `connector/README.md`, "The Claude Code hooks are kept in place".
 - Claw, Agent Sandbox: a sandbox template says how its sandbox mounts its workspace's storage with `workspaceStorage`:
   `"on"` (the default, as before), `"off"` (none of it; the SaFE Workload gets
   `primus-safe.workload.use.workspace.storage: "false"`) or `"readOnly"` (all of it read-only, init containers

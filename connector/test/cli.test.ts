@@ -818,83 +818,51 @@ describe("init and hooks: the Claude Code session hooks", () => {
   const approvalCmds = (dir: string) => hookCommands(dir).filter((c) => c.includes("approval-hook.js") && c.includes(`--dir '${dir}'`));
   const mineSettings = () => JSON.stringify({ model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "mine.sh" }] }] } }, null, 2);
 
-  test("init with nobody to ask leaves Claude Code's settings alone and prints the command that would add the hooks", async () => {
-    const home = tmpdir();
-    const dir = claudeDir(home);
-    const mine = mineSettings();
-    fs.writeFileSync(settings(dir), mine);
-    const a = ctx(home, { hookScript: stand(), approvalHookScript: standApproval() });
-    assert.equal(await main(["init"], a.c), EXIT.ok);
-    assert.ok(fs.existsSync(path.join(home, "config", "agents.toml")), "the sample is still written");
-    assert.equal(fs.readFileSync(settings(dir), "utf8"), mine, "settings.json byte for byte as it was");
-    assert.match(a.text(), /did not add the Claude Code hooks to .*settings\.json \(no terminal to ask in\).*claw-connector hooks install --approvals/);
-    assert.doesNotMatch(a.text(), /Add them\?|approval hooks:/, "nothing is offered to nobody");
-    const bare = tmpdir();
-    const bareDir = claudeDir(bare);
-    assert.equal(await main(["init"], ctx(bare, { hookScript: stand(), approvalHookScript: standApproval() }).c), EXIT.ok);
-    assert.equal(fs.existsSync(settings(bareDir)), false, "and no settings.json is created where there was none");
-  });
-
-  test("init at a terminal asks once, default yes: no leaves the settings alone, Enter installs the session and approval hooks; run again it neither asks nor changes anything", async () => {
+  test("init adds the session and approval hooks without asking and without a command to run; the user's own entries stay; run again it changes nothing", async () => {
     const home = tmpdir();
     const dir = claudeDir(home);
     fs.writeFileSync(settings(dir), mineSettings());
-    const before = fs.readFileSync(settings(dir), "utf8");
     const script = stand();
     const approvalScript = standApproval();
-    const asked: Array<[string, boolean | undefined]> = [];
-    const no = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q, d) => { asked.push([q, d]); return false; } });
-    assert.equal(await main(["init"], no.c), EXIT.ok);
-    assert.equal(asked.length, 1);
-    assert.deepEqual(asked[0], ["Add them? [Y/n] ", true], "one question, and Enter means yes");
-    assert.match(no.text(), /session hooks \(SessionStart, SessionEnd\)/);
-    assert.match(no.text(), /approval hooks: a question Claude Code asks in a terminal .* also comes to your chat; the terminal keeps asking and the first answer wins/);
-    assert.equal(fs.readFileSync(settings(dir), "utf8"), before);
-    assert.match(no.text(), /did not add the Claude Code hooks to .*settings\.json\. .*claw-connector hooks install --approvals/);
-    // Enter: the stand-in answers with the question's default.
-    const enter = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q, d) => { asked.push([q, d]); return d ?? false; } });
-    assert.equal(await main(["init"], enter.c), EXIT.ok);
-    assert.equal(asked.length, 2);
-    assert.match(enter.text(), /installed the Claude Code session hooks in .*settings\.json/);
-    assert.match(enter.text(), /installed the approval hooks in .*settings\.json: questions Claude Code asks in a terminal also go to your chat/);
-    assert.equal(sessionCmds(dir).length, 2);
-    assert.equal(approvalCmds(dir).length, 7, "PermissionRequest, PostToolUse, PostToolUseFailure, UserPromptSubmit, Stop, StopFailure, SessionEnd");
-    assert.ok(approvalCmds(dir).every((c) => c.includes(`--socket '${path.join(enter.c.dirs.state, "approvals.sock")}'`)), "they talk to this connector's socket");
-    assert.ok(hookCommands(dir).includes("mine.sh"), "the user's own hook is still there");
-    assert.equal(JSON.parse(fs.readFileSync(settings(dir), "utf8")).model, "opus");
+    const noAsk = async (): Promise<boolean> => assert.fail("init must not ask about the hooks");
+    for (const withTerminal of [false, true]) {
+      const h = withTerminal ? home : tmpdir();
+      const d = withTerminal ? dir : claudeDir(h);
+      if (!withTerminal) fs.writeFileSync(settings(d), mineSettings());
+      const a = ctx(h, { hookScript: script, approvalHookScript: approvalScript, ...(withTerminal ? { ask: noAsk } : {}) });
+      assert.equal(await main(["init"], a.c), EXIT.ok);
+      assert.ok(fs.existsSync(path.join(h, "config", "agents.toml")), "the sample is still written");
+      assert.match(a.text(), /installed the Claude Code session hooks in .*settings\.json/);
+      assert.match(a.text(), /installed the approval hooks in .*settings\.json: questions Claude Code asks in a terminal also go to your chat/);
+      assert.doesNotMatch(a.text(), /Add them\?|run: claw-connector hooks/, "no question and no command");
+      assert.equal(sessionCmds(d).length, 2);
+      assert.equal(approvalCmds(d).length, 7, "PermissionRequest, PostToolUse, PostToolUseFailure, UserPromptSubmit, Stop, StopFailure, SessionEnd");
+      assert.ok(approvalCmds(d).every((c) => c.includes(`--socket '${path.join(a.c.dirs.state, "approvals.sock")}'`)), "they talk to this connector's socket");
+      assert.ok(hookCommands(d).includes("mine.sh"), "the user's own hook is still there");
+      assert.equal(JSON.parse(fs.readFileSync(settings(d), "utf8")).model, "opus");
+    }
     const bytes = fs.readFileSync(settings(dir), "utf8");
-    const again = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q, d) => { asked.push([q, d]); return false; } });
+    const again = ctx(home, { hookScript: script, approvalHookScript: approvalScript });
     assert.equal(await main(["init"], again.c), EXIT.ok);
-    assert.equal(asked.length, 2, "hooks of ours already there are not asked about again");
     assert.match(again.text(), /session hooks are already in/);
     assert.match(again.text(), /approval hooks are already in/);
     assert.equal(fs.readFileSync(settings(dir), "utf8"), bytes);
   });
 
-  test("a setup from before, with the session hooks only: kept up to date, the approval hooks offered alone at a terminal and never added without one", async () => {
+  test("a setup from before, with the session hooks only: init keeps them and adds the approval hooks", async () => {
     const home = tmpdir();
     const dir = claudeDir(home);
     fs.writeFileSync(settings(dir), mineSettings());
     const script = stand();
     const approvalScript = standApproval();
-    assert.equal(await main(["hooks", "install"], ctx(home, { hookScript: script }).c), EXIT.ok);
-    const sessionOnly = fs.readFileSync(settings(dir), "utf8");
-    // No terminal: nothing new is added, and it says how.
-    const quiet = ctx(home, { hookScript: script, approvalHookScript: approvalScript });
-    assert.equal(await main(["init"], quiet.c), EXIT.ok);
-    assert.equal(fs.readFileSync(settings(dir), "utf8"), sessionOnly, "settings.json as it was");
-    assert.match(quiet.text(), /did not add the approval hooks to .*\(no terminal to ask in\)\. Without them, a question it asks waits for you at that terminal only; to add them: claw-connector hooks install --approvals/);
-    assert.match(quiet.text(), /session hooks are already in/);
-    // A terminal: only the approval hooks are offered.
-    const asked: string[] = [];
-    const no = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async (q) => { asked.push(q); return false; } });
-    assert.equal(await main(["init"], no.c), EXIT.ok);
-    assert.equal(asked.length, 1);
-    assert.doesNotMatch(no.text(), /session hooks \(SessionStart/, "what is there already is not offered again");
-    assert.match(no.text(), /approval hooks: a question/);
-    assert.equal(fs.readFileSync(settings(dir), "utf8"), sessionOnly);
-    const yes = ctx(home, { hookScript: script, approvalHookScript: approvalScript, ask: async () => true });
-    assert.equal(await main(["init"], yes.c), EXIT.ok);
+    assert.equal(await main(["hooks", "install", "--config-dir", dir], ctx(home, { hookScript: script, approvalHookScript: approvalScript }).c), EXIT.ok);
+    assert.equal(await main(["hooks", "uninstall", "--approvals", "--config-dir", dir], ctx(home).c), EXIT.ok);
+    // As a connector before the opt-out was kept left it: session hooks only, nothing recorded.
+    fs.rmSync(path.join(home, "config", "claude-hooks.json"));
+    const a = ctx(home, { hookScript: script, approvalHookScript: approvalScript });
+    assert.equal(await main(["init"], a.c), EXIT.ok);
+    assert.match(a.text(), /session hooks are already in/);
+    assert.match(a.text(), /installed the approval hooks/);
     assert.equal(sessionCmds(dir).length, 2);
     assert.equal(approvalCmds(dir).length, 7);
     assert.ok(hookCommands(dir).includes("mine.sh"));
@@ -927,16 +895,18 @@ describe("init and hooks: the Claude Code session hooks", () => {
     assert.match(both.errText(), /contradict/);
   });
 
-  test("init --no-hooks leaves Claude Code alone; with no Claude directory and no Claude Code installed it says how to do it later and creates nothing", async () => {
+  test("init --no-hooks leaves Claude Code alone; with no Claude directory and no Claude Code installed it creates nothing and shows no command", async () => {
     const home = tmpdir();
     const dir = claudeDir(home);
     const a = ctx(home, { hookScript: stand(), ask: async () => assert.fail("--no-hooks must not ask") });
     assert.equal(await main(["init", "--no-hooks"], a.c), EXIT.ok);
     assert.equal(fs.existsSync(settings(dir)), false);
+    assert.match(a.text(), /left Claude Code's settings alone \(--no-hooks\); the connector will not add its hooks/);
     const other = tmpdir();
     const b = ctx(other, { hookScript: stand() });
     assert.equal(await main(["init"], b.c), EXIT.ok);
-    assert.match(b.text(), /Claude Code is not installed here \(no claude on PATH\), so its hooks were not added; once you install it, run: claw-connector hooks install --approvals/);
+    assert.match(b.text(), /Claude Code is not installed here \(no claude on PATH\); the connector adds its hooks once it is/);
+    assert.doesNotMatch(b.text(), /hooks install/);
     assert.equal(fs.existsSync(path.join(other, "claude-config")), false);
   });
 
@@ -963,7 +933,7 @@ describe("init and hooks: the Claude Code session hooks", () => {
     const home = tmpdir();
     const dir = path.join(home, "elsewhere");
     const script = stand();
-    const i = ctx(home, { hookScript: script });
+    const i = ctx(home, { hookScript: script, approvalHookScript: standApproval() });
     assert.equal(await main(["hooks", "install", "--config-dir", dir], i.c), EXIT.ok);
     assert.ok(fs.existsSync(settings(dir)), "an explicit directory is created if it is not there");
     const st = ctx(home);
@@ -1012,19 +982,19 @@ describe("init and hooks: the Claude Code session hooks", () => {
     const agent = (id: string, dir: string | null) => `[[agents]]\nid = "${id}"\npreset = "claude-attach"\nroots = [${JSON.stringify(os.tmpdir())}]\n${dir ? `[agents.env]\nCLAUDE_CONFIG_DIR = ${JSON.stringify(dir)}\n` : ""}`;
     fs.mkdirSync(path.join(home, "config"), { recursive: true });
     fs.writeFileSync(path.join(home, "config", "agents.toml"), [agent("one", a), agent("two", b), agent("three", a)].join("\n"));
-    const i = ctx(home, { hookScript: stand() });
+    const i = ctx(home, { hookScript: stand(), approvalHookScript: standApproval() });
     assert.equal(await main(["hooks", "install"], i.c), EXIT.ok);
-    assert.equal(i.out.length, 2, "two different directories, each once");
-    assert.equal(hookCommands(a).length, 2);
-    assert.equal(hookCommands(b).length, 2);
+    assert.equal(i.out.length, 4, "two different directories, each once (the session hooks and the approval hooks)");
+    assert.equal(sessionCmds(a).length, 2);
+    assert.equal(sessionCmds(b).length, 2);
     assert.equal(fs.existsSync(settings(dflt)), false, "the default directory is not touched when the agents name theirs");
     // an attach agent that names no directory uses CLAUDE_CONFIG_DIR of the environment, else the home's .claude
     fs.writeFileSync(path.join(home, "config", "agents.toml"), agent("solo", null));
-    const j = ctx(home, { hookScript: stand() });
+    const j = ctx(home, { hookScript: stand(), approvalHookScript: standApproval() });
     assert.equal(await main(["hooks", "install"], j.c), EXIT.ok);
-    assert.equal(hookCommands(dflt).length, 2);
+    assert.equal(sessionCmds(dflt).length, 2);
     // a directory that does not exist, not named explicitly, is not invented while Claude Code is not installed
-    const k = ctx(tmpdir(), { hookScript: stand() });
+    const k = ctx(tmpdir(), { hookScript: stand(), approvalHookScript: standApproval() });
     assert.equal(await main(["hooks", "install"], k.c), EXIT.failure);
     assert.match(k.errText(), /no Claude Code directory .*Claude Code is not installed here .*--config-dir/);
     assert.equal(fs.existsSync(path.join(k.c.env.CLAUDE_CONFIG_DIR!)), false);
@@ -1032,8 +1002,9 @@ describe("init and hooks: the Claude Code session hooks", () => {
     const bin = tmpdir("bin-");
     fs.writeFileSync(path.join(bin, "claude"), "#!/bin/sh\n", { mode: 0o755 });
     const fresh = tmpdir();
-    const m = ctx(fresh, { hookScript: stand(), env: { PATH: bin, CLAUDE_CONFIG_DIR: path.join(fresh, "claude-config") } });
+    const m = ctx(fresh, { hookScript: stand(), approvalHookScript: standApproval(), env: { PATH: bin, CLAUDE_CONFIG_DIR: path.join(fresh, "claude-config") } });
     assert.equal(await main(["hooks", "install"], m.c), EXIT.ok, m.errText());
-    assert.equal(hookCommands(path.join(fresh, "claude-config")).length, 2);
+    assert.equal(sessionCmds(path.join(fresh, "claude-config")).length, 2);
+    assert.equal(approvalCmds(path.join(fresh, "claude-config")).length, 7);
   });
 });

@@ -7,7 +7,7 @@
  * (`claw-connector supervise`) keeping `run --supervised` up, and a stand-in Claw that recommends a version.
  *
  *  1. 1.0.0 is told 1.0.1: it upgrades, the supervisor starts itself again on 1.0.1 (same pid), 1.0.1 connects, the session
- *     hooks that were installed are brought up to date and the approval hooks that were not are not added.
+ *     hooks are brought up to date and the approval hooks the person took out are not added back.
  *  2. 1.0.2 is a broken build (its `run` exits at once): three trials fail, 1.0.1 is put back, 1.0.2 is pinned as failed and
  *     never downloaded again, and the heartbeat says so.
  *  3. 1.0.3 passes its trial but its real run exits at once (before any of its own code runs): the supervisor counts three such
@@ -184,10 +184,13 @@ safe_modes = ["default"]
 roots = [${JSON.stringify(workDir)}]
 `);
   assert.equal((await cli(pkgDir, ["login", "--key", "good-token", "--server", claw.url], env)).status, 0);
-  // The session hooks, installed by 1.0.0, then one of them lost (an older version's set): the upgrade brings them up to date.
+  // The hooks, installed by 1.0.0, the approval hooks then taken out by the person, and one session hook lost (an older
+  // version's set): every start brings the session hooks up to date, and no start or upgrade adds the approval hooks back.
   assert.equal((await cli(pkgDir, ["hooks", "install"], env)).status, 0);
+  assert.equal((await cli(pkgDir, ["hooks", "uninstall", "--approvals"], env)).status, 0);
   const settings = path.join(claude, "settings.json");
   const s0 = JSON.parse(fs.readFileSync(settings, "utf8"));
+  assert.equal(s0.hooks.PermissionRequest, undefined);
   delete s0.hooks.SessionEnd;
   fs.writeFileSync(settings, JSON.stringify(s0, null, 2));
 
@@ -203,11 +206,12 @@ roots = [${JSON.stringify(workDir)}]
   const restarted = fs.readFileSync(log, "utf8").match(/supervisor 1\.0\.1 started \(pid (\d+)\)/);
   assert.equal(Number(restarted?.[1]), sup.pid, "the same supervisor process, now on the new code");
   assert.ok(fs.existsSync(path.join(prefix, "lib", "node_modules", "@primusclaw", ".connector-backup-1.0.0", "dist", "cli.js")), "the old version is kept");
-  // (by the first run of 1.0.1, as it starts)
-  const s1 = await until("the installed session hooks to be brought up to date", () => { const v = JSON.parse(fs.readFileSync(settings, "utf8")); return v.hooks.SessionEnd ? v : null; }, 30_000, log);
+  // (by a start of the connector, without a word to the person beyond one line in the log)
+  const s1 = await until("the session hooks to be brought up to date", () => { const v = JSON.parse(fs.readFileSync(settings, "utf8")); return v.hooks.SessionEnd ? v : null; }, 30_000, log);
   assert.ok(s1.hooks.SessionStart);
-  assert.match(fs.readFileSync(log, "utf8"), /brought the Claude Code session hooks in .* up to date/);
-  assert.equal(s1.hooks.PermissionRequest, undefined, "hooks that were not installed are not added");
+  assert.match(fs.readFileSync(log, "utf8"), /Claude Code hooks: .*settings\.json: session hooks updated/);
+  assert.ok(JSON.stringify(s1.hooks).includes(path.join(pkgDir, "dist", "terminal-hook.js")), "they run the installed connector");
+  assert.equal(s1.hooks.PermissionRequest, undefined, "the approval hooks the person took out are not added back by the upgrade");
 
   // --- 2: the broken 1.0.2 -------------------------------------------------------------------------------------------
   const state = path.join(home, "state", "auto-upgrade.json");
@@ -223,6 +227,7 @@ roots = [${JSON.stringify(workDir)}]
   await sleep(1500);
   assert.equal(registry.downloads(PKG, "1.0.2"), 1, "a failed version is not tried again");
   assert.match(fs.readFileSync(log, "utf8"), /trial runs failed/);
+  assert.equal(JSON.parse(fs.readFileSync(settings, "utf8")).hooks.PermissionRequest, undefined, "nor by the runs of 1.0.1 since");
 
   // --- 3: 1.0.3 passes its trial, and its real runs fail before any of its code runs -------------------------------------------
   const scope = path.dirname(pkgDir);
