@@ -85,6 +85,7 @@ func TestWebhookDeniedPodFailsTheSandboxAtOnce(t *testing.T) {
 		},
 	}
 	podCreates := 0
+	transient := false
 	c := fake.NewClientBuilder().
 		WithScheme(Scheme).
 		WithStatusSubresource(&sandboxv1alpha1.Sandbox{}).
@@ -93,6 +94,9 @@ func TestWebhookDeniedPodFailsTheSandboxAtOnce(t *testing.T) {
 			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 				if _, ok := obj.(*corev1.Pod); ok {
 					podCreates++
+					if transient {
+						return k8serrors.NewServerTimeout(schema.GroupResource{Resource: "pods"}, "create", 1)
+					}
 					return webhookDenial(http.StatusBadRequest)
 				}
 				return cl.Create(ctx, obj, opts...)
@@ -137,6 +141,18 @@ func TestWebhookDeniedPodFailsTheSandboxAtOnce(t *testing.T) {
 	_, err = r.Reconcile(t.Context(), req)
 	require.NoError(t, err)
 	require.Equal(t, 2, podCreates)
+
+	// A later spec whose create fails for a passing reason does not keep the
+	// earlier spec's refusal as its outcome.
+	transient = true
+	require.NoError(t, c.Get(t.Context(), req.NamespacedName, got))
+	got.Generation = 3
+	require.NoError(t, c.Update(t.Context(), got))
+	_, err = r.Reconcile(t.Context(), req)
+	require.Error(t, err)
+	require.Equal(t, 3, podCreates)
+	require.NoError(t, c.Get(t.Context(), req.NamespacedName, got))
+	require.Nil(t, meta.FindStatusCondition(got.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed)))
 }
 
 // A failure the API server may get past is still retried and leaves no Failed

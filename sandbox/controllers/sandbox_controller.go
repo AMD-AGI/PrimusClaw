@@ -213,10 +213,14 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	// again. Replicas 0 deletes the Pod on purpose, so its absence there says
 	// nothing about the outcome already published either.
 	scaledToZero := sandbox.Spec.Replicas != nil && *sandbox.Spec.Replicas == 0
-	switch {
-	case refused != nil:
+	if refused != nil {
 		applyPodCreateRefused(sandbox, refused.message)
-	case podErr == nil && !scaledToZero:
+		return allErrors
+	}
+	// A refusal published for an earlier spec says nothing about this one,
+	// whatever happened to its create, and must not be read as its outcome.
+	clearPodCreateRefused(sandbox)
+	if podErr == nil && !scaledToZero {
 		applyPodTerminalConditions(sandbox, pod)
 	}
 
@@ -302,6 +306,14 @@ func applyPodCreateRefused(sandbox *sandboxv1alpha1.Sandbox, message string) {
 		Message:            message,
 	})
 	meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
+}
+
+// clearPodCreateRefused removes a published PodCreateRefused condition.
+func clearPodCreateRefused(sandbox *sandboxv1alpha1.Sandbox) {
+	failed := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	if failed != nil && failed.Reason == sandboxv1alpha1.SandboxReasonPodCreateRefused {
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	}
 }
 
 // applyPodTerminalConditions records Succeeded/Failed from the Pod phase so
