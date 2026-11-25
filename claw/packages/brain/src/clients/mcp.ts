@@ -490,11 +490,22 @@ function connectFailureReason(err: unknown): string {
  * Without it a server that is down is indistinguishable from one that was never
  * configured: the model is simply not offered its tools, and tells the user it
  * has no way to do what they asked instead of saying the service is unreachable.
+ *
+ * A server that is only slow (`deferred`: still connecting when the turn's budget ran out) is said apart from one that failed:
+ * it is not known to be down, and telling the model to call it unreachable had it tell the user the service was down while
+ * the server answered a moment later.
  */
-export function mcpUnavailableNote(failed: readonly McpConnectFailure[]): string {
-  if (!failed.length) return "";
-  const list = failed.map((f) => `${f.name} (${f.reason})`).join("; ");
-  return `[Unavailable this turn: MCP server(s) ${list}. Their tools are not offered. If the request needs one, tell the user that service is unreachable right now rather than that you lack the capability.]`;
+export function mcpUnavailableNote(failed: readonly McpConnectFailure[], deferred: readonly McpDeferred[] = []): string {
+  const lines: string[] = [];
+  if (failed.length) {
+    const list = failed.map((f) => `${f.name} (${f.reason})`).join("; ");
+    lines.push(`[Unavailable this turn: MCP server(s) ${list}. Their tools are not offered. If the request needs one, tell the user that service is unreachable right now rather than that you lack the capability.]`);
+  }
+  if (deferred.length) {
+    const list = deferred.map((d) => `${d.name} (${d.reason})`).join("; ");
+    lines.push(`[Not ready this turn: MCP server(s) ${list}. Their tools are not offered in this turn. They are slow to connect, not known to be down: if the request needs one, tell the user it did not answer in time and that sending the message again will retry it; do not say the service is down or unreachable.]`);
+  }
+  return lines.join("\n");
 }
 
 /** A server left out of this turn because it was not ready within the turn's budget; it keeps connecting for the next one. */
@@ -514,7 +525,7 @@ export interface ConnectPlatformMcpOptions {
    */
   budgetMs?: number;
   /**
-   * Servers the run cannot work without (a review session's review tools): each is waited for up to `requiredBudgetMs` instead of
+   * Servers the run cannot work without (a review session's review tools, an assistant turn's own server): each is waited for up to `requiredBudgetMs` instead of
    * `budgetMs`, and is deferred only past that. The others still wait no longer than `budgetMs`.
    */
   required?: readonly string[];
