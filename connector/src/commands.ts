@@ -24,8 +24,8 @@ import {
 } from "./hooks.js";
 import { CURSOR_HOLD_DEFAULT_S, CURSOR_HOLD_MAX_S, CURSOR_HOLD_MIN_S, cursorConfigDir } from "./cursor-approvals.js";
 import { approvalSocketFile } from "./approvals.js";
-import { optedOut } from "./approval-skip.js";
-import { recordHooksChoice, wantedHooks } from "./hooks-auto.js";
+import { OPT_OUT_ENV, optedOut } from "./approval-skip.js";
+import { migrateHookPrefs, recordHooksChoice, wantedHooks, type HookSet } from "./hooks-auto.js";
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
 import { checkAll, defaultDeps, formatReport, runProbe, shq, writeReport, type DoctorDeps, type Problem, type Report } from "./doctor.js";
@@ -387,6 +387,7 @@ export interface HookChoice { hooks: boolean; noHooks: boolean; noApprovals: boo
  * merged into is reported, and the command still succeeds.
  */
 export async function setupHooks(ctx: Ctx, o: HookChoice): Promise<void> {
+  migrateHookPrefs(ctx.dirs, [], hasSet, true);
   try {
     if (o.noHooks) {
       recordHooksChoice(ctx.dirs, null, "session", "off");
@@ -424,6 +425,7 @@ export interface EnsuredHooks {
 export function ensureClaudeHooks(ctx: Ctx, o: { create?: boolean } = {}): EnsuredHooks[] {
   let dirs: string[];
   try { dirs = claudeDirs(ctx, undefined); } catch (e) { return [{ dir: defaultClaudeDir(ctx), error: errMessage(e) }]; }
+  migrateHookPrefs(ctx.dirs, dirs, hasSet, false);
   const out: EnsuredHooks[] = [];
   for (const dir of dirs) {
     const r: EnsuredHooks = { dir };
@@ -460,6 +462,14 @@ function autoHooks(ctx: Ctx): void {
 
 /** Whether Claude Code is installed here: its program on PATH (pair.ts `detectAgents`). */
 const claudeInstalled = (ctx: Ctx): boolean => detectAgents(ctx.env).includes("claude");
+
+/** Whether any hook of that set is in this directory's settings, or null when they cannot be read; for {@link migrateHookPrefs}. */
+const hasSet = (dir: string, set: HookSet): boolean | null => {
+  try {
+    const st = (set === "session" ? hooksStatus : approvalHooksStatus)(dir);
+    return st.events.length > 0 ? true : st.problem ? null : false;
+  } catch { return null; }
+};
 
 /** Whether any hook of that set is in this directory's settings already; a settings file that cannot be read counts as no. */
 function present(status: (dir: string) => HooksStatus, dir: string): boolean {
@@ -627,6 +637,8 @@ function cmdHooks(args: string[], ctx: Ctx): number {
   if (agent === "codex") return cmdCodexHooks(sub, values["config-dir"], !!values.json, ctx);
   const dirs = claudeDirs(ctx, values["config-dir"]);
   const approvals = !!values.approvals;
+  // Carry over what 0.3.3 or earlier left before this records a choice: for the directories this start would serve too.
+  if (sub !== "status") { try { migrateHookPrefs(ctx.dirs, [...new Set([...claudeDirs(ctx, undefined), ...dirs])], hasSet, false); } catch { /* best effort */ } }
   let code: number = EXIT.ok;
   const report: Array<Record<string, unknown>> = [];
   for (const dir of dirs) {
@@ -642,7 +654,9 @@ function cmdHooks(args: string[], ctx: Ctx): number {
         recordHooksChoice(ctx.dirs, dir, "session", "on");
         if (approvals) recordHooksChoice(ctx.dirs, dir, "approvals", "on");
         ctx.out(describeInstall(dir, installOne(ctx, dir).changed));
-        if (wantedHooks(ctx.dirs, dir).approvals) ctx.out(describeApprovals(dir, installApprovalsOne(ctx, dir).changed));
+        // CLAW_APPROVAL_HOOKS=off keeps them out as a start of the connector would, unless they are asked for by name.
+        if (!approvals && optedOut(ctx.env)) ctx.out(`the approval hooks stay out of ${settingsFile(dir)}: ${OPT_OUT_ENV}=off is set here ("hooks install --approvals" adds them)`);
+        else if (wantedHooks(ctx.dirs, dir).approvals) ctx.out(describeApprovals(dir, installApprovalsOne(ctx, dir).changed));
         else ctx.out(`the approval hooks stay out of ${settingsFile(dir)}, as you chose ("hooks install --approvals" adds them)`);
       } else if (sub === "uninstall") {
         // `--approvals` takes out only the approval hooks; without it, both sets go. Kept as the person's choice: no later start

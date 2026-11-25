@@ -12,6 +12,11 @@
  * names, `--no-hooks` / `--no-approval-hooks` on `init` or `pair` for every directory, and a "no" to the question 0.1.23 to
  * 0.3.3 asked once per directory (approval-hooks-offer.json in the state directory). `hooks install` takes a no back for the
  * directories it names, as `init --hooks` / `pair --hooks` do for every directory.
+ *
+ * Versions up to 0.3.3 recorded no other no: `hooks uninstall`, `--no-hooks` and a "n" at the init/pair question only left the
+ * hooks out of settings.json. So the first time this version needs the choices and finds no claude-hooks.json, anywhere but in
+ * `init` and `pair` it reads them from what is in place ({@link migrateHookPrefs}): a set that is missing from an existing
+ * directory was taken out, and stays out.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -59,6 +64,42 @@ function legacyNo(d: Dirs, dir: string): boolean {
     const a = isObj(doc) && isObj(doc.answered) ? doc.answered[dir] : undefined;
     return isObj(a) && a.answer === "no";
   } catch { return false; }
+}
+
+function legacyAnswered(d: Dirs, dir: string): boolean {
+  try {
+    const doc: unknown = JSON.parse(fs.readFileSync(legacyOfferFile(d), "utf8"));
+    return isObj(doc) && isObj(doc.answered) && isObj(doc.answered[dir]);
+  } catch { return false; }
+}
+
+/**
+ * Once, when there is no claude-hooks.json yet: write it, so the choices of a person who used 0.3.3 or earlier are kept. With
+ * `fresh` (`init` and `pair`, which add both sets now) nothing is carried over. Otherwise, in each of `dirs` that exists:
+ * - no session hooks of ours there means they were taken out (`hooks uninstall`, `--no-hooks`, a "n" at init/pair): "off";
+ * - no approval hooks of ours there is "off" too when the session hooks are missing as well, or when the 0.1.23 to 0.3.3
+ *   question was already answered for that directory (a yes taken back with `hooks uninstall --approvals`). Where the session
+ *   hooks are in and the question was never answered, they are added, as that question would have offered them.
+ * `present` says whether any hook of that set is in that directory's settings, or null when they cannot be read (then nothing is
+ * recorded for it, and the hooks go in once the file can be merged into). Never throws: a failure is retried next time.
+ */
+export function migrateHookPrefs(d: Dirs, dirs: string[], present: (dir: string, set: HookSet) => boolean | null, fresh: boolean): void {
+  try {
+    if (fs.existsSync(hookPrefsFile(d))) return;
+    const p: Prefs = { v: 1, all: {}, dirs: {} };
+    if (!fresh) {
+      for (const dir of dirs) {
+        if (!fs.existsSync(dir)) continue;
+        const c: Choice = {};
+        const session = present(dir, "session");
+        if (session === false) c.session = "off";
+        if (present(dir, "approvals") === false && (session === false || legacyAnswered(d, dir))) c.approvals = "off";
+        if (Object.keys(c).length) p.dirs[dir] = c;
+      }
+    }
+    if (fs.existsSync(hookPrefsFile(d))) return;
+    writePrefs(d, p);
+  } catch { /* tried again next time */ }
 }
 
 /** Which sets of hooks belong in this directory: a choice made for the directory, else one made for all, else both. */

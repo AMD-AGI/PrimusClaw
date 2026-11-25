@@ -683,8 +683,16 @@ A no is kept, in `claude-hooks.json` in the connector's configuration directory,
 `hooks uninstall` (both sets) or `hooks uninstall --approvals` (the approval hooks) for the directories it names, `init` or
 `pair` with `--no-hooks` or `--no-approval-hooks` for every directory, and a no to the question connectors 0.1.23 to 0.3.3
 asked about the approval hooks. `hooks install` (with `--approvals` for those) takes it back for its directories, `init --hooks`
-or `pair --hooks` for every directory. The Codex and Cursor hooks are not installed by themselves (Codex asks you to trust a
-new hook): see below.
+or `pair --hooks` for every directory. `CLAW_APPROVAL_HOOKS=off` in the connector's environment keeps the approval hooks out
+too (on a start and on `hooks install`; `hooks install --approvals` still adds them).
+
+Connectors up to 0.3.3 kept no record of a no other than that answer. So the first start after the upgrade (or the first `hooks`
+command, whichever comes first) reads it from what is in place, once: in a Claude config directory that exists, a set with none
+of its hooks there was taken out and stays out (both sets where the session hooks are missing; the approval hooks alone where the
+session hooks are there and that question was already answered). Where the session hooks are in and the question was never
+asked, the approval hooks are added. A directory made after that, and `init` or `pair` run after the upgrade, get both sets.
+
+The Codex and Cursor hooks are not installed by themselves (Codex asks you to trust a new hook): see below.
 
 ### The same for Codex
 

@@ -32,11 +32,14 @@ const commandsOf = (dir: string): string[] => {
   const doc = JSON.parse(fs.readFileSync(settingsFile(dir), "utf8"));
   return Object.values<any>(doc.hooks ?? {}).flatMap((groups) => groups.flatMap((g: any) => g.hooks.map((h: any) => h.command as string)));
 };
-const ours = (dir: string) => commandsOf(dir).filter((c) => c.endsWith("--managed-by claw-connector"));
+const ours = (dir: string) => (fs.existsSync(settingsFile(dir)) ? commandsOf(dir) : []).filter((c) => c.endsWith("--managed-by claw-connector"));
 const MINE = { model: "opus", hooks: { Stop: [{ hooks: [{ type: "command", command: "mine.sh" }] }], PermissionRequest: [{ matcher: "Bash", hooks: [{ type: "command", command: "guard.sh" }] }] } };
 
-/** A home with agents.toml, a sign-in for the stand-in Claw, and a Claude config directory (made unless `noDir`). */
-function home(claw: FakeClaw, o: { noDir?: boolean } = {}) {
+/**
+ * A home with agents.toml, a sign-in for the stand-in Claw, and a Claude config directory (made unless `noDir`). Set up by this
+ * version (`init`/`pair` wrote claude-hooks.json), unless `upgrade`: then it is what 0.3.3 or earlier left.
+ */
+function home(claw: FakeClaw, o: { noDir?: boolean; upgrade?: boolean } = {}) {
   const h = tmpdir();
   const work = tmpdir("w-");
   const cfgDir = path.join(h, "config");
@@ -51,6 +54,7 @@ roots = [${JSON.stringify(work)}]
   fs.writeFileSync(path.join(cfgDir, "credentials.json"), JSON.stringify({ v: 1, server: claw.url, kind: "key", key: "good-token", saved_at: "" }), { mode: 0o600 });
   const dir = path.join(h, "claude-config");
   if (!o.noDir) fs.mkdirSync(dir, { recursive: true });
+  if (!o.upgrade) fs.writeFileSync(path.join(cfgDir, "claude-hooks.json"), JSON.stringify({ v: 1, all: {}, dirs: {} }));
   const bin = tmpdir("cc-hookbin-");
   const scripts = { hookScript: stand("terminal-hook.js", bin), approvalHookScript: stand("approval-hook.js", bin) };
   const mk = (extra: Partial<Ctx> = {}) => {
@@ -105,7 +109,7 @@ describe("the connector keeps the Claude Code hooks in place by itself", () => {
   test("a setup with the session hooks only gets the approval hooks; nothing else in the file changes, and it is backed up once", async () => {
     const claw = await FakeClaw.start();
     try {
-      const s = home(claw);
+      const s = home(claw, { upgrade: true });
       fs.writeFileSync(settingsFile(s.dir), JSON.stringify(MINE, null, 2));
       installHooks(s.dir, NODE, s.scripts.hookScript);
       // As an older connector left it: no backup of ours yet.
@@ -134,7 +138,7 @@ describe("the connector keeps the Claude Code hooks in place by itself", () => {
   test("entries that name a node or scripts that moved (an upgrade, another node) are rewritten to this program", async () => {
     const claw = await FakeClaw.start();
     try {
-      const s = home(claw);
+      const s = home(claw, { upgrade: true });
       const old = tmpdir("old-install-");
       const oldNode = stand("node", old);
       const oldHook = stand("terminal-hook.js", old);
@@ -216,10 +220,11 @@ describe("the connector keeps the Claude Code hooks in place by itself", () => {
   test("a no to the one-time question of older versions is kept; CLAW_APPROVAL_HOOKS=off adds no approval hooks; no directory and no Claude Code: nothing is made", async () => {
     const claw = await FakeClaw.start();
     try {
-      const s = home(claw);
+      const s = home(claw, { upgrade: true });
       const dirs = s.mk().c.dirs;
       fs.mkdirSync(dirs.state, { recursive: true });
       fs.writeFileSync(legacyOfferFile(dirs), JSON.stringify({ v: 1, answered: { [s.dir]: { answer: "no", at: "2026-11-01T00:00:00Z" } } }));
+      installHooks(s.dir, NODE, s.scripts.hookScript); // that question was asked where the session hooks were
       await start(claw, s.mk());
       assert.equal(hooksStatus(s.dir).installed, true);
       assert.equal(approvalHooksStatus(s.dir).events.length, 0);
@@ -243,11 +248,84 @@ describe("the connector keeps the Claude Code hooks in place by itself", () => {
   test("a settings file that cannot be merged into is left alone; the run still starts and says why in one line", async () => {
     const claw = await FakeClaw.start();
     try {
-      const s = home(claw);
+      const s = home(claw, { upgrade: true });
       fs.writeFileSync(settingsFile(s.dir), "{ not json");
       const said = await start(claw, s.mk());
       assert.match(said, /Claude Code hooks: .*not valid JSON/);
       assert.equal(fs.readFileSync(settingsFile(s.dir), "utf8"), "{ not json");
+    } finally { await claw.close(); }
+  });
+});
+
+describe("an upgrade from 0.3.3 or earlier, which recorded no no", () => {
+  test("hooks taken out there (hooks uninstall, --no-hooks, a \"n\" at init/pair) stay out; a yes to the old question taken back with uninstall --approvals stays out", async () => {
+    const claw = await FakeClaw.start();
+    try {
+      // `hooks uninstall`, `init --no-hooks` or a "n": an existing directory with none of ours, the person's own hooks kept.
+      const s = home(claw, { upgrade: true });
+      fs.writeFileSync(settingsFile(s.dir), JSON.stringify(MINE, null, 2));
+      const before = fs.readFileSync(settingsFile(s.dir), "utf8");
+      assert.doesNotMatch(await start(claw, s.mk()), /Claude Code hooks:/);
+      assert.equal(fs.readFileSync(settingsFile(s.dir), "utf8"), before, "settings.json untouched");
+      assert.deepEqual(JSON.parse(fs.readFileSync(hookPrefsFile(s.mk().c.dirs), "utf8")).dirs[s.dir], { session: "off", approvals: "off" });
+      await start(claw, s.mk());
+      assert.equal(ours(s.dir).length, 0, "nor on any later start");
+      // `hooks install` takes it back, as before.
+      assert.equal(await main(["hooks", "install"], s.mk().c), EXIT.ok);
+      assert.equal(hooksStatus(s.dir).installed, true);
+
+      // A directory with no settings.json at all is the same.
+      const bare = home(claw, { upgrade: true });
+      await start(claw, bare.mk());
+      assert.equal(fs.existsSync(settingsFile(bare.dir)), false);
+
+      // A yes to the old question, then `hooks uninstall --approvals`: the session hooks follow this install, the approval hooks stay out.
+      const y = home(claw, { upgrade: true });
+      const old = tmpdir("old-install-");
+      installHooks(y.dir, stand("node", old), stand("terminal-hook.js", old));
+      const dirs = y.mk().c.dirs;
+      fs.mkdirSync(dirs.state, { recursive: true });
+      fs.writeFileSync(legacyOfferFile(dirs), JSON.stringify({ v: 1, answered: { [y.dir]: { answer: "yes", at: "2026-11-01T00:00:00Z" } } }));
+      assert.match(await start(claw, y.mk()), /settings\.json: session hooks updated$/m);
+      assert.equal(hooksStatus(y.dir).healthy, true);
+      assert.equal(approvalHooksStatus(y.dir).events.length, 0, "the approval hooks stay out");
+    } finally { await claw.close(); }
+  });
+
+  test("only the first start carries over: a directory made later, and init or pair run now, get both sets; a hooks command for another directory carries over too", async () => {
+    const claw = await FakeClaw.start();
+    try {
+      const later = home(claw, { upgrade: true, noDir: true });
+      await start(claw, later.mk());
+      fs.mkdirSync(later.dir, { recursive: true });
+      assert.match(await start(claw, later.mk()), /session hooks added, approval hooks added/);
+
+      const re = home(claw, { upgrade: true });
+      assert.equal(await main(["init", "--no-probe"], re.mk().c), EXIT.ok);
+      assert.equal(hooksStatus(re.dir).installed, true, "init now adds them, as it says");
+      assert.equal(approvalHooksStatus(re.dir).installed, true);
+
+      const other = home(claw, { upgrade: true });
+      const elsewhere = tmpdir("other-claude-");
+      assert.equal(await main(["hooks", "install", "--config-dir", elsewhere], other.mk().c), EXIT.ok);
+      assert.equal(hooksStatus(elsewhere).installed, true);
+      await start(claw, other.mk());
+      assert.equal(ours(other.dir).length, 0, "the directory the connector serves keeps what it had");
+    } finally { await claw.close(); }
+  });
+
+  test("hooks install keeps the approval hooks out under CLAW_APPROVAL_HOOKS=off, as a start does; --approvals adds them", async () => {
+    const claw = await FakeClaw.start();
+    try {
+      const s = home(claw);
+      const env = { CLAUDE_CONFIG_DIR: s.dir, PATH: "/nonexistent", CLAW_APPROVAL_HOOKS: "off" };
+      const plain = s.mk({ env });
+      assert.equal(await main(["hooks", "install"], plain.c), EXIT.ok);
+      assert.match(plain.text(), /CLAW_APPROVAL_HOOKS=off/);
+      assert.equal(hooksStatus(s.dir).installed, true);
+      assert.equal(approvalHooksStatus(s.dir).events.length, 0);
+      assert.equal(await main(["hooks", "install", "--approvals"], s.mk({ env }).c), EXIT.ok);
+      assert.equal(approvalHooksStatus(s.dir).installed, true);
     } finally { await claw.close(); }
   });
 });
