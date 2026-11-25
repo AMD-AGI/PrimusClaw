@@ -50,6 +50,7 @@ type fakeRunner struct {
 	observed  string
 	failure   string
 	node      string
+	preferred string
 	adopted   []time.Duration
 	// onCancel runs when a held create is cancelled, before it returns.
 	onCancel func()
@@ -78,7 +79,7 @@ func (f *fakeRunner) Create(ctx context.Context, req CreateRequest) (CreateResul
 	if f.fail != nil {
 		return CreateResult{}, f.fail
 	}
-	return CreateResult{SandboxName: "pod-" + req.SandboxID, Namespace: req.Namespace, PodIP: "10.0.0.8", PodPort: 8080, NodeName: "node-a"}, nil
+	return CreateResult{SandboxName: "pod-" + req.SandboxID, Namespace: req.Namespace, PodIP: "10.0.0.8", PodPort: 8080, NodeName: "node-a", PreferredNodes: f.preferred}, nil
 }
 
 func (f *fakeRunner) Observe(_ context.Context, sandboxID string) (CreateResult, string, error) {
@@ -89,7 +90,7 @@ func (f *fakeRunner) Observe(_ context.Context, sandboxID string) (CreateResult,
 	if node == "" {
 		node = "node-a"
 	}
-	return CreateResult{SandboxName: "pod-" + sandboxID, Namespace: "ns", PodIP: "10.0.0.8", PodPort: 8080, NodeName: node, Failure: f.failure}, f.observed, nil
+	return CreateResult{SandboxName: "pod-" + sandboxID, Namespace: "ns", PodIP: "10.0.0.8", PodPort: 8080, NodeName: node, Failure: f.failure, PreferredNodes: f.preferred}, f.observed, nil
 }
 
 func (f *fakeRunner) Delete(_ context.Context, sandboxID string) error {
@@ -714,6 +715,78 @@ func TestSameNodeMarksOnlyAnAvoidedNode(t *testing.T) {
 				t.Fatalf("metadata=%v", ref.Metadata)
 			}
 		})
+	}
+}
+
+// preferred-node says whether the sandbox landed on a node its template
+// prefers, and is left out when the template prefers none.
+func TestPreferredNodeMarksTheLanding(t *testing.T) {
+	cases := []struct {
+		preferred string
+		want      string
+	}{
+		{},
+		{preferred: "node-b", want: "false"},
+		{preferred: "node-b node-a", want: "true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.preferred, func(t *testing.T) {
+			svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
+			runner.preferred = tc.preferred
+			got, status, err := svc.Create(context.Background(), keys["measurement"], CreateBody{TemplateID: "runner", Timeout: 60})
+			if err != nil || status != http.StatusCreated {
+				t.Fatalf("status=%d err=%v", status, err)
+			}
+			ref, err := svc.grants.Sandbox(context.Background(), "gr-01jb7m9k2x", "measurement", got.SandboxID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v, ok := ref.Metadata[preferredNodeMetadata]; v != tc.want || ok != (tc.want != "") {
+				t.Fatalf("metadata=%v", ref.Metadata)
+			}
+		})
+	}
+}
+
+// A sandbox adopted from a running Workload is marked from the preferred
+// nodes recorded on the Workload, like one created in this process.
+func TestReplayMarksAPreferredNode(t *testing.T) {
+	svc, runner, keys := testPlane(t, 600, []int32{1}, 1)
+	runner.started = make(chan struct{})
+	runner.hold = make(chan struct{})
+	body := CreateBody{TemplateID: "runner", Timeout: 60, Metadata: map[string]string{idempotencyMetadataKey: "once"}}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := svc.Create(context.Background(), keys["measurement"], body)
+		done <- err
+	}()
+	awaitStarted(t, runner.started, done)
+	runner.observed = WorkloadRunning
+	runner.node = "node-b"
+	runner.preferred = "node-b"
+	got, status, err := svc.Create(context.Background(), keys["measurement"], body)
+	if err != nil || status != http.StatusCreated {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	detail, err := svc.Get(context.Background(), keys["measurement"], got.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Metadata[preferredNodeMetadata] != "true" || detail.Metadata[nodeNameMetadata] != "node-b" {
+		t.Fatalf("metadata=%v", detail.Metadata)
+	}
+	close(runner.hold)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A caller may not set preferred-node itself.
+func TestPreferredNodeMetadataIsReserved(t *testing.T) {
+	for _, key := range []string{preferredNodeMetadata, "preferred-node"} {
+		if err := checkMetadata(map[string]string{key: "true"}); err == nil {
+			t.Fatalf("%s accepted", key)
+		}
 	}
 }
 
