@@ -563,12 +563,15 @@ describe("M the merge gates", () => {
   test("M3c a cancelled check run superseded by a later run of the same check on the head is not a failure: the gate and gh_pr_get read the latest run only", async () => {
     const superseded = () => {
       e.gh.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "code-metrics" }, { context: "pr-hygiene" }] } }];
+      // Two workflow runs of one workflow on the head, the first one's jobs cancelled by the second.
+      const app = { id: 15368, slug: "github-actions" };
       e.gh.checkRuns = [
-        { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "cancelled", app: { id: 15368, slug: "github-actions" } },
-        { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app: { id: 15368, slug: "github-actions" } },
-        { id: 45538768282, name: "code-metrics", status: "completed", conclusion: "success", app: { id: 15368, slug: "github-actions" } },
-        { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app: { id: 15368, slug: "github-actions" } },
+        { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "cancelled", app, check_suite: { id: 501 } },
+        { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app, check_suite: { id: 501 } },
+        { id: 45538768282, name: "code-metrics", status: "completed", conclusion: "success", app, check_suite: { id: 502 } },
+        { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app, check_suite: { id: 502 } },
       ];
+      e.gh.workflowRuns = [{ id: 9001, workflow_id: 77, check_suite_id: 501 }, { id: 9002, workflow_id: 77, check_suite_id: 502 }];
     };
     e = await reviewEnv(); allowed();
     superseded();
@@ -598,7 +601,8 @@ describe("M the merge gates", () => {
     e = await reviewEnv({}, { approved: true }); allowed();
     e.gh.graphql.mergeStateStatus = "CLEAN";
     superseded();
-    e.gh.checkRuns.push({ id: 45538799999, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app: { id: 15368, slug: "github-actions" } });
+    e.gh.checkRuns.push({ id: 45538799999, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app: { id: 15368, slug: "github-actions" }, check_suite: { id: 503 } });
+    e.gh.workflowRuns.push({ id: 9003, workflow_id: 77, check_suite_id: 503 });
     assert.equal(reason(await merge()), "ci_not_green");
     assert.equal(puts().length, 0);
 
@@ -609,6 +613,19 @@ describe("M the merge gates", () => {
     e.gh.checkRuns[0] = { ...e.gh.checkRuns[0], conclusion: "failure" };
     assert.equal(reason(await merge()), "ci_not_green");
     assert.equal(puts().length, 0);
+
+    // A cancelled run is not superseded by another workflow's job of the same name, nor when the workflow runs cannot be read.
+    for (const arrange of [
+      () => { e.gh.workflowRuns[1] = { ...e.gh.workflowRuns[1]!, workflow_id: 78 }; },
+      () => { e.gh.workflowRuns = []; },
+    ]) {
+      e = await reviewEnv({}, { approved: true }); allowed();
+      e.gh.graphql.mergeStateStatus = "CLEAN";
+      superseded();
+      arrange();
+      assert.equal(reason(await merge()), "ci_not_green");
+      assert.equal(puts().length, 0);
+    }
   });
 
   test("M3b a failed check the base branch does not require is advisory: GitHub's UNSTABLE for it merges, as GitHub would (Primus-SaFE#873, codecov/patch)", async () => {

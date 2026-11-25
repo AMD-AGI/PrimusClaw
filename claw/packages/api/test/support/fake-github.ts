@@ -47,7 +47,9 @@ export class FakeGithub {
   files: FakeFile[] = [
     { filename: "src/app.ts", status: "modified", additions: 3, deletions: 1, patch: "@@ -1,4 +1,6 @@\n a\n-b\n+b2\n+c\n+d\n e\n f" },
   ];
-  checkRuns: Array<{ name: string; status: string; conclusion: string | null; id?: number; app?: { id?: number; slug?: string } }> = [{ name: "test", status: "completed", conclusion: "success" }];
+  checkRuns: Array<{ name: string; status: string; conclusion: string | null; id?: number; app?: { id?: number; slug?: string }; check_suite?: { id: number } }> = [{ name: "test", status: "completed", conclusion: "success" }];
+  /** `GET /actions/runs?head_sha=`: the workflow runs on a commit, each naming its check suite and its workflow. */
+  workflowRuns: Array<{ id: number; workflow_id: number; check_suite_id: number; head_sha?: string }> = [];
   statuses: Array<{ context: string; state: string }> = [];
   rules: unknown = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "test" }] } }];
   rulesStatus = 200;
@@ -169,6 +171,10 @@ export class FakeGithub {
       const per = Number(call.query.per_page ?? 30);
       const page = Number(call.query.page ?? 1);
       return json(200, { total_count: this.checkRuns.length, check_runs: this.checkRuns.slice((page - 1) * per, page * per) });
+    }
+    if (/^\/repos\/[^/]+\/[^/]+\/actions\/runs$/.test(p)) {
+      const runs = this.workflowRuns.filter((w) => w.head_sha === undefined || w.head_sha === call.query.head_sha);
+      return json(200, { total_count: runs.length, workflow_runs: runs });
     }
     if (/\/commits\/[0-9a-f]{40}\/status$/.test(p)) return json(200, { total_count: this.statuses.length, state: "success", statuses: this.statuses });
     if (/^\/repos\/[^/]+\/[^/]+\/branches\/[^/]+$/.test(p)) return this.branchStatus === 200 ? json(200, this.branch) : json(this.branchStatus, { message: "nope" });

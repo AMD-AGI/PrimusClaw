@@ -779,12 +779,19 @@ describe("B checks and the writes added for them", () => {
     respond = (url) => {
       if (url.pathname === "/repos/o/r/commits/abc/check-runs") {
         return json({ check_runs: [
-          { id: 45538768282, name: "code-metrics", status: "completed", conclusion: "success", app },
-          { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app },
-          { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "cancelled", app },
-          { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app },
-          { id: 45538700001, name: "build", status: "completed", conclusion: "failure", app },
-          { id: 45538700002, name: "build", status: "completed", conclusion: "success", app },
+          { id: 45538768282, name: "code-metrics", status: "completed", conclusion: "success", app, check_suite: { id: 502 }, head_sha: "abc" },
+          { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app, check_suite: { id: 502 } },
+          { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "cancelled", app, check_suite: { id: 501 } },
+          { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app, check_suite: { id: 501 } },
+          { id: 45538700001, name: "build", status: "completed", conclusion: "failure", app, check_suite: { id: 501 } },
+          { id: 45538700002, name: "build", status: "completed", conclusion: "success", app, check_suite: { id: 502 } },
+          { id: 45538700003, name: "lint", status: "completed", conclusion: "cancelled", app, check_suite: { id: 501 } },
+          { id: 45538700004, name: "lint", status: "completed", conclusion: "success", app, check_suite: { id: 503 } },
+        ] });
+      }
+      if (url.pathname === "/repos/o/r/actions/runs" && url.searchParams.get("head_sha") === "abc") {
+        return json({ total_count: 3, workflow_runs: [
+          { id: 1, workflow_id: 7, check_suite_id: 501 }, { id: 2, workflow_id: 7, check_suite_id: 502 }, { id: 3, workflow_id: 8, check_suite_id: 503 },
         ] });
       }
       if (url.pathname === "/repos/o/r/commits/abc/status") return json({ state: "success", statuses: [] });
@@ -796,6 +803,8 @@ describe("B checks and the writes added for them", () => {
       [45538768282, "success", false], [45538768384, "success", false], [45538748410, "cancelled", true], [45538748336, "cancelled", true],
       // A failed run is never marked: a later run of the same name may be another workflow's job.
       [45538700001, "failure", false], [45538700002, "success", false],
+      // Another workflow's job of the same name does not supersede a cancelled run.
+      [45538700003, "cancelled", false], [45538700004, "success", false],
     ]);
   });
 

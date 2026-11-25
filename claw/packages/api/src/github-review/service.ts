@@ -23,7 +23,7 @@
 import { createHash } from "node:crypto";
 import pino from "pino";
 import { IdentityCredentialRefusedError, IdentityUnavailableError, type ResolveCredentialRequest, type ResolvedCredential } from "@claw/utils";
-import { appOfRun, evaluateChecks, hasMergeQueueRule, requiredContextsFromBranch, requiredContextsFromRules, type ChecksVerdict } from "./checks.js";
+import { appOfRun, evaluateChecks, hasMergeQueueRule, requiredContextsFromBranch, requiredContextsFromRules, type ChecksVerdict, suiteOfRun, withWorkflows } from "./checks.js";
 import { checkCoverage, coverageFiles, coverageText, type CoverageCheck } from "./coverage.js";
 import { commentableLines } from "./diff.js";
 import { bodyWithNotes, runFindingCheck, type Finding, type FindingCheckOutcome } from "./finding-check.js";
@@ -1721,10 +1721,11 @@ export class GithubReview {
       repoPath(ref, `/commits/${sha}/status`), { per_page: 100 },
     );
     const required = requiredContextsFromRules(await this.baseRules(ctx, ref, pr));
-    const checkRuns = listed.map((c) => ({
+    // The workflow of each run, read only when a cancelled run may have been superseded (latestCheckRuns needs it to tell the same check).
+    const checkRuns = await withWorkflows(listed.map((c) => ({
       name: String(c.name ?? ""), status: String(c.status ?? ""), conclusion: c.conclusion ?? null,
-      id: typeof c.id === "number" ? c.id : null, app: appOfRun(c),
-    }));
+      id: typeof c.id === "number" ? c.id : null, app: appOfRun(c), suite: suiteOfRun(c),
+    })), async (page) => (await ctx.client.get<unknown>(repoPath(ref, "/actions/runs"), { head_sha: sha, per_page: 100, page })).json);
     const statuses = (status.json?.statuses ?? []).map((s) => ({ context: String(s.context ?? ""), state: String(s.state ?? "") }));
     const input = {
       checkRuns, statuses, required,

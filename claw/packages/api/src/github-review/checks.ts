@@ -15,8 +15,19 @@ export interface CheckRunInput {
   conclusion: string | null;
   /** GitHub's id of the run: a later run of the same check has a larger one. */
   id?: number | null;
-  /** The app that reported the run (its id or slug), which with the name says which check it is. */
+  /** The app that reported the run (its id or slug). */
   app?: string | null;
+  /**
+   * The GitHub Actions workflow the run belongs to (its workflow id, through the run's check suite; `withWorkflows`): with the name and the
+   * app, what says a later run is the same check of the same workflow. Unknown, the run supersedes nothing and nothing supersedes it.
+   */
+  workflow?: string | null;
+}
+
+/** The check suite of a check run as GitHub answers it (`check_suite.id`), which `withWorkflows` maps to its workflow. */
+export function suiteOfRun(run: unknown): number | null {
+  const id = (run as { check_suite?: { id?: unknown } | null } | null)?.check_suite?.id;
+  return typeof id === "number" && Number.isFinite(id) ? id : null;
 }
 
 /** The app of a check run as GitHub answers it (`app.id`, else `app.slug`), for `latestCheckRuns`. */
@@ -32,27 +43,77 @@ export function appOfRun(run: unknown): string | null {
  * run; that CANCELLED run is not a failure of the head (2026-11-25: code-metrics and pr-hygiene, each one CANCELLED run and a later
  * SUCCESS one, were called failing).
  *
- * Only a CANCELLED run is ever superseded, and only by a later run (a larger id) of the same name and the same app that was not skipped.
- * A name and an app do not say which workflow a run belongs to (every GitHub Actions job reports as one app, two workflows may each have
- * a job `build`, and a fork's pull request may add a workflow of its own), so a failed, timed-out or otherwise finished run is never
- * hidden by a later one of the same name: the worse one stands, as before. A run skipped by its `if:` (a later `labeled` or `edited`
- * event) did not run the job, so it supersedes nothing. A cancelled LATEST run is still not green, and a run without an id or an app is
- * kept as it is.
+ * Only a CANCELLED run is ever superseded, and only by a later run (a larger id) of the same name, the same app and the same workflow that
+ * was not skipped. The name and the app alone do not say which workflow a run belongs to (every GitHub Actions job reports as one app, two
+ * workflows may each have a job `build`, and a fork's pull request may add a workflow of its own), so a run whose workflow is unknown is
+ * never superseded, and a failed, timed-out or otherwise finished run never is: the worse one stands, as before. A run skipped by its
+ * `if:` (a later `labeled` or `edited` event) did not run the job, so it supersedes nothing. A cancelled LATEST run is still not green.
  */
 export function latestCheckRuns<T extends CheckRunInput>(runs: readonly T[]): T[] {
-  const known = (run: T): boolean => typeof run.id === "number" && Number.isFinite(run.id) && typeof run.app === "string" && run.app !== "";
-  const keyOf = (run: T): string => JSON.stringify([run.name, run.app]);
-  const newestRan = new Map<string, number>();
-  for (const run of runs) {
-    if (!known(run) || run.conclusion === "skipped") continue;
-    const key = keyOf(run);
-    const prior = newestRan.get(key);
-    if (prior === undefined || (run.id as number) > prior) newestRan.set(key, run.id as number);
-  }
+  const newest = newestRanByCheck(runs);
   return runs.filter((run) => {
-    if (!known(run) || run.conclusion !== "cancelled") return true;
-    const newest = newestRan.get(keyOf(run));
-    return newest === undefined || newest <= (run.id as number);
+    if (!lineageKnown(run) || run.conclusion !== "cancelled") return true;
+    const later = newest.get(checkKey(run));
+    return later === undefined || later <= (run.id as number);
+  });
+}
+
+function lineageKnown(run: CheckRunInput): boolean {
+  return typeof run.id === "number" && Number.isFinite(run.id) && typeof run.app === "string" && run.app !== "" && typeof run.workflow === "string" && run.workflow !== "";
+}
+
+function checkKey(run: CheckRunInput): string {
+  return JSON.stringify([run.name, run.app ?? "", run.workflow ?? ""]);
+}
+
+/** The largest id of a run that was not skipped, for each check (its name, app and workflow). */
+function newestRanByCheck(runs: readonly CheckRunInput[]): Map<string, number> {
+  const newest = new Map<string, number>();
+  for (const run of runs) {
+    if (!lineageKnown(run) || run.conclusion === "skipped") continue;
+    const key = checkKey(run);
+    const prior = newest.get(key);
+    if (prior === undefined || (run.id as number) > prior) newest.set(key, run.id as number);
+  }
+  return newest;
+}
+
+/** The most pages of workflow runs `withWorkflows` reads, 100 each. */
+const MAX_WORKFLOW_RUN_PAGES = 5;
+
+/**
+ * The runs with the workflow each belongs to, for `latestCheckRuns`. Read only when the name and the app alone would let a later run
+ * supersede a cancelled one, so a head with no cancelled run costs no request: `readPage` answers a page (1-based, 100 each) of
+ * `GET /repos/{o}/{r}/actions/runs?head_sha=...`, whose workflow runs name their check suite and their workflow. A run whose check suite
+ * no workflow run names, or a read that failed, leaves the workflow unknown, and the run is then never superseded; a rate-limited read
+ * (`rateLimited` on the error) is thrown.
+ */
+export async function withWorkflows<T extends CheckRunInput & { suite?: number | null }>(
+  runs: readonly T[], readPage: (page: number) => Promise<unknown>,
+): Promise<T[]> {
+  const candidate = runs.some((run) => run.conclusion === "cancelled" && typeof run.id === "number" && typeof run.app === "string" && run.app !== ""
+    && runs.some((later) => later !== run && later.name === run.name && later.app === run.app && later.conclusion !== "skipped"
+      && typeof later.id === "number" && later.id > (run.id as number)));
+  if (!candidate) return [...runs];
+  const workflowOfSuite = new Map<number, string>();
+  try {
+    let read = 0;
+    for (let page = 1; page <= MAX_WORKFLOW_RUN_PAGES; page++) {
+      const got = (await readPage(page)) as { total_count?: unknown; workflow_runs?: unknown } | null;
+      const list = Array.isArray(got?.workflow_runs) ? got.workflow_runs : [];
+      for (const w of list as Array<{ check_suite_id?: unknown; workflow_id?: unknown } | null>) {
+        if (typeof w?.check_suite_id === "number" && typeof w.workflow_id === "number") workflowOfSuite.set(w.check_suite_id, String(w.workflow_id));
+      }
+      read += list.length;
+      if (list.length < 100 || read >= Number(got?.total_count ?? 0)) break;
+    }
+  } catch (err) {
+    if ((err as { rateLimited?: unknown } | null)?.rateLimited === true) throw err;
+    return [...runs];
+  }
+  return runs.map((run) => {
+    const workflow = typeof run.suite === "number" ? workflowOfSuite.get(run.suite) : undefined;
+    return workflow === undefined ? run : { ...run, workflow };
   });
 }
 
