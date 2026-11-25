@@ -1347,6 +1347,8 @@ export interface ErrandParams extends RemoteParams {
   /** In a new session in the seat's folder, even when its conversation is open in a terminal. */
   new_session?: true;
   dispatched_at?: string;
+  /** When `work_send` (or a card pressed) last opened it again: a reopening not yet sent is under way for a while after (`reopenErrand`). */
+  reopened_at?: string;
   /** The latest step of the agent's plan (untrusted, one line, cut), and how far along the plan is. */
   progress?: { current: string; done: number; total: number; at: string };
   progress_told_at?: string;
