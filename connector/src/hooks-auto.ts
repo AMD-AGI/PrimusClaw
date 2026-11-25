@@ -58,17 +58,20 @@ function writePrefs(d: Dirs, p: Prefs): void {
   fs.renameSync(tmp, file);
 }
 
-function legacyNo(d: Dirs, dir: string): boolean {
+/** The directories 0.1.23 to 0.3.3 were told no for, in their one-time question about the approval hooks. */
+function legacyNoDirs(d: Dirs): string[] {
   try {
     const doc: unknown = JSON.parse(fs.readFileSync(legacyOfferFile(d), "utf8"));
-    const a = isObj(doc) && isObj(doc.answered) ? doc.answered[dir] : undefined;
-    return isObj(a) && a.answer === "no";
-  } catch { return false; }
+    if (!isObj(doc) || !isObj(doc.answered)) return [];
+    return Object.entries(doc.answered).filter(([, a]) => isObj(a) && a.answer === "no").map(([dir]) => dir);
+  } catch { return []; }
 }
 
 /**
- * Once, when there is no claude-hooks.json yet: write it, so the choices of a person who used 0.3.3 or earlier are kept. With
- * `fresh` (`init` and `pair`, which add both sets now) nothing is carried over. Otherwise, in each of `dirs` that exists, a set
+ * Once, when there is no claude-hooks.json yet: write it, so the choices of a person who used 0.3.3 or earlier are kept.
+ * A no to the one-time question 0.1.23 to 0.3.3 asked is carried over as "off" for its directory, so `--hooks` and
+ * `hooks install --approvals` take it back like any other no. With `fresh` (`init` and `pair`, which add both sets now) nothing
+ * else is carried over. Otherwise, in each of `dirs` that exists, a set
  * with none of its hooks there was taken out or never agreed to (`hooks uninstall`, `--no-hooks`, `--no-approval-hooks`, a "n"
  * at init/pair or to the one-time question): "off" for that directory, so it stays out until `hooks install` or `--hooks`.
  * `present` says whether any hook of that set is in that directory's settings, or null when they cannot be read (then nothing is
@@ -78,10 +81,11 @@ export function migrateHookPrefs(d: Dirs, dirs: string[], present: (dir: string,
   try {
     if (fs.existsSync(hookPrefsFile(d))) return;
     const p: Prefs = { v: 1, all: {}, dirs: {} };
+    for (const dir of legacyNoDirs(d)) p.dirs[dir] = { approvals: "off" };
     if (!fresh) {
       for (const dir of dirs) {
         if (!fs.existsSync(dir)) continue;
-        const c: Choice = {};
+        const c: Choice = { ...p.dirs[dir] };
         for (const set of ["session", "approvals"] as const) if (present(dir, set) === false) c[set] = "off";
         if (Object.keys(c).length) p.dirs[dir] = c;
       }
@@ -96,8 +100,7 @@ export function wantedHooks(d: Dirs, dir: string): Record<HookSet, boolean> {
   const p = readPrefs(d);
   const own = p.dirs[dir] ?? {};
   const session = (own.session ?? p.all.session ?? "on") === "on";
-  const approvalsChoice = own.approvals ?? p.all.approvals ?? (legacyNo(d, dir) ? "off" : "on");
-  return { session, approvals: approvalsChoice === "on" };
+  return { session, approvals: (own.approvals ?? p.all.approvals ?? "on") === "on" };
 }
 
 /**

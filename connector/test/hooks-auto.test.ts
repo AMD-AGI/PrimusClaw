@@ -229,6 +229,17 @@ describe("the connector keeps the Claude Code hooks in place by itself", () => {
       assert.equal(hooksStatus(s.dir).installed, true);
       assert.equal(approvalHooksStatus(s.dir).events.length, 0);
 
+      // `init` after the upgrade keeps that no; `init --hooks` takes it back.
+      const i = home(claw, { upgrade: true });
+      const idirs = i.mk().c.dirs;
+      fs.mkdirSync(idirs.state, { recursive: true });
+      fs.writeFileSync(legacyOfferFile(idirs), JSON.stringify({ v: 1, answered: { [i.dir]: { answer: "no", at: "2026-11-01T00:00:00Z" } } }));
+      assert.equal(await main(["init", "--no-probe"], i.mk().c), EXIT.ok);
+      assert.equal(hooksStatus(i.dir).installed, true);
+      assert.equal(approvalHooksStatus(i.dir).events.length, 0);
+      assert.equal(await main(["init", "--hooks", "--no-probe"], i.mk().c), EXIT.ok);
+      assert.equal(approvalHooksStatus(i.dir).installed, true, "--hooks takes the old no back");
+
       const e = home(claw);
       await start(claw, e.mk({ env: { CLAUDE_CONFIG_DIR: e.dir, PATH: "/nonexistent", CLAW_APPROVAL_HOOKS: "off" } }));
       assert.equal(hooksStatus(e.dir).installed, true);
