@@ -46,8 +46,8 @@ export class TerminalApprovalsCommand implements CommandHandler {
     const arg = args.trim().toLowerCase();
     const one = /^(mute|unmute)\s+#?(\d{1,9})$/.exec(arg);
     if (one) return this.mute(route, one[1] === "mute", Number(one[2]));
-    const summary = /^summary(?:\s+(.*))?$/.exec(arg);
-    if (summary) return this.summary(route, (summary[1] ?? "").trim());
+    const [word, ...rest] = arg.split(/\s+/u);
+    if (word === "summary") return this.summary(route, rest.join(" "));
     if (arg !== "" && arg !== "on" && arg !== "off") {
       await say(words.approvalsUsage);
       return true;

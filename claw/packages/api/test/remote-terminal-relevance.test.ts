@@ -69,7 +69,6 @@ describe("which terminal ends are pushed, and the summary", { skip }, () => {
   }
   const post = (user: string, path: string, body: unknown) => call(user, "POST", path, body);
   const CLAUDE = { agent_id: "claude", kind: "claude", name: "Claude Code", capabilities: { roots: ["/home/u"] } };
-  const CODEX = { agent_id: "codex", kind: "codex", name: "Codex", capabilities: { roots: ["/home/u"] } };
   async function machine(owner: string, name: string, agents: Recorded[] = [CLAUDE]): Promise<string> {
     const row = await store.registerConnector(owner, name, "0.1.23", null, 10);
     assert.ok(row);
@@ -91,19 +90,12 @@ describe("which terminal ends are pushed, and the summary", { skip }, () => {
     assert.deepEqual(r.body.data.rejected, []);
   }
   const started: [string, Recorded] = ["session_started", { origin: "terminal_hook", ref: "conv-1", title: "修 CI", agent: "claude", cwd: "/home/u/work/claw" }];
-  const OPTIONS = [
-    { optionId: "o0", name: "Red", kind: "allow_once" }, { optionId: "o1", name: "Blue", kind: "allow_once" },
-  ];
-  const ask = (actionId: string, tool = "Which color?"): [string, Recorded] =>
-    ["permissionRequest", { actionId, tool, kind: "question", input: null, toolCallId: null, options: OPTIONS, timeout_ms: 3_600_000, origin: "terminal_hook", cwd: "/home/u/work/claw" }];
   const remoteItem = async (sid: string) => (await w.q("SELECT * FROM claw_work_items WHERE worker_session_id = $1", [`remote:${sid}`]))[0];
   /** What was pushed of the session of `itemId` (filed under the item or not), oldest first. */
   const pushed = async (itemId: string) => (await w.q(
     `SELECT o.payload FROM claw_notification_outbox o
       WHERE o.payload->'remote'->>'session_id' = (SELECT params->>'session_id' FROM claw_work_items WHERE item_id = $1) ORDER BY o.id`, [itemId],
   )).map((r: Recorded) => r.payload as Recorded);
-  /** How many messages are filed under the item (the one per wait that told the user of it). */
-  const filed = async (itemId: string) => (await w.q("SELECT COUNT(*)::int AS n FROM claw_assistant_says WHERE item_id = $1", [itemId]))[0].n;
 
   const end = (extra: Recorded = {}): [string, Recorded] => ["terminal_turn_end", {
     ref: "conv-1", outcome: "done", message: "probe done.", agent: "claude", cwd: "/home/u/work/claw",
