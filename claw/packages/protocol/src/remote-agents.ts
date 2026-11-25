@@ -158,7 +158,7 @@ export const PERMISSION_PARK_MAX_MS = 24 * 3600_000;
  * terminal pushes off or muted that conversation. From connector 0.3.4 it also says who started the turn, as Claude Code's transcript
  * records it (`origin`: "person" or "automation"; absent when that is not known), and an end that stands for a run of turns nobody
  * typed carries `turns` (how many), `earlier` (the earlier ones' last words, oldest first, at most five), `since` (ISO time of the
- * first) and `failed_earlier` (how many of the earlier ones failed, when any did). Claw pushes at once only a person's turn, one that asks the person something, or one that failed; it sums up the others.
+ * first), `failed_earlier` and `asked_earlier` (how many of the earlier ones failed, or asked the person something, when any did). Claw pushes at once only a person's turn, one that asks the person something, or one that failed; it sums up the others.
  */
 export const REMOTE_EVENT_TERMINAL_TURN_END = "terminal_turn_end";
 /**
@@ -587,6 +587,33 @@ export function parseTerminalSessionOpen(body: unknown): Parsed<RemoteTerminalSe
 export function parseApprovalsSetting(body: unknown): Parsed<{ enabled: boolean }> {
   if (!isObject(body) || typeof body.enabled !== "boolean") return fail("enabled_required");
   return { ok: true, value: { enabled: body.enabled } };
+}
+
+/** How much of the end of the last paragraph is read for a question: its last few sentences. */
+const ASK_TAIL = 300;
+/** Words that say the agent waits for the person: a choice, an approval, a confirmation, a decision. */
+const ASK_WORDS: readonly RegExp[] = [
+  /(?:要不要|是否需要|是否要|是否继续|可以吗|行吗|好吗|同意吗|你看呢|选哪个|选哪一个|哪个方案)/u,
+  /(?:请|麻烦)(?:你|您)?(?:确认|决定|拍板|选择|批准|审批|回复|告诉我)/u,
+  /(?:等你|等您|需要你|需要您)(?:的)?(?:确认|决定|拍板|选择|批准|回复|答复|同意|授权)/u,
+  /(?:你来|您来)(?:定|决定|选)/u,
+  /\b(?:should I|shall I|do you want(?: me)? to|would you like(?: me)? to|want me to|let me know (?:if|whether|which|how)|please (?:confirm|approve|decide|choose|advise)|(?:waiting|wait) (?:for|on) your|need your (?:input|decision|approval|confirmation|go-ahead)|your call|which (?:option|one) (?:do you|would you|should))\b/iu,
+];
+
+/**
+ * Whether what the agent last said asks the person something or waits for their decision: its last paragraph ends in a question, or
+ * says in so many words that it waits for them (a choice, an approval, a confirmation), in Chinese or English. Deterministic and narrow
+ * on purpose: only the end of the answer is read (where an answer that needs the person says so); a question quoted earlier in a report
+ * does not count. Shared: the connector counts the questions of the ends it folds into one, and Claw decides what to push with it.
+ */
+export function turnAsksPerson(message: string): boolean {
+  const text = message.replace(/\r\n?/gu, "\n").trim();
+  if (!text) return false;
+  const blocks = text.split(/\n\s*\n/u).map((b) => b.trim()).filter(Boolean);
+  const last = (blocks[blocks.length - 1] ?? "").replace(/[`*_~>#]+/gu, "").trim();
+  const tail = Array.from(last).slice(-ASK_TAIL).join("");
+  if (/[?？][\s)）」』"'”’\]】]*[\p{Extended_Pictographic}\s]*$/u.test(tail)) return true;
+  return ASK_WORDS.some((re) => re.test(tail));
 }
 
 /**

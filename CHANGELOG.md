@@ -306,7 +306,7 @@ release version, and its `appVersion` stays `latest`.
   it failed. The connector reads who started the turn from Claude Code's transcript (`origin.kind`, `promptSource`) and sends it
   as `origin` on `terminal_turn_end`; ends of turns nobody typed (another session's message, a schedule, a hook) that follow one
   another before the terminal has been quiet a minute are sent as one, the newest, with `turns`, `earlier` and `since` (at the
-  latest fifteen minutes after the first; `failed_earlier` counts failures among them, and such a run is pushed), and a new
+  latest fifteen minutes after the first; `failed_earlier` and `asked_earlier` count failures and questions among them, and such a run is pushed), and a new
   prompt holds an end not yet told until its own turn ends. Claw gathers the ends it does not push (the earlier turns of a run
   it does push, and the ends the five-minute gap holds back, too) on the conversation's item and says, at most once per
   conversation every hour, what it did since: how many turns, how many failed, the latest result in whole sentences, and

@@ -40,7 +40,7 @@ import {
 } from "./cursor-approvals.js";
 import { lastInputMs as ttyLastInputMs } from "./codex-terminal.js";
 import { boundedInput, type OfferedOption } from "./permissions.js";
-import { REMOTE_EVENT_TERMINAL_TURN_END } from "./protocol.js";
+import { REMOTE_EVENT_TERMINAL_TURN_END, turnAsksPerson } from "./protocol.js";
 import { redactDeep } from "./redact.js";
 import { turnOrigin, type TurnOrigin } from "./turn-origin.js";
 
@@ -406,6 +406,8 @@ interface Ending {
   earlier: string[];
   /** How many of the earlier turns folded into it failed: a failure is never hidden behind a later turn that finished. */
   failedEarlier: number;
+  /** How many of the earlier turns folded into it asked the person something, counted whether or not their words are kept. */
+  askedEarlier: number;
   /** When the first of the folded ends came. */
   since: number;
   timer: NodeJS.Timeout;
@@ -663,6 +665,7 @@ export class ApprovalBroker {
       ref, agent, configDir: from.configDir, cwd, tty, at, outcome: failed ? "error" : "done", error,
       message: cutEnd(said, TURN_END_MESSAGE_MAX), origin: runOrigin, turns: fold ? prev.turns + 1 : 1, earlier, since,
       failedEarlier: fold ? prev.failedEarlier + (prev.outcome === "error" ? 1 : 0) : 0,
+      askedEarlier: fold ? prev.askedEarlier + (prev.outcome !== "error" && turnAsksPerson(prev.message) ? 1 : 0) : 0,
       timer: setTimeout(() => { void this.tellEnding(e); }, wait),
     };
     e.timer.unref?.();
@@ -735,6 +738,7 @@ export class ApprovalBroker {
       ...(e.origin ? { origin: e.origin } : {}),
       ...(e.turns > 1 ? { turns: e.turns, earlier: e.earlier, since: new Date(e.since).toISOString() } : {}),
       ...(e.failedEarlier > 0 ? { failed_earlier: e.failedEarlier } : {}),
+      ...(e.askedEarlier > 0 ? { asked_earlier: e.askedEarlier } : {}),
     });
     this.d.audit("turn_end_sent", { session_id: opened.sessionId, ref: e.ref, agent: e.agent, outcome: e.outcome });
   }

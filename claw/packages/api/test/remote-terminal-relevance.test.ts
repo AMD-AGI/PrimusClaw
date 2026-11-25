@@ -272,5 +272,10 @@ describe("which terminal ends are pushed, and the summary", { skip }, () => {
     const third = await remoteItem(carol.sid);
     assert.equal((await pushed(third.item_id)).length, 1);
     assert.deepEqual([third.params.digest.turns, third.params.digest.asks], [1, 1]);
+
+    // the connector counted a question whose words it no longer carries
+    const dave = await convo("dave");
+    await events("dave", dave.cid, dave.sid, [auto("第七份报告。", { turns: 7, earlier: ["2", "3", "4", "5", "6"], asked_earlier: 1, since: "2026-11-25T01:00:00Z" })]);
+    assert.equal((await pushed((await remoteItem(dave.sid)).item_id)).length, 1);
   });
 });

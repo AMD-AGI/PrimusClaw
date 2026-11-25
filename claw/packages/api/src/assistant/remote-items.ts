@@ -1323,7 +1323,8 @@ async function applyTerminal(
         : [];
       const earlier = earlierSaid.map((x) => terminalEndSummary(x).summary);
       // A question in any turn of a folded run counts: the run is pushed, and the summary says something asked the person.
-      const earlierAsks = earlierSaid.some((x) => asksPerson(x));
+      // (`asked_earlier`: the connector's count over every folded turn, also those whose words it no longer carries)
+      const earlierAsks = earlierSaid.some((x) => asksPerson(x)) || (Number.isSafeInteger(e.data.asked_earlier) && Number(e.data.asked_earlier) > 0);
       const asks = (!failed && asksPerson(message)) || earlierAsks;
       const failedEarlier = Number.isSafeInteger(e.data.failed_earlier) && Number(e.data.failed_earlier) > 0
         ? Math.min(Number(e.data.failed_earlier), turns - 1) : 0;

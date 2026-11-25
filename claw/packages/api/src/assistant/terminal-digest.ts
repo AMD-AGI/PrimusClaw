@@ -18,7 +18,7 @@
  * conversation, and the owner's chat holds a summary through quiet hours or a pause as it holds every push.
  */
 import pino from "pino";
-import { TERMINAL_SUMMARY } from "@claw/protocol";
+import { TERMINAL_SUMMARY, turnAsksPerson } from "@claw/protocol";
 import { CLAW_ASSISTANT_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { approvalsEnabled, terminalMuted, terminalSummaryMinutes } from "../remote-agents/store.js";
@@ -28,32 +28,8 @@ import { cwdTail, terminalAttachCommand, terminalEndName, terminalToolOf, type R
 
 const logger = pino({ name: "assistant-terminal-digest" });
 
-/** How much of the end of the last paragraph is read for a question: its last few sentences. */
-const ASK_TAIL = 300;
-/** Words that say the agent waits for the person: a choice, an approval, a confirmation, a decision. */
-const ASK_WORDS: readonly RegExp[] = [
-  /(?:要不要|是否需要|是否要|是否继续|可以吗|行吗|好吗|同意吗|你看呢|选哪个|选哪一个|哪个方案)/u,
-  /(?:请|麻烦)(?:你|您)?(?:确认|决定|拍板|选择|批准|审批|回复|告诉我)/u,
-  /(?:等你|等您|需要你|需要您)(?:的)?(?:确认|决定|拍板|选择|批准|回复|答复|同意|授权)/u,
-  /(?:你来|您来)(?:定|决定|选)/u,
-  /\b(?:should I|shall I|do you want(?: me)? to|would you like(?: me)? to|want me to|let me know (?:if|whether|which|how)|please (?:confirm|approve|decide|choose|advise)|(?:waiting|wait) (?:for|on) your|need your (?:input|decision|approval|confirmation|go-ahead)|your call|which (?:option|one) (?:do you|would you|should))\b/iu,
-];
-
-/**
- * Whether what the agent last said asks the person something or waits for their decision: its last paragraph ends in a question, or
- * says in so many words that it waits for them (a choice, an approval, a confirmation), in Chinese or English. Deterministic and narrow
- * on purpose: only the end of the answer is read (where an answer that needs the person says so); a question quoted earlier in a report
- * does not count.
- */
-export function asksPerson(message: string): boolean {
-  const text = message.replace(/\r\n?/gu, "\n").trim();
-  if (!text) return false;
-  const blocks = text.split(/\n\s*\n/u).map((b) => b.trim()).filter(Boolean);
-  const last = (blocks[blocks.length - 1] ?? "").replace(/[`*_~>#]+/gu, "").trim();
-  const tail = Array.from(last).slice(-ASK_TAIL).join("");
-  if (/[?？][\s)）」』"'”’\]】]*[\p{Extended_Pictographic}\s]*$/u.test(tail)) return true;
-  return ASK_WORDS.some((re) => re.test(tail));
-}
+/** Whether what the agent last said asks the person something or waits for their decision (protocol `turnAsksPerson`). */
+export const asksPerson = turnAsksPerson;
 
 /** What a conversation did since it was last summed up, kept on its item (`params.digest`). */
 export interface TerminalDigest {
