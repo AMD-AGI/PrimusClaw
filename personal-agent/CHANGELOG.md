@@ -24,7 +24,8 @@ packaged Claw client does) (#937), and a surface of one's own has a new view to 
 end of a terminal turn nobody was at is shown as its own card: which conversation, what it did in whole sentences, the
 end of its last answer (up to 2000 characters) on a tap, and buttons that attach the chat to it or mute it (#936).
 With the Claw release that carries #937,
-such an end comes at once only when a person started that turn, it asks the person something or it failed; the ends of
+such an end comes at once when a person started that turn (or the connector cannot tell who did, as for Codex), it asks
+the person something or it failed; the ends of
 turns nobody typed that finished (another session's message, a schedule, a hook) and the ends the five-minute gap holds
 back are gathered by Claw and summed up at most once per conversation every hour by default, which `/approvals summary`
 reads and changes; when a pushed end stands for several turns nobody typed, the card first says the earlier one that asked something
@@ -63,7 +64,8 @@ renderer, as Teams' has) (#936). Everything else is additive: `remoteView.termin
   terminal is summed up; `/approvals summary <minutes>` (15 to 1440) sets it and `/approvals summary off` turns the
   summaries off (#937). Claw sends such a summary (how many turns ran, how many failed, the latest result, whether any
   asked the person) in place of the ends of finished turns nobody typed, which it no longer pushes one by one; the ends of
-  a person's turns, of turns that ask the person something and of failed turns still come at once, as the card above.
+  a person's turns, of turns whose starter the connector cannot tell (Codex), of turns that ask the person something and
+  of failed turns still come at once, as the card above.
   With `/approvals off` no summary is gathered, and turning approvals off or muting the conversation drops the one being
   gathered; quiet hours hold a summary as they hold every push (#937).
 
