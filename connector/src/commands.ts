@@ -25,7 +25,7 @@ import {
 import { CURSOR_HOLD_DEFAULT_S, CURSOR_HOLD_MAX_S, CURSOR_HOLD_MIN_S, cursorConfigDir } from "./cursor-approvals.js";
 import { approvalSocketFile } from "./approvals.js";
 import { OPT_OUT_ENV, optedOut } from "./approval-skip.js";
-import { migrateHookPrefs, recordHooksChoice, settlePending, wantedHooks, type HookSet } from "./hooks-auto.js";
+import { migrateHookPrefs, recordHooksChoice, settlePending, wantedHooks, type Choice, type HookSet } from "./hooks-auto.js";
 import { Connector, isAuthRefusal, type ConnectorTiming } from "./connector.js";
 import { clearNeedsLogin, markNeedsLogin, needsLogin, recentDisconnects } from "./health.js";
 import { checkAll, defaultDeps, formatReport, runProbe, shq, writeReport, type DoctorDeps, type Problem, type Report } from "./doctor.js";
@@ -387,17 +387,19 @@ export interface HookChoice { hooks: boolean; noHooks: boolean; noApprovals: boo
  * merged into is reported, and the command still succeeds.
  */
 export async function setupHooks(ctx: Ctx, o: HookChoice): Promise<void> {
-  migrateHookPrefs(ctx.dirs, [], hasSet, true);
+  const unmigrated = migrateHookPrefs(ctx.dirs, [], hasSet, true);
+  if (unmigrated) { ctx.err(`hooks: ${unmigrated}, so no hooks were added (everything else is set up)`); return; }
   try {
     if (o.noHooks) {
-      recordHooksChoice(ctx.dirs, null, "session", "off");
-      recordHooksChoice(ctx.dirs, null, "approvals", "off");
+      recordHooksChoice(ctx.dirs, null, { session: "off", approvals: "off" });
       ctx.out("left Claude Code's settings alone (--no-hooks); the connector will not add its hooks");
       return;
     }
-    if (o.hooks) recordHooksChoice(ctx.dirs, null, "session", "on");
-    if (o.noApprovals) recordHooksChoice(ctx.dirs, null, "approvals", "off");
-    else if (o.hooks) recordHooksChoice(ctx.dirs, null, "approvals", "on");
+    const c: Choice = {};
+    if (o.hooks) c.session = "on";
+    if (o.noApprovals) c.approvals = "off";
+    else if (o.hooks) c.approvals = "on";
+    if (Object.keys(c).length) recordHooksChoice(ctx.dirs, null, c);
   } catch (e) {
     // Adding the hooks now could go against the very choice that was not recorded (`--no-approval-hooks`).
     ctx.err(`hooks: could not record the choice, so no hooks were added: ${errMessage(e)} (everything else is set up)`);
@@ -646,7 +648,11 @@ function cmdHooks(args: string[], ctx: Ctx): number {
   const dirs = claudeDirs(ctx, values["config-dir"]);
   const approvals = !!values.approvals;
   // Carry over what 0.3.3 or earlier left before this records a choice: for the directories this start would serve too.
-  if (sub !== "status") { try { migrateHookPrefs(ctx.dirs, [...new Set([...claudeDirs(ctx, undefined), ...dirs])], hasSet, false); } catch { /* best effort */ } }
+  // Until that is written, recording a choice would leave out a no it never recorded (the approval hooks would then be added).
+  if (sub !== "status") {
+    const unmigrated = migrateHookPrefs(ctx.dirs, [...new Set([...claudeDirs(ctx, undefined), ...dirs])], hasSet, false);
+    if (unmigrated) { ctx.err(`hooks: ${unmigrated}; nothing was changed, run this again once it can be written`); return EXIT.failure; }
+  }
   let code: number = EXIT.ok;
   const report: Array<Record<string, unknown>> = [];
   for (const dir of dirs) {
@@ -660,8 +666,7 @@ function cmdHooks(args: string[], ctx: Ctx): number {
           continue;
         }
         // Installing takes back a no said for this directory: the session hooks always, the approval hooks with --approvals.
-        recordHooksChoice(ctx.dirs, dir, "session", "on");
-        if (approvals) recordHooksChoice(ctx.dirs, dir, "approvals", "on");
+        recordHooksChoice(ctx.dirs, dir, approvals ? { session: "on", approvals: "on" } : { session: "on" });
         ctx.out(describeInstall(dir, installOne(ctx, dir).changed));
         // CLAW_APPROVAL_HOOKS=off keeps them out as a start of the connector would, unless they are asked for by name.
         if (!approvals && optedOut(ctx.env)) ctx.out(`the approval hooks stay out of ${settingsFile(dir)}: ${OPT_OUT_ENV}=off is set here ("hooks install --approvals" adds them)`);
@@ -670,8 +675,7 @@ function cmdHooks(args: string[], ctx: Ctx): number {
       } else if (sub === "uninstall") {
         // `--approvals` takes out only the approval hooks; without it, both sets go. Kept as the person's choice: no later start
         // of the connector adds them back.
-        recordHooksChoice(ctx.dirs, dir, "approvals", "off");
-        if (!approvals) recordHooksChoice(ctx.dirs, dir, "session", "off");
+        recordHooksChoice(ctx.dirs, dir, approvals ? { approvals: "off" } : { session: "off", approvals: "off" });
         if (!approvals) ctx.out(uninstallHooks(dir).changed ? `removed the Claude Code session hooks from ${settingsFile(dir)}` : `no session hooks of ours in ${settingsFile(dir)}`);
         ctx.out(uninstallApprovalHooks(dir).changed ? `removed the approval hooks from ${settingsFile(dir)}` : `no approval hooks of ours in ${settingsFile(dir)}`);
       } else {

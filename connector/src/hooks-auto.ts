@@ -23,7 +23,7 @@ import path from "node:path";
 import type { Dirs } from "./paths.js";
 
 export type HookSet = "session" | "approvals";
-type Choice = Partial<Record<HookSet, "on" | "off">>;
+export type Choice = Partial<Record<HookSet, "on" | "off">>;
 /** `pending`: directories whose settings could not be read when what 0.3.3 or earlier left was carried over ({@link settlePending}). */
 interface Prefs { v: 1; all: Choice; dirs: Record<string, Choice>; pending?: string[] }
 
@@ -134,18 +134,23 @@ export function wantedHooks(d: Dirs, dir: string): Record<HookSet, boolean> {
 }
 
 /**
- * Record a choice, for one directory or (`dir` null) for every directory. A choice for every directory replaces what was said per
- * directory before it (the latest word wins); a later choice for one directory overrides it there.
+ * Record a choice for one or both sets, for one directory or (`dir` null) for every directory, in one write: both sets are kept,
+ * or neither. A choice for every directory replaces what was said per directory before it (the latest word wins); a later choice
+ * for one directory overrides it there.
  */
-export function recordHooksChoice(d: Dirs, dir: string | null, set: HookSet, value: "on" | "off"): void {
+export function recordHooksChoice(d: Dirs, dir: string | null, choices: Choice): void {
   const p = readPrefs(d);
-  if (dir === null) {
-    if (value === "on") delete p.all[set]; else p.all[set] = "off";
-    for (const c of Object.values(p.dirs)) delete c[set];
-    // A yes for every directory (`--hooks`) leaves nothing to carry over.
-    if (value === "on") delete p.pending;
-  } else {
-    p.dirs[dir] = { ...(p.dirs[dir] ?? {}), [set]: value };
+  for (const set of ["session", "approvals"] as const) {
+    const value = choices[set];
+    if (value === undefined) continue;
+    if (dir === null) {
+      if (value === "on") delete p.all[set]; else p.all[set] = "off";
+      for (const c of Object.values(p.dirs)) delete c[set];
+      // A yes for every directory (`--hooks`) leaves nothing to carry over.
+      if (value === "on") delete p.pending;
+    } else {
+      p.dirs[dir] = { ...(p.dirs[dir] ?? {}), [set]: value };
+    }
   }
   for (const [k, c] of Object.entries(p.dirs)) if (Object.keys(c).length === 0) delete p.dirs[k];
   writePrefs(d, p);

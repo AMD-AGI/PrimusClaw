@@ -412,6 +412,62 @@ describe("an upgrade from 0.3.3 or earlier, which recorded no no", () => {
     } finally { await claw.close(); }
   });
 
+  /** Make the writes of claude-hooks.json fail as `fail(n)` says, n counting them from 1; the returned function undoes it. */
+  const failPrefWrites = (file: string, fail: (n: number) => boolean): (() => void) => {
+    const real = fs.renameSync;
+    let n = 0;
+    (fs as { renameSync: typeof fs.renameSync }).renameSync = (from, to) => {
+      if (to === file && fail(++n)) throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      return real(from, to);
+    };
+    return () => { (fs as { renameSync: typeof fs.renameSync }).renameSync = real; };
+  };
+
+  test("init --no-hooks and hooks uninstall record both noes in one write: a failed write cannot leave only one of them", async () => {
+    const claw = await FakeClaw.start();
+    try {
+      // init --no-hooks: the write that records the noes fails, then the next start adds nothing.
+      const i = home(claw);
+      const a = i.mk();
+      let undo = failPrefWrites(hookPrefsFile(a.c.dirs), (n) => n >= 2);
+      try { await setupHooks(a.c, { hooks: false, noHooks: true, noApprovals: false }); } finally { undo(); }
+      await start(claw, i.mk());
+      assert.equal(ours(i.dir).length, 0, "neither set is added after init --no-hooks");
+
+      // hooks uninstall: the same, for the directory it names.
+      const u = home(claw);
+      const b = u.mk();
+      assert.equal(await main(["hooks", "install", "--approvals"], b.c), EXIT.ok);
+      undo = failPrefWrites(hookPrefsFile(b.c.dirs), (n) => n >= 2);
+      try { await main(["hooks", "uninstall"], b.c); } finally { undo(); }
+      await start(claw, u.mk());
+      assert.equal(hooksStatus(u.dir).events.length, 0, "the session hooks stay out after hooks uninstall");
+      assert.equal(approvalHooksStatus(u.dir).events.length, 0, "and the approval hooks");
+    } finally { await claw.close(); }
+  });
+
+  test("hooks install fails, and changes nothing, when what an older version left cannot be recorded", async () => {
+    const claw = await FakeClaw.start();
+    try {
+      const s = home(claw, { upgrade: true });
+      const a = s.mk();
+      fs.mkdirSync(path.dirname(legacyOfferFile(a.c.dirs)), { recursive: true });
+      fs.writeFileSync(legacyOfferFile(a.c.dirs), JSON.stringify({ v: 1, answered: { [s.dir]: { answer: "no", at: "2026-11-01T00:00:00Z" } } }));
+      // Only the first write (the carry-over) fails.
+      const undo = failPrefWrites(hookPrefsFile(a.c.dirs), (n) => n === 1);
+      let code: number;
+      try { code = await main(["hooks", "install"], a.c); } finally { undo(); }
+      assert.equal(code, EXIT.failure);
+      assert.match(a.errText(), /could not write .*claude-hooks\.json.*nothing was changed/);
+      assert.equal(fs.existsSync(hookPrefsFile(a.c.dirs)), false, "no choice recorded without the carried-over no");
+      assert.equal(ours(s.dir).length, 0, "settings.json untouched");
+      // Once it can be written, the old no for the approval hooks is kept.
+      assert.equal(await main(["hooks", "install"], s.mk().c), EXIT.ok);
+      assert.equal(hooksStatus(s.dir).installed, true);
+      assert.equal(approvalHooksStatus(s.dir).events.length, 0, "the approval hooks said no to under 0.3.3 stay out");
+    } finally { await claw.close(); }
+  });
+
   test("hooks install keeps the approval hooks out under CLAW_APPROVAL_HOOKS=off, as a start does; --approvals adds them", async () => {
     const claw = await FakeClaw.start();
     try {
