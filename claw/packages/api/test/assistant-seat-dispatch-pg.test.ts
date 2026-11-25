@@ -42,11 +42,13 @@
  *   D27 an instruction queued behind a turn under way, or sent while the agent is on a turn of its own, is the seat's work until its own
  *       end names it, however quiet it is: its prompt is on record before the end of the turn it waited behind, and may be further
  *       back than the events a reading takes
- *   D30 one session, one seat: a task for a seat takes over that seat's own conversation (never a new session in its folder: one asked
+ *   D30 a task whose turn has ended frees its seat at once, before the connector's next heartbeat acknowledges its prompt: the next
+ *       task is sent, not queued; one that waited goes on that end (not at the sweep); a prompt not yet collected and not ended is work
+ *   D31 one session, one seat: a task for a seat takes over that seat's own conversation (never a new session in its folder: one asked
  *       for is refused), and the
  *       next goes into the session that holds it; two seats of one folder queue apart; a conversation its machine no longer has fails
  *       the task, said plainly, and the seat is gone (refused) until its machine lists it again
- *   D31 a seat whose conversation a session open through Claw held, once closed where no agent of its machine takes a conversation over,
+ *   D32 a seat whose conversation a session open through Claw held, once closed where no agent of its machine takes a conversation over,
  *       is gone, and the task waiting in its queue fails, said
  */
 import assert from "node:assert/strict";
@@ -1347,6 +1349,32 @@ describe("seat dispatch", { skip }, () => {
     assert.notEqual((await seats.rosterOf("alice"))[0]!.state, "working");
   });
 
+  test("D30 a task whose turn ended frees its seat before the heartbeat acknowledges its prompt: the next is sent, a waiting one goes on that end", async () => {
+    const alice = await w.user("alice");
+    const cid = await machine("alice", "devbox");
+    const s = await seat(cid, "/home/u/rel", { alias: "发布台", role: "负责发布", role_state: "confirmed", dispatch_mode: "auto" });
+    const lastPrompt = async () => Number((await prompted(cid)).at(-1)!.cmd_seq);
+    // The first task is sent; its prompt is on record and not yet acknowledged (no heartbeat since): the seat is working.
+    const first = await create(await userTurn(alice, "发布 1"), `seat:${s.seatId}`, "任务 1");
+    assert.equal(first.dispatch, "sent", JSON.stringify(first));
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "working", "a prompt neither collected nor ended is work");
+    // Its turn ends a few seconds later, before the connector's next heartbeat: the seat is free, and a task asked now goes at once.
+    await events("alice", cid, s.sid, [chunk("ok"), ["turn_end", { stopReason: "end_turn", cmd_seq: await lastPrompt() }]]);
+    assert.equal((await item(first.item_id)).board_state, "done");
+    assert.equal((await prompted(cid)).length, 1, "still unacknowledged");
+    assert.equal((await seats.rosterOf("alice"))[0]!.state, "idle");
+    const second = await create(await userTurn(alice, "发布 2"), `seat:${s.seatId}`, "任务 2");
+    assert.equal(second.dispatch, "sent", JSON.stringify(second));
+    // A third waits behind the second; the second's end (still before any heartbeat) sends it on that event, not at the sweep.
+    const third = await create(await userTurn(alice, "发布 3"), `seat:${s.seatId}`, "任务 3");
+    assert.deepEqual([third.dispatch, third.queued_reason], ["queued", "seat_busy"], JSON.stringify(third));
+    await events("alice", cid, s.sid, [chunk("ok"), ["turn_end", { stopReason: "end_turn", cmd_seq: await lastPrompt() }]]);
+    const next = await item(third.item_id);
+    assert.equal(next.params.queued, undefined, JSON.stringify(next.params));
+    assert.ok(next.params.dispatched_at, "sent on the end of the task before it");
+    assert.equal((await prompted(cid)).length, 3);
+  });
+
   test("D12 the prompt asks for parking only from a connector that can park", async () => {
     const alice = await w.user("alice");
     const cid = await machine("alice", "devbox", [claude({ permission_park: true })]);
@@ -1375,7 +1403,7 @@ describe("seat dispatch", { skip }, () => {
     assert.doesNotMatch(d, /offline\/unsupported cannot take work/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true, send: true }), /"task handed to seat" is not one of these: another instruction for it is work_send/);
   });
-  test("D30 one session, one seat: a task resumes that seat's conversation; two seats of a folder queue apart; a conversation gone is said, and its seat takes no more", async () => {
+  test("D31 one session, one seat: a task resumes that seat's conversation; two seats of a folder queue apart; a conversation gone is said, and its seat takes no more", async () => {
     // 2026-11-25: a seat is one session. Six sessions in one folder are six seats, and a task for one goes to that conversation.
     const alice = await w.user("alice");
     await w.subscribe("alice");
@@ -1454,7 +1482,7 @@ describe("seat dispatch", { skip }, () => {
     assert.notEqual((await seats.rosterOf("alice")).find((x) => x.seat_id === s3)!.state, "gone");
   });
 
-  test("D31 a seat whose conversation a session open through Claw held, closed where no agent takes it over: gone, said, and its queued task fails", async () => {
+  test("D32 a seat whose conversation a session open through Claw held, closed where no agent takes it over: gone, said, and its queued task fails", async () => {
     const alice = await w.user("alice");
     await w.subscribe("alice");
     const cid = await machine("alice", "devbox");

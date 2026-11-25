@@ -118,17 +118,19 @@ func (s *Server) Create(ctx context.Context, req e2b.CreateRequest) (e2b.CreateR
 		_ = s.deleteSandboxAndSession(context.WithoutCancel(ctx), info, "e2b-create-failed")
 		return e2b.CreateResult{}, err
 	}
-	cluster := ""
+	cluster, preferred := "", ""
 	if policy != nil {
 		cluster = policy.Cluster
+		preferred = policy.PreferredNodes
 	}
 	return e2b.CreateResult{
-		SandboxName: sandboxName,
-		Namespace:   namespace,
-		PodIP:       podIP,
-		PodPort:     port,
-		NodeName:    nodeName,
-		Cluster:     cluster,
+		SandboxName:    sandboxName,
+		Namespace:      namespace,
+		PodIP:          podIP,
+		PodPort:        port,
+		NodeName:       nodeName,
+		Cluster:        cluster,
+		PreferredNodes: preferred,
 	}, nil
 }
 

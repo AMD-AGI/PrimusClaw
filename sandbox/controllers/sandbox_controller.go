@@ -9,9 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"net/http"
 	"reflect"
 	"regexp"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -176,6 +179,13 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 
 	// Reconcile Pod
 	pod, podErr := r.reconcilePod(ctx, sandbox, nameHash)
+	// A refused create is the outcome, not a reconcile error: the same Pod is
+	// refused the same way on every retry, so it is published as Failed below
+	// and not requeued.
+	var refused *podCreateRefusedError
+	if errors.As(podErr, &refused) {
+		podErr = nil
+	}
 	allErrors = errors.Join(allErrors, podErr)
 	if pod == nil {
 		sandbox.Status.Replicas = 0
@@ -191,6 +201,10 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 
 	// compute and set overall Ready condition
 	readyCondition := r.computeReadyCondition(sandbox, allErrors, svc, pod)
+	if refused != nil {
+		readyCondition.Reason = sandboxv1alpha1.SandboxReasonPodCreateRefused
+		readyCondition.Message = refused.message
+	}
 	meta.SetStatusCondition(&sandbox.Status.Conditions, readyCondition)
 	// Only where the Pod's state was actually read. A Get that failed is not a
 	// Pod that is absent, and acting on it as one removes a terminal condition
@@ -199,11 +213,110 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	// again. Replicas 0 deletes the Pod on purpose, so its absence there says
 	// nothing about the outcome already published either.
 	scaledToZero := sandbox.Spec.Replicas != nil && *sandbox.Spec.Replicas == 0
+	if refused != nil {
+		applyPodCreateRefused(sandbox, refused.message)
+		return allErrors
+	}
+	// A refusal published for an earlier spec says nothing about this one,
+	// whatever happened to its create, and must not be read as its outcome.
+	// One for this spec stays even when the Pod could not be read this time.
+	clearStalePodCreateRefused(sandbox)
 	if podErr == nil && !scaledToZero {
 		applyPodTerminalConditions(sandbox, pod)
 	}
 
 	return allErrors
+}
+
+// podCreateRefusedError is a sandbox Pod the API server refused for good.
+// message is the condition message: SandboxPodCreateRefusedPrefix followed by
+// the API server's text.
+type podCreateRefusedError struct {
+	message string
+}
+
+func (e *podCreateRefusedError) Error() string { return e.message }
+
+// podCreateRefusedMessageLimit bounds the refusal text kept on the condition.
+// A webhook writes what it likes; the API server caps a condition message at
+// 32768 bytes and refuses the whole status update past it.
+const podCreateRefusedMessageLimit = 4096
+
+// newPodCreateRefused renders a refused Pod create as the condition message.
+func newPodCreateRefused(err error) *podCreateRefusedError {
+	message := sandboxv1alpha1.SandboxPodCreateRefusedPrefix + err.Error()
+	if len(message) > podCreateRefusedMessageLimit {
+		cut := podCreateRefusedMessageLimit
+		for cut > 0 && !utf8.RuneStart(message[cut]) {
+			cut--
+		}
+		message = message[:cut]
+	}
+	return &podCreateRefusedError{message: message}
+}
+
+// isTerminalCreateRefusal reports whether a Pod create error is a refusal that
+// every retry of the same Pod meets again: an admission webhook that denied
+// it, a Pod the API server finds invalid, or one it forbids. Retrying such a
+// create only holds the caller until its pending deadline and then reports a
+// timeout in place of the reason.
+//
+// Two Forbidden answers are not about the Pod and do pass: a ResourceQuota
+// that is full now may have room later, and a namespace being deleted takes
+// the Sandbox with it. A webhook that answers with a code outside 400, 403 and
+// 422 (429, or a 5xx) is saying try again, and is retried.
+func isTerminalCreateRefusal(err error) bool {
+	var status k8serrors.APIStatus
+	if err == nil || !errors.As(err, &status) {
+		return false
+	}
+	code := status.Status().Code
+	message := status.Status().Message
+	switch {
+	case k8serrors.IsInvalid(err):
+		return true
+	case k8serrors.IsForbidden(err):
+		return !strings.Contains(message, "exceeded quota") && !strings.Contains(message, "because it is being terminated")
+	case code == http.StatusBadRequest:
+		return strings.Contains(message, "admission webhook") && strings.Contains(message, "denied the request")
+	}
+	return false
+}
+
+// refusedForGeneration returns the published PodCreateRefused condition when it
+// was recorded against the current spec. A spec change is the only thing that
+// can turn the refusal around, so only then is the Pod created again.
+func refusedForGeneration(sandbox *sandboxv1alpha1.Sandbox) *metav1.Condition {
+	failed := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	if failed == nil || failed.Status != metav1.ConditionTrue ||
+		failed.Reason != sandboxv1alpha1.SandboxReasonPodCreateRefused ||
+		failed.ObservedGeneration != sandbox.Generation {
+		return nil
+	}
+	return failed
+}
+
+// applyPodCreateRefused publishes a refused Pod create as Failed, which SaFE
+// maps to a failed Workload, so the create waiting on it ends with the reason.
+func applyPodCreateRefused(sandbox *sandboxv1alpha1.Sandbox, message string) {
+	meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+		Type:               string(sandboxv1alpha1.SandboxConditionFailed),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: sandbox.Generation,
+		Reason:             sandboxv1alpha1.SandboxReasonPodCreateRefused,
+		Message:            message,
+	})
+	meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionSucceeded))
+}
+
+// clearStalePodCreateRefused removes a PodCreateRefused condition published
+// for an earlier generation of the spec.
+func clearStalePodCreateRefused(sandbox *sandboxv1alpha1.Sandbox) {
+	failed := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	if failed != nil && failed.Reason == sandboxv1alpha1.SandboxReasonPodCreateRefused &&
+		failed.ObservedGeneration != sandbox.Generation {
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1alpha1.SandboxConditionFailed))
+	}
 }
 
 // applyPodTerminalConditions records Succeeded/Failed from the Pod phase so
@@ -564,6 +677,10 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 	}
 
 	// 3. PATH: Create new Pod
+	if refused := refusedForGeneration(sandbox); refused != nil {
+		log.Info("Not creating the Pod: the API server refused this spec", "Pod.Namespace", sandbox.Namespace, "Pod.Name", sandbox.Name)
+		return nil, &podCreateRefusedError{message: refused.Message}
+	}
 	log.Info("Creating a new Pod", "Pod.Namespace", sandbox.Namespace, "Pod.Name", sandbox.Name)
 	labels := map[string]string{
 		sandboxLabel: nameHash,
@@ -604,6 +721,9 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 	}
 	if err := r.Create(ctx, pod, client.FieldOwner(sandboxControllerFieldOwner)); err != nil {
 		log.Error(err, "Failed to create", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
+		if isTerminalCreateRefusal(err) {
+			return nil, newPodCreateRefused(err)
+		}
 		return nil, err
 	}
 

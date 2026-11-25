@@ -28,6 +28,15 @@ const (
 	SandboxReasonPodSucceeded = "PodSucceeded"
 	// SandboxReasonPodFailed is the reason on SandboxConditionFailed.
 	SandboxReasonPodFailed = "PodFailed"
+	// SandboxReasonPodCreateRefused is the reason on SandboxConditionFailed when
+	// the API server refused the sandbox Pod for good, for example an admission
+	// webhook denied it. The controller does not create the Pod again until the
+	// Sandbox spec changes.
+	SandboxReasonPodCreateRefused = "PodCreateRefused"
+	// SandboxPodCreateRefusedPrefix starts the message of a PodCreateRefused
+	// condition; the API server's own refusal text follows it. The workload
+	// manager reads it from the SaFE Workload to fail a pending create at once.
+	SandboxPodCreateRefusedPrefix = "Pod create refused: "
 )
 
 type PodMetadata struct {

@@ -32,7 +32,9 @@ const manifestWith = (templates: Array<Record<string, unknown>>) => ({
   sandbox_templates: templates,
   sandbox_roles: { measurement: templates.map((t) => t.name as string) },
 });
-const measurement = (over: Record<string, unknown> = {}) => ({ name: "measurement", fromImage: "registry.example.invalid/m:1", per_gpu_count: [1], ...over });
+const measurement = (over: Record<string, unknown> = {}) => ({
+  name: "measurement", fromImage: "registry.example.invalid/m:1", per_gpu_count: [1], workspaceStorage: "off", ...over,
+});
 
 function servePlugin(manifest: unknown): void {
   db.query = (async (text: string) => {
@@ -72,7 +74,7 @@ test("a mount under a hostpath volume of the template's workspace is admitted, a
 test("a template naming its own workspace is checked against that workspace, each workspace read once", async () => {
   const templates = [
     measurement({ host_mounts: [{ hostPath: CACHE, readOnly: true }], workspace: "ws-own" }),
-    { name: "runner", fromImage: "img:1", workspace: "ws-own", host_mounts: [{ hostPath: "/shared/x", readOnly: true }] },
+    { name: "runner", fromImage: "img:1", workspace: "ws-own", workspaceStorage: "off", host_mounts: [{ hostPath: "/shared/x", readOnly: true }] },
   ];
   const { out, asked } = await check(manifestWith(templates), async () => ({ volumes: SHARED }));
   assert.equal(out.statusCode, undefined, JSON.stringify(out));
@@ -89,9 +91,10 @@ test("a mount outside every directory the workspace mounts is refused with the f
   assert.deepEqual(none.asked, []);
 });
 
-test("a read-write mount or a raw hostPath volume never reaches the workspace check: the manifest is invalid", async () => {
+test("a read-write mount, a raw hostPath volume or a mount with the workspace's storage on never reaches the workspace check: the manifest is invalid", async () => {
   for (const t of [
     measurement({ host_mounts: [{ hostPath: CACHE, readOnly: false }] }),
+    measurement({ workspaceStorage: "on", host_mounts: [{ hostPath: CACHE, readOnly: true }] }),
     measurement({ volumes: [{ name: "v", hostPath: { path: "/" } }], volumeMounts: [{ name: "v", mountPath: "/host", readOnly: false }] }),
   ]) {
     const { out, asked } = await check(manifestWith([t]), async () => ({ volumes: SHARED }));

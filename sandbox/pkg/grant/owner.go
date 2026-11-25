@@ -25,12 +25,15 @@ import (
 )
 
 const (
+	// OwnerTemplatesID is the grant id label of the CodeInterpreters
+	// registered from the owner policy rather than for one grant.
+	OwnerTemplatesID = "e2b-owner-templates"
 	// OwnerKeyLabel marks a SandboxGrant that holds one owner's quota for identity keys.
 	OwnerKeyLabel = "agent-sandbox.io/owner-key"
 	// ownerAppRunID prefixes the shared template names used by identity keys.
 	ownerAppRunID = "e2b"
 	// ownerTemplatesID owns the CodeInterpreters registered from the owner policy.
-	ownerTemplatesID = "e2b-owner-templates"
+	ownerTemplatesID = OwnerTemplatesID
 	// ownerRecordLifetime is the expiresAt of an owner quota record.
 	ownerRecordLifetime = 10 * 365 * 24 * time.Hour
 	// defaultOwnerRole is the role and Workload display name for identity keys.
@@ -241,6 +244,9 @@ func (s *Service) prepareOwnerPolicy(ctx context.Context, p OwnerPolicy) (*owner
 		return nil, err
 	}
 	if err := validateTemplateResources(stored, "invalid_owner_policy"); err != nil {
+		return nil, err
+	}
+	if err := validateTemplatePreferredNodes(stored, "invalid_owner_policy"); err != nil {
 		return nil, err
 	}
 	if err := s.resolveTemplateGPUCounts(ctx, ownerAppRunID, stored); err != nil {

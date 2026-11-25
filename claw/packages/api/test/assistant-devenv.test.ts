@@ -286,6 +286,13 @@ describe("devenv_list", { skip }, () => {
       { state: "idle", n: 1 }, { state: "live", n: 2 }, { state: "attached", n: 3 }, { state: "weird", n: 4 }, { state: "idle", n: 5 }, { state: "idle", n: 6 },
     ]);
     assert.deepEqual(order.map((x) => [x.c.n, x.shown]), [[2, true], [1, true], [5, true], [4, true], [6, false]]);
+    // The card reads the first twelve as reported and only then drops attached ones: an attached one among them leaves a thirteenth unshown.
+    const many = devenv.cardOrder([
+      { state: "attached", n: 1 }, ...Array.from({ length: 11 }, (_, i) => ({ state: "weird", n: i + 2 })), { state: "live", n: 13 },
+    ]);
+    assert.deepEqual(many.filter((x) => x.shown).map((x) => x.c.n), [2, 3]);
+    assert.equal(many.find((x) => x.c.n === 13)?.shown, false);
+    assert.equal(many.some((x) => x.c.n === 1), false);
   });
 
   test("D1c every machine comes first as a compact summary, so a machine with many sessions does not push another out of the turn's result", async () => {

@@ -36,6 +36,15 @@ function enabledOf(answer: unknown): boolean {
   return enabled;
 }
 
+function summaryOf(answer: unknown): number {
+  const data = anyDataOf(answer, "the summary setting");
+  const minutes =
+    data !== null && typeof data === "object" ? (data as Record<string, unknown>)["summary_minutes"] : undefined;
+  if (typeof minutes !== "number" || !Number.isSafeInteger(minutes) || minutes < 0)
+    throw new ClawAnswerInvalid("the summary setting has no summary_minutes");
+  return minutes;
+}
+
 /** `ClawRemoteAgentsPort` over Claw's HTTP API; every call names this client (`X-Claw-Client`) in Claw's audit trail. */
 export class HttpRemoteAgents implements ClawRemoteAgentsPort {
   constructor(
@@ -58,6 +67,14 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
 
   async setApprovals(key: ClawCredential, enabled: boolean): Promise<boolean> {
     return enabledOf(await this.#call("PUT", "/approvals", key, { enabled }));
+  }
+
+  async summary(key: ClawCredential): Promise<number> {
+    return summaryOf(await this.#call("GET", "/approvals", key));
+  }
+
+  async setSummary(key: ClawCredential, minutes: number): Promise<number> {
+    return summaryOf(await this.#call("PUT", "/approvals/summary", key, { minutes }));
   }
 
   async muteTerminal(key: ClawCredential, item: number, muted: boolean): Promise<TerminalMute> {

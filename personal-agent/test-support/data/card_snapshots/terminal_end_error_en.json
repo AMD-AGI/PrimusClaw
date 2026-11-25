@@ -1,0 +1,75 @@
+{
+ "attachments": [
+  {
+   "content": {
+    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    "actions": [
+     {
+      "data": {
+       "msteams": {
+        "type": "imBack",
+        "value": "/approvals mute #7"
+       }
+      },
+      "title": "Mute this conversation",
+      "type": "Action.Submit"
+     }
+    ],
+    "body": [
+     {
+      "columns": [
+       {
+        "items": [
+         {
+          "color": "Attention",
+          "size": "Large",
+          "text": "┃",
+          "type": "TextBlock",
+          "weight": "Bolder"
+         }
+        ],
+        "spacing": "None",
+        "type": "Column",
+        "width": "auto"
+       },
+       {
+        "items": [
+         {
+          "size": "Medium",
+          "text": "❌ Claude Code stopped with an error (rate\\_limit)",
+          "type": "TextBlock",
+          "weight": "Bolder",
+          "wrap": true
+         },
+         {
+          "isSubtle": true,
+          "size": "Small",
+          "spacing": "None",
+          "text": "robin-dev · work/claw · terminal idle · #7",
+          "type": "TextBlock",
+          "wrap": true
+         }
+        ],
+        "spacing": "Small",
+        "type": "Column",
+        "verticalContentAlignment": "Center",
+        "width": "stretch"
+       }
+      ],
+      "type": "ColumnSet"
+     },
+     {
+      "spacing": "Small",
+      "text": "API Error: rate limit reached for this organization.",
+      "type": "TextBlock",
+      "wrap": true
+     }
+    ],
+    "type": "AdaptiveCard",
+    "version": "1.5"
+   },
+   "contentType": "application/vnd.microsoft.card.adaptive"
+  }
+ ],
+ "type": "message"
+}

@@ -118,7 +118,9 @@ describe("a turn's end in a terminal nobody is at", () => {
       r.broker.settled({ session_id: CLAUDE_STOP.session_id, hook_event_name: next, cwd: "/home/u/work/claw", prompt: "go on" }, claude);
       await wait(300);
       assert.equal(r.ends().length, 0, next);
-      assert.ok(r.skipped().includes("terminal_active"), next);
+      // a new prompt holds the end until its own turn ends (who started it decides); the end of the conversation drops it
+      if (next === "UserPromptSubmit") assert.equal(r.audited.filter((a) => a.event === "turn_end_held").length, 1);
+      else assert.ok(r.skipped().includes("terminal_active"), next);
     }
   });
 
@@ -226,7 +228,7 @@ describe("a turn's end in a terminal nobody is at", () => {
       go();
       await wait(100);
       assert.equal(r.ends().length, 0, next);
-      assert.deepEqual(r.skipped(), ["terminal_active"], next);
+      assert.deepEqual(r.skipped(), next === "UserPromptSubmit" ? [] : ["terminal_active"], next);
     }
 
     let typedAt = t0;

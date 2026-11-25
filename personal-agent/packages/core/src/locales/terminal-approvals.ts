@@ -45,7 +45,7 @@ export const terminalApprovalText = defineCatalog({
     approvalsTurnedOn: "Turned on: questions your terminals ask come here too. `/approvals off` stops it.",
     approvalsTurnedOff: "Turned off: questions stay in the terminal. `/approvals on` brings them back.",
     approvalsUsage:
-      "Use `/approvals on`, `/approvals off`, or `/approvals` to see which it is; `/approvals mute #12` (or `unmute #12`) for one terminal conversation, by the number its message names.",
+      "Use `/approvals on`, `/approvals off`, or `/approvals` to see which it is; `/approvals mute #12` (or `unmute #12`) for one terminal conversation, by the number its message names; `/approvals summary 60` (minutes, 15 to 1440, or `off`) for how often a conversation that keeps working on its own is summed up.",
     muted: (p: { item: string; where: string }) =>
       `Muted #${p.item}${p.where ? ` (${p.where})` : ""}: what that conversation asks, waits for or finishes stays in its terminal. \`/approvals unmute #${p.item}\` brings it back.`,
     unmuted: (p: { item: string; where: string }) =>
@@ -53,7 +53,37 @@ export const terminalApprovalText = defineCatalog({
     muteNotFound: (p: { item: string }) => `I have no item #${p.item} of yours.`,
     muteNotTerminal: (p: { item: string }) =>
       `#${p.item} is not a conversation open in one of your terminals, so there is nothing to mute.`,
+    endDone: "finished",
+    endError: (p: { error: string }) => `stopped with an error (${p.error})`,
+    endIdle: "terminal idle",
+    endFull: "Show all",
+    endRest: "The rest is in the terminal.",
+    endAttach: "Attach",
+    endMute: "Mute this conversation",
+    endEarlierAsked: (p: { text: string; count: number }) =>
+      p.text
+        ? `An earlier turn asked: ${p.text}${p.count > 1 ? ` (${String(p.count)} earlier turns asked; see the terminal)` : ""}`
+        : p.count > 1
+          ? `${String(p.count)} earlier turns asked you something; see the terminal.`
+          : "An earlier turn asked you something; see the terminal.",
+    endEarlierFailed: (p: { text: string; count: number }) =>
+      p.text
+        ? `An earlier turn stopped with an error: ${p.text}${p.count > 1 ? ` (${String(p.count)} earlier turns did; see the terminal)` : ""}`
+        : p.count > 1
+          ? `${String(p.count)} earlier turns stopped with an error; see the terminal.`
+          : "An earlier turn stopped with an error; see the terminal.",
+    endLatest: (p: { text: string }) => `Latest turn: ${p.text}`,
     approvalsUnavailable: "I could not reach the setting just now. Try again in a moment.",
+    summaryEvery: (p: { minutes: string }) =>
+      `A terminal conversation that keeps working on its own (turns another session or a schedule started) is summed up at most once every ${p.minutes} minutes; the end of a turn you started, or one that asks you something, comes at once. \`/approvals summary <minutes>|off\` changes it.`,
+    summaryNever:
+      "Summaries are off: only the end of a turn you started, or one that asks you something, comes here. `/approvals summary 60` turns them back on.",
+    summarySet: (p: { minutes: string }) =>
+      `Done: a conversation that keeps working on its own is summed up at most once every ${p.minutes} minutes.`,
+    summaryOff:
+      "Done: no more summaries; the end of a turn you started, or one that asks you something, still comes here.",
+    summaryUsage:
+      "Use `/approvals summary <minutes>` with 15 to 1440 minutes, `/approvals summary off`, or `/approvals summary` to see it.",
   },
   zh: {
     title: "终端在等你回答",
@@ -89,12 +119,35 @@ export const terminalApprovalText = defineCatalog({
     approvalsTurnedOn: "已开启：终端里的问题也会推到这里。发 `/approvals off` 关闭。",
     approvalsTurnedOff: "已关闭：问题只在终端里问。发 `/approvals on` 重新开启。",
     approvalsUsage:
-      "用 `/approvals on` 或 `/approvals off`；只发 `/approvals` 看当前状态；对单个终端会话用 `/approvals mute #12`（或 `unmute #12`），编号见推送消息开头。",
+      "用 `/approvals on` 或 `/approvals off`；只发 `/approvals` 看当前状态；对单个终端会话用 `/approvals mute #12`（或 `unmute #12`），编号见推送消息里的 #N；`/approvals summary 60`（分钟，15 到 1440，或 `off`）设置持续工作的会话多久汇总一次。",
     muted: (p) =>
       `已静音 #${p.item}${p.where ? `（${p.where}）` : ""}：这个会话的提问、等待和完成都只留在终端里。发 \`/approvals unmute #${p.item}\` 恢复。`,
     unmuted: (p) => `已恢复 #${p.item}${p.where ? `（${p.where}）` : ""}：这个会话的提问和完成会重新推到这里。`,
     muteNotFound: (p) => `你没有编号为 #${p.item} 的事项。`,
     muteNotTerminal: (p) => `#${p.item} 不是你终端里打开的会话，没有可静音的。`,
+    endDone: "做完了",
+    endError: (p) => `出错停下（${p.error}）`,
+    endIdle: "终端空闲",
+    endFull: "全文",
+    endRest: "全文见终端。",
+    endAttach: "接入会话",
+    endMute: "静音此会话",
+    endEarlierAsked: (p) =>
+      p.text
+        ? `早先一轮在问你：${p.text}${p.count > 1 ? `（早先共 ${String(p.count)} 轮在问你，详见终端）` : ""}`
+        : `早先有 ${String(p.count)} 轮在问你，详见终端。`,
+    endEarlierFailed: (p) =>
+      p.text
+        ? `早先一轮出错停下：${p.text}${p.count > 1 ? `（早先共 ${String(p.count)} 轮出错，详见终端）` : ""}`
+        : `早先有 ${String(p.count)} 轮出错停下，详见终端。`,
+    endLatest: (p) => `最新一轮：${p.text}`,
     approvalsUnavailable: "暂时读不到这个设置，请稍后再试。",
+    summaryEvery: (p) =>
+      `其他会话或定时任务驱动、持续在跑的终端会话，最多每 ${p.minutes} 分钟汇总一次；你自己发起的回合、或在问你的回合，结束时立即推送。发 \`/approvals summary <分钟>|off\` 修改。`,
+    summaryNever: "汇总已关闭：只推送你自己发起的回合、或在问你的回合。发 `/approvals summary 60` 重新开启。",
+    summarySet: (p) => `已设置：持续工作的终端会话最多每 ${p.minutes} 分钟汇总一次。`,
+    summaryOff: "已关闭汇总；你自己发起的回合、或在问你的回合，结束时仍会推送。",
+    summaryUsage:
+      "用 `/approvals summary <分钟>`（15 到 1440），`/approvals summary off` 关闭，只发 `/approvals summary` 查看当前设置。",
   },
 });

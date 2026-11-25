@@ -43,6 +43,11 @@ const nodeNameMetadata = metadataPrefix + "node-name"
 // sameNodeMetadata is set only when the pod landed on a node the caller asked to avoid.
 const sameNodeMetadata = metadataPrefix + "same-node"
 
+// preferredNodeMetadata says whether the pod landed on one of the nodes its
+// template prefers ("true" or "false"). It is set only when the template
+// prefers nodes.
+const preferredNodeMetadata = metadataPrefix + "preferred-node"
+
 // avoidNodesMetadata lists nodes the workload prefers not to run on.
 const avoidNodesMetadata = metadataPrefix + "avoid-nodes"
 
@@ -76,6 +81,7 @@ var reservedMetadataKeys = map[string]struct{}{
 	"node-name":          {},
 	"signing-public-key": {},
 	"same-node":          {},
+	"preferred-node":     {},
 	"nodes":              {},
 	"owner-user-id":      {},
 }
@@ -289,13 +295,31 @@ func excludedNodesLabel(raw string) string {
 	return strings.Join(out, " ")
 }
 
-// landedOnAvoidedNode reports whether node is one of the names in avoid-nodes.
-func landedOnAvoidedNode(node, avoidRaw string) bool {
+// placementMetadata is the metadata a running sandbox records about the node it
+// landed on: the node name, same-node when the node is one it asked to avoid,
+// and preferred-node when its template prefers nodes.
+func placementMetadata(result CreateResult, avoidRaw string) map[string]string {
+	if result.NodeName == "" {
+		return nil
+	}
+	md := map[string]string{nodeNameMetadata: result.NodeName}
+	if nodeListed(result.NodeName, avoidRaw) {
+		md[sameNodeMetadata] = "true"
+	}
+	if strings.TrimSpace(result.PreferredNodes) != "" {
+		md[preferredNodeMetadata] = strconv.FormatBool(nodeListed(result.NodeName, result.PreferredNodes))
+	}
+	return md
+}
+
+// nodeListed reports whether node is one of the names in raw (a node list as
+// avoid-nodes takes it: names split by blanks, commas or semicolons).
+func nodeListed(node, raw string) bool {
 	node = strings.TrimSpace(node)
 	if node == "" {
 		return false
 	}
-	for _, name := range strings.Fields(excludedNodesLabel(avoidRaw)) {
+	for _, name := range strings.Fields(excludedNodesLabel(raw)) {
 		if name == node {
 			return true
 		}

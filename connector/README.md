@@ -646,8 +646,13 @@ The same hooks also tell you when a turn ends in a terminal you walked away from
 `StopFailure` (it stopped on an API error: a rate limit, a billing or sign-in problem, an unknown model), and Codex's `Stop`
 (installed with `hooks install --agent codex`; Codex asks you to trust the new hook once). At the end of a turn the hook names
 the terminal the session runs in, and the connector waits: if nobody types in that terminal for a minute after the turn
-ended (its last-input time, as `w` reads it), the chat gets one message naming the machine, the tool, the conversation and
-its folder, with the end of what the agent last said, or the error. Nothing is said:
+ended (its last-input time, as `w` reads it), the chat gets one card. Its title names the conversation (the name Claude
+Code's own session list shows, else its title) and says whether it finished or stopped with an error (and why); a small line
+under it names the tool, the machine, the folder and the conversation's item number. Under that, what the agent did, in a few
+whole sentences from the start of its last answer (from its summary, or its last paragraph, when the answer was too long to
+send whole), with the whole answer behind *Show all*, and buttons that send *Attach* (`/agent attach <ref>`) and *Mute this
+conversation* (`/approvals mute #<item>`) as your own message. A chat that shows no cards gets the same as three lines of
+text. Nothing is said:
 
 - when someone typed in that terminal, sent a new prompt or ended the conversation within that minute;
 - while a chat follows the conversation (taken over, typed into or watched from the phone): it shows the end itself;
@@ -656,8 +661,17 @@ its folder, with the end of what the agent last said, or the error. Nothing is s
   the sessions this connector runs;
 - more than once every five minutes for one conversation (the work item still records every end).
 
-`/approvals off` turns these off with the questions. To stop hearing from one conversation, send the command its message
-ends with, `/approvals mute #<item>` (`/approvals unmute #<item>` brings it back): its questions, waits and ends then stay in
+Each end says who started its turn, as Claude Code's transcript records it: a person (typed at that terminal, a queued prompt,
+an accepted suggestion, a slash command) or something else (a message from another session, a scheduled prompt, a hook). Claw
+pushes at once only the ends of turns a person started and those that ask you something or failed; the others are gathered and
+summed up at most once an hour per conversation (`/approvals summary <minutes>|off`). Ends of turns nobody typed that follow
+one another within the minute are told as one, the newest, carrying how many turns and the earlier ones' last words (and
+which of them failed); when one of them asked you something or failed, the message says that turn first. A new
+prompt holds an end not yet told until its own turn ends, and a person's prompt drops it. A Claude Code older than these
+fields, and Codex, are told as before.
+
+`/approvals off` turns these off with the questions. To stop hearing from one conversation, tap *Mute this conversation*
+or send `/approvals mute #<item>` (`/approvals unmute #<item>` brings it back): its questions, waits and ends then stay in
 its terminal, and Claw refuses to open a card session for it (`session_muted`). The audit log records each end told or not
 (`turn_end_sent`, `turn_end_not_sent` with the reason), never the agent's words.
 

@@ -39,6 +39,9 @@ import { ERRAND_CLIENT, inRemoteSessionOrder, langOf, noteErrandPrompt, noteRemo
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
 import { typedCommand } from "./typed-commands.js";
+import { inertMd } from "./inert-md.js";
+
+export { inertMd };
 
 const logger = pino({ name: "assistant-devenv" });
 
@@ -618,8 +621,10 @@ export const CARD_AGENT_BLOCKS = 6;
 
 /** One agent's conversations in the agents card's order, each with whether the card shows it. Pure, for the tests. */
 export function cardOrder<T extends { state: string }>(conversations: readonly T[]): Array<{ c: T; shown: boolean }> {
+  // As the card reads them: the first twelve as reported, and only then without the attached ones (an attached one among the first
+  // twelve does not let a thirteenth in).
+  const head = conversations.slice(0, CARD_RESUMABLE_READ).filter((c) => c.state !== "attached");
   const read = conversations.filter((c) => c.state !== "attached");
-  const head = read.slice(0, CARD_RESUMABLE_READ);
   const live = head.filter((c) => c.state === "live");
   const idle = head.filter((c) => c.state === "idle");
   const unknown = head.filter((c) => c.state !== "live" && c.state !== "idle");
@@ -1608,18 +1613,6 @@ export async function devenvHide(claims: AssistantTokenClaims, args: DevenvHideA
   });
   if (out.announce) await out.announce();
   return { ...proposed(out.row, out.subscribers, "done", zh ? "zh" : "en"), machine: params.machine, hide: params.hide.length, show: params.show.length, disconnect: params.close.length, not_hidden_live: params.live };
-}
-
-/**
- * Text a machine reported (a conversation's title, a folder, the machine's own name), made inert for a card the user reads as
- * markdown: every character markdown or HTML reads as markup is escaped, and a scheme's "://" is broken so nothing autolinks. A
- * title like "[Confirm](https://x)" is shown as those characters, never as a link or a button-looking word.
- */
-export function inertMd(text: string | null | undefined): string {
-  return String(text ?? "")
-    .replace(/[\\`*_[\]()<>|~]/g, (ch) => `\\${ch}`)
-    .replace(/:\/\//g, ":/\u200b/")
-    .replace(/\bwww\./gi, (m) => `${m.slice(0, 3)}\u200b.`);
 }
 
 /** What the card of a `devenv_hide` says: each conversation by its title, what happens to it, and that nothing on the machine is deleted. */

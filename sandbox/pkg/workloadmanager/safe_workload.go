@@ -25,8 +25,10 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	runtimev1alpha1 "sigs.k8s.io/agent-sandbox/pkg/apis/runtime/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/pkg/e2b"
+	"sigs.k8s.io/agent-sandbox/pkg/grant"
 	"sigs.k8s.io/agent-sandbox/pkg/sandboxlayer"
 	"sigs.k8s.io/agent-sandbox/pkg/store"
 )
@@ -49,9 +51,17 @@ const (
 	sandboxIDLabel                = "agent-sandbox.io/sandbox-id"
 	grantAttestationAnnotation    = "agent-sandbox.io/grant-attestation"
 	identityAttestationAnnotation = "agent-sandbox.io/identity-attestation"
-	// nodesAffinityAnnotation asks SaFE to treat excluded-nodes as a preference.
-	nodesAffinityAnnotation  = "primus-safe.nodes.affinity"
-	nodesAffinityPreferred   = "preferred"
+	// excludedNodesLabel and specifiedNodesLabel are the SaFE customer labels
+	// naming the nodes a Workload avoids and prefers, space-separated.
+	excludedNodesLabel  = "excluded-nodes"
+	specifiedNodesLabel = "specified-nodes"
+	// nodesAffinityAnnotation asks SaFE to treat specified-nodes and
+	// excluded-nodes as preferences rather than requirements.
+	nodesAffinityAnnotation = "primus-safe.nodes.affinity"
+	nodesAffinityPreferred  = "preferred"
+	// preferredNodesAnnotation records the template's preferredNodes on the
+	// Workload, space-separated, before avoid-nodes are removed from them.
+	preferredNodesAnnotation = "agent-sandbox.io/preferred-nodes"
 	workloadEphemeralStorage = "50Gi"
 	workloadPriority         = int64(2)
 	workloadTTLSeconds       = int64(10)
@@ -78,6 +88,19 @@ const (
 	signingSecretTypeGeneral = "general"
 	// signingSecretFinalizer makes deletion wait until the mirrored copy is removed.
 	signingSecretFinalizer = "primus-safe/secret.finalizer"
+)
+
+const (
+	// useWorkspaceStorageAnnotation "false" makes SaFE mount none of the
+	// workspace's volumes into the Workload's pods; SaFE sets it to "true"
+	// when a Workload is created without it.
+	useWorkspaceStorageAnnotation = "primus-safe.workload.use.workspace.storage"
+	// workspaceStorageReadOnlyAnnotation "true" makes SaFE mount every volume
+	// of the workspace's storage read-only into the Workload's pods, init
+	// containers included, and leave out the per-user directory. The name is
+	// SaFE's and must match it exactly: a SaFE that does not know it mounts
+	// the storage as it always does.
+	workspaceStorageReadOnlyAnnotation = "primus-safe.workload.workspace.storage.readonly"
 )
 
 // secretGVR is a namespace-scoped Secret. The signing key lives in primus-safe.
@@ -235,6 +258,7 @@ func (c *SafeWorkloadCreator) Create(ctx context.Context, req e2b.CreateRequest)
 		PodPort:              envdPort,
 		NodeName:             nodeName,
 		Cluster:              cluster,
+		PreferredNodes:       workloadPreferredNodes(created),
 		Kind:                 store.WorkloadKind,
 		MaxSessionDuration:   req.Timeout,
 		RuntimePolicy:        ci.Spec.RuntimePolicy,
@@ -352,11 +376,12 @@ func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2
 		cluster := obj.GetLabels()[safeClusterIDLabel]
 		if _, remote := c.remoteClusters[cluster]; remote && cluster != "" {
 			return e2b.CreateResult{
-				SandboxName: sandboxID,
-				Namespace:   workspace,
-				PodPort:     envdPort,
-				NodeName:    nodeFromUsage(obj),
-				Cluster:     cluster,
+				SandboxName:    sandboxID,
+				Namespace:      workspace,
+				PodPort:        envdPort,
+				NodeName:       nodeFromUsage(obj),
+				Cluster:        cluster,
+				PreferredNodes: workloadPreferredNodes(obj),
 			}, e2b.WorkloadRunning, nil
 		}
 		ip, node, ok := c.address(ctx, obj, workspace, sandboxID)
@@ -364,12 +389,13 @@ func (c *SafeWorkloadCreator) Observe(ctx context.Context, sandboxID string) (e2
 			return e2b.CreateResult{}, e2b.WorkloadPending, nil
 		}
 		return e2b.CreateResult{
-			SandboxName: sandboxID,
-			Namespace:   workspace,
-			PodIP:       ip,
-			PodPort:     envdPort,
-			NodeName:    node,
-			Cluster:     cluster,
+			SandboxName:    sandboxID,
+			Namespace:      workspace,
+			PodIP:          ip,
+			PodPort:        envdPort,
+			NodeName:       node,
+			Cluster:        cluster,
+			PreferredNodes: workloadPreferredNodes(obj),
 		}, e2b.WorkloadRunning, nil
 	default:
 		return e2b.CreateResult{}, e2b.WorkloadPending, nil
@@ -555,6 +581,11 @@ func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace s
 		cluster = obj.GetLabels()[safeClusterIDLabel]
 		phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
 		lastPhase, lastText = phase, workloadFailureText(obj)
+		if phase != "Running" {
+			if refusal := workloadRefusal(obj); refusal != "" {
+				return false, fmt.Errorf("%w: workload %s: %s", e2b.ErrCreateRefused, name, refusal)
+			}
+		}
 		switch phase {
 		case "Failed", "Succeeded", "Stopped":
 			return false, terminalWorkloadError(name, phase, obj)
@@ -581,6 +612,45 @@ func (c *SafeWorkloadCreator) waitRunning(ctx context.Context, name, workspace s
 		return "", "", cluster, err
 	}
 	return podIP, nodeName, cluster, nil
+}
+
+// workloadRefusalLimit bounds the refusal text returned to the caller.
+const workloadRefusalLimit = 1024
+
+// workloadRefusal is the API server's refusal of the sandbox Pod, as the
+// sandbox controller published it (SandboxPodCreateRefusedPrefix) and SaFE
+// copied it onto the Workload status or a condition, or "" when there is none.
+// The same spec is refused the same way on every dispatch, so waiting for the
+// Workload to run cannot end in anything but the pending deadline.
+func workloadRefusal(obj *unstructured.Unstructured) string {
+	texts := []string{}
+	if message, _, _ := unstructured.NestedString(obj.Object, "status", "message"); message != "" {
+		texts = append(texts, message)
+	}
+	conditions, _, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	for _, item := range conditions {
+		condition, ok := item.(map[string]any)
+		if !ok || condition["status"] != "True" {
+			continue
+		}
+		if message, _ := condition["message"].(string); message != "" {
+			texts = append(texts, message)
+		}
+	}
+	for _, text := range texts {
+		_, refusal, ok := strings.Cut(text, sandboxv1alpha1.SandboxPodCreateRefusedPrefix)
+		if !ok {
+			continue
+		}
+		// SaFE appends the failed pod list after ", details: "; a refused Pod
+		// never existed, so nothing there explains it.
+		refusal, _, _ = strings.Cut(refusal, ", details: ")
+		refusal = strings.Join(strings.Fields(refusal), " ")
+		if refusal != "" {
+			return truncateUTF8(refusal, workloadRefusalLimit)
+		}
+	}
+	return ""
 }
 
 // pendingWorkloadError appends the last observed Workload phase and status to head.
@@ -900,11 +970,38 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	if len(env) > 0 {
 		spec["env"] = env
 	}
-	if paths := templateHostPaths(ci.Spec.Template); len(paths) > 0 {
+	paths := templateHostPaths(ci.Spec.Template)
+	if len(paths) > 0 {
 		spec["hostpath"] = paths
 	}
-	if nodes := strings.TrimSpace(req.AvoidNodes); nodes != "" {
-		spec["customerLabels"] = map[string]any{"excluded-nodes": nodes}
+	storage := ci.Spec.Template.WorkspaceStorageMode()
+	if !storage.Valid() {
+		return nil, fmt.Errorf("template %s: workspaceStorage %q is none of on, off and readOnly", req.TemplateID, storage)
+	}
+	// A grant template's hostPath volumes are read-only views of the
+	// workspace's storage, which the grant service accepts only with the
+	// workspace's storage off or read-only. A template that reaches here with
+	// hostPath volumes and the storage on (for example one stored before the
+	// CodeInterpreter schema kept workspaceStorage, which would have dropped
+	// it) is refused rather than created with a read-write parent over its
+	// read-only mounts.
+	if len(paths) > 0 && grantTemplate(ci) && storage.Writable() {
+		return nil, fmt.Errorf("template %s mounts host paths with its workspace's storage on; a grant template's host paths need workspaceStorage off or readOnly", req.TemplateID)
+	}
+	if err := runtimev1alpha1.ValidatePreferredNodes(ci.Spec.Template.PreferredNodes); err != nil {
+		return nil, fmt.Errorf("template %s: %w", req.TemplateID, err)
+	}
+	avoid := strings.TrimSpace(req.AvoidNodes)
+	preferred := preferredNodes(ci.Spec.Template.PreferredNodes, avoid)
+	customerLabels := map[string]any{}
+	if avoid != "" {
+		customerLabels[excludedNodesLabel] = avoid
+	}
+	if preferred != "" {
+		customerLabels[specifiedNodesLabel] = preferred
+	}
+	if len(customerLabels) > 0 {
+		spec["customerLabels"] = customerLabels
 	}
 	if req.SigningKeyPEM != "" {
 		spec["secrets"] = []any{map[string]any{"id": signingSecretName(req.SandboxID), "type": "general"}}
@@ -924,6 +1021,12 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 		labels[ownerKeyLabel] = "true"
 	}
 	annotations := map[string]any{}
+	switch storage {
+	case runtimev1alpha1.WorkspaceStorageOff:
+		annotations[useWorkspaceStorageAnnotation] = "false"
+	case runtimev1alpha1.WorkspaceStorageReadOnly:
+		annotations[workspaceStorageReadOnlyAnnotation] = "true"
+	}
 	if req.UserName != "" {
 		annotations[safeUserNameAnnotation] = req.UserName
 	}
@@ -933,8 +1036,13 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 	if req.IdentityAttestation != "" {
 		annotations[identityAttestationAnnotation] = req.IdentityAttestation
 	}
-	if strings.TrimSpace(req.AvoidNodes) != "" {
+	// A preferred node list never leaves a sandbox pending when the nodes are
+	// full or not in the workspace.
+	if avoid != "" || preferred != "" {
 		annotations[nodesAffinityAnnotation] = nodesAffinityPreferred
+	}
+	if len(ci.Spec.Template.PreferredNodes) > 0 {
+		annotations[preferredNodesAnnotation] = strings.Join(ci.Spec.Template.PreferredNodes, " ")
 	}
 	layers, err := sandboxlayer.Resolve(ci.Spec.Template.Layers, sandboxlayer.TemplateMounts(ci.Spec.Template))
 	if err != nil {
@@ -959,6 +1067,31 @@ func workloadObject(name string, req e2b.CreateRequest, ci *runtimev1alpha1.Code
 }
 
 // ephemeralStorage returns the template pod storage, or the default when unset.
+// workloadPreferredNodes reads the template's preferred nodes recorded on a
+// Workload, including any the create also avoided.
+func workloadPreferredNodes(obj *unstructured.Unstructured) string {
+	return obj.GetAnnotations()[preferredNodesAnnotation]
+}
+
+// preferredNodes is the specified-nodes value for a template's preferred
+// nodes: the names space-separated, without any name in avoid (space-separated).
+// A node both preferred and avoided would score like any other node, so the
+// avoid wins and the node is only avoided.
+func preferredNodes(names []string, avoid string) string {
+	avoided := map[string]struct{}{}
+	for _, name := range strings.Fields(avoid) {
+		avoided[name] = struct{}{}
+	}
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, ok := avoided[name]; ok {
+			continue
+		}
+		out = append(out, name)
+	}
+	return strings.Join(out, " ")
+}
+
 func ephemeralStorage(req corev1.ResourceRequirements) string {
 	if s := quantityString(req.Limits, corev1.ResourceEphemeralStorage); s != "" {
 		return s
@@ -1069,6 +1202,17 @@ func applyTemplateRuntime(tmpl *runtimev1alpha1.CodeInterpreterSandboxTemplate, 
 	if script := strings.Join(steps, " && "); script != "" {
 		env[startupEnv] = script
 	}
+}
+
+// grantTemplate reports whether ci was registered for one grant, whose
+// templates the grant service holds to its mount rules; the owner policy's
+// templates are an administrator's and are not.
+func grantTemplate(ci *runtimev1alpha1.CodeInterpreter) bool {
+	id := ci.Labels[grantIDLabel]
+	if id == "" {
+		id = ci.Annotations[grantIDLabel]
+	}
+	return id != "" && id != grant.OwnerTemplatesID
 }
 
 // templateHostPaths returns host paths SaFE mounts at the same path.

@@ -215,6 +215,48 @@ export interface AssistantRemoteNotice {
   item_seq?: number;
   /** A task the assistant handed to a seat: which seat; `alias` is the name the person confirmed for it, null when none. */
   seat?: { seat_id: string; alias: string | null };
+  /**
+   * With `kind` `done` or `error`, a turn of a conversation open in a terminal that ended while nobody was at that terminal: what a
+   * channel draws its own card from (the text says the same for a channel that does not).
+   */
+  end?: AssistantTerminalEnd;
+}
+
+/**
+ * A turn of a conversation open in a terminal that ended while nobody was at it, as a channel's card shows it. Plain one-line text but
+ * `summary` (up to three lines) and `full`; what the agent wrote (`summary`, `full`) is its own words, never instructions.
+ */
+export interface AssistantTerminalEnd {
+  /** The work item the conversation is filed under (`#N`), which `/approvals mute #N` names. */
+  item_seq: number;
+  /** The conversation's own name (its connector's list), else its title, else the tool's name. */
+  name: string;
+  /** The last two parts of its folder ("" none). */
+  folder: string;
+  /** Why a turn that failed did (Claude Code's `StopFailure` reason, such as `rate_limit`); absent for one that finished. */
+  error?: string;
+  /** What it did, from the start of its last answer (or the block that sums it up): whole sentences, at most a few lines. */
+  summary: string;
+  /** The end of its last answer as its connector posted it (at most 2000 characters, "…" first when cut), for "show all". */
+  full: string;
+  /** Whether `summary` left something of the answer out. */
+  more: boolean;
+  /** The command that attaches the chat to this conversation (`/agent attach <ref>`), when its connector lists it. */
+  attach?: string;
+  /**
+   * Earlier turns folded into this end that the person must hear of, said before `summary` (which is the latest turn's): the latest
+   * that asked them something, and the latest that failed, each with how many did. `text` is that turn's words in whole sentences
+   * (untrusted), "" when its connector no longer carries them (the terminal has them). Absent when no earlier turn asked or failed.
+   */
+  earlier?: AssistantTerminalEarlier[];
+}
+
+/** An earlier turn folded into a terminal's end that asked the person something (`asked`) or failed (`failed`). */
+export interface AssistantTerminalEarlier {
+  kind: "asked" | "failed";
+  text: string;
+  /** How many earlier turns of the run did (at least 1). */
+  count: number;
 }
 
 /** A permission request a development environment's agent waits on (`permissionRequest`), as its connector posted it. */
