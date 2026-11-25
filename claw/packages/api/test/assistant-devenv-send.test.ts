@@ -1866,7 +1866,7 @@ describe("development environment items and devenv_send", { skip }, () => {
     assert.match(section, /Never say something did not run when such an item says it finished/);
     assert.doesNotMatch(section, /nothing here sends it/);
     assert.match(prompts.renderRouterDevenvSection({ actions: true }), /nothing here sends it/);
-    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v15");
+    assert.equal(prompts.ROUTER_DEVENV_PROMPT_VERSION, "router-devenv-v16");
     // "连接我的开发机" and its kin (a typo too) connect a machine.
     for (const said of ["连接我的开发机", "连接开发机", "连我的机器", "连接我得开发机"]) assert.ok(section.includes(said), said);
     assert.doesNotMatch(section, /needs_identity/);

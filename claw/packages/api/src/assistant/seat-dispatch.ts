@@ -34,7 +34,7 @@ import {
   errandNotice, errandText, errandWorkerSessionId, langOf, noteErrandPrompt, REMOTE_EVENT_COMMAND_REJECTED, REMOTE_EVENT_TURN_END, reportErrand,
   SEAT_QUEUE_REASONS, type ErrandParams, type ErrandQueue, type RemoteLang,
 } from "./remote-items.js";
-import { SEAT_QUEUE_MAX, seatDispatchOn, seatsLive, syncSeats, type SeatLive } from "./seats.js";
+import { SEAT_QUEUE_MAX, seatDispatchOn, seatDisplayName, seatsLive, syncSeats, type SeatLive } from "./seats.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
 import { typedCommand } from "./typed-commands.js";
@@ -90,10 +90,13 @@ export function parseTarget(raw: unknown): Target | null {
   return { kind: "seats", seats, sandbox };
 }
 
-/** How a seat is named to the user: the alias they confirmed, else `<machine>/<agent>`; one line of at most 40 code points. */
-export function seatLabel(live: Pick<SeatLive, "machine" | "seat">): string {
+/**
+ * How a seat is named to the user on a card: the alias they confirmed with the name its session has on their machine beside it (what
+ * `/agents` shows), else that name, else `<machine>/<agent>`; one line of at most 40 code points.
+ */
+export function seatLabel(live: Pick<SeatLive, "machine" | "seat"> & { names?: readonly string[] }): string {
   const alias = typeof live.seat.alias === "string" && live.seat.alias ? live.seat.alias : null;
-  return flat(alias ?? `${live.machine}/${String(live.seat.agent_id)}`, LABEL_MAX);
+  return flat(seatDisplayName(alias, live.names ?? []) ?? `${live.machine}/${String(live.seat.agent_id)}`, LABEL_MAX);
 }
 
 /** Why a task for this seat needs a card, or null when it may go directly (see the module's comment). */
