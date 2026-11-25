@@ -425,7 +425,9 @@ export interface EnsuredHooks {
 export function ensureClaudeHooks(ctx: Ctx, o: { create?: boolean } = {}): EnsuredHooks[] {
   let dirs: string[];
   try { dirs = claudeDirs(ctx, undefined); } catch (e) { return [{ dir: defaultClaudeDir(ctx), error: errMessage(e) }]; }
-  migrateHookPrefs(ctx.dirs, dirs, hasSet, false);
+  // Until what an older version left is carried over, adding anything could undo a no it never recorded.
+  const unmigrated = migrateHookPrefs(ctx.dirs, dirs, hasSet, false);
+  if (unmigrated) return dirs.map((dir) => ({ dir, error: unmigrated }));
   const out: EnsuredHooks[] = [];
   for (const dir of dirs) {
     const r: EnsuredHooks = { dir };

@@ -15,7 +15,7 @@ import path from "node:path";
 import test, { describe } from "node:test";
 import { fileURLToPath } from "node:url";
 import { approvalSocketFile } from "../src/approvals.js";
-import { EXIT, main, type Ctx } from "../src/commands.js";
+import { ensureClaudeHooks, EXIT, main, type Ctx } from "../src/commands.js";
 import { approvalHooksStatus, BACKUP_PREFIX, hooksStatus, installApprovalHooks, installHooks, settingsFile } from "../src/hooks.js";
 import { hookPrefsFile, legacyOfferFile } from "../src/hooks-auto.js";
 import { resolveDirs } from "../src/paths.js";
@@ -330,6 +330,25 @@ describe("an upgrade from 0.3.3 or earlier, which recorded no no", () => {
       await start(claw, other.mk());
       assert.equal(ours(other.dir).length, 0, "the directory the connector serves keeps what it had");
     } finally { await claw.close(); }
+  });
+
+  test("when what an older version left cannot be recorded, nothing is added: a no it never recorded is not undone", () => {
+    const h = tmpdir();
+    const blocker = path.join(h, "not-a-dir");
+    fs.writeFileSync(blocker, "");
+    const dir = path.join(h, "claude-config");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(settingsFile(dir), JSON.stringify(MINE, null, 2));
+    const before = fs.readFileSync(settingsFile(dir), "utf8");
+    const bin = tmpdir("cc-hookbin-");
+    const c: Ctx = {
+      dirs: { config: path.join(blocker, "config"), state: path.join(h, "state") }, env: { CLAUDE_CONFIG_DIR: dir, PATH: "/nonexistent" },
+      out: () => {}, err: () => {}, hostname: "box", node: NODE, hookScript: stand("terminal-hook.js", bin), approvalHookScript: stand("approval-hook.js", bin),
+    };
+    const r = ensureClaudeHooks(c);
+    assert.equal(r.length, 1);
+    assert.match(r[0]!.error ?? "", /could not write .*claude-hooks\.json/);
+    assert.equal(fs.readFileSync(settingsFile(dir), "utf8"), before, "settings.json untouched");
   });
 
   test("hooks install keeps the approval hooks out under CLAW_APPROVAL_HOOKS=off, as a start does; --approvals adds them", async () => {

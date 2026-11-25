@@ -75,11 +75,12 @@ function legacyNoDirs(d: Dirs): string[] {
  * with none of its hooks there was taken out or never agreed to (`hooks uninstall`, `--no-hooks`, `--no-approval-hooks`, a "n"
  * at init/pair or to the one-time question): "off" for that directory, so it stays out until `hooks install` or `--hooks`.
  * `present` says whether any hook of that set is in that directory's settings, or null when they cannot be read (then nothing is
- * recorded for it, and the hooks go in once the file can be merged into). Never throws: a failure is retried next time.
+ * recorded for it, and the hooks go in once the file can be merged into). Never throws: it returns why the file could not be
+ * written (then the caller adds nothing, since a no it cannot see yet would be undone), and it is tried again next time.
  */
-export function migrateHookPrefs(d: Dirs, dirs: string[], present: (dir: string, set: HookSet) => boolean | null, fresh: boolean): void {
+export function migrateHookPrefs(d: Dirs, dirs: string[], present: (dir: string, set: HookSet) => boolean | null, fresh: boolean): string | null {
   try {
-    if (fs.existsSync(hookPrefsFile(d))) return;
+    if (fs.existsSync(hookPrefsFile(d))) return null;
     const p: Prefs = { v: 1, all: {}, dirs: {} };
     for (const dir of legacyNoDirs(d)) p.dirs[dir] = { approvals: "off" };
     if (!fresh) {
@@ -90,9 +91,10 @@ export function migrateHookPrefs(d: Dirs, dirs: string[], present: (dir: string,
         if (Object.keys(c).length) p.dirs[dir] = c;
       }
     }
-    if (fs.existsSync(hookPrefsFile(d))) return;
+    if (fs.existsSync(hookPrefsFile(d))) return null;
     writePrefs(d, p);
-  } catch { /* tried again next time */ }
+    return null;
+  } catch (e) { return `could not write ${hookPrefsFile(d)}: ${(e as Error).message}`; }
 }
 
 /** Which sets of hooks belong in this directory: a choice made for the directory, else one made for all, else both. */
