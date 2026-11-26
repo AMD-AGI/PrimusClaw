@@ -296,6 +296,15 @@ release version, and its `appVersion` stays `latest`.
   is a Prometheus rule group with two alerts, `ClawNotificationOutboxStalled` (a notification has waited more than 15
   minutes, for 5 minutes) and `ClawNotificationQuarantined`, tested with `promtool` in CI.
 
+- Claw, personal agent: `/approvals` with no word says the whole state in one message: whether approvals from terminals are on, how
+  often a conversation that keeps working on its own is summed up (or that summaries are off), and the conversations the user
+  muted, each with its `#<item>` (what `/approvals unmute #<item>` takes), its name now (as its machine lists it, else the title
+  it had when muted), its machine and since when (UTC), or that none is muted. Claw serves them on
+  `GET /v1/remote-agents/approvals/mutes` (the user's own only, newest mute first: `item`, `machine`, `title`, `muted_since`; `item`
+  is the latest work item of the conversation, null when none is left), named as `devenv_list`'s `muted_conversations` names them,
+  which now carry `item` too. The personal agent needs the Claw release with this entry: with an older Claw, `/approvals` says
+  the setting cannot be reached now.
+
 ### Changed
 
 - Claw: one session, one seat. A seat is now one conversation of an agent on the user's machine (`claw_devenv_seats.conversation_ref`,
@@ -443,6 +452,11 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Personal agent: a message that starts with the bot's name typed as words (`@clawy /approvals`: what Teams on a phone sends when the
+  name was typed and not picked, with no mention behind it) was read as a sentence and answered by the assistant, never as the
+  command it carries (2026-11-26, `/approvals` answered with the assistant's overview). The name first, before more words, is now
+  dropped from the text as a picked mention is, in a 1:1 and in a group chat; the name alone, or a word that merely starts with it
+  (`@clawyx`), stays as typed, and the mentions of other people keep their place in the words.
 - Claw: the assistant named the user's sessions differently from their `/agents` card. `devenv_list` gave a session's title (the
   name the user gave it on their machine) only with `detail: "activity"`, and its default read listed each machine's first six
   sessions, not the ones the card shows; asked again with a plain read, the router called the titles it had given made up and said
@@ -456,8 +470,8 @@ release version, and its `appVersion` stays `latest`.
 - Claw: asked "did I mute only this one conversation?", the assistant said it could not tell: no tool it reads carried the mutes
   (`/approvals mute #<item>`, or a card's mute button), only titles, states and activity. And with more sessions on a machine than
   the `/agents` card shows, it said the count as "8 in all, 8 listed, 1 not listed". `devenv_list` now gives
-  `muted_conversations` (every conversation the user muted, from Claw's own record: its machine, id, title now, label and since
-  when) and each session's `muted` (and `muted_since`), and `sessions_listed` beside `session_count` and `sessions_not_shown`;
+  `muted_conversations` (every conversation the user muted, from Claw's own record: its machine, id, title now, label, since
+  when and the item that unmutes it) and each session's `muted` (and `muted_since`), and `sessions_listed` beside `session_count` and `sessions_not_shown`;
   `seat_roster` gives each seat's `muted`. The router answers mutes and counts from these and never says it cannot tell.
   Router prompt router-devenv-v17.
 - Claw: a task handed to a seat within about 30 seconds of the end of the seat's previous task was queued as "the seat

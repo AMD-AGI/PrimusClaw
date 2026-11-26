@@ -67,6 +67,33 @@ export function addressedToBot(activity: Activity, botName: string = DEFAULT_BOT
   return toBotPattern(botName).test(written(activity));
 }
 
+const typedName = new Map<string, RegExp>();
+
+/** "@<name>" as words at the start of a text, and the spaces after it (the name ends there: not at a letter, digit, `_` or `-`). */
+function typedNamePattern(botName: string): RegExp {
+  let pattern = typedName.get(botName);
+  if (pattern === undefined) {
+    pattern = new RegExp(`^${SPACE}*@${caseless(botName)}(?![\\p{L}\\p{N}_-])${SPACE}+`, "u");
+    typedName.set(botName, pattern);
+  }
+  return pattern;
+}
+
+/**
+ * `text` without the bot's name typed as words ahead of what else it says, and how many code points that took off its start. A
+ * mention a person picks is an entity, which `messageText` drops; one Teams on a phone sends as plain words (2026-11-26 03:24: "@clawy
+ * /approvals") has none, so it stayed in the text and `/approvals` was read as a sentence, not as the command. Only the name first,
+ * before more words: the name alone, or a word that merely starts with it, stays as it was typed.
+ */
+export function withoutTypedBotName(
+  text: string,
+  botName: string,
+): { readonly text: string; readonly removed: number } {
+  const named = typedNamePattern(botName).exec(text);
+  if (named === null || named[0].length === text.length) return { text, removed: 0 };
+  return { text: text.slice(named[0].length), removed: cpLength(named[0]) };
+}
+
 /**
  * The person's text without the bot's @mention markup and without what Teams adds for a quote: the words the commands
  * are read from. With no recipient id every mention is removed (the 1:1 behaviour); in a group chat a mention of

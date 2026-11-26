@@ -1393,22 +1393,34 @@ export async function terminalMuted(owner: string, connectorId: string, ref: str
   )).rows.length > 0;
 }
 
-/** One conversation open in a terminal whose pushes its owner muted: where it is, the title it had then, and since when. */
-export interface TerminalMute { connector_id: string; machine: string | null; ref: string; title: string; muted_at: string }
+/**
+ * One conversation open in a terminal whose pushes its owner muted: where it is, the title it had then, and since when; and `item`,
+ * the owner's latest work item of it (what `setTerminalMute` takes to unmute it), null when none is left.
+ */
+export interface TerminalMute { connector_id: string; machine: string | null; ref: string; title: string; muted_at: string; item: number | null }
 
 /** How a mute is matched with a conversation: its machine and its id, compared without case (as `CONVERSATION_REF_SQL` keeps ids). */
 export const muteKey = (connectorId: string, ref: string): string => `${connectorId.toLowerCase()}\u0000${ref.toLowerCase()}`;
 
-/** Every conversation the owner muted (`claw_remote_terminal_mutes`), newest first, with its machine's name. */
+/**
+ * Every conversation the owner muted (`claw_remote_terminal_mutes`), newest first, with its machine's name and the latest of their work
+ * items that a terminal-hook session of it carried (the one `setTerminalMute` finds it by).
+ */
 export async function listTerminalMutes(owner: string, q: Querier = direct): Promise<TerminalMute[]> {
   return (await q(
-    `SELECT m.connector_id::text AS connector_id, c.name AS machine, m.ref, m.title, m.muted_at FROM claw_remote_terminal_mutes m
+    `SELECT m.connector_id::text AS connector_id, c.name AS machine, m.ref, m.title, m.muted_at,
+            (SELECT MAX(i.seq) FROM claw_remote_sessions s
+               JOIN claw_work_items i ON i.user_id = m.owner_user_id AND i.kind = 'remote' AND i.params->>'origin' = 'terminal'
+                                     AND i.params->>'session_id' = s.session_id::text
+              WHERE s.owner_user_id = m.owner_user_id AND s.connector_id = m.connector_id AND s.ref = m.ref AND s.origin = $2) AS item
+       FROM claw_remote_terminal_mutes m
        LEFT JOIN claw_remote_connectors c ON c.connector_id = m.connector_id
       WHERE m.owner_user_id = $1 ORDER BY m.muted_at DESC`,
-    [owner],
+    [owner, REMOTE_ORIGIN_TERMINAL_HOOK],
   )).rows.map((r: Row) => ({
     connector_id: String(r.connector_id), machine: typeof r.machine === "string" ? r.machine : null, ref: String(r.ref),
     title: String(r.title ?? ""), muted_at: r.muted_at instanceof Date ? r.muted_at.toISOString() : String(r.muted_at),
+    item: r.item === null || r.item === undefined ? null : Number(r.item),
   }));
 }
 

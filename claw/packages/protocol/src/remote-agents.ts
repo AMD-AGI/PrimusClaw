@@ -642,6 +642,24 @@ export function parseTerminalMute(body: unknown): Parsed<{ item: number; muted: 
 }
 
 /**
+ * One conversation open in a terminal whose pushes its owner muted, as `GET /v1/remote-agents/approvals/mutes` lists them (newest
+ * mute first; `/approvals` says them).
+ */
+export interface RemoteMutedConversation {
+  /**
+   * The owner's latest work item of the conversation: the `#<item>` `/approvals unmute` and `PUT /v1/remote-agents/approvals/mutes`
+   * name it by. Null when no item of it is left to name it by.
+   */
+  item: number | null;
+  /** Its machine's name; null when that machine is gone. */
+  machine: string | null;
+  /** The conversation's name now, as its machine lists it, else the title its item had when it was muted; null: it has none. */
+  title: string | null;
+  /** When it was muted (ISO 8601). */
+  muted_since: string;
+}
+
+/**
  * Hiding conversations of a machine from its owner's lists (`POST /v1/remote-agents/connectors/:cid/hidden`), and the
  * listing that leaves them out (`GET /v1/remote-agents/connectors`, `?hidden=include` to list them too). Nothing on the
  * machine changes: only which of the conversations it reports (`capabilities.resumable`) the owner's lists show.

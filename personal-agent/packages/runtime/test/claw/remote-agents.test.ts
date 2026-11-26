@@ -143,3 +143,34 @@ describe("hiding a machine's conversations", () => {
     );
   });
 });
+
+describe("remote agents: muted conversations", () => {
+  it("reads the muted conversations as Claw lists them, newest first, and refuses an answer of another shape", async () => {
+    const wire = new Wire(() =>
+      json(200, {
+        data: [
+          { item: 12, machine: "pod", title: "clean", muted_since: "2026-11-26T03:21:56.359Z" },
+          { item: null, machine: null, title: null, muted_since: "2026-11-25T10:00:00Z", extra: 1 },
+          "not a row",
+        ],
+      }),
+    );
+    const claw = wire.client();
+    assert.deepEqual(await claw.remoteAgents.mutedTerminals("ak-a"), [
+      { item: 12, machine: "pod", title: "clean", muted_since: "2026-11-26T03:21:56.359Z" },
+      { item: null, machine: null, title: null, muted_since: "2026-11-25T10:00:00Z" },
+    ]);
+    assert.deepEqual(
+      wire.sent.map((s) => [s.method, s.rawPath, s.headers.get("x-claw-client")]),
+      [["GET", "/v1/remote-agents/approvals/mutes", "personal-agent"]],
+    );
+    wire.answer = () => json(200, { data: [] });
+    assert.deepEqual(await claw.remoteAgents.mutedTerminals("ak-a"), []);
+    wire.answer = () => json(200, { data: [{ item: 3, machine: "pod", title: "x" }] });
+    await assert.rejects(claw.remoteAgents.mutedTerminals("ak-a"), ClawAnswerInvalid, "a mute with no time");
+    wire.answer = () => json(200, { data: { muted: [] } });
+    await assert.rejects(claw.remoteAgents.mutedTerminals("ak-a"), ClawAnswerInvalid, "not a list");
+    wire.answer = () => json(200, { data: "nope" });
+    await assert.rejects(claw.remoteAgents.mutedTerminals("ak-a"), ClawAnswerInvalid);
+  });
+});

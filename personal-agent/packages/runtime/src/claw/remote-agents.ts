@@ -17,6 +17,7 @@ import {
   type RemoteConnector,
   type RemoteEventRow,
   type RemoteHidden,
+  type RemoteMutedConversation,
   type RemotePairing,
   type RemoteSession,
   type RemoteSetup,
@@ -24,7 +25,7 @@ import {
   type TerminalMute,
 } from "@primusclaw/personal-agent";
 import type { z } from "zod";
-import { anyDataOf, dataOf } from "./answers.js";
+import { anyDataOf, dataOf, rowsOf } from "./answers.js";
 import { type ClawHttp, pyQuote, segment } from "./http.js";
 import { sseEvents } from "./sse-stream.js";
 
@@ -88,6 +89,19 @@ export class HttpRemoteAgents implements ClawRemoteAgentsPort {
       machine: typeof d["machine"] === "string" ? d["machine"] : "",
       title: typeof d["title"] === "string" ? d["title"] : "",
     };
+  }
+
+  async mutedTerminals(key: ClawCredential): Promise<RemoteMutedConversation[]> {
+    return rowsOf(await this.#call("GET", "/approvals/mutes", key), "the muted conversations").map((row) => {
+      if (typeof row["muted_since"] !== "string")
+        throw new ClawAnswerInvalid("a muted conversation has no muted_since");
+      return {
+        item: typeof row["item"] === "number" ? row["item"] : null,
+        machine: typeof row["machine"] === "string" ? row["machine"] : null,
+        title: typeof row["title"] === "string" ? row["title"] : null,
+        muted_since: row["muted_since"],
+      };
+    });
   }
 
   async pair(key: ClawCredential): Promise<RemotePairing> {

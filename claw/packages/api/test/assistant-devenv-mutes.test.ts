@@ -14,6 +14,8 @@
  *   MU1b a muted conversation held by a session open through Claw is named by that session's title and label
  *   MU2 a machine with more sessions than its agents card shows says how many are listed: session_count = sessions_listed + sessions_not_shown
  *   MU3 the router is told to answer mutes and counts from these fields, never "cannot tell"
+ *   MU4 `mutedConversations` (what `/approvals` says): each muted conversation with its machine, its name now, since when and its
+ *       item; nothing of anyone else's
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -145,6 +147,26 @@ describe("devenv_list mutes and counts", { skip }, () => {
     const one = await devenv.devenvList(await userTurn(alice, "yihan-dev-pod 上的会话都列出来"), { machine: "yihan-dev-pod" });
     assert.equal(one.machines[0]!.sessions.length, 7);
     assert.equal(one.machines[0]!.sessions_not_shown, undefined);
+  });
+
+  test("MU4 mutedConversations names each muted conversation as the router does, and lists only the user's own", async () => {
+    await w.user("alice");
+    const clean = conv(1, "clean", "live", 30);
+    const pod = await machine("alice", "yihan-dev-pod", [clean, conv(2, "hosting", "live", 60)]);
+    await mute("alice", pod, clean.ref, "yihan", 1);
+    await mute("alice", pod, "a0000000-0000-4000-8000-000000000099", "an old one", 600);
+    const bobBox = await machine("bob", "bob-box", [conv(7, "bob's", "live", 10)]);
+    await mute("bob", bobBox, conv(7, "x", "live", 0).ref, "bob's", 1);
+
+    const out = await devenv.mutedConversations("alice");
+    assert.deepEqual(out.map((m) => [m.item, m.machine, m.title]), [
+      [null, "yihan-dev-pod", "clean"], // (the title it has now, not the one it was muted under; no item of it is left to name it by)
+      [null, "yihan-dev-pod", "an old one"], // (one the machine no longer reports keeps the title it had)
+    ]);
+    assert.deepEqual(Object.keys(out[0]!).sort(), ["item", "machine", "muted_since", "title"]);
+    assert.ok(Date.parse(out[0]!.muted_since) > Date.parse(out[1]!.muted_since), "newest first");
+    assert.deepEqual((await devenv.mutedConversations("bob")).map((m) => [m.machine, m.title]), [["bob-box", "bob's"]]);
+    assert.deepEqual(await devenv.mutedConversations("carol"), []);
   });
 
   test("MU3 the router answers mutes and counts from devenv_list, never 'cannot tell'", () => {

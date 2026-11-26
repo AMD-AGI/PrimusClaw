@@ -67,6 +67,62 @@ test("a group message: who, where, the words, the mentions, the links and the qu
   assert.equal(markedText(event.text, event.mentions).text, `Dana, ask ${MARK_OPEN}0${MARK_CLOSE} about fix it`);
 });
 
+// 2026-11-26 03:24: a person sent `/approvals` to the bot from Teams on iOS and got the assistant's overview, not the command's answer. The
+// text that reached the worker was "@clawy /approvals": the bot's name typed as words, with no mention entity behind it (a picked mention
+// is an entity, and `messageText` drops it), so it was not an exact command and went to the assistant as a sentence.
+test("the bot's name typed as words ahead of a command is not part of the command", () => {
+  const said = (text: string, botName = "Clawy"): string => message(dm(text), botName).text;
+  assert.equal(said("@clawy /approvals"), "/approvals");
+  assert.equal(said("@Clawy /approvals mute #12"), "/approvals mute #12");
+  assert.equal(said("  @CLAWY \u00a0 /help"), "/help");
+  assert.equal(said("@clawy\n/approvals"), "/approvals");
+  assert.equal(said("@PrimusClaw Assistant /approvals", "PrimusClaw Assistant"), "/approvals");
+  // (also in a reply to a message, whose text is HTML with the quote cut out of it)
+  assert.equal(message(dm(replyHtml({ own: "@clawy /approvals" })), "Clawy").text, "/approvals");
+  // (and no run of spaces after the name makes it slow)
+  assert.equal(said(`@clawy${" ".repeat(50_000)}x`), "x");
+  assert.equal(said(`@clawy${" ".repeat(50_000)}`), "@clawy");
+  assert.equal(said(`${" ".repeat(50_000)}@clawy${"\u00a0".repeat(50_000)}`), "@clawy");
+  // not the bot's name, or not first, or the whole message, or no other word: left as typed
+  for (const text of [
+    "@clawy",
+    "@clawy ",
+    "@clawyx /approvals",
+    "@clawy_ /approvals",
+    "@clawy-2 /approvals",
+    "hi @clawy /approvals",
+    "/approvals @clawy",
+    "clawy /approvals",
+    "@ clawy /approvals",
+  ])
+    assert.equal(said(text), text.trim(), text);
+  assert.equal(said("@clawy /approvals", "Robin"), "@clawy /approvals", "another deployment's name");
+  // the bot is still named first (what an attached chat reads to keep the words for the bot), and a picked mention reads as before
+  const typed = message(dm("@clawy /approvals"), "Clawy");
+  assert.deepEqual([typed.namesBotFirst, typed.mentioned], [true, false]);
+  const picked = message(
+    dm("<at>Clawy</at> /approvals", {
+      entities: [{ type: "mention", text: "<at>Clawy</at>", mentioned: { id: BOT, name: "Clawy" } }],
+    }),
+    "Clawy",
+  );
+  assert.deepEqual([picked.text, picked.namesBotFirst, picked.mentioned], ["/approvals", true, true]);
+  // a group chat's message that names the bot as words reads the same
+  assert.equal(message(grp("@clawy /help", { mention: false }), "Clawy").text, "/help");
+});
+
+test("a mention of someone else keeps its place in the words once the bot's name typed ahead is gone", () => {
+  const typed = message(dm("@clawy ask <at>Dana</at> now", { entities: [DANA] }), "Clawy");
+  assert.equal(typed.text, "ask Dana now");
+  assert.deepEqual(typed.mentions, [
+    { channelUserId: "29:dana", userId: "aad-d", name: "Dana", shown: "Dana", offset: 4 },
+  ]);
+  assert.equal(markedText(typed.text, typed.mentions).text, `ask ${MARK_OPEN}0${MARK_CLOSE} now`);
+  // the same words with no name ahead: the same offset
+  const plain = message(dm("ask <at>Dana</at> now", { entities: [DANA] }), "Clawy");
+  assert.deepEqual(plain.mentions, typed.mentions);
+});
+
 test("the message id of a quote comes from the entity and from the html", () => {
   const html = message(dm("hi", { attachments: [htmlAttachment(replyHtml({ messageId: "m-7", senderId: BOT }))] }));
   const [first] = html.quotes;

@@ -27,7 +27,7 @@
  */
 import { createHash } from "node:crypto";
 import pino from "pino";
-import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_EVENT_USER_PROMPT } from "@claw/protocol";
+import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_EVENT_USER_PROMPT, type RemoteMutedConversation } from "@claw/protocol";
 import { CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
@@ -260,6 +260,8 @@ export interface DevenvMuted {
   /** Its label in this read, or null when this read does not list it. */
   label: string | null;
   muted_since: string;
+  /** The user's latest work item of the conversation (`/approvals unmute #<item>` names it); null when none is left. */
+  item: number | null;
 }
 
 export interface DevenvMachine {
@@ -913,8 +915,19 @@ export function mutedListed(
   const listed = new Set(machines.flatMap((m) => m.sessions.map((s) => s.label)));
   return muted.map((m) => ({
     machine: m.machine_now, id: m.ref, title: m.now ? m.now.title : flat(m.title, NAME_MAX),
-    label: m.now && listed.has(m.now.label) ? m.now.label : null, muted_since: m.muted_at,
+    label: m.now && listed.has(m.now.label) ? m.now.label : null, muted_since: m.muted_at, item: m.item,
   }));
+}
+
+/**
+ * The conversations the user muted, as `/approvals` says them (`GET /v1/remote-agents/approvals/mutes`): each as `devenv_list` names it
+ * (its title now, else the one it had when it was muted), with the item to unmute it by.
+ */
+export async function mutedConversations(
+  userId: string, onlineWindowMs: number = REMOTE_AGENT_TIMING.onlineWindowMs,
+): Promise<RemoteMutedConversation[]> {
+  const { machines, muted } = await collect(userId, false, onlineWindowMs);
+  return mutedListed(muted, machines).map(({ item, machine, title, muted_since }) => ({ item, machine, title, muted_since }));
 }
 
 /**
