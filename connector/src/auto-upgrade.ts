@@ -26,8 +26,8 @@
  *  - then on probation (`Probation`) until a real run of it stays connected for `probationMs`: three runs of it that fail
  *    first (counted by the run as it starts and by the script supervisor as it ends) restore the backup and pin it the same way.
  *
- * The first run of the new version does the setup a new version may need (commands.ts `postUpgradeSetup`): hooks that are
- * installed are brought up to date; hooks that are not are never added, only mentioned once. The outcome travels to Claw
+ * The first run of the new version does the setup a new version may need (commands.ts `postUpgradeSetup`; the Claude Code hooks
+ * are put in place by every start, `ensureClaudeHooks`). The outcome travels to Claw
  * with every heartbeat (`capabilities.auto_upgrade`, and a health problem while it cannot upgrade).
  *
  * A connector from before this file cannot be reached this way: its first upgrade to a version with it is done by hand.

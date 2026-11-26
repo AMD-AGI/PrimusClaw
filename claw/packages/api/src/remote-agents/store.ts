@@ -799,6 +799,15 @@ export async function recentCommandCount(q: Querier, owner: string): Promise<num
  * (`read_only` on the session's newest `session_started` or `session_resumed`, connector/src/session.ts `spectate`). Such a
  * session shows what the terminal does and takes no prompt; the routes refuse one before it is queued.
  */
+/**
+ * The agent's own id of the conversation a session holds (`session_started.acp_session_id`: the one it started, or the one it took over
+ * or watches), lower case; null until the machine said it. A session holds one conversation all its life, so the first that names it
+ * (near the start of its events: cheap) is the one. A seat is one such conversation (`assistant/seats.ts`).
+ */
+export const CONVERSATION_REF_SQL = `(SELECT LOWER(e.data->>'acp_session_id') FROM claw_remote_events e
+   WHERE e.session_id = s.session_id AND e.type = 'session_started' AND e.data->>'acp_session_id' ~ '^[A-Za-z0-9._:-]{1,128}$'
+   ORDER BY e.id LIMIT 1)`;
+
 const READ_ONLY_SQL = `COALESCE((SELECT e.data->>'read_only' = 'true' FROM claw_remote_events e
    WHERE e.session_id = s.session_id AND e.type IN ('session_started', 'session_resumed') ORDER BY e.id DESC LIMIT 1), false)`;
 
@@ -850,7 +859,7 @@ const ACTIVITY_PROMPTS = 10;
 export async function sessionActivity(owner: string, limit: number, events = ACTIVITY_EVENTS): Promise<Row[]> {
   return (await direct(
     `SELECT s.session_id::text AS session_id, s.connector_id::text AS connector_id, s.agent_id, s.cwd, s.mode,
-            s.created_at, s.updated_at, ${READ_ONLY_SQL} AS read_only,
+            s.created_at, s.updated_at, ${READ_ONLY_SQL} AS read_only, ${CONVERSATION_REF_SQL} AS conversation_ref,
             (SELECT COUNT(*)::int FROM claw_remote_commands m
               WHERE m.connector_id = s.connector_id AND m.session_id = s.session_id AND m.type = 'prompt'
                 AND NOT EXISTS (

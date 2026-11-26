@@ -571,9 +571,12 @@ its prompt treats the user's development environments (开发环境, dev box, my
 connectors, never as SaFE workspaces. The tool answers the caller's own connectors that are not
 revoked: each machine's name, whether it is online, when it was last seen, its version and its
 agents; and every session on it, both the ones open through Claw and the agents' own
-conversations a connector offers to take over (`capabilities.resumable`), each with its folder,
-state (`working`, `waiting_for_you`, `idle`, `in_terminal`), last activity, a label
-(`machine/agent/n`) and the command that attaches the user's chat to it
+conversations a connector offers to take over (`capabilities.resumable`), each with its id (the
+Claw session id or the conversation ref), its `title` (the name the user gave it on their machine,
+as `/agents` shows it; for a session open through Claw, the title of the conversation it holds or
+watches), its folder, state (`working`, `waiting_for_you`, `idle`, `in_terminal`), last activity,
+a label (`machine/agent/n`, numbered in the order `/agents` lists them) and the command that
+attaches the user's chat to it
 (`/agent attach <session id or conversation ref>`). The router passes that command to the
 channel with `channel_action`; a machine that is offline has none. A conversation open in a
 terminal on the machine has one too when its agent reports `watch_live`, marked `read_only` with a
@@ -590,6 +593,13 @@ gets one. An agent that only takes over existing conversations (`kind: attach`),
 reports no folder, or one on a machine whose name another online machine of the user's shares
 has none. With no session anywhere and one such agent, it is `attach_default`
 (`new_session: true`).
+
+When every machine is asked for, each machine lists the sessions the user's agents card (`/agents`)
+shows of it, in its order: under each of the first six agents of online machines (all machines
+counted) the conversations open in a terminal (at most five among its twelve newest), then idle ones in the room left (at most two),
+then ones the connector cannot tell (at most two); and the five newest sessions open through Claw
+of all machines. The rest are counted (`session_count`, `sessions_by_state`, `sessions_not_shown`)
+and listed when that machine is asked for by name, marked `not_on_agents_card`.
 
 ### Development environment items
 
@@ -667,11 +677,20 @@ reported reaches the model only after the choice, and the turn has read it from 
 
 ### Seats
 
-A seat is one folder an agent works in on one of the user's machines (`claw_devenv_seats`: owner, connector, agent, folder, and an
-optional conversation ref that no seat uses yet). Sessions end, are compacted or are taken over, and their ids change; the folder does
-not, so that is what the user's word about it is kept on. Claw makes and keeps the seats from what it already has: every folder a
-session open through Claw works in, and every folder of a conversation a connector reports (open now, or updated within 30 days). A seat
-whose machine registers again under its name (a reinstall that revoked the old row) moves to the new row, with what the user said of it.
+A seat is one conversation of an agent on one of the user's machines (`claw_devenv_seats`: owner, connector, agent, folder, and
+`conversation_ref`, the agent's own id of that conversation, lower case): one session, one seat, so six named sessions in one folder
+are six seats. Claw opens sessions on a conversation and closes them, and their ids change; the conversation's does not, so that is
+what the user's word about it is kept on. Claw makes and keeps the seats from what it already has: every conversation a connector
+reports (open now, or updated within 30 days), and every one a session open through Claw holds (the one it started or took over, as
+its `session_started.acp_session_id` names it); a conversation that one agent started and another of that machine takes over (Claude
+Code and its existing-sessions entry) is one seat, under the agent that takes it over. A session open through Claw whose conversation
+its machine has not named yet holds a seat of its folder until it does. A seat of a folder (as seats were made before 2026-11-25)
+moves to the conversation that occupies it: its current session's, else the one open there now (newest first), else the latest its
+agent had there, with its alias, role and dispatch mode; when that conversation already has a seat, the one that holds more of the
+user's (a confirmed or retired role, an alias, a guess) is kept, with the other's tasks and waiting cards; when both hold the user's
+words, the next session there is tried, and a folder's seat none is left for stays the folder's: a task for it is refused
+(`seat_unbound`) while no session of it holds a conversation, rather than guessing one. A seat whose machine registers again under its name (a reinstall that revoked the old row) moves to the new
+row, with what the user said of it.
 
 What a seat is for (`alias`, at most 16 characters, and `role`, at most 120) counts only once the user confirmed it on a card, from one
 of two sources:
@@ -684,9 +703,10 @@ of two sources:
   it), and telling the assistant what it handles instead goes through `seat_set`. The guess is one model call with no tools, never in
   the router's prompt, whose answer is kept only if it fits the schema (a role that is a description, an alias that is a name, tags
   only from Claw's own slugs of the folder's git remote and branch). Its inputs are data: the folder, its git remote and branch, the
-  titles of its conversations, the start (80 characters) of the user's last 20 prompts there, and once per seat (again only when the
+  title of its conversation (a seat of a folder: of its conversations), the start (80 characters) of the user's last 20 prompts in it,
+  and once per seat (again only when the
   user asks for a refresh, `seat_set{refresh: true}`) the session's own answer to one fixed question, in the user's language (that of their latest message; English
-  when there is none): *"(Your assistant, read-only: asked once to learn what this folder's session is for; nothing will be
+  when there is none): *"(Your assistant, read-only: asked once to learn what this session is for; nothing will be
   changed.) Please describe in two or three sentences what you are responsible for in this directory and what you have been
   working on recently. Only answer; do not run any tool or change anything."* Its first line is there for the person (fixed words: no
   name a client sends goes into it): a chat attached to that session shows the question and its answer like any other turn. It is asked only in a session open through Claw that is idle with nothing in it for ten minutes,
@@ -708,11 +728,21 @@ of two sources:
 
 `seat_roster` (a router read) lists the seats with only what Claw computed or the user confirmed: `seat_id`, `alias`, the confirmed
 `role`, `role_state` (`new`, `suggested`, `confirmed`, `retired`), `machine_online`, `state` (from the types of the session's
-events and the machine's presence), `dispatch_mode` and the latest item. It has no tags: they are slugs of the git remote and branch
+events and the machine's presence; `gone` when its conversation is no longer on its machine), `dispatch_mode`, the latest item and
+`sessions`, the ids of the sessions in the seat now (the sessions open through Claw that hold its conversation, and the conversation
+itself when it is open in a terminal on the machine; only UUIDs), which `devenv_list` lists
+by the same ids with their labels and titles. It has no tags: they are slugs of the git remote and branch
 the machine reports, whose words a branch name can make anything, so they are only what a guess may pick from (and the API lists
 them, for a card). Nothing in it was written by a machine or an agent, so
 reading it does not mark the turn as having read untrusted text (`devenv_list` still does). `devenv_list` shows each session's seat
 (alias, confirmed role), and `GET /v1/remote-agents/seats` lists the caller's seats with their machine and folder, for a card.
+
+A seat is called what its session is called on the user's machine: its conversation's title (as last listed, kept in
+`conversation_title`), one line of at most 40 characters on a card (compared whole) with control and bidi characters removed. Those are the machine's words, so they
+are never in the roster: the seat cards (`seat_set`, a guess, a task) show them, beside the alias the user gave the seat when it has
+one, and Claw compares them with the user's words when they name a seat that way (`seat_roster` and `seat_set` with `name`, whole
+names before parts of them). A name the user's message does not hold was read from what a machine wrote: `seat_roster` then marks
+the turn as having read untrusted text, and `seat_set` refuses it (`name_not_said`). A task still goes only to a `seat_id`.
 
 The connector reports each folder's git remote and branch in its heartbeat (`workspaces`, agent capability `git_info`), read from
 the files git keeps (never by running git) and normalized on the machine and again by Claw: `host/owner/repo` with no user or
@@ -734,6 +764,15 @@ nothing a machine or an agent wrote, naming one seat whose role the user confirm
 (`dispatch_mode` becomes `auto`), unless they asked for a card every time (`seat_set confirm_each: true`) or the seat's agent runs
 unattended. A report or a wake hands nothing to a seat. Everything else is a `seat_dispatch` card; a choice card carries `options`
 and its decision names one (`choice`), which Claw checks.
+
+A task goes to the seat's own conversation: into the session open through Claw that holds it, else typed into its terminal (below),
+else that conversation taken over by the agent that takes conversations over (`resume_ref`), never a new session in its folder
+(`new_session: true` for such a seat is refused, `seat_new_session`: a new session in that folder is another conversation, so
+`devenv_send` with `new_session`, a card); the session opened for it is the seat's from then on.
+When the machine refuses it as `unknown_session` (the conversation was deleted, or is too old to resume) the task fails, saying so,
+and the seat is `gone` (`seat_gone` for every task, a queued one fails) until a heartbeat after that lists the conversation again. A
+seat whose conversation was held only by a session open through Claw, closed on a machine where no agent takes conversations over, is
+`gone` as well.
 
 One task runs in a seat at a time; up to three wait in its queue, in order, and go when it is free (after its events, or the sweep).
 A conversation open in a terminal that someone used in the last ten minutes is not typed into. A task waiting for an offline machine

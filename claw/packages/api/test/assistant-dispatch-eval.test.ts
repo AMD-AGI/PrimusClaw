@@ -139,7 +139,7 @@ test("V3 the stand-in keeps the tool layer's rules", () => {
   const off = r(user().call(...create(seat(SEAT.notes))));
   assert.deepEqual([off.dispatch, off.queued_reason, off.position], ["queued", "machine_offline", 1]);
   assert.equal(r(user().call(...create(seat(SEAT.hlci2)))).queued_reason, "in_terminal");
-  assert.equal(r(user().call(...create(seat(SEAT.hlci2), { new_session: true }))).dispatch, "sent");
+  assert.equal(user().call(...create(seat(SEAT.hlci2), { new_session: true })).code, "seat_new_session", "a seat is one session: a new one is not it");
   assert.equal(user().call(...create(seat(SEAT.codex))).code, "seat_unsupported");
   assert.equal(new DispatchStub({ lang: "en", hlciQueue: 3 }).call(...create(seat(SEAT.hlci))).code, "seat_queue_full");
   const choice = r(user().call(...create([seat(SEAT.hlci), seat(SEAT.hlci2), "sandbox"])));
