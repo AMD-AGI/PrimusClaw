@@ -262,6 +262,8 @@ export interface AttachDeps {
   blindCheckMs?: number;
   /** What a process's own pane shows as its conversation's name (default: read with the agent's tmux; tests). */
   screenName?: (pid: number) => Promise<string | null>;
+  /** Called when a file of the session registry changes (see {@link AttachSupport.close}); it must not throw. */
+  onRegistryChange?: () => void;
 }
 
 const NO_HOOKS: AdapterHooks = {
@@ -408,7 +410,7 @@ export class AttachSupport {
    * refresh (a new one starts in the background when it is old); the state is read fresh, but never holds the
    * heartbeat for more than `capMs`.
    */
-  private looking: Promise<LiveEntry[] | null> | null = null;
+  private looking: Promise<{ live: LiveEntry[]; summary: string } | null> | null = null;
   /**
    * The scan for Claude Code processes with an unreadable registry row (`blindHolders`), shared as `looking` is: one at a time, so
    * a scan stalled on a network disk holds one thread of the pool, never one more per heartbeat or per check (service.ts: once the
@@ -458,8 +460,12 @@ export class AttachSupport {
     } else if (this.now() - this.listedAt > this.d.catalogMs) void this.refreshCatalog();
     // One look at a time: a look still waiting on a stalled disk is shared, not started again by every heartbeat (each
     // would hold a thread of the pool until the disk answers).
-    this.looking ??= this.liveEntries().catch(() => null).finally(() => { this.looking = null; });
-    const live = await within(this.looking, capMs, null);
+    this.looking ??= this.lookAtLive().catch(() => null).finally(() => { this.looking = null; });
+    const look = await within(this.looking, capMs, null);
+    const live = look?.live ?? null;
+    // What this report describes, for `poll` to compare with. A look that did not answer in time says
+    // `unknown` of every conversation whatever their state, so what the registry says now stands for it.
+    this.reported = look?.summary ?? (await within(this.summarize(), capMs, null)) ?? this.reported;
     // A scan that did not answer in time is no evidence either way: every idle conversation is then "unknown", as it is when the
     // live list cannot be had. Its own adapters' processes (the groups this connector leads) are no holder.
     const own = new Set(this.d.registry.list().map((r) => r.pgid));
@@ -512,17 +518,36 @@ export class AttachSupport {
   /**
    * A cheap look, with no process started: the names and modification times of Claude Code's session registry files (one
    * is written when a terminal opens a conversation, rewritten when it starts or finishes a turn or starts waiting, and
-   * removed when it exits) and of its projects directory (a new working directory). True when something changed since
-   * the previous look, so that the caller reports at once rather than at the next heartbeat. A live conversation inside
+   * removed when it exits) and of its projects directory (a new working directory). True when what the phone is shown differs
+   * from what the last heartbeat said, so that the caller reports at once rather than at the next heartbeat (not merely from
+   * what the previous look saw: a conversation resumed and ended between two looks is a change too). A live conversation inside
    * the roots whose transcript exists but which the list does not have yet (a terminal just opened it), or a new transcript
    * in a project folder inside the roots (one a terminal ran and already ended), is listed again first, at most every
-   * {@link UNKNOWN_RELIST_MS} (a change inside that time is listed when it is up). The first look only learns what is there.
+   * {@link UNKNOWN_RELIST_MS} (a change inside that time is listed when it is up). With no heartbeat yet to compare with, the first look only learns what is there.
    */
-  async poll(): Promise<boolean> {
+  poll(now = false): Promise<boolean> {
+    // One look at a time (the periodic one and those a hook or a change in the registry asks for share what they learn).
+    const run = this.looks.then(() => this.look(now), () => this.look(now));
+    this.looks = run.catch(() => undefined);
+    return run;
+  }
+
+  private looks: Promise<unknown> = Promise.resolve();
+
+  /**
+   * One look of {@link poll}. `now` skips the shortcut of the look that nothing written since the last one would make: a hook said a
+   * turn or a conversation ended, or the registry changed, and the answer is wanted whatever the files' names and times say.
+   */
+  private async look(now: boolean): Promise<boolean> {
+    await this.watchRegistry();
     // Read off the event loop (this runs every few seconds, and the Claude config directory may be on a network disk).
     const print = await this.fingerprint();
-    const projects = await this.projectsPrint();
-    if (print === this.lastPrint && projects === this.lastProjects && !this.relistDue) return false;
+    // (a look asked for by a change in the registry leaves the projects directory to the periodic one: nothing there changes with it)
+    const projects = now && this.lastProjects !== null ? this.lastProjects : await this.projectsPrint();
+    // Nothing was written since the last look, and that look saw what the last heartbeat said. (A heartbeat can describe a state
+    // between two looks, a conversation resumed and ended again: the files then read as they did at the look before it, and only
+    // the comparison with what was reported shows it.)
+    if (!now && print === this.lastPrint && projects === this.lastProjects && !this.relistDue && this.lastSummary === this.reported) return false;
     const first = this.lastPrint === null;
     const looked = print !== this.lastPrint || projects !== this.lastProjects;
     // A new transcript in a project folder inside the roots: a conversation was started there (one a terminal ran and
@@ -542,18 +567,87 @@ export class AttachSupport {
       relisted = await within(this.refreshCatalog().then(() => true), 60_000, false);
     }
     // Only a change in what the phone is shown is worth a report: a file rewritten with the same status is not.
-    // (A registry that cannot be read, or is not there yet, still lets a new conversation in the list count as a change.)
-    // (a row that turned unreadable under a live Claude Code changes what is shown: its folder's conversations become unknown)
-    const blind = ((await within(this.scanBlind().catch(() => [] as BlindHolder[]), this.blindCheckMs, null)) ?? []).map((b) => b.pid).sort().join(".");
-    const summary = (rows === null ? "unreadable;" : "") + (blind ? `blind:${blind};` : "") + this.listed.slice(0, MAX_REPORTED).map((l) => {
-      const holders = (rows ?? []).filter((e) => e.sessionId.toLowerCase() === l.ref);
-      return `${l.ref}:${holders.length ? (liveActivity(holders).activity ?? "live") : "-"}:${liveActivity(holders).waiting_for ?? ""}`;
-    }).join(",");
-    const changed = summary !== this.lastSummary;
+    const summary = await this.summarize(rows);
+    const before = this.lastSummary;
     this.lastSummary = summary;
-    return changed && (!first || relisted);
+    // A change is a difference from what the phone was last told, not from what the previous look saw. Until a heartbeat has
+    // described the conversations there is nothing to compare with, and the first look only learns what is there.
+    if (this.reported !== null) return summary !== this.reported;
+    return summary !== before && (!first || relisted);
   }
 
+  private watcher: fs.FSWatcher | null = null;
+  private watchedDir: number | null = null;
+
+  /**
+   * Tell the owner (`onRegistryChange`) the moment a file of Claude Code's session registry changes, so that a conversation that
+   * just ended (a `claude -p` that returned, or a terminal that exited: the row is removed) is looked at within a second instead of
+   * at the next periodic look. Claude Code's hooks cannot say it for a `claude -p` (they leave sessions nobody sits at alone,
+   * approval-skip.ts), the registry does. Where the directory cannot be watched (it is not there yet, or the system has no room for
+   * one more watch) the periodic look is all there is, as before; each look tries again, and starts a new watch when the directory
+   * was removed and made again.
+   */
+  private async watchRegistry(): Promise<void> {
+    const onChange = this.d.onRegistryChange;
+    if (!onChange || this.closed) return;
+    const dir = path.join(this.configDir, "sessions");
+    let ino: number | null = null;
+    try { ino = (await fsp.stat(dir)).ino; } catch { /* not there */ }
+    if (this.closed) return;
+    if (this.watcher && ino !== null && ino === this.watchedDir) return;
+    this.watcher?.close();
+    this.watcher = null;
+    this.watchedDir = null;
+    if (ino === null) return;
+    try {
+      const w = fs.watch(dir, { persistent: false }, (_event, name) => {
+        // (a row is `<pid>.json`; Claude Code's other files there say nothing the phone shows)
+        if (name === null || String(name).endsWith(".json")) onChange();
+      });
+      w.on("error", () => { if (this.watcher === w) { this.watcher = null; this.watchedDir = null; } w.close(); });
+      this.watcher = w;
+      this.watchedDir = ino;
+    } catch { /* no room for another watch: the periodic look covers it */ }
+  }
+
+  private closed = false;
+
+  /** Stop watching the registry (the connector's run ended); it is not watched again. */
+  close(): void {
+    this.closed = true;
+    this.watcher?.close();
+    this.watcher = null;
+    this.watchedDir = null;
+  }
+
+  /** The summary taken just before the live list is read, so that it can be older than what the list says, never newer. */
+  private async lookAtLive(): Promise<{ live: LiveEntry[]; summary: string }> {
+    const summary = await this.summarize();
+    return { live: await this.liveEntries(), summary };
+  }
+
+  /**
+   * What the phone is shown of the newest conversations, as far as a cheap look can tell (no process is started): for each, what
+   * a process holding it says it is doing, and the processes whose registry row cannot be read (which make a folder's conversations
+   * unknown). Two summaries are equal when nothing the phone shows differs. `rows` is the registry as read, or null when it
+   * cannot be read (a registry that cannot be read, or is not there yet, still lets a new conversation in the list count as a
+   * change); not given, it is read here.
+   */
+  private async summarize(rows?: LiveEntry[] | null): Promise<string> {
+    let registry = rows;
+    if (registry === undefined) {
+      try { registry = await readRegistryAsync(this.configDir, this.localDomain, this.now()); } catch { registry = null; }
+    }
+    // (a row that turned unreadable under a live Claude Code changes what is shown: its folder's conversations become unknown)
+    const blind = ((await within(this.scanBlind().catch(() => [] as BlindHolder[]), this.blindCheckMs, null)) ?? []).map((b) => b.pid).sort().join(".");
+    return (registry === null ? "unreadable;" : "") + (blind ? `blind:${blind};` : "") + this.listed.slice(0, MAX_REPORTED).map((l) => {
+      const holders = (registry ?? []).filter((e) => e.sessionId.toLowerCase() === l.ref);
+      return `${l.ref}:${holders.length ? (liveActivity(holders).activity ?? "live") : "-"}:${liveActivity(holders).waiting_for ?? ""}`;
+    }).join(",");
+  }
+
+  /** The summary of what the last heartbeat described (taken before it read the conversations); null until one has. */
+  private reported: string | null = null;
   private lastSummary = "";
   private lastProjects: string | null = null;
   /** A change asked for a new list that the rate limit has held back; the next look makes it. */

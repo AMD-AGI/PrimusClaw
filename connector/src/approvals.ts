@@ -359,6 +359,13 @@ export interface BrokerDeps {
   lastInputMs?: (tty: string) => number | null;
   /** How old a run of folded ends may get before it is told without waiting (default {@link TURN_END_RUN_MAX_MS}). */
   runMaxMs?: number;
+  /**
+   * A terminal's turn or conversation ended (Claude Code's `Stop`, `StopFailure` or `SessionEnd`, Codex's `Stop`), whether or not any
+   * request or card was waiting on it: what a conversation then shows on the phone (a terminal in use, a turn running) may have changed.
+   * `configDir` is the Claude config directory (or `CODEX_HOME`) the hook was installed for. Called inside the hook's socket handler:
+   * it must not throw.
+   */
+  terminalEnded?: (e: { agent: HookAgent; configDir: string; ref: string; event: "Stop" | "StopFailure" | "SessionEnd" }) => void;
 }
 
 /**
@@ -606,6 +613,9 @@ export class ApprovalBroker {
       if (hit) this.settle(hit, null, "terminal");
     } else if (event === "UserPromptSubmit" || event === "Stop" || event === "StopFailure" || event === "SessionEnd") {
       for (const p of mine) this.settle(p, null, "terminal");
+    }
+    if (event === "Stop" || event === "StopFailure" || event === "SessionEnd") {
+      try { this.d.terminalEnded?.({ agent: from.agent ?? "claude", configDir: from.configDir ?? "", ref, event }); } catch { /* a report of the end never costs the hook its answer */ }
     }
     // A new prompt or the end of the conversation: someone is at the terminal, and an end not yet told is not news to them.
     if (event === "SessionEnd") {

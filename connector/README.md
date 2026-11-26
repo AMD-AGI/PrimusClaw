@@ -391,7 +391,10 @@ Each entry also says, for a conversation a terminal holds open, what Claude Code
 `working`, `waiting` for the person at it, or `idle`; with `waiting`, `waiting_for` in its words, such as "input needed"). The
 connector looks at Claude Code's session registry and projects directory every 10 seconds (file names and times only; nothing
 is started) and reports a change at once instead of at the next heartbeat, so a conversation a terminal has just opened, or one
-that starts waiting, reaches the phone within seconds.
+that starts waiting, reaches the phone within seconds. A change in the registry itself (a conversation that ended: a `claude -p`
+that returned, a terminal that exited), and the end of a turn or of a conversation in a terminal with the approval hooks installed,
+is looked at a second later, without waiting for the next look; a heartbeat is sent only when what the phone is shown of the
+conversations differs from what the last heartbeat said.
 
 ```toml
 [[agents]]
