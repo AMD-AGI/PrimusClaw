@@ -36,10 +36,10 @@ test("the same name twice: the worse result stands", () => {
 
 /** A review of 2026-11-25: each check ran twice on the head, the older run CANCELLED by the newer one. */
 const SUPERSEDED = [
-  { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7" },
-  { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7" },
-  { id: 45538768282, name: "code-metrics", status: "completed", conclusion: "success", app: "15368", workflow: "7" },
-  { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app: "15368", workflow: "7" },
+  { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: 501 },
+  { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: 501 },
+  { id: 45538768282, name: "code-metrics", status: "completed", conclusion: "success", app: "15368", workflow: "7", suite: 502 },
+  { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app: "15368", workflow: "7", suite: 502 },
 ];
 
 test("only the latest run of each check counts: a run a later one superseded is not a failure", () => {
@@ -78,8 +78,8 @@ test("only a cancelled run is superseded, by a later run of the same check of th
   for (const failed of ["failure", "timed_out", "startup_failure", "action_required", "stale"]) {
     for (const [status, conclusion] of [["completed", "success"], ["completed", "skipped"], ["completed", "neutral"]] as const) {
       const runs = [
-        { id: 100, name: "build", status: "completed", conclusion: failed, app: "15368", workflow: "7" },
-        { id: 200, name: "build", status, conclusion, app: "15368", workflow: "7" },
+        { id: 100, name: "build", status: "completed", conclusion: failed, app: "15368", workflow: "7", suite: 501 },
+        { id: 200, name: "build", status, conclusion, app: "15368", workflow: "7", suite: 502 },
       ];
       const v = evaluateChecks({ ...base, checkRuns: runs });
       assert.equal(v.green, false, `${failed} then ${conclusion}`);
@@ -89,8 +89,8 @@ test("only a cancelled run is superseded, by a later run of the same check of th
   }
   // A cancelled run and a later skipped one: the job never ran to an end on the head.
   const skipped = [
-    { id: 100, name: "test", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7" },
-    { id: 200, name: "test", status: "completed", conclusion: "skipped", app: "15368", workflow: "7" },
+    { id: 100, name: "test", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: 501 },
+    { id: 200, name: "test", status: "completed", conclusion: "skipped", app: "15368", workflow: "7", suite: 502 },
   ];
   assert.equal(evaluateChecks({ ...base, checkRuns: skipped }).green, false);
   assert.deepEqual(latestCheckRuns(skipped).map((r) => r.id), [100, 200]);
@@ -98,16 +98,39 @@ test("only a cancelled run is superseded, by a later run of the same check of th
   for (const [a, b] of [[{ app: "15368", workflow: "7" }, { app: "15368", workflow: "8" }], [{ app: null, workflow: "7" }, { app: null, workflow: "7" }],
     [{ app: "15368", workflow: null }, { app: "15368", workflow: null }], [{ app: "15368", workflow: "7" }, { app: "15368" }]] as const) {
     assert.equal(evaluateChecks({ ...base, checkRuns: [
-      { id: 100, name: "test", status: "completed", conclusion: "cancelled", ...a },
-      { id: 200, name: "test", status: "completed", conclusion: "success", ...b },
+      { id: 100, name: "test", status: "completed", conclusion: "cancelled", suite: 501, ...a },
+      { id: 200, name: "test", status: "completed", conclusion: "success", suite: 502, ...b },
     ] }).green, false, JSON.stringify([a, b]));
   }
   // A later run still running supersedes the cancelled one, and the head waits for it.
   const running = evaluateChecks({ ...base, checkRuns: [
-    { id: 100, name: "test", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7" },
-    { id: 200, name: "test", status: "in_progress", conclusion: null, app: "15368", workflow: "7" },
+    { id: 100, name: "test", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: 501 },
+    { id: 200, name: "test", status: "in_progress", conclusion: null, app: "15368", workflow: "7", suite: 502 },
   ] });
   assert.deepEqual([running.green, running.summary.failedNames, running.summary.pendingNames], [false, [], ["test"]]);
+});
+
+test("a cancelled run is superseded only by a later run of another workflow run (check suite): two same-named jobs of one run do not", () => {
+  // A matrix with a fixed `name: test`, or two jobs `build` in one workflow: one leg cancelled (a `timeout-minutes` overrun reads as
+  // cancelled), a later-id leg of the same workflow run a success. Concurrency cancels the OLDER workflow run, never a leg of the same one.
+  const sameSuite = [
+    { id: 10, name: "test", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: 501 },
+    { id: 11, name: "test", status: "completed", conclusion: "success", app: "15368", workflow: "7", suite: 501 },
+  ];
+  const v = evaluateChecks({ ...base, checkRuns: sameSuite });
+  assert.deepEqual([v.green, v.summary.failedNames], [false, ["test"]]);
+  assert.deepEqual(latestCheckRuns(sameSuite).map((r) => r.id), [10, 11]);
+  // Unknown suites say nothing either.
+  for (const [a, b] of [[null, 502], [501, null], [undefined, undefined]] as const) {
+    assert.equal(evaluateChecks({ ...base, checkRuns: [
+      { id: 10, name: "test", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: a },
+      { id: 11, name: "test", status: "completed", conclusion: "success", app: "15368", workflow: "7", suite: b },
+    ] }).green, false, JSON.stringify([a, b]));
+  }
+  // The same leg cancelled in one run and green in a later run of the workflow still counts once, even when a sibling leg of that later
+  // run also exists.
+  const rerun = [...sameSuite, { id: 20, name: "test", status: "completed", conclusion: "success", app: "15368", workflow: "7", suite: 502 }];
+  assert.deepEqual(latestCheckRuns(rerun).map((r) => r.id), [11, 20]);
 });
 
 test("withWorkflows reads the workflow of each run through its check suite, only when a cancelled run may have been superseded", async () => {
@@ -123,6 +146,12 @@ test("withWorkflows reads the workflow of each run through its check suite, only
     { id: 1, name: "a", status: "completed", conclusion: "cancelled", app: "15368", suite: 11 },
     { id: 2, name: "a", status: "completed", conclusion: "skipped", app: "15368", suite: 12 },
     { id: 3, name: "b", status: "completed", conclusion: "success", app: "15368", suite: 12 },
+  ], answer);
+  // A later run of the same check suite (two legs of one workflow run), or of an unknown one, supersedes nothing: no request either.
+  await withWorkflows([
+    { id: 1, name: "a", status: "completed", conclusion: "cancelled", app: "15368", suite: 11 },
+    { id: 2, name: "a", status: "completed", conclusion: "success", app: "15368", suite: 11 },
+    { id: 3, name: "a", status: "completed", conclusion: "success", app: "15368", suite: null },
   ], answer);
   assert.deepEqual(pages, []);
   // The production shape across two workflow runs of one workflow; and a same-named job of another workflow.
