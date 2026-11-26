@@ -40,7 +40,7 @@ import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS } from "@claw
 import { CLAW_ASSISTANT_ENABLED, CLAW_DEVENV_SEAT_DISPATCH, CLAW_DEVENV_SEATS, CLAW_DEVENV_SEATS_USERS, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { CONVERSATION_REF_SQL, issueCommand, listConnectors, sessionActivity, wakeConnector, workspacesOf, type Row } from "../remote-agents/store.js";
+import { CONVERSATION_REF_SQL, issueCommand, listConnectors, listTerminalMutes, sessionActivity, wakeConnector, workspacesOf, type Row } from "../remote-agents/store.js";
 import { heldTitle, inertMd, readActivity, resumableOf, type Resumable } from "./devenv-tools.js";
 import { versionVerdict } from "../remote-agents/setup.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
@@ -480,6 +480,9 @@ export interface RosterSeat {
   queue_len: number;
   /** The latest development environment item of this seat: its number and where it stands. */
   last_item: { seq: number; state: string } | null;
+  /** Whether the user muted this seat's conversation (its pushes from the terminal: `claw_remote_terminal_mutes`), and since when. */
+  muted: boolean;
+  muted_since?: string;
   /**
    * The sessions in this seat now, by id (its sessions open through Claw, and its folder's conversations open on the machine): the same
    * ids `devenv_list` lists them by (`sessions[].id`), with their labels and titles. Only ids: their names are the machine's words.
@@ -763,7 +766,7 @@ export async function rosterOf(
   const q: Querier = (t, p) => db.query(t, p);
   // The latest item of each seat: a task handed to it, or the item of a session at its place, whichever moved last.
   const seats = (await q(
-    `SELECT s.seat_id, s.connector_id, s.agent_id, s.cwd, s.alias, s.role, s.role_state, s.dispatch_mode, s.confirm_each, it.seq AS item_seq, it.board_state AS item_state
+    `SELECT s.seat_id, s.connector_id, s.agent_id, s.cwd, s.conversation_ref, s.alias, s.role, s.role_state, s.dispatch_mode, s.confirm_each, it.seq AS item_seq, it.board_state AS item_state
        FROM claw_devenv_seats s
        LEFT JOIN LATERAL (
          SELECT seq, board_state FROM (
@@ -794,9 +797,13 @@ export async function rosterOf(
     return seatNameIs(where.name!, typeof s.alias === "string" ? s.alias : null, now?.known_names ?? [], exact);
   });
   const picked = where.name ? (named(true).length ? named(true) : named(false)) : there;
+  // A seat's conversation, or one of its sessions' (a conversation open on the machine is listed by its own id), that the user muted.
+  const mutes = new Map((await listTerminalMutes(owner, q)).map((m) => [`${m.connector_id}\u0000${m.ref}`, m.muted_at]));
   return picked.map((s) => {
     const confirmed = s.role_state === "confirmed";
     const now = live.get(String(s.seat_id));
+    const mutedAt = [s.conversation_ref, ...(now?.sessions ?? []).map((x) => x.id)]
+      .map((ref) => (typeof ref === "string" && ref ? mutes.get(`${String(s.connector_id)}\u0000${ref}`) : undefined)).find((v) => v !== undefined);
     return {
       seat_id: String(s.seat_id),
       alias: typeof s.alias === "string" ? s.alias : null,
@@ -808,6 +815,7 @@ export async function rosterOf(
       confirm_each: s.confirm_each === true,
       queue_len: now?.queue.length ?? 0,
       last_item: s.item_seq != null ? { seq: Number(s.item_seq), state: String(s.item_state) } : null,
+      ...(mutedAt ? { muted: true, muted_since: mutedAt } : { muted: false }),
       sessions: (now?.sessions ?? []).map((x) => x.id).filter((id) => UUID_RE.test(id)),
     };
   });
@@ -816,7 +824,8 @@ export async function rosterOf(
 /** How the roster's seats are matched with the sessions `devenv_list` names. */
 export const ROSTER_SESSIONS_NOTE = "sessions are the ids of the sessions in a seat now: devenv_list lists each by the same id, with the "
   + "label and the title (the name the user gave it on their machine, as /agents shows it) to name it by; a seat with none has no session "
-  + "now. Name only seats and sessions these results list.";
+  + "now. Name only seats and sessions these results list. muted: the user muted that seat's conversation (Claw's own record; muted_since: "
+  + "since when).";
 
 /** The roster's note where tasks may be handed to seats (`seat-dispatch.ts`). */
 export const ROSTER_NOTE = "Seats (工位): each conversation (session) of an agent on the user's machines is one seat. Every field here was computed by Claw or "

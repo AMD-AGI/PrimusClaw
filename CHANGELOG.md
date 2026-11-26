@@ -453,6 +453,13 @@ release version, and its `appVersion` stays `latest`.
   and takes `name` (a session's name or the alias, compared by Claw and never listed; a name the user's message does not hold marks
   the turn), `seat_set` takes `name` too, and the seat cards show the session names beside an alias (one line, at most 40
   characters, control characters removed). Seats prompt router-seats-v2. Router prompt router-devenv-v16.
+- Claw: asked "did I mute only this one conversation?", the assistant said it could not tell: no tool it reads carried the mutes
+  (`/approvals mute #<item>`, or a card's mute button), only titles, states and activity. And with more sessions on a machine than
+  the `/agents` card shows, it said the count as "8 in all, 8 listed, 1 not listed". `devenv_list` now gives
+  `muted_conversations` (every conversation the user muted, from Claw's own record: its machine, id, title now, label and since
+  when) and each session's `muted` (and `muted_since`), and `sessions_listed` beside `session_count` and `sessions_not_shown`;
+  `seat_roster` gives each seat's `muted`. The router answers mutes and counts from these and never says it cannot tell.
+  Router prompt router-devenv-v17.
 - Claw: a task handed to a seat within about 30 seconds of the end of the seat's previous task was queued as "the seat
   is busy" with nothing ahead of it, and a task already waiting did not go on that end: the prompt of a task whose turn
   had ended still counted as work in progress until the connector's next heartbeat acknowledged it, and that heartbeat

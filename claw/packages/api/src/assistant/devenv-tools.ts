@@ -31,7 +31,8 @@ import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_EVENT
 import { CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
-  createSession, findConnector, findSession, issueCommand, listConnectors, onlineSql, sessionActivity, setHidden, wakeConnector, type Row,
+  createSession, findConnector, findSession, issueCommand, listConnectors, listTerminalMutes, onlineSql, sessionActivity, setHidden, wakeConnector,
+  type Row, type TerminalMute,
 } from "../remote-agents/store.js";
 import { connectorSetup, outdatedMessage, versionVerdict, type ConnectorVersionVerdict } from "../remote-agents/setup.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
@@ -241,6 +242,24 @@ export interface DevenvSession {
   waiting_for?: string | null;
   /** The seat this session's folder is (`seats.ts`, where seats are on): its alias, and its role once the user confirmed it. */
   seat?: { seat_id: string; alias: string | null; role: string | null };
+  /**
+   * Whether the user muted this conversation's pushes from its terminal (`/approvals mute #<item>` or a card's mute button,
+   * `claw_remote_terminal_mutes`): Claw's own record, and since when.
+   */
+  muted: boolean;
+  muted_since?: string;
+}
+
+/** A conversation the user muted, as `devenv_list` lists every one of them, listed on a machine or not. */
+export interface DevenvMuted {
+  machine: string | null;
+  /** The conversation's id, as `sessions[].id` names it. */
+  id: string;
+  /** Its title on the machine now, when this read lists it; else the title its item had when it was muted. The machine's words: data. */
+  title: string | null;
+  /** Its label in this read, or null when this read does not list it. */
+  label: string | null;
+  muted_since: string;
 }
 
 export interface DevenvMachine {
@@ -250,6 +269,8 @@ export interface DevenvMachine {
    * are not listed (`devenv_list` with `machine` lists every one).
    */
   session_count?: number;
+  /** With `session_count`: how many of them `sessions` lists (`session_count` = `sessions_listed` + `sessions_not_shown`). */
+  sessions_listed?: number;
   sessions_by_state?: Record<string, number>;
   sessions_not_shown?: number;
   online: boolean;
@@ -436,6 +457,8 @@ export interface DevenvList {
   machines: DevenvMachine[];
   /** The session "connect me" means when there is exactly one obvious one, else null (ask which). */
   attach_default: { label: string; ref: string; attach_command: string; new_session?: true } | null;
+  /** Every conversation the user muted (Claw's own record), newest first; empty when none is. */
+  muted_conversations: DevenvMuted[];
   /**
    * With no machine connected, what connects one, said in `text` with its exact command(s): in a turn answering the user's own
    * message, a one-line pairing command made for them now (`pairing`, as devenv_pair gives it); else, or where pairing is refused,
@@ -588,7 +611,9 @@ const OUTDATED_NOTE = " A machine whose version_status is outdated or unsupporte
  * the card shows named sessions the card did not and left out two it did (2026-11-25 04:38, "和我发送 /agents 的对不上").
  */
 export const SESSIONS_CUT_NOTE = " A machine with sessions_not_shown lists only the sessions the user's agents card (/agents) shows of it, in "
-  + "its order: session_count and sessions_by_state count all of them. To name, count or connect one that is not listed, call devenv_list again with machine set to that machine's name; never "
+  + "its order: session_count and sessions_by_state count all of them, sessions_listed is how many are listed, and session_count = "
+  + "sessions_listed + sessions_not_shown. Say it plainly with these three numbers (共 8 个会话，列出 7 个，另有 1 个未列出; 8 in all, 7 "
+  + "listed, 1 not listed), never a listed count that is not sessions_listed. To name, count or connect one that is not listed, call devenv_list again with machine set to that machine's name; never "
   + "say a machine or a session is missing because it is not listed.";
 
 /** Each machine with the sessions the agents card (`/agents`) shows of it, and the counts of all of them where some are left out. Pure, for the tests. */
@@ -599,7 +624,8 @@ export function compactMachines(machines: readonly DevenvMachine[]): DevenvMachi
     const byState: Record<string, number> = {};
     for (const s of m.sessions) byState[s.state] = (byState[s.state] ?? 0) + 1;
     return {
-      ...m, session_count: m.sessions.length, sessions_by_state: byState, sessions_not_shown: m.sessions.length - kept.length, sessions: kept,
+      ...m, session_count: m.sessions.length, sessions_listed: kept.length, sessions_by_state: byState,
+      sessions_not_shown: m.sessions.length - kept.length, sessions: kept,
     };
   });
 }
@@ -665,7 +691,7 @@ export async function devenvList(
   const gate = await mayPairHere(claims);
   // Before any of it is passed on: from here on this turn has read what a connector and its agents reported.
   await markUntrustedRead((text, params) => db.query(text, params), claims.sid, claims.mid);
-  const { machines: all, attachable } = await collect(userId, detail === "activity", onlineWindowMs);
+  const { machines: all, attachable, muted } = await collect(userId, detail === "activity", onlineWindowMs);
   // One machine asked for by name: that machine with every session; else every machine, each with its latest sessions.
   const one = named === null ? [] : all.filter((m) => (m.machine ?? "").toLowerCase() === named);
   if (named !== null && !one.length) {
@@ -692,6 +718,7 @@ export async function devenvList(
       : sessions.length === 0 && agents.length === 1 ? agents[0] : null;
   return {
     ok: true, detail, total: all.length, online: all.filter((m) => m.online).length, machines,
+    muted_conversations: mutedListed(muted, machines),
     attach_default: pick
       ? { label: pick.label, ref: pick.ref, attach_command: attachCommand(pick.ref), ...(pick.opened_in === "agent" ? { new_session: true } : {}) }
       : null,
@@ -705,7 +732,7 @@ export async function devenvList(
         },
       }
       : {}),
-    note: (detail === "activity" ? ACTIVITY_NOTE : STATUS_NOTE) + (made ? (allOffline ? ALL_OFFLINE_NOTE : noteFor(made)) : "")
+    note: (detail === "activity" ? ACTIVITY_NOTE : STATUS_NOTE) + MUTED_NOTE + (made ? (allOffline ? ALL_OFFLINE_NOTE : noteFor(made)) : "")
       + (old ? OUTDATED_NOTE : "") + (cut ? SESSIONS_CUT_NOTE : "") + (all.length === 0 ? NO_MACHINE_NOTE : ""),
   };
 }
@@ -744,12 +771,21 @@ export function heldTitle(agent: Row | undefined, s: { cwd?: unknown; read_only?
 }
 
 async function collect(userId: string, activity: boolean, onlineWindowMs: number): Promise<{
-  machines: DevenvMachine[]; attachable: Attachable[];
+  machines: DevenvMachine[]; attachable: Attachable[]; muted: Array<MutedNow>;
 }> {
-  const [connectors, open] = await Promise.all([
+  const [connectors, open, mutes] = await Promise.all([
     listConnectors(userId, onlineWindowMs),
     sessionActivity(userId, REMOTE_AGENT_LIMITS.maxActiveSessionsPerUser),
+    listTerminalMutes(userId),
   ]);
+  // The user's mutes by conversation (`claw_remote_terminal_mutes`): a session of a muted conversation says so, with since when.
+  const muteOf = new Map(mutes.map((m) => [`${m.connector_id}\u0000${m.ref}`, m]));
+  const mutedRow = (connectorId: string, ref: unknown): Pick<DevenvSession, "muted" | "muted_since"> => {
+    const m = typeof ref === "string" && ref ? muteOf.get(`${connectorId}\u0000${ref}`) : undefined;
+    return m ? { muted: true, muted_since: m.muted_at } : { muted: false };
+  };
+  // The title and label each muted conversation has in this read, found by its id.
+  const titleNow = new Map<string, string | null>();
   const shown = flat;
   // Each session's seat (its conversation's alias and confirmed role, else its folder's), for a user who has seats.
   const seatsMod = await import("./seats.js");
@@ -803,7 +839,9 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
           ...(can && inTerminal ? (r.typed ? { typed_into_terminal: true as const, note: TYPED_NOTE } : { read_only: true as const, note: READ_ONLY_NOTE }) : {}),
           ...(carded && block ? {} : { not_on_agents_card: true as const }),
           ...seatOf(String(c.connector_id), String(a.agent_id), r.cwd, r.ref),
+          ...mutedRow(String(c.connector_id), r.ref),
         };
+        titleNow.set(`${String(c.connector_id)}\u0000${r.ref}`, r.title);
         if (inTerminal && r.terminal_state) row.terminal_state = r.terminal_state;
         if (activity && r.terminal_state === "waiting_for_you") row.waiting_for = r.waiting_for;
         sessions.push(row);
@@ -824,6 +862,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
         ...(s.read_only === true ? { read_only: true, note: READ_ONLY_NOTE } : {}),
         ...(onCard.has(ref) ? {} : { not_on_agents_card: true as const }),
         ...seatOf(String(c.connector_id), String(s.agent_id), s.cwd, s.conversation_ref),
+        ...mutedRow(String(c.connector_id), s.conversation_ref),
       };
       if (activity) Object.assign(row, { step: reading.step, last_answer: reading.answer, asked: reading.asked, last_stop: reading.last_stop, queued_prompts: Number(s.queued) || 0 });
       sessions.push(row);
@@ -844,8 +883,39 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
       ...(health ? { problems: health.problems, health_checked_at: health.checked_at } : {}),
     });
   }
-  return { machines, attachable };
+  const names = new Map(connectors.map((c) => [String(c.connector_id), shown(c.name, NAME_MAX)]));
+  const muted = mutes.map((m) => ({
+    ...m, seen: titleNow.has(`${m.connector_id}\u0000${m.ref}`), title_now: titleNow.get(`${m.connector_id}\u0000${m.ref}`) ?? null,
+    machine_now: names.get(m.connector_id) ?? flat(m.machine, NAME_MAX),
+  }));
+  return { machines, attachable, muted };
 }
+
+/** A mute with what this read knows of its conversation: whether its machine reports it (`seen`), its title there and the machine's name. */
+export type MutedNow = TerminalMute & { seen: boolean; title_now: string | null; machine_now: string | null };
+
+/**
+ * The user's muted conversations as `devenv_list` gives them: each with its machine, its title now (else the one it had when muted)
+ * and its label where these machines list it. Pure, for the tests.
+ */
+export function mutedListed(
+  muted: ReadonlyArray<MutedNow>, machines: readonly DevenvMachine[],
+): DevenvMuted[] {
+  const labels = new Map<string, string>();
+  for (const m of machines) for (const s of m.sessions) if (s.opened_in === "machine" && !labels.has(`${m.machine ?? ""}\u0000${s.id}`)) labels.set(`${m.machine ?? ""}\u0000${s.id}`, s.label);
+  return muted.map((m) => ({
+    machine: m.machine_now, id: m.ref, title: m.seen ? m.title_now : flat(m.title, NAME_MAX),
+    label: labels.get(`${m.machine_now ?? ""}\u0000${m.ref}`) ?? null, muted_since: m.muted_at,
+  }));
+}
+
+/**
+ * What the router says about mutes: from muted_conversations and each session's muted, which are Claw's own record, never "cannot tell".
+ */
+export const MUTED_NOTE = " muted_conversations is every conversation the user muted (their pushes from its terminal are off: /approvals mute "
+  + "#<item> or a card's mute button), from Claw's own record, and each session's muted says the same for it (muted_since: since when). "
+  + "Asked which conversations are muted, or whether only one is, answer from them: name each by its title, quoted, and its machine; "
+  + "empty means none is muted. Never say you cannot see or tell whether one is muted.";
 
 // --- devenv_send: an instruction for an agent on the user's machine ---------------------------------------------------------
 
