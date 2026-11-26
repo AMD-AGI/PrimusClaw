@@ -4,7 +4,7 @@
 /** Whether the head commit is green: what counts, and what must never be read as green. */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateChecks, requiredContextsFromBranch, requiredContextsFromRules } from "../src/github-review/checks.js";
+import { evaluateChecks, latestCheckRuns, requiredContextsFromBranch, requiredContextsFromRules, withWorkflows } from "../src/github-review/checks.js";
 
 const run = (name: string, status = "completed", conclusion: string | null = "success") => ({ name, status, conclusion });
 const base = { statuses: [], required: [], truncated: false };
@@ -32,6 +32,146 @@ test("every other conclusion is a failure, an unfinished run is pending, and nei
 test("the same name twice: the worse result stands", () => {
   const v = evaluateChecks({ ...base, checkRuns: [run("a", "completed", "success"), run("a", "completed", "failure")] });
   assert.equal(v.green, false);
+});
+
+/** A review of 2026-11-25: each check ran twice on the head, the older run CANCELLED by the newer one. */
+const SUPERSEDED = [
+  { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: 501 },
+  { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: 501 },
+  { id: 45538768282, name: "code-metrics", status: "completed", conclusion: "success", app: "15368", workflow: "7", suite: 502 },
+  { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app: "15368", workflow: "7", suite: 502 },
+];
+
+test("only the latest run of each check counts: a run a later one superseded is not a failure", () => {
+  const v = evaluateChecks({ ...base, checkRuns: SUPERSEDED, required: ["code-metrics", "pr-hygiene"] });
+  assert.equal(v.green, true, v.reasons.join("; "));
+  assert.deepEqual([v.summary.failedNames, v.summary.passed, v.summary.total], [[], 2, 2]);
+  // Whatever order GitHub lists them in.
+  assert.equal(evaluateChecks({ ...base, checkRuns: [...SUPERSEDED].reverse() }).green, true);
+  assert.deepEqual(latestCheckRuns(SUPERSEDED).map((r) => r.id), [45538768282, 45538768384]);
+});
+
+test("a cancelled, failed or unfinished LATEST run is still not green, and an older success does not hide it", () => {
+  for (const [status, conclusion] of [["completed", "cancelled"], ["completed", "failure"], ["in_progress", null]] as const) {
+    const runs = [
+      { id: 100, name: "code-metrics", status: "completed", conclusion: "success", app: "15368", workflow: "7" },
+      { id: 200, name: "code-metrics", status, conclusion, app: "15368", workflow: "7" },
+    ];
+    const v = evaluateChecks({ ...base, checkRuns: runs });
+    assert.equal(v.green, false, String(conclusion));
+    assert.deepEqual(conclusion === null ? v.summary.pendingNames : v.summary.failedNames, ["code-metrics"], String(conclusion));
+  }
+});
+
+test("another app's run of the same name supersedes nothing, and the worse one stands", () => {
+  const v = evaluateChecks({ ...base, checkRuns: [
+    { id: 1, name: "build", status: "completed", conclusion: "failure", app: "1" },
+    { id: 2, name: "build", status: "completed", conclusion: "success", app: "2" },
+  ] });
+  assert.equal(v.green, false);
+  assert.deepEqual(v.summary.failedNames, ["build"]);
+});
+
+test("only a cancelled run is superseded, by a later run of the same check of the same workflow: a failure stands, and a skipped run supersedes nothing", () => {
+  // Two workflows with a job `build` (one app for every GitHub Actions job), a re-trigger that skips the job, a fork's workflow: a
+  // name and an app do not say which run replaced which, so a finished failure stands.
+  for (const failed of ["failure", "timed_out", "startup_failure", "action_required", "stale"]) {
+    for (const [status, conclusion] of [["completed", "success"], ["completed", "skipped"], ["completed", "neutral"]] as const) {
+      const runs = [
+        { id: 100, name: "build", status: "completed", conclusion: failed, app: "15368", workflow: "7", suite: 501 },
+        { id: 200, name: "build", status, conclusion, app: "15368", workflow: "7", suite: 502 },
+      ];
+      const v = evaluateChecks({ ...base, checkRuns: runs });
+      assert.equal(v.green, false, `${failed} then ${conclusion}`);
+      assert.deepEqual(v.summary.failedNames, ["build"], `${failed} then ${conclusion}`);
+      assert.deepEqual(latestCheckRuns(runs).map((r) => r.id), [100, 200]);
+    }
+  }
+  // A cancelled run and a later skipped one: the job never ran to an end on the head.
+  const skipped = [
+    { id: 100, name: "test", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: 501 },
+    { id: 200, name: "test", status: "completed", conclusion: "skipped", app: "15368", workflow: "7", suite: 502 },
+  ];
+  assert.equal(evaluateChecks({ ...base, checkRuns: skipped }).green, false);
+  assert.deepEqual(latestCheckRuns(skipped).map((r) => r.id), [100, 200]);
+  // A cancelled run of one workflow is not superseded by another workflow's job of the same name, nor when its app or workflow is unknown.
+  for (const [a, b] of [[{ app: "15368", workflow: "7" }, { app: "15368", workflow: "8" }], [{ app: null, workflow: "7" }, { app: null, workflow: "7" }],
+    [{ app: "15368", workflow: null }, { app: "15368", workflow: null }], [{ app: "15368", workflow: "7" }, { app: "15368" }]] as const) {
+    assert.equal(evaluateChecks({ ...base, checkRuns: [
+      { id: 100, name: "test", status: "completed", conclusion: "cancelled", suite: 501, ...a },
+      { id: 200, name: "test", status: "completed", conclusion: "success", suite: 502, ...b },
+    ] }).green, false, JSON.stringify([a, b]));
+  }
+  // A later run still running supersedes the cancelled one, and the head waits for it.
+  const running = evaluateChecks({ ...base, checkRuns: [
+    { id: 100, name: "test", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: 501 },
+    { id: 200, name: "test", status: "in_progress", conclusion: null, app: "15368", workflow: "7", suite: 502 },
+  ] });
+  assert.deepEqual([running.green, running.summary.failedNames, running.summary.pendingNames], [false, [], ["test"]]);
+});
+
+test("a cancelled run is superseded only by a later run of another workflow run (check suite): two same-named jobs of one run do not", () => {
+  // A matrix with a fixed `name: test`, or two jobs `build` in one workflow: one leg cancelled (a `timeout-minutes` overrun reads as
+  // cancelled), a later-id leg of the same workflow run a success. Concurrency cancels the OLDER workflow run, never a leg of the same one.
+  const sameSuite = [
+    { id: 10, name: "test", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: 501 },
+    { id: 11, name: "test", status: "completed", conclusion: "success", app: "15368", workflow: "7", suite: 501 },
+  ];
+  const v = evaluateChecks({ ...base, checkRuns: sameSuite });
+  assert.deepEqual([v.green, v.summary.failedNames], [false, ["test"]]);
+  assert.deepEqual(latestCheckRuns(sameSuite).map((r) => r.id), [10, 11]);
+  // Unknown suites say nothing either.
+  for (const [a, b] of [[null, 502], [501, null], [undefined, undefined]] as const) {
+    assert.equal(evaluateChecks({ ...base, checkRuns: [
+      { id: 10, name: "test", status: "completed", conclusion: "cancelled", app: "15368", workflow: "7", suite: a },
+      { id: 11, name: "test", status: "completed", conclusion: "success", app: "15368", workflow: "7", suite: b },
+    ] }).green, false, JSON.stringify([a, b]));
+  }
+  // The same leg cancelled in one run and green in a later run of the workflow still counts once, even when a sibling leg of that later
+  // run also exists.
+  const rerun = [...sameSuite, { id: 20, name: "test", status: "completed", conclusion: "success", app: "15368", workflow: "7", suite: 502 }];
+  assert.deepEqual(latestCheckRuns(rerun).map((r) => r.id), [11, 20]);
+});
+
+test("withWorkflows reads the workflow of each run through its check suite, only when a cancelled run may have been superseded", async () => {
+  const pages: number[] = [];
+  const answer = (page: number) => { pages.push(page); return Promise.resolve({ total_count: 2, workflow_runs: [
+    { id: 1, workflow_id: 7, check_suite_id: 11 }, { id: 2, workflow_id: 8, check_suite_id: 12 },
+  ] }); };
+  // Nothing cancelled, or a cancelled run with no later run of its name and app: no request.
+  assert.deepEqual(await withWorkflows([{ id: 1, name: "a", status: "completed", conclusion: "success", app: "15368", suite: 11 }], answer), [
+    { id: 1, name: "a", status: "completed", conclusion: "success", app: "15368", suite: 11 },
+  ]);
+  await withWorkflows([
+    { id: 1, name: "a", status: "completed", conclusion: "cancelled", app: "15368", suite: 11 },
+    { id: 2, name: "a", status: "completed", conclusion: "skipped", app: "15368", suite: 12 },
+    { id: 3, name: "b", status: "completed", conclusion: "success", app: "15368", suite: 12 },
+  ], answer);
+  // A later run of the same check suite (two legs of one workflow run), or of an unknown one, supersedes nothing: no request either.
+  await withWorkflows([
+    { id: 1, name: "a", status: "completed", conclusion: "cancelled", app: "15368", suite: 11 },
+    { id: 2, name: "a", status: "completed", conclusion: "success", app: "15368", suite: 11 },
+    { id: 3, name: "a", status: "completed", conclusion: "success", app: "15368", suite: null },
+  ], answer);
+  assert.deepEqual(pages, []);
+  // The production shape across two workflow runs of one workflow; and a same-named job of another workflow.
+  const runs = [
+    { id: 10, name: "build", status: "completed", conclusion: "cancelled", app: "15368", suite: 11 },
+    { id: 20, name: "build", status: "completed", conclusion: "success", app: "15368", suite: 12 },
+    { id: 30, name: "build", status: "completed", conclusion: "success", app: "15368", suite: 99 },
+  ];
+  const read = await withWorkflows(runs, (page) => Promise.resolve(page === 1 ? { total_count: 2, workflow_runs: [
+    { id: 1, workflow_id: 7, check_suite_id: 11 }, { id: 2, workflow_id: 8, check_suite_id: 12 },
+  ] } : {}));
+  assert.deepEqual(read.map((r) => r.workflow ?? null), ["7", "8", null]);
+  assert.equal(evaluateChecks({ ...base, checkRuns: read }).green, false, "another workflow's success does not supersede the cancelled run");
+  const same = await withWorkflows(runs, () => Promise.resolve({ total_count: 2, workflow_runs: [
+    { id: 1, workflow_id: 7, check_suite_id: 11 }, { id: 2, workflow_id: 7, check_suite_id: 12 },
+  ] }));
+  assert.deepEqual(latestCheckRuns(same).map((r) => r.id), [20, 30]);
+  // A read that failed leaves every workflow unknown, so nothing is superseded; a rate-limited one is thrown.
+  assert.deepEqual((await withWorkflows(runs, () => Promise.reject(new Error("boom")))).map((r) => r.workflow ?? null), [null, null, null]);
+  await assert.rejects(withWorkflows(runs, () => Promise.reject(Object.assign(new Error("slow down"), { rateLimited: true }))), /slow down/);
 });
 
 test("commit statuses count too: success passes, pending waits, failure and error fail", () => {
