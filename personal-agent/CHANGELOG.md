@@ -15,6 +15,34 @@ release is the tag `personal-agent-vX.Y.Z`, and its section here is the GitHub R
 (each incompatible change called out, a plugin port change in core's `src/plugins/` included, and the oldest Claw a
 feature needs), follow the repository's versioning rules in the root [CHANGELOG.md](../CHANGELOG.md#versioning).
 
+## Unreleased
+
+`ClawRemoteAgentsPort` (the `remoteAgents` member of the exported `ClawPort`) gains the required `mutedTerminals(key)`, so code
+that implements `ClawPort` itself must add it (the packaged Claw client does); nothing to do for a deployment of the published
+packages. No plugin port (core's `src/plugins/`) changed, and the store is unchanged.
+
+**Claw:** `/approvals` with no word needs the first Claw release with `GET /v1/remote-agents/approvals/mutes`; with an older Claw
+it says the setting cannot be reached now (`/approvals on`, `off`, `mute`, `unmute` and `summary` are unchanged).
+
+### Added
+
+- `@primusclaw/personal-agent`: `/approvals` with no word says the whole state in one message: whether approvals from terminals
+  are on, how often a conversation that keeps working on its own is summed up (or that summaries are off), and the conversations
+  muted, one line each with its `#<item>` (what `/approvals unmute #<item>` takes), its name, its machine and since when (UTC), or
+  that none is muted. The usage text says so. The runtime's Claw client reads them with `mutedTerminals` (`GET
+/v1/remote-agents/approvals/mutes`); from the shared protocol, `RemoteMutedConversation`.
+
+### Fixed
+
+- `@primusclaw/personal-agent-teams`: a message that starts with the bot's name typed as words ahead of a command (`@clawy /approvals`,
+  as Teams on a phone sends a name that was typed and not picked, with no mention behind it; also the name without its `@`) was read as
+  a sentence and answered by the assistant, never as the command it carries. The name (the deployment's `botName`) is dropped
+  from the text as a picked mention is when a command word follows it (`/approvals`, in a 1:1 and in a group chat), and the mentions of other people keep their place in the words. Every other message is read as before: the
+  name alone, a word that merely starts with it, the name before words that are not a command (`@clawy stop`) or before a path
+  (`/tmp/app.log`) stay as typed. A name dropped this way, with the `@` or without, also sets `namesBotFirst` (`addressedToBot` reads
+  only the `@` form): in a 1:1 chat attached to a remote session `clawy /clear` stays with the bot as `@clawy /clear` does, and no
+  slash word reaches the coding agent bare.
+
 ## 0.15.0
 
 A minor release, because core's exported API changes incompatibly: `ClawPort`'s `remoteAgents` (`ClawRemoteAgentsPort`)

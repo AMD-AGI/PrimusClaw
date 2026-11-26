@@ -19,6 +19,8 @@
  *   U7 a mute names a terminal item of the caller's own: anything else is refused
  *   U8 a muted conversation's wait in its terminal is not told either
  *   U9 a Codex conversation's end is said as Codex's
+ *   U10 `GET /v1/remote-agents/approvals/mutes` (what `/approvals` says): the conversations the owner muted, newest first, each with
+ *       its machine, its name, since when and the latest item that unmutes it; another owner's are never listed
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -275,6 +277,40 @@ describe("turn ends and mutes from terminals", { skip }, () => {
       await waits.runTerminalWaitSweep(60_000, 0);
       assert.equal(told.length, 1);
     } finally { waits.terminalWaitPorts.tell = tell; }
+  });
+
+  test("U10 the owner's muted conversations are listed with their machine, name, since when and the item that unmutes them", async () => {
+    const alice = await w.user("alice");
+    await w.subscribe(alice.userId);
+    const cid = await machine("alice", "laptop");
+    const listing = async (user = "alice") => (await call(user, "GET", "/v1/remote-agents/approvals/mutes")).body;
+    assert.deepEqual(await listing(), { ok: true, data: [] }, "nothing muted: an empty list");
+    const sid = (await open("alice", cid, "conv-1")).body.data.session_id as string;
+    const other = (await open("alice", cid, "conv-2", { title: "写文档" })).body.data.session_id as string;
+    await events("alice", cid, sid, [started, end()]);
+    await events("alice", cid, other, [["session_started", { ...started[1], ref: "conv-2", title: "写文档" }], end({ ref: "conv-2" })]);
+    const first = await remoteItem(sid);
+    const doc = await remoteItem(other);
+    assert.equal((await mute("alice", first.seq)).status, 200);
+    assert.equal((await mute("alice", doc.seq)).status, 200);
+    const got = (await listing()).data;
+    assert.deepEqual(got.map((m: Recorded) => [m.item, m.machine, m.title]), [[doc.seq, "laptop", "写文档"], [first.seq, "laptop", "修 CI"]], "newest mute first");
+    assert.ok(got.every((m: Recorded) => !Number.isNaN(Date.parse(m.muted_since))), JSON.stringify(got));
+    assert.deepEqual(Object.keys(got[0]).sort(), ["item", "machine", "muted_since", "title"]);
+    // Unmuted and back again through a later item of the same conversation: one row, naming the latest item.
+    assert.equal((await mute("alice", first.seq, false)).status, 200);
+    assert.deepEqual((await listing()).data.map((m: Recorded) => m.item), [doc.seq], "unmuted: gone from the list");
+    const again = (await open("alice", cid, "conv-1")).body.data.session_id as string;
+    await events("alice", cid, again, [started, end({ message: "again" })]);
+    const later = await remoteItem(again);
+    assert.ok(later.seq > first.seq);
+    assert.equal((await mute("alice", later.seq)).status, 200);
+    assert.deepEqual((await listing()).data.map((m: Recorded) => [m.item, m.title]), [[later.seq, "修 CI"], [doc.seq, "写文档"]]);
+    // Another owner sees none of it; a mute whose items are all gone is still listed, with no item to unmute it by.
+    assert.deepEqual(await listing("bob"), { ok: true, data: [] });
+    await w.q("DELETE FROM claw_work_items WHERE item_id = $1", [doc.item_id]);
+    const gone = (await listing()).data.find((m: Recorded) => m.title === "写文档");
+    assert.deepEqual([gone.item, gone.machine], [null, "laptop"], "no item of it left to name it by");
   });
 
   test("U9 a Codex conversation's end is said as Codex's", async () => {

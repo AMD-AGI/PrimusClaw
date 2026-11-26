@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { JsonObject } from "../../json.js";
-import type { RemoteHidden } from "../../protocol.js";
+import type { RemoteHidden, RemoteMutedConversation } from "../../protocol.js";
 import type { ClawCredential } from "../../claw/credential.js";
 import type { SseEvent } from "../../claw/model.js";
 import type { RemoteConnector, RemoteEventRow, RemotePairing, RemoteSession, RemoteSetup } from "../../claw/remote.js";
@@ -59,6 +59,11 @@ export interface ClawRemoteAgentsPort {
    * is pushed while muted (`PUT /approvals/mutes`). Answers what Claw stored, and the machine and conversation it names.
    */
   muteTerminal(key: ClawCredential, item: number, muted: boolean): Promise<TerminalMute>;
+  /**
+   * The conversations the caller muted, newest first (`GET /approvals/mutes`): each with its machine, its name now, since when and the
+   * `#<item>` that unmutes it (null when no item of it is left).
+   */
+  mutedTerminals(key: ClawCredential): Promise<RemoteMutedConversation[]>;
   /**
    * How often (minutes; 0 never) a conversation of the caller's that keeps working in a terminal on its own is summed up
    * (`GET /approvals`, `summary_minutes`; an hour unless they set otherwise).

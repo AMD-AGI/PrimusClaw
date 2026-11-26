@@ -139,6 +139,7 @@ const WITHOUT_ID = new Set([
   "remoteAgents.approvals",
   "remoteAgents.setApprovals",
   "remoteAgents.muteTerminal",
+  "remoteAgents.mutedTerminals",
   "remoteAgents.summary",
   "remoteAgents.setSummary",
   "remoteAgents.sessions",

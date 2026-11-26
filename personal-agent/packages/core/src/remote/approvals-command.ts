@@ -5,17 +5,21 @@
  * `/approvals [on|off]`: whether the questions the person's own terminals ask (a coding agent started there wants to run a
  * command, change a file, start on a plan or have a question answered, and the connector's approval hooks put it here), their
  * waits and the turns that ended while nobody was there come to this chat. The setting is Claw's (`/v1/remote-agents/approvals`),
- * on unless turned off; with no word it is only read. `/approvals mute #<item>` and `unmute #<item>` do the same for one
- * conversation, named by the work item its messages start with (`PUT /v1/remote-agents/approvals/mutes`). `/approvals summary
- * [<minutes>|off]` reads or sets how often a conversation that keeps working on its own is summed up
- * (`PUT /v1/remote-agents/approvals/summary`; 15 to 1440 minutes, or off).
+ * on unless turned off; with no word it says the whole state in one message: that switch, how often a conversation that keeps
+ * working on its own is summed up, and the conversations muted (`GET /v1/remote-agents/approvals/mutes`). `/approvals mute #<item>`
+ * and `unmute #<item>` do the same for one conversation, named by the work item its messages start with
+ * (`PUT /v1/remote-agents/approvals/mutes`). `/approvals summary [<minutes>|off]` reads or sets how often a conversation that keeps
+ * working on its own is summed up (`PUT /v1/remote-agents/approvals/summary`; 15 to 1440 minutes, or off).
  */
 import { ClawAnswerInvalid, ClawError } from "../claw/errors.js";
 import { terminalApprovalText } from "../locales/terminal-approvals.js";
 import type { ClawRemoteAgentsPort } from "../ports/claw/remote-agents.js";
 import type { CommandHandler, CommandRoute } from "../ports/routing.js";
 import { textMessage } from "../ports/surface.js";
+import type { RemoteMutedConversation } from "../protocol.js";
+import { lit } from "./inert.js";
 import { isTransport } from "./state.js";
+import { parseIsoSeconds, utcStamp } from "./time.js";
 
 /** The interval Claw takes for the summaries (`TERMINAL_SUMMARY` in its protocol), in minutes. */
 const SUMMARY_MIN = 15;
@@ -30,13 +34,25 @@ function summaryMinutes(arg: string): number | undefined | null {
   return n >= SUMMARY_MIN && n <= SUMMARY_MAX ? n : null;
 }
 
+/**
+ * One muted conversation: its item number (what `unmute` takes), its name and its machine (the machine's words, shown inert), and since
+ * when (UTC, as the remote cards stamp a time).
+ */
+function mutedLine(m: RemoteMutedConversation, words: ReturnType<typeof terminalApprovalText.in>): string {
+  const who = [m.item === null ? "" : `#${String(m.item)}`, lit(m.title, 60), lit(m.machine, 40)]
+    .filter(Boolean)
+    .join(" · ");
+  const at = parseIsoSeconds(m.muted_since);
+  return words.mutedLine({ who: who || words.mutedUnnamed, since: at === null ? "" : utcStamp(at) });
+}
+
 export class TerminalApprovalsCommand implements CommandHandler {
   readonly name = "approvals";
 
   constructor(
     private readonly claw: Pick<
       ClawRemoteAgentsPort,
-      "approvals" | "setApprovals" | "muteTerminal" | "summary" | "setSummary"
+      "approvals" | "setApprovals" | "muteTerminal" | "mutedTerminals" | "summary" | "setSummary"
     >,
   ) {}
 
@@ -53,7 +69,7 @@ export class TerminalApprovalsCommand implements CommandHandler {
       return true;
     }
     try {
-      if (arg === "") await say((await this.claw.approvals(route.credential)) ? words.approvalsOn : words.approvalsOff);
+      if (arg === "") await say(await this.state(route));
       else {
         const enabled = await this.claw.setApprovals(route.credential, arg === "on");
         await say(enabled ? words.approvalsTurnedOn : words.approvalsTurnedOff);
@@ -63,6 +79,24 @@ export class TerminalApprovalsCommand implements CommandHandler {
       await say(words.approvalsUnavailable);
     }
     return true;
+  }
+
+  /** The whole state, as one message: the switch, how often a conversation that works on its own is summed up, the muted ones. */
+  private async state(route: CommandRoute): Promise<string> {
+    const words = terminalApprovalText.in(route.lang());
+    const [enabled, every, muted] = await Promise.all([
+      this.claw.approvals(route.credential),
+      this.claw.summary(route.credential),
+      this.claw.mutedTerminals(route.credential),
+    ]);
+    const lines = [
+      enabled ? words.approvalsOn : words.approvalsOff,
+      every === 0 ? words.summaryNever : words.summaryEvery({ minutes: String(every) }),
+    ];
+    if (muted.length === 0) lines.push(words.mutedNone);
+    else
+      lines.push(words.mutedHeader({ count: String(muted.length) }), ...muted.map((m) => `- ${mutedLine(m, words)}`));
+    return lines.join("\n");
   }
 
   private async summary(route: CommandRoute, arg: string): Promise<boolean> {

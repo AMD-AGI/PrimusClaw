@@ -48,7 +48,7 @@ import { startTerminalWaitSweep, TERMINAL_WAIT_NOTICE_MS } from "../remote-agent
 import { startTerminalDigestSweep } from "../assistant/terminal-digest.js";
 import { DELIVERY_SWEEP_MS, deliveryWritesIdle, noteEventsPost, recordOutboxReport, startDeliveryHealthSweep } from "../remote-agents/delivery-health.js";
 import { metrics } from "../infra/metrics.js";
-import { closeCardsOfConnector } from "../assistant/devenv-tools.js";
+import { closeCardsOfConnector, mutedConversations } from "../assistant/devenv-tools.js";
 import { startSeatSweep } from "../assistant/seats.js";
 import { inRemoteSessionOrder, noteRemoteCancel, noteRemoteEvents, noteRemotePrompt, remoteEventMark } from "../assistant/remote-items.js";
 
@@ -648,6 +648,14 @@ export async function registerRemoteAgentRoutes(app: FastifyInstance, opts: Remo
     const out = await store.setTerminalMute(owner, body.value.item, body.value.muted, clientLabel(req));
     if (out.status !== "ok") return out.status === "not_found" ? fail(reply, 404, "item_not_found") : fail(reply, 409, "not_a_terminal_item");
     return reply.send({ ok: true, data: { item: out.seq, muted: out.muted, machine: out.machine, title: out.title } });
+  });
+
+  // The conversations the owner muted, newest first (`store.listTerminalMutes`), each named as the assistant names it, with the `#<item>`
+  // that unmutes it.
+  app.get("/v1/remote-agents/approvals/mutes", async (req, reply) => {
+    const owner = requireOwner(req, reply);
+    if (!owner) return;
+    return reply.send({ ok: true, data: await mutedConversations(owner, onlineWindowMs) });
   });
 
   app.get<{ Params: { cid: string }; Querystring: { after?: string } }>(

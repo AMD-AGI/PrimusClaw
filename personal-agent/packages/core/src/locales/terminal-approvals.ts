@@ -45,7 +45,12 @@ export const terminalApprovalText = defineCatalog({
     approvalsTurnedOn: "Turned on: questions your terminals ask come here too. `/approvals off` stops it.",
     approvalsTurnedOff: "Turned off: questions stay in the terminal. `/approvals on` brings them back.",
     approvalsUsage:
-      "Use `/approvals on`, `/approvals off`, or `/approvals` to see which it is; `/approvals mute #12` (or `unmute #12`) for one terminal conversation, by the number its message names; `/approvals summary 60` (minutes, 15 to 1440, or `off`) for how often a conversation that keeps working on its own is summed up.",
+      "Use `/approvals` to see whether approvals from terminals are on, how often summaries come and which conversations are muted; `/approvals on` or `/approvals off` to change the first; `/approvals mute #12` (or `unmute #12`) for one terminal conversation, by the number its message names; `/approvals summary 60` (minutes, 15 to 1440, or `off`) for how often a conversation that keeps working on its own is summed up.",
+    mutedNone: "No conversation is muted. `/approvals mute #12` mutes one, by the number its message names.",
+    mutedHeader: (p: { count: string }) =>
+      `Muted conversations (${p.count}): what they ask, wait for or finish stays in their terminals. \`/approvals unmute #12\` brings one back.`,
+    mutedLine: (p: { who: string; since: string }) => (p.since ? `${p.who} (muted since ${p.since})` : p.who),
+    mutedUnnamed: "a conversation",
     muted: (p: { item: string; where: string }) =>
       `Muted #${p.item}${p.where ? ` (${p.where})` : ""}: what that conversation asks, waits for or finishes stays in its terminal. \`/approvals unmute #${p.item}\` brings it back.`,
     unmuted: (p: { item: string; where: string }) =>
@@ -119,7 +124,12 @@ export const terminalApprovalText = defineCatalog({
     approvalsTurnedOn: "已开启：终端里的问题也会推到这里。发 `/approvals off` 关闭。",
     approvalsTurnedOff: "已关闭：问题只在终端里问。发 `/approvals on` 重新开启。",
     approvalsUsage:
-      "用 `/approvals on` 或 `/approvals off`；只发 `/approvals` 看当前状态；对单个终端会话用 `/approvals mute #12`（或 `unmute #12`），编号见推送消息里的 #N；`/approvals summary 60`（分钟，15 到 1440，或 `off`）设置持续工作的会话多久汇总一次。",
+      "只发 `/approvals` 看当前状态（终端审批推送是否开启、汇总间隔、已静音的会话）；用 `/approvals on` 或 `/approvals off` 开关推送；对单个终端会话用 `/approvals mute #12`（或 `unmute #12`），编号见推送消息里的 #N；`/approvals summary 60`（分钟，15 到 1440，或 `off`）设置持续工作的会话多久汇总一次。",
+    mutedNone: "没有已静音的会话。发 `/approvals mute #12` 静音某个会话，编号见推送消息里的 #N。",
+    mutedHeader: (p) =>
+      `已静音的会话（${p.count} 个）：它们的提问、等待和完成只留在终端里。发 \`/approvals unmute #12\` 恢复其中一个。`,
+    mutedLine: (p) => (p.since ? `${p.who}（${p.since} 起静音）` : p.who),
+    mutedUnnamed: "一个会话",
     muted: (p) =>
       `已静音 #${p.item}${p.where ? `（${p.where}）` : ""}：这个会话的提问、等待和完成都只留在终端里。发 \`/approvals unmute #${p.item}\` 恢复。`,
     unmuted: (p) => `已恢复 #${p.item}${p.where ? `（${p.where}）` : ""}：这个会话的提问和完成会重新推到这里。`,

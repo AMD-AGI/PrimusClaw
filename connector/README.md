@@ -663,7 +663,7 @@ prompt holds an end not yet told until its own turn ends, and a person's prompt 
 fields, and Codex, are told as before.
 
 `/approvals off` turns these off with the questions. To stop hearing from one conversation, tap *Mute this conversation*
-or send `/approvals mute #<item>` (`/approvals unmute #<item>` brings it back): its questions, waits and ends then stay in
+or send `/approvals mute #<item>` (`/approvals unmute #<item>` brings it back; `/approvals` alone lists the conversations muted, each with its number): its questions, waits and ends then stay in
 its terminal, and Claw refuses to open a card session for it (`session_muted`). The audit log records each end told or not
 (`turn_end_sent`, `turn_end_not_sent` with the reason), never the agent's words.
 

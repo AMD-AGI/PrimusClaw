@@ -26,7 +26,15 @@ import { cardDataOf, cardKindOf, cardVerb, isCardClick } from "./actions.js";
 import { forwardsInText, forwardsOf, logUnreadKinds, ownWords } from "./forwards.js";
 import { clientPlatform, conversationId, conversationKind, isPersonal, senderOf, tenantOf } from "./identity.js";
 import { inboundLinksOf } from "./links.js";
-import { addressedToBot, DEFAULT_BOT_NAME, isMentioned, isTargeted, mentionsOf, messageText } from "./mentions.js";
+import {
+  addressedToBot,
+  DEFAULT_BOT_NAME,
+  isMentioned,
+  isTargeted,
+  mentionsOf,
+  messageText,
+  withoutTypedBotName,
+} from "./mentions.js";
 import { isBotQuote, logPlaceholderQuotes, quotesOf } from "./quotes.js";
 import { parseActivity, partOf, truthy, type Activity } from "./schema.js";
 
@@ -92,18 +100,27 @@ function messageOf(activity: Activity, sender: UserRef, options: ToEventOptions)
   logPlaceholderQuotes(activity, found, logger);
   logUnreadKinds(activity, logger);
   const bot = partOf(activity, "recipient");
+  const botName = options.botName ?? DEFAULT_BOT_NAME;
+  const said = withoutTypedBotName(
+    forwarded.forwards.length && !forwardsInText(activity)
+      ? ownWords(messageText(activity), forwarded.forwards, /<attachment\b/iu.test(pyStr(activity.text)))
+      : messageText(activity),
+    botName,
+  );
   return {
     type: "message",
     ...base(activity, sender),
-    text:
-      forwarded.forwards.length && !forwardsInText(activity)
-        ? ownWords(messageText(activity), forwarded.forwards, /<attachment\b/iu.test(pyStr(activity.text)))
-        : messageText(activity),
+    text: said.text,
     mentioned: isMentioned(activity),
     targeted: isTargeted(activity),
-    namesBotFirst: addressedToBot(activity, options.botName ?? DEFAULT_BOT_NAME),
+    // (a name taken off the text, with its @ or without, is the person naming the bot: an attached chat keeps those words for the bot, so
+    // "<name> /clear" is not sent bare as "/clear" to the agent while "@<name> /clear" stays with the bot)
+    namesBotFirst: said.removed > 0 || addressedToBot(activity, botName),
     conversationName: personal ? "" : pyStr(partOf(activity, "conversation")["name"]),
-    mentions: mentionsOf(activity),
+    // (the offsets are in the text: where the name typed ahead stood is not there any more)
+    mentions: mentionsOf(activity)
+      .filter((m) => m.offset >= said.removed)
+      .map((m) => ({ ...m, offset: m.offset - said.removed })),
     links: inboundLinksOf(activity),
     quotes: found.map((q) => ({
       author: q.sender,
