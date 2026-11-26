@@ -132,6 +132,37 @@ test("the bot's name typed as words ahead of a command is not part of the comman
   assert.equal(message(grp("@clawy /help", { mention: false }), "Clawy").text, "/help");
 });
 
+// A chat attached to a remote session sends the person's words on to the agent unless they start by naming the bot (`namesBotFirst`). The name
+// taken off the text is the person naming the bot, with or without the @: with the name gone and the flag not set, "clawy /clear" reached the
+// agent as a bare "/clear" while "@clawy /clear" stayed with the bot (review of #949).
+test("the bot's name typed ahead of a command names the bot first, with or without the @", () => {
+  for (const text of [
+    "@clawy /clear",
+    "clawy /clear",
+    "  CLAWY \u00a0 /compact",
+    "@Clawy /approvals",
+    "clawy /approvals mute #12",
+  ]) {
+    const event = message(dm(text), "Clawy");
+    assert.deepEqual([event.namesBotFirst, event.mentioned, event.text.startsWith("/")], [true, false, true], text);
+  }
+  // another deployment's name, or words that only look like naming the bot, are not the bot's: the flag stays off where nothing was taken off
+  for (const text of [
+    "clawy /tmp/app.log is huge",
+    "clawyx /clear",
+    "hi clawy /clear",
+    "clawy: /clear",
+    "clawy hello",
+    "clawy /",
+    "clawy",
+  ])
+    assert.equal(message(dm(text), "Clawy").namesBotFirst, false, text);
+  assert.equal(message(dm("clawy /clear"), "Robin").namesBotFirst, false);
+  assert.equal(message(dm("clawy /clear"), "Robin").text, "clawy /clear");
+  // (a reply, whose text is HTML, is read the same)
+  assert.equal(message(dm(replyHtml({ own: "clawy /clear" })), "Clawy").namesBotFirst, true);
+});
+
 // (a name that is made of pattern syntax is only its own letters)
 test("a bot name with pattern characters is matched as the words it is", () => {
   const said = (text: string): string => message(dm(text), "a|b(").text;

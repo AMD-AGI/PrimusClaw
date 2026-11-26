@@ -457,7 +457,8 @@ release version, and its `appVersion` stays `latest`.
   assistant, never as the command it carries (2026-11-26, `/approvals` answered with the assistant's overview). The name (the
   deployment's, with or without the `@`) is now dropped from the text as a picked mention is when a command word follows it, in a 1:1 and in a group chat; any other message, the name alone, a word that merely starts with it
   (`@clawyx`), or the name before words that are not a command, stays as typed, and the mentions of other people keep their place
-  in the words.
+  in the words. A name dropped this way, with the `@` or without, also names the bot first: in a 1:1 chat attached to a remote
+  session `clawy /clear` stays with the bot as `@clawy /clear` does, and no slash word reaches the coding agent bare.
 - Claw: the assistant named the user's sessions differently from their `/agents` card. `devenv_list` gave a session's title (the
   name the user gave it on their machine) only with `detail: "activity"`, and its default read listed each machine's first six
   sessions, not the ones the card shows; asked again with a plain read, the router called the titles it had given made up and said

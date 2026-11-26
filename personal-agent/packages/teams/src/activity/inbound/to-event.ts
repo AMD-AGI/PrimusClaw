@@ -113,7 +113,9 @@ function messageOf(activity: Activity, sender: UserRef, options: ToEventOptions)
     text: said.text,
     mentioned: isMentioned(activity),
     targeted: isTargeted(activity),
-    namesBotFirst: addressedToBot(activity, botName),
+    // (a name taken off the text, with its @ or without, is the person naming the bot: an attached chat keeps those words for the bot, so
+    // "clawy /clear" is not sent bare as "/clear" to the agent while "@clawy /clear" stays with the bot)
+    namesBotFirst: said.removed > 0 || addressedToBot(activity, botName),
     conversationName: personal ? "" : pyStr(partOf(activity, "conversation")["name"]),
     // (the offsets are in the text: where the name typed ahead stood is not there any more)
     mentions: mentionsOf(activity)

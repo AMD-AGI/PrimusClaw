@@ -91,7 +91,8 @@ function typedNamePattern(botName: string): RegExp {
  * that took off its start. A mention a person picks is an entity, which `messageText` drops; one Teams on a phone sends as plain words
  * (2026-11-26 03:24: "@<name> /approvals") has none, so it stayed in the text and `/approvals` was read as a sentence, not as the
  * command. Only the name first and a command word after it: any other words, the name alone, a word that merely starts with the name
- * and a path (`/tmp/app.log`) stay as they were typed, so no ordinary chat becomes a command.
+ * and a path (`/tmp/app.log`) stay as they were typed, so no ordinary chat becomes a command. A name taken off here, with its @ or without,
+ * is the person naming the bot, so the caller also reads the message as naming the bot first (`addressedToBot` reads only the @ form).
  */
 export function withoutTypedBotName(
   text: string,

@@ -39,7 +39,9 @@ it says the setting cannot be reached now (`/approvals on`, `off`, `mute`, `unmu
   a sentence and answered by the assistant, never as the command it carries. The name (the deployment's `botName`) is dropped
   from the text as a picked mention is when a command word follows it (`/approvals`, in a 1:1 and in a group chat), and the mentions of other people keep their place in the words. Every other message is read as before: the
   name alone, a word that merely starts with it, the name before words that are not a command (`@clawy stop`) or before a path
-  (`/tmp/app.log`) stay as typed.
+  (`/tmp/app.log`) stay as typed. A name dropped this way, with the `@` or without, also sets `namesBotFirst` (`addressedToBot` reads
+  only the `@` form): in a 1:1 chat attached to a remote session `clawy /clear` stays with the bot as `@clawy /clear` does, and no
+  slash word reaches the coding agent bare.
 
 ## 0.15.0
 
