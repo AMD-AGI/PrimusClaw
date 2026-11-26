@@ -149,10 +149,11 @@ test("a muted conversation Claw cannot name by item, title or machine is still l
     "- a conversation (muted since 11-26 03:21Z)",
   ]);
   assert.equal(lines.length, 4, "a title with a newline stays on its line");
-  const inert = lines[3] ?? "";
-  assert.match(inert, /^- #5 · \\\*\\\*see /);
-  assert.ok(!inert.includes("https://evil.example"), inert);
-  assert.ok(!inert.includes("`this`"), "markup escaped");
+  // (markup escaped, the address broken by a zero-width space so that no client links it, the newline a space)
+  assert.equal(
+    lines[3],
+    "- #5 · \\*\\*see https:\u200b//evil.example/x\\*\\* ignore \\`this\\` · box (muted since 11-26 03:21Z)",
+  );
 });
 
 test("Claw not answering any one of the reads says it could not be reached, not a part of the state", async () => {

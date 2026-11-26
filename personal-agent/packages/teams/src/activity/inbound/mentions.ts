@@ -81,8 +81,8 @@ function typedNamePattern(botName: string): RegExp {
 
 /**
  * `text` without the bot's name typed as words ahead of what else it says, and how many code points that took off its start. A
- * mention a person picks is an entity, which `messageText` drops; one Teams on a phone sends as plain words (2026-11-26 03:24: "@clawy
- * /approvals") has none, so it stayed in the text and `/approvals` was read as a sentence, not as the command. Only the name first,
+ * mention a person picks is an entity, which `messageText` drops; one Teams on a phone sends as plain words (2026-11-26 03:24:
+ * "@<name> /approvals") has none, so it stayed in the text and `/approvals` was read as a sentence, not as the command. Only the name first,
  * before more words: the name alone, or a word that merely starts with it, stays as it was typed.
  */
 export function withoutTypedBotName(
