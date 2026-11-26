@@ -27,6 +27,8 @@
  *       after devenv_list) and says what is still put to the user: their own attach commands as a button, devenv_send as a card
  *   D9  what each machine's connector health checks found (`capabilities.health`) reaches the router as the machine's problems:
  *       failures first, a machine-wide one once, each with its fix; a connector that reports no health has no problems field
+ *   D1d the default read lists what the /agents card shows of each machine, in its order, each session with its title (the name the
+ *       user gave it on their machine) and id; the rest only when that machine is asked for, marked not on the card
  *   R1  readSession: the state, step, answer and question of a session from its events (pure)
  */
 import assert from "node:assert/strict";
@@ -44,6 +46,7 @@ describe("devenv_list", { skip }, () => {
   let store: typeof import("../src/remote-agents/store.js");
   let rt: typeof import("../src/assistant/review-tools.js");
   let inbound: typeof import("../src/assistant/inbound.js");
+  let devenv: typeof import("../src/assistant/devenv-tools.js");
   let Client: typeof import("@modelcontextprotocol/sdk/client/index.js").Client;
   let InMemoryTransport: typeof import("@modelcontextprotocol/sdk/inMemory.js").InMemoryTransport;
   let kick: () => Promise<void>;
@@ -54,6 +57,7 @@ describe("devenv_list", { skip }, () => {
     store = await import("../src/remote-agents/store.js");
     rt = await import("../src/assistant/review-tools.js");
     inbound = await import("../src/assistant/inbound.js");
+    devenv = await import("../src/assistant/devenv-tools.js");
     kick = rt.reviewToolPorts.kick;
     rt.reviewToolPorts.kick = async () => undefined;
     ({ Client } = await import("@modelcontextprotocol/sdk/client/index.js"));
@@ -184,29 +188,34 @@ describe("devenv_list", { skip }, () => {
     assert.ok(!Number.isNaN(Date.parse(b.machines[1].last_seen)), "when the offline one was last seen");
 
     const rows = b.machines[0].sessions.map((s: Recorded) => [s.label, s.agent, s.cwd, s.opened_in, s.state, s.ref, s.attach_command]);
+    // As /agents lists them: each agent's own conversations first (open in a terminal, then idle), then the sessions open through Claw.
     assert.deepEqual(rows, [
-      ["laptop/claude/1", "claude", "/home/alice/api", "chat", "working", working, `/agent attach ${working}`],
-      ["laptop/codex/1", "codex", "/home/alice/web", "chat", "waiting_for_you", waiting, `/agent attach ${waiting}`],
-      ["laptop/claude/2", "claude", "/home/alice/docs", "chat", "idle", idle, `/agent attach ${idle}`],
-      ["laptop/claude/3", "claude", "/home/alice/conn", "machine", "in_terminal", "c0ffee00-0000-4000-8000-000000000002",
+      ["laptop/claude/1", "claude", "/home/alice/conn", "machine", "in_terminal", "c0ffee00-0000-4000-8000-000000000002",
         "/agent attach c0ffee00-0000-4000-8000-000000000002"],
-      ["laptop/claude/4", "claude", "/home/alice/api", "machine", "idle", "c0ffee00-0000-4000-8000-000000000001",
+      ["laptop/claude/2", "claude", "/home/alice/api", "machine", "idle", "c0ffee00-0000-4000-8000-000000000001",
         "/agent attach c0ffee00-0000-4000-8000-000000000001"],
+      ["laptop/claude/3", "claude", "/home/alice/api", "chat", "working", working, `/agent attach ${working}`],
+      ["laptop/codex/1", "codex", "/home/alice/web", "chat", "waiting_for_you", waiting, `/agent attach ${waiting}`],
+      ["laptop/claude/4", "claude", "/home/alice/docs", "chat", "idle", idle, `/agent attach ${idle}`],
     ]);
     // Open in a terminal: it can be attached to watch, read-only, and the listing says that is all it can do.
-    assert.equal(b.machines[0].sessions[3].read_only, true);
-    assert.match(b.machines[0].sessions[3].note, /only watches it/);
-    assert.equal(b.machines[0].sessions[3].why_not, undefined);
-    assert.equal(b.machines[0].sessions[4].read_only, undefined);
+    assert.equal(b.machines[0].sessions[0].read_only, true);
+    assert.match(b.machines[0].sessions[0].note, /only watches it/);
+    assert.equal(b.machines[0].sessions[0].why_not, undefined);
+    assert.equal(b.machines[0].sessions[1].read_only, undefined);
     assert.deepEqual(b.machines[1].sessions, []);
     for (const s of b.machines[0].sessions) assert.ok(!Number.isNaN(Date.parse(s.last_activity)), s.label);
     const text = JSON.stringify(b);
     assert.ok(!text.includes("already open in chat"), "a conversation already open through Claw is listed once, as the chat session");
     for (const theirs of ["bob", bobSession, "old box"]) assert.ok(!text.includes(theirs), `${theirs} is not listed`);
-    // By default nothing an agent wrote: no answer, step or title.
-    for (const words of ["Running the suite", "Run make test", "312 tests", "fix the flaky api test", "run make test"]) {
+    // By default no answer or step; a conversation's title is what the user named it on their machine (what /agents shows), in every read.
+    for (const words of ["Running the suite", "Run make test", "312 tests", "run make test"]) {
       assert.ok(!text.includes(words), `"${words}" is the agent's, and only "activity" carries it`);
     }
+    assert.deepEqual(b.machines[0].sessions.map((s: Recorded) => [s.id, s.title]), [
+      ["c0ffee00-0000-4000-8000-000000000002", "refactor the connector"], ["c0ffee00-0000-4000-8000-000000000001", "fix the flaky api test"],
+      [working, null], [waiting, null], [idle, null],
+    ]);
     assert.match(b.note, /not SaFE\s+workspaces/);
   });
 
@@ -229,6 +238,63 @@ describe("devenv_list", { skip }, () => {
     assert.deepEqual(act.machines[0].sessions.map((s: Recorded) => s.waiting_for ?? null), ["input needed", null, null, null]);
   });
 
+  test("D1d the default read lists the sessions /agents shows, in its order, each with its title and id, so the router names what the card shows", async () => {
+    // As on 2026-11-25 04:38: one folder with two sessions open through Claw and six conversations open in terminals. The status read
+    // carried no titles and the first six sessions; the router named titles from an earlier activity read, then took them back as made
+    // up and said it could not read titles, and the user could not match it with the /agents card.
+    const alice = await w.user("alice");
+    const ref = (i: number) => `d00d0000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+    const box = await machine("alice", "devpod", { online: true, agents: [{ id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)", watch: true, resumable: [
+      { ref: ref(1), title: "multibranch-toolbox", cwd: "/w", updated_at: now() - 10, state: "live", activity: "working" },
+      { ref: ref(2), title: "dispatron", cwd: "/w", updated_at: now() - 20, state: "live", activity: "working" },
+      { ref: ref(3), title: "hosting", cwd: "/w", updated_at: now() - 30, state: "live", activity: "working" },
+      { ref: ref(4), title: "notes", cwd: "/w", updated_at: now() - 40, state: "live", activity: "working" },
+      { ref: ref(5), title: "clean", cwd: "/w", updated_at: now() - 50, state: "live", activity: "working" },
+      { ref: ref(6), title: "weekly report", cwd: "/w", updated_at: now() - 7 * 86_400, state: "live", activity: "idle" },
+      { ref: ref(7), title: "approval test", cwd: "/w/a", updated_at: now() - 10 * 86_400, state: "idle" },
+      { ref: ref(8), title: "held\u0007 by\nchat", cwd: "/w/held", updated_at: now() - 5, state: "attached" },
+    ] }] });
+    const older = await session("alice", box, "claude-sessions", "/w", [chunk("ok"), end()], 60);
+    const held = await session("alice", box, "claude-sessions", "/w/held", [chunk("ok"), end()], 5);
+
+    const b = (await call(await userTurn(alice, "我连接的开发机上有哪些会话，名字也列出来"))).body;
+    const m = b.machines[0];
+    assert.deepEqual(m.sessions.map((s: Recorded) => [s.label, s.id, s.title, s.opened_in]), [
+      ["devpod/claude-sessions/1", ref(1), "multibranch-toolbox", "machine"],
+      ["devpod/claude-sessions/2", ref(2), "dispatron", "machine"],
+      ["devpod/claude-sessions/3", ref(3), "hosting", "machine"],
+      ["devpod/claude-sessions/4", ref(4), "notes", "machine"],
+      ["devpod/claude-sessions/5", ref(5), "clean", "machine"],
+      ["devpod/claude-sessions/8", held, "held by chat", "chat"],
+      ["devpod/claude-sessions/9", older, null, "chat"],
+    ], "the card's: its five newest conversations open in terminals, no idle one (no room left), then the sessions open through Claw");
+    assert.deepEqual([m.session_count, m.sessions_not_shown], [9, 2]);
+    assert.match(b.note, /title is the name the user gave a session on their machine/);
+    assert.match(b.note, /never a title or session this result does not list/);
+    // Asked for by name: every session, the two the card does not show marked so.
+    const all = (await call(await userTurn(alice, "devpod 上所有会话"), { machine: "devpod" })).body.machines[0].sessions;
+    assert.deepEqual(all.filter((s: Recorded) => s.not_on_agents_card).map((s: Recorded) => [s.label, s.title]),
+      [["devpod/claude-sessions/6", "weekly report"], ["devpod/claude-sessions/7", "approval test"]]);
+    // The card shows the conversations of six online agents of all machines, in order: a seventh agent's are only counted.
+    await machine("alice", "spare", { online: true, agents: Array.from({ length: 6 }, (_, i) => ({ id: `a${i}`, kind: "attach", name: `A${i}`, watch: true,
+      resumable: [{ ref: `5a5a0000-0000-4000-8000-00000000000${i}`, title: `spare ${i}`, cwd: "/s", updated_at: now() - 5, state: "live" }] })) });
+    const two = (await call(await userTurn(alice, "两台机器上的会话"))).body;
+    assert.deepEqual(two.machines[1].sessions.map((s: Recorded) => s.title), ["spare 0", "spare 1", "spare 2", "spare 3", "spare 4"]);
+    assert.equal(two.machines[1].sessions_not_shown, 1);
+    // The card's rule, alone: at most five open in terminals, idle ones only in the room left (at most two), unknown ones (at most two).
+    const order = devenv.cardOrder([
+      { state: "idle", n: 1 }, { state: "live", n: 2 }, { state: "attached", n: 3 }, { state: "weird", n: 4 }, { state: "idle", n: 5 }, { state: "idle", n: 6 },
+    ]);
+    assert.deepEqual(order.map((x) => [x.c.n, x.shown]), [[2, true], [1, true], [5, true], [4, true], [6, false]]);
+    // The card reads the first twelve as reported and only then drops attached ones: an attached one among them leaves a thirteenth unshown.
+    const many = devenv.cardOrder([
+      { state: "attached", n: 1 }, ...Array.from({ length: 11 }, (_, i) => ({ state: "weird", n: i + 2 })), { state: "live", n: 13 },
+    ]);
+    assert.deepEqual(many.filter((x) => x.shown).map((x) => x.c.n), [2, 3]);
+    assert.equal(many.find((x) => x.c.n === 13)?.shown, false);
+    assert.equal(many.some((x) => x.c.n === 1), false);
+  });
+
   test("D1c every machine comes first as a compact summary, so a machine with many sessions does not push another out of the turn's result", async () => {
     // As on 2026-11-07 14:32: two machines, a dozen sessions on the first. The whole list was longer than a turn reads, Brain cut it to
     // fit, the second machine was never seen, and "连一下第二台" was answered "第二台连不上，读取结果被截断".
@@ -244,11 +310,11 @@ describe("devenv_list", { skip }, () => {
 
     const b = (await call(await userTurn(alice, "我的开发环境有哪些"))).body;
     assert.deepEqual(b.machines.map((m: Recorded) => [m.machine, m.session_count, m.sessions_not_shown, (m.sessions as unknown[]).length]), [
-      ["build-box", 14, 8, 6], ["dev-box", 12, 6, 6],
-    ]);
+      ["build-box", 14, 9, 5], ["dev-box", 12, 7, 5],
+    ], "what /agents shows of each: the ones open in a terminal among the twelve newest, then idle ones to five");
     assert.deepEqual(b.machines[0].sessions_by_state, { idle: 9, in_terminal: 5 }, "counted over all of them");
-    assert.equal(b.machines[0].sessions[0].ref, "d0d0d0d0-0000-4000-8000-000000000000", "the latest first");
-    assert.match(b.note, /sessions_not_shown lists only its latest sessions.*machine set to that machine's name/);
+    assert.equal(b.machines[0].sessions[0].ref, "d0d0d0d0-0000-4000-8000-000000000001", "the latest open in a terminal first, as /agents lists it");
+    assert.match(b.note, /sessions_not_shown lists only the sessions the user's agents card \(\/agents\) shows of it.*machine set to that machine's name/);
     // What the router reads of it: Brain keeps the whole answer, both machines in it.
     const read = truncateToolResult(JSON.stringify(b), "mcp__assistant__devenv_list");
     const seen = JSON.parse(read);
@@ -302,8 +368,11 @@ describe("devenv_list", { skip }, () => {
       { id: "codex", kind: "codex", name: "Codex" },
     ] });
     let b = (await call(await w.routerTurn(alice))).body;
-    assert.deepEqual(b.attach_default, { label: "devbox/claude/2", ref: "eva10000-0000-4000-8000-000000000001", attach_command: "/agent attach eva10000-0000-4000-8000-000000000001" },
-      "the one conversation that is not in a terminal");
+    assert.deepEqual(b.attach_default, { label: "devbox/claude/3", ref: "eva10000-0000-4000-8000-000000000001", attach_command: "/agent attach eva10000-0000-4000-8000-000000000001" },
+      "the one conversation that is not in a terminal (numbered as /agents lists them: the two open in a terminal first)");
+    // devenv_send takes the label devenv_list gave it to mean that same session.
+    const planned = await devenv.planSend("alice", { text: "看看", target: "devbox/claude/3" }) as Recorded;
+    assert.deepEqual([planned.ok, planned.plan?.resume_ref, planned.plan?.label], [true, "eva10000-0000-4000-8000-000000000001", "devbox/claude/3"]);
     assert.equal(b.machines[0].sessions.length, 3, "a ref that could forge an argument is not listed");
     // This connector does not say it can watch a conversation open in a terminal (an older one): such a one has no command.
     const inTerminal = b.machines[0].sessions.find((x: Recorded) => x.cwd === "/w/b");
@@ -501,6 +570,9 @@ describe("devenv_list", { skip }, () => {
     assert.match(withActions, /attach_command/);
     assert.match(withActions, /开发环境/);
     assert.doesNotMatch(prompts.renderRouterDevenvSection({ actions: false }), /channel_action/);
+    // Sessions by their titles, which every read gives; nothing named that this turn's results do not list.
+    assert.match(withActions, /each session by its title \(the name the user gave it on their machine, as \/agents shows it/);
+    assert.match(withActions, /never say you cannot read them, and never name a session or title it did not list in this turn/);
   });
 
   test("D8 no machine: the user's own ask gets a one-line pairing command made for them, in their language", async () => {

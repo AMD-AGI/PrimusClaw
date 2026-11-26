@@ -225,7 +225,7 @@ describe("claw-connector pair", () => {
     }
   });
 
-  describe("the Claude Code hooks, offered as init offers them", () => {
+  describe("the Claude Code hooks, added as init adds them", () => {
     const stand = (name: string): string => { const f = path.join(tmpdir("pair-hookbin-"), name); fs.writeFileSync(f, "// stand-in\n"); return f; };
     const scripts = () => ({ hookScript: stand("terminal-hook.js"), approvalHookScript: stand("approval-hook.js") });
     const commands = (dir: string): string[] => {
@@ -240,45 +240,39 @@ describe("claw-connector pair", () => {
       return cc;
     };
 
-    test("at a terminal, Enter installs the session and approval hooks after the pairing and before the connector starts", async () => {
-      const home = tmpdir();
-      const cc = setup(home);
-      const order: string[] = [];
-      const asked: Array<[string, boolean | undefined]> = [];
-      const a = ctx(home, {
-        fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...scripts(),
-        ask: async (q, d) => { asked.push([q, d]); order.push("asked"); return d ?? false; },
-      });
-      const rc = await cmdPair(["ABCD-EFGH-JKMN", "--server", "https://claw.example/api"], a.c, {
-        runningPid: () => null, stop: async () => undefined, hooks: setupHooks,
-        start: async () => { order.push("started"); return 0; },
-      });
-      assert.equal(rc, 0, a.errText());
-      assert.deepEqual(order, ["asked", "started"]);
-      assert.deepEqual(asked, [["Add them? [Y/n] ", true]]);
-      const cmds = commands(cc);
-      assert.equal(cmds.filter((c) => c.includes("terminal-hook.js")).length, 2);
-      assert.equal(cmds.filter((c) => c.includes("approval-hook.js") && c.includes(path.join(a.c.dirs.state, "approvals.sock"))).length, 7);
-      assert.equal(JSON.parse(fs.readFileSync(path.join(cc, "settings.json"), "utf8")).model, "opus");
-      assert.match(a.text(), /paired "box"[\s\S]*installed the approval hooks[\s\S]*is coming online/);
-    });
-
-    test("a no, nobody to ask, or --no-hooks leaves Claude Code's settings alone and the pairing goes on; --hooks with --no-hooks is refused before the code is spent", async () => {
-      for (const [how, args, ask] of [
-        ["no", [], async () => false],
-        ["no terminal", [], undefined],
-        ["--no-hooks", ["--no-hooks"], async () => assert.fail("--no-hooks must not ask")],
-      ] as const) {
+    test("the session and approval hooks are added without a question, after the pairing and before the connector starts", async () => {
+      for (const withTerminal of [true, false]) {
         const home = tmpdir();
         const cc = setup(home);
-        const before = fs.readFileSync(path.join(cc, "settings.json"), "utf8");
-        const a = ctx(home, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...scripts(), ...(ask ? { ask } : {}) });
-        assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start", ...args], a.c), EXIT.ok, `${how}: ${a.errText()}`);
-        assert.equal(fs.readFileSync(path.join(cc, "settings.json"), "utf8"), before, how);
-        assert.ok(fs.existsSync(credentialsFile(a.c.dirs)), `${how}: still paired`);
-        if (how !== "--no-hooks") assert.match(a.text(), /did not add the Claude Code hooks .*claw-connector hooks install --approvals/, how);
-        if (how === "no terminal") assert.match(a.text(), /no terminal to ask in/);
+        const order: string[] = [];
+        const a = ctx(home, {
+          fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...scripts(),
+          ...(withTerminal ? { ask: async () => assert.fail("pair must not ask about the hooks") } : {}),
+        });
+        const rc = await cmdPair(["ABCD-EFGH-JKMN", "--server", "https://claw.example/api"], a.c, {
+          runningPid: () => null, stop: async () => undefined, hooks: setupHooks,
+          start: async () => { order.push(commands(cc).length ? "hooks, then started" : "started without hooks"); return 0; },
+        });
+        assert.equal(rc, 0, a.errText());
+        assert.deepEqual(order, ["hooks, then started"]);
+        const cmds = commands(cc);
+        assert.equal(cmds.filter((c) => c.includes("terminal-hook.js")).length, 2);
+        assert.equal(cmds.filter((c) => c.includes("approval-hook.js") && c.includes(path.join(a.c.dirs.state, "approvals.sock"))).length, 7);
+        assert.equal(JSON.parse(fs.readFileSync(path.join(cc, "settings.json"), "utf8")).model, "opus");
+        assert.match(a.text(), /paired "box"[\s\S]*installed the approval hooks[\s\S]*is coming online/);
+        assert.doesNotMatch(a.text(), /Add them\?|run: claw-connector hooks/);
       }
+    });
+
+    test("--no-hooks leaves Claude Code's settings alone and the pairing goes on; --hooks with --no-hooks is refused before the code is spent", async () => {
+      const home = tmpdir();
+      const cc = setup(home);
+      const before = fs.readFileSync(path.join(cc, "settings.json"), "utf8");
+      const a = ctx(home, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...scripts() });
+      assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start", "--no-hooks"], a.c), EXIT.ok, a.errText());
+      assert.equal(fs.readFileSync(path.join(cc, "settings.json"), "utf8"), before);
+      assert.ok(fs.existsSync(credentialsFile(a.c.dirs)), "still paired");
+      assert.match(a.text(), /the connector will not add its hooks/);
       const spent: any[] = [];
       const both = ctx(tmpdir(), { fetch: claimFetch(() => ({ status: 201, body: { ok: true, data: { token: GRANT } } }), spent) });
       assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--hooks", "--no-hooks"], both.c), EXIT.usage);
@@ -286,39 +280,46 @@ describe("claw-connector pair", () => {
       assert.deepEqual(spent, []);
     });
 
-    test("Claude Code installed but never run here (no config directory yet): the same question, and Enter creates the directory with the hooks; a no or no terminal creates nothing", async () => {
-      for (const [how, ask] of [["enter", async (_q: string, d?: boolean) => d ?? false], ["no", async () => false], ["no terminal", undefined]] as const) {
-        const home = tmpdir();
-        const cc = path.join(home, "never-run", ".claude");
-        const asked: string[] = [];
-        const a = ctx(home, {
-          fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...scripts(),
-          ...(ask ? { ask: async (q: string, d?: boolean) => { asked.push(q); return ask(q, d); } } : {}),
-        });
-        assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start"], a.c), EXIT.ok, `${how}: ${a.errText()}`);
-        assert.ok(fs.existsSync(credentialsFile(a.c.dirs)), `${how}: paired`);
-        assert.doesNotMatch(a.text(), /not installed|once you use Claude Code/, how);
-        if (how === "enter") {
-          assert.deepEqual(asked, ["Add them? [Y/n] "]);
-          assert.match(a.text(), /Claude Code has not run here yet: .* is created with only entries marked --managed-by claw-connector/);
-          const cmds = commands(cc);
-          assert.equal(cmds.filter((c) => c.includes("terminal-hook.js")).length, 2);
-          assert.equal(cmds.filter((c) => c.includes("approval-hook.js")).length, 7);
-          assert.match(a.text(), /installed the approval hooks/);
-        } else {
-          assert.equal(fs.existsSync(cc), false, `${how}: nothing created`);
-          assert.match(a.text(), /did not add the Claude Code hooks .*claw-connector hooks install --approvals/, how);
-        }
-      }
+    test("a --no-approval-hooks that cannot be recorded: paired, but the connector is not started (it would add them)", async () => {
+      const home = tmpdir();
+      const cc = setup(home);
+      const before = fs.readFileSync(path.join(cc, "settings.json"), "utf8");
+      const a = ctx(home, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...scripts() });
+      // claude-hooks.json cannot be replaced: the temporary file it is written through is taken by a directory.
+      fs.mkdirSync(a.c.dirs.config, { recursive: true });
+      fs.mkdirSync(path.join(a.c.dirs.config, `claude-hooks.json.${process.pid}.tmp`));
+      let started = false;
+      const rc = await cmdPair(["ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-approval-hooks"], a.c, {
+        runningPid: () => null, stop: async () => undefined, hooks: setupHooks, start: async () => { started = true; return 0; },
+      });
+      assert.notEqual(rc, 0);
+      assert.equal(started, false, "not started");
+      assert.ok(fs.existsSync(credentialsFile(a.c.dirs)), "still paired");
+      assert.match(a.errText(), /paired, but not started/);
+      assert.equal(fs.readFileSync(path.join(cc, "settings.json"), "utf8"), before, "settings.json untouched");
     });
 
-    test("Claude Code not installed here: nothing asked or created, and the command to run once it is; --hooks adds them anyway", async () => {
+    test("Claude Code installed but never run here (no config directory yet): the directory is created with the hooks", async () => {
+      const home = tmpdir();
+      const cc = path.join(home, "never-run", ".claude");
+      const a = ctx(home, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("claude"), CLAUDE_CONFIG_DIR: cc }, ...scripts() });
+      assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start"], a.c), EXIT.ok, a.errText());
+      assert.ok(fs.existsSync(credentialsFile(a.c.dirs)), "paired");
+      assert.doesNotMatch(a.text(), /not installed/);
+      const cmds = commands(cc);
+      assert.equal(cmds.filter((c) => c.includes("terminal-hook.js")).length, 2);
+      assert.equal(cmds.filter((c) => c.includes("approval-hook.js")).length, 7);
+      assert.match(a.text(), /installed the approval hooks/);
+    });
+
+    test("Claude Code not installed here: nothing created and no command shown; --hooks adds them anyway", async () => {
       const home = tmpdir();
       const cc = path.join(home, ".claude");
       const a = ctx(home, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: fakePath("codex"), CLAUDE_CONFIG_DIR: cc }, ...scripts(), ask: async () => assert.fail("nothing to ask about") });
       assert.equal(await main(["pair", "ABCD-EFGH-JKMN", "--server", "https://claw.example/api", "--no-start"], a.c), EXIT.ok, a.errText());
       assert.equal(fs.existsSync(cc), false);
-      assert.match(a.text(), /Claude Code is not installed here \(no claude on PATH\), so its hooks were not added; once you install it, run: claw-connector hooks install --approvals/);
+      assert.match(a.text(), /Claude Code is not installed here \(no claude on PATH\); the connector adds its hooks once it is/);
+      assert.doesNotMatch(a.text(), /hooks install/);
       const forced = tmpdir();
       const fc = path.join(forced, ".claude");
       const b = ctx(forced, { fetch: granted(), cwd: tmpdir("w-"), env: { PATH: "", CLAUDE_CONFIG_DIR: fc }, ...scripts(), ask: async () => assert.fail("--hooks must not ask") });

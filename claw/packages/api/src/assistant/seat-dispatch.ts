@@ -26,7 +26,7 @@ import { readTrustedSessionCredentials, sealedCredentialFields } from "../auth/s
 import { CLAW_ASSISTANT_MAX_ACTIVE_ITEMS, CLAW_ASSISTANT_WORKER_MODEL } from "../config.js";
 import { connectionLost, db, inTransaction, type Querier } from "../infra/db.js";
 import { insertSessionRow } from "../routes/sessions.js";
-import { executeSend, inertMd, resumableOf, type SendPlan } from "./devenv-tools.js";
+import { executeSend, inertMd, type SendPlan } from "./devenv-tools.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
 import { drainSessionIfIdle, queueServerMessage } from "./messages.js";
 import { recordSystemNotice } from "./outbound.js";
@@ -34,7 +34,7 @@ import {
   errandNotice, errandText, errandWorkerSessionId, langOf, noteErrandPrompt, REMOTE_EVENT_COMMAND_REJECTED, REMOTE_EVENT_TURN_END, reportErrand,
   SEAT_QUEUE_REASONS, type ErrandParams, type ErrandQueue, type RemoteLang,
 } from "./remote-items.js";
-import { SEAT_QUEUE_MAX, seatDispatchOn, seatsLive, syncSeats, type SeatLive } from "./seats.js";
+import { SEAT_QUEUE_MAX, seatDispatchOn, seatDisplayName, seatsLive, syncSeats, type SeatLive } from "./seats.js";
 import type { AssistantTokenClaims } from "./token.js";
 import { assertLiveRun, attendedTurn, ToolRefused } from "./tools.js";
 import { typedCommand } from "./typed-commands.js";
@@ -90,10 +90,13 @@ export function parseTarget(raw: unknown): Target | null {
   return { kind: "seats", seats, sandbox };
 }
 
-/** How a seat is named to the user: the alias they confirmed, else `<machine>/<agent>`; one line of at most 40 code points. */
-export function seatLabel(live: Pick<SeatLive, "machine" | "seat">): string {
+/**
+ * How a seat is named to the user on a card: the alias they confirmed with the name its session has on their machine beside it (what
+ * `/agents` shows), else that name, else `<machine>/<agent>`; one line of at most 40 code points.
+ */
+export function seatLabel(live: Pick<SeatLive, "machine" | "seat"> & { names?: readonly string[] }): string {
   const alias = typeof live.seat.alias === "string" && live.seat.alias ? live.seat.alias : null;
-  return flat(alias ?? `${live.machine}/${String(live.seat.agent_id)}`, LABEL_MAX);
+  return flat(seatDisplayName(alias, live.names ?? []) ?? `${live.machine}/${String(live.seat.agent_id)}`, LABEL_MAX);
 }
 
 /** Why a task for this seat needs a card, or null when it may go directly (see the module's comment). */
@@ -113,6 +116,17 @@ export function seatRefusal(live: SeatLive | undefined, seatId: string): ToolRef
     return new ToolRefused("seat_not_found", "no seat of the user's has that seat_id: use the seat_id from seat_roster (an alias or a machine name is not a target)");
   }
   if (live.seat.role_state === "retired") return new ToolRefused("seat_retired", "the user said not to send work to that seat");
+  // A seat of a folder whose agent only takes conversations over, with no session of its own now: which conversation would be a guess
+  // (each has its own seat), so nothing goes to it until a session of it holds one again.
+  if (!live.seat.conversation_ref && String(live.agent?.kind) === "attach" && !live.session) {
+    return new ToolRefused("seat_unbound", "that seat is a folder's from before seats were per session, and its sessions are seats of their "
+      + "own now: hand the task to one of those (seat_roster), or say which session it is (seat_set)");
+  }
+  if (live.unsupported === "conversation_gone" || live.unsupported === "conversation_closed") {
+    return new ToolRefused("seat_gone", live.unsupported === "conversation_gone"
+      ? "that seat's conversation is no longer on its machine (deleted, or too old to resume): nothing can be sent to it; tell the user, and offer another seat or the sandbox"
+      : "that seat's conversation was closed and no agent on its machine can take it over again: nothing can be sent to it; tell the user, and offer another seat or the sandbox");
+  }
   if (live.unsupported) {
     return new ToolRefused("seat_unsupported", live.unsupported === "connector_outdated"
       ? "the connector on that machine is too old to take tasks: tell the user to upgrade it"
@@ -120,6 +134,16 @@ export function seatRefusal(live: SeatLive | undefined, seatId: string): ToolRef
         : "that seat's agent is no longer offered by its machine", live.upgrade_command ? { upgrade_command: live.upgrade_command } : undefined);
   }
   return null;
+}
+
+/**
+ * A new session asked for a seat that is one conversation: refused. That session would be another conversation, so another seat, than
+ * the one the user confirmed (and a card for this seat would show this seat): a task for a seat only ever goes to its own conversation.
+ */
+export function newSessionRefusal(live: SeatLive | undefined, newSession: boolean): ToolRefused | null {
+  if (!newSession || !live?.seat.conversation_ref) return null;
+  return new ToolRefused("seat_new_session", "a seat is one session: a task for it goes to that session (it waits in its queue while the "
+    + "user is in its terminal). A new session in its folder is not that seat: for one, devenv_send with new_session (a card), or another seat");
 }
 
 /**
@@ -205,6 +229,7 @@ export type DispatchOutcome =
 
 /** Where a task goes in this seat now: a session to continue, a terminal to type into, a new session; or why it waits. */
 function planFor(live: SeatLive, newSession: boolean): { plan: SendPlan } | { wait: ErrandQueue } | { error: string; message: string } {
+  if (live.base === "gone") return { error: "seat_gone", message: "that seat's conversation is gone: nothing can be sent to it" };
   if (live.base === "offline") return { wait: "machine_offline" };
   if (live.base === "unsupported") return { error: "seat_unsupported", message: "that seat cannot take tasks now" };
   if (live.base === "working" || live.base === "waiting_for_you") return { wait: "seat_busy" };
@@ -219,14 +244,17 @@ function planFor(live: SeatLive, newSession: boolean): { plan: SendPlan } | { wa
   if (!newSession && live.terminal?.typed) {
     return { plan: { ...base, agent_id: live.terminal.agent_id, session_id: null, resume_ref: live.terminal.ref, label: `${live.machine}/${live.terminal.agent_id}`, terminal: true } };
   }
-  // ③ A new session in its folder (taking over its own conversation when it is held to one, or when its agent only takes over).
-  let ref: string | null = typeof seat.conversation_ref === "string" && seat.conversation_ref ? seat.conversation_ref : null;
-  if (!ref && String(live.agent?.kind) === "attach") {
-    const free = resumableOf(live.agent!).filter((r) => r.cwd === seat.cwd && r.state !== "attached" && r.state !== "live")
-      .sort((a, b) => (b.updated_at ?? "").localeCompare(a.updated_at ?? ""));
-    ref = free[0]?.ref ?? null;
-    if (!ref) return { error: "seat_unsupported", message: "that seat's agent only takes over a conversation of its folder, and none is free there now" };
+  // ③ Its own conversation, taken over (a seat is one conversation: never a new one in its folder, unless the user asked for that).
+  const ref: string | null = typeof seat.conversation_ref === "string" && seat.conversation_ref ? seat.conversation_ref : null;
+  if (ref && newSession) {
+    // (refused before it was made: `newSessionRefusal`; a task from before seats were per conversation that asked for one goes there too)
+    const refusal = newSessionRefusal(live, true)!;
+    return { error: refusal.code, message: refusal.message };
   }
+  // (Its conversation, held by no session open through Claw: its agent takes it over.)
+  if (ref) return { plan: { ...base, session_id: null, resume_ref: ref, label: `${live.machine}/${String(seat.agent_id)}` } };
+  // (A seat of a folder whose agent only takes conversations over: never a guess at one of them; `seatRefusal` says so first.)
+  if (String(live.agent?.kind) === "attach") return { error: "seat_unbound", message: "that seat is a folder's: hand the task to one of its sessions' seats" };
   return { plan: { ...base, session_id: null, resume_ref: ref, label: `${live.machine}/${String(seat.agent_id)}/new` } };
 }
 
@@ -310,6 +338,12 @@ export async function dispatchErrand(
       if (sent.error === "busy" || sent.error === "session_closed" || sent.error === "session_read_only") return queue("seat_busy");
       if (sent.error === "connector_offline" || sent.error === "machine_reconnected") return queue("machine_offline");
       return { error: sent.error, message: sent.message };
+    }
+    // A session opened for it (its conversation taken over, or a new one in its folder) is the seat's own from now on: the next task
+    // goes into it, not into one more.
+    if (!planned.plan.session_id) {
+      await db.query("UPDATE claw_devenv_seats SET current_session_id = $2::uuid, updated_at = NOW() WHERE seat_id = $1 AND owner_user_id = $3",
+        [seatId, sent.session_id, owner]);
     }
     return { dispatch: "sent", session_id: sent.session_id };
   });
@@ -413,6 +447,8 @@ export async function seatWorkCreate(claims: AssistantTokenClaims, args: SeatCre
   const newSession = args.new_session === true && target.seats.length === 1 && !target.sandbox;
   const choice = target.seats.length > 1 || target.sandbox;
   const live = choice ? null : all.get(target.seats[0]!)!;
+  const noNew = newSessionRefusal(live ?? undefined, newSession);
+  if (noNew) throw noNew;
   const why = live ? whyCard(live, attendedRefusal) : "choice";
   const { assistantSchedulesOn, proposeConfirmation, proposed } = await import("./schedules.js");
   if (why && !assistantSchedulesOn()) throw new ToolRefused("cards_off", "confirmation cards are off here, so nothing can be handed to the user's machine");
@@ -839,7 +875,7 @@ async function errandWorkSendOnce(
     attendedRefusal = err.code;
   }
   const live = (await seatsLive(userId, undefined, [p.seat_id])).get(p.seat_id);
-  const refused = seatRefusal(live, p.seat_id);
+  const refused = seatRefusal(live, p.seat_id) ?? newSessionRefusal(live, newSession);
   if (refused) throw refused;
   const running = errandRunning(item, p);
   if (!running) {
@@ -1034,7 +1070,7 @@ export async function drainSeatsOf(owner: string, _sessionIds: readonly string[]
 }
 
 /** Refusals a queued task never gets past. */
-const PERMANENT = new Set(["seat_not_found", "seat_retired", "seat_unsupported", "item_closed", "needs_card", "seat_unattended"]);
+const PERMANENT = new Set(["seat_not_found", "seat_retired", "seat_gone", "seat_unbound", "seat_new_session", "seat_unsupported", "item_closed", "needs_card", "seat_unattended"]);
 
 /** A task that waited in a queue and will not go: it fails, said as such, and the router hears of it. */
 async function failQueued(owner: string, itemId: string, why: string): Promise<void> {

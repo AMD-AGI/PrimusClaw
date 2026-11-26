@@ -26,13 +26,13 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import * as seats from "../../src/assistant/seats.js";
 import { errandText } from "../../src/assistant/remote-items.js";
 import {
-  errandClosed, errandNotStarted, errandRunning, parseTarget, seatRefusal, sendKey, whyCard, type Target,
+  errandClosed, errandNotStarted, errandRunning, newSessionRefusal, parseTarget, seatRefusal, sendKey, whyCard, type Target,
 } from "../../src/assistant/seat-dispatch.js";
 import type { ToolRefused } from "../../src/assistant/tools.js";
 import { REMOTE_AGENT_LIMITS } from "@claw/protocol";
 import { messagesLlm, promptFor, userTurn, type Block, type Llm, type Message, type ModelResponse, type ToolSchema } from "./assistant-router-eval-lib.js";
 import {
-  CHANNEL_ACTIONS, ERRAND_SEAT, INJECT_EN, INJECT_ZH, ITEM, MACHINES, MANIFEST, NOW, SEAT, SEATS, seatOf,
+  CHANNEL_ACTIONS, ERRAND_SEAT, INJECT_EN, INJECT_ZH, ITEM, MACHINES, MANIFEST, NOW, SEAT, SEATS, seatOf, sessionIdOf,
   type Category, type Decision, type DispatchCase, type FixtureSeat, type SeatKey,
 } from "./assistant-dispatch-eval-cases.js";
 
@@ -129,7 +129,8 @@ const itemOf = (ref: unknown) => {
  * `unsupported: "agent_kind"`, as `seatsLive` marks it).
  */
 const liveOf = (s: FixtureSeat): seats.SeatLive => ({
-  seat: { seat_id: s.seat_id, role_state: s.role_state, confirm_each: s.confirm_each, dispatch_mode: s.dispatch_mode },
+  // (each fixture seat is one session: its conversation)
+  seat: { seat_id: s.seat_id, role_state: s.role_state, confirm_each: s.confirm_each, dispatch_mode: s.dispatch_mode, conversation_ref: sessionIdOf(s) },
   unattended: s.unattended,
   ...(seats.SEAT_DISPATCH_AGENT_KINDS.has(s.kind) ? {} : { unsupported: "agent_kind" }),
 } as unknown as seats.SeatLive);
@@ -181,6 +182,8 @@ export class DispatchStub {
       seat_id: s.seat_id, alias: s.alias, role: s.role_state === "confirmed" ? s.role : null, role_state: s.role_state,
       machine_online: MACHINES.find((m) => m.machine === s.machine)?.online === true, state: this.stateOf(s), dispatch_mode: s.dispatch_mode,
       last_item: s.last_item, queue_len: this.queues.get(s.seat_id)?.length ?? 0,
+      // (one session per seat: its id, as devenv_list lists it; none while its machine is offline)
+      sessions: MACHINES.find((m) => m.machine === s.machine)?.online === true ? [sessionIdOf(s)] : [],
     }));
   }
 
@@ -292,6 +295,9 @@ export class DispatchStub {
       return ok({ ...this.card("seat_dispatch", { choices }), item_id: itemId, seq, dispatch: "card", why_card: "choice", choices });
     }
     const s = seatOf(target.seats[0]!)!;
+    // A seat is one session: a new session beside it is not that seat (`newSessionRefusal`).
+    const noNew = newSessionRefusal(liveOf(s), input.new_session === true);
+    if (noNew) return refused(noNew, refuse);
     const queue = this.queues.get(s.seat_id)!;
     const fresh = input.new_session === true && s.state === "in_terminal";
     // A full queue is said before anything is made (a seat that is not idle), or when the task would wait behind it.
@@ -350,7 +356,7 @@ export class DispatchStub {
       return refuse("brief_too_long", `the instruction is too long to send to a machine (at most ${REMOTE_AGENT_LIMITS.maxPromptBytes} bytes)`);
     }
     const s = seatOf(seatId);
-    const no = seatRefusal(s && liveOf(s), seatId);
+    const no = seatRefusal(s && liveOf(s), seatId) ?? (s ? newSessionRefusal(liveOf(s), input.new_session === true) : null);
     if (no) return refused(no, refuse);
     const running = errandRunning({ board_state: this.reopened.has(item.itemId) ? "in_progress" : item.boardState }, p);
     if (!running) {
@@ -385,7 +391,7 @@ export class DispatchStub {
         sessions: SEATS.filter((s) => s.machine === m.machine).map((s, i) => ({
           label: `${m.machine}/${s.agent}/${i + 1}`, agent: s.agent, cwd: s.cwd.replace("/home/dev", "~"), opened_in: s.state === "in_terminal" ? "machine" : "chat",
           state: s.state === "unsupported" ? "idle" : s.state, last_activity: "2026-11-24T08:30:00.000Z",
-          ref: m.online ? `${s.seat_id.slice(5, 13)}-0000-4000-8000-000000000000` : null,
+          id: sessionIdOf(s), ref: m.online ? sessionIdOf(s) : null,
           ...(activity ? { title: s.seat_id === SEAT.hlci && this.c.inject === "title" ? (this.c.lang === "zh" ? INJECT_ZH : INJECT_EN) : `work in ${s.cwd.replace("/home/dev", "~")}` } : {}),
           seat: { seat_id: s.seat_id, alias: s.alias, role: s.role_state === "confirmed" ? s.role : null },
         })),

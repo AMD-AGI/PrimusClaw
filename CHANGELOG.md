@@ -16,7 +16,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 | Release | Tag | Current version |
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
-| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.3 |
+| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.4 |
 | Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.15.0 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
@@ -298,6 +298,32 @@ release version, and its `appVersion` stays `latest`.
 
 ### Changed
 
+- Claw: one session, one seat. A seat is now one conversation of an agent on the user's machine (`claw_devenv_seats.conversation_ref`,
+  the agent's own id of it), not a folder: six named Claude Code sessions in one folder are six seats, each called what that session is
+  called (as `/agents` shows it), each with its own confirmed role, alias, queue, guess and cards (still one guess card at a time, at
+  most three a day). Every conversation a connector reports and every one a session open through Claw holds is a seat. A seat of a
+  folder made before moves to the session that occupies it (its session's conversation, else the one open there now, else its latest),
+  keeping its alias, role and auto dispatch; where that conversation already had a seat holding less of the user's words, the two become
+  one, with the other's tasks (when both hold the user's words, the next session there is tried; a folder's seat none is left for
+  takes no task, `seat_unbound`, rather than a guessed session). A task for a seat takes over that very conversation (or goes into the session holding it), never a new
+  session in its folder (`new_session` for such a seat is refused, `seat_new_session`). When the machine refuses to start the session that was to take over (or type into) the seat's conversation because that conversation is not there (`unknown_session` as that session's first word; the same reason later, for a session the machine no longer knows, only closes that session), the task fails saying so, and the seat is
+  `gone` in the roster and refused (`seat_gone`) until its machine lists that conversation again; one a session open through Claw held,
+  closed on a machine where no agent takes conversations over, is `gone` too. Prompts `router-seats-v3`, `router-dispatch-v2`.
+- Connector: the Claude Code hooks (the session hooks and the approval hooks) are installed and kept in place by the connector
+  itself, as it keeps itself up to date. Every start, including the first run after an auto-upgrade, makes sure each Claude
+  config directory it serves has them and that they run the installation that is running (stale node or script paths are
+  rewritten), with one line in the connector log when something changed and nothing shown to the person. Only entries marked
+  `--managed-by claw-connector` change; the file is written through a rename under a lock, re-read if another writer changed
+  it meanwhile, and backed up once (`settings.json.bak-claw-<time>`) before the first change to anything of the person's.
+  `init` and `pair` no longer ask or print a command: they add the hooks unless `--no-hooks` / `--no-approval-hooks`. An
+  explicit no is kept for good in `claude-hooks.json` in the configuration directory: `hooks uninstall` (`--approvals` for the
+  approval hooks only), `--no-hooks` / `--no-approval-hooks`, or a no to the question 0.1.23 to 0.3.4 asked; `hooks install`
+  (`--approvals`) and `--hooks` take it back. `hooks install` now installs the approval hooks too, unless they were taken out
+  or `CLAW_APPROVAL_HOOKS=off` is set. Versions up to 0.3.4 recorded no other no, so the first start after the upgrade reads it
+  from what is in place, once: a set none of whose hooks is in an existing Claude config directory stays out there; `init`
+  and `pair` run after the upgrade add both sets.
+  The one-time question about the approval hooks after other commands is gone. Codex and Cursor hooks are unchanged (Codex
+  needs the person to trust a new hook). See `connector/README.md`, "The Claude Code hooks are kept in place".
 - Claw, Agent Sandbox: a sandbox template says how its sandbox mounts its workspace's storage with `workspaceStorage`:
   `"on"` (the default, as before), `"off"` (none of it; the SaFE Workload gets
   `primus-safe.workload.use.workspace.storage: "false"`) or `"readOnly"` (all of it read-only, init containers
@@ -417,6 +443,16 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Claw: the assistant named the user's sessions differently from their `/agents` card. `devenv_list` gave a session's title (the
+  name the user gave it on their machine) only with `detail: "activity"`, and its default read listed each machine's first six
+  sessions, not the ones the card shows; asked again with a plain read, the router called the titles it had given made up and said
+  it could not read them. Every read now gives each session's `title` and `id`, the default read lists exactly what the card shows
+  of each machine, in its order (the rest when that machine is asked for, marked `not_on_agents_card`), and the router names
+  sessions by title and label (the labels `devenv_send` takes as targets) and nothing its results do not list. A seat is now called
+  what its sessions are called on the machine: `seat_roster` lists the ids of the sessions in each seat (which `devenv_list` names)
+  and takes `name` (a session's name or the alias, compared by Claw and never listed; a name the user's message does not hold marks
+  the turn), `seat_set` takes `name` too, and the seat cards show the session names beside an alias (one line, at most 40
+  characters, control characters removed). Seats prompt router-seats-v2. Router prompt router-devenv-v16.
 - Claw: a task handed to a seat within about 30 seconds of the end of the seat's previous task was queued as "the seat
   is busy" with nothing ahead of it, and a task already waiting did not go on that end: the prompt of a task whose turn
   had ended still counted as work in progress until the connector's next heartbeat acknowledged it, and that heartbeat
