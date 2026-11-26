@@ -660,7 +660,9 @@ export function createAssistantMcpServer(
         + "gives what each session is doing in the agent's words (its step, the end of its last answer). With no machine at all, "
         + "connect_a_machine is what connects one: with pairing, a one-line pairing command made for the user now, said as it is. "
         + "Every machine is listed, with the sessions its /agents card shows, in that order; a machine with more counts them all "
-        + "(session_count, sessions_by_state, sessions_not_shown): machine (its name) lists every session of that one machine.",
+        + "(session_count, sessions_listed, sessions_by_state, sessions_not_shown): machine (its name) lists every session of that one machine. "
+        + "Which conversations the user muted (静音: their pushes from the terminal are off) is in it too, from Claw's own record: "
+        + "muted_conversations lists every one, and each session says muted.",
         { detail: z.enum(["status", "activity"]).optional(), machine: z.string().max(200).optional() },
         (args) => answer(claims, "devenv_list", () => devenvList(claims, args)),
       );

@@ -37,6 +37,7 @@
  *      with its tasks; two that both hold the user's words stay apart (the folder's goes to the next session there, else stays the
  *      folder's and takes no task); a folder with no session known keeps its seat; each is found by its
  *      own session's name, keeps the name it was last listed by, and devenv_list puts each session beside its own seat
+ *   S10 a seat whose conversation the user muted says so in the roster (muted, since when), from Claw's own record; the others say not
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -282,7 +283,7 @@ describe("seats", { skip }, () => {
     const out = await seats.seatRoster(turn) as { seats: Recorded[] };
     assert.equal(await untrusted(turn), false, "reading the roster does not mark the turn");
     assert.deepEqual(out.seats.map((s) => Object.keys(s).sort()), out.seats.map(() =>
-      ["alias", "confirm_each", "dispatch_mode", "last_item", "machine_online", "queue_len", "role", "role_state", "seat_id", "sessions", "state"]));
+      ["alias", "confirm_each", "dispatch_mode", "last_item", "machine_online", "muted", "queue_len", "role", "role_state", "seat_id", "sessions", "state"]));
     // A seat named by its machine or folder: Claw compares the user's words and lists only the seats there, never the names.
     const byFolder = await seats.seatRoster(turn, { folder: "~/rel" }) as { seats: Recorded[]; where: string };
     assert.deepEqual(byFolder.seats.map((s) => s.alias), ["发布台"]);
@@ -874,5 +875,30 @@ describe("seats", { skip }, () => {
     const out = await tools.devenvList(await userTurn(alice, "看看开发机"));
     const seatBy = new Map(out.machines[0]!.sessions.map((x) => [x.id, x.seat?.seat_id ?? null]));
     assert.deepEqual([seatBy.get(ref(1)), seatBy.get(ref(2)), seatBy.get(chat)], ["seat_rel", byRef.get(ref(2))!.seat_id, "seat_blog"]);
+  });
+  test("S10 seat_roster says which seats' conversations the user muted", async () => {
+    const alice = await w.user("alice");
+    const ago = Math.floor(Date.now() / 1000) - 600;
+    const attach = {
+      agent_id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)",
+      capabilities: { resumable: [
+        { ref: "aaaaaaaa-3333-4333-8333-333333333333", title: "clean", cwd: "/home/u/a", updated_at: ago, state: "live" },
+        { ref: "44444444-4444-4444-8444-444444444444", title: "hosting", cwd: "/home/u/b", updated_at: ago, state: "live" },
+      ] },
+    };
+    const cid = await machine("alice", "devbox", { agents: [CLAUDE, attach] });
+    await seats.syncSeats("alice");
+    // (stored with the id in another case: ids are compared without case)
+    await w.q("INSERT INTO claw_remote_terminal_mutes (owner_user_id, connector_id, ref, title) VALUES ('alice', $1, 'AAAAAAAA-3333-4333-8333-333333333333', 'yihan')", [cid]);
+    const turn = await userTurn(alice, "哪些工位静音了？");
+    const out = await seats.seatRoster(turn) as { seats: Recorded[] };
+    const rows = await seatRows();
+    const seatOf = (ref: string) => out.seats.find((x) => x.seat_id === rows.find((r) => r.conversation_ref === ref)!.seat_id)!;
+    const muted = seatOf("aaaaaaaa-3333-4333-8333-333333333333");
+    assert.equal(muted.muted, true);
+    assert.ok(!Number.isNaN(Date.parse(muted.muted_since)));
+    assert.deepEqual([seatOf("44444444-4444-4444-8444-444444444444").muted, "muted_since" in seatOf("44444444-4444-4444-8444-444444444444")], [false, false]);
+    assert.equal(await untrusted(turn), false, "a mute is Claw's own record: reading it does not mark the turn");
+    assert.ok(!JSON.stringify(out).includes("yihan"), "the title a mute was stored with is not in the roster");
   });
 });

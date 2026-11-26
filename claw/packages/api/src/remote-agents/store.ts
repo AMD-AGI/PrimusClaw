@@ -1393,6 +1393,25 @@ export async function terminalMuted(owner: string, connectorId: string, ref: str
   )).rows.length > 0;
 }
 
+/** One conversation open in a terminal whose pushes its owner muted: where it is, the title it had then, and since when. */
+export interface TerminalMute { connector_id: string; machine: string | null; ref: string; title: string; muted_at: string }
+
+/** How a mute is matched with a conversation: its machine and its id, compared without case (as `CONVERSATION_REF_SQL` keeps ids). */
+export const muteKey = (connectorId: string, ref: string): string => `${connectorId.toLowerCase()}\u0000${ref.toLowerCase()}`;
+
+/** Every conversation the owner muted (`claw_remote_terminal_mutes`), newest first, with its machine's name. */
+export async function listTerminalMutes(owner: string, q: Querier = direct): Promise<TerminalMute[]> {
+  return (await q(
+    `SELECT m.connector_id::text AS connector_id, c.name AS machine, m.ref, m.title, m.muted_at FROM claw_remote_terminal_mutes m
+       LEFT JOIN claw_remote_connectors c ON c.connector_id = m.connector_id
+      WHERE m.owner_user_id = $1 ORDER BY m.muted_at DESC`,
+    [owner],
+  )).rows.map((r: Row) => ({
+    connector_id: String(r.connector_id), machine: typeof r.machine === "string" ? r.machine : null, ref: String(r.ref),
+    title: String(r.title ?? ""), muted_at: r.muted_at instanceof Date ? r.muted_at.toISOString() : String(r.muted_at),
+  }));
+}
+
 export type TerminalMuteOutcome =
   | { status: "ok"; muted: boolean; machine: string; title: string; seq: number }
   | { status: "not_found" | "not_terminal" };
