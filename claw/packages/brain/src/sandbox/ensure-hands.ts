@@ -36,6 +36,7 @@ import {
   resourcesMapToWorkloadArray,
   assertImageDigest,
   applyMultiNodeExternalEnv,
+  usesTopologyHandoff,
   writeTopologyHandoff,
   hasSshKeyFile,
   applyPlatformKeyEnv,
@@ -2916,7 +2917,7 @@ async function provisionHands(
   const handsUrl = `${handsBaseUrl}/mcp`;
   logger.info({ sessionId, workloadId, handsUrl }, "ensureHands.health_ok");
 
-  // infera drives its GPU pods over SSH, so the key Brain derived for this
+  // infera, atomesh and sglangrouter drive their GPU pods over SSH, so the key Brain derived for this
   // cluster has to exist as a file here before the optimizer runs.
   if (multiNodeContext && hasSshKeyFile(multiNodeContext)) {
     await writeSandboxSshKey(
@@ -2930,7 +2931,8 @@ async function provisionHands(
   // The topology handoff goes after the key it points at, outside the synced
   // workspace. During the transition the legacy env is sufficient on its own, so
   // a write failure is a warning, not a failed sandbox. Only paths are logged.
-  if (multiNodeContext) {
+  // atomesh and sglangrouter hand off through the node list env instead.
+  if (multiNodeContext && usesTopologyHandoff(multiNodeContext)) {
     const r = await writeTopologyHandoff(
       (cmd, t) => getSafeWorkloadProvider().exec(inst, cmd, t, undefined, { untracked: true }),
       multiNodeContext,

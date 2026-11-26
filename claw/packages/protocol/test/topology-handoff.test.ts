@@ -23,6 +23,7 @@ const FULL = {
     ssh_key_file: "/k",
     ssh_port_base: 2233,
     known_hosts_file: "/kh",
+    router_ips: ["1.1.1.9"],
     prefill_ips: ["1.1.1.1"],
     decode_ips: [],
     worker_ips: [],

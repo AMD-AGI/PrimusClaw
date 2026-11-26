@@ -16,6 +16,11 @@
  * load deterministic builders without inheriting process environment.
  */
 
+import {
+  assertPdClusterPrompt,
+  resolvePdClusterReplicas,
+} from "./prompt-flags.js";
+import { SandboxFailure } from "../errors.js";
 import type { MultiNodeBackend } from "./types.js";
 
 /** RayJob head serves the inference server here; matches the Claw template. */
@@ -197,9 +202,16 @@ function sanitizeLabels(
   return out;
 }
 
-/** SSH port offset for a GPU role; decode is strided so it can co-locate. */
+/** SSH port offset for a role; decode and the frontend are strided so they can co-locate. */
 export function sshRolePortOffset(role: string): number {
-  return role.toLowerCase() === "decode" ? INFERA_SSH_PORT_ROLE_STRIDE : 0;
+  switch (role.toLowerCase()) {
+    case "decode":
+      return INFERA_SSH_PORT_ROLE_STRIDE;
+    case "frontend":
+      return 2 * INFERA_SSH_PORT_ROLE_STRIDE;
+    default:
+      return 0;
+  }
 }
 
 /**
@@ -461,7 +473,10 @@ export interface InferaWorkloadParams extends CommonWorkloadParams {
 export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string, unknown> {
   assertCommon(p);
   if (!p.model.trim()) {
-    throw new Error("model is required (infera frontend --router-tokenizer-path)");
+    throw new SandboxFailure(
+      "infera_model_missing",
+      "model is required (infera frontend --router-tokenizer-path)",
+    );
   }
   if (!p.sshAuthorizedKey.trim()) {
     throw new Error("sshAuthorizedKey is required for the Infera idle-pod control plane");
@@ -491,10 +506,17 @@ export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string,
     return res;
   };
 
-  const frontendEp = b64(
-    `python3 -m infera.server --host 0.0.0.0 --port ${frontendPort} ` +
-    `--router-policy round-robin --router-tokenizer-path ${p.model.trim()} --enable-profiling`,
-  );
+  const frontendEp = b64([
+    "set -euo pipefail",
+    `export MN_SSH_PORT=${sshPortForPod("frontend", null, sshPortBase)}`,
+    ...PD_SSHD_BOOTSTRAP,
+    ...detachedServer(
+      `python3 -m infera.server --host 0.0.0.0 --port ${frontendPort} --router-policy round-robin ` +
+        `--router-tokenizer-path ${shellSingleQuote(p.model.trim())} --enable-profiling`,
+      String(frontendPort),
+    ),
+    PD_HOLD,
+  ].join("\n"));
 
   let resources: Record<string, unknown>[];
   let images: string[];
@@ -576,6 +598,386 @@ export function buildInferaWorkloadBody(p: InferaWorkloadParams): Record<string,
   if (p.ownerId) body.ownerId = p.ownerId;
   applyCustomerLabels(body, p.nodeLabels);
   return body;
+}
+
+/** Router Service port. SaFE rejects any other Atom targetPort. */
+export const ATOM_ROUTER_PORT = 8000;
+
+/** Engine HTTP ports SaFE assigns to the prefill and decode Services. */
+export const PD_ENGINE_PREFILL_PORT = 8010;
+export const PD_ENGINE_DECODE_PORT = 8020;
+
+/** The listen port SaFE injects into every Atom and SGLangRouter role, as a shell expression. */
+const ATOM_SERVER_PORT_EXPR = "${ATOM_SERVER_PORT}";
+
+/** Mooncake bootstrap ports published on the prefill and decode Services. */
+const ATOM_PREFILL_BOOTSTRAP_PORT = 8998;
+const ATOM_DECODE_BOOTSTRAP_PORT = 9098;
+
+/** Quote a value for a single-quoted shell word. */
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+/**
+ * Last line of every PD and Infera frontend entrypoint. The launcher waits on this process, so a
+ * server stopped or relaunched by any tool never ends the container. The server
+ * itself runs detached in its own session, reaped by the launcher as PID 1.
+ */
+const PD_HOLD = "exec tail -f /dev/null";
+
+/** File the detached server's pid is written to. */
+const PD_SERVER_PID_FILE = "/tmp/mn-server.pid";
+
+/**
+ * Start `command` detached in its own session, then wait until it accepts TCP
+ * connections on `port` (a number or a shell expression). A server that exits
+ * before it listens ends the entrypoint with status 1, so the pod fails instead
+ * of holding a dead service; once it has listened, stopping it never ends the
+ * container.
+ */
+export function detachedServer(command: string, port: string): string[] {
+  return [
+    `( setsid ${command} < /dev/null & echo $! > ${PD_SERVER_PID_FILE} )`,
+    `mn_server_pid=$(cat ${PD_SERVER_PID_FILE})`,
+    `until (: > /dev/tcp/127.0.0.1/${port}) 2>/dev/null; do`,
+    `  mn_server_state=$(sed -E 's/.*\\) ([A-Za-z]).*/\\1/' "/proc/\${mn_server_pid}/stat" 2>/dev/null || echo X)`,
+    `  if [ "\${mn_server_state}" = X ] || [ "\${mn_server_state}" = Z ]; then`,
+    `    echo "ERROR: server exited before listening on ${port}" >&2`,
+    "    exit 1",
+    "  fi",
+    "  sleep 2",
+    "done",
+  ];
+}
+
+/**
+ * SGLang model-gateway command.
+ *
+ * SaFE replaces `{prefill}` and `{decode}` with the engine Service URLs. The
+ * bootstrap port stays in the command because it is the Mooncake port, not
+ * part of that URL.
+ */
+function sglangRouterEntrypoint(): string {
+  return [
+    "set -euo pipefail",
+    ...detachedServer([
+      "python3 -m sglang_router.launch_router \\",
+      "  --pd-disaggregation \\",
+      `  --prefill {prefill} ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
+      "  --decode {decode} \\",
+      "  --host 0.0.0.0 \\",
+      "  --port \"${ATOM_SERVER_PORT}\"",
+    ].join("\n"), ATOM_SERVER_PORT_EXPR),
+    PD_HOLD,
+  ].join("\n");
+}
+
+/**
+ * Router command. SaFE injects ATOM_SERVER_PORT and the role endpoints.
+ * `--backend` is the prompt's `--framework`.
+ */
+function atomRouterEntrypoint(framework: string): string {
+  return [
+    "set -euo pipefail",
+    ...detachedServer([
+      "atomesh launch \\",
+      "  --host 0.0.0.0 \\",
+      "  --port \"${ATOM_SERVER_PORT}\" \\",
+      "  --pd-disaggregation \\",
+      `  --prefill "\${ATOM_PREFILL_ENDPOINT}" ${ATOM_PREFILL_BOOTSTRAP_PORT} \\`,
+      "  --decode \"${ATOM_DECODE_ENDPOINT}\" \\",
+      `  --backend ${shellSingleQuote(framework)}`,
+    ].join("\n"), ATOM_SERVER_PORT_EXPR),
+    PD_HOLD,
+  ].join("\n");
+}
+
+/**
+ * Start sshd for the optimizer's in-place relaunch, then fall through.
+ *
+ * The images carry sshd but not the SaFE idle scripts, so the key and daemon
+ * are set up here from MN_SSH_AUTHORIZED_KEY / MN_SSH_PORT. Key-only root
+ * login. A failure only warns: the process still serves, without SSH control.
+ * MN_SSH_PORT is exported per role by the entrypoint (`sshdBootstrap`).
+ */
+const PD_SSHD_BOOTSTRAP = [
+  "if ! { mkdir -p /root/.ssh /run/sshd && chmod 700 /root/.ssh \\",
+  "    && printf '%s\\n' \"${MN_SSH_AUTHORIZED_KEY}\" > /root/.ssh/authorized_keys \\",
+  "    && chmod 600 /root/.ssh/authorized_keys \\",
+  "    && { [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A; } \\",
+  "    && /usr/sbin/sshd -p \"${MN_SSH_PORT}\" -o PasswordAuthentication=no \\",
+  "      -o KbdInteractiveAuthentication=no -o PermitRootLogin=prohibit-password; }; then",
+  "  echo \"WARN: sshd did not start on port ${MN_SSH_PORT}; this pod runs without SSH control\" >&2",
+  "fi",
+];
+
+/** The sshd bootstrap on `sshPort`, or nothing when the role runs without sshd. */
+function sshdBootstrap(sshPort: number | null): string[] {
+  return sshPort === null ? [] : [`export MN_SSH_PORT=${sshPort}`, ...PD_SSHD_BOOTSTRAP];
+}
+
+/** A router entrypoint with the sshd bootstrap on `sshPort` after its `set` line. */
+function routerEntrypointWithSshd(entrypoint: string, sshPort: number | null): string {
+  if (sshPort === null) return entrypoint;
+  const [first, ...rest] = entrypoint.split("\n");
+  return [first, ...sshdBootstrap(sshPort), ...rest].join("\n");
+}
+
+/**
+ * Split a prompt arg string into words the way a POSIX shell does, without
+ * expansion: whitespace separates words, single quotes keep their content
+ * literally, double quotes keep it with `\` escaping `"`, `\`, `$` and a
+ * backtick, and an unquoted `\` keeps the next character.
+ */
+export function shellWords(raw: string): string[] {
+  const words: string[] = [];
+  let word = "";
+  let inWord = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (c === "'") {
+      const end = raw.indexOf("'", i + 1);
+      if (end < 0) throw new SandboxFailure("mn_config_invalid", `unterminated single quote in engine args: ${raw}`);
+      word += raw.slice(i + 1, end);
+      inWord = true;
+      i = end;
+    } else if (c === '"') {
+      inWord = true;
+      for (i++; ; i++) {
+        if (i >= raw.length) throw new SandboxFailure("mn_config_invalid", `unterminated double quote in engine args: ${raw}`);
+        const d = raw[i]!;
+        if (d === '"') break;
+        if (d === "\\" && i + 1 < raw.length && '"\\$`'.includes(raw[i + 1]!)) word += raw[++i];
+        else word += d;
+      }
+    } else if (c === "\\") {
+      if (i + 1 < raw.length) word += raw[++i];
+      inWord = true;
+    } else if (/\s/.test(c)) {
+      if (inWord) words.push(word);
+      word = "";
+      inWord = false;
+    } else {
+      word += c;
+      inWord = true;
+    }
+  }
+  if (inWord) words.push(word);
+  return words;
+}
+
+/**
+ * Prefill or decode command. Model, TP, transfer backend, IB device, and the
+ * extra server flags all come from the prompt. The listen port is the one SaFE
+ * injects. Bootstrap ports are the pair this workload's router command uses.
+ * A non-null `sshPort` prepends the sshd bootstrap on that port.
+ */
+function atomEngineEntrypoint(
+  role: "prefill" | "decode",
+  model: string,
+  tp: number,
+  kvTransferBackend: string,
+  ibDevice: string,
+  serverArgs: string,
+  roleArgs: string,
+  sshPort: number | null,
+): string {
+  const bootstrap = role === "prefill" ? ATOM_PREFILL_BOOTSTRAP_PORT : ATOM_DECODE_BOOTSTRAP_PORT;
+  const lines = [
+    "set -euo pipefail",
+    ...sshdBootstrap(sshPort),
+    "export SGLANG_HOST_IP=\"${POD_IP:-$(hostname -i | awk '{print $1}')}\"",
+    "args=(",
+    "  python3 -m sglang.launch_server",
+    `  --model-path ${shellSingleQuote(model)}`,
+    "  --host 0.0.0.0",
+    "  --port \"${ATOM_SERVER_PORT}\"",
+    `  --tp-size ${tp}`,
+    `  --disaggregation-mode ${role}`,
+    `  --disaggregation-transfer-backend ${shellSingleQuote(kvTransferBackend)}`,
+    `  --disaggregation-bootstrap-port ${bootstrap}`,
+  ];
+  if (ibDevice.trim()) {
+    lines.push(`  --disaggregation-ib-device ${shellSingleQuote(ibDevice.trim())}`);
+  }
+  for (const word of [...shellWords(serverArgs), ...shellWords(roleArgs)]) {
+    lines.push(`  ${shellSingleQuote(word)}`);
+  }
+  lines.push(")", ...detachedServer("\"${args[@]}\"", ATOM_SERVER_PORT_EXPR), PD_HOLD);
+  return lines.join("\n");
+}
+
+export interface AtomWorkloadParams extends CommonWorkloadParams {
+  /** Model path for prefill and decode `--model-path`. */
+  model: string;
+  /** Prompt `--framework`, passed to atomesh `--backend`. */
+  framework: string;
+  /** Prompt `--server-args`. */
+  serverArgs?: string;
+  /** Prompt `--pd-prefill-extra-args`. */
+  pdPrefillExtraArgs?: string;
+  /** Prompt `--pd-decode-extra-args`. */
+  pdDecodeExtraArgs?: string;
+  /** Prompt `--pd-ib-device`. */
+  pdIbDevice?: string;
+  /** KV transfer backend for both engine roles. */
+  kvTransferBackend: string;
+  /** Must be disaggregated; Atom/SGLangRouter have no aggregated shape. */
+  pdMode: "aggregated" | "disaggregated";
+  pdPrefillNodes?: number;
+  pdDecodeNodes?: number;
+  pdPrefillTp?: number;
+  pdDecodeTp?: number;
+  rdmaResource?: string;
+  /** Public key authorised for root SSH on prefill and decode; no sshd without it. */
+  sshAuthorizedKey?: string;
+  /** sshd base port; each role listens on its own offset (`sshPortForPod`). */
+  sshPortBase?: number;
+}
+
+interface PdClusterBodyOptions {
+  /** SaFE GroupVersionKind.kind. */
+  kind: "Atom" | "SGLangRouter";
+  /** Correlation label and env value. */
+  backend: "atomesh" | "sglangrouter";
+  /** Router command, base64-encoded by the builder. */
+  routerEntrypoint: string;
+}
+
+/**
+ * SaFE CreateWorkloadRequest for a router, prefill, decode cluster.
+ *
+ * The router is a CPU process. Both engine roles request GPUs and RDMA because
+ * the KV transfer plane needs a device. Entry points start the servers detached
+ * and then hold the launcher's waited pid.
+ *
+ * @param p Prompt-derived sizes, image, model, and env.
+ * @param opts Kind and router command. Engine commands are shared.
+ */
+function buildPdClusterWorkloadBody(
+  p: AtomWorkloadParams,
+  opts: PdClusterBodyOptions,
+): Record<string, unknown> {
+  assertCommon(p);
+  if (!p.model.trim()) {
+    throw new SandboxFailure(
+      "mn_model_missing",
+      `model is required (${opts.backend} prefill/decode --model-path)`,
+    );
+  }
+  assertPdClusterPrompt({
+    backend: opts.backend,
+    pdMode: p.pdMode,
+    framework: p.framework,
+    nodes: p.nodes,
+    gpusPerNode: p.gpusPerNode,
+    pdPrefillNodes: p.pdPrefillNodes ?? 0,
+    pdDecodeNodes: p.pdDecodeNodes ?? 0,
+    pdPrefillTp: p.pdPrefillTp ?? 0,
+    pdDecodeTp: p.pdDecodeTp ?? 0,
+  });
+
+  const model = p.model.trim();
+  const { prefill: prefillReplica, decode: decodeReplica } = resolvePdClusterReplicas({
+    nodes: p.nodes,
+    pdPrefillNodes: p.pdPrefillNodes ?? 0,
+    pdDecodeNodes: p.pdDecodeNodes ?? 0,
+    backend: opts.backend,
+  });
+
+  // Default TP to every GPU on the pod. An explicit size above that was already rejected.
+  const prefillTp = p.pdPrefillTp && p.pdPrefillTp > 0 ? p.pdPrefillTp : p.gpusPerNode;
+  const decodeTp = p.pdDecodeTp && p.pdDecodeTp > 0 ? p.pdDecodeTp : p.gpusPerNode;
+
+  const sharedMemoryGi = Math.max(1, Math.floor(p.memGiPerNode / 2));
+
+  const routerResource = {
+    replica: 1,
+    cpu: "4",
+    memory: "16Gi",
+    sharedMemory: "4Gi",
+    ephemeralStorage: "20Gi",
+  };
+  const gpuResource = (replica: number): Record<string, unknown> => ({
+    replica,
+    cpu: String(p.cpusPerNode),
+    memory: `${p.memGiPerNode}Gi`,
+    gpu: String(p.gpusPerNode),
+    sharedMemory: `${sharedMemoryGi}Gi`,
+    ephemeralStorage: `${p.ephemeralGiPerNode}Gi`,
+    rdmaResource: p.rdmaResource ?? "1k",
+  });
+
+  const sshKey = (p.sshAuthorizedKey ?? "").trim();
+  const sshBase = p.sshPortBase ?? inferaSshPortBase(p.displayName);
+  // hostNetwork pods of different roles can share a node, so each role's sshd gets its own port.
+  const sshPort = (role: string): number | null => (sshKey ? sshPortForPod(role, null, sshBase) : null);
+  const env = sanitizeEnv(p.extraEnv);
+  if (sshKey) env.MN_SSH_AUTHORIZED_KEY = sshKey;
+  applyCorrelationEnv(env, opts.backend, p.sessionId, p.messageId);
+
+  // useWorkspaceStorage stays absent: SaFE defaults an absent *bool to true
+  // (see baseBody). Sending it could only ever turn the mount off.
+  const body: Record<string, unknown> = {
+    ...baseBody(opts.kind),
+    groupVersionKind: { group: "amd.com", kind: opts.kind, version: "v1" },
+    timeout: workloadTimeout(p.timeoutSec, p.defaultTimeoutSec),
+    displayName: p.displayName,
+    workspaceId: p.workspace,
+    resources: [routerResource, gpuResource(prefillReplica), gpuResource(decodeReplica)],
+    images: [p.image, p.image, p.image],
+    entryPoints: [
+      b64(routerEntrypointWithSshd(opts.routerEntrypoint, sshPort("frontend"))),
+      b64(atomEngineEntrypoint(
+        "prefill", model, prefillTp, p.kvTransferBackend,
+        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdPrefillExtraArgs ?? "", sshPort("prefill"),
+      )),
+      b64(atomEngineEntrypoint(
+        "decode", model, decodeTp, p.kvTransferBackend,
+        p.pdIbDevice ?? "", p.serverArgs ?? "", p.pdDecodeExtraArgs ?? "", sshPort("decode"),
+      )),
+    ],
+    env,
+    labels: correlationLabels(p.extraLabels, opts.backend, p.sessionId, p.messageId),
+    service: {
+      protocol: "TCP",
+      port: ATOM_ROUTER_PORT,
+      targetPort: ATOM_ROUTER_PORT,
+      serviceType: "ClusterIP",
+    },
+  };
+  applyWorkloadId(body, p.messageId);
+  if (p.description) body.description = p.description;
+  if (p.ownerId) body.ownerId = p.ownerId;
+  return body;
+}
+
+/**
+ * SaFE CreateWorkloadRequest for a multi-node Atom workload.
+ *
+ * Roles are fixed as router, prefill, decode. The router runs atomesh.
+ */
+export function buildAtomWorkloadBody(p: AtomWorkloadParams): Record<string, unknown> {
+  return buildPdClusterWorkloadBody(p, {
+    kind: "Atom",
+    backend: "atomesh",
+    routerEntrypoint: atomRouterEntrypoint(p.framework),
+  });
+}
+
+/**
+ * SaFE CreateWorkloadRequest for a multi-node SGLangRouter workload.
+ *
+ * Same three roles as Atom. The router runs sglang_router and leaves
+ * `{prefill}` and `{decode}` for SaFE to replace with Service URLs.
+ */
+export function buildSGLangRouterWorkloadBody(p: AtomWorkloadParams): Record<string, unknown> {
+  return buildPdClusterWorkloadBody(p, {
+    kind: "SGLangRouter",
+    backend: "sglangrouter",
+    routerEntrypoint: sglangRouterEntrypoint(),
+  });
 }
 
 /** Positional serviceRoles for a topology; must match the builders above. */

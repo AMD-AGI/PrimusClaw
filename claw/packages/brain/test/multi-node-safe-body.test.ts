@@ -3,8 +3,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { SandboxFailure } from "../src/sandbox/errors.js";
 import {
+  buildAtomWorkloadBody,
+  detachedServer,
   buildInferaWorkloadBody,
+  buildSGLangRouterWorkloadBody,
   buildRayJobWorkloadBody,
   inferaFrontendPort,
   inferaSshPortBase,
@@ -71,6 +76,20 @@ test("neither body claims the workspace-storage field", () => {
   for (const [name, body] of [
     ["rayjob", buildRayJobWorkloadBody(COMMON)],
     ["infera", buildInferaWorkloadBody({ ...INFERA_COMMON, pdMode: "aggregated" })],
+    ["atom", buildAtomWorkloadBody({
+      ...COMMON,
+      model: "/models/m",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
+    })],
+    ["sglangrouter", buildSGLangRouterWorkloadBody({
+      ...COMMON,
+      model: "/models/m",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
+    })],
   ] as const) {
     assert.ok(
       !("useWorkspaceStorage" in (body as Record<string, unknown>)),
@@ -233,8 +252,11 @@ test("buildInferaWorkloadBody deploys aggregated workers idle with a role-scoped
 
   assert.match(
     decodeEp(body.entryPoints[0]),
-    new RegExp(`infera\\.server .*--port ${port} .*--router-tokenizer-path /models/Qwen3-30B-A3B`),
+    new RegExp(`infera\\.server .*--port ${port} .*--router-tokenizer-path '/models/Qwen3-30B-A3B'`),
   );
+  const frontend = decodeEp(body.entryPoints[0]);
+  assert.match(frontend, / --router-policy round-robin /);
+  assert.match(frontend, / --enable-profiling( |$)/m);
   // The worker never starts an engine at deploy time; the optimizer SSHes in.
   assert.equal(
     decodeEp(body.entryPoints[1]),
@@ -280,6 +302,323 @@ test("buildInferaWorkloadBody marks a role multinode when its TP exceeds one pod
   assert.deepStrictEqual(body.inferaOptions.multinodeRoles, ["prefill"]);
 });
 
+test("buildAtomWorkloadBody creates router, prefill and decode from the prompt spec", () => {
+  const body = buildAtomWorkloadBody({
+    ...COMMON,
+    displayName: "msg1-atom",
+    model: "/models/Qwen3-14B-FP8",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+    pdPrefillNodes: 1,
+    pdDecodeNodes: 1,
+    pdPrefillTp: 8,
+    pdDecodeTp: 8,
+    memGiPerNode: 128,
+    cpusPerNode: 16,
+    ephemeralGiPerNode: 50,
+    extraEnv: { NCCL_IB_GID_INDEX: "1" },
+  }) as Record<string, any>;
+
+  assert.deepStrictEqual(body.groupVersionKind, { group: "amd.com", kind: "Atom", version: "v1" });
+  assert.equal(body.useWorkspaceStorage, undefined);
+  assert.equal(body.workloadId, "msg1");
+  assert.equal(body.resources.length, 3);
+  assert.equal(body.resources[0].gpu, undefined);
+  assert.equal(body.resources[0].cpu, "4");
+  assert.equal(body.resources[0].sharedMemory, "4Gi");
+  assert.equal(body.resources[1].replica, 1);
+  assert.equal(body.resources[1].gpu, "8");
+  assert.equal(body.resources[1].memory, "128Gi");
+  assert.equal(body.resources[1].sharedMemory, "64Gi");
+  assert.equal(body.resources[1].rdmaResource, "1k");
+  assert.equal(body.resources[2].rdmaResource, "1k");
+  assert.equal(body.images.length, 3);
+  assert.equal(body.service.port, 8000);
+  assert.equal(body.service.targetPort, 8000);
+  assert.equal(body.env.PRIMUS_CLAW_MN_BACKEND, "atomesh");
+  assert.equal(body.env.NCCL_IB_GID_INDEX, "1");
+  assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, undefined);
+  assert.equal(body.inferaOptions, undefined);
+
+  const router = decodeEp(body.entryPoints[0]);
+  const prefill = decodeEp(body.entryPoints[1]);
+  const decode = decodeEp(body.entryPoints[2]);
+  assert.match(router, /atomesh launch/);
+  assert.match(router, /--backend 'sglang'/);
+  assert.equal(router.includes("--policy"), false);
+  assert.equal(prefill.includes("--mem-fraction-static"), false);
+  assert.match(prefill, /--model-path '\/models\/Qwen3-14B-FP8'/);
+  assert.match(prefill, /--tp-size 8/);
+  assert.match(prefill, /--disaggregation-mode prefill/);
+  assert.match(prefill, /--disaggregation-bootstrap-port 8998/);
+  assert.match(prefill, /--disaggregation-transfer-backend 'mooncake'/);
+  assert.match(decode, /--disaggregation-mode decode/);
+  assert.match(decode, /--disaggregation-bootstrap-port 9098/);
+});
+
+test("buildAtomWorkloadBody splits --nodes across prefill and decode when pd counts are omitted", () => {
+  const body = buildAtomWorkloadBody({
+    ...COMMON,
+    nodes: 4,
+    model: "/models/m",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+  }) as Record<string, any>;
+  assert.equal(body.resources[1].replica, 2);
+  assert.equal(body.resources[2].replica, 2);
+  assert.match(decodeEp(body.entryPoints[1]), /--tp-size 8/);
+});
+
+test("buildAtomWorkloadBody uses the prompt engine args", () => {
+  const body = buildAtomWorkloadBody({
+    ...COMMON,
+    model: "/models/m",
+    framework: "sglang",
+    kvTransferBackend: "nixl",
+    pdMode: "disaggregated",
+    serverArgs: "--mem-fraction-static 0.8",
+    pdPrefillExtraArgs: "--watchdog-timeout 3600",
+    pdDecodeExtraArgs: "--max-running-requests 4",
+    pdIbDevice: "mlx5_0",
+  }) as Record<string, any>;
+  const router = decodeEp(body.entryPoints[0]);
+  const prefill = decodeEp(body.entryPoints[1]);
+  const decode = decodeEp(body.entryPoints[2]);
+  assert.match(router, /--backend 'sglang'/);
+  assert.match(prefill, /--disaggregation-transfer-backend 'nixl'/);
+  assert.ok(prefill.includes("'--mem-fraction-static'"));
+  assert.ok(prefill.includes("'0.8'"));
+  assert.ok(prefill.includes("'--watchdog-timeout'"));
+  assert.ok(prefill.includes("'3600'"));
+  assert.match(prefill, /--disaggregation-ib-device 'mlx5_0'/);
+  assert.equal(prefill.includes("max-running-requests"), false);
+  assert.ok(decode.includes("'--max-running-requests'"));
+  assert.ok(decode.includes("'4'"));
+  assert.equal(decode.includes("watchdog-timeout"), false);
+});
+
+test("buildAtomWorkloadBody rejects aggregated pd-mode and cross-pod TP", () => {
+  const base = {
+    ...COMMON,
+    model: "/models/m",
+    framework: "sglang" as const,
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated" as const,
+  };
+  assert.throws(
+    () => buildAtomWorkloadBody({ ...base, pdMode: "aggregated" }),
+    /requires --pd-mode disaggregated/,
+  );
+  assert.throws(
+    () => buildAtomWorkloadBody({ ...base, pdPrefillTp: 16 }),
+    /cross-pod TP is not supported/,
+  );
+  assert.throws(
+    () => buildAtomWorkloadBody({
+      ...base,
+      nodes: 4,
+      pdPrefillNodes: 1,
+      pdDecodeNodes: 1,
+    }),
+    /must equal prefill\+decode/,
+  );
+});
+
+test("atomesh and sglangrouter reject a framework other than the sglang engines they run", () => {
+  for (const build of [buildAtomWorkloadBody, buildSGLangRouterWorkloadBody]) {
+    assert.throws(
+      () => build({ ...COMMON, model: "/models/m", framework: "vllm", kvTransferBackend: "mooncake", pdMode: "disaggregated" }),
+      (e: unknown) => e instanceof SandboxFailure && e.code === "mn_config_invalid" && /--framework sglang/.test(e.message),
+    );
+  }
+});
+
+test("engine args keep quoted values as one word without their quotes", () => {
+  const body = buildAtomWorkloadBody({
+    ...COMMON,
+    model: "/models/m",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+    serverArgs: `--json-model-override-args '{"a": 1}' --chat-template "a b"`,
+    pdPrefillExtraArgs: String.raw`--x c\ d "it's"`,
+  }) as Record<string, any>;
+  const prefill = decodeEp(body.entryPoints[1]);
+  const block = prefill.slice(prefill.indexOf("args=("), prefill.indexOf("\n)\n") + 2);
+  const run = spawnSync("bash", ["-c", `${block}\nprintf '%s\\n' "\${args[@]:17}"`], { encoding: "utf-8" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(run.stdout.trimEnd().split("\n"), [
+    "--json-model-override-args", '{"a": 1}', "--chat-template", "a b", "--x", "c d", "it's",
+  ]);
+});
+
+test("buildSGLangRouterWorkloadBody uses the model gateway and the same engine roles", () => {
+  const body = buildSGLangRouterWorkloadBody({
+    ...COMMON,
+    displayName: "msg1-sglangrouter",
+    model: "/models/Qwen3-14B",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+    pdPrefillNodes: 1,
+    pdDecodeNodes: 1,
+    extraEnv: { MC_GID_INDEX: "1" },
+  }) as Record<string, any>;
+
+  assert.deepStrictEqual(body.groupVersionKind, {
+    group: "amd.com",
+    kind: "SGLangRouter",
+    version: "v1",
+  });
+  assert.equal(body.resources.length, 3);
+  assert.equal(body.resources[1].rdmaResource, "1k");
+  assert.equal(body.resources[2].rdmaResource, "1k");
+  assert.equal(body.service.port, 8000);
+  assert.equal(body.env.PRIMUS_CLAW_MN_BACKEND, "sglangrouter");
+  assert.equal(body.env.MC_GID_INDEX, "1");
+  assert.equal(body.labels["primus-claw/mn-backend"], "sglangrouter");
+
+  const router = decodeEp(body.entryPoints[0]);
+  const prefill = decodeEp(body.entryPoints[1]);
+  const decode = decodeEp(body.entryPoints[2]);
+  assert.match(router, /sglang_router\.launch_router/);
+  assert.match(router, /--prefill \{prefill\} 8998/);
+  assert.match(router, /--decode \{decode\}/);
+  assert.equal(router.includes("atomesh"), false);
+  assert.match(prefill, /--model-path '\/models\/Qwen3-14B'/);
+  assert.match(prefill, /--tp-size 8/);
+  assert.match(prefill, /--disaggregation-mode prefill/);
+  assert.match(decode, /--disaggregation-mode decode/);
+  assert.equal(prefill.includes("atomesh"), false);
+  assert.equal(decode.includes("atomesh"), false);
+});
+
+test("Infera frontend starts sshd on its own port, runs the server detached and holds the waited pid", () => {
+  for (const pdMode of ["aggregated", "disaggregated"] as const) {
+    const body = buildInferaWorkloadBody({ ...INFERA_COMMON, pdMode }) as Record<string, any>;
+    const frontend = decodeEp(body.entryPoints[0]);
+    const base = inferaSshPortBase(INFERA_COMMON.displayName);
+    assert.ok(frontend.includes(`export MN_SSH_PORT=${base + 20}\n`), frontend);
+    assert.ok(frontend.includes("/usr/sbin/sshd -p \"${MN_SSH_PORT}\""), frontend);
+    assert.match(frontend, /\n\( setsid python3 -m infera\.server .* < \/dev\/null & echo \$! > \/tmp\/mn-server\.pid \)\n/);
+    assert.ok(frontend.includes(`/dev/tcp/127.0.0.1/${inferaFrontendPort(INFERA_COMMON.displayName)}`), frontend);
+    assert.match(frontend, /\nexec tail -f \/dev\/null$/);
+    assert.equal(sshPortForPod("frontend", null, base), base + 20);
+  }
+});
+
+test("PD entrypoints run the server detached and hold the waited pid", () => {
+  for (const [build, routerCommand] of [
+    [buildAtomWorkloadBody, "( setsid atomesh launch"],
+    [buildSGLangRouterWorkloadBody, "( setsid python3 -m sglang_router.launch_router"],
+  ] as const) {
+    for (const sshAuthorizedKey of ["", "ssh-ed25519 AAAATEST primus-claw-sess-1"]) {
+      const body = build({
+        ...COMMON,
+        model: "/models/m",
+        framework: "sglang",
+        kvTransferBackend: "mooncake",
+        pdMode: "disaggregated",
+        sshAuthorizedKey,
+        sshPortBase: 25032,
+      }) as Record<string, any>;
+      const [router, prefill, decode] = body.entryPoints.map(decodeEp);
+      assert.ok(router.includes(routerCommand), router);
+      assert.match(router, /< \/dev\/null & echo \$! > \/tmp\/mn-server\.pid \)\n/);
+      for (const ep of [prefill, decode]) {
+        assert.match(ep, /\n\( setsid "\$\{args\[@\]\}" < \/dev\/null & echo \$! > \/tmp\/mn-server\.pid \)\n/);
+      }
+      for (const ep of [router, prefill, decode]) {
+        assert.ok(ep.includes("/dev/tcp/127.0.0.1/${ATOM_SERVER_PORT}"), ep);
+        assert.match(ep, /\nexec tail -f \/dev\/null$/);
+      }
+      for (const ep of [router, prefill, decode]) {
+        const execs = ep.split("\n").filter((line) => line.startsWith("exec "));
+        assert.deepStrictEqual(execs, ["exec tail -f /dev/null"], ep);
+      }
+    }
+  }
+});
+
+test("PD entrypoints start sshd on a port of each role before the server when a key is given", () => {
+  for (const [build, routerCommand] of [
+    [buildAtomWorkloadBody, "setsid atomesh launch"],
+    [buildSGLangRouterWorkloadBody, "setsid python3 -m sglang_router.launch_router"],
+  ] as const) {
+    const body = build({
+      ...COMMON,
+      model: "/models/m",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
+      sshAuthorizedKey: "ssh-ed25519 AAAATEST primus-claw-sess-1",
+      sshPortBase: 25032,
+    }) as Record<string, any>;
+    assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, "ssh-ed25519 AAAATEST primus-claw-sess-1");
+    assert.equal(body.env.MN_SSH_PORT, undefined, "the port is per role, not shared");
+    const [routerEp, prefillEp, decodeEp_] = body.entryPoints.map(decodeEp);
+    assert.ok(routerEp.includes(`export MN_SSH_PORT=${sshPortForPod("frontend", null, 25032)}\n`), routerEp);
+    assert.ok(prefillEp.includes(`export MN_SSH_PORT=${sshPortForPod("prefill", null, 25032)}\n`), prefillEp);
+    assert.ok(decodeEp_.includes(`export MN_SSH_PORT=${sshPortForPod("decode", null, 25032)}\n`), decodeEp_);
+    const router = decodeEp(body.entryPoints[0]);
+    assert.ok(router.startsWith("set -euo pipefail\n"), router);
+    const routerSshd = router.indexOf("/usr/sbin/sshd -p \"${MN_SSH_PORT}\"");
+    assert.ok(routerSshd >= 0, router);
+    assert.ok(routerSshd < router.indexOf(routerCommand), router);
+    for (const ep of [decodeEp(body.entryPoints[1]), decodeEp(body.entryPoints[2])]) {
+      const sshd = ep.indexOf("/usr/sbin/sshd -p \"${MN_SSH_PORT}\"");
+      assert.ok(sshd >= 0, ep);
+      assert.ok(sshd < ep.indexOf("sglang.launch_server"));
+      assert.match(ep, /PasswordAuthentication=no/);
+      assert.match(ep, /WARN: sshd/);
+    }
+  }
+});
+
+test("PD entrypoints carry no sshd without a key", () => {
+  const body = buildSGLangRouterWorkloadBody({
+    ...COMMON,
+    model: "/models/m",
+    framework: "sglang",
+    kvTransferBackend: "mooncake",
+    pdMode: "disaggregated",
+  }) as Record<string, any>;
+  assert.equal(body.env.MN_SSH_AUTHORIZED_KEY, undefined);
+  assert.equal(body.env.MN_SSH_PORT, undefined);
+  assert.equal(decodeEp(body.entryPoints[0]).includes("sshd"), false);
+  assert.equal(decodeEp(body.entryPoints[1]).includes("sshd"), false);
+});
+
+test("discoverRolePods groups SGLangRouter pods by resourceId", () => {
+  const workload = {
+    pods: [
+      { podId: "claw-1-597f94c46d-l9q6p", podIP: "172.16.6.11", phase: "Running" },
+      { podId: "claw-1-prefill-76bd465cbc-qttfv", podIP: "10.235.225.141", phase: "Running", resourceId: 1 },
+      { podId: "claw-1-decode-554bf5b8c6-8k56h", podIP: "10.235.225.70", phase: "Running", resourceId: 2 },
+    ],
+  };
+  const groups = discoverRolePods(workload, "disaggregated", 25032);
+  assert.deepStrictEqual(groups.frontend.map((p) => p.podIp), ["172.16.6.11"]);
+  assert.deepStrictEqual(groups.prefill.map((p) => p.podIp), ["10.235.225.141"]);
+  assert.deepStrictEqual(groups.decode.map((p) => p.podIp), ["10.235.225.70"]);
+  assert.equal(gpuPodsReady(groups, "disaggregated"), true);
+});
+
+test("buildAtomWorkloadBody rejects a missing model", () => {
+  assert.throws(
+    () => buildAtomWorkloadBody({
+      ...COMMON,
+      model: "  ",
+      framework: "sglang",
+      kvTransferBackend: "mooncake",
+      pdMode: "disaggregated",
+    }),
+    /model is required/,
+  );
+});
+
 test("buildInferaWorkloadBody rejects a missing model or authorized key", () => {
   assert.throws(
     () => buildInferaWorkloadBody({ ...INFERA_COMMON, model: "  ", pdMode: "aggregated" }),
@@ -301,15 +640,47 @@ test("sshPortForPod matches the port the idle entryPoint computes in-pod", () =>
   assert.equal(sshPortForPod("worker", null, base), 20032, "unparseable ordinal falls back to the leader");
 });
 
+test("discoverRolePods reads roles from resourceId, an absent one being role 0", () => {
+  // SaFE serialises resourceId with omitempty, so role 0 carries none.
+  const pd = discoverRolePods(
+    {
+      pods: [
+        { podId: "wl-597f94c46d-l9q6p", podIP: "172.16.6.11", phase: "Running" },
+        { podId: "wl-x-76bd465cbc-qttfv", podIP: "10.235.225.141", phase: "Running", resourceId: 1 },
+        { podId: "wl-y-554bf5b8c6-8k56h", podIP: "10.235.225.70", phase: "Running", resourceId: 2 },
+      ],
+    },
+    "disaggregated",
+    25032,
+  );
+  assert.deepStrictEqual(pd.frontend.map((p) => p.podIp), ["172.16.6.11"]);
+  assert.deepStrictEqual(pd.prefill.map((p) => p.podIp), ["10.235.225.141"]);
+  assert.deepStrictEqual(pd.decode.map((p) => p.podIp), ["10.235.225.70"]);
+
+  const aggregated = discoverRolePods(
+    {
+      pods: [
+        { podId: "wl-6d4f8b9c7-x2k9p", podIP: "10.0.0.9", phase: "Running" },
+        { podId: "wl-g-1", podIP: "10.0.0.2", phase: "Running", resourceId: 1 },
+        { podId: "wl-g-0", podIP: "10.0.0.1", phase: "Running", resourceId: 1 },
+      ],
+    },
+    "aggregated",
+    2222,
+  );
+  assert.deepStrictEqual(aggregated.frontend.map((p) => p.podIp), ["10.0.0.9"]);
+  assert.deepStrictEqual(aggregated.worker.map((p) => p.podIp), ["10.0.0.1", "10.0.0.2"]);
+});
+
 test("discoverRolePods maps PD pods by slot index and drops dead ones", () => {
   const workload = {
     pods: [
       { podId: "test-role0-abc", podIP: "192.0.2.1", phase: "Running" },
-      { podId: "test-role1-def", podIP: "192.0.2.2", phase: "Running" },
-      { podId: "test-role2-ghi", podIP: "192.0.2.3", phase: "Running" },
+      { podId: "test-role1-def", podIP: "192.0.2.2", phase: "Running", resourceId: 1 },
+      { podId: "test-role2-ghi", podIP: "192.0.2.3", phase: "Running", resourceId: 2 },
       // A crashed replica keeps its IP but has no sshd: SSHing to it fails the round.
-      { podId: "test-role2-dead", podIP: "192.0.2.9", phase: "Failed" },
-      { podId: "test-role1-nopod", podIP: "", phase: "Pending" },
+      { podId: "test-role2-dead", podIP: "192.0.2.9", phase: "Failed", resourceId: 2 },
+      { podId: "test-role1-nopod", podIP: "", phase: "Pending", resourceId: 1 },
     ],
   };
   const groups = discoverRolePods(workload, "disaggregated", 2222);
@@ -323,9 +694,9 @@ test("discoverRolePods maps PD pods by slot index and drops dead ones", () => {
 test("discoverRolePods orders an LWS group leader-first", () => {
   const workload = {
     pods: [
-      { podId: "test-role1-lws-2", podIP: "192.0.2.4", phase: "Running" },
-      { podId: "test-role1-lws-0", podIP: "192.0.2.2", phase: "Running" },
-      { podId: "test-role1-lws-1", podIP: "192.0.2.3", phase: "Running" },
+      { podId: "test-role1-lws-2", podIP: "192.0.2.4", phase: "Running", resourceId: 1 },
+      { podId: "test-role1-lws-0", podIP: "192.0.2.2", phase: "Running", resourceId: 1 },
+      { podId: "test-role1-lws-1", podIP: "192.0.2.3", phase: "Running", resourceId: 1 },
     ],
   };
   const groups = discoverRolePods(workload, "aggregated", 2222);
@@ -333,9 +704,47 @@ test("discoverRolePods orders an LWS group leader-first", () => {
   assert.deepStrictEqual(groups.worker.map((p) => p.sshPort), [2222, 2223, 2224]);
 });
 
+test("gpuPodsReady with the router required waits for a router pod IP", () => {
+  const noRouter = discoverRolePods(
+    {
+      pods: [
+        { podId: "wl-p", podIP: "192.0.2.2", phase: "Running", resourceId: 1 },
+        { podId: "wl-d", podIP: "192.0.2.3", phase: "Running", resourceId: 2 },
+      ],
+    },
+    "disaggregated",
+    2222,
+  );
+  assert.equal(gpuPodsReady(noRouter, "disaggregated"), true);
+  assert.equal(gpuPodsReady(noRouter, "disaggregated", { requireRouter: true }), false);
+  noRouter.frontend.push({ podId: "wl-r", podIp: "192.0.2.1", sshPort: 2242, lwsIndex: null } as never);
+  assert.equal(gpuPodsReady(noRouter, "disaggregated", { requireRouter: true }), true);
+});
+
+/** Run `detachedServer(command, port)` then `echo HELD`; stdout, stderr and exit status. */
+function runDetached(command: string, port: number): { status: number | null; stdout: string; stderr: string } {
+  const script = ["set -euo pipefail", ...detachedServer(command, String(port)), "echo HELD"].join("\n");
+  return spawnSync("bash", ["-c", script], {
+    encoding: "utf-8",
+    timeout: 20_000,
+    env: { ...process.env, NODE_BIN: process.execPath },
+  });
+}
+
+test("a server that exits before it listens fails the entrypoint; one that listens is held", () => {
+  const dead = runDetached("sh -c 'exit 3'", 39411);
+  assert.equal(dead.status, 1, dead.stderr);
+  assert.equal(dead.stdout.includes("HELD"), false);
+  assert.match(dead.stderr, /exited before listening on 39411/);
+
+  const up = runDetached(`"$NODE_BIN" -e "require('net').createServer().listen(39412); setTimeout(() => process.exit(0), 3000)"`, 39412);
+  assert.equal(up.status, 0, up.stderr);
+  assert.match(up.stdout, /HELD/);
+});
+
 test("gpuPodsReady waits for every role the topology needs", () => {
   const onlyPrefill = discoverRolePods(
-    { pods: [{ podId: "test-role1-a", podIP: "192.0.2.2", phase: "Running" }] },
+    { pods: [{ podId: "test-role1-a", podIP: "192.0.2.2", phase: "Running", resourceId: 1 }] },
     "disaggregated",
     2222,
   );
