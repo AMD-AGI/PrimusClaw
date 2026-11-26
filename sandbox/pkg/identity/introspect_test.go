@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -209,5 +210,43 @@ func TestIntrospectUnreachableIsUnavailable(t *testing.T) {
 	c := NewClient("http://127.0.0.1:1/oauth/introspect", "id", "secret", "")
 	if _, err := c.Introspect(context.Background(), "ak-x"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestIntrospectParsesTeams checks the teams field for present, absent, null, empty and invalid shapes.
+func TestIntrospectParsesTeams(t *testing.T) {
+	tests := []struct {
+		name    string
+		teams   any
+		set     bool
+		want    []string
+		wantErr error
+	}{
+		{name: "present", teams: []string{"t1", "t2"}, set: true, want: []string{"t1", "t2"}},
+		{name: "absent"},
+		{name: "null", teams: nil, set: true},
+		{name: "empty", teams: []string{}, set: true, want: []string{}},
+		{name: "non string entry", teams: []any{"t1", 7}, set: true, wantErr: ErrUnavailable},
+		{name: "not a list", teams: "t1", set: true, wantErr: ErrUnavailable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ans := map[string]any{"active": true, "sub": "u-1", "groups": []string{"g1"}}
+			if tc.set {
+				ans["teams"] = tc.teams
+			}
+			f := &fakeIdentity{answers: map[string]map[string]any{"ak": ans}}
+			c, _ := newTestClient(t, f, testSecret)
+			tok, err := c.Introspect(context.Background(), "ak")
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+			if tc.wantErr != nil {
+				return
+			}
+			if !reflect.DeepEqual(tok.Teams, tc.want) || !reflect.DeepEqual(tok.Groups, []string{"g1"}) {
+				t.Fatalf("teams = %#v groups = %#v", tok.Teams, tok.Groups)
+			}
+		})
 	}
 }

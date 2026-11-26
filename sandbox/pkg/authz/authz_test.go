@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -278,5 +279,105 @@ func TestAllowedDeniesAnEmptySubjectWithoutAReview(t *testing.T) {
 	ok, err := c.Allowed(context.Background(), "", []string{"system-admin"}, workspaceUse("lab"))
 	if ok || err != nil || rec.count() != 0 {
 		t.Fatalf("ok=%v err=%v calls=%d", ok, err, rec.count())
+	}
+}
+
+// teamReviewer allows a review only when the subject groups include the group required for resource/verb.
+type teamReviewer struct {
+	need map[string]string
+}
+
+// Create answers one review from the required group of its resource and verb.
+func (r teamReviewer) Create(_ context.Context, sar *authorizationv1.SubjectAccessReview, _ metav1.CreateOptions) (*authorizationv1.SubjectAccessReview, error) {
+	out := sar.DeepCopy()
+	attrs := sar.Spec.ResourceAttributes
+	want, ok := r.need[attrs.Resource+"/"+attrs.Verb]
+	out.Status.Allowed = ok && slices.Contains(sar.Spec.Groups, want)
+	return out, nil
+}
+
+// TestReviewGroups checks how team ids become review groups.
+func TestReviewGroups(t *testing.T) {
+	tests := []struct {
+		name string
+		tok  identity.Token
+		want []string
+	}{
+		{name: "no teams", tok: identity.Token{Groups: []string{"g1"}}, want: []string{"g1"}},
+		{name: "nothing", tok: identity.Token{}, want: nil},
+		{name: "prefixed", tok: identity.Token{Teams: []string{"a", "b"}}, want: []string{"team:a", "team:b"}},
+		{name: "empty id skipped", tok: identity.Token{Teams: []string{"", "a"}}, want: []string{"team:a"}},
+		{name: "colon id skipped", tok: identity.Token{Teams: []string{"x:y", ":", "a"}}, want: []string{"team:a"}},
+		{name: "groups and teams", tok: identity.Token{Groups: []string{"g1"}, Teams: []string{"a"}}, want: []string{"g1", "team:a"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := reviewGroups(tc.tok); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("groups = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReviewGroupsDoesNotMutateTheToken checks that appending teams leaves the token slices intact.
+func TestReviewGroupsDoesNotMutateTheToken(t *testing.T) {
+	groups := make([]string, 1, 8)
+	groups[0] = "g1"
+	tok := identity.Token{Groups: groups, Teams: []string{"a"}}
+	_ = reviewGroups(tok)
+	if !reflect.DeepEqual(tok.Groups, []string{"g1"}) || !reflect.DeepEqual(tok.Teams, []string{"a"}) || groups[:2][1] != "" {
+		t.Fatalf("token changed: %#v backing=%#v", tok, groups[:2])
+	}
+}
+
+// TestReviewSpecGroupsAreTeamAwareSortedAndCompacted checks the prefixed, sorted and de-duplicated review groups.
+func TestReviewSpecGroupsAreTeamAwareSortedAndCompacted(t *testing.T) {
+	rec := &recordingReviewer{}
+	c := NewClient(rec, "primus:")
+	tok := identity.Token{Subject: "u-1", Groups: []string{"team:a", "z", "g1"}, Teams: []string{"b", "a", "a", "", "x:y"}}
+	if _, err := c.CanUseWorkspace(context.Background(), tok, "lab"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"primus:g1", "primus:team:a", "primus:team:b", "primus:z"}
+	if !reflect.DeepEqual(rec.spec.Groups, want) {
+		t.Fatalf("groups = %#v, want %#v", rec.spec.Groups, want)
+	}
+}
+
+// TestTeamGroupGrantsAccess checks that a team group is the only access path for each decision.
+func TestTeamGroupGrantsAccess(t *testing.T) {
+	r := teamReviewer{need: map[string]string{
+		"workspaces/use":  "primus:team:a",
+		"sessions/delete": "primus:team:adm",
+		"sessions/list":   "primus:team:aud",
+	}}
+	tests := []struct {
+		name      string
+		teams     []string
+		workspace bool
+		role      string
+	}{
+		{name: "no team", teams: nil, role: identity.RoleDefault},
+		{name: "other team", teams: []string{"b"}, role: identity.RoleDefault},
+		{name: "workspace team", teams: []string{"a"}, workspace: true, role: identity.RoleDefault},
+		{name: "admin team", teams: []string{"adm"}, role: identity.RoleSystemAdmin},
+		{name: "audit team", teams: []string{"aud"}, role: identity.RoleSystemAdminReadonly},
+		{name: "invalid id never matches", teams: []string{"x:a"}, role: identity.RoleDefault},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewClient(r, "primus:")
+			ctx := context.Background()
+			tok := identity.Token{Subject: "u-1", Teams: tc.teams}
+			if ok, err := c.CanUseWorkspace(ctx, tok, "lab"); err != nil || ok != tc.workspace {
+				t.Fatalf("CanUseWorkspace = %v, %v", ok, err)
+			}
+			if ok, err := c.CanUseAllWorkspaces(ctx, tok); err != nil || ok != tc.workspace {
+				t.Fatalf("CanUseAllWorkspaces = %v, %v", ok, err)
+			}
+			if role, err := c.PlatformRole(ctx, tok); err != nil || role != tc.role {
+				t.Fatalf("PlatformRole = %q, %v", role, err)
+			}
+		})
 	}
 }
