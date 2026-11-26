@@ -11,6 +11,7 @@
  *   MU1 devenv_list gives every conversation the user muted (muted_conversations: machine, id, title now, label, since), and each
  *       session says muted (with since when); a conversation muted under an older title is named by its title now; one the machine
  *       no longer reports keeps the title it had; another user's mutes are never listed; ids are compared without case
+ *   MU1b a muted conversation held by a session open through Claw is named by that session's title and label
  *   MU2 a machine with more sessions than its agents card shows says how many are listed: session_count = sessions_listed + sessions_not_shown
  *   MU3 the router is told to answer mutes and counts from these fields, never "cannot tell"
  */
@@ -111,6 +112,23 @@ describe("devenv_list mutes and counts", { skip }, () => {
     const upper = await devenv.devenvList(await userTurn(alice, "clean 静音了吗？"));
     assert.deepEqual(upper.machines[0]!.sessions.map((s) => [s.title, s.muted]), [["clean", true], ["hosting", false], ["blog", false]]);
     assert.deepEqual(upper.muted_conversations.map((m) => [m.title, m.label]), [["clean", upper.machines[0]!.sessions[0]!.label]]);
+  });
+
+  test("MU1b a muted conversation held by a session open through Claw is named by the title and label of that session", async () => {
+    const alice = await w.user("alice");
+    const clean = { ...conv(1, "clean", "idle", 30), state: "attached" };
+    const pod = await machine("alice", "yihan-dev-pod", [clean, conv(2, "hosting", "live", 60)]);
+    const made = await store.createSession({ owner: "alice", client: null, connectorId: pod, agentId: "claude-sessions", cwd: "/home/u", mode: null, maxActive: 10, commandsPerMinute: 1000 });
+    assert.equal(made.status, "created");
+    const sid = (made as { session: Recorded }).session.session_id as string;
+    await w.q("DELETE FROM claw_remote_commands WHERE session_id = $1", [sid]);
+    await store.ingestEvents({ connector_id: pod, owner_user_id: "alice" },
+      [{ index: 0, session_id: sid, seq: 1, type: "session_started", ts: Date.now(), data: { acp_session_id: clean.ref } }]);
+    await mute("alice", pod, clean.ref, "yihan", 1);
+    const out = await devenv.devenvList(await userTurn(alice, "我静音的只是clean这一个会话吧？"));
+    const chat = out.machines[0]!.sessions.find((s) => s.opened_in === "chat")!;
+    assert.deepEqual([chat.id, chat.title, chat.muted], [sid, "clean", true]);
+    assert.deepEqual(out.muted_conversations.map((m) => [m.id, m.title, m.label]), [[clean.ref, "clean", chat.label]]);
   });
 
   test("MU2 a machine whose card shows only some sessions says how many are listed, and the counts add up", async () => {

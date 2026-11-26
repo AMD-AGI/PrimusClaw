@@ -784,8 +784,13 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
     const m = typeof ref === "string" && ref ? muteOf.get(muteKey(connectorId, ref)) : undefined;
     return m ? { muted: true, muted_since: m.muted_at } : { muted: false };
   };
-  // The title and label each muted conversation has in this read, found by its id.
-  const titleNow = new Map<string, string | null>();
+  // The title and label each conversation has in this read, found by its id (a session open through Claw: the one it holds).
+  const now = new Map<string, { title: string | null; label: string }>();
+  const seen = (connectorId: string, ref: unknown, title: string | null, label: string) => {
+    if (typeof ref !== "string" || !ref) return;
+    const key = muteKey(connectorId, ref);
+    if (!now.has(key)) now.set(key, { title, label });
+  };
   const shown = flat;
   // Each session's seat (its conversation's alias and confirmed role, else its folder's), for a user who has seats.
   const seatsMod = await import("./seats.js");
@@ -841,7 +846,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
           ...seatOf(String(c.connector_id), String(a.agent_id), r.cwd, r.ref),
           ...mutedRow(String(c.connector_id), r.ref),
         };
-        titleNow.set(muteKey(String(c.connector_id), r.ref), r.title);
+        seen(String(c.connector_id), r.ref, r.title, row.label);
         if (inTerminal && r.terminal_state) row.terminal_state = r.terminal_state;
         if (activity && r.terminal_state === "waiting_for_you") row.waiting_for = r.waiting_for;
         sessions.push(row);
@@ -864,6 +869,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
         ...seatOf(String(c.connector_id), String(s.agent_id), s.cwd, s.conversation_ref),
         ...mutedRow(String(c.connector_id), s.conversation_ref),
       };
+      seen(String(c.connector_id), s.conversation_ref, row.title, row.label);
       if (activity) Object.assign(row, { step: reading.step, last_answer: reading.answer, asked: reading.asked, last_stop: reading.last_stop, queued_prompts: Number(s.queued) || 0 });
       sessions.push(row);
       if (online) attachable.push({ label: row.label, ref, opened_in: "chat", ...(s.read_only === true ? { read_only: true as const } : {}) });
@@ -885,14 +891,16 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
   }
   const names = new Map(connectors.map((c) => [String(c.connector_id), shown(c.name, NAME_MAX)]));
   const muted = mutes.map((m) => ({
-    ...m, seen: titleNow.has(muteKey(m.connector_id, m.ref)), title_now: titleNow.get(muteKey(m.connector_id, m.ref)) ?? null,
-    machine_now: names.get(m.connector_id) ?? flat(m.machine, NAME_MAX),
+    ...m, now: now.get(muteKey(m.connector_id, m.ref)) ?? null, machine_now: names.get(m.connector_id) ?? flat(m.machine, NAME_MAX),
   }));
   return { machines, attachable, muted };
 }
 
-/** A mute with what this read knows of its conversation: whether its machine reports it (`seen`), its title there and the machine's name. */
-export type MutedNow = TerminalMute & { seen: boolean; title_now: string | null; machine_now: string | null };
+/**
+ * A mute with what this read knows of its conversation: its title there and the label of its session, when its machine reports it
+ * (`now`), and the machine's name.
+ */
+export type MutedNow = TerminalMute & { now: { title: string | null; label: string } | null; machine_now: string | null };
 
 /**
  * The user's muted conversations as `devenv_list` gives them: each with its machine, its title now (else the one it had when muted)
@@ -901,11 +909,11 @@ export type MutedNow = TerminalMute & { seen: boolean; title_now: string | null;
 export function mutedListed(
   muted: ReadonlyArray<MutedNow>, machines: readonly DevenvMachine[],
 ): DevenvMuted[] {
-  const labels = new Map<string, string>();
-  for (const m of machines) for (const s of m.sessions) if (s.opened_in === "machine" && !labels.has(muteKey(m.machine ?? "", s.id))) labels.set(muteKey(m.machine ?? "", s.id), s.label);
+  // (a label only when these machines list that session: a machine's compact read leaves some out)
+  const listed = new Set(machines.flatMap((m) => m.sessions.map((s) => s.label)));
   return muted.map((m) => ({
-    machine: m.machine_now, id: m.ref, title: m.seen ? m.title_now : flat(m.title, NAME_MAX),
-    label: labels.get(muteKey(m.machine_now ?? "", m.ref)) ?? null, muted_since: m.muted_at,
+    machine: m.machine_now, id: m.ref, title: m.now ? m.now.title : flat(m.title, NAME_MAX),
+    label: m.now && listed.has(m.now.label) ? m.now.label : null, muted_since: m.muted_at,
   }));
 }
 
