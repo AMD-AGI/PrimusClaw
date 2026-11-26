@@ -40,7 +40,7 @@ import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS } from "@claw
 import { CLAW_ASSISTANT_ENABLED, CLAW_DEVENV_SEAT_DISPATCH, CLAW_DEVENV_SEATS, CLAW_DEVENV_SEATS_USERS, CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import { callMemoryLLM } from "../llm/client.js";
-import { CONVERSATION_REF_SQL, issueCommand, listConnectors, listTerminalMutes, sessionActivity, wakeConnector, workspacesOf, type Row } from "../remote-agents/store.js";
+import { CONVERSATION_REF_SQL, issueCommand, listConnectors, listTerminalMutes, muteKey, sessionActivity, wakeConnector, workspacesOf, type Row } from "../remote-agents/store.js";
 import { heldTitle, inertMd, readActivity, resumableOf, type Resumable } from "./devenv-tools.js";
 import { versionVerdict } from "../remote-agents/setup.js";
 import { markUntrustedRead, turnMessage } from "./inbound.js";
@@ -798,12 +798,12 @@ export async function rosterOf(
   });
   const picked = where.name ? (named(true).length ? named(true) : named(false)) : there;
   // A seat's conversation, or one of its sessions' (a conversation open on the machine is listed by its own id), that the user muted.
-  const mutes = new Map((await listTerminalMutes(owner, q)).map((m) => [`${m.connector_id}\u0000${m.ref}`, m.muted_at]));
+  const mutes = new Map((await listTerminalMutes(owner, q)).map((m) => [muteKey(m.connector_id, m.ref), m.muted_at]));
   return picked.map((s) => {
     const confirmed = s.role_state === "confirmed";
     const now = live.get(String(s.seat_id));
     const mutedAt = [s.conversation_ref, ...(now?.sessions ?? []).map((x) => x.id)]
-      .map((ref) => (typeof ref === "string" && ref ? mutes.get(`${String(s.connector_id)}\u0000${ref}`) : undefined)).find((v) => v !== undefined);
+      .map((ref) => (typeof ref === "string" && ref ? mutes.get(muteKey(String(s.connector_id), ref)) : undefined)).find((v) => v !== undefined);
     return {
       seat_id: String(s.seat_id),
       alias: typeof s.alias === "string" ? s.alias : null,

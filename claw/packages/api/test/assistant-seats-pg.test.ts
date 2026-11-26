@@ -882,18 +882,19 @@ describe("seats", { skip }, () => {
     const attach = {
       agent_id: "claude-sessions", kind: "attach", name: "Claude Code (existing sessions)",
       capabilities: { resumable: [
-        { ref: "33333333-3333-4333-8333-333333333333", title: "clean", cwd: "/home/u/a", updated_at: ago, state: "live" },
+        { ref: "aaaaaaaa-3333-4333-8333-333333333333", title: "clean", cwd: "/home/u/a", updated_at: ago, state: "live" },
         { ref: "44444444-4444-4444-8444-444444444444", title: "hosting", cwd: "/home/u/b", updated_at: ago, state: "live" },
       ] },
     };
     const cid = await machine("alice", "devbox", { agents: [CLAUDE, attach] });
     await seats.syncSeats("alice");
-    await w.q("INSERT INTO claw_remote_terminal_mutes (owner_user_id, connector_id, ref, title) VALUES ('alice', $1, '33333333-3333-4333-8333-333333333333', 'yihan')", [cid]);
+    // (stored with the id in another case: ids are compared without case)
+    await w.q("INSERT INTO claw_remote_terminal_mutes (owner_user_id, connector_id, ref, title) VALUES ('alice', $1, 'AAAAAAAA-3333-4333-8333-333333333333', 'yihan')", [cid]);
     const turn = await userTurn(alice, "哪些工位静音了？");
     const out = await seats.seatRoster(turn) as { seats: Recorded[] };
     const rows = await seatRows();
     const seatOf = (ref: string) => out.seats.find((x) => x.seat_id === rows.find((r) => r.conversation_ref === ref)!.seat_id)!;
-    const muted = seatOf("33333333-3333-4333-8333-333333333333");
+    const muted = seatOf("aaaaaaaa-3333-4333-8333-333333333333");
     assert.equal(muted.muted, true);
     assert.ok(!Number.isNaN(Date.parse(muted.muted_since)));
     assert.deepEqual([seatOf("44444444-4444-4444-8444-444444444444").muted, "muted_since" in seatOf("44444444-4444-4444-8444-444444444444")], [false, false]);

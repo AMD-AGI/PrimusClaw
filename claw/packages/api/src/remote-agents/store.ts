@@ -1396,6 +1396,9 @@ export async function terminalMuted(owner: string, connectorId: string, ref: str
 /** One conversation open in a terminal whose pushes its owner muted: where it is, the title it had then, and since when. */
 export interface TerminalMute { connector_id: string; machine: string | null; ref: string; title: string; muted_at: string }
 
+/** How a mute is matched with a conversation: its machine and its id, compared without case (as `CONVERSATION_REF_SQL` keeps ids). */
+export const muteKey = (connectorId: string, ref: string): string => `${connectorId.toLowerCase()}\u0000${ref.toLowerCase()}`;
+
 /** Every conversation the owner muted (`claw_remote_terminal_mutes`), newest first, with its machine's name. */
 export async function listTerminalMutes(owner: string, q: Querier = direct): Promise<TerminalMute[]> {
   return (await q(

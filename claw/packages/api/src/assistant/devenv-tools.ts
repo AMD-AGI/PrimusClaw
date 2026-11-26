@@ -31,7 +31,7 @@ import { REMOTE_AGENT_LIMITS, REMOTE_AGENT_TIMING, REMOTE_COMMANDS, REMOTE_EVENT
 import { CLAW_REMOTE_AGENTS_ENABLED } from "../config.js";
 import { db, inTransaction, type Querier } from "../infra/db.js";
 import {
-  createSession, findConnector, findSession, issueCommand, listConnectors, listTerminalMutes, onlineSql, sessionActivity, setHidden, wakeConnector,
+  createSession, findConnector, findSession, issueCommand, listConnectors, listTerminalMutes, muteKey, onlineSql, sessionActivity, setHidden, wakeConnector,
   type Row, type TerminalMute,
 } from "../remote-agents/store.js";
 import { connectorSetup, outdatedMessage, versionVerdict, type ConnectorVersionVerdict } from "../remote-agents/setup.js";
@@ -779,9 +779,9 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
     listTerminalMutes(userId),
   ]);
   // The user's mutes by conversation (`claw_remote_terminal_mutes`): a session of a muted conversation says so, with since when.
-  const muteOf = new Map(mutes.map((m) => [`${m.connector_id}\u0000${m.ref}`, m]));
+  const muteOf = new Map(mutes.map((m) => [muteKey(m.connector_id, m.ref), m]));
   const mutedRow = (connectorId: string, ref: unknown): Pick<DevenvSession, "muted" | "muted_since"> => {
-    const m = typeof ref === "string" && ref ? muteOf.get(`${connectorId}\u0000${ref}`) : undefined;
+    const m = typeof ref === "string" && ref ? muteOf.get(muteKey(connectorId, ref)) : undefined;
     return m ? { muted: true, muted_since: m.muted_at } : { muted: false };
   };
   // The title and label each muted conversation has in this read, found by its id.
@@ -841,7 +841,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
           ...seatOf(String(c.connector_id), String(a.agent_id), r.cwd, r.ref),
           ...mutedRow(String(c.connector_id), r.ref),
         };
-        titleNow.set(`${String(c.connector_id)}\u0000${r.ref}`, r.title);
+        titleNow.set(muteKey(String(c.connector_id), r.ref), r.title);
         if (inTerminal && r.terminal_state) row.terminal_state = r.terminal_state;
         if (activity && r.terminal_state === "waiting_for_you") row.waiting_for = r.waiting_for;
         sessions.push(row);
@@ -885,7 +885,7 @@ async function collect(userId: string, activity: boolean, onlineWindowMs: number
   }
   const names = new Map(connectors.map((c) => [String(c.connector_id), shown(c.name, NAME_MAX)]));
   const muted = mutes.map((m) => ({
-    ...m, seen: titleNow.has(`${m.connector_id}\u0000${m.ref}`), title_now: titleNow.get(`${m.connector_id}\u0000${m.ref}`) ?? null,
+    ...m, seen: titleNow.has(muteKey(m.connector_id, m.ref)), title_now: titleNow.get(muteKey(m.connector_id, m.ref)) ?? null,
     machine_now: names.get(m.connector_id) ?? flat(m.machine, NAME_MAX),
   }));
   return { machines, attachable, muted };
@@ -902,10 +902,10 @@ export function mutedListed(
   muted: ReadonlyArray<MutedNow>, machines: readonly DevenvMachine[],
 ): DevenvMuted[] {
   const labels = new Map<string, string>();
-  for (const m of machines) for (const s of m.sessions) if (s.opened_in === "machine" && !labels.has(`${m.machine ?? ""}\u0000${s.id}`)) labels.set(`${m.machine ?? ""}\u0000${s.id}`, s.label);
+  for (const m of machines) for (const s of m.sessions) if (s.opened_in === "machine" && !labels.has(muteKey(m.machine ?? "", s.id))) labels.set(muteKey(m.machine ?? "", s.id), s.label);
   return muted.map((m) => ({
     machine: m.machine_now, id: m.ref, title: m.seen ? m.title_now : flat(m.title, NAME_MAX),
-    label: labels.get(`${m.machine_now ?? ""}\u0000${m.ref}`) ?? null, muted_since: m.muted_at,
+    label: labels.get(muteKey(m.machine_now ?? "", m.ref)) ?? null, muted_since: m.muted_at,
   }));
 }
 

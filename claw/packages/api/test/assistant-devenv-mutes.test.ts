@@ -10,7 +10,7 @@
  *
  *   MU1 devenv_list gives every conversation the user muted (muted_conversations: machine, id, title now, label, since), and each
  *       session says muted (with since when); a conversation muted under an older title is named by its title now; one the machine
- *       no longer reports keeps the title it had; another user's mutes are never listed
+ *       no longer reports keeps the title it had; another user's mutes are never listed; ids are compared without case
  *   MU2 a machine with more sessions than its agents card shows says how many are listed: session_count = sessions_listed + sessions_not_shown
  *   MU3 the router is told to answer mutes and counts from these fields, never "cannot tell"
  */
@@ -105,6 +105,12 @@ describe("devenv_list mutes and counts", { skip }, () => {
     const none = await devenv.devenvList(await userTurn(alice, "我静音了哪些会话？"));
     assert.deepEqual(none.muted_conversations, []);
     assert.ok(none.machines[0]!.sessions.every((s) => s.muted === false));
+
+    // A mute stored with the id in another case is the same conversation (ids are compared without case).
+    await mute("alice", pod, clean.ref.toUpperCase(), "yihan", 1);
+    const upper = await devenv.devenvList(await userTurn(alice, "clean 静音了吗？"));
+    assert.deepEqual(upper.machines[0]!.sessions.map((s) => [s.title, s.muted]), [["clean", true], ["hosting", false], ["blog", false]]);
+    assert.deepEqual(upper.muted_conversations.map((m) => [m.title, m.label]), [["clean", upper.machines[0]!.sessions[0]!.label]]);
   });
 
   test("MU2 a machine whose card shows only some sessions says how many are listed, and the counts add up", async () => {
