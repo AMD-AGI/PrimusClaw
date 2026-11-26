@@ -16,7 +16,7 @@ the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 | Release | Tag | Current version |
 |---|---|---|
 | Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
-| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.5 |
+| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.6 |
 | Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.15.0 |
 
 Every tag is a GitHub Release, and its notes are that version's release notes.
@@ -452,6 +452,13 @@ release version, and its `appVersion` stays `latest`.
   (#872).
 ### Fixed
 
+- Connector: a conversation that had just ended (a `claude -p` that returned, a terminal that exited) kept showing as in use on the
+  phone, with only the view-only button, for up to a sessions look (10 s) plus a heartbeat, and up to a heartbeat interval (30 s)
+  when it had been resumed and ended again between two looks. A change in Claude Code's session registry, and the `Stop`,
+  `StopFailure` and `SessionEnd` events of the approval hooks, now make the connector look at its conversations a second later (one
+  look for however many arrived), and the periodic look compares with what the last heartbeat reported, not with the look before it.
+  A heartbeat is sent only when what the phone is shown differs from what the last one said, and one asked for while a heartbeat is
+  on its way follows it at once.
 - Personal agent: a message that starts with the bot's name typed as words ahead of a command (`@clawy /approvals`: what Teams on a
   phone sends when the name was typed and not picked, with no mention behind it) was read as a sentence and answered by the
   assistant, never as the command it carries (2026-11-26, `/approvals` answered with the assistant's overview). The name (the

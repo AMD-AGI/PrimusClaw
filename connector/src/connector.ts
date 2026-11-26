@@ -82,6 +82,13 @@ export interface ConnectorTiming extends SessionTiming {
    * reported at once instead of at the next heartbeat.
    */
   sessionsWatchMs: number;
+  /**
+   * How long after something that may change what the phone is shown of the conversations (a terminal's hook said a turn or a
+   * conversation ended, or a file of Claude Code's session registry changed: a `claude -p` that returned, a terminal that exited)
+   * they are looked at again. One look serves everything that arrived meanwhile, and a heartbeat is sent only when what the phone
+   * is shown differs from what the last heartbeat said.
+   */
+  lookSoonMs: number;
   /** How long the command that lists the open sessions may take before the check is refused as unanswerable. */
   attachCliMs: number;
   /** A session whose transcript was written this recently is still in someone's hands. */
@@ -147,6 +154,7 @@ export const DEFAULT_TIMING: ConnectorTiming = {
   pausePollMs: 1_000,
   catalogMs: 120_000,
   sessionsWatchMs: 10_000,
+  lookSoonMs: 1_000,
   attachCliMs: 8_000,
   recentWriteMs: 10_000,
   authFailLimit: 4,
@@ -441,11 +449,13 @@ export class Connector {
     this.store = new SessionStore(sessionsFile(d.dirs), report);
     for (const a of d.config.agents) {
       if (!a.attach) continue;
-      this.attach.set(a.id, new AttachSupport(a, {
+      const support: AttachSupport = new AttachSupport(a, {
         registry: this.registry, audit: d.audit, log: d.log, logDir: logDir(d.dirs), version: d.version, env: process.env,
         catalogMs: this.timing.catalogMs, cliTimeoutMs: this.timing.attachCliMs, recentWriteMs: this.timing.recentWriteMs,
         attachedRefs: () => this.manager.attachedRefs(a.id),
-      }));
+        onRegistryChange: () => this.lookSoon(support),
+      });
+      this.attach.set(a.id, support);
     }
     const env: SessionEnv = {
       config: d.config, audit: d.audit, registry: this.registry, store: this.store, attach: this.attach, timing: this.timing,
@@ -460,6 +470,8 @@ export class Connector {
       ttlMs: this.timing.approvalTtlMs,
       attached: (ref) => this.manager.followsRef(ref),
       awayMs: this.timing.turnEndAwayMs,
+      // A turn or a conversation ended in a terminal: what the phone is shown of its conversation may have changed.
+      terminalEnded: (e) => this.terminalEnded(e.agent, e.configDir),
     });
     this.manager.approvals = this.approvals;
   }
@@ -1042,21 +1054,76 @@ export class Connector {
       for (const support of this.attach.values()) {
         try { if (await support.poll()) changed = true; } catch (e) { this.d.log.warn("looking for changed sessions failed", { agent: support.agent.id, error: errMessage(e) }); }
       }
-      if (changed && !this.paused) this.wakeHeartbeat?.();
+      if (changed) this.requestHeartbeat();
       await sleep(this.timing.sessionsWatchMs, this.ctl.signal);
     }
   }
 
+  /** The conversations whose attach agent is to be looked at, and the timer that does it ({@link lookSoon}). */
+  private readonly lookDue = new Set<AttachSupport>();
+  private lookTimer: NodeJS.Timeout | null = null;
+
+  /** A terminal's hook said a turn or a conversation ended: the conversations of the Claude config directory it was installed for are looked at soon. */
+  private terminalEnded(agent: HookAgent, configDir: string): void {
+    if (agent !== "claude" || configDir === "") return;
+    const dir = path.resolve(configDir);
+    for (const support of this.attach.values()) if (support.configDir === dir) this.lookSoon(support);
+  }
+
+  /**
+   * Something that may change what the phone is shown of `support`'s conversations happened (a hook said a turn or a conversation ended,
+   * a file of the session registry changed): they are looked at in {@link ConnectorTiming.lookSoonMs}, once for however many things
+   * happened meanwhile, and a heartbeat is sent only if what the phone is shown differs from what the last one said. It does not wait
+   * for the next periodic look (`sessionsWatcher`, every {@link ConnectorTiming.sessionsWatchMs}) nor the heartbeat's own timer.
+   */
+  private lookSoon(support: AttachSupport): void {
+    if (this.ctl.signal.aborted) return;
+    this.lookDue.add(support);
+    if (this.lookTimer) return;
+    this.lookTimer = setTimeout(() => {
+      this.lookTimer = null;
+      void this.lookDueNow();
+    }, this.timing.lookSoonMs);
+    this.lookTimer.unref?.();
+  }
+
+  private async lookDueNow(): Promise<void> {
+    const due = [...this.lookDue];
+    this.lookDue.clear();
+    let changed = false;
+    for (const support of due) {
+      try { if (await support.poll(true)) changed = true; } catch (e) { this.d.log.warn("looking for changed sessions failed", { agent: support.agent.id, error: errMessage(e) }); }
+    }
+    if (changed) this.requestHeartbeat();
+  }
+
+  /**
+   * What the phone is shown changed: send a heartbeat now, or right after the one on its way (it may have read the conversations
+   * before the change), never while paused. Several requests before it is sent make one.
+   */
+  private requestHeartbeat(): void {
+    if (this.paused) return;
+    if (this.wakeHeartbeat) this.wakeHeartbeat();
+    else if (this.heartbeatBusy) this.heartbeatAgain = true;
+  }
+  private heartbeatBusy = false;
+  private heartbeatAgain = false;
+
   private async heartbeater(): Promise<void> {
     while (!this.ctl.signal.aborted) {
-      await new Promise<void>((resolve) => {
-        const done = () => { clearTimeout(t); this.wakeHeartbeat = null; this.ctl.signal.removeEventListener("abort", done); resolve(); };
-        const t = setTimeout(done, this.timing.heartbeatMs);
-        this.wakeHeartbeat = done;
-        this.ctl.signal.addEventListener("abort", done, { once: true });
-      });
+      // (one asked for while the last was on its way goes at once)
+      if (!this.heartbeatAgain) {
+        await new Promise<void>((resolve) => {
+          const done = () => { clearTimeout(t); this.wakeHeartbeat = null; this.ctl.signal.removeEventListener("abort", done); resolve(); };
+          const t = setTimeout(done, this.timing.heartbeatMs);
+          this.wakeHeartbeat = done;
+          this.ctl.signal.addEventListener("abort", done, { once: true });
+        });
+      }
+      this.heartbeatAgain = false;
       if (this.ctl.signal.aborted) break;
       if (this.paused) continue;
+      this.heartbeatBusy = true;
       try {
         await this.heartbeat();
         this.authFailures = 0;
@@ -1068,6 +1135,8 @@ export class Connector {
         this.noteOutage(e);
         if (isAuthRefusal(e) && await this.authRefused(e)) return;
         this.d.log.warn("heartbeat failed", { error: errMessage(e) });
+      } finally {
+        this.heartbeatBusy = false;
       }
     }
   }
@@ -1515,6 +1584,10 @@ export class Connector {
       failure = errMessage(e);
       throw e;
     } finally {
+      // No look is asked for any more: the watches on the session registries end, and a look that was due does not start.
+      if (this.lookTimer) { clearTimeout(this.lookTimer); this.lookTimer = null; }
+      this.lookDue.clear();
+      for (const support of this.attach.values()) support.close();
       await closeApprovals?.().catch(() => undefined);
       // Stopped or restarted (not revoked, not refused): what is in flight is the next run's to end or carry on.
       await this.manager.killAll(this.revoked ? "revoked" : "stopped", !this.revoked && !this.authFailed).catch(() => undefined);

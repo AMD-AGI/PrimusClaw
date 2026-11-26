@@ -113,6 +113,10 @@ export class FakeClaw {
   holdConfirms = false;
   private heldConfirms: Array<() => void> = [];
   releaseConfirms(): void { const h = this.heldConfirms; this.heldConfirms = []; for (const f of h) f(); }
+  /** Hold every heartbeat's answer (the heartbeat is recorded as it arrives) until `releaseHeartbeats` (a slow Claw). */
+  holdHeartbeats = false;
+  private heldHeartbeats: Array<() => void> = [];
+  releaseHeartbeats(): void { const h = this.heldHeartbeats; this.heldHeartbeats = []; for (const f of h) f(); }
   private readonly streams = new Set<http.ServerResponse>();
   private readonly sockets = new Set<import("node:net").Socket>();
   private server!: http.Server;
@@ -302,6 +306,7 @@ export class FakeClaw {
         this.heartbeats.push(body);
         if (hb.value.cmdCursor !== null) { this.cursor = Math.max(this.cursor, hb.value.cmdCursor); }
         this.wake();
+        if (this.holdHeartbeats) await new Promise<void>((resolve) => { this.heldHeartbeats.push(resolve); });
         const pol = this.connectorVersions;
         // A recommended version that does not compare (not a version at all) is sent too: a connector must refuse it itself.
         const old = pol && typeof hb.value.version === "string" && (compareConnectorVersions(hb.value.version, pol.recommended) ?? -1) < 0;
