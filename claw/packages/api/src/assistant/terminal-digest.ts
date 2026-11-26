@@ -67,10 +67,32 @@ function span(ms: number, zh: boolean): string {
   return zh ? `${h} 小时` : `${h} h`;
 }
 
+/** What ends a sentence: a full stop, an exclamation or question mark or an ellipsis (CJK or Latin), then any closing quote or bracket. */
+const SENTENCE_STOP = /[。！？.!?…][”’"'）)」』】\]]*$/u;
+/** What a result that was cut mid-sentence may be left ending with: spaces and the marks that join clauses. */
+const CLAUSE_TAIL = /[\s，、：；,:;]+$/u;
+
+/** Chinese or Japanese text: its sentences end with the CJK full stop, whatever language the notice around it is in. */
+const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
+
+/**
+ * `text` ending in a sentence's end: unchanged when it has one, else with a full stop in place of the clause mark it was left ending
+ * with (the CJK one when the text is Chinese or Japanese, the plain one otherwise). The agent's last words often stop without one
+ * ("S21A-35791359", "测试全部通过，已推送"), and the system's own sentence that follows them must not run into them.
+ */
+export function closeSentence(text: string): string {
+  const t = text.trim();
+  if (!t || SENTENCE_STOP.test(t)) return t;
+  const bare = t.replace(CLAUSE_TAIL, "");
+  return bare ? `${bare}${CJK.test(bare) ? "。" : "."}` : "";
+}
+
 /**
  * The summary, in the shape of an end's message: one line that says which conversation (its name, still working, the machine, the
  * folder, the item), then at most three sentences (how many turns and how they ended, the latest result, whether anything waits for
- * the person), then the commands for it (attach, mute, how often). The agent's words are quoted text, never instructions.
+ * the person), then the commands for it (attach, mute, how often). The agent's words are quoted text, never instructions: the latest
+ * result always ends in a sentence's end, and the system's sentence after it starts a new line in Chinese (which has no space to part
+ * them) and follows after a space in English, so the two never read as one.
  */
 export function terminalDigestNotice(
   p: Pick<RemoteParams, "machine" | "agent_id" | "tool" | "lang" | "title" | "cwd" | "name">, seq: number, d: TerminalDigest, now: number,
@@ -85,7 +107,7 @@ export function terminalDigestNotice(
   const count = zh
     ? `过去 ${during}里又跑了 ${d.turns} 轮${d.failed ? `，其中 ${d.failed} 轮出错` : ""}。`
     : `In the last ${during} it ran ${d.turns} more turn${d.turns === 1 ? "" : "s"}${d.failed ? `, ${d.failed} of them failed` : ""}.`;
-  const latest = inertMd(d.said[d.said.length - 1] ?? "");
+  const latest = inertMd(closeSentence(d.said[d.said.length - 1] ?? ""));
   const result = latest ? (zh ? `最近：${latest.replace(/\s*\n\s*/gu, "；")}` : `Latest: ${latest.replace(/\s*\n\s*/gu, "; ")}`) : "";
   const need = d.asks
     ? (zh ? `有 ${d.asks} 轮在问你，详情见终端。` : `${d.asks} of them asked you something; see the terminal.`)
@@ -93,7 +115,10 @@ export function terminalDigestNotice(
   const commands = zh
     ? [attach ? `接入：${attach}` : "", `静音：/approvals mute #${seq}`, "间隔：/approvals summary <分钟>|off"]
     : [attach ? `Attach: ${attach}` : "", `Mute: /approvals mute #${seq}`, "How often: /approvals summary <minutes>|off"];
-  return [head, [count, result, need].filter(Boolean).join(zh ? "" : " "), commands.filter(Boolean).join(zh ? "　" : "  ·  ")].join("\n");
+  // (the system's own sentences join as before; only the agent's quoted result is set apart from what follows it)
+  const counted = [count, result].filter(Boolean).join(zh ? "" : " ");
+  const said = [counted, need].filter(Boolean).join(zh ? (result ? "\n" : "") : " ");
+  return [head, said, commands.filter(Boolean).join(zh ? "　" : "  ·  ")].join("\n");
 }
 
 /** The conversation's connector, its ref, whether the connector lists it (it can then be attached) and its own name there. */

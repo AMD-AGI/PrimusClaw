@@ -12,6 +12,7 @@
  *   R4 a run of ends the connector folded into one: every turn gathered, its results kept
  *   R5 the summary: not before the interval; once after it, with the conversation, the turns, the latest result and that nothing
  *      needs the person; the item's gathered ends cleared; nothing new, nothing said
+ *   R5b a last word that ends without a sentence end is closed with one, and "不需要你处理。" starts its own line
  *   R6 an end held back by the gap between two pushes is gathered, not lost; the one told is not said again
  *   R7 the owner's interval (`PUT /v1/remote-agents/approvals/summary`, read back on `GET /approvals`); 0 drops what was gathered
  *   R8 pushes off: nothing gathered; muted after gathering: the summary is dropped, not said
@@ -177,13 +178,25 @@ describe("which terminal ends are pushed, and the summary", { skip }, () => {
     assert.equal(got[0].remote.item_seq, item.seq);
     assert.equal(got[0].text,
       `【nightly-bot】持续工作中 · laptop · work/claw · #${item.seq}\n`
-      + "过去 60 分钟里又跑了 2 轮。最近：测试全部通过，已推送。不需要你处理。\n"
+      + "过去 60 分钟里又跑了 2 轮。最近：测试全部通过，已推送。\n不需要你处理。\n"
       + `接入：/agent attach conv-1　静音：/approvals mute #${item.seq}　间隔：/approvals summary <分钟>|off`);
     const cleared = await remoteItem(sid);
     assert.equal(cleared.params.digest, undefined);
     assert.equal(cleared.params.summary_told_at, first + HOUR + 1);
     assert.deepEqual(await digest.runTerminalDigestSweep(first + 3 * HOUR), { told: 0, dropped: 0 }, "nothing new");
     assert.equal((await pushed(item.item_id)).length, 1);
+  });
+
+  test("R5b a last word that ends without a sentence end is closed, and the fixed sentence starts a new line", async () => {
+    // What a one-word `claude -p` turn really ended with: no stop, so the summary used to say "最近：S21A-35791359不需要你处理。"
+    const { cid, sid } = await convo();
+    await events("alice", cid, sid, [auto("S21A-35791359")]);
+    const item = await remoteItem(sid);
+    assert.deepEqual(item.params.digest.said, ["S21A-35791359"]);
+    await digest.runTerminalDigestSweep(Number(item.params.digest.first_at) + HOUR + 1);
+    const got = await pushed(item.item_id);
+    assert.equal(got.length, 1);
+    assert.match(got[0].text, /又跑了 1 轮。最近：S21A-35791359\.\n不需要你处理。\n/);
   });
 
   test("R6 an end held back by the gap is gathered, and the one told is not said again", async () => {
