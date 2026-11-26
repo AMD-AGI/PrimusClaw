@@ -970,6 +970,30 @@ describe("seat dispatch", { skip }, () => {
     assert.ok((await item(out.item_id)).params.open_cmd_seqs.map(Number).includes(seq), "noted after the machine collected it");
   });
 
+  /**
+   * The server's own account of one advisory lock taken as `pg_advisory_lock(hashtext(key))`: who holds it and how many wait on it.
+   * `pg_locks` is server-wide, and every test file of a shard runs at once on one server, each in a database of its own
+   * (`support/pg-cluster.ts`): a count of "advisory locks" or "holders other than mine" also counts the leader and sweep locks of the
+   * files running beside this one. The lock is named by its key, in this database: nothing outside it is counted.
+   */
+  async function advisoryLock(key: string): Promise<{ holders: number[]; waiting: number }> {
+    const rows = await w.q(
+      `SELECT pid, granted FROM pg_locks
+        WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+          AND ((classid::bigint << 32) | objid::bigint) = hashtext($1)::bigint`, [key]);
+    return { holders: rows.filter((r: Recorded) => r.granted).map((r: Recorded) => Number(r.pid)), waiting: rows.filter((r: Recorded) => !r.granted).length };
+  }
+  /** Until `n` calls wait for the lock named by `key`. */
+  async function waitForWaiters(key: string, n: number): Promise<void> {
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const { waiting } = await advisoryLock(key);
+      if (waiting >= n) return;
+      assert.ok(Date.now() < deadline, `only ${waiting} of ${n} calls reached the lock ${key}`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
   test("D25 calls to one task waiting for each other hold no main-pool connection while they wait", async () => {
     const { db } = await import("../src/infra/db.js");
     const alice = await w.user("alice");
@@ -987,13 +1011,7 @@ describe("seat dispatch", { skip }, () => {
     try {
       calls = Array.from({ length: n }, () => tools.workSend(turn, { item_id: String(out.item_id), text: "顺便更新 changelog" }) as Promise<Recorded>);
       for (const c of calls) c.catch(() => undefined);
-      const deadline = Date.now() + 10_000;
-      for (;;) {
-        const waiting = (await w.q("SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"))[0].n;
-        if (waiting >= n) break;
-        assert.ok(Date.now() < deadline, `only ${waiting} of ${n} calls reached the lock`);
-        await new Promise((r) => setTimeout(r, 25));
-      }
+      await waitForWaiters(key, n);
       assert.equal(db.pool.totalCount - db.pool.idleCount, 0, "no main-pool connection is held by a call waiting for the lock");
     } finally {
       await holder.query("SELECT pg_advisory_unlock(hashtext($1))", [key]);
@@ -1036,35 +1054,26 @@ describe("seat dispatch", { skip }, () => {
     const done = await finished(alice, cid, s, "整理文档");
     const gen = Number(done.generation);
     const turn = await userTurn(alice, "补一节安装，再补一节升级");
-    const waiters = async (n: number): Promise<void> => {
-      const deadline = Date.now() + 10_000;
-      for (;;) {
-        if ((await w.q("SELECT COUNT(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"))[0].n >= n) return;
-        assert.ok(Date.now() < deadline, `fewer than ${n} calls reached a lock`);
-        await new Promise((r) => setTimeout(r, 25));
-      }
-    };
+    const sendKey = `claw-seat-work-send:${String(done.item_id)}`;
     // The seat's lock is held: the first call opens the task again and then waits to send it.
     const holder = await db.pool.connect();
     const seatKey = `claw-seat-dispatch:${s.seatId}`;
     await holder.query("SELECT pg_advisory_lock(hashtext($1))", [seatKey]);
-    const holderPid = Number((await holder.query("SELECT pg_backend_pid() AS pid")).rows[0].pid);
     let a: Promise<Recorded> | undefined;
     let b: Promise<{ code: string }> | undefined;
     try {
       a = tools.workSend(turn, { item_id: String(done.item_id), text: "补一节安装" }) as Promise<Recorded>;
       a.catch(() => undefined);
-      await waiters(1);
+      await waitForWaiters(seatKey, 1);
       const open = await item(done.item_id);
       assert.deepEqual([open.board_state, Number(open.generation)], ["in_progress", gen + 1], "the first call opened it again");
       b = refusal(tools.workSend(turn, { item_id: String(done.item_id), text: "补一节升级" }));
       b.catch(() => undefined);
-      await waiters(2);
+      await waitForWaiters(sendKey, 1);
       // The first call's lock connection drops: the server lets the second call in.
-      const lockers = await w.q(
-        "SELECT DISTINCT pid FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid <> $1", [holderPid]);
-      assert.equal(lockers.length, 1, JSON.stringify(lockers));
-      await w.q("SELECT pg_terminate_backend($1)", [lockers[0].pid]);
+      const { holders } = await advisoryLock(sendKey);
+      assert.equal(holders.length, 1, `the task's lock is held by the first call alone: ${JSON.stringify(holders)}`);
+      await w.q("SELECT pg_terminate_backend($1)", [holders[0]]);
       assert.equal((await b).code, "item_changed", "the second call is refused rather than opening it over the first");
     } finally {
       await holder.query("SELECT pg_advisory_unlock(hashtext($1))", [seatKey]);

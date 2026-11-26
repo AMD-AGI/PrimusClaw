@@ -666,6 +666,10 @@ describe("permissions", () => {
     const seq = h.prompt(sid, "write parked.txt", { park_permissions: true });
     const perm = await h.permission(sid);
     assert.equal(perm.data.cmd_seq, seq);
+    // The agent may have been recycled for idleness before this (the session was quiet for `idleMs` while the prompt was on its way, which
+    // a slow machine makes likely at 150 ms): it is started again for the turn, and that is no part of what is shown below. From the moment
+    // the request is open the session is busy, so what is counted is what happens to the agent while the request waits.
+    const recycledBefore = h.audit().filter((a) => a.kind === "adapter_recycled").length;
     const parked = await h.claw.until("permission_parked", () => h.claw.eventsOf(sid, "permission_parked")[0]);
     assert.equal(parked.data.actionId, perm.data.actionId);
     assert.equal(parked.data.cmd_seq, seq);
@@ -676,7 +680,7 @@ describe("permissions", () => {
     assert.deepEqual(h.claw.eventsOf(sid, "permission_resolved"), []);
     assert.deepEqual(h.turnEnds(sid), []);
     assert.equal(h.claw.eventsOf(sid, "permission_parked").length, 1, "said once");
-    assert.ok(!h.audit().some((a) => a.kind === "adapter_recycled"), "a session with a parked request keeps its agent");
+    assert.equal(h.audit().filter((a) => a.kind === "adapter_recycled").length, recycledBefore, "a session with a parked request keeps its agent");
     assert.ok(h.audit().some((a) => a.kind === "permission_parked" && a.action_id === perm.data.actionId));
     h.decide(sid, perm.data.actionId, "allow-once");
     const end = await h.turnEnd(sid);
