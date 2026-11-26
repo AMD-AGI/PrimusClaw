@@ -148,6 +148,7 @@ describe("/approvals, for a person the assistant understands", () => {
   for (const [how, raw] of [
     ["typed as it is", typed("/approvals")],
     ["with the bot's name typed as words ahead of it, as Teams on iOS sent it", typed("@clawy /approvals")],
+    ["with the bot's name typed ahead of it, without the @", typed("Clawy /approvals")],
     [
       "with the bot's mention picked (an entity)",
       typed("<at>Clawy</at> /approvals", [

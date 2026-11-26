@@ -914,7 +914,7 @@ export function mutedListed(
   // (a label only when these machines list that session: a machine's compact read leaves some out)
   const listed = new Set(machines.flatMap((m) => m.sessions.map((s) => s.label)));
   return muted.map((m) => ({
-    machine: m.machine_now, id: m.ref, title: m.now ? m.now.title : flat(m.title, NAME_MAX),
+    machine: m.machine_now, id: m.ref, title: m.now?.title ?? flat(m.title, NAME_MAX),
     label: m.now && listed.has(m.now.label) ? m.now.label : null, muted_since: m.muted_at, item: m.item,
   }));
 }

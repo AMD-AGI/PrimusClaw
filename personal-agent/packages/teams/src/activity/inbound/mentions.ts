@@ -69,28 +69,36 @@ export function addressedToBot(activity: Activity, botName: string = DEFAULT_BOT
 
 const typedName = new Map<string, RegExp>();
 
-/** "@<name>" as words at the start of a text, and the spaces after it (the name ends there: not at a letter, digit, `_` or `-`). */
+/**
+ * The bot's name, as words, at the start of a text (`@<name>` or `<name>`, and the name ends there: not at a letter, digit, `_` or
+ * `-`) and the spaces after it, when what follows is a command word: `/`, a letter, then letters, digits, `_` or `-` up to a space or
+ * the end (`/approvals`, not `/tmp/app.log`).
+ */
 function typedNamePattern(botName: string): RegExp {
   let pattern = typedName.get(botName);
   if (pattern === undefined) {
-    pattern = new RegExp(`^${SPACE}*@${caseless(botName)}(?![\\p{L}\\p{N}_-])${SPACE}+`, "u");
+    pattern = new RegExp(
+      `^${SPACE}*@?${caseless(botName)}(?![\\p{L}\\p{N}_-])${SPACE}+(?=/\\p{L}[\\p{L}\\p{N}_-]*(?:${SPACE}|$))`,
+      "u",
+    );
     typedName.set(botName, pattern);
   }
   return pattern;
 }
 
 /**
- * `text` without the bot's name typed as words ahead of what else it says, and how many code points that took off its start. A
- * mention a person picks is an entity, which `messageText` drops; one Teams on a phone sends as plain words (2026-11-26 03:24:
- * "@<name> /approvals") has none, so it stayed in the text and `/approvals` was read as a sentence, not as the command. Only the name first,
- * before more words: the name alone, or a word that merely starts with it, stays as it was typed.
+ * `text` without the bot's name typed as words ahead of a command (`@<name> /approvals`, `<name> /approvals`), and how many code points
+ * that took off its start. A mention a person picks is an entity, which `messageText` drops; one Teams on a phone sends as plain words
+ * (2026-11-26 03:24: "@<name> /approvals") has none, so it stayed in the text and `/approvals` was read as a sentence, not as the
+ * command. Only the name first and a command word after it: any other words, the name alone, a word that merely starts with the name
+ * and a path (`/tmp/app.log`) stay as they were typed, so no ordinary chat becomes a command.
  */
 export function withoutTypedBotName(
   text: string,
   botName: string,
 ): { readonly text: string; readonly removed: number } {
   const named = typedNamePattern(botName).exec(text);
-  if (named === null || named[0].length === text.length) return { text, removed: 0 };
+  if (named === null) return { text, removed: 0 };
   return { text: text.slice(named[0].length), removed: cpLength(named[0]) };
 }
 

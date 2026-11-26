@@ -16,6 +16,7 @@
  *   MU3 the router is told to answer mutes and counts from these fields, never "cannot tell"
  *   MU4 `mutedConversations` (what `/approvals` says): each muted conversation with its machine, its name now, since when and its
  *       item; nothing of anyone else's
+ *   MU5 a muted conversation its machine lists with no title now keeps the title it had when it was muted
  */
 import assert from "node:assert/strict";
 import { after, before, beforeEach, describe, test } from "node:test";
@@ -167,6 +168,22 @@ describe("devenv_list mutes and counts", { skip }, () => {
     assert.ok(Date.parse(out[0]!.muted_since) > Date.parse(out[1]!.muted_since), "newest first");
     assert.deepEqual((await devenv.mutedConversations("bob")).map((m) => [m.machine, m.title]), [["bob-box", "bob's"]]);
     assert.deepEqual(await devenv.mutedConversations("carol"), []);
+  });
+
+  test("MU5 a muted conversation its machine lists with no title now keeps the title it had when it was muted", async () => {
+    await w.user("alice");
+    // Two conversations of one folder are held by sessions open through Claw: the machine does not say which one a session holds, so none is named.
+    const held = { ...conv(1, "clean", "idle", 30), state: "attached" };
+    const pod = await machine("alice", "yihan-dev-pod", [held, { ...conv(2, "hosting", "idle", 60), state: "attached" }]);
+    const made = await store.createSession({ owner: "alice", client: null, connectorId: pod, agentId: "claude-sessions", cwd: "/home/u", mode: null, maxActive: 10, commandsPerMinute: 1000 });
+    assert.equal(made.status, "created");
+    const sid = (made as { session: Recorded }).session.session_id as string;
+    await w.q("DELETE FROM claw_remote_commands WHERE session_id = $1", [sid]);
+    await store.ingestEvents({ connector_id: pod, owner_user_id: "alice" },
+      [{ index: 0, session_id: sid, seq: 1, type: "session_started", ts: Date.now(), data: { acp_session_id: held.ref } }]);
+    await mute("alice", pod, held.ref, "yihan", 1);
+    const out = await devenv.mutedConversations("alice");
+    assert.deepEqual(out.map((m) => [m.machine, m.title]), [["yihan-dev-pod", "yihan"]]);
   });
 
   test("MU3 the router answers mutes and counts from devenv_list, never 'cannot tell'", () => {

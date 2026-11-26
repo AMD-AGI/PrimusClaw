@@ -34,11 +34,12 @@ it says the setting cannot be reached now (`/approvals on`, `off`, `mute`, `unmu
 
 ### Fixed
 
-- `@primusclaw/personal-agent-teams`: a message that starts with the bot's name typed as words (`@clawy /approvals`, as Teams on a
-  phone sends a name that was typed and not picked, with no mention behind it) was read as a sentence and answered by the
-  assistant, never as the command it carries. The name first, before more words, is dropped from the text as a picked mention
-  is, in a 1:1 and in a group chat (the name alone, or a word that merely starts with it, stays as typed), and the mentions of
-  other people keep their place in the words.
+- `@primusclaw/personal-agent-teams`: a message that starts with the bot's name typed as words ahead of a command (`@clawy /approvals`,
+  as Teams on a phone sends a name that was typed and not picked, with no mention behind it; also the name without its `@`) was read as
+  a sentence and answered by the assistant, never as the command it carries. The name (the deployment's `botName`) is dropped
+  from the text as a picked mention is when a command word follows it (`/approvals`, in a 1:1 and in a group chat), and the mentions of other people keep their place in the words. Every other message is read as before: the
+  name alone, a word that merely starts with it, the name before words that are not a command (`@clawy stop`) or before a path
+  (`/tmp/app.log`) stay as typed.
 
 ## 0.15.0
 

@@ -77,23 +77,44 @@ test("the bot's name typed as words ahead of a command is not part of the comman
   assert.equal(said("  @CLAWY \u00a0 /help"), "/help");
   assert.equal(said("@clawy\n/approvals"), "/approvals");
   assert.equal(said("@PrimusClaw Assistant /approvals", "PrimusClaw Assistant"), "/approvals");
+  // (the name without its @, as a phone without the picker sends it)
+  assert.equal(said("clawy /approvals"), "/approvals");
+  assert.equal(said("Clawy /approvals summary 60"), "/approvals summary 60");
   // (also in a reply to a message, whose text is HTML with the quote cut out of it)
   assert.equal(message(dm(replyHtml({ own: "@clawy /approvals" })), "Clawy").text, "/approvals");
-  // (and no run of spaces after the name makes it slow)
-  assert.equal(said(`@clawy${" ".repeat(50_000)}x`), "x");
-  assert.equal(said(`@clawy${" ".repeat(50_000)}`), "@clawy");
+  // (and no run of spaces around the name makes it slow)
+  assert.equal(said(`@clawy${" ".repeat(50_000)}/approvals`), "/approvals");
+  assert.equal(said(`@clawy${" ".repeat(50_000)}x`), `@clawy${" ".repeat(50_000)}x`);
   assert.equal(said(`${" ".repeat(50_000)}@clawy${"\u00a0".repeat(50_000)}`), "@clawy");
-  // not the bot's name, or not first, or the whole message, or no other word: left as typed
+  assert.equal(said(`${" ".repeat(50_000)}clawy${"\u00a0".repeat(50_000)}/`), `clawy${"\u00a0".repeat(50_000)}/`);
+  // not the bot's name, not first, not before a command: left as typed, so no ordinary words become a command
   for (const text of [
     "@clawy",
     "@clawy ",
+    "clawy",
     "@clawyx /approvals",
     "@clawy_ /approvals",
     "@clawy-2 /approvals",
+    "clawyx /approvals",
     "hi @clawy /approvals",
+    "hi clawy /approvals",
     "/approvals @clawy",
-    "clawy /approvals",
     "@ clawy /approvals",
+    "@clawy, /approvals",
+    "clawy: /approvals",
+    "@clawy hello",
+    "@clawy stop", // (a word of the commands menu: a picked mention would make it `/stop`; typed words are the assistant's)
+    "@clawy help",
+    "@clawy new",
+    "@clawy unlink",
+    "clawy stop",
+    "@clawy is /approvals broken",
+    "@clawy /tmp/app.log is huge",
+    "clawy /tmp/app.log is huge",
+    "@clawy /",
+    "@clawy /1",
+    "@clawy //approvals",
+    "@clawy /approvals/x",
   ])
     assert.equal(said(text), text.trim(), text);
   assert.equal(said("@clawy /approvals", "Robin"), "@clawy /approvals", "another deployment's name");
@@ -111,16 +132,31 @@ test("the bot's name typed as words ahead of a command is not part of the comman
   assert.equal(message(grp("@clawy /help", { mention: false }), "Clawy").text, "/help");
 });
 
+// (a name that is made of pattern syntax is only its own letters)
+test("a bot name with pattern characters is matched as the words it is", () => {
+  const said = (text: string): string => message(dm(text), "a|b(").text;
+  assert.equal(said("@a|b( /approvals"), "/approvals");
+  assert.equal(said("A|B( /approvals"), "/approvals");
+  assert.equal(said("@a /approvals"), "@a /approvals");
+  assert.equal(said("@b( /approvals"), "@b( /approvals");
+});
+
 test("a mention of someone else keeps its place in the words once the bot's name typed ahead is gone", () => {
-  const typed = message(dm("@clawy ask <at>Dana</at> now", { entities: [DANA] }), "Clawy");
-  assert.equal(typed.text, "ask Dana now");
+  const typed = message(dm("@clawy /ask <at>Dana</at> now", { entities: [DANA] }), "Clawy");
+  assert.equal(typed.text, "/ask Dana now");
   assert.deepEqual(typed.mentions, [
-    { channelUserId: "29:dana", userId: "aad-d", name: "Dana", shown: "Dana", offset: 4 },
+    { channelUserId: "29:dana", userId: "aad-d", name: "Dana", shown: "Dana", offset: 5 },
   ]);
-  assert.equal(markedText(typed.text, typed.mentions).text, `ask ${MARK_OPEN}0${MARK_CLOSE} now`);
+  assert.equal(markedText(typed.text, typed.mentions).text, `/ask ${MARK_OPEN}0${MARK_CLOSE} now`);
   // the same words with no name ahead: the same offset
-  const plain = message(dm("ask <at>Dana</at> now", { entities: [DANA] }), "Clawy");
+  const plain = message(dm("/ask <at>Dana</at> now", { entities: [DANA] }), "Clawy");
   assert.deepEqual(plain.mentions, typed.mentions);
+  // and words that are not a command are not touched, whoever they mention
+  const words = message(dm("@clawy ask <at>Dana</at> now", { entities: [DANA] }), "Clawy");
+  assert.equal(words.text, "@clawy ask Dana now");
+  assert.deepEqual(words.mentions, [
+    { channelUserId: "29:dana", userId: "aad-d", name: "Dana", shown: "Dana", offset: 11 },
+  ]);
 });
 
 test("the message id of a quote comes from the entity and from the html", () => {
