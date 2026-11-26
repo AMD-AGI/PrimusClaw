@@ -18,6 +18,7 @@ import { approvalSocketFile, ApprovalBroker, type BrokerDeps } from "../src/appr
 import { memoryAudit } from "../src/audit.js";
 import { ChildRegistry, processStart } from "../src/children.js";
 import { parseConfig } from "../src/config.js";
+import { terminalsDir } from "../src/terminals.js";
 import { silentLogger } from "../src/util.js";
 import { ADAPTER, Harness, tmpdir } from "./support/harness.js";
 
@@ -37,6 +38,11 @@ const sleeper = (): ChildProcess => {
 };
 const stop = async (c: ChildProcess) => { c.kill("SIGKILL"); await new Promise((r) => c.once("exit", r)); };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** Wait for `cond` (a positive answer is waited for as long as a slow runner needs; only the absence of one is a fixed wait). */
+async function eventually(cond: () => boolean, what: string, ms = 5_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) { if (Date.now() > end) throw new Error(`timed out waiting for ${what}`); await sleep(20); }
+}
 
 /** A process that has the conversation open, and the registry row Claude Code writes for it (removed with it, as when it exits). */
 function open(dir: string, ref: string, status = "busy"): { pid: number; row: string; rewrite(status: string): void; end(): Promise<void> } {
@@ -100,6 +106,24 @@ describe("a conversation that just ended is reported within seconds", () => {
     assert.equal(h.claw.heartbeats.length, before + 1, "one heartbeat for it");
   });
 
+  test("the first conversation ever run on a machine (Claude Code makes the registry directory itself): reported live, then free, within seconds each", { skip: process.platform !== "linux" }, async () => {
+    const h = await connector();
+    await settled(h);
+    assert.equal(lastState(h), "idle");
+    assert.ok(!fs.existsSync(path.join(h.attachDir, "sessions")), "no registry directory yet");
+    const before = h.claw.heartbeats.length;
+    const t0 = Date.now();
+    const conv = open(h.attachDir, REF);
+    await h.claw.until("a heartbeat that says it is in use", () => h.claw.heartbeats.slice(before).find((b) => stateOf(b) === "live"), 5_000);
+    assert.ok(Date.now() - t0 < 3_000, `reported ${Date.now() - t0} ms after it started`);
+    const mid = h.claw.heartbeats.length;
+    const t1 = Date.now();
+    await conv.end();
+    await h.claw.until("a heartbeat that says it is free", () => h.claw.heartbeats.slice(mid).find((b) => stateOf(b) === "idle"), 5_000);
+    assert.ok(Date.now() - t1 < 3_000, `reported ${Date.now() - t1} ms after it ended`);
+    assert.equal(h.claw.heartbeats.length, mid + 1);
+  });
+
   test("a terminal that exited and ran its SessionEnd hook: told within seconds of the hook, with nothing but the hook to see it", { skip: process.platform !== "linux" }, async () => {
     let conv!: ReturnType<typeof open>;
     const h = await connector({ rows: (dir) => { conv = open(dir, REF); } });
@@ -127,7 +151,9 @@ describe("a conversation that just ended is reported within seconds", () => {
     await settled(h);
     assert.equal(h.claw.heartbeats[h.claw.heartbeats.length - 1].agents[0].capabilities.resumable[0].activity, "working");
     const before = h.claw.heartbeats.length;
+    // Claude Code rewrites the row as the turn ends and runs the Stop hook: both ask for the one look.
     conv.rewrite("idle");
+    await hookSays(h, { session_id: REF, hook_event_name: "Stop", last_assistant_message: "done" });
     const hb = await h.claw.until("a heartbeat that says it is at its prompt", () => h.claw.heartbeats.slice(before).find((b) => b.agents[0].capabilities.resumable[0].activity === "idle"), 5_000);
     assert.equal(stateOf(hb), "live");
     assert.equal(h.claw.heartbeats.length, before + 1);
@@ -227,7 +253,7 @@ describe("the broker says when a terminal's turn or conversation ended", () => {
 
 describe("what the phone was last told, not what the previous look saw", () => {
   /** An attach agent on `dir` that lists REF, with the stand-in adapter; nothing is started to look. */
-  function support(dir: string, onRegistryChange?: () => void): AttachSupport {
+  function support(dir: string, onRegistryChange?: () => void, registry = new ChildRegistry(path.join(tmpdir(), "children.json"))): AttachSupport {
     const cfg = parseConfig(`
 [[agents]]
 id = "a"
@@ -240,7 +266,7 @@ args = [${JSON.stringify(ADAPTER)}]
 CLAUDE_CONFIG_DIR = ${JSON.stringify(dir)}
 `);
     const s = new AttachSupport(cfg.agents[0]!, {
-      registry: new ChildRegistry(path.join(tmpdir(), "children.json")), audit: memoryAudit(), log: silentLogger, logDir: tmpdir(), version: "test", env: process.env,
+      registry, audit: memoryAudit(), log: silentLogger, logDir: tmpdir(), version: "test", env: process.env,
       catalogMs: 60_000, cliTimeoutMs: 1500, recentWriteMs: 10_000, attachedRefs: () => new Set(), ...(onRegistryChange ? { onRegistryChange } : {}),
     });
     const any = s as unknown as { listed: unknown[]; waitedOnce: boolean; listedAt: number };
@@ -296,47 +322,82 @@ CLAUDE_CONFIG_DIR = ${JSON.stringify(dir)}
     assert.equal(await s.poll(true), false);
   });
 
+  test("what the process of this connector's own adapter does is not what the phone is shown: it says attached, so its status changes are no change", { skip: process.platform !== "linux" }, async () => {
+    const dir = dirWithRegistry();
+    const adapter = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", detached: true });   // (it leads its own group, as an adapter does)
+    children.push(adapter);
+    const registry = new ChildRegistry(path.join(tmpdir(), "children.json"));
+    registry.add({ pid: adapter.pid!, pgid: adapter.pid!, agent_id: "claude", session_id: "s-phone" });
+    const row = path.join(dir, "sessions", `${adapter.pid}.json`);
+    const write = (status: string) => fs.writeFileSync(row, JSON.stringify({ pid: adapter.pid, sessionId: REF, status, kind: "interactive", procStart: processStart(adapter.pid!), pidDomain: localPidDomain() }));
+    write("busy");
+    const s = support(dir, undefined, registry);
+    assert.deepEqual((await s.resumable(1_000)).map((r) => [r.state, r.activity ?? null]), [["attached", null]]);
+    assert.equal(await s.poll(), false);
+    write("waiting");
+    assert.equal(await s.poll(), false, "a turn that waits on the phone is not shown as a terminal that waits");
+    write("idle");
+    assert.equal(await s.poll(true), false);
+    await stop(adapter);
+  });
+
+  test("a conversation only a terminal's hook row says is open: the end of that terminal is a change", { skip: process.platform !== "linux" }, async () => {
+    const dir = dirWithRegistry();
+    const s = support(dir);
+    const proc = sleeper();
+    const rows = terminalsDir(dir);
+    fs.mkdirSync(rows, { recursive: true });
+    const file = path.join(rows, `${proc.pid}.json`);
+    fs.writeFileSync(file, JSON.stringify({ v: 1, pid: proc.pid, procStart: processStart(proc.pid!), sessionId: REF, cwd: os.tmpdir(), at: Date.now(), pidDomain: localPidDomain() }));
+    assert.deepEqual((await s.resumable(1_000)).map((r) => r.state), ["live"], "the hook row says it is open, the registry says nothing");
+    assert.equal(await s.poll(), false);
+    fs.rmSync(file);   // (the SessionEnd hook takes the row away)
+    assert.equal(await s.poll(true), true);
+    await s.resumable(1_000);
+    assert.equal(await s.poll(true), false);
+    await stop(proc);
+  });
+
   test("the registry is watched: a row written or removed says so at once; other files and a closed support do not", { skip: process.platform !== "linux" }, async () => {
     const dir = dirWithRegistry();
     let n = 0;
     const s = support(dir, () => { n++; });
     await s.poll();   // (the first look starts the watch)
     const term = open(dir, REF);
-    await sleep(200);
-    assert.ok(n > 0, "a row written");
+    await eventually(() => n > 0, "a row written");
     n = 0;
     fs.writeFileSync(path.join(dir, "sessions", `${term.pid}.key`), "x");
-    await sleep(200);
+    await sleep(300);
     assert.equal(n, 0, "a file that is no row says nothing");
     await term.end();
-    await sleep(200);
-    assert.ok(n > 0, "a row removed");
+    await eventually(() => n > 0, "a row removed");
     s.close();
     n = 0;
     const again = open(dir, REF);
-    await sleep(200);
+    await sleep(300);
     assert.equal(n, 0, "closed");
     await again.end();
   });
 
-  test("a registry directory that was not there yet is watched once it is; one replaced is watched again", { skip: process.platform !== "linux" }, async () => {
+  test("a registry directory that was not there yet is watched the moment it is made; one replaced is watched again", { skip: process.platform !== "linux" }, async () => {
     const dir = tmpdir("cc-claudecfg-");
     let n = 0;
     const s = support(dir, () => { n++; });
     await s.poll();
-    fs.mkdirSync(path.join(dir, "sessions"));
-    await s.poll();   // (each look tries again)
+    assert.equal(n, 0);
+    // Claude Code runs for the first time on this machine: it makes the directory and writes its row, with no look in between.
     const a = open(dir, REF);
-    await sleep(200);
-    assert.ok(n > 0);
+    await eventually(() => n > 0, "the directory made, and a look asked for");
+    await sleep(100);
+    n = 0;
     await a.end();
+    await eventually(() => n > 0, "the row removed, in the directory now watched");
     fs.renameSync(path.join(dir, "sessions"), path.join(dir, "sessions.old"));
     fs.mkdirSync(path.join(dir, "sessions"));
     await s.poll();
     n = 0;
     const b = open(dir, REF);
-    await sleep(200);
-    assert.ok(n > 0, "the new directory");
+    await eventually(() => n > 0, "a row in the new directory");
     await b.end();
     s.close();
   });

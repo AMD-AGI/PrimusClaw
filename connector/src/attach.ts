@@ -466,16 +466,24 @@ export class AttachSupport {
     // What this report describes, for `poll` to compare with. A look that did not answer in time says
     // `unknown` of every conversation whatever their state, so what the registry says now stands for it.
     this.reported = look?.summary ?? (await within(this.summarize(), capMs, null)) ?? this.reported;
-    // A scan that did not answer in time is no evidence either way: every idle conversation is then "unknown", as it is when the
-    // live list cannot be had. Its own adapters' processes (the groups this connector leads) are no holder.
+    return this.describe(live, await within(this.scanBlind().catch(() => null), capMs, null));
+  }
+
+  /**
+   * The newest conversations with their state, as the heartbeat says it, from what holds them open: `live` (null: the list of the
+   * processes could not be had) and `scanned` (the processes whose registry row cannot be read; null: the scan did not answer in
+   * time, which is no evidence either way: every idle conversation is then "unknown", as it is when the live list cannot be had).
+   * The one place that says it, so that what a look compares (`summarize`) is what a heartbeat reports.
+   */
+  private describe(live: LiveEntry[] | null, scanned: BlindHolder[] | null): Resumable[] {
+    // Its own adapters' processes (the groups this connector leads) are no holder.
     const own = new Set(this.d.registry.list().map((r) => r.pgid));
-    const scanned = await within(this.scanBlind().catch(() => null), capMs, null);
     const blind = scanned === null ? null : scanned.filter((b) => b.pgid === null || !own.has(b.pgid));
     const attached = this.d.attachedRefs();
     // (a process of a group this connector leads is the adapter of one of its own sessions, of any of its agents: asked once per pid)
     const groupOf = new Map<number, number | null>();
     const ownHolder = (e: LiveEntry): boolean => {
-      if (e.foreign) return false;
+      if (e.foreign || own.size === 0) return false;
       if (!groupOf.has(e.pid)) groupOf.set(e.pid, processGroup(e.pid));
       const g = groupOf.get(e.pid);
       return g != null && own.has(g);
@@ -583,9 +591,9 @@ export class AttachSupport {
    * Tell the owner (`onRegistryChange`) the moment a file of Claude Code's session registry changes, so that a conversation that
    * just ended (a `claude -p` that returned, or a terminal that exited: the row is removed) is looked at within a second instead of
    * at the next periodic look. Claude Code's hooks cannot say it for a `claude -p` (they leave sessions nobody sits at alone,
-   * approval-skip.ts), the registry does. Where the directory cannot be watched (it is not there yet, or the system has no room for
-   * one more watch) the periodic look is all there is, as before; each look tries again, and starts a new watch when the directory
-   * was removed and made again.
+   * approval-skip.ts), the registry does. A directory that is not there yet (a machine where Claude Code has not run) is waited for by
+   * watching the Claude config directory for its creation; one that was removed and made again is watched anew at the next look.
+   * Where nothing can be watched (no room for one more watch) the periodic look is all there is, as before.
    */
   private async watchRegistry(): Promise<void> {
     const onChange = this.d.onRegistryChange;
@@ -598,7 +606,9 @@ export class AttachSupport {
     this.watcher?.close();
     this.watcher = null;
     this.watchedDir = null;
-    if (ino === null) return;
+    if (ino === null) { this.watchCreation(onChange); return; }
+    this.parentWatcher?.close();
+    this.parentWatcher = null;
     try {
       const w = fs.watch(dir, { persistent: false }, (_event, name) => {
         // (a row is `<pid>.json`; Claude Code's other files there say nothing the phone shows)
@@ -610,13 +620,32 @@ export class AttachSupport {
     } catch { /* no room for another watch: the periodic look covers it */ }
   }
 
+  private parentWatcher: fs.FSWatcher | null = null;
+
+  /** The registry directory is not there: wait for Claude Code to make it, then watch it and ask for a look at what is in it. */
+  private watchCreation(onChange: () => void): void {
+    if (this.parentWatcher) return;
+    try {
+      const w = fs.watch(this.configDir, { persistent: false }, (_event, name) => {
+        if (name !== "sessions") return;
+        w.close();
+        if (this.parentWatcher === w) this.parentWatcher = null;
+        void this.watchRegistry().then(() => { if (!this.closed) onChange(); }, () => undefined);
+      });
+      w.on("error", () => { if (this.parentWatcher === w) this.parentWatcher = null; w.close(); });
+      this.parentWatcher = w;
+    } catch { /* no Claude config directory yet either: the periodic look covers it */ }
+  }
+
   private closed = false;
 
   /** Stop watching the registry (the connector's run ended); it is not watched again. */
   close(): void {
     this.closed = true;
     this.watcher?.close();
+    this.parentWatcher?.close();
     this.watcher = null;
+    this.parentWatcher = null;
     this.watchedDir = null;
   }
 
@@ -627,23 +656,21 @@ export class AttachSupport {
   }
 
   /**
-   * What the phone is shown of the newest conversations, as far as a cheap look can tell (no process is started): for each, what
-   * a process holding it says it is doing, and the processes whose registry row cannot be read (which make a folder's conversations
-   * unknown). Two summaries are equal when nothing the phone shows differs. `rows` is the registry as read, or null when it
-   * cannot be read (a registry that cannot be read, or is not there yet, still lets a new conversation in the list count as a
-   * change); not given, it is read here.
+   * What the phone is shown of the newest conversations, as far as a cheap look can tell (no process is started): each one's state
+   * as {@link describe} says it from the registry, the terminals' hook rows and the scan for rows that cannot be read. Two summaries
+   * are equal when nothing the phone shows differs: a conversation this connector's own adapter holds says `attached` and nothing
+   * of what that process is doing. `rows` is the registry as read, or null when it cannot be read (the conversations are then
+   * unknown, and are again when it can); not given, it is read here.
    */
   private async summarize(rows?: LiveEntry[] | null): Promise<string> {
     let registry = rows;
     if (registry === undefined) {
       try { registry = await readRegistryAsync(this.configDir, this.localDomain, this.now()); } catch { registry = null; }
     }
-    // (a row that turned unreadable under a live Claude Code changes what is shown: its folder's conversations become unknown)
-    const blind = ((await within(this.scanBlind().catch(() => [] as BlindHolder[]), this.blindCheckMs, null)) ?? []).map((b) => b.pid).sort().join(".");
-    return (registry === null ? "unreadable;" : "") + (blind ? `blind:${blind};` : "") + this.listed.slice(0, MAX_REPORTED).map((l) => {
-      const holders = (registry ?? []).filter((e) => e.sessionId.toLowerCase() === l.ref);
-      return `${l.ref}:${holders.length ? (liveActivity(holders).activity ?? "live") : "-"}:${liveActivity(holders).waiting_for ?? ""}`;
-    }).join(",");
+    const hooks = await this.terminalRowsAsync();
+    const scanned = await within(this.scanBlind().catch(() => null), this.blindCheckMs, null);
+    const items = this.describe(registry === null ? null : [...hooks, ...registry], scanned);
+    return (registry === null ? "unreadable;" : "") + items.map((r) => [r.ref, r.state, r.activity ?? "", r.waiting_for ?? "", r.input ?? ""].join(":")).join(",");
   }
 
   /** The summary of what the last heartbeat described (taken before it read the conversations); null until one has. */
