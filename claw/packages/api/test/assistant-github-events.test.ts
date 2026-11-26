@@ -73,6 +73,7 @@ function fakeGithub() {
     reviewComments: [] as Array<Record<string, any>>,
     reviews: [] as Array<Record<string, any>>,
     checkRuns: [] as Array<Record<string, any>>,
+    workflowRuns: [] as Array<Record<string, any>>,
     posts: [] as Posted[],
     reads: 0,
     /** What the next POST does: write and answer, write and lose the answer (502), or refuse without writing. */
@@ -145,6 +146,7 @@ function fakeGithub() {
         return json(p.items, 200, link);
       }
       if (path === `${base}/commits/${HEAD}/check-runs`) return json({ total_count: s.checkRuns.length, check_runs: pageOf(s.checkRuns, u).items });
+      if (path === `${base}/actions/runs` && u.searchParams.get("head_sha") === HEAD) return json({ total_count: s.workflowRuns.length, workflow_runs: s.workflowRuns });
       return json({ message: "Not Found" }, 404);
     }
     const body = JSON.parse(String(init?.body ?? "{}")).body as string;
@@ -981,6 +983,27 @@ describe("assistant GitHub events", { skip }, () => {
     await w.q("DELETE FROM claw_work_item_github_events");
     await poll();
     assert.ok(!(await events(it.itemId)).some((e) => e.kind === "check_failed"), "a run that was not read may still be running");
+  });
+
+  test("F7b a cancelled run a later run of the same check superseded is no CI failure; a failed one still is", async () => {
+    const it = await watched();
+    const app = { id: 15368, slug: "github-actions" };
+    gh.s.checkRuns.push(
+      { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "cancelled", app, check_suite: { id: 501 }, completed_at: gh.ago(0) },
+      { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app, check_suite: { id: 501 }, completed_at: gh.ago(0) },
+      { id: 45538768282, name: "code-metrics", status: "completed", conclusion: "success", app, check_suite: { id: 502 }, completed_at: gh.ago(0) },
+      { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app, check_suite: { id: 502 }, completed_at: gh.ago(0) },
+    );
+    // Two workflow runs of one workflow; another workflow's run would supersede nothing.
+    gh.s.workflowRuns.push({ id: 9001, workflow_id: 77, check_suite_id: 501 }, { id: 9002, workflow_id: 77, check_suite_id: 502 });
+    await poll();
+    assert.ok(!(await events(it.itemId)).some((e) => e.kind === "check_failed"), "the superseded cancellation is not the head's");
+    // The latest run of a check failing is.
+    gh.s.checkRuns.push({ id: 45538799999, name: "code-metrics", status: "completed", conclusion: "failure", app, check_suite: { id: 503 }, completed_at: gh.ago(0) });
+    gh.s.workflowRuns.push({ id: 9003, workflow_id: 77, check_suite_id: 503 });
+    await poll();
+    const ci = (await events(it.itemId)).filter((e) => e.kind === "check_failed");
+    assert.deepEqual(ci.map((e) => e.body), ["1 of 3 check runs failed: run 45538799999 failure"]);
   });
 
   test("W1 an answer the owner approved through the github tools is ours when read back; the owner's own words still reach the worker", async () => {

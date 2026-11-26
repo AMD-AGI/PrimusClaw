@@ -560,6 +560,74 @@ describe("M the merge gates", () => {
     }
   });
 
+  test("M3c a cancelled check run superseded by a later run of the same check on the head is not a failure: the gate and gh_pr_get read the latest run only", async () => {
+    const superseded = () => {
+      e.gh.rules = [{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "code-metrics" }, { context: "pr-hygiene" }] } }];
+      // Two workflow runs of one workflow on the head, the first one's jobs cancelled by the second.
+      const app = { id: 15368, slug: "github-actions" };
+      e.gh.checkRuns = [
+        { id: 45538748410, name: "code-metrics", status: "completed", conclusion: "cancelled", app, check_suite: { id: 501 } },
+        { id: 45538748336, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app, check_suite: { id: 501 } },
+        { id: 45538768282, name: "code-metrics", status: "completed", conclusion: "success", app, check_suite: { id: 502 } },
+        { id: 45538768384, name: "pr-hygiene", status: "completed", conclusion: "success", app, check_suite: { id: 502 } },
+      ];
+      e.gh.workflowRuns = [{ id: 9001, workflow_id: 77, check_suite_id: 501 }, { id: 9002, workflow_id: 77, check_suite_id: 502 }];
+    };
+    e = await reviewEnv(); allowed();
+    superseded();
+    const read = await get();
+    assert.equal(read.isError, false);
+    const b = read.body as any;
+    assert.deepEqual([b.checks.green, b.checks.reasons, b.checks.failed, b.checks.total], [true, [], 0, 2], JSON.stringify(b.checks));
+    assert.deepEqual(b.risk.hard_holds, []);
+
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.graphql.mergeStateStatus = "CLEAN";
+    superseded();
+    assert.equal(reason(await merge()), "merged");
+    assert.equal(puts().length, 1);
+
+    // Past the first page of 100: the superseded run on page 1, the latest one on page 2, every page read.
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.graphql.mergeStateStatus = "CLEAN";
+    superseded();
+    const [olderMetrics, olderHygiene, latestMetrics, latestHygiene] = e.gh.checkRuns;
+    const filler = Array.from({ length: 150 }, (_, i) => ({ id: 1000 + i, name: `job${i}`, status: "completed", conclusion: "success", app: { id: 15368 } }));
+    e.gh.checkRuns = [olderMetrics, olderHygiene, ...filler, latestMetrics, latestHygiene];
+    assert.equal(reason(await merge()), "merged");
+    assert.equal(e.gh.calls.filter((c) => /\/check-runs$/.test(c.path) && c.query.page === "2").length > 0, true, "page 2 read");
+
+    // The latest run cancelled is still not green.
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.graphql.mergeStateStatus = "CLEAN";
+    superseded();
+    e.gh.checkRuns.push({ id: 45538799999, name: "pr-hygiene", status: "completed", conclusion: "cancelled", app: { id: 15368, slug: "github-actions" }, check_suite: { id: 503 } });
+    e.gh.workflowRuns.push({ id: 9003, workflow_id: 77, check_suite_id: 503 });
+    assert.equal(reason(await merge()), "ci_not_green");
+    assert.equal(puts().length, 0);
+
+    // An earlier FAILED run of the same name and app is not superseded by a later success (another workflow's job of that name, a fork's).
+    e = await reviewEnv({}, { approved: true }); allowed();
+    e.gh.graphql.mergeStateStatus = "CLEAN";
+    superseded();
+    e.gh.checkRuns[0] = { ...e.gh.checkRuns[0], conclusion: "failure" };
+    assert.equal(reason(await merge()), "ci_not_green");
+    assert.equal(puts().length, 0);
+
+    // A cancelled run is not superseded by another workflow's job of the same name, nor when the workflow runs cannot be read.
+    for (const arrange of [
+      () => { e.gh.workflowRuns[1] = { ...e.gh.workflowRuns[1]!, workflow_id: 78 }; },
+      () => { e.gh.workflowRuns = []; },
+    ]) {
+      e = await reviewEnv({}, { approved: true }); allowed();
+      e.gh.graphql.mergeStateStatus = "CLEAN";
+      superseded();
+      arrange();
+      assert.equal(reason(await merge()), "ci_not_green");
+      assert.equal(puts().length, 0);
+    }
+  });
+
   test("M3b a failed check the base branch does not require is advisory: GitHub's UNSTABLE for it merges, as GitHub would (Primus-SaFE#873, codecov/patch)", async () => {
     e = await reviewEnv({}, { approved: true }); allowed();
     e.gh.statuses = [{ context: "codecov/patch", state: "failure" }];
