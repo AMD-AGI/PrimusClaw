@@ -15,7 +15,7 @@
 # pull it through a mirror, configure the builder's registry mirrors.
 
 # ========== Build and check the packages ==========
-FROM node:26-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68 AS build
+FROM node:26-bookworm-slim@sha256:0042e17d232a87a2cd485be1da7900fca4d10a4ad11b29e9285da1d2e54798c9 AS build
 WORKDIR /src/personal-agent
 
 # The dependencies first, so a source change reuses this layer.
@@ -55,7 +55,7 @@ RUN version="$(node -p 'require("/src/personal-agent/packages/teams/package.json
       "/packages/primusclaw-personal-agent-teams-$version.tgz"
 
 # ========== Runtime ==========
-FROM node:26-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68
+FROM node:26-bookworm-slim@sha256:0042e17d232a87a2cd485be1da7900fca4d10a4ad11b29e9285da1d2e54798c9
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build /app /app
