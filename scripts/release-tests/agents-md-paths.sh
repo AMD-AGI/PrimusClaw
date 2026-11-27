@@ -69,12 +69,14 @@ static_roots="claw connector personal-agent sandbox scripts docs deploy .github"
 ext_re='\.(ts|tsx|js|mjs|cjs|sh|md|json|yml|yaml|toml|py|go|sql|txt)$'
 
 # One record per code span or fenced line: "<block id> <line> <text>", tab separated.
-# Every inline span is a block of its own; a fenced block is one block, so a `cd` on
-# one of its lines holds for the next.
+# Every inline span is a block of its own; a fenced block (``` or ~~~) is one block,
+# so a `cd` on one of its lines holds for the next.
 extract_code() {
   awk '
-    /^[[:space:]]*```/ { fence = !fence; blk++; next }
-    fence { printf "F%d\t%d\t%s\n", blk, NR, $0; next }
+    { s = $0; sub(/^[[:space:]]+/, "", s) }
+    fence == "" && (s ~ /^```/ || s ~ /^~~~/) { fence = substr(s, 1, 3); blk++; next }
+    fence != "" && substr(s, 1, 3) == fence { fence = ""; next }
+    fence != "" { printf "F%d\t%d\t%s\n", blk, NR, $0; next }
     {
       line = $0; n = 0
       while (match(line, /`[^`]+`/)) {
@@ -187,6 +189,7 @@ check_tree() {
     saved="$cur"
     lead="${text#"${text%%[![:space:]]*}"}"
     while IFS= read -r seg; do
+      [ -n "${seg//[[:space:]]/}" ] || continue
       read -r -a w <<<"$seg" || true
       [ "${#w[@]}" -gt 0 ] || continue
       w[0]="${w[0]#(}"
@@ -261,6 +264,11 @@ cd ..
 (cd sandbox && make fmt-verify)
 make lint
 ```
+
+~~~sh
+
+bash scripts/release-tests/x.sh
+~~~
 MD
   git -C "$d" init -q
   git -C "$d" add -A
@@ -313,6 +321,7 @@ if [ "$mode" = "self-test" ]; then
   expect_stale "a make -f target that only the root Makefile defines, after cd" 's|make -f Makefile fmt-verify|make -f Makefile verify|'
   expect_stale "a make -f file that does not exist in the directory" 's|make -f Makefile fmt-verify|make -f Makefile.gone fmt-verify|'
   expect_stale "a make target of the wrong Makefile in a fenced block" 's|^make all$|make lint|'
+  expect_stale "a path in a ~~~ fenced block" 's|^bash scripts/release-tests/x.sh$|bash scripts/release-tests/z.sh|'
   expect_stale "a script path gone" 's|bash scripts/release-tests/x.sh|bash scripts/release-tests/y.sh|'
 
   d="$tmp/m$((++n))"
