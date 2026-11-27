@@ -172,10 +172,12 @@ WORKDIR /app
 ENV NODE_ENV=production \
     WORKSPACE_PATH=/workspace
 
-# perl-base is already present; naming it makes apt pull the patched build
-# (5.36.0-7+deb12u4) even when the base image has not been rebuilt yet.
+# perl-base and the libpam packages are already present; naming them makes apt pull the
+# patched builds (perl-base 5.36.0-7+deb12u4, libpam 1.5.2-6+deb12u3 for CVE-2025-6020)
+# even when the base image has not been rebuilt yet.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends tini ca-certificates bash curl xz-utils perl-base \
+    libpam0g libpam-modules libpam-modules-bin libpam-runtime \
  && rm -rf /var/lib/apt/lists/* \
  && mkdir -p /workspace
 

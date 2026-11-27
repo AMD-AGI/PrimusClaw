@@ -54,4 +54,16 @@
 # Verified with the gate's own Trivy invocation against the new digests, and
 # apt 2.6.2 read from the published package list; runtime versions unchanged
 # (NODE_VERSION=26.13.0, PYTHON_VERSION=3.15.2).
-vulnerabilities: []
+#
+# 2026-11-27: CVE-2025-6020 in libpam0g, libpam-modules, libpam-modules-bin and
+# libpam-runtime 1.5.2-6+deb12u2 of node:26-bookworm-slim. Debian published
+# 1.5.2-6+deb12u3; the newest digest (sha256:0042e17d...) still carries deb12u2, so
+# the pin stays and the entry below holds the gate until the publisher rebuilds.
+# claw/Dockerfile names the four packages in its runtime apt step, so the image
+# we build is patched meanwhile. Delete the entry when a rebuilt digest is pinned.
+vulnerabilities:
+  - id: CVE-2025-6020
+    statement: >-
+      libpam 1.5.2-6+deb12u3 is published; the base image has not been rebuilt
+      with it, and claw/Dockerfile installs the patched packages itself.
+    expired_at: 2026-12-04
