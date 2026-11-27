@@ -55,8 +55,9 @@ CI tests on Node 26 (`claw/.nvmrc`). `connector/` declares Node >=22, so use no 
   the `claw/` tests do not run, so run all three trees.
 - "Router" means three things: the Claw assistant's router turn (`claw/packages/api/src/assistant/`), personal-agent
   message routing (`personal-agent/packages/core/src/routing/`) and the Sandbox Router (`sandbox/pkg/router`).
-- Database DDL lives in `claw/packages/api/src/infra/db.ts` and runs idempotently on every API start; what the code then
-  depends on is added to `schema-guard.ts` beside it.
+- Database DDL is idempotent and runs on every API start, from `initDb` in `claw/packages/api/src/infra/db.ts`: the core
+  tables are there, and `initDb` calls each feature's own schema module (`assistant/schema.ts`, `remote-agents/schema.ts`,
+  ...) when the feature is enabled. What the code then depends on is added to `schema-guard.ts` beside `initDb`.
 
 ## Tests
 

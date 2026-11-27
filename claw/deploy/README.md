@@ -43,9 +43,10 @@ Browser / MCP Client
 # 1. Copy/fill per-env values (contains secrets; do not commit)
 cp deploy/values.example.env deploy/values.primus-claw.env
 
-# 2. Deploy everything: a release, docker.io/rocm/primusclaw:claw-<version>
-#    (<version> is X.Y.Z of a claw-vX.Y.Z tag on the GitHub Releases page)
-TAG=claw-<version> bash deploy/deploy.sh
+# 2. Deploy everything: a release, docker.io/rocm/primusclaw:claw-$VERSION, where
+#    VERSION is the X.Y.Z of a claw-vX.Y.Z tag on the GitHub Releases page
+VERSION=X.Y.Z   # replace with that X.Y.Z
+TAG=claw-$VERSION bash deploy/deploy.sh
 #    or an image of your own, myregistry.com/team/claw:v1.0.0
 REGISTRY=myregistry.com/team TAG=v1.0.0 bash deploy/deploy.sh
 ```

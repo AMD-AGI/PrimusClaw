@@ -169,7 +169,8 @@ check_tree() {
       esac
     done
     [ "${#targets[@]}" -gt 0 ] || return 0
-    file="${file:-${dir:+$dir/}Makefile}"
+    # -f is read in the directory make runs in, which is the one `cd` or -C led to.
+    file="${dir:+$dir/}${file:-Makefile}"
     if [ ! -f "$root/$file" ]; then
       stale "make runs against $file, which does not exist"
       return 0
@@ -246,7 +247,8 @@ Trees: `claw/`, `sandbox/` and `docs/`; the assistant is `claw/packages/api/src/
 `test/<name>.test.ts`, `$HOME/x.ts`, `DATABASE_URL=postgres://u:p@127.0.0.1:5432/db`.
 
 Run `make verify`, then `make -k lint`, or `make verify && make lint` in one go.
-Sandbox: `cd sandbox && make all && make fmt-verify`.
+Sandbox: `cd sandbox && make all && make fmt-verify`, or `make -C sandbox all`, or
+`cd sandbox && make -f Makefile fmt-verify`.
 The prompt lives in `claw/packages/api/src/assistant/prompts.ts` (also `inbound.ts`
 and `assistant/inbound.ts`). Run `bash scripts/release-tests/x.sh`.
 
@@ -307,6 +309,9 @@ if [ "$mode" = "self-test" ]; then
   expect_stale "a make target that only the root Makefile defines, after cd" 's|make all && make fmt-verify|make all \&\& make verify|'
   expect_stale "a path in a fenced block" 's|bash scripts/lint-x.sh|bash scripts/lint-y.sh|'
   expect_stale "a cd into a missing directory" 's|cd ../sandbox|cd ../sandboxx|'
+  expect_stale "a make -C target that only the root Makefile defines" 's|make -C sandbox all|make -C sandbox verify|'
+  expect_stale "a make -f target that only the root Makefile defines, after cd" 's|make -f Makefile fmt-verify|make -f Makefile verify|'
+  expect_stale "a make -f file that does not exist in the directory" 's|make -f Makefile fmt-verify|make -f Makefile.gone fmt-verify|'
   expect_stale "a make target of the wrong Makefile in a fenced block" 's|^make all$|make lint|'
   expect_stale "a script path gone" 's|bash scripts/release-tests/x.sh|bash scripts/release-tests/y.sh|'
 
