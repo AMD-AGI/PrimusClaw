@@ -37,5 +37,5 @@
 - [ ] A user-visible change has a line under `[Unreleased]` in `CHANGELOG.md` (or `personal-agent/CHANGELOG.md`) that names the oldest peer version it needs
 - [ ] A regression test fails when the fix is reverted
 - [ ] No secrets, credentials, or internal endpoints committed (`bash scripts/release-tests/public-tree-scan.sh` is clean)
-- [ ] If a coding agent helped, the summary above says how much; no commit carries a trailer naming an agent or tool
+- [ ] No commit carries a `Co-authored-by` or `Signed-off-by` trailer that names an agent or a tool
 - [ ] Breaking changes documented above (migration path if any)

@@ -172,7 +172,7 @@ verify-lint:
 	fi
 	@echo "==> lint: PromQL rollout gates"
 	@bash scripts/release-tests/promql-gates.sh
-	@echo "==> lint: AGENTS.md names only what the tree has"
+	@echo "==> lint: AGENTS.md and ENGINEERING.md name only what the tree has"
 	@bash scripts/release-tests/agents-md-paths.sh --all
 	@bash scripts/release-tests/agents-md-paths.sh --self-test
 	@# The last gate before anything reaches a public tree. It needs ripgrep with

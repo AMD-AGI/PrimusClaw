@@ -4,9 +4,9 @@
 
 # agents-md-paths.sh
 #
-# Keep AGENTS.md a true map of the repository.
+# Keep AGENTS.md and ENGINEERING.md a true map of the repository.
 #
-# AGENTS.md names files, directories and make targets, and a coding agent follows
+# Both name files, directories and make targets, and a coding agent follows
 # every one of them. A rename that forgets the file leaves the agent with a path
 # that does not exist, and nothing else in CI reads Markdown for that, so this
 # guard does. What it checks, in the code spans and fenced blocks only (prose is
@@ -28,20 +28,22 @@
 # starts with `(` is a subshell and its `cd` ends with the line. Words with a
 # placeholder or a glob (`<name>`, `*`, `$`, `{`) and anything after ` #` are skipped.
 #
-# It does not run the commands (CI already does) and does not parse prose.
+# It does not run the commands (CI already does) and does not parse prose. The
+# documents it reads are the ones in `docs` below: AGENTS.md and ENGINEERING.md.
 #
 # Modes (same convention as the claw lint scripts):
 #
 #   (no args)    same as --all.
-#   --all        CI: check AGENTS.md at the repository root.
-#   --self-test  Build a small repository, require its AGENTS.md to pass, then seed
-#                each kind of stale reference and require every one to be rejected,
-#                so a guard that stopped guarding fails CI rather than passing all.
+#   --all        CI: check AGENTS.md and ENGINEERING.md at the repository root.
+#   --self-test  Build a small repository, require its AGENTS.md and ENGINEERING.md
+#                to pass, then seed each kind of stale reference in each of them and
+#                require every one to be rejected, so a guard that stopped guarding
+#                fails CI rather than passing all.
 #
 # Exit codes:
-#   0  AGENTS.md is consistent with the tree
+#   0  both documents are consistent with the tree
 #   1  at least one reference is stale
-#   2  invocation error (bad arg, AGENTS.md or git missing)
+#   2  invocation error (bad arg, a document or git missing)
 
 set -euo pipefail
 
@@ -64,6 +66,9 @@ fi
 # a removed directory is reported rather than silently unchecked. Directories the
 # tree has beyond these are added at run time.
 static_roots="claw connector personal-agent sandbox scripts docs deploy .github"
+
+# The documents checked, relative to the root. Each must exist.
+docs="AGENTS.md ENGINEERING.md"
 
 # Extensions that make a word with a slash a file reference.
 ext_re='\.(ts|tsx|js|mjs|cjs|sh|md|json|yml|yaml|toml|py|go|sql|txt)$'
@@ -124,8 +129,8 @@ cd_to() {
   esac
 }
 
-check_tree() {
-  local root="$1" md="$1/AGENTS.md" fail=0
+check_doc() {
+  local root="$1" name="$2" md="$1/$2" fail=0
   local tracked roots id line text last_id="" cur="" seg first word saved lead
   local -a w args
 
@@ -139,7 +144,7 @@ check_tree() {
   fi
   roots="$static_roots $(git -C "$root" ls-files | awk -F/ 'NF > 1 { print $1 }' | sort -u | tr '\n' ' ')"
 
-  stale() { echo "AGENTS.md:$line: $*" >&2; fail=1; }
+  stale() { echo "$name:$line: $*" >&2; fail=1; }
 
   is_root() { case " $roots " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -225,14 +230,27 @@ check_tree() {
 
   if [ "$fail" -ne 0 ]; then
     echo >&2
-    echo "AGENTS.md names something the tree does not have. Fix the reference in the same" >&2
+    echo "$name names something the tree does not have. Fix the reference in the same" >&2
     echo "change that moved or renamed the file, directory or make target." >&2
     return 1
   fi
   return 0
 }
 
-# A small repository whose AGENTS.md uses every construct the guard understands.
+# Every document in $docs. An invocation error (2) wins over a stale reference (1),
+# and every document is checked even when an earlier one failed, so one run lists
+# everything that is stale.
+check_tree() {
+  local root="$1" name rc=0 r
+  for name in $docs; do
+    r=0
+    check_doc "$root" "$name" || r=$?
+    if [ "$r" -eq 2 ] || { [ "$r" -ne 0 ] && [ "$rc" -eq 0 ]; }; then rc="$r"; fi
+  done
+  return "$rc"
+}
+
+# A small repository whose AGENTS.md and ENGINEERING.md use every construct the guard understands.
 make_fixture() {
   local d="$1"
   mkdir -p "$d/claw/packages/api/src/assistant" "$d/claw/scripts" "$d/sandbox" "$d/scripts/release-tests" "$d/docs"
@@ -270,24 +288,35 @@ make lint
 bash scripts/release-tests/x.sh
 ~~~
 MD
+  cat > "$d/ENGINEERING.md" <<'MD'
+# Engineering principles
+
+The guard is `claw/scripts/lint-x.sh`; it covers `claw/packages/api/src/assistant/` and the prompt is `prompts.ts`.
+Run `make -C sandbox all`, then `make verify`.
+
+```bash
+cd claw
+bash scripts/lint-x.sh --all
+```
+MD
   git -C "$d" init -q
   git -C "$d" add -A
 }
 
-# Copies the fixture's AGENTS.md through one sed expression, then requires the guard
-# to fail it.
+# Copies the fixture's AGENTS.md (or the document named by the optional third
+# argument) through one sed expression, then requires the guard to fail it.
 expect_stale() {
-  local what="$1" expr="$2" d
+  local what="$1" expr="$2" doc="${3:-AGENTS.md}" d
   d="$tmp/m$((++n))"
   make_fixture "$d"
-  sed -i.bak -e "$expr" "$d/AGENTS.md"
-  if cmp -s "$d/AGENTS.md" "$d/AGENTS.md.bak"; then
+  sed -i.bak -e "$expr" "$d/$doc"
+  if cmp -s "$d/$doc" "$d/$doc.bak"; then
     echo "agents-md-paths: self-test mutation did not change the fixture: $what" >&2
     exit 1
   fi
-  rm -f "$d/AGENTS.md.bak"
+  rm -f "$d/$doc.bak"
   if check_tree "$d" >/dev/null 2>&1; then
-    echo "ERROR: self-test: the guard accepted AGENTS.md with $what. The guard is not guarding." >&2
+    echo "ERROR: self-test: the guard accepted $doc with $what. The guard is not guarding." >&2
     exit 1
   fi
 }
@@ -300,7 +329,7 @@ if [ "$mode" = "self-test" ]; then
 
   make_fixture "$tmp/ok"
   if ! check_tree "$tmp/ok"; then
-    echo "ERROR: self-test: the guard rejected a consistent AGENTS.md." >&2
+    echo "ERROR: self-test: the guard rejected a consistent AGENTS.md and ENGINEERING.md." >&2
     exit 1
   fi
 
@@ -324,6 +353,13 @@ if [ "$mode" = "self-test" ]; then
   expect_stale "a path in a ~~~ fenced block" 's|^bash scripts/release-tests/x.sh$|bash scripts/release-tests/z.sh|'
   expect_stale "a script path gone" 's|bash scripts/release-tests/x.sh|bash scripts/release-tests/y.sh|'
 
+  expect_stale "ENGINEERING.md: a file under a top-level directory renamed" 's|claw/scripts/lint-x.sh|claw/scripts/lint-y.sh|' ENGINEERING.md
+  expect_stale "ENGINEERING.md: a directory with a trailing slash renamed" 's|`claw/packages/api/src/assistant/`|`claw/packages/api/src/assistantx/`|' ENGINEERING.md
+  expect_stale "ENGINEERING.md: a bare file name renamed" 's|`prompts.ts`|`promptz.ts`|' ENGINEERING.md
+  expect_stale "ENGINEERING.md: a make target gone" 's|make verify|make nosuch|' ENGINEERING.md
+  expect_stale "ENGINEERING.md: a make -C target that only the root Makefile defines" 's|make -C sandbox all|make -C sandbox verify|' ENGINEERING.md
+  expect_stale "ENGINEERING.md: a path in a fenced block" 's|bash scripts/lint-x.sh|bash scripts/lint-y.sh|' ENGINEERING.md
+
   d="$tmp/m$((++n))"
   make_fixture "$d"
   rm -rf "$d/docs"
@@ -339,6 +375,16 @@ if [ "$mode" = "self-test" ]; then
   check_tree "$d" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -ne 2 ]; then
     echo "ERROR: self-test: a missing AGENTS.md must be an invocation error (2), got $rc." >&2
+    exit 1
+  fi
+
+  d="$tmp/m$((++n))"
+  make_fixture "$d"
+  rm -f "$d/ENGINEERING.md"
+  rc=0
+  check_tree "$d" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -ne 2 ]; then
+    echo "ERROR: self-test: a missing ENGINEERING.md must be an invocation error (2), got $rc." >&2
     exit 1
   fi
 

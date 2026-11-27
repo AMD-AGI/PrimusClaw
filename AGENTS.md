@@ -5,7 +5,9 @@ PrimusClaw is one repository with four product trees: `claw/` (the server: API, 
 Claw; Microsoft Teams is the first surface) and `sandbox/` (a Go fork of kubernetes-sigs/agent-sandbox, Apache-2.0).
 `deploy/` (the whole-stack installer and the LiteLLM wrapper, in Python) and `docs/` (the Sphinx site for the Python
 packages) sit beside them. Read the README of the tree you change; this file holds only what the READMEs and the code do
-not say, and `CONTRIBUTING.md` has the DCO and the pull request workflow.
+not say, and `CONTRIBUTING.md` has the DCO and the pull request workflow. Before you design or review a change, read
+`ENGINEERING.md`: architecture principles, design rules, the definition of done and the review bar, each with the file
+that enforces it.
 
 ## Before you push
 
@@ -81,26 +83,8 @@ CI tests on Node 26 (`claw/.nvmrc`). `connector/` declares Node >=22, so use no 
   non-zero. Wait on a condition, not a fixed sleep. A test that changes shared state (DDL, advisory locks, sockets, TMPDIR)
   scopes it to its own database or name and restores it in `finally`.
 
-## Rules the guards and reviewers enforce
+## Personal agent
 
-- Each `claw/scripts/lint-*.sh` states its invariant and why in its header; read it before editing near it. Examples:
-  workspace code calls Hands only through the timeout wrapper; every prom-client metric registers; a route on a tenant's
-  sessions or tasks authorizes inside its handler; `process.env.X ?? default` is forbidden, use `||`; every brain `LLM_*`
-  setting reaches the chart.
-- A rule that protects the user (confirmation, read-only, "only this seat") is enforced in the tool or server that
-  performs the effect; prompt text only describes it. Re-check a policy at the moment of the effect, under the lock that
-  serialises its writers, not only when the request or card was made.
-- A preference, opt-out or restriction that cannot be read or written keeps the restriction; never default to on or
-  unrestricted.
-- Every path that moves a user message, event, notice or answer states and tests what happens on transient failure,
-  shutdown, redelivery and a rolling deploy. Drop or quarantine only on a proven-permanent signal.
-- When a view, list, check or test double repeats a rule that lives elsewhere, import the real function, or add a test that
-  runs both on the same fixtures.
-- Text written by an agent, a machine, a forwarded message or another user is data: render it inert
-  (`claw/packages/api/src/assistant/inert-md.ts`) and keep it out of router prompts unless the turn is marked untrusted
-  (`markUntrustedRead` in `assistant/inbound.ts`).
-- Every user-visible string is a `defineCatalog({ en, zh })` entry in `personal-agent/packages/core/src/locales/` and is
-  chosen by the recipient's language, never the requester's, the group's or an item title's.
 - The bot's earlier default name may appear in `personal-agent/packages/*/src` only in `LEGACY_` or `PERSISTED_` constants,
   comments and examples included (`personal-agent/test/legacy-names.test.ts`). Take the bot's name from configuration.
 - A change to name stripping, addressing or typed commands is tested for a 1:1 chat attached to a coding agent, a 1:1 chat
@@ -116,14 +100,22 @@ CI tests on Node 26 (`claw/.nvmrc`). `connector/` declares Node >=22, so use no 
   (`internal-text.ts`), the wrong language and over-long text. Which tools read and which write comes from one catalog,
   `claw/packages/protocol/src/mcp-tool-catalog.ts`; do not keep a second list.
 
-## Compatibility and releases
+## What blocks a review
 
-- Name the oldest Claw, connector and stored-row shape your change must still serve (`CONNECTOR_VERSIONS.minimum` in
-  `claw/packages/protocol/src/remote-agents.ts`) and test against it.
-- Every user-visible change adds a line under `## [Unreleased]` in `CHANGELOG.md` (Claw, connector) or
-  `personal-agent/CHANGELOG.md`. State only what the code does unconditionally, and name the minimum peer version.
-- Before 1.0, changing an exported type, port or protocol field is incompatible and needs a MINOR ("Versioning" in
-  `CHANGELOG.md`). Say so in the pull request; leave version bumps and tags to the maintainers.
+The full list is `ENGINEERING.md` section 4. A finding blocks when it is a defect on the normal path or is exploitable:
+
+- a regression, crash, hang or wrong result on the normal path, also behind a shipped flag or documented setting, or from
+  a new branch wider than its case;
+- a security flaw: a missing owner check, a secret in a log or event, untrusted text that can act, an approval nobody gave;
+- a guard, validator, fake or test that disagrees with the real consumer (fix the class, not the instance);
+- a retry, stop, restart, failed or concurrent write, or migration that drops the user's explicit choice or a parameter,
+  or carries stale state;
+- a data write that is not transaction-safe, or one code for "refused" and "unknown";
+- a claim the code does not keep in a line the change adds or changes: a test that cannot fail, an "only", "never" or "no"
+  the code contradicts, a setting no deployment can write;
+- an incompatible change not called out; a side effect nobody told the user about.
+
+An edge case with no reachable path, a name or a wording is recorded in the pull request and does not block.
 
 ## Public repository
 
@@ -142,7 +134,7 @@ CI tests on Node 26 (`claw/.nvmrc`). `connector/` declares Node >=22, so use no 
 
 - `git commit -s` with your own real name and email. Never add or invent a `Signed-off-by` for someone else, and add no
   `Co-authored-by`, `Signed-off-by` or similar trailer that names an agent or a tool: the person who submits the change is
-  its author. If an agent wrote or substantially edited it, say how much in the pull request description.
+  its author.
 - Subject `type(scope): what changed`, for example `fix(connector): report a conversation that just ended`; the scope is the
   tree or package (`claw`, `connector`, `personal-agent`, `sandbox`, or a package such as `brain`, comma-separated for
   several) and the squash merge adds `(#N)`. One change per pull request, except that changes to claw, personal-agent and

@@ -39,7 +39,6 @@ to every tree in the repository.
 - Create a feature branch off `main`.
 - Sign off every commit (`git commit -s`) — see [Licensing your contribution](#licensing-your-contribution).
 - Keep changes focused and include context in the PR description (problem, approach, test coverage).
-- If a coding agent helped, say in the PR description how much (see [Contributing with a coding agent](#contributing-with-a-coding-agent)).
 - Ensure merge requirements and applicable GitHub checks pass before requesting review (see [CI and documentation-only changes](#ci-and-documentation-only-changes)).
 - Avoid committing generated artifacts; keep diffs minimal.
 
@@ -149,9 +148,10 @@ They are ratchets rather than targets: each sits just under the figure measured 
 ## Before opening a PR
 - [ ] Every commit is signed off (`git commit -s`).
 - [ ] The checks of every tree you changed pass (see "Before you push" in [`AGENTS.md`](AGENTS.md)); `make verify` alone does not cover `personal-agent/` or `connector/`.
+- [ ] The change meets the definition of done in [`ENGINEERING.md`](ENGINEERING.md).
 - [ ] No unwanted files (build artifacts, large logs, credentials).
 - [ ] No internal hostnames, endpoints, or key-shaped strings — `bash scripts/release-tests/public-tree-scan.sh` checks this and also runs in CI.
-- [ ] If a coding agent helped, the PR description says how much, and no commit carries a trailer naming an agent or tool.
+- [ ] No commit carries a `Co-authored-by` or `Signed-off-by` trailer that names an agent or a tool.
 
 ## Contributing with a coding agent
 
@@ -159,13 +159,12 @@ You are the author of what you submit, and you sign the DCO yourself. An agent
 never adds or invents a `Signed-off-by` for someone else, and a commit carries no
 `Co-authored-by`, `Signed-off-by` or similar trailer that names an agent or a tool.
 (GitHub adds a `Co-authored-by` for each human author when it merges a pull request
-that has several; that is fine.) State in the pull request description how much an
-agent assisted: for example that it drafted the change and you edited it, or that
-you used it only to review.
+that has several; that is fine.)
 
 Review every line before you open the pull request, run the checks for the trees
 you changed, and keep the change focused. [`AGENTS.md`](AGENTS.md) is written for
-coding agents and lists the checks and conventions they most often miss.
+coding agents and lists the checks and conventions they most often miss;
+[`ENGINEERING.md`](ENGINEERING.md) is the bar a change meets, whoever writes it.
 
 ## Security
 - Do not include secrets in code or logs.
