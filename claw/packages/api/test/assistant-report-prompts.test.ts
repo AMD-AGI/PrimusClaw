@@ -95,7 +95,7 @@ test("P3 the worker is told how to report, to end with a report, and to check be
   assert.match(renderWorkerSystem({ seq: 7, title: "Fix CI" }), /item #7: Fix CI$/);
 });
 
-// G0 2026-11-07 (nightly sa-eval-bot-2, cat-items-wr-001): asked to "add a script and open a PR", the worker reported waiting with
+// G0 2026-11-07 (nightly evaluation, cat-items-wr-001): asked to "add a script and open a PR", the worker reported waiting with
 // "Confirm I should push ... and open the PR?" instead of pushing, so no card came and the user was asked again in words.
 test("P3b the worker makes the write the task asks for and lets the hold ask; it never asks first in a report", () => {
   for (const prompt of [WORKER_PROMPT, WORKER_DISCIPLINE_PROMPT]) {
@@ -107,7 +107,7 @@ test("P3b the worker makes the write the task asks for and lets the hold ask; it
   }
 });
 
-// E232 2026-11-08 (nightly sa-eval-bot-2, cat-github-edge-001): asked to star vllm, the worker reported failed in 6 s ("no star tool;
+// E232 2026-11-08 (nightly evaluation, cat-github-edge-001): asked to star vllm, the worker reported failed in 6 s ("no star tool;
 // the sandbox token cannot go around the card"), so the user got no card. A GitHub write no tool makes goes through gh, which the shell
 // holds for a card (Brain's bash-approval-defaults.ts; its engine test holds `gh api -X PUT user/starred/...`).
 test("P3c a GitHub write no tool makes is made with gh, whose hold asks the user; never failed for want of a tool (both prompts)", () => {

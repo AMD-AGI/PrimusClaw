@@ -39,6 +39,7 @@ to every tree in the repository.
 - Create a feature branch off `main`.
 - Sign off every commit (`git commit -s`) — see [Licensing your contribution](#licensing-your-contribution).
 - Keep changes focused and include context in the PR description (problem, approach, test coverage).
+- If a coding agent helped, say in the PR description how much (see [Contributing with a coding agent](#contributing-with-a-coding-agent)).
 - Ensure merge requirements and applicable GitHub checks pass before requesting review (see [CI and documentation-only changes](#ci-and-documentation-only-changes)).
 - Avoid committing generated artifacts; keep diffs minimal.
 
@@ -93,8 +94,12 @@ Lint and image builds are optional from a merge-policy perspective; skipping the
 
 ## Testing
 
-`make verify` from the repository root runs everything CI runs, so a green local
-run should mean a green pull request. CodeQL is the only required check with no
+`make verify` from the repository root runs the Claw, Sandbox, Python, docs and
+lint targets below. It does not run everything CI runs: there is no step for
+`personal-agent/` (`npm run check`), `connector/` (`npm run typecheck && npm test`),
+the Claw wire-type compile or `claw/scripts/lint-llm-settings-deployable.sh`.
+[`AGENTS.md`](AGENTS.md) ("Before you push") lists what to run for each tree; run
+what matches the trees you changed. CodeQL is the only required check with no
 local equivalent; the image builds and the dependency audits also have none.
 Run `make help` for the individual targets; `make -k verify` reports every
 failure instead of stopping at the first.
@@ -110,9 +115,13 @@ failure instead of stopping at the first.
 For a tighter loop, run the component directly:
 - `pytest deploy/litellm/tests`
 - `cd claw && npm test`
+- `cd personal-agent && npm run check`
+- `cd connector && npm run typecheck && npm test`
 - `cd sandbox && make test`
 - To target a single file or test name:
   - `pytest deploy/litellm/tests/test_prompt_cache_hook.py -k ttl`
+  - The single-file commands for the Claw, personal-agent and connector suites are in
+    [`AGENTS.md`](AGENTS.md) ("Tests").
 
 ### Coverage (source of truth)
 
@@ -134,21 +143,29 @@ They are ratchets rather than targets: each sits just under the figure measured 
 ## Linting and formatting
 - Claw TypeScript type checks:
   - `cd claw && npm run typecheck`
-- Claw repo lint scripts (also enforced in CI):
-  - `bash claw/scripts/lint-no-direct-hands-calltool-in-workspace.sh --all`
-  - `bash claw/scripts/lint-metrics-must-register.sh --all`
-  - `bash claw/scripts/lint-session-events-must-redact.sh --all`
-  - `bash claw/scripts/lint-tenant-routes-must-authorize.sh --all`
-  - `bash claw/scripts/lint-drain-shutdown-guard.sh --all`
-  - `bash claw/scripts/lint-dockerfile-build-order.sh --all`
-  - `bash claw/scripts/lint-no-nullish-env-default.sh --all`
+- Claw repo lint scripts (also enforced in CI): `make verify-lint`. Each
+  `claw/scripts/lint-*.sh` states the invariant it guards, and why, in its header.
 
 ## Before opening a PR
 - [ ] Every commit is signed off (`git commit -s`).
-- [ ] `make verify` passes, or at minimum the targets covering what you changed.
-- [ ] Claw type checks pass (`cd claw && npm run typecheck`) if touching `claw/`.
+- [ ] The checks of every tree you changed pass (see "Before you push" in [`AGENTS.md`](AGENTS.md)); `make verify` alone does not cover `personal-agent/` or `connector/`.
 - [ ] No unwanted files (build artifacts, large logs, credentials).
 - [ ] No internal hostnames, endpoints, or key-shaped strings — `bash scripts/release-tests/public-tree-scan.sh` checks this and also runs in CI.
+- [ ] If a coding agent helped, the PR description says how much, and no commit carries a trailer naming an agent or tool.
+
+## Contributing with a coding agent
+
+You are the author of what you submit, and you sign the DCO yourself. An agent
+never adds or invents a `Signed-off-by` for someone else, and a commit carries no
+`Co-authored-by`, `Signed-off-by` or similar trailer that names an agent or a tool.
+(GitHub adds a `Co-authored-by` for each human author when it merges a pull request
+that has several; that is fine.) State in the pull request description how much an
+agent assisted: for example that it drafted the change and you edited it, or that
+you used it only to review.
+
+Review every line before you open the pull request, run the checks for the trees
+you changed, and keep the change focused. [`AGENTS.md`](AGENTS.md) is written for
+coding agents and lists the checks and conventions they most often miss.
 
 ## Security
 - Do not include secrets in code or logs.

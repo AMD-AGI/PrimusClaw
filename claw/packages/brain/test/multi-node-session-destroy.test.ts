@@ -495,7 +495,7 @@ test("a workspace the key cannot read makes the teardown incomplete, not clean",
 });
 
 /**
- * The production case of 2026-11-06..07: a non-admin key (sa-eval-bot-5, workspaces global-cpu and
+ * The production case of 2026-11-06..07: a non-admin key (an evaluation identity, workspaces global-cpu and
  * crusoe-spur-vk) deleting a session that never started a sandbox, so no workspace was recorded. SaFE
  * answered the unscoped list 403 "workspace: []", every Brain replica logged
  * `session.cleanup_incomplete_parked reason=lookup_failed`, and there was nothing anywhere to clean up.

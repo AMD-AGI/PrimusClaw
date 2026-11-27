@@ -95,7 +95,7 @@ import { tmpDir } from "../../utils/test/tmp-dirs.js";
 
 const API_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const RUNNER = join(API_DIR, "test", "e2e", "sa-eval.ts");
-const EMAIL = "sa-eval-bot@example.test";
+const EMAIL = "eval-bot@example.test";
 
 interface Item { item_id: string; seq: number; title: string; kind: string; board_state: string; can_accept: boolean; result_version: number; worker_session_id: string }
 interface Row { event_id: string; event_type: string; data: Record<string, unknown>; created_at: string }
@@ -198,7 +198,7 @@ class FakeClaw {
     let m: RegExpExecArray | null;
     if (method === "GET" && path === "/v1/me") {
       const email = this.meFor(String(req.headers.authorization ?? ""));
-      return send(200, { userId: email === EMAIL ? "u-eval" : `u-${email}`, name: "sa-eval-bot", email });
+      return send(200, { userId: email === EMAIL ? "u-eval" : `u-${email}`, name: "eval-bot", email });
     }
     if (method === "POST" && path === "/judge/v1/messages") {
       this.judgePrompts.push(String((JSON.parse(body || "{}") as any)?.messages?.[0]?.content ?? ""));

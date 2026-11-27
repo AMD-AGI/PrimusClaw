@@ -106,7 +106,7 @@ export const TOOL_NAME_PREFIX = `mcp__${ASSISTANT_MCP_SERVER}__`;
  * worker-v5: v4 with what was found reported before a write the user approves: the user is told it first, then asked (G2).
  * worker-v6: v5 with a difference, ratio or percentage computed from the unrounded values and rounded once, at the end (M2).
  * worker-v8: v6 with a write the task asks for made when the worker reaches it, never first asked about in a report: the hold puts it
- * to the user on a card (G0 2026-11-07, nightly sa-eval-bot-2 cat-items-wr-001: the worker asked "Confirm I should push ... and open
+ * to the user on a card (G0 2026-11-07, nightly evaluation cat-items-wr-001: the worker asked "Confirm I should push ... and open
  * the PR?" as a waiting question, so a user who had asked for the PR was asked again in words, and once more on the card after yes).
  * worker-v10: v8 with a GitHub write no tool makes (a star) made with gh in the workspace, where the shell holds it for a card
  * (`bash-approval-defaults.ts` in Brain), never reported failed for want of a tool (E232, nightly 2026-11-08 cat-github-edge-001: "star

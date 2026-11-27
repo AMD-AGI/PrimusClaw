@@ -88,3 +88,20 @@ jobs:
         run: |
           bash scripts/release-tests/public-message-scan.sh \
             "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
+  # AGENTS.md is a map that coding agents follow file by file, and a rename that
+  # forgets it leaves them a path that does not exist. It lives here because this
+  # workflow has no paths filter: a pull request that only edits Markdown, or only
+  # renames a file AGENTS.md names, would skip Lint and never reach the check.
+  agents-md-paths:
+    name: AGENTS.md names only files, directories and make targets the tree has
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run agents-md-paths
+        run: |
+          bash scripts/release-tests/agents-md-paths.sh --all
+          bash scripts/release-tests/agents-md-paths.sh --self-test

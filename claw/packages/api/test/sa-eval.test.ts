@@ -1062,7 +1062,7 @@ test("S32 EVAL_FRESH_SESSION_EVERY: a count of cases, or every attempt", () => {
 });
 
 test("S33 the cards waiting for the identity, and when an attempt cannot be graded on its cards", () => {
-  // e232 (2026-11-09, sa-eval-bot-4, k=3): the second and third attempts of cat-github-wr-001 were told "已经在等你确认" and showed no card.
+  // e232 (2026-11-09, an evaluation identity, k=3): the second and third attempts of cat-github-wr-001 were told "已经在等你确认" and showed no card.
   const assistant = { ok: true, data: [
     { confirmation_id: "cf2e00aa-0000-4000-8000-000000000001", kind: "github_comment", ref: "cf2e00" },
     { confirmation_id: "542a02aa-0000-4000-8000-000000000002", kind: "trigger_create", ref: "542a02" },
@@ -1224,7 +1224,7 @@ test("S35 a turn's channel_context goes with its message, beside its files; a ca
   assert.ok(!TURN_CONTEXT_KEYS.includes("files"));
 });
 
-// Replies of the live assistant to the evaluation identities (sa-eval-bot-4, 2026-11-09), which the language check failed although
+// Replies of the live assistant to the evaluation identities (an evaluation identity, 2026-11-09), which the language check failed although
 // each is in the person's language: Chinese answers that list English names, a command answered in the identity's language.
 const PLANS_ZH = "**Dispatron 里现在共 7 个 plan**\n\n- top-model-daily\n- hyperloom-main-daily-ci\n- hyperloom-release-qualification\n"
   + "- hyperloom-release-legs-v1.1.5\n- mi355x-kernel-arena-daily-dag\n- ka-geak-canary-20261028\n- assistant-eval-main-daily-ci";
@@ -1269,7 +1269,7 @@ test("S36 the reply's language is judged by its own words, not by the names, cod
   const en = caseOf({ lang: "en", turns: [{ user: "what did the worker report on the line-count item?" }], style: { reply_lang: "follow_user" } });
   assert.deepEqual(failed(en, observed({ final: "worker 汇报：统计完成，共 1,204 行，`src/` 下最多。" })), ["reply in en"]);
   assert.deepEqual(failed(en, observed({ final: "The worker of “统计行数” reported 1,204 lines, most of them under `src/`." })), []);
-  // The live English answer to that question, which names the person's items by their Chinese titles (sa-eval-bot-8, 2026-11-10).
+  // The live English answer to that question, which names the person's items by their Chinese titles (an evaluation identity, 2026-11-10).
   const items = "**⚠️ Neither line-count item produced a result; both were stopped before finishing.**\n\n"
     + "**#77 加统计 assistant 下 ts 行数的脚本 (the one with the PR)**\n- The worker wrote `claw/scripts/count-assistant-ts-lines.sh`.\n"
     + "- It then asked your approval to run a command that creates the branch `chore/count-assistant-ts-lines` and commits the script.\n"
