@@ -42,8 +42,8 @@ numbers are defined in `CHANGELOG.md` ("Versioning").
 5. **Every read and write is scoped to its owner.** Authentication is one global hook; ownership is checked inside each
    handler or store function. A session or task that is not yours is refused with 403 (the task routes answer
    `access_denied`; an id that does not exist is 404); a row of the remote-agents store that is not yours is simply not
-   found (404). A read-only admin may read a tenant's session by design (`canAccessSessionAsOperator`) and may not
-   change it (`canWriteSessionAsOperator`). [CI]
+   found (404). A read-only admin may read a tenant's sessions and tasks by design (`canAccessSessionAsOperator`) and may
+   not change them (`canWriteSessionAsOperator`); starting work under a session is the owner's alone. [CI]
    `claw/scripts/lint-tenant-routes-must-authorize.sh` (session, task and task-dag routes). [test]
    `claw/packages/api/test/routes-authz.test.ts`, `claw/packages/api/test/auth-anonymous-paths.test.ts` (the anonymous
    paths are an explicit list). [review] every other namespace; see the owner in each WHERE of
