@@ -13,13 +13,15 @@ Notable changes to PrimusClaw. The format follows
 PrimusClaw publishes three things to its users, and all three are versioned
 the same way, `MAJOR.MINOR.PATCH`, each with its own tag:
 
-| Release | Tag | Current version |
-|---|---|---|
-| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` | 0.3.1 |
-| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` | 0.3.6 |
-| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` | 0.15.0 |
+| Release | Tag |
+|---|---|
+| Claw (the server: the `claw` image and the `claw` chart) | `claw-vX.Y.Z` |
+| Connector (`@primusclaw/connector` on npm) | `connector-vX.Y.Z` |
+| Personal agent (`@primusclaw/personal-agent`, `-runtime` and `-teams` on npm, the Teams ingress's Function package on the GitHub Release (its npm package `-teams-ingress` is not published) and the `personal-agent-teams` image, all at one version) | `personal-agent-vX.Y.Z` |
 
-Every tag is a GitHub Release, and its notes are that version's release notes.
+Every tag is a GitHub Release, and its notes are that version's release notes. The
+current version of each is the latest release of its tag on the
+[Releases page](https://github.com/AMD-AGI/PrimusClaw/releases).
 The Teams app package (its manifest `version`) is not covered by these rules.
 
 ### Which number moves
@@ -1552,9 +1554,9 @@ The first tagged Claw release, a baseline for what was deployed on that day; eve
   undo it", "or reply 批准 #5ec155"). Both forms are still read whatever the language. Router prompt router-v21 (review router-v27,
   router-memory-v3, router-proactive-v4). Router prompt router-devenv-v13.
 - `channel_context.via` on a message to the person's assistant: `on_behalf` (the only value kept; anything else is dropped) says the
-  channel posted the message into the person's own chat for them (Clawy's on-behalf endpoint, their coordinator's review request)
+  channel posted the message into the person's own chat for them (a service's on-behalf endpoint, for example a review request sent for them)
   rather than their typing it. It is stored with the message (`claw_assistant_messages.channel_context`) so that what counts the
-  person's own messages can count these apart, and it widens nothing a turn may do (2026-11-08: Clawy's daily failure mining counted
+  person's own messages can count these apart, and it widens nothing a turn may do (2026-11-08: a daily failure-mining job counted
   52 "real user messages" in a day, all of them such requests).
 - A session's event stream opened without a cursor on a session longer than `SSE_HISTORY_TAIL` events sends `historyComplete`
   and its live events again. The tail is a whole number of pages; after the last one the empty page that follows wrote
@@ -1629,7 +1631,7 @@ The first tagged Claw release, a baseline for what was deployed on that day; eve
   "#381: 2 comments" still listed): each ended watch whose news is from the last 7 days has its branches read once with its owner's
   token, beside the poll pass and never holding it back (`claw_work_item_subscriptions.refs_read_at`, added at api start), claimed across replicas and
   never again; after the first passes following the release no GitHub call is made.
-- A worker's answer reaches the chat without waiting on the router (release gate run 1108021655-0c1088: the item delivered
+- A worker's answer reaches the chat without waiting on the router (a release gate run: the item delivered
   `result.md`, the chat showed "delivered result.md (28 B)", the router's line said the file's first line would follow, and it came
   only from the silent sweep five minutes later). An answer that comes with files the worker delivered is said whole by the system
   with them, before them, as a long answer already was, and the router is told it was sent. A router turn woken to say an answer that
@@ -1686,7 +1688,7 @@ The first tagged Claw release, a baseline for what was deployed on that day; eve
   `"success"`; the turn rebuilt for the next message still carries what that call answered.
 - An item started after the server's "on it" line is told in that line's message: the start notice takes its place (`replaces`), and
   what the router adds after it goes to the same message, so the channel shows one message rather than the line and the notice
-  (2026-11-07 run on sa-eval-bot-8: 3 of 34 timed lines stayed beside a start notice).
+  (2026-11-07 run on an evaluation identity: 3 of 34 timed lines stayed beside a start notice).
 - A user whose several machines are all offline is told in Chinese to run the restart command on each of them (每台机器), not on
   "that machine". A pairing claimed but not registered yet holds its name: two machines of one hostname claimed one after the
   other, before either registered, no longer both get the same alternate name.
@@ -3021,9 +3023,9 @@ The first tagged Claw release, a baseline for what was deployed on that day; eve
   `SANDBOX_CPU_NAMESPACE` is set, so a client can tell an account that has no CPU sandbox workspace before it is refused.
 - A work item's worker whose item waits for a person (`needs_you`) or is `done` no longer keeps its sandbox for background work: past
   `WAITING_ITEM_SANDBOX_RELEASE_SECONDS` (API, default 900) of quiet with nothing queued, the orphan sweep stops it, and the next turn
-  starts a fresh one. A review session's leftover test Postgres had held global-cpu sandboxes for up to two hours behind held merges.
-- Brain: deleting a session owned by a non-admin key (every ordinary user, and service identities such as `sa-eval-bot`,
-  `sa-release-gate` and `dispatron-service`) no longer stops at `cleanup_incomplete_parked`. The session-scoped SaFE workload
+  starts a fresh one. A review session's leftover test Postgres had held CPU sandboxes for up to two hours behind held merges.
+- Brain: deleting a session owned by a non-admin key (every ordinary user, and service identities that run
+  evaluations, release checks and integrations) no longer stops at `cleanup_incomplete_parked`. The session-scoped SaFE workload
   list named no workspace, which SaFE answers with 403 for any key that is not an admin's, so teardown read it as
   `mn.safe_lookup_failed`. When the unscoped list is refused with 403, teardown and the multi-node idle sweep now list in
   the workspace the session recorded (its `hands.<sid>` binding's `namespace`), one list per workspace when there are several;

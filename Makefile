@@ -1,8 +1,11 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-# One entry point for verifying the whole repository. `make verify` is intended
-# to run exactly what CI runs, so a green local run means a green pull request:
+# One entry point for verifying the repository. `make verify` runs the targets
+# below, which cover most of what CI runs. It has no step for personal-agent/ or
+# connector/, the Claw wire-type compile or the LLM-settings guard; AGENTS.md
+# ("Before you push") lists those, so a green local run is not by itself a green
+# pull request:
 #
 #   verify-claw       -> .github/workflows/tests.yml, job "claw"
 #   verify-sandbox    -> .github/workflows/tests.yml, job "sandbox"
@@ -40,7 +43,7 @@ endef
 help:
 	@echo "PrimusClaw — verification targets"
 	@echo
-	@echo "  make verify             everything below (mirrors CI)"
+	@echo "  make verify             everything below (most of CI; AGENTS.md lists the rest)"
 	@echo "  make release-verify     Docker/Helm/installer/PostgreSQL release gates"
 	@echo "  make release-verify-k8s run migration smoke in the current K8s cluster"
 	@echo
@@ -169,6 +172,9 @@ verify-lint:
 	fi
 	@echo "==> lint: PromQL rollout gates"
 	@bash scripts/release-tests/promql-gates.sh
+	@echo "==> lint: AGENTS.md and ENGINEERING.md name only what the tree has"
+	@bash scripts/release-tests/agents-md-paths.sh --all
+	@bash scripts/release-tests/agents-md-paths.sh --self-test
 	@# The last gate before anything reaches a public tree. It needs ripgrep with
 	@# PCRE2 and exits 2 rather than reporting a clean tree it never searched.
 	@echo "==> lint: public tree scan"

@@ -65,7 +65,7 @@ function fakeSafe() {
     const url = new URL(String(input), "http://safe.test");
     if (listStatus !== 200) return new Response("nope", { status: listStatus });
     // Like SaFE for a user who is not a system-admin: a list that names no
-    // workspace is refused (hosting, 2026-11-07: sa-eval-bot's run looped on 403).
+    // workspace is refused (2026-11-07: an evaluation identity's run looped on 403).
     const workspaceId = url.searchParams.get("workspaceId");
     listedWorkspaces.push(workspaceId ?? "");
     if (!workspaceId) return new Response(JSON.stringify({ errorMessage: "forbidden" }), { status: 403 });

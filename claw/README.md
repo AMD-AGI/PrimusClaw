@@ -149,7 +149,8 @@ claw/
 review misses — that workspace code must not call Hands directly without a
 timeout, that every prom-client metric is registered, that session events are
 redacted before persistence, that tenant routes authorize, that Brain's drain
-path is guarded on shutdown. CI runs all five; so does `make verify-lint`.
+path is guarded on shutdown. CI runs every one of them; `make verify` from the repository
+root runs most of them locally.
 
 ## Private CA anchors
 

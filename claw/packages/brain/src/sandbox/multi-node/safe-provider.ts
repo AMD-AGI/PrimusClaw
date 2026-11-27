@@ -144,7 +144,7 @@ class WorkloadListRefused extends Error {
  * The workspaces to list a session's workloads in, as given: trimmed, deduplicated, empty names dropped.
  *
  * SaFE lists workloads across workspaces only for an admin key. Any other key -- every ordinary user, and
- * the service identities Claw runs for (sa-eval-bot, sa-release-gate, dispatron-service) -- is answered 403
+ * the service identities Claw runs for (evaluation, release-check and integration identities) -- is answered 403
  * unless the request names a workspace the key may read, so an unscoped list made every non-admin session's
  * teardown `lookup_failed` and parked it for good. The workspaces come from what the session recorded
  * (its `hands.<sid>` binding's namespace), and are asked only after the unscoped list is refused.
