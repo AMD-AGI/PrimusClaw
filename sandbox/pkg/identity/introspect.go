@@ -48,7 +48,9 @@ type Token struct {
 	Email    string
 	Roles    []string
 	// Groups are the platform groups of the subject.
-	Groups  []string
+	Groups []string
+	// Teams are the team ids of the subject. They are never platform groups.
+	Teams   []string
 	expires time.Time
 }
 
@@ -144,6 +146,7 @@ type introspection struct {
 	Email    string          `json:"email"`
 	Roles    []string        `json:"roles"`
 	Groups   []string        `json:"groups"`
+	Teams    []string        `json:"teams"`
 	Audience json.RawMessage `json:"aud"`
 	ClientID string          `json:"client_id"`
 	Exp      json.Number     `json:"exp"`
@@ -192,7 +195,7 @@ func (c *Client) call(ctx context.Context, key string) (Token, bool, error) {
 		c.refuse(reason)
 		return Token{}, false, nil
 	}
-	tok := Token{Subject: out.Sub, Username: out.Username, Email: out.Email, Roles: out.Roles, Groups: out.Groups}
+	tok := Token{Subject: out.Sub, Username: out.Username, Email: out.Email, Roles: out.Roles, Groups: out.Groups, Teams: out.Teams}
 	if out.Exp != "" {
 		if f, err := out.Exp.Float64(); err == nil && f > 0 {
 			tok.expires = time.Unix(int64(f), 0)

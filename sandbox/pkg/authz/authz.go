@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -124,13 +125,13 @@ func (c *Client) CanUseWorkspace(ctx context.Context, tok identity.Token, ws str
 	if ws == "" {
 		return false, ErrEmptyWorkspace
 	}
-	return c.Allowed(ctx, tok.Subject, tok.Groups, workspaceUse(ws))
+	return c.Allowed(ctx, tok.Subject, reviewGroups(tok), workspaceUse(ws))
 }
 
 // CanUseAllWorkspaces reports whether the subject may use any workspace.
 // It is the only review that leaves the workspace name empty.
 func (c *Client) CanUseAllWorkspaces(ctx context.Context, tok identity.Token) (bool, error) {
-	return c.Allowed(ctx, tok.Subject, tok.Groups, workspaceUse(""))
+	return c.Allowed(ctx, tok.Subject, reviewGroups(tok), workspaceUse(""))
 }
 
 // ChooseWorkspace returns the requested workspace when the subject may use it.
@@ -151,10 +152,10 @@ func (c *Client) ChooseWorkspace(ctx context.Context, tok identity.Token, reques
 
 // PlatformRole returns system-admin when the subject may delete sessions,
 // system-admin-readonly when it may list them, and default otherwise.
-// The review uses tok.Groups. Token roles are not added as groups.
+// The review uses tok.Groups and team groups. Token roles are not added as groups.
 func (c *Client) PlatformRole(ctx context.Context, tok identity.Token) (string, error) {
 	attrs := authorizationv1.ResourceAttributes{Group: "runtime.agent-sandbox.io", Resource: "sessions", Verb: "delete"}
-	ok, err := c.Allowed(ctx, tok.Subject, tok.Groups, attrs)
+	ok, err := c.Allowed(ctx, tok.Subject, reviewGroups(tok), attrs)
 	if err != nil {
 		return "", err
 	}
@@ -162,7 +163,7 @@ func (c *Client) PlatformRole(ctx context.Context, tok identity.Token) (string, 
 		return identity.RoleSystemAdmin, nil
 	}
 	attrs.Verb = "list"
-	if ok, err = c.Allowed(ctx, tok.Subject, tok.Groups, attrs); err != nil {
+	if ok, err = c.Allowed(ctx, tok.Subject, reviewGroups(tok), attrs); err != nil {
 		return "", err
 	}
 	if ok {
@@ -187,6 +188,18 @@ func (c *Client) CallerRole(ctx context.Context, tok identity.Token) (string, er
 	return c.PlatformRole(ctx, tok)
 }
 
+// reviewGroups returns the token groups plus one team:<id> group per team.
+// Empty team ids and ids containing a colon are skipped.
+func reviewGroups(tok identity.Token) []string {
+	groups := append([]string(nil), tok.Groups...)
+	for _, t := range tok.Teams {
+		if t != "" && !strings.Contains(t, ":") {
+			groups = append(groups, "team:"+t)
+		}
+	}
+	return groups
+}
+
 // Allowed reviews attrs for the prefixed subject and groups. An empty subject is denied.
 func (c *Client) Allowed(ctx context.Context, sub string, groups []string, attrs authorizationv1.ResourceAttributes) (bool, error) {
 	question := attrs.Resource
@@ -208,6 +221,7 @@ func (c *Client) Allowed(ctx context.Context, sub string, groups []string, attrs
 		}
 	}
 	sort.Strings(spec.Groups)
+	spec.Groups = slices.Compact(spec.Groups)
 	key := cacheKey(spec)
 	if allowed, ok := c.cached(key); ok {
 		result := "deny"
